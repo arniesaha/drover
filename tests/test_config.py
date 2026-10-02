@@ -42,6 +42,20 @@ def test_default_config_uses_home_dir():
     assert cfg.embeddings_api_base_url == ""
 
 
+def test_span_integration_is_off_by_default():
+    assert default_config().spans_enabled is False
+    assert load_config(FIXTURE).spans_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("true", True), ("false", False), ('"true"', False)]
+)
+def test_span_integration_requires_explicit_boolean_opt_in(tmp_path, raw, expected):
+    path = tmp_path / "config.toml"
+    path.write_text(f"[telemetry]\nspans_enabled = {raw}\n")
+    assert load_config(path).spans_enabled is expected
+
+
 def test_loads_local_ollama_summarizer_config(tmp_path):
     cfg_file = tmp_path / "summarizer.toml"
     cfg_file.write_text(

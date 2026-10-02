@@ -489,6 +489,13 @@ class DroverConfig:
     # launch; worktree creation must not share a volume with slow bulk data.
     worktrees_dir: Path | None = None
     setup_check: SetupCheckConfig = SetupCheckConfig()
+    # Optional span integration (AgentWeave proxy -> Tempo -> tempo-relay ->
+    # OTLP :4317 -> Parquet spans/). Off by default since #473: spans only
+    # covered proxied calls, the chain failed silently for days, and nothing
+    # core may depend on it. When off, the OTLP receiver does not start, no
+    # span embed jobs are enqueued, and span-derived views report "disabled".
+    # Historical span Parquet is never deleted; it is readable again once on.
+    spans_enabled: bool = False
 
 
 _DEFAULTS = {
@@ -634,6 +641,10 @@ _DEFAULTS = {
     "advisory": {
         "full_review_interval_seconds": 86400.0,
         "poll_interval_seconds": 5.0,
+    },
+    # Optional span/OTLP integration (#473). Off: no receiver, no span jobs.
+    "telemetry": {
+        "spans_enabled": False,
     },
     "advisory_content": {
         "enabled": False,
@@ -874,7 +885,13 @@ def _from_dict(d: dict) -> DroverConfig:
         apns_key_id=str(d["apns"]["key_id"]),
         apns_team_id=str(d["apns"]["team_id"]),
         apns_bundle_id=str(d["apns"]["bundle_id"]),
+        spans_enabled=_strict_bool(d["telemetry"].get("spans_enabled", False)),
     )
+
+
+def _strict_bool(value: object) -> bool:
+    """Only a real ``true`` opts in; a stray string like "false" must not."""
+    return value is True
 
 
 def default_config() -> DroverConfig:

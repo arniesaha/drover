@@ -2142,6 +2142,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 source_session_id=_optional_text(body.get("source_session_id")),
                 handoff_mode=_optional_text(body.get("handoff_mode")),
                 client_session_id=client_session_id,
+                parent_session_id=_optional_text(body.get("parent_session_id")),
             )
             session_id = session.session_id
             registry_created = True
@@ -2487,6 +2488,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 model=model,
                 thinking_effort=thinking_effort,
                 client_session_id=client_session_id,
+                parent_session_id=_optional_text(body.get("parent_session_id")),
             )
             session_id = session.session_id
             registry_created = True

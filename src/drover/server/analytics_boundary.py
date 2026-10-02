@@ -62,6 +62,7 @@ _COCKPIT_QUERY_FIELDS = frozenset(
         "model_cursor",
     }
 )
+_PROJECT_ACTIVITY_QUERY_FIELDS = frozenset({"project", "days", "limit"})
 _INSIGHT_QUERY_FIELDS = frozenset(
     {
         "state",
@@ -273,6 +274,8 @@ def _allowed_query_fields(method: str, path: str) -> frozenset[str]:
         return _COCKPIT_QUERY_FIELDS
     if path == "/insights":
         return _INSIGHT_QUERY_FIELDS
+    if path == "/projects/activity":
+        return _PROJECT_ACTIVITY_QUERY_FIELDS
     return frozenset()
 
 
@@ -295,6 +298,7 @@ def validate_analytics_request(method: str, path: str, query: str) -> None:
                 "/analytics",
                 "/insights",
                 "/insights/content-analysis",
+                "/projects/activity",
             }
             or _is_insight_detail(parts)
             or _is_insight_check_status(parts)

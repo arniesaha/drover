@@ -84,11 +84,15 @@ class CockpitService:
         advisory_repository: Any | None = None,
         cursor_secret: bytes | None = None,
         maintenance_gate: AnalyticalMaintenanceGate | None = None,
+        spans_enabled: bool = False,
     ) -> None:
         # Background analytical passes stand aside while this is in flight
         # (#331). Optional so the many tests that build a service by hand keep
         # working unchanged; the server always supplies one.
         self.maintenance_gate = maintenance_gate
+        # Optional span integration (#473): off, cost and latency are reported
+        # with zero coverage and the activity query never reads span Parquet.
+        self.spans_enabled = spans_enabled
         self.duckdb_path = Path(duckdb_path) if duckdb_path is not None else None
         self.provider_usage = provider_usage
         self._connect = connect
@@ -385,11 +389,17 @@ class CockpitService:
                     # and brings whatever control-plane tables it wants.
                     with attached_control_plane_snapshot(con, self.duckdb_path):
                         outcome["result"] = activity_analytics(
-                            con, filters, cursor_codec=self._cursor_codec
+                            con,
+                            filters,
+                            cursor_codec=self._cursor_codec,
+                            spans_enabled=self.spans_enabled,
                         )
                 else:
                     outcome["result"] = activity_analytics(
-                        con, filters, cursor_codec=self._cursor_codec
+                        con,
+                        filters,
+                        cursor_codec=self._cursor_codec,
+                        spans_enabled=self.spans_enabled,
                     )
             except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
                 outcome["error"] = exc
@@ -468,6 +478,7 @@ class CockpitService:
             "source": str(source),
             "filters": asdict(filters),
             "cursor_secret": self._cursor_secret.hex(),
+            "spans_enabled": self.spans_enabled,
             "control_store": asdict(config) if config is not None else None,
         }
         # The parent owns the directory so even a killed or crashed child

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,7 +15,12 @@ from click.testing import CliRunner
 from drover.event_identity import audit_agent_event_identity, scan_agent_events_once
 from drover.schema import bootstrap
 from drover.server.__main__ import main
-from drover.server.doctor import format_runtime_audit, runtime_audit
+from drover.server.doctor import format_runtime_audit
+from drover.server.doctor import runtime_audit as _runtime_audit
+
+# Many audits here assert span sections, so the module opts into the optional
+# span integration (#473); the spans-off default is tested explicitly below.
+runtime_audit = functools.partial(_runtime_audit, spans_enabled=True)
 
 _SPAN_SCHEMA = pa.schema(
     [
@@ -359,6 +365,31 @@ def test_runtime_audit_formats_no_diagnostic_snapshot_as_none(tmp_path: Path) ->
     assert report["diagnostic_duckdb_path"] is None
     assert f"source_db     : {db}" in text
     assert "diagnostic_db : none" in text
+
+
+def test_runtime_audit_reports_spans_disabled_without_reading_them(
+    tmp_path: Path,
+) -> None:
+    parquet_dir = tmp_path / "parquet"
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=db)
+    # Any span read would fail on this file.
+    bad = parquet_dir / "spans" / "date=2026-09-30" / "bad.parquet"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("not parquet")
+
+    report = _runtime_audit(duckdb_path=db, incoming_dir=None, hours=24)
+    text = format_runtime_audit(report)
+
+    assert report["span_integration"] == "disabled"
+    assert report["span_health"]["status"] == "disabled"
+    assert report["openclaw_agentweave_health"]["status"] == "disabled"
+    assert report["span_embedding_coverage"]["status"] == "disabled"
+    assert report["table_counts"]["spans"] is None
+    assert not [w for w in report["warnings"] if "span" in w.lower()]
+    assert "span integration: disabled" in text
+    assert "span health:" not in text
+    assert "OpenClaw/AgentWeave" not in text
 
 
 def test_runtime_audit_groups_pending_incoming_by_source_without_db_writes(

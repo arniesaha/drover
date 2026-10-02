@@ -18,7 +18,9 @@ public struct MetricSources: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case usagePercent = "usage_percent"
-        case spansPercent = "span_percent"
+        // The server field is `spans_percent`; reading `span_percent` left
+        // this nil on every payload, so the app always said "unavailable".
+        case spansPercent = "spans_percent"
         case status
     }
 

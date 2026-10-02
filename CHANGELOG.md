@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Span ingestion is an optional integration, off by default (#473). The OTLP
+  receiver only starts with `[telemetry] spans_enabled = true`; with it off no
+  span Parquet is read, no span embedding jobs are enqueued or claimed,
+  `doctor`/`quality`/`data_quality` report spans as `disabled` instead of
+  missing or stale, advisory checks no longer raise "span feed is silent",
+  `drover_recall` returns session-summary hits only, and span-only commands
+  (`trace-tail`, `recent-traces`, `embeddings enqueue-spans`/`reset-stale-spans`/
+  `prune-orphan-spans`, `decisions derive`, `session graph --spans`) name the
+  flag. Historical span data is kept; no schema is dropped.
+  `drover-collect tempo-relay` remains as an optional, legacy command. See
+  `docs/optional-span-integration.md`.
+- `drover-server session graph` now draws the work tree from recorded launch
+  metadata (delegation parent, handoff source, Factory run) with each
+  session's state and what is stuck; `--run RUN_ID` shows a Factory run.
+  Also served at `GET /harness/sessions/{id}/graph` and
+  `GET /harness/runs/{run_id}/graph` (#473).
+- MCP `drover_project_activity` answers "what happened on this project and what
+  is still open" from Drover's own sessions, summaries and `session_usage`,
+  with hard caps (30 days, 20 projects, 200 sessions, 20 open items). Also
+  served at `GET /projects/activity` (#473).
+- The app hides the API-billed cost metric when no session reported a cost,
+  and names spans as a measurement source only when they contributed (#473).
+
 ### Added
+
+- Harness launches accept an optional `parent_session_id` so an orchestrator
+  can record delegation explicitly; it is stored on `harness_sessions`
+  (PostgreSQL control-store migration 5) (#473).
 
 - Sign-out revokes the phone's own hub credential and clears its APNs
   registration through `DELETE /auth/device/credential` (self-only and

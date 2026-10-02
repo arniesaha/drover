@@ -18,6 +18,12 @@ import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
 
+_SPAN_COST_SQL = """COALESCE((
+    SELECT SUM(cost_usd)
+      FROM spans s
+     WHERE s.task_id = t.task_id
+  ), 0.0)"""
+
 _ROLLUP_SQL = f"""
 WITH {canonical_agent_events_cte()}
 UPDATE tasks AS t SET
@@ -26,11 +32,7 @@ UPDATE tasks AS t SET
       FROM canonical_agent_events ae
      WHERE ae.task_id = t.task_id
   ), 0),
-  total_cost_usd = COALESCE((
-    SELECT SUM(cost_usd)
-      FROM spans s
-     WHERE s.task_id = t.task_id
-  ), 0.0),
+  total_cost_usd = {_SPAN_COST_SQL},
   repo_owner = COALESCE(t.repo_owner, (
     SELECT any_value(ae.repo_owner)
       FROM canonical_agent_events ae
@@ -55,6 +57,7 @@ def rollup_tasks(
     *,
     task_ids: Iterable[str] | None = None,
     dates: Iterable[str] | None = None,
+    include_span_cost: bool = True,
 ) -> int:
     """Refresh derived columns on task rows.
 
@@ -62,6 +65,10 @@ def rollup_tasks(
     the always-on ingest path from running broad historical rollups after every
     small incoming batch. Omitting ``task_ids`` preserves the full-refresh CLI
     behavior.
+
+    ``total_cost_usd`` is span-derived. With ``include_span_cost`` off (the
+    optional span integration disabled, #473) it is left exactly as stored and
+    no span Parquet is read.
     """
     ids = sorted({task_id for task_id in (task_ids or []) if task_id})
     bounded_dates = sorted({date for date in (dates or []) if date})
@@ -72,6 +79,10 @@ def rollup_tasks(
             )
             total_cost_sql = "t.total_cost_usd"
             params = [*bounded_dates, ids]
+        elif not include_span_cost:
+            event_source_sql = "SELECT * FROM agent_events"
+            total_cost_sql = "t.total_cost_usd"
+            params = [ids]
         else:
             event_source_sql = "SELECT * FROM agent_events"
             total_cost_sql = "COALESCE((SELECT SUM(cost_usd) FROM spans s WHERE s.task_id = t.task_id), 0.0)"
@@ -108,6 +119,9 @@ def rollup_tasks(
             params,
         )
         return len(ids)
-    con.execute(_ROLLUP_SQL)
+    if include_span_cost:
+        con.execute(_ROLLUP_SQL)
+    else:
+        con.execute(_ROLLUP_SQL.replace(_SPAN_COST_SQL, "t.total_cost_usd"))
     row = con.execute("SELECT COUNT(*) FROM tasks").fetchone()
     return row[0] if row else 0

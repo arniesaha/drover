@@ -106,6 +106,7 @@ class EmbedWorker:
         session_job_stream: Optional[object] = None,
         span_job_stream: Optional[object] = None,
         worker_id: str = "embeddings",
+        spans_enabled: bool = False,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self._embedder = embedder
@@ -117,6 +118,9 @@ class EmbedWorker:
         self.poll_interval_s = poll_interval_s
         self.session_job_stream = session_job_stream
         self.span_job_stream = span_job_stream
+        # Optional span integration (#473). Off, historical span jobs are left
+        # exactly as they are: neither claimed nor recovered nor failed.
+        self.spans_enabled = spans_enabled
         self.worker_id = worker_id
         self._session_quarantine = ClaimQuarantine("embed_jobs", "session_id", log)
         self._span_quarantine = ClaimQuarantine("span_embed_jobs", "span_id", log)
@@ -144,7 +148,12 @@ class EmbedWorker:
             return
         # Crash recovery (AGE-45): reconcile crashed in-flight work from DuckDB
         # for both session- and span-embed kinds before draining.
-        for job_kind in ("embed_session", "embed_span"):
+        job_kinds = (
+            ("embed_session", "embed_span")
+            if self.spans_enabled
+            else ("embed_session",)
+        )
+        for job_kind in job_kinds:
             ledger_shadow.recover_runnable(self.duckdb_path, job_kind=job_kind)
         self._stop.clear()
         self._thread = threading.Thread(
@@ -344,7 +353,7 @@ class EmbedWorker:
         return rows
 
     def _claim_span_jobs(self, *, max_jobs: int) -> list[dict]:
-        if max_jobs <= 0:
+        if max_jobs <= 0 or not self.spans_enabled:
             return []
         if self.span_job_stream is not None:
             return self._claim_span_stream_jobs(max_jobs=max_jobs)

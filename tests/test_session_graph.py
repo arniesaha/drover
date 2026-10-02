@@ -1,4 +1,4 @@
-"""Tests for session span-tree reconstruction."""
+"""Tests for the Session Graph: delegation tree, and the legacy span tree."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from click.testing import CliRunner
 
 from drover.schema import bootstrap
 from drover.server.__main__ import main
+from drover.server.harness.registry import HarnessRegistry
+from drover.server.session_graph import delegation_graph_payload, session_state
 
 _SPAN_SCHEMA = pa.schema(
     [
@@ -32,7 +34,7 @@ _SPAN_SCHEMA = pa.schema(
 )
 
 
-def _make_config(tmp_path: Path) -> Path:
+def _make_config(tmp_path: Path, *, spans: bool = True) -> Path:
     cfg = tmp_path / "config.toml"
     cfg.write_text(f"""
 [paths]
@@ -48,6 +50,9 @@ mcp_http_port  = 17077
 [agent]
 agent_id     = "test"
 principal_id = "test"
+
+[telemetry]
+spans_enabled = {"true" if spans else "false"}
 """)
     return cfg
 
@@ -141,7 +146,7 @@ def _seed_spans(tmp_path: Path) -> Path:
 def test_session_graph_ascii_reconstructs_parent_child_tree(tmp_path: Path) -> None:
     cfg = _seed_spans(tmp_path)
     res = CliRunner().invoke(
-        main, ["--config", str(cfg), "session", "graph", "sess-graph"]
+        main, ["--config", str(cfg), "session", "graph", "--spans", "sess-graph"]
     )
 
     assert res.exit_code == 0, res.output
@@ -157,7 +162,16 @@ def test_session_graph_json_output_is_nested(tmp_path: Path) -> None:
     cfg = _seed_spans(tmp_path)
     res = CliRunner().invoke(
         main,
-        ["--config", str(cfg), "session", "graph", "sess-graph", "--format", "json"],
+        [
+            "--config",
+            str(cfg),
+            "session",
+            "graph",
+            "--spans",
+            "sess-graph",
+            "--format",
+            "json",
+        ],
     )
 
     assert res.exit_code == 0, res.output
@@ -174,7 +188,16 @@ def test_session_graph_dot_output_contains_edges(tmp_path: Path) -> None:
     cfg = _seed_spans(tmp_path)
     res = CliRunner().invoke(
         main,
-        ["--config", str(cfg), "session", "graph", "sess-graph", "--format", "dot"],
+        [
+            "--config",
+            str(cfg),
+            "session",
+            "graph",
+            "--spans",
+            "sess-graph",
+            "--format",
+            "dot",
+        ],
     )
 
     assert res.exit_code == 0, res.output
@@ -241,6 +264,7 @@ def test_session_graph_parent_lookup_is_trace_scoped(tmp_path: Path) -> None:
             str(cfg),
             "session",
             "graph",
+            "--spans",
             "sess-collide",
             "--format",
             "json",
@@ -259,8 +283,214 @@ def test_session_graph_exits_nonzero_for_missing_session(tmp_path: Path) -> None
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
 
     res = CliRunner().invoke(
-        main, ["--config", str(cfg), "session", "graph", "missing"]
+        main, ["--config", str(cfg), "session", "graph", "--spans", "missing"]
     )
 
     assert res.exit_code != 0
     assert "no spans found for session_id=missing" in res.output
+
+
+def test_span_tree_requires_the_span_integration(tmp_path: Path) -> None:
+    cfg = _seed_spans(tmp_path)
+    _make_config(tmp_path, spans=False)
+
+    res = CliRunner().invoke(
+        main, ["--config", str(cfg), "session", "graph", "--spans", "sess-graph"]
+    )
+
+    assert res.exit_code != 0
+    assert "spans_enabled = true" in res.output
+
+
+# --- Delegation graph (launch metadata only) -----------------------------------
+
+_NOW = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+
+
+def _registry(tmp_path: Path) -> HarnessRegistry:
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    return HarnessRegistry(duckdb_path)
+
+
+def _launch(registry: HarnessRegistry, session_id: str, **fields) -> None:
+    registry.create_session(
+        session_id=session_id,
+        host_id=fields.pop("host_id", "mac-mini"),
+        harness=fields.pop("harness", "claude-code"),
+        command="claude",
+        status=fields.pop("status", "running"),
+        started_at=fields.pop("started_at", _NOW - timedelta(minutes=10)),
+        repo_owner="acme",
+        repo_name="widget",
+        **fields,
+    )
+
+
+def test_session_state_maps_recorded_fields_to_actionable_states() -> None:
+    recent = _NOW - timedelta(minutes=5)
+    stale = _NOW - timedelta(hours=2)
+    assert (
+        session_state(status="completed", awaiting=None, last_activity=stale, now=_NOW)
+        == "done"
+    )
+    assert (
+        session_state(status="errored", awaiting=None, last_activity=recent, now=_NOW)
+        == "failed"
+    )
+    assert (
+        session_state(status="running", awaiting="input", last_activity=stale, now=_NOW)
+        == "awaiting_input"
+    )
+    assert (
+        session_state(
+            status="running", awaiting="approval", last_activity=recent, now=_NOW
+        )
+        == "awaiting_approval"
+    )
+    assert (
+        session_state(status="running", awaiting=None, last_activity=stale, now=_NOW)
+        == "idle"
+    )
+    assert (
+        session_state(status="running", awaiting=None, last_activity=recent, now=_NOW)
+        == "running"
+    )
+
+
+def test_delegation_graph_builds_tree_from_parent_and_handoff_links(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    _launch(registry, "orchestrator")
+    _launch(registry, "child-a", parent_session_id="orchestrator")
+    _launch(registry, "child-b", parent_session_id="orchestrator", status="errored")
+    _launch(
+        registry,
+        "grandchild",
+        source_session_id="child-a",
+        handoff_mode="nexus_handoff",
+    )
+    registry.update_session_activity(
+        "child-a", awaiting="input", last_activity=_NOW - timedelta(minutes=1)
+    )
+
+    # Asking from a leaf returns the whole tree, rooted at the orchestrator.
+    payload = delegation_graph_payload(registry, session_id="grandchild", now=_NOW)
+
+    assert payload is not None
+    assert payload["source"] == "drover_launch_metadata"
+    assert payload["focus_session_id"] == "grandchild"
+    root = payload["root"]
+    assert root["kind"] == "session"
+    assert root["started_by"] == "direct launch"
+    top = root["children"][0]
+    assert top["session_id"] == "orchestrator"
+    children = {node["session_id"]: node for node in top["children"]}
+    assert set(children) == {"child-a", "child-b"}
+    assert children["child-a"]["link"] == "delegated"
+    assert children["child-a"]["state"] == "awaiting_input"
+    assert children["child-b"]["state"] == "failed"
+    assert children["child-a"]["children"][0]["session_id"] == "grandchild"
+    assert children["child-a"]["children"][0]["link"] == "handoff"
+    assert payload["node_count"] == 4
+    stuck = {item["session_id"]: item["reason"] for item in payload["stuck"]}
+    assert stuck == {"child-a": "waiting for input", "child-b": "failed"}
+
+
+def test_delegation_graph_names_an_unknown_handoff_source_without_inventing_it(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    _launch(
+        registry,
+        "resumed",
+        source_session_id="native-123",
+        handoff_mode="native_resume",
+    )
+
+    payload = delegation_graph_payload(registry, session_id="resumed", now=_NOW)
+
+    assert payload["root"]["started_by"] == "handoff from native-123"
+    assert payload["root"]["unknown_parent_session_id"] == "native-123"
+    assert payload["root"]["children"][0]["session_id"] == "resumed"
+
+
+def test_delegation_graph_groups_a_factory_run(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    for session_id, revision in (("run-a", 1), ("run-b", 2)):
+        _launch(
+            registry,
+            session_id,
+            source_session_id=f"factory/run_42@{revision}",
+            handoff_mode="factory_observer",
+        )
+    _launch(
+        registry,
+        "other-run",
+        source_session_id="factory/run_43@1",
+        handoff_mode="factory_observer",
+    )
+
+    by_session = delegation_graph_payload(registry, session_id="run-b", now=_NOW)
+    by_run = delegation_graph_payload(registry, run_id="run_42", now=_NOW)
+
+    for payload in (by_session, by_run):
+        assert payload["root"] == {
+            **payload["root"],
+            "kind": "factory_run",
+            "run_id": "run_42",
+        }
+        assert [n["session_id"] for n in payload["root"]["children"]] == [
+            "run-a",
+            "run-b",
+        ]
+    assert by_session["focus_session_id"] == "run-b"
+
+
+def test_delegation_graph_is_capped(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    _launch(registry, "root")
+    for index in range(5):
+        _launch(registry, f"child-{index}", parent_session_id="root")
+
+    payload = delegation_graph_payload(
+        registry, session_id="root", now=_NOW, max_nodes=3
+    )
+
+    assert payload["node_count"] == 3
+    assert payload["truncated"] is True
+
+
+def test_delegation_graph_returns_none_for_unknown_session(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    assert delegation_graph_payload(registry, session_id="missing") is None
+
+
+def test_session_graph_cli_defaults_to_delegation_tree_with_spans_off(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_config(tmp_path, spans=False)
+    registry = _registry(tmp_path)
+    _launch(registry, "orchestrator")
+    _launch(registry, "worker", parent_session_id="orchestrator")
+
+    text = CliRunner().invoke(
+        main, ["--config", str(cfg), "session", "graph", "worker"]
+    )
+    as_json = CliRunner().invoke(
+        main,
+        ["--config", str(cfg), "session", "graph", "worker", "--format", "json"],
+    )
+    missing = CliRunner().invoke(
+        main, ["--config", str(cfg), "session", "graph", "nope"]
+    )
+
+    assert text.exit_code == 0, text.output
+    assert text.output.startswith("orchestrator [")
+    assert "└─ worker [" in text.output
+    assert "(delegated)" in text.output
+    assert as_json.exit_code == 0, as_json.output
+    assert json.loads(as_json.output)["node_count"] == 2
+    assert missing.exit_code != 0
+    assert "no harness session found for session_id=nope" in missing.output

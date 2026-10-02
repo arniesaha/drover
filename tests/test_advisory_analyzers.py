@@ -369,6 +369,24 @@ def test_silent_span_feed_is_one_fleet_finding() -> None:
     assert silent[0].severity is Severity.LOW
 
 
+def test_silent_span_feed_is_expected_when_the_span_integration_is_off() -> None:
+    snapshot = _snapshot(
+        telemetry=(
+            _telemetry(
+                sessions_with_spans=0,
+                token_observed_sessions=0,
+                cost_observed_sessions=0,
+                latest_span_at=None,
+            ),
+        )
+    )
+    findings = TelemetryCoverageAnalyzer(spans_enabled=False).analyze(snapshot)
+    rules = {f.rule_id for f in findings}
+    assert "telemetry.span_feed_silent" not in rules
+    # The rules built on Drover's own data still apply.
+    assert "telemetry.token_source_missing" in rules
+
+
 def test_harness_with_no_token_source_is_one_finding_per_harness() -> None:
     snapshot = _snapshot(
         telemetry=(

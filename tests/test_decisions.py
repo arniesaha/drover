@@ -55,6 +55,9 @@ mcp_http_port  = 17077
 [agent]
 agent_id     = "test"
 principal_id = "test"
+
+[telemetry]
+spans_enabled = true
 """)
     return cfg
 
@@ -229,3 +232,15 @@ def test_decisions_derive_cli_reports_inserted_count(tmp_path: Path) -> None:
 
     assert res.exit_code == 0, res.output
     assert "inserted 1 decision" in res.output
+
+
+def test_decisions_derive_cli_is_off_without_the_span_integration(
+    tmp_path: Path,
+) -> None:
+    cfg = _seed_decision_trace(tmp_path)
+    cfg.write_text(cfg.read_text().replace("spans_enabled = true", ""))
+
+    res = CliRunner().invoke(main, ["--config", str(cfg), "decisions", "derive"])
+
+    assert res.exit_code != 0
+    assert "span integration is disabled" in res.output

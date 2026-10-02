@@ -303,52 +303,132 @@ def test_recent_sessions_respects_limit(tmp_path: Path) -> None:
     assert len(out["sessions"]) == 2
 
 
-def test_project_activity_uses_enriched_span_attribution(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    now = datetime.now(timezone.utc)
-    _write_agent_events(
-        parquet_dir,
-        session_id="session-with-repo",
-        repo_owner="arniesaha",
-        repo_name="nexus",
-    )
-    _write_span(
-        parquet_dir,
-        span_id="span-without-repo",
-        agent_id="a",
-        start_time=now,
-        project="fallback-label",
-    )
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-
-    out = drover_project_activity(
-        duckdb_path=duckdb_path,
-        project_key="arniesaha/nexus",
-        since=(now - timedelta(minutes=1)).isoformat(),
-    )
-
-    assert len(out["rows"]) == 1
-    assert out["rows"][0]["project_key"] == "arniesaha/nexus"
-    assert out["rows"][0]["agentweave_project"] == "fallback-label"
+def _sessions(out: dict) -> dict[str, dict]:
+    return {s["session_id"]: s for day in out["days"] for s in day["sessions"]}
 
 
-def test_project_activity_uses_bounded_enriched_span_partitions(
+def test_project_activity_builds_a_timeline_from_events_and_summaries(
     tmp_path: Path,
 ) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
-    now = datetime.now(timezone.utc)
+    _write_agent_events(
+        parquet_dir, session_id="native-1", repo_owner="arniesaha", repo_name="nexus"
+    )
+    _write_agent_events(
+        parquet_dir, session_id="elsewhere", repo_owner="arniesaha", repo_name="other"
+    )
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    _insert_summary(duckdb_path, "native-1")
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute("""UPDATE session_summaries
+                  SET next_steps_md = 'Ship the graph route.',
+                      open_questions = ['Which cap for days?']
+                WHERE session_id = 'native-1'""")
+    finally:
+        con.close()
+
+    out = drover_project_activity(
+        duckdb_path=duckdb_path, project_key="arniesaha/nexus"
+    )
+
+    assert out["source"] == "drover_sessions"
+    assert out["window"]["days"] == 7
+    assert [p["project_key"] for p in out["projects"]] == ["arniesaha/nexus"]
+    assert out["projects"][0]["session_count"] == 1
+    session = _sessions(out)["native-1"]
+    assert session["title"] == "summary native-1"
+    assert session["state"] == "done"
+    assert session["launched_by_drover"] is False
+    kinds = {(item["kind"], item["text"]) for item in out["open_items"]}
+    assert ("next_step", "Ship the graph route.") in kinds
+    assert ("open_question", "Which cap for days?") in kinds
+    assert "elsewhere" not in _sessions(out)
+
+
+def test_project_activity_reports_launched_session_state_and_tokens(
+    tmp_path: Path,
+) -> None:
+    from drover.server.db import control_plane_path
+    from drover.server.harness.registry import HarnessRegistry
+
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    registry = HarnessRegistry(duckdb_path)
+    started = datetime.now(timezone.utc) - timedelta(hours=1)
+    registry.create_session(
+        session_id="launched-1",
+        host_id="mac-mini",
+        harness="claude-code",
+        command="claude",
+        status="running",
+        started_at=started,
+        repo_owner="arniesaha",
+        repo_name="drover",
+        branch="drover/launched-1",
+        parent_session_id="orchestrator-1",
+    )
+    registry.update_session_activity("launched-1", awaiting="input")
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        con.execute("""INSERT INTO session_usage
+                 (session_id, host_id, harness, input_tokens, output_tokens,
+                  cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                  turn_count, exact, source, source_seq, source_event_count,
+                  observed_at)
+               VALUES ('launched-1', 'mac-mini', 'claude-code', 100, 20, 30, 0,
+                       NULL, 1, TRUE, 'harness_events', 1, 1, now())""")
+    finally:
+        con.close()
+
+    out = drover_project_activity(duckdb_path=duckdb_path, days=3)
+
+    session = _sessions(out)["launched-1"]
+    assert session["state"] == "awaiting_input"
+    assert session["launched_by_drover"] is True
+    assert session["harness"] == "claude-code"
+    assert session["total_tokens"] == 150
+    assert session["refs"] == {
+        "branch": "drover/launched-1",
+        "parent_session_id": "orchestrator-1",
+    }
+    assert session["duration_seconds"] >= 3500
+    project = out["projects"][0]
+    assert project["project_key"] == "arniesaha/drover"
+    assert project["total_tokens"] == 150
+    assert 0.9 < project["active_hours"] < 1.1
+    assert out["open_items"][0]["kind"] == "awaiting_input"
+
+
+def test_project_activity_never_reads_spans(tmp_path: Path) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    _write_span(
+        parquet_dir,
+        span_id="span-only",
+        agent_id="a",
+        start_time=datetime.now(timezone.utc),
+        project="span-only-project",
+    )
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    # A corrupt span partition would fail any query that touched it.
+    bad = parquet_dir / "spans" / "date=2026-09-30" / "bad.parquet"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("not parquet")
+
+    out = drover_project_activity(duckdb_path=duckdb_path)
+
+    assert out["projects"] == []
+    assert out["days"] == []
+
+
+def test_project_activity_tolerates_corrupt_partitions_outside_the_window(
+    tmp_path: Path,
+) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
     _write_agent_events(
         parquet_dir,
         session_id="session-with-repo",
         repo_owner="arniesaha",
         repo_name="nexus",
-    )
-    _write_span(
-        parquet_dir,
-        span_id="span-without-repo",
-        agent_id="a",
-        start_time=now,
-        project="fallback-label",
     )
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
     bad_agent_events = (
@@ -364,11 +444,29 @@ def test_project_activity_uses_bounded_enriched_span_partitions(
     out = drover_project_activity(
         duckdb_path=duckdb_path,
         project_key="arniesaha/nexus",
-        since=(now - timedelta(minutes=1)).isoformat(),
+        since=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
     )
 
-    assert len(out["rows"]) == 1
-    assert out["rows"][0]["project_key"] == "arniesaha/nexus"
+    assert list(_sessions(out)) == ["session-with-repo"]
+    assert out["window"]["days"] == 1
+
+
+def test_project_activity_caps_and_validates_inputs(tmp_path: Path) -> None:
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    for index in range(4):
+        _write_agent_events(
+            parquet_dir, session_id=f"S{index}", repo_owner="o", repo_name="r"
+        )
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+
+    out = drover_project_activity(duckdb_path=duckdb_path, days=365, limit=2)
+
+    assert out["window"]["days"] == 30
+    assert len(_sessions(out)) == 2
+    assert out["truncated"]["sessions"] is True
+    assert out["projects"][0]["session_count"] == 4
+    with pytest.raises(ValueError, match="owner"):
+        drover_project_activity(duckdb_path=duckdb_path, project_key="not-a-pair")
 
 
 def test_open_loops_scopes_project_key_to_exact_repository(tmp_path: Path) -> None:
@@ -436,11 +534,21 @@ def test_recall_can_return_span_hits_distinct_from_summary_hits(tmp_path: Path) 
     finally:
         con.close()
 
-    out = drover_recall(duckdb_path=duckdb_path, query_embedding=[1.0, 0.0], limit=2)
+    out = drover_recall(
+        duckdb_path=duckdb_path,
+        query_embedding=[1.0, 0.0],
+        limit=2,
+        include_spans=True,
+    )
+    default = drover_recall(
+        duckdb_path=duckdb_path, query_embedding=[1.0, 0.0], limit=2
+    )
 
     assert [r["source_type"] for r in out["results"]] == ["span", "session_summary"]
     assert out["results"][0]["span_id"] == "span-near"
     assert out["results"][0]["source_text"] == "prompt: vector search bug"
+    # Span hits are optional-integration data and stay out by default (#473).
+    assert [r["source_type"] for r in default["results"]] == ["session_summary"]
 
 
 def test_recall_filters_span_hits_by_persisted_span_repo(tmp_path: Path) -> None:
@@ -467,6 +575,7 @@ def test_recall_filters_span_hits_by_persisted_span_repo(tmp_path: Path) -> None
         repo_owner="arniesaha",
         repo_name="nexus",
         limit=5,
+        include_spans=True,
     )
 
     assert [r["span_id"] for r in out["results"]] == ["span-nexus"]

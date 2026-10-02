@@ -545,6 +545,7 @@ class HarnessRegistry:
         model: str | None = None,
         thinking_effort: str | None = None,
         client_session_id: str | None = None,
+        parent_session_id: str | None = None,
     ) -> HarnessSession:
         # Read before writing so the ordinary repeat is a cheap lookup, and
         # catch the constraint below so the concurrent one is still correct.
@@ -567,9 +568,9 @@ class HarnessRegistry:
                       command, status, started_at, updated_at, native_session_id,
                       native_resume_label, source_session_id, handoff_mode, mode,
                       permission_mode, model, thinking_effort,
-                      recap_reconcile_needed, client_session_id
+                      recap_reconcile_needed, client_session_id, parent_session_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         session_id,
@@ -593,6 +594,7 @@ class HarnessRegistry:
                         thinking_effort,
                         _supports_live_recaps(mode, harness),
                         client_session_id,
+                        parent_session_id,
                     ],
                 )
                 con.execute("COMMIT")
@@ -674,6 +676,79 @@ class HarnessRegistry:
                 [session_id],
             )
         return HarnessSession.from_row(rows[0]) if rows else None
+
+    def sessions_launched_from(
+        self, session_ids: list[str], *, limit: int
+    ) -> list[HarnessSession]:
+        """Sessions whose recorded launch names one of ``session_ids``.
+
+        Either an explicit delegation parent or a handoff source. Recorded
+        launch fields only -- nothing is inferred (#473).
+        """
+        if not session_ids:
+            return []
+        placeholders = ", ".join("?" for _ in session_ids)
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                f"""SELECT * FROM harness_sessions
+                     WHERE parent_session_id IN ({placeholders})
+                        OR source_session_id IN ({placeholders})
+                     ORDER BY started_at, session_id
+                     LIMIT ?""",
+                [*session_ids, *session_ids, max(1, int(limit))],
+            )
+        return [HarnessSession.from_row(row) for row in rows]
+
+    def session_token_totals(self, session_ids: list[str]) -> dict[str, int]:
+        """Total tokens per session from ``session_usage``, where reported.
+
+        Cache tokens count once: harnesses that already include them in input
+        are not double counted, matching the cockpit's token totals.
+        """
+        from drover.server.harness.usage import CACHE_INSIDE_INPUT_HARNESSES
+
+        session_ids = [session_id for session_id in session_ids if session_id]
+        if not session_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in session_ids)
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                f"""SELECT session_id, harness, input_tokens, output_tokens,
+                           cache_read_tokens, cache_write_tokens
+                      FROM session_usage
+                     WHERE session_id IN ({placeholders})""",
+                session_ids,
+            )
+        totals: dict[str, int] = {}
+        for row in rows:
+            if row.get("input_tokens") is None and row.get("output_tokens") is None:
+                continue
+            total = int(row.get("input_tokens") or 0) + int(
+                row.get("output_tokens") or 0
+            )
+            if row.get("harness") not in CACHE_INSIDE_INPUT_HARNESSES:
+                total += int(row.get("cache_read_tokens") or 0) + int(
+                    row.get("cache_write_tokens") or 0
+                )
+            totals[str(row["session_id"])] = total
+        return totals
+
+    def factory_run_sessions(self, run_id: str, *, limit: int) -> list[HarnessSession]:
+        """Every session the Factory observer launched for one run."""
+        prefix = f"factory/{run_id}@"
+        with self._connect() as con:
+            rows = _rows(
+                con,
+                """SELECT * FROM harness_sessions
+                    WHERE handoff_mode = 'factory_observer'
+                      AND substr(source_session_id, 1, ?) = ?
+                    ORDER BY started_at, session_id
+                    LIMIT ?""",
+                [len(prefix), prefix, max(1, int(limit))],
+            )
+        return [HarnessSession.from_row(row) for row in rows]
 
     def reconcile_orphan_completions(self, *, limit: int = 100) -> int:
         """Retry derived recap reconciliation left pending by session creation."""

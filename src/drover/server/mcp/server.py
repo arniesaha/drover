@@ -29,12 +29,16 @@ def build_mcp_server(
     summarize_job_stream: object | None = None,
     archive: SessionArchive | None = None,
     archive_config: ArchiveConfig | None = None,
+    spans_enabled: bool = False,
 ) -> FastMCP:
     """Construct a FastMCP server with all Drover tools registered.
 
     ``backend_config`` is optional — it's only needed by tools that call
     out to an LLM on demand (currently ``drover_active_handoff``). If
     unset, those tools will raise at call-time.
+
+    ``spans_enabled`` mirrors ``[telemetry] spans_enabled``: off, no tool
+    reads span Parquet or span embeddings (#473).
     """
     mcp = FastMCP(name, host=host, port=port)
     db = Path(duckdb_path)
@@ -267,6 +271,7 @@ def build_mcp_server(
             limit=limit,
             repo_owner=repo_owner,
             repo_name=repo_name,
+            include_spans=spans_enabled,
         )
 
     @mcp.tool()
@@ -279,15 +284,23 @@ def build_mcp_server(
     def drover_project_activity(
         project_key: Optional[str] = None,
         since: Optional[str] = None,
+        days: Optional[int] = None,
         limit: int = 20,
     ) -> dict:
-        """Span-level activity grouped by repo and agent. Shows which projects are
-        active, their cost, and which agents are working on them.
+        """What happened on a project recently and what is still open.
 
-        ``project_key`` filters to one repo (``owner/name``).
-        ``since`` is an ISO-8601 lower bound (default: last 7 days)."""
+        Per-project counts (sessions, active hours, tokens), a timeline of
+        sessions grouped by day (title, harness, host, state, duration,
+        branch), and open items (sessions waiting or failed, latest next steps
+        and open questions). ``project_key`` filters to one repo
+        (``owner/name``). ``since`` is an ISO-8601 lower bound, or ``days``
+        (default 7, max 30). ``limit`` caps timeline sessions (max 200)."""
         return t.drover_project_activity(
-            duckdb_path=db, project_key=project_key, since=since, limit=limit
+            duckdb_path=db,
+            project_key=project_key,
+            since=since,
+            days=days,
+            limit=limit,
         )
 
     @mcp.tool()
@@ -334,6 +347,7 @@ def build_mcp_server(
             incoming_dir=Path(incoming_dir) if incoming_dir else None,
             hours=hours,
             deep=deep,
+            spans_enabled=spans_enabled,
         )
 
     @mcp.tool()
@@ -352,6 +366,7 @@ def build_mcp_server(
             incoming_dir=Path(incoming_dir) if incoming_dir else None,
             max_artifacts=max_artifacts,
             max_projects=max_projects,
+            spans_enabled=spans_enabled,
         )
 
     return mcp

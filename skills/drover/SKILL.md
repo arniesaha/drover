@@ -36,10 +36,11 @@ access.
 ## Product boundary
 
 Drover owns session control, a durable local archive, replay/search, summaries,
-project briefs, and handoff bundles. AgentWeave may supply provenance; tools
-such as Langfuse may evaluate runs. Drover can retain their identifiers as
-evidence without becoming a tracing dashboard, eval platform, model router, or
-hosted memory service.
+project briefs, and handoff bundles, built on data Drover records itself.
+External tracing (an optional, off-by-default span integration) and tools such
+as Langfuse may add evidence; Drover can retain their identifiers without
+becoming a tracing dashboard, eval platform, model router, or hosted memory
+service.
 
 See `references/drover-agentweave-langfuse-positioning.md` when explaining this
 boundary publicly.

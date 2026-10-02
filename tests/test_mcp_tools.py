@@ -724,6 +724,7 @@ def test_data_quality_returns_structured_snapshot(
             "incoming_dir": incoming_dir,
             "hours": 12,
             "deep": False,
+            "spans_enabled": False,
         }
     ]
     assert out["status"] == "warn"

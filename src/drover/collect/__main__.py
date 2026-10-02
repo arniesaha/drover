@@ -283,7 +283,9 @@ def run(ctx: click.Context, source_filter: Optional[str], dry_run: bool) -> None
         sys.exit(2)
 
 
-@main.command("tempo-relay")
+@main.command(
+    "tempo-relay", short_help="(Optional, legacy) relay spans from Tempo to OTLP."
+)
 @click.option(
     "--backfill-from",
     "backfill_from",
@@ -310,7 +312,10 @@ def tempo_relay_cmd(
     backfill_to: Optional[str],
     chunk_minutes: int,
 ) -> None:
-    """Pull AgentWeave spans from Tempo and push to the lakehouse OTLP receiver.
+    """Pull spans from Tempo and push them to the hub's OTLP receiver.
+
+    Optional, legacy integration (#473): the hub only accepts these when
+    ``[telemetry] spans_enabled = true``, and no core feature needs them.
 
     Reads ``[tempo]`` from collect.toml. Default: walk one cursor-tracked
     window forward (the systemd timer's normal mode). With

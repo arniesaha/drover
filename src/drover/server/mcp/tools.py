@@ -18,8 +18,10 @@ import duckdb
 
 from drover.context_containers import normalize_context_type
 from drover.event_identity import canonical_agent_events_cte
-from drover.server.db import open_duckdb_connection
+from drover.server.db import attached_control_plane_snapshot, open_duckdb_connection
 from drover.server.observatory import pipeline_observatory_snapshot
+from drover.server.project_activity import MAX_DAYS as PROJECT_ACTIVITY_MAX_DAYS
+from drover.server.project_activity import project_activity
 from drover.server.quality import quality_snapshot
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
@@ -765,31 +767,17 @@ def drover_resume_context(
 # --- drover_project_activity --------------------------------------------------
 
 
-def _project_activity_span_dates(
-    con: duckdb.DuckDBPyConnection, *, since: Optional[str]
-) -> list[str]:
+def _activity_days(since: Optional[str], days: Optional[int], now: datetime) -> int:
+    """Window length in whole days; ``since`` wins, both are capped at 30."""
     if since:
-        rows = con.execute(
-            """
-            SELECT DISTINCT date
-            FROM spans
-            WHERE date <> '_seed'
-              AND date >= strftime(TRY_CAST(? AS TIMESTAMPTZ), '%Y-%m-%d')
-              AND start_time >= ?
-            ORDER BY date
-            """,
-            [since, since],
-        ).fetchall()
-    else:
-        rows = con.execute("""
-            SELECT DISTINCT date
-            FROM spans
-            WHERE date <> '_seed'
-              AND date >= strftime(current_date - INTERVAL 9 DAY, '%Y-%m-%d')
-              AND start_time >= now() - INTERVAL 7 DAY
-            ORDER BY date
-            """).fetchall()
-    return [str(row[0]) for row in rows if row and row[0]]
+        lower = _parse_datetime(since)
+        if lower is None:
+            raise ValueError("project_activity: since must be an ISO-8601 timestamp")
+        if lower.tzinfo is None:
+            lower = lower.replace(tzinfo=timezone.utc)
+        elapsed = (now - lower).total_seconds() / 86400.0
+        return max(1, min(PROJECT_ACTIVITY_MAX_DAYS, int(elapsed) + 1))
+    return max(1, min(PROJECT_ACTIVITY_MAX_DAYS, int(days or 7)))
 
 
 def drover_project_activity(
@@ -797,62 +785,32 @@ def drover_project_activity(
     duckdb_path: Path,
     project_key: Optional[str] = None,
     since: Optional[str] = None,
+    days: Optional[int] = None,
     limit: int = 20,
 ) -> dict:
-    """Return span-level activity grouped by repo/project for the given window.
+    """Return what happened on a project recently and what is still open.
 
-    ``project_key`` filters to ``<owner>/<name>`` (e.g. ``arniesaha/drover``).
-    ``since`` is an ISO-8601 lower bound (default: last 7 days).
-    Results are sorted by cost descending so the most expensive repos appear first.
+    Built from Drover's own records -- harness launches and state, agent-event
+    day summaries, session summaries and ``session_usage`` -- never spans
+    (#473). ``project_key`` filters to ``<owner>/<name>``; without it every
+    project in the window is listed. ``since`` (ISO-8601) or ``days`` sets the
+    window, default 7 days, capped at 30. ``limit`` caps the sessions in the
+    timeline (max 200); projects and open items have their own hard caps.
     """
+    now = datetime.now(timezone.utc)
+    window_days = _activity_days(since, days, now)
     con = _connect(duckdb_path)
     try:
-        span_dates = _project_activity_span_dates(con, since=since)
-        if not span_dates:
-            return {"window_since": since or "last 7 days", "rows": []}
-
-        bounded_spans = "\nUNION ALL\n".join(
-            "SELECT * FROM spans_enriched_for_date(?)" for _ in span_dates
-        )
-        where_parts = []
-        params: list = list(span_dates)
-        if since:
-            where_parts.append("start_time >= ?")
-            params.append(since)
-        else:
-            where_parts.append("start_time >= now() - INTERVAL 7 DAY")
-        if project_key:
-            owner, _, name = project_key.partition("/")
-            where_parts.append("repo_owner = ? AND repo_name = ?")
-            params.extend([owner, name])
-
-        where = " AND ".join(where_parts)
-        rows = _row_to_dict(
-            con.execute(
-                f"""WITH bounded_spans AS (
-                  {bounded_spans}
-                )
-                SELECT
-                  COALESCE(repo_owner || '/' || repo_name, project, 'unknown') AS project_key,
-                  repo_owner,
-                  repo_name,
-                  project          AS agentweave_project,
-                  agent_id,
-                  COUNT(*)         AS span_count,
-                  SUM(cost_usd)    AS cost_usd,
-                  MIN(start_time)  AS first_span,
-                  MAX(start_time)  AS last_span
-                FROM bounded_spans
-               WHERE {where}
-               GROUP BY 1, 2, 3, 4, 5
-               ORDER BY cost_usd DESC NULLS LAST
-               LIMIT ?""",
-                params + [int(limit)],
+        with attached_control_plane_snapshot(con, duckdb_path):
+            return project_activity(
+                con,
+                project_key=project_key,
+                days=window_days,
+                now=now,
+                max_sessions=int(limit),
             )
-        )
     finally:
         con.close()
-    return {"window_since": since or "last 7 days", "rows": rows}
 
 
 # --- drover_fleet_status ------------------------------------------------------
@@ -930,6 +888,7 @@ def drover_data_quality(
     incoming_dir: Optional[Path] = None,
     hours: int = 24,
     deep: bool = False,
+    spans_enabled: bool = False,
 ) -> dict:
     """Return the structured read-only Drover lakehouse quality snapshot.
 
@@ -941,6 +900,7 @@ def drover_data_quality(
         incoming_dir=incoming_dir,
         hours=int(hours),
         deep=deep,
+        spans_enabled=spans_enabled,
     )
 
 
@@ -950,12 +910,14 @@ def drover_pipeline_observatory(
     incoming_dir: Optional[Path] = None,
     max_artifacts: int = 10,
     max_projects: int = 10,
+    spans_enabled: bool = False,
 ) -> dict:
     """Return saved artifact and project-readiness drilldown for Drover."""
     quality = quality_snapshot(
         duckdb_path=duckdb_path,
         incoming_dir=incoming_dir,
         deep=False,
+        spans_enabled=spans_enabled,
     )
     return pipeline_observatory_snapshot(
         duckdb_path=duckdb_path,
@@ -975,6 +937,7 @@ def drover_recall(
     limit: int = 5,
     repo_owner: Optional[str] = None,
     repo_name: Optional[str] = None,
+    include_spans: bool = False,
 ) -> dict:
     """Return session summaries ranked by cosine similarity to ``query_embedding``.
 
@@ -984,7 +947,8 @@ def drover_recall(
     Until then, the typical caller is the brief worker or a CLI script
     that owns the embedder.
 
-    Filters by ``(repo_owner, repo_name)`` if both are provided.
+    Filters by ``(repo_owner, repo_name)`` if both are provided. Raw-span hits
+    are only unioned in when the optional span integration is on (#473).
     """
     if not query_embedding:
         raise ValueError("recall: query_embedding is required (list[float])")
@@ -1005,6 +969,20 @@ def drover_recall(
     if repo_owner and repo_name:
         span_where.append("spe.repo_owner = ? AND spe.repo_name = ?")
         span_params.extend([repo_owner, repo_name])
+    span_hits = f"""
+            UNION ALL
+            SELECT 'span' AS source_type,
+                   spe.session_id AS session_id,
+                   spe.span_id AS span_id,
+                   spe.agent_id AS agent_id,
+                   NULL::TIMESTAMP AS ended_at,
+                   NULL::VARCHAR AS summary_md,
+                   NULL::VARCHAR AS next_steps_md,
+                   []::VARCHAR[] AS open_questions,
+                   spe.source_text AS source_text,
+                   list_cosine_similarity(spe.embedding::DOUBLE[], ?::DOUBLE[]) AS score
+            FROM span_embeddings spe
+            WHERE {' AND '.join(span_where)}"""
     sql = f"""
         WITH {canonical_agent_events_cte()}, hits AS (
             SELECT 'session_summary' AS source_type,
@@ -1019,20 +997,7 @@ def drover_recall(
                    list_cosine_similarity(se.embedding::DOUBLE[], ?::DOUBLE[]) AS score
             FROM session_embeddings se
             JOIN session_summaries ss USING (session_id)
-            WHERE {' AND '.join(where)}
-            UNION ALL
-            SELECT 'span' AS source_type,
-                   spe.session_id AS session_id,
-                   spe.span_id AS span_id,
-                   spe.agent_id AS agent_id,
-                   NULL::TIMESTAMP AS ended_at,
-                   NULL::VARCHAR AS summary_md,
-                   NULL::VARCHAR AS next_steps_md,
-                   []::VARCHAR[] AS open_questions,
-                   spe.source_text AS source_text,
-                   list_cosine_similarity(spe.embedding::DOUBLE[], ?::DOUBLE[]) AS score
-            FROM span_embeddings spe
-            WHERE {' AND '.join(span_where)}
+            WHERE {' AND '.join(where)}{span_hits if include_spans else ""}
         )
         SELECT source_type, session_id, span_id, agent_id, ended_at, summary_md,
                next_steps_md, open_questions, source_text, score
@@ -1042,9 +1007,10 @@ def drover_recall(
     """
     con = _connect(duckdb_path)
     try:
-        results = _row_to_dict(
-            con.execute(sql, [query_embedding, *params, query_embedding, *span_params])
-        )
+        bound = [query_embedding, *params]
+        if include_spans:
+            bound.extend([query_embedding, *span_params])
+        results = _row_to_dict(con.execute(sql, bound))
     finally:
         con.close()
     return {"results": results, "limit": int(limit)}

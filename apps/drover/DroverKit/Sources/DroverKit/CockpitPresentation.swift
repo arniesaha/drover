@@ -91,10 +91,13 @@ public struct CoverageSourcesPresentation: Sendable, Equatable {
         } else {
             usage = "usage unavailable"
         }
-        let spans = sources.spansPercent.map {
-            "spans \(CoveragePercent.text($0))%"
-        } ?? "spans unavailable"
-        return "\(label) sources: \(usage); \(spans)"
+        // Spans are an optional integration, off by default (drover#473). They
+        // are named only when they actually contributed; otherwise mentioning
+        // them reads as a missing source rather than one that is not in use.
+        guard let spans = sources.spansPercent, spans > 0 else {
+            return "\(label) sources: \(usage)"
+        }
+        return "\(label) sources: \(usage); spans \(CoveragePercent.text(spans))%"
     }
 }
 
@@ -120,6 +123,11 @@ public struct ActivityTotalsPresentation: Sendable, Equatable {
     /// unreported case as "zero dollars, API-billed".
     public let costAccessibilityText: String
     public let costIsUnreported: Bool
+    /// Whether the cost metric belongs on screen at all. Cost arrives only
+    /// through the optional span integration, which is off by default
+    /// (drover#473); with no session reporting one, the metric is hidden
+    /// rather than shown as a permanent "Not reported".
+    public var showsCost: Bool { !costIsUnreported }
     /// Coverage for tokens *and* cost, because they are routinely different —
     /// 5.8% against 5% in the case that prompted #150 — and printing only the
     /// token figure left the less-covered number looking like a total. Says it
@@ -167,7 +175,9 @@ public struct ActivityTotalsPresentation: Sendable, Equatable {
     static func coverageText(_ coverage: Coverage) -> String {
         guard let tokens = coverage.tokenPercent else { return "Token coverage unavailable" }
         let tokenText = "\(CoveragePercent.text(tokens))% token coverage"
-        guard let cost = coverage.costPercent,
+        // No session reporting a cost means the cost metric is hidden, so a
+        // "0% cost coverage" clause would qualify a number nobody can see.
+        guard let cost = coverage.costPercent, cost > 0,
               CoveragePercent.text(cost) != CoveragePercent.text(tokens)
         else { return tokenText }
         return "\(tokenText) · \(CoveragePercent.text(cost))% cost coverage"

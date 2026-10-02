@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 import duckdb
 
 from drover.config import AdvisoryContentConfig
+from drover.server.advisory import span_facts
 from drover.server.advisory.analyzers import (
     MAX_SNAPSHOT_RECORDS,
     AnalysisSnapshot,
@@ -1280,7 +1281,7 @@ def operational_analyzers() -> tuple[Analyzer, ...]:
     return (
         ConnectorFreshnessAnalyzer(),
         ProviderResetWindowAnalyzer(),
-        TelemetryCoverageAnalyzer(),
+        TelemetryCoverageAnalyzer(spans_enabled=span_facts.enabled()),
         RoutingMismatchAnalyzer(),
         CacheReadEfficiencyAnalyzer(),
         HookValidityAnalyzer(),
@@ -1422,8 +1423,21 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
     )
 
 
+#: Stands in for ``spans`` when the span integration is off, so the telemetry
+#: facts keep their exact shape -- session_usage still supplies tokens and
+#: cache pairs -- without a single span Parquet read.
+_NO_SPANS_RELATION = """(
+  SELECT NULL::VARCHAR AS span_id, NULL::VARCHAR AS session_id,
+         NULL::TIMESTAMPTZ AS start_time, NULL::BIGINT AS total_tokens,
+         NULL::BIGINT AS prompt_tokens, NULL::DOUBLE AS cost_usd,
+         NULL::BIGINT AS cache_read_tokens
+  WHERE FALSE
+)"""
+
+
 def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
     where, params = _runtime_session_filter(target_id, analyzed_at)
+    span_relation = "spans" if span_facts.enabled() else _NO_SPANS_RELATION
     rows = con.execute(
         f"""
         WITH ranked_sessions AS (
@@ -1443,7 +1457,8 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
         raw_span_candidates AS (
           SELECT s.span_id, s.session_id, s.start_time, s.total_tokens,
                  s.prompt_tokens, s.cost_usd, s.cache_read_tokens
-          -- `spans`, not `spans_enriched`: this reads only span-native
+          -- `spans` (or the empty stand-in when the span integration is off),
+          -- not `spans_enriched`: this reads only span-native
           -- columns, and the enrichment exists solely to coalesce
           -- repo_owner/repo_name/branch. Producing those costs two DISTINCT
           -- scans of every span plus two joins over every agent_event, and
@@ -1453,7 +1468,7 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
           -- failures were inside these two loaders (#246). `spans` is the
           -- relation documented for exactly this: broad analytics that must
           -- not join agent_events implicitly.
-          FROM spans s
+          FROM {span_relation} s
           JOIN bounded_sessions h USING (session_id)
           WHERE s.start_time >= ? AND s.start_time <= ?
           ORDER BY s.start_time DESC NULLS LAST, s.span_id
@@ -1664,6 +1679,10 @@ def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
 
 
 def _load_routing_facts(con, target_id: str, analyzed_at: datetime):
+    if not span_facts.enabled():
+        # Routing provenance exists only on spans. No facts means no findings,
+        # so findings raised while the integration was on resolve (#473).
+        return ()
     where, params = _runtime_session_filter(target_id, analyzed_at)
     target_parts = target_id.split("/")
     provider = (

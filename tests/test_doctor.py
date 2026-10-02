@@ -57,8 +57,16 @@ def test_doctor_reports_zero_on_fresh_lakehouse(tmp_path: Path) -> None:
     report = audit_lakehouse(
         parquet_dir=parquet_dir, duckdb_path=duckdb_path, incoming_dir=incoming
     )
+    with_spans = audit_lakehouse(
+        parquet_dir=parquet_dir,
+        duckdb_path=duckdb_path,
+        incoming_dir=incoming,
+        spans_enabled=True,
+    )
     assert report["agent_events_total"] == 0
-    assert report["spans_total"] == 0
+    # Spans are an optional integration (#473): not counted unless enabled.
+    assert report["spans_total"] is None
+    assert with_spans["spans_total"] == 0
     assert report["warnings"] == []
 
 

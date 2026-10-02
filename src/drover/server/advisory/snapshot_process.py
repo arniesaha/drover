@@ -11,6 +11,7 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+from drover.server.advisory import span_facts
 from drover.server.advisory.analyzers import AnalysisSnapshot
 from drover.server.advisory.snapshot_codec import decode_snapshot
 from drover.server.control_store import control_store_config, is_postgres_control_store
@@ -56,6 +57,8 @@ def read_operational_snapshot_in_child(
         "source_version": source_version,
         "analyzed_at": analyzed_at.isoformat() if analyzed_at is not None else None,
         "control_store": asdict(config) if config is not None else None,
+        # A fresh interpreter does not inherit the parent's setting (#473).
+        "spans_enabled": span_facts.enabled(),
     }
     with tempfile.TemporaryDirectory(
         prefix="drover-advisory-", dir=snapshot_scratch_root(source)

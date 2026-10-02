@@ -126,6 +126,7 @@ def test_runtime_mcp_factory_injects_the_exact_enabled_archive_client(
         "summarize_job_stream": summarize_job_stream,
         "archive_config": cfg.archive,
         "archive": archive,
+        "spans_enabled": False,
     }
 
 
@@ -159,4 +160,5 @@ def test_runtime_mcp_factory_injects_disabled_config_without_a_client(
         "summarize_job_stream": None,
         "archive_config": cfg.archive,
         "archive": None,
+        "spans_enabled": False,
     }
