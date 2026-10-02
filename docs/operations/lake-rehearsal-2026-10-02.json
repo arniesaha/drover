@@ -1,0 +1,80 @@
+{
+  "source_backup": "pre-ducklake-20261001/lake-and-catalogs.tar",
+  "environment": "macOS arm64, Python 3.14, DuckDB 1.5.5; initdb-created private Postgres catalog; new /tmp data root",
+  "rebuild_seconds": 890.0520675000153,
+  "sampled_peak_rss_bytes": 2535391232,
+  "rss_measurement": "20ms samples: coordinator plus active disposable worker",
+  "engine_memory_limit": "1GB",
+  "threads": 1,
+  "input_batch_rows": 128,
+  "other_batch_files": 32,
+  "raw": {
+    "agent_events": {
+      "rows": 5288617,
+      "normalized_multiset_sha256": "69ab500054948ac56361b2e14931d95e3fcea9492916975da3ff28dd36b326e5"
+    },
+    "provider_usage_snapshots": {
+      "rows": 147362,
+      "normalized_multiset_sha256": "f7866d6ea00a14d14e95f415c18d9e9b2b8fc3cc35ce4e678434e717a86938ff"
+    },
+    "control_outbox_batches": {
+      "rows": 100089,
+      "normalized_multiset_sha256": "75c20d41144afc238b4ea488b566b59260739976d0b3ef2dc809ea57e65c5139"
+    }
+  },
+  "original_key_baseline": {
+    "rows": 5211239,
+    "normalized_multiset_sha256": "69bd71edd43910c8f0902e175e641c9cdb5102d3802fa557ecd58c9a4925a0eb"
+  },
+  "serving": {
+    "rows": 4937355,
+    "normalized_multiset_sha256": "fa07eda82030d0c6ec956b20187b093e58a9edf444a03b7964b5e630a337e9cc"
+  },
+  "legacy_metadata": {
+    "rows": 273035,
+    "normalized_multiset_sha256": "f24ba21665561f15107656510d2b6d576be4d162ef727b7498cde963ddd9c434"
+  },
+  "input_buckets": {
+    "original": 4931381,
+    "rebuild_backfill": 81691,
+    "legacy_metadata": 273035,
+    "legacy_null": 2510
+  },
+  "dedupe_losers": 78227,
+  "original_key_losers": 77378,
+  "backfill_additional_losers": 849,
+  "cross_partition_check": "passed",
+  "utc_partitions": 238,
+  "verification_report_sha256": "f8c65ded25e91875c913431693fe35de9ba06d01c5d2e228bec274b0c787a568",
+  "release_status": "Passing rebuild/accounting proof; serving cutover and backup/restore remain blocked.",
+  "independent_verify": {
+    "elapsed_seconds": 263.5230947919772,
+    "peak_rss_bytes": 857669632,
+    "tables": {
+      "agent_events": {
+        "rows": 4937355,
+        "normalized_multiset_sha256": "fa07eda82030d0c6ec956b20187b093e58a9edf444a03b7964b5e630a337e9cc"
+      },
+      "provider_usage_snapshots": {
+        "rows": 147362,
+        "normalized_multiset_sha256": "f7866d6ea00a14d14e95f415c18d9e9b2b8fc3cc35ce4e678434e717a86938ff"
+      },
+      "control_outbox_batches": {
+        "rows": 100089,
+        "normalized_multiset_sha256": "75c20d41144afc238b4ea488b566b59260739976d0b3ef2dc809ea57e65c5139"
+      },
+      "agent_events_legacy_metadata": {
+        "rows": 273035,
+        "normalized_multiset_sha256": "f24ba21665561f15107656510d2b6d576be4d162ef727b7498cde963ddd9c434"
+      }
+    }
+  },
+  "independent_verify_receipt_sha256": "1fc6dbad195b3882ac4a48637fea3a7041c55a908e6ba7cd97d8a9aa2b2fcd57",
+  "foreground_rehearsal_wall_seconds": 1154.93,
+  "single_process_high_water_rss_bytes": 2414182400,
+  "tests": {
+    "focused_passed": 136,
+    "focused_skipped": 4,
+    "full_backup_rebuild_and_independent_verify_passed": 1
+  }
+}

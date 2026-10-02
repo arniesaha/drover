@@ -95,8 +95,33 @@ winner/loser file/row/hash mappings are hashed evidence. The original 5,211,239
 canonical baseline includes null keys before this policy and is reported
 separately from the new serving count.
 
-Bounded publication rehearsal results will be recorded below once verification
-completes. An intermediate attempt published all partitions but stopped when a
+The full October 1 backup was rebuilt into a new scratch catalog/data root in
+890.05 seconds, including content verification and evidence hashing. Peak
+sampled coordinator-plus-worker RSS was 2,535,391,232 bytes (2.361 GiB), below
+the 2.5 GiB gate. All 238 partitions passed the keys-only cross-partition check.
+Independent `lake verify` then passed in 263.52 seconds with 857,669,632 bytes
+sampled peak RSS (0.799 GiB). The complete foreground rehearsal/test took
+1,154.93 seconds (19m 14.93s); all four relations matched their saved hashes.
+Raw and original-key canonical counts **and their hashes** match the initial
+rehearsal exactly. Provider/outbox counts and hashes also match.
+
+| Input bucket | Rows |
+| --- | ---: |
+| Original key | 4,931,381 |
+| Null key with content, backfilled | 81,691 |
+| Null key, empty content, null role, archived | 273,035 |
+| Remaining empty-content null key, retained | 2,510 |
+| Total raw | 5,288,617 |
+
+Policy output: 4,937,355 serving + 273,035 archive + 78,227 losers =
+5,288,617 raw. The original 77,378 losers are unchanged; backfill adds 849.
+The [aggregate rehearsal evidence](lake-rehearsal-2026-10-02.json) records the
+serving/archive digests, limits, measurements and the private verification
+report digest. Source payloads, row mappings and the private spike report are
+not copied into the repository. This is rebuild proof, not backup/restore or
+rollback proof.
+
+An intermediate attempt published all partitions but stopped when a
 macOS subprocess RSS probe timed out. Native process sampling replaces that probe
 and handles the kernel's child-exit transition without tolerating an unmeasurable
 live process.
@@ -110,3 +135,9 @@ The hub [RSS guard](hub-memory-budget.md) defaults to 4 GiB for its own process,
 with readiness/data-quality state and disposable child telemetry. Separate
 [reader/exporter/admin catalog groups](lake-catalog-roles.md) are provisioned and
 tested on scratch Postgres; installer login wiring remains outstanding.
+
+Final focused validation: **136 passed, 4 skipped** (conditional PG-vector cases
+and the separately run opt-in full-backup case). The explicit full-backup
+rebuild plus independent verification test passed against a private test cluster.
+No backup generation, restore round trip, or config-epoch rollback rehearsal
+has been claimed; these require the remaining exporter/backend/lifecycle work.
