@@ -22,8 +22,11 @@ but the integration contract is spread across several places:
 Those tables describe related properties without one source of truth. Adding a
 harness therefore requires coordinated special cases, and clients can offer a
 control that a selected harness cannot execute. OpenClaw previously appeared as
-a launch target without a drive implementation; it is now correctly
-observe-only, with a regression test preventing that specific failure.
+a launch target without a drive implementation. It is now observe-only end to
+end (#421): no preset, adapter, envelope row, launch path or native-resume
+argument exists for it or for Hermes, and
+`test_observe_only_sources_are_never_drive_targets` keeps it that way while
+their collection, parsing, attribution, metrics and recall stay unchanged.
 
 ## Goals
 
@@ -394,7 +397,7 @@ terminal input remains the bounded legacy path.
    and new servers.
 6. Remove the legacy client fallback only after the supported upgrade window.
 7. Remove remaining dead OpenClaw drive/resume glue while preserving collection,
-   parsing, metrics, and historical compatibility.
+   parsing, metrics, and historical compatibility. Done in #421.
 
 Each migration step must be independently releasable. A mixed-version fleet
 must continue to list and launch the capabilities an older host can prove.

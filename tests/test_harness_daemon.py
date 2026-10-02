@@ -4604,6 +4604,53 @@ def test_every_offered_preset_can_actually_be_driven():
     ), f"presets with no structured driver: {sorted(offered - drivable)}"
 
 
+def test_observe_only_sources_are_never_drive_targets(tmp_path):
+    """OpenClaw and Hermes are collected, never driven (drover#421).
+
+    Their collect Sources and parsers keep ingesting fixtures, while the
+    drive side has no adapter, preset, advertised row, launch path in either
+    mode, or native-resume argument for them.
+    """
+    from pathlib import Path
+
+    from drover.collect.sources import HermesSource, OpenClawSource
+    from drover.parsers import parse_openclaw_sessions
+
+    fixtures = Path(__file__).parent / "fixtures"
+    events = parse_openclaw_sessions(str(fixtures / "openclaw_session_contract.jsonl"))
+    assert {event.raw_data["harness"] for event in events} == {"openclaw"}
+    assert OpenClawSource(root=tmp_path).id == "openclaw"
+    assert HermesSource(tmp_path).id == "hermes"
+
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        for observed in ("openclaw", "hermes"):
+            assert observed not in DEFAULT_PRESETS
+            assert observed not in state.adapters.ids()
+            assert observed not in {
+                row["name"] for row in state.capabilities()["harnesses"]
+            }
+            for mode in ("structured", "pty"):
+                with pytest.raises(urllib.error.HTTPError) as refused:
+                    _json_request(
+                        f"{base_url}/sessions",
+                        payload={
+                            "harness": observed,
+                            "mode": mode,
+                            "cwd": str(tmp_path),
+                            "native_resume": {"session_id": "native-1"},
+                        },
+                    )
+                assert refused.value.code == 400
+        assert state.registry.list_sessions() == []
+        assert state.pty.list_sessions() == []
+        assert state.structured.session_ids() == []
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_a_repeated_handoff_create_returns_the_session_it_already_made(tmp_path):
     """A retry after a timeout must not leave two sessions.
 

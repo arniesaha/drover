@@ -294,12 +294,11 @@ DEFAULT_PRESETS = {
         enabled=False,
         description="Antigravity CLI (agy)",
     ),
-    # Retired as a session target: openclaw never had a structured driver, so
-    # offering it here only produced "harness has no structured driver:
-    # openclaw" at launch. It is still an *observed* agent -- the collect
-    # source, parser and metrics stay -- it is simply not driven from Drover.
-    # `test_every_offered_preset_can_actually_be_driven` keeps a driverless
-    # preset from being added back.
+    # OpenClaw and Hermes are observe-only: collect Sources, parsers,
+    # attribution, metrics and recall ingest their history, but neither has a
+    # drive adapter, so neither is a preset, a launch target or a resume
+    # target. `test_every_offered_preset_can_actually_be_driven` and
+    # `test_observe_only_sources_are_never_drive_targets` keep it that way.
     "deepseek-harness": HarnessPreset(
         name="deepseek-harness",
         command=("dsh",),
@@ -403,9 +402,6 @@ def _native_resume_args(harness: str, native_resume: Any) -> list[str]:
         # harnesses make here.
         if session_id:
             return ["--conversation", session_id]
-    if harness == "openclaw":
-        if session_id:
-            return ["resume", session_id]
     return []
 
 
@@ -4386,8 +4382,6 @@ def _harness_name_for_command(command: tuple[str, ...]) -> str:
         return "codex"
     if "agy" in command_text or "antigravity" in command_text:
         return "agy"
-    if "openclaw" in command_text:
-        return "openclaw"
     return "shell"
 
 

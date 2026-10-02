@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go dark now read stale, then offline, instead of staying online. Thresholds
   are `DROVER_HOST_STALE_AFTER_SECONDS` (45) and
   `DROVER_HOST_OFFLINE_AFTER_SECONDS` (600); see `docs/multi-host.md` (#474).
+
+- OpenClaw is observe-only end to end (#421). harnessd no longer carries an
+  OpenClaw native-resume argument or maps a terminal command to `openclaw`;
+  neither path was reachable without a preset. Collection, parsing,
+  attribution, metrics, recall and historical rows are unchanged, and a
+  regression test keeps OpenClaw and Hermes out of presets, the adapter
+  registry, the capability envelope and both launch modes.
 - Span ingestion is an optional integration, off by default (#473). The OTLP
   receiver only starts with `[telemetry] spans_enabled = true`; with it off no
   span Parquet is read, no span embedding jobs are enqueued or claimed,
