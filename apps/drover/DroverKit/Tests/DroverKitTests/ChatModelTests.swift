@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import Testing
 @testable import DroverKit
 
@@ -140,6 +141,30 @@ private func waitUntil(
     while !condition() {
         guard ContinuousClock.now < deadline else { throw TimeoutError() }
         try await Task.sleep(for: .milliseconds(10))
+    }
+}
+
+@MainActor
+private func waitForModelState(_ condition: () -> Bool) async throws {
+    // Observation fires before mutation. The main-actor waiter resumes after
+    // mutation and registers again if the transition is still incomplete.
+    // The timeout only bounds failures; it never drives the successful path.
+    let (changes, continuation) = AsyncStream<Void>.makeStream()
+    let timeout = DispatchWorkItem { continuation.finish() }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: timeout)
+    defer {
+        timeout.cancel()
+        continuation.finish()
+    }
+    var iterator = changes.makeAsyncIterator()
+    while true {
+        let satisfied = withObservationTracking {
+            condition()
+        } onChange: {
+            continuation.yield(())
+        }
+        if satisfied { return }
+        guard await iterator.next() != nil else { throw TimeoutError() }
     }
 }
 
@@ -751,9 +776,13 @@ struct ChatModelTests {
     model.ingest(.message(.fixture(seq: 9, type: .status,
                                    payload: ["turn_complete": .bool(true),
                                              "awaiting": .string("input")])))
-    try await waitUntil { turnPosts.count == 2 }
-    #expect(turnPosts[1] == "follow-up question")
-    try await waitUntil { model.queuedTurn == nil }
+    // Queue removal and request arrival both precede the response. Wait for
+    // the successful auto-send to clear the hint and finish submitting.
+    try await waitForModelState {
+        model.pendingTurn != nil && !model.isSending && model.hint == nil
+    }
+    #expect(turnPosts == ["follow-up question", "follow-up question"])
+    #expect(model.queuedTurn == nil)
     #expect(model.hint == nil)
 }
 
@@ -957,9 +986,13 @@ struct ChatModelTests {
         type: .status,
         payload: ["turn_complete": .bool(true), "awaiting": .string("input")]
     )))
-    try await waitUntil { preferenceKeys.count == 2 }
+    try await waitForModelState {
+        model.pendingTurn != nil && !model.isSending && model.hint == nil
+    }
 
     #expect(preferenceKeys == [[], []])
+    #expect(model.queuedTurn == nil)
+    #expect(model.hint == nil)
 }
 
 @Test @MainActor func imageOnlyTurnSends() async throws {
@@ -999,7 +1032,12 @@ struct ChatModelTests {
     model.ingest(.message(.fixture(seq: 9, type: .status,
                                    payload: ["turn_complete": .bool(true),
                                              "awaiting": .string("input")])))
-    try await waitUntil { turnPosts.count == 2 }
+    try await waitForModelState {
+        model.pendingTurn != nil && !model.isSending && model.hint == nil
+    }
+    try #require(turnPosts.count == 2)
+    #expect(model.queuedTurn == nil)
+    #expect(model.hint == nil)
     let retriedImages = turnPosts[1]["images"] as? [[String: Any]] ?? []
     #expect(retriedImages.count == 1)
     #expect(retriedImages[0]["data_base64"] as? String == attachment.data.base64EncodedString())
@@ -1641,7 +1679,7 @@ struct ChatModelTests {
     model.ingest(.message(.fixture(seq: 9, type: .status,
                                    payload: ["turn_complete": .bool(true),
                                              "awaiting": .string("input")])))
-    try await waitUntil { model.pendingTurn?.canRetry == true }
+    try await waitForModelState { model.pendingTurn?.canRetry == true && !model.isSending }
     let confirmedTurnID = try #require(turnID)
 
     // That dispatch had in fact landed. Same trap, same rule.
