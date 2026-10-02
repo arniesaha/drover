@@ -366,6 +366,8 @@ extension HostSummary {
 public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
     public var id: String        // session_id
     public var hostID: String
+    public var hostDisplayName: String? = nil
+    public var hostRetiredAt: Date? = nil
     public var harness: String
     /// "pty" | "structured" | nil. `nil` means the wire omitted the key or
     /// sent JSON null — legacy sessions predating the field. Do NOT collapse
@@ -427,6 +429,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case id = "session_id"
         case hostID = "host_id"
+        case hostDisplayName = "host_display_name"
+        case hostRetiredAt = "host_retired_at"
         case harness
         case mode
         case status
@@ -448,6 +452,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         hostID = (try? container.decode(String.self, forKey: .hostID)) ?? ""
+        hostDisplayName = try? container.decode(String.self, forKey: .hostDisplayName)
+        hostRetiredAt = WireDate.parse(try? container.decode(String.self, forKey: .hostRetiredAt))
         harness = (try? container.decode(String.self, forKey: .harness)) ?? ""
         mode = try? container.decode(String.self, forKey: .mode)
         status = (try? container.decode(String.self, forKey: .status)) ?? ""

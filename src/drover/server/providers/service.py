@@ -251,6 +251,22 @@ class ProviderUsageService:
         finally:
             con.close()
 
+        from drover.server.harness.registry import HarnessRegistry
+
+        retired_ids = {
+            host.host_id
+            for host in HarnessRegistry(self.duckdb_path).list_hosts(
+                include_retired=True
+            )
+            if host.retired_at is not None
+        }
+        rows = [row for row in rows if row["host_id"] not in retired_ids]
+        connections = {
+            key: value
+            for key, value in connections.items()
+            if key[2] not in retired_ids
+        }
+
         snapshots = _snapshots_from_rows(rows)
         by_account: dict[tuple[str, str, str], list[ProviderAccountSnapshot]] = {}
         for snapshot in snapshots:

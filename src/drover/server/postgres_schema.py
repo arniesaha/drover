@@ -247,6 +247,14 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS harness_sessions_parent ON harness_sessions (parent_session_id) WHERE parent_session_id IS NOT NULL",
         ),
     ),
+    (
+        6,
+        (
+            # Self-contained host lifecycle migration; safe to renumber.
+            "ALTER TABLE harness_hosts ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ",
+            "ALTER TABLE harness_hosts ADD COLUMN IF NOT EXISTS retired_reason TEXT",
+        ),
+    ),
 )
 
 

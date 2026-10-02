@@ -946,3 +946,59 @@ def test_postgres_advisory_occurrence_sweep_counts_empty_and_keeps_newest_failin
         assert con.execute(
             "SELECT occurrence_id FROM advisory_occurrences ORDER BY occurrence_id"
         ).fetchall() == [("pg-newest-failing",)]
+
+
+def test_postgres_retirement_migration_and_credentials(postgres_control_store):
+    from drover.server.control_store import postgres_control_store as pg_store
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry, HostRetiredError
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    path, _ = postgres_control_store
+    registry = HarnessRegistry(path)
+    registry.register_host(host_id="retire-me", display_name="Original", kind="mac")
+    store = PostgresCredentialStore(path)
+    _, token = store.issue(scope="host", label="Mac", host_id="retire-me")
+    registry.retire_host("retire-me", reason="uninstalled")
+    assert registry.list_hosts() == []
+    assert store.find_active(token) is None
+    with pytest.raises(HostRetiredError):
+        registry.register_host(host_id="retire-me", display_name="Changed", kind="mac")
+    pg_store(path).bootstrap()  # versioned migration is repeatable
+    with control_plane_connection(path) as con:
+        assert (
+            con.execute(
+                "SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'harness_hosts' AND column_name = 'retired_at'"
+            ).fetchone()[0]
+            == "timestamp with time zone"
+        )
+    registry.unretire_host("retire-me")
+    assert store.find_active(token) is None
+    assert registry.get_host("retire-me").display_name == "Original"
+
+
+def test_host_retirement_migration_upgrades_existing_host(postgres_control_store):
+    from drover.server.control_store import postgres_control_store as pg_store
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.postgres_schema import _MIGRATIONS
+
+    retirement_version = next(
+        version
+        for version, statements in _MIGRATIONS
+        if any("retired_at" in statement for statement in statements)
+    )
+    path, _ = postgres_control_store
+    registry = HarnessRegistry(path)
+    registry.register_host(host_id="old-host", display_name="Existing Mac", kind="mac")
+    with control_plane_connection(path) as con:
+        con.execute("ALTER TABLE harness_hosts DROP COLUMN retired_at")
+        con.execute("ALTER TABLE harness_hosts DROP COLUMN retired_reason")
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [retirement_version],
+        )
+    pg_store(path).bootstrap()
+    host = registry.list_hosts()[0]
+    assert host.display_name == "Existing Mac"
+    assert host.retired_at is None and host.retired_reason is None

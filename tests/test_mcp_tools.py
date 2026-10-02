@@ -1051,3 +1051,25 @@ def test_search_since_is_an_instant_not_a_string(tmp_path: Path, since: str) -> 
         "needle 3",
         "needle legacy",
     ]
+
+
+def test_fleet_status_excludes_retired_host_sessions(tmp_path):
+    from drover.server.harness.registry import HarnessRegistry
+
+    path = _seed_active_fleet(tmp_path, sessions=3)
+    registry = HarnessRegistry(path)
+    registry.register_host(host_id="gone", display_name="Gone", kind="mac")
+    active = mcp_tools.drover_fleet_status(duckdb_path=path)["active_sessions"]
+    registry.create_session(
+        host_id="gone",
+        harness="claude",
+        command="claude",
+        status="completed",
+        native_session_id=active[0]["session_id"],
+    )
+    registry.retire_host("gone", reason="uninstalled")
+    result = mcp_tools.drover_fleet_status(duckdb_path=path)
+    assert result["count"] == 2
+    assert active[0]["session_id"] not in {
+        session["session_id"] for session in result["active_sessions"]
+    }

@@ -341,3 +341,24 @@ Linux. They are restarted before the daemon restarts itself, because that
 restart ends the process. The list is empty by default and only applies to
 `in_place`. A symlink flip does not touch a running venv, so on those hosts a
 sibling keeps running its own files until it restarts for its own reasons.
+
+## Retiring a host
+
+After uninstalling Drover from a machine, run `drover-server hosts list`, then
+`drover-server hosts retire mac-mini --reason "Decommissioned"`. Use `--yes`
+for scripts. Retirement refuses hosts with running or awaiting sessions; use
+`--force` to override deliberately. Retirement preserves sessions, events,
+usage and the original host name, hides the host from fleet and capacity
+views and launch pickers, and revokes its per-host credentials. Shared legacy
+tokens are not revoked.
+
+`drover-server hosts unretire mac-mini` allows it to register again. Revoked
+credentials stay revoked: use `drover-server pair-host --name mac-mini` to
+issue a new one. Until restored, registration/heartbeat returns HTTP 409 with
+`host retired; unretire to rejoin` (a revoked credential still fails authentication).
+
+The operator cluster bearer token can call `POST /harness/hosts/{id}/retire`
+with `{"reason":"Decommissioned","force":false}` and
+`POST /harness/hosts/{id}/unretire` with `{}`. Device and host credentials cannot
+perform these actions. `GET /harness/hosts` hides retired hosts;
+`?include_retired=1` includes their `retired_at` and `retired_reason`.
