@@ -219,6 +219,28 @@ class CockpitService:
         section = dict(cached[1])
         if not section.get("data"):
             return None
+        if self.duckdb_path is not None:
+            from drover.server.harness.registry import HarnessRegistry
+
+            try:
+                retired = {
+                    host.host_id
+                    for host in HarnessRegistry(self.duckdb_path).list_hosts(
+                        include_retired=True
+                    )
+                    if host.retired_at is not None
+                }
+            except Exception:
+                return None
+            section["data"] = [
+                account
+                for account in section["data"]
+                if account.get("host_id") not in retired
+            ]
+            section["coverage"] = {
+                **(section.get("coverage") or {}),
+                "account_count": len(section["data"]),
+            }
         section["status"] = "stale"
         return section
 

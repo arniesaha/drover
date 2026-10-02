@@ -340,6 +340,8 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "agent_version": "VARCHAR",
             "model_catalogs_json": "VARCHAR NOT NULL DEFAULT '{}'",
             "update_json": "VARCHAR",
+            "retired_at": "TIMESTAMPTZ",
+            "retired_reason": "VARCHAR",
         },
     )
     con.execute(_HARNESS_SESSIONS_DDL)

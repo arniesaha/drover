@@ -1825,7 +1825,7 @@ def _load_hook_facts(con, target_id: str, analyzed_at: datetime):
         SELECT host_id, capabilities_json,
                CAST(updated_at AS TIMESTAMPTZ), CAST(last_seen_at AS TIMESTAMPTZ)
         FROM harness_hosts
-        {where}
+        {where + " AND retired_at IS NULL" if where else "WHERE retired_at IS NULL"}
         ORDER BY host_id
         LIMIT {MAX_SNAPSHOT_RECORDS}
         """,

@@ -840,6 +840,32 @@ def drover_fleet_status(
                FROM active_sessions a
                LEFT JOIN tasks t ON a.task_id = t.task_id
                ORDER BY a.last_event_at DESC"""))
+        from drover.server.harness.registry import HarnessRegistry
+
+        registry = HarnessRegistry(duckdb_path)
+        retired = {
+            host.host_id
+            for host in registry.list_hosts(include_retired=True)
+            if host.retired_at is not None
+        }
+        retired_sessions = set()
+        for host_id in retired:
+            for session in registry.list_sessions(host_id=host_id):
+                retired_sessions.update(
+                    value
+                    for value in (
+                        session.session_id,
+                        session.native_session_id,
+                        session.summary_session_id,
+                    )
+                    if value
+                )
+        sessions = [
+            session
+            for session in sessions
+            if session["agent_id"] not in retired
+            and session["session_id"] not in retired_sessions
+        ]
         # One bounded pass for every snippet. The previous loop ran a
         # whole-history canonical scan *per session*, so the cost of the tool
         # grew with the size of the fleet it was reporting on and a busy hub

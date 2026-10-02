@@ -42,6 +42,15 @@ from drover.server.harness.recap_jobs import (
     latest_live_recaps,
 )
 
+
+class HostRetiredError(ValueError):
+    """A retired identity must be explicitly restored before registration."""
+
+
+class HostBusyError(ValueError):
+    """Retirement requires an explicit override for live sessions."""
+
+
 _SESSION_PREVIEW_CANDIDATE_LIMIT = 5
 _MODEL_CATALOG_CACHE_MAX_BYTES = 512 * 1024
 _MODEL_CATALOG_SCOPES_PER_HARNESS = 2
@@ -407,6 +416,7 @@ class HarnessRegistry:
                   update_json = excluded.update_json,
                   last_seen_at = excluded.last_seen_at,
                   updated_at = excluded.updated_at
+                WHERE harness_hosts.retired_at IS NULL
                 """,
                 [
                     host_id,
@@ -427,6 +437,8 @@ class HarnessRegistry:
         host = self.get_host(host_id)
         if host is None:
             raise RuntimeError(f"failed to register harness host {host_id!r}")
+        if host.retired_at is not None:
+            raise HostRetiredError("host retired; unretire to rejoin")
         return host
 
     def get_host(self, host_id: str) -> HarnessHost | None:
@@ -438,15 +450,76 @@ class HarnessRegistry:
             )
         return HarnessHost.from_row(rows[0]) if rows else None
 
-    def list_hosts(self, *, status: str | None = None) -> list[HarnessHost]:
-        query = "SELECT * FROM harness_hosts"
+    def list_hosts(
+        self, *, status: str | None = None, include_retired: bool = False
+    ) -> list[HarnessHost]:
+        query = "SELECT * FROM harness_hosts WHERE 1 = 1"
         params: list[Any] = []
+        if not include_retired:
+            query += " AND retired_at IS NULL"
         if status is not None:
-            query += " WHERE status = ?"
+            query += " AND status = ?"
             params.append(status)
         query += " ORDER BY display_name, host_id"
         with self._connect() as con:
             return [HarnessHost.from_row(row) for row in _rows(con, query, params)]
+
+    def retire_host(
+        self, host_id: str, *, reason: str, force: bool = False
+    ) -> HarnessHost:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason is required")
+        with self._connect() as con:
+            con.execute("BEGIN")
+            try:
+                lock = " FOR UPDATE" if is_postgres_connection(con) else ""
+                row = con.execute(
+                    "SELECT host_id FROM harness_hosts WHERE host_id = ?" + lock,
+                    [host_id],
+                ).fetchone()
+                if row is None:
+                    raise KeyError(host_id)
+                busy = con.execute(
+                    "SELECT session_id FROM harness_sessions WHERE host_id = ? "
+                    "AND (status IN ('running', 'awaiting') OR "
+                    "(awaiting IS NOT NULL AND status NOT IN ('completed', 'terminated', 'errored', 'failed'))) LIMIT 1",
+                    [host_id],
+                ).fetchone()
+                if busy and not force:
+                    raise HostBusyError(
+                        "host has running/awaiting sessions; use --force to retire"
+                    )
+                con.execute(
+                    "UPDATE harness_hosts SET retired_at = COALESCE(retired_at, ?), "
+                    "retired_reason = ?, updated_at = ? WHERE host_id = ?",
+                    [_now(), reason.strip(), _now(), host_id],
+                )
+                if is_postgres_connection(con):
+                    con.execute(
+                        "UPDATE control_credentials SET revoked_at = ? "
+                        "WHERE scope = 'host' AND host_id = ? AND revoked_at IS NULL",
+                        [_now(), host_id],
+                    )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+        return self.get_host(host_id)
+
+    def unretire_host(self, host_id: str) -> HarnessHost:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT host_id FROM harness_hosts WHERE host_id = ?", [host_id]
+            ).fetchone()
+            if row is None:
+                raise KeyError(host_id)
+            con.execute(
+                "UPDATE harness_hosts SET retired_at = NULL, retired_reason = NULL, "
+                "status = CASE WHEN retired_at IS NOT NULL THEN 'offline' ELSE status END, "
+                "updated_at = ? WHERE host_id = ?",
+                [_now(), host_id],
+            )
+        return self.get_host(host_id)
 
     def save_model_catalog(
         self,
@@ -561,6 +634,13 @@ class HarnessRegistry:
         with self._connect() as con:
             con.execute("BEGIN TRANSACTION")
             try:
+                lock = " FOR UPDATE" if is_postgres_connection(con) else ""
+                host_row = con.execute(
+                    "SELECT retired_at FROM harness_hosts WHERE host_id = ?" + lock,
+                    [host_id],
+                ).fetchone()
+                if host_row is not None and host_row[0] is not None:
+                    raise HostRetiredError("host retired; unretire to rejoin")
                 con.execute(
                     """
                     INSERT INTO harness_sessions (

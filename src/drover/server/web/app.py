@@ -1064,7 +1064,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self._send(
                 200,
                 "application/json",
-                self.collector.render_harness_json(include_sessions=False),
+                (
+                    json.dumps(
+                        self.collector.harness_snapshot(
+                            include_sessions=False, include_retired=True
+                        ),
+                        default=str,
+                    )
+                    + "\n"
+                    if parse_qs(parsed.query).get("include_retired") == ["1"]
+                    else self.collector.render_harness_json(include_sessions=False)
+                ),
             )
             return
         try:
@@ -1338,6 +1348,55 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/harness/events":
             self._ingest_harness_events()
+            return
+        if path.startswith("/harness/hosts/") and path.rsplit("/", 1)[-1] in {
+            "retire",
+            "unretire",
+        }:
+            # The cluster bearer is the existing operator credential. Device,
+            # host, preflight and browser sessions do not carry operator scope.
+            authorization = self.headers.get("Authorization", "") or ""
+            import hmac
+
+            if not (
+                self.auth.enabled
+                and self.auth.legacy_token_enabled
+                and self.auth.api_token
+                and hmac.compare_digest(authorization, f"Bearer {self.auth.api_token}")
+            ):
+                self._send(
+                    403, "application/json", '{"error": "operator scope required"}\n'
+                )
+                return
+            encoded_host, action = path.removeprefix("/harness/hosts/").rsplit("/", 1)
+            if not encoded_host or "/" in encoded_host:
+                self._send(400, "application/json", '{"error": "invalid host_id"}\n')
+                return
+            host_id = unquote(encoded_host)
+            body = self._read_json()
+            if body is None:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error": "request body must be a JSON object"}\n',
+                )
+                return
+            status, payload = self.collector.retire_harness_host(
+                host_id, body, unretire=action == "unretire"
+            )
+            if (
+                status == 200
+                and action == "retire"
+                and self.auth.credentials is not None
+            ):
+                for credential in self.auth.credentials.list_all():
+                    if (
+                        credential.scope == "host"
+                        and credential.host_id == host_id
+                        and credential.revoked_at is None
+                    ):
+                        self.auth.credentials.revoke(credential.id)
+            self._send(status, "application/json", payload)
             return
         if path == "/harness/hosts":
             body = self._read_json(capability_registration=True)

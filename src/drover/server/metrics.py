@@ -36,6 +36,7 @@ from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.models import HARNESS_STALE_AFTER_SECONDS
 from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.recap_prompt import drop_user_subject
+from drover.server.harness.registry import HostBusyError, HostRetiredError
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
@@ -941,7 +942,9 @@ def _harness_host_dict(
             relay_manager.is_responsive(host.host_id) if relay_manager else False
         )
         item["status"] = "online" if responsive else "offline"
-        return _wire_datetimes(item, ("last_seen_at", "created_at", "updated_at"))
+        return _wire_datetimes(
+            item, ("last_seen_at", "created_at", "updated_at", "retired_at")
+        )
     last_seen_at = getattr(host, "last_seen_at", None)
     if last_seen_at is not None:
         if last_seen_at.tzinfo is None:
@@ -951,15 +954,21 @@ def _harness_host_dict(
         if age_s > HARNESS_STALE_AFTER_SECONDS and item.get("status") == "online":
             item["status"] = "stale"
             item["stale_after_seconds"] = HARNESS_STALE_AFTER_SECONDS
-    return _wire_datetimes(item, ("last_seen_at", "created_at", "updated_at"))
+    return _wire_datetimes(
+        item, ("last_seen_at", "created_at", "updated_at", "retired_at")
+    )
 
 
 def _harness_session_dict(
     session: Any,
     preview: str | None = None,
     recap: LiveRecap | None = None,
+    host: Any | None = None,
 ) -> dict[str, Any]:
     item = dict(session.__dict__)
+    if host is not None:
+        item["host_display_name"] = host.display_name
+        item["host_retired_at"] = _wire_datetime(host.retired_at)
     # Factory is deliberately not a Drover ledger.  The projection is derived
     # from existing session correlation fields and therefore vanishes with the
     # session; it cannot approve, cancel, or advance a Factory run.
@@ -1520,6 +1529,32 @@ class MetricsCollector:
         except Exception as exc:  # normalized below, isolated from other APIs
             return _insight_error_response(exc)
 
+    def retire_harness_host(
+        self, host_id: str, payload: Mapping[str, Any], *, unretire: bool = False
+    ) -> tuple[int, str]:
+        try:
+            registry = HarnessRegistry(self.duckdb_path)
+            if unretire:
+                host = registry.unretire_host(host_id)
+            else:
+                if not isinstance(payload.get("force", False), bool):
+                    raise ValueError("force must be a boolean")
+                host = registry.retire_host(
+                    host_id,
+                    reason=payload.get("reason"),
+                    force=payload.get("force", False),
+                )
+            self.invalidate_harness_cache()
+            return _json_response(
+                200, {"host": _harness_host_dict(host, self.relay_manager)}
+            )
+        except KeyError:
+            return _json_response(404, {"error": "unknown harness host"})
+        except HostBusyError as exc:
+            return _json_response(409, {"error": str(exc)})
+        except ValueError as exc:
+            return _json_response(400, {"error": str(exc)})
+
     def register_harness_host(self, payload: Mapping[str, Any]) -> tuple[int, str]:
         host_id = str(payload.get("host_id") or "").strip()
         if not host_id:
@@ -1554,6 +1589,8 @@ class MetricsCollector:
                 agent_version=agent_version,
                 update=update,
             )
+        except HostRetiredError as exc:
+            return _json_response(409, {"error": str(exc)})
         except InvalidCapabilities as exc:
             # Validation errors contain only static messages, never wire data.
             return _json_response(400, {"error": str(exc)})
@@ -2344,6 +2381,7 @@ class MetricsCollector:
         *,
         include_hosts: bool = True,
         include_sessions: bool = True,
+        include_retired: bool = False,
         archived_limit: int | None = _UNSET_ARCHIVED_LIMIT,
     ) -> dict[str, Any]:
         from drover.server.cockpit.service import COCKPIT_SECTIONS
@@ -2364,11 +2402,25 @@ class MetricsCollector:
             # registered central store was healthy.  HarnessRegistry resolves
             # the selected control backend without consulting the lake.
             registry = HarnessRegistry(self.duckdb_path)
-            hosts = registry.list_hosts() if include_hosts else []
+            hosts = (
+                registry.list_hosts(include_retired=include_retired)
+                if include_hosts
+                else []
+            )
             sessions = (
                 registry.list_sessions(archived_limit=archived_limit)
                 if include_sessions
                 else []
+            )
+            # Historical sessions retain the original display name even when
+            # their host is no longer part of the live fleet.
+            session_hosts = (
+                {
+                    host.host_id: host
+                    for host in registry.list_hosts(include_retired=True)
+                }
+                if sessions
+                else {}
             )
             previews = registry.latest_session_previews(
                 [session.session_id for session in sessions]
@@ -2391,6 +2443,7 @@ class MetricsCollector:
                         session,
                         previews.get(session.session_id),
                         recaps.get(session.session_id),
+                        session_hosts.get(session.host_id),
                     )
                     for session in sessions
                 ],
@@ -2441,7 +2494,8 @@ class MetricsCollector:
     def _harness_host(self, host_id: str, *, raise_errors: bool = False) -> Any | None:
         try:
             registry = HarnessRegistry(self.duckdb_path)
-            return registry.get_host(host_id)
+            host = registry.get_host(host_id)
+            return host if host is not None and host.retired_at is None else None
         except Exception as exc:  # noqa: BLE001
             if raise_errors:
                 raise

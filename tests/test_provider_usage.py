@@ -1198,3 +1198,25 @@ def test_explicit_account_identity_round_trips_through_hub_storage(
         duckdb_path=None, provider_usage=provider_service
     )._provider_capacity(AnalyticsFilters())
     assert section["data"][0]["account_identity"] == "google-sub:fixture-stable-id"
+
+
+def test_retired_host_capacity_disappears_without_deleting_snapshots(
+    provider_service, provider_host
+):
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(provider_service.duckdb_path)
+    registry.register_host(
+        host_id=provider_host.host_id, display_name="Mac", kind="mac"
+    )
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    assert len(provider_service.latest_accounts()) == 1
+    registry.retire_host(provider_host.host_id, reason="decommissioned")
+    assert provider_service.latest_accounts() == []
+    with duckdb.connect(str(provider_service.duckdb_path)) as con:
+        assert (
+            con.execute("SELECT count(*) FROM provider_usage_snapshots").fetchone()[0]
+            > 0
+        )
+    registry.unretire_host(provider_host.host_id)
+    assert len(provider_service.latest_accounts()) == 1

@@ -5,6 +5,14 @@ import Testing
 // Pure derivation tests — no MockURLProtocol, so deliberately OUTSIDE
 // the MockNetworkTests serialized suite (see ClientTests' doc comment).
 struct FleetGroupingTests {
+    @Test func retiredSessionDoesNotSynthesizeFleetHost() throws {
+        let data = Data(#"{"session_id":"old","host_id":"mac-mini","host_display_name":"Original Mac","host_retired_at":"2026-10-01T00:00:00Z","harness":"claude-code","status":"running"}"#.utf8)
+        let session = try JSONDecoder().decode(SessionSummary.self, from: data)
+        #expect(session.hostDisplayName == "Original Mac")
+        #expect(session.hostRetiredAt != nil)
+        #expect(SessionStore.hostGroups(hosts: [], sessions: [session]).isEmpty)
+    }
+
     @Test func groupsActiveSessionsUnderTheirHost() {
         let hosts = [HostSummary.fixture(id: "mac-mini"), HostSummary.fixture(id: "nas")]
         let sessions = [

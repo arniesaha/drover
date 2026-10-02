@@ -152,6 +152,7 @@ public final class SessionStore {
         sessions: [SessionSummary]
     ) -> [HostGroup] {
         let active = sessions.filter {
+            guard $0.hostRetiredAt == nil else { return false }
             switch $0.attention {
             case .needsApproval, .needsInput, .working: return true
             case .done, .errored: return false

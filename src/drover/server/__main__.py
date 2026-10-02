@@ -1225,6 +1225,68 @@ def archive_source_eligibility_cmd(
     click.echo(json.dumps(summary, sort_keys=True))
 
 
+@main.group(name="hosts")
+def hosts_cmd() -> None:
+    """List and manage fleet host lifecycle."""
+
+
+@hosts_cmd.command(name="list")
+@click.pass_context
+def hosts_list_cmd(ctx: click.Context) -> None:
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    result = _local_api_request(cfg, "GET", "/harness/hosts?include_retired=1")
+    click.echo("ID\tSTATUS\tLAST SEEN\tRETIRED")
+    for host in result.get("hosts", []):
+        click.echo(
+            "\t".join(
+                str(host.get(key) or "-")
+                for key in ("host_id", "status", "last_seen_at", "retired_at")
+            )
+        )
+
+
+@hosts_cmd.command(name="retire")
+@click.argument("host_id")
+@click.option("--reason", required=True, help="Why the host is being retired")
+@click.option("--yes", is_flag=True, help="Skip confirmation")
+@click.option(
+    "--force", is_flag=True, help="Allow retirement with running/awaiting sessions"
+)
+@click.pass_context
+def hosts_retire_cmd(
+    ctx: click.Context, host_id: str, reason: str, yes: bool, force: bool
+) -> None:
+    from urllib.parse import quote
+
+    if not reason.strip():
+        raise click.ClickException("reason is required")
+    if not yes:
+        click.confirm(
+            f"Retire host {host_id}? Its host credentials will be revoked", abort=True
+        )
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    _local_api_request(
+        cfg,
+        "POST",
+        f"/harness/hosts/{quote(host_id, safe='')}/retire",
+        {"reason": reason, "force": force},
+    )
+    click.echo(f"Retired {host_id}")
+
+
+@hosts_cmd.command(name="unretire")
+@click.argument("host_id")
+@click.pass_context
+def hosts_unretire_cmd(ctx: click.Context, host_id: str) -> None:
+    from urllib.parse import quote
+
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    _local_api_request(
+        cfg, "POST", f"/harness/hosts/{quote(host_id, safe='')}/unretire", {}
+    )
+    click.echo(f"Unretired {host_id}; pair-host again if its credential was revoked")
+
+
 @main.command(name="pair")
 @click.option("--label", default="New device", show_default=True, help="Device label")
 @click.pass_context

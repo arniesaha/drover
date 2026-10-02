@@ -507,7 +507,7 @@ struct SessionsView: View {
     }
 
     private func hostTitle(for session: SessionSummary) -> String {
-        store.snapshot?.hosts.first { $0.id == session.hostID }?.title ?? session.hostID
+        store.snapshot?.hosts.first { $0.id == session.hostID }?.title ?? session.hostDisplayName ?? session.hostID
     }
 
     private func crossHarnessTargets(for session: SessionSummary) -> [String] {

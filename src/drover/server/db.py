@@ -195,6 +195,8 @@ _POSTGRES_ANALYTICS_SNAPSHOT_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("model_catalogs_json", "VARCHAR"),
         ("agent_version", "VARCHAR"),
         ("update_json", "VARCHAR"),
+        ("retired_at", "TIMESTAMPTZ"),
+        ("retired_reason", "VARCHAR"),
         ("last_seen_at", "TIMESTAMPTZ"),
         ("created_at", "TIMESTAMPTZ"),
         ("updated_at", "TIMESTAMPTZ"),

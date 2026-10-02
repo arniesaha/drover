@@ -574,7 +574,7 @@ ${s.path}`;
             ${context.sub ? `<div class="ctx-sub">${esc(context.sub)}</div>` : ""}
           </td>
           <td>${esc(session.harness)}</td>
-          <td>${esc(session.host_id)}</td>
+          <td>${esc(session.host_display_name || session.host_id)}</td>
           <td><div>${esc(updatedLabel || "")}</div><div class="ctx-sub">${esc(session.updated_at || "")}</div></td>
           <td class="row">
             <a class="button" href="/ui/harness/sessions/${encodeURIComponent(session.session_id)}">Open</a>

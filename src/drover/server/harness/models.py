@@ -43,6 +43,8 @@ class HarnessHost:
     # Live update state reported on heartbeat: pending_version, update_blocked,
     # reason, and observed_at.
     update: dict[str, Any] | None = None
+    retired_at: datetime | None = None
+    retired_reason: str | None = None
     last_seen_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -62,6 +64,8 @@ class HarnessHost:
             ),
             agent_version=row.get("agent_version"),
             update=_loads_object(row.get("update_json")) or None,
+            retired_at=row.get("retired_at"),
+            retired_reason=row.get("retired_reason"),
             last_seen_at=row.get("last_seen_at"),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
