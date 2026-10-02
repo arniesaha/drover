@@ -34,6 +34,7 @@ import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
 from drover.server import ledger_shadow
+from drover.server.claim_quarantine import ClaimQuarantine
 from drover.server.db import open_duckdb_connection
 from drover.server.jobs import Delivery
 from drover.server.ledger import ArtifactSpec, Ledger
@@ -124,6 +125,7 @@ class SummarizerWorker:
         self._before_success_effects = _before_success_effects
         self._before_failure_finish = _before_failure_finish
         self._after_completion_commit = _after_completion_commit
+        self._claim_quarantine = ClaimQuarantine("summarize_jobs", "session_id", log)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -372,22 +374,28 @@ class SummarizerWorker:
                             WHERE status='retry_wait' AND next_run_at <= ?""",
                         [now, now],
                     )
+                exclusion, skipped = self._claim_quarantine.exclusion("session_id")
                 row = con.execute(
-                    """SELECT session_id, source_version FROM summarize_jobs
-                       WHERE status='pending'
-                       ORDER BY enqueued_at ASC LIMIT 1"""
+                    f"""SELECT session_id, source_version FROM summarize_jobs
+                       WHERE status='pending' {exclusion}
+                       ORDER BY enqueued_at ASC LIMIT 1""",
+                    skipped,
                 ).fetchone()
                 if row is None:
                     return None
                 candidate, source_version = row
                 # Conditional update: only claim if still pending
                 with summary_jobs_writer():
-                    con.execute(
+                    claimed = self._claim_quarantine.execute(
+                        con,
                         """UPDATE summarize_jobs
                            SET status='running', updated_at=?
                            WHERE session_id=? AND status='pending'""",
                         [now, candidate],
+                        candidate,
                     )
+                    if claimed is None:
+                        continue
                 # If a sibling already claimed it, fetchone returns 0 affected rows.
                 # DuckDB doesn't expose rowcount on UPDATE directly; verify via re-read.
                 claimed = con.execute(
@@ -418,6 +426,9 @@ class SummarizerWorker:
             self.job_stream.fail(delivery.id, "missing session_id")
             return None, None, delivery
         session_id = str(session_id)
+        if session_id in self._claim_quarantine.skipped:
+            self.job_stream.ack(delivery.id)
+            return None, None, None
         delivery_source_version = delivery.fields.get("source_version")
         if delivery_source_version is not None:
             delivery_source_version = str(delivery_source_version)
@@ -451,24 +462,34 @@ class SummarizerWorker:
                             self._defer_delivery(delivery, next_run_at)
                         return None
                     with summary_jobs_writer():
-                        con.execute(
+                        claimed = self._claim_quarantine.execute(
+                            con,
                             """UPDATE summarize_jobs
                                   SET status='pending', next_run_at=NULL, updated_at=?
                                 WHERE session_id=? AND status='retry_wait'
                                   AND source_version IS NOT DISTINCT FROM ?""",
                             [now, session_id, source_version],
+                            session_id,
                         )
+                        if claimed is None:
+                            self.job_stream.ack(delivery.id)
+                            return None, None, None
                     status = "pending"
                 if status != "pending":
                     return None
                 with summary_jobs_writer():
-                    con.execute(
+                    claimed = self._claim_quarantine.execute(
+                        con,
                         """UPDATE summarize_jobs
                            SET status='running', updated_at=?
                            WHERE session_id=? AND status='pending'
                              AND source_version IS NOT DISTINCT FROM ?""",
                         [now, session_id, source_version],
+                        session_id,
                     )
+                    if claimed is None:
+                        self.job_stream.ack(delivery.id)
+                        return None, None, None
                 claimed = con.execute(
                     "SELECT status FROM summarize_jobs WHERE session_id=?",
                     [session_id],

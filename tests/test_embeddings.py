@@ -787,3 +787,196 @@ def test_worker_acks_span_stream_redelivery_when_embedding_already_done(
     assert worker.drain_batch(max_jobs=1) == 0
     assert stream.pending() == []
     assert stream.length() == 0
+
+
+class _PoisonedClaimConnection:
+    """Inject only the unavailable live ART ghost; all other SQL is real DuckDB.
+
+    duckdb/duckdb#4886's UPDATE/INSERT repro succeeds on our pinned 1.5.5,
+    so it cannot deterministically reproduce the live index corruption.
+    """
+
+    def __init__(self, path, table, failure, claim_error=duckdb.ConstraintException):
+        self.con = duckdb.connect(str(path))
+        self.table = table
+        self.failure = failure
+        self.claim_error = claim_error
+
+    def execute(self, query, parameters=None):
+        if (
+            query.lstrip().startswith(f"UPDATE {self.table}")
+            and parameters
+            and "poison" in parameters
+        ):
+            raise self.claim_error(
+                'Duplicate key "poison" violates primary key constraint'
+            )
+        if (
+            self.failure
+            and query.startswith(f"{self.failure} {self.table}")
+            and parameters
+            and "poison" in parameters
+        ):
+            raise duckdb.ConstraintException("quarantine index failure")
+        return (
+            self.con.execute(query, parameters)
+            if parameters is not None
+            else self.con.execute(query)
+        )
+
+    def close(self):
+        self.con.close()
+
+
+@pytest.mark.parametrize(
+    "kind,streamed",
+    [
+        ("session", False),
+        ("session", True),
+        ("session", "versioned"),
+        ("span", False),
+        ("span", True),
+    ],
+)
+@pytest.mark.parametrize("failure", [None, "DELETE FROM", "INSERT INTO"])
+def test_poisoned_embed_claim_does_not_block_queue(
+    tmp_path, monkeypatch, caplog, kind, streamed, failure
+):
+    path = _seed(tmp_path)
+    table = "embed_jobs" if kind == "session" else "span_embed_jobs"
+    key = f"{kind}_id"
+    if kind == "span":
+        _insert_span_for_stream(path, "poison")
+        con = duckdb.connect(str(path))
+        for name in ("healthy", "later"):
+            con.execute(
+                "INSERT INTO spans SELECT * REPLACE (? AS span_id) FROM spans WHERE span_id='poison'",
+                [name],
+            )
+        con.close()
+    else:
+        for name in ("poison", "healthy", "later"):
+            _insert_summary(path, name, name)
+    con = duckdb.connect(str(path))
+    for i, name in enumerate(("poison", "healthy", "later")):
+        con.execute(
+            f"INSERT INTO {table} ({key}, status, attempts, enqueued_at) VALUES (?, 'pending', 3, TIMESTAMP '2026-09-18' + ? * INTERVAL 1 SECOND)",
+            [name, i],
+        )
+    if streamed == "versioned":
+        for name in ("poison", "healthy", "later"):
+            con.execute(
+                "INSERT INTO summarize_jobs (session_id, status, source_version) VALUES (?, 'done', 'v1')",
+                [name],
+            )
+        con.execute("UPDATE embed_jobs SET source_version='v1'")
+    before = con.execute(
+        f"SELECT enqueued_at FROM {table} WHERE {key}='poison'"
+    ).fetchone()[0]
+    con.close()
+    monkeypatch.setattr(
+        embedding_worker_module,
+        "open_duckdb_connection",
+        lambda path: _PoisonedClaimConnection(path, table, failure),
+    )
+    stream = JobStream(table, visibility_timeout_ms=0) if streamed else None
+    if stream is not None:
+        for name in ("poison", "healthy", "later"):
+            stream.add(
+                {
+                    key: name,
+                    **({"source_version": "v1"} if streamed == "versioned" else {}),
+                }
+            )
+    worker = EmbedWorker(
+        duckdb_path=path,
+        embedder=_StubEmbedder(),
+        **({f"{kind}_job_stream": stream} if streamed else {}),
+    )
+    assert worker.drain_batch(max_jobs=2) == 1
+    assert worker.drain_batch(max_jobs=1) == 1
+    if stream is not None:
+        stream.add({key: "poison"})
+    assert worker.drain_batch(max_jobs=1) == 0
+    if stream is not None:
+        assert stream.pending() == []
+        assert stream.length() == 0
+    con = duckdb.connect(str(path))
+    assert con.execute(
+        f"SELECT {key} FROM {kind}_embeddings ORDER BY {key}"
+    ).fetchall() == [("healthy",), ("later",)]
+    poison = con.execute(
+        f"SELECT status, last_error, attempts, enqueued_at FROM {table} WHERE {key}='poison'"
+    ).fetchone()
+    if failure is None and streamed == "versioned":
+        assert con.execute(
+            "SELECT source_version FROM embed_jobs WHERE session_id='poison'"
+        ).fetchone() == ("v1",)
+    con.close()
+    if failure is None:
+        assert poison == ("errored", "constraint: index ghost; requeued", 3, before)
+    elif failure == "DELETE FROM":
+        assert poison[0] == "pending"
+    else:
+        assert poison is None  # DELETE committed, replacement INSERT failed.
+    records = [r for r in caplog.records if getattr(r, "job_key", None) == "poison"]
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+    assert records[0].quarantine == ("errored" if failure is None else "memory_skip")
+
+
+@pytest.mark.parametrize("name", ["summarizer", "briefs"])
+@pytest.mark.parametrize("streamed", [False, True])
+def test_other_workers_skip_poisoned_claim(tmp_path, monkeypatch, name, streamed):
+    import importlib
+
+    module = importlib.import_module(f"drover.server.{name}.worker")
+    path = _seed(tmp_path)
+    table, key = (
+        ("summarize_jobs", "session_id")
+        if name == "summarizer"
+        else ("brief_jobs", "project_key")
+    )
+    con = duckdb.connect(str(path))
+    for i, subject in enumerate(("poison", "healthy")):
+        con.execute(
+            f"INSERT INTO {table} ({key}, status, enqueued_at) VALUES (?, 'pending', TIMESTAMP '2026-09-18' + ? * INTERVAL 1 SECOND)",
+            [subject, i],
+        )
+    con.close()
+    monkeypatch.setattr(
+        module,
+        "open_duckdb_connection",
+        lambda path, **kwargs: _PoisonedClaimConnection(path, table, "DELETE FROM"),
+    )
+    stream = JobStream(table, visibility_timeout_ms=0) if streamed else None
+    if stream is not None:
+        for subject in ("poison", "healthy"):
+            stream.add({key: subject})
+    cls = module.SummarizerWorker if name == "summarizer" else module.BriefWorker
+    worker = cls(duckdb_path=path, job_stream=stream)
+    claim = worker._claim_stream_job if streamed else worker._claim_duckdb_job
+    first = claim()
+    if name == "briefs" or streamed:
+        assert first is None or first[0] is None
+        first = claim()
+    assert first[0] == "healthy"
+    if name == "briefs" and not streamed:
+        assert worker._oldest_pending_project() is None
+
+
+def test_embed_claim_only_catches_constraint_exception(tmp_path, monkeypatch):
+    path = _seed(tmp_path)
+    _insert_summary(path, "poison", "summary")
+    enqueue_embed(path, "poison")
+    monkeypatch.setattr(
+        embedding_worker_module,
+        "open_duckdb_connection",
+        lambda path: _PoisonedClaimConnection(
+            path, "embed_jobs", None, duckdb.BinderException
+        ),
+    )
+    worker = EmbedWorker(duckdb_path=path, embedder=_StubEmbedder())
+    with pytest.raises(duckdb.BinderException):
+        worker.drain_batch()
+    assert not worker._session_quarantine.skipped
