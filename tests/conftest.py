@@ -7,6 +7,8 @@ a local PostgreSQL install (``initdb``/``pg_ctl`` on PATH, under
 private Unix socket. Nothing here touches a cluster it did not create, and every
 test schema is dropped afterwards. With neither available the dependent tests
 skip, exactly like the existing PostgreSQL contracts.
+``--require-pgvector`` instead requires an explicit test DSN, verifies extension
+installation and makes skipped contracts fail the release gate.
 """
 
 from __future__ import annotations
@@ -29,6 +31,46 @@ _HOMEBREW_BINDIRS = (
 )
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--require-pgvector",
+        action="store_true",
+        help="Require an explicit disposable PostgreSQL DSN and fail on any skip.",
+    )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = (yield).get_result()
+    if item.config.getoption("--require-pgvector") and report.skipped:
+        report.outcome = "failed"
+        report.longrepr = f"Mandatory pgvector gate forbids skips: {report.longrepr}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def required_pgvector(request):
+    if request.config.getoption("--require-pgvector"):
+        request.getfixturevalue("pgvector")
+
+
+@pytest.fixture(scope="session")
+def pgvector(postgres_dsn, request):
+    """Verify real extension installation before vector contracts can run."""
+    import psycopg
+
+    if not pgvector_available(postgres_dsn):
+        if request.config.getoption("--require-pgvector"):
+            pytest.fail("pgvector is not available on the mandatory test server")
+        pytest.skip("pgvector is not installed on this PostgreSQL server")
+    with psycopg.connect(postgres_dsn) as con:
+        con.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        version = con.execute(
+            "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+        ).fetchone()
+        assert version is not None, "CREATE EXTENSION vector did not install pgvector"
+        print(f"PostgreSQL {con.info.server_version}; pgvector {version[0]}")
+
+
 def _postgres_bindir() -> Path | None:
     explicit = os.environ.get("DROVER_TEST_PG_BINDIR")
     candidates = [explicit] if explicit else []
@@ -49,12 +91,14 @@ def _free_port() -> int:
 
 
 @pytest.fixture(scope="session")
-def postgres_dsn():
+def postgres_dsn(request):
     """A DSN for a PostgreSQL server the test session may create schemas in."""
     dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
     if dsn:
         yield dsn
         return
+    if request.config.getoption("--require-pgvector"):
+        pytest.fail("DROVER_TEST_POSTGRES_DSN is required for the pgvector gate")
     bindir = _postgres_bindir()
     if bindir is None:
         pytest.skip("no DROVER_TEST_POSTGRES_DSN and no local initdb")

@@ -447,11 +447,10 @@ def test_worker_releases_jobs_when_pgvector_is_missing(
     assert len(errors) == 1 and "pgvector" in errors[0].getMessage()
 
 
+@pytest.mark.pgvector
 def test_worker_writes_pgvector_rows_end_to_end(
-    pg_control_path: Path, postgres_dsn: str
+    pgvector, pg_control_path: Path
 ) -> None:
-    if not pgvector_available(postgres_dsn):
-        pytest.skip("pgvector is not installed on this PostgreSQL server")
     _put_summary(pg_control_path, "bad", body="short vector")
     _put_summary(pg_control_path, "good", body="a full vector")
     _enqueue(pg_control_path, "bad")
@@ -463,3 +462,6 @@ def test_worker_writes_pgvector_rows_end_to_end(
     assert store.embedded_session_ids(["good", "bad"]) == {"good"}
     assert _job(pg_control_path, "bad").status == "quarantined"
     assert _job(pg_control_path, "good").status == "succeeded"
+    hits = store.search([0.1] * DIM)
+    assert [hit.session_id for hit in hits] == ["good"]
+    assert hits[0].similarity == pytest.approx(1.0)

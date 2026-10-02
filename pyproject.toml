@@ -85,6 +85,7 @@ drover = ["prompts/*.md", "server/web/static/*.html", "server/web/static/*.js"]
 # API rather than importing the server. Its tests still need to import it.
 pythonpath = ["src", "scripts"]
 testpaths = ["tests"]
+markers = ["pgvector: contracts requiring the actual PostgreSQL vector extension"]
 # Passing tests stop leaving their tmp_path behind. The harness suites write a
 # DuckDB per test, so the default ("all", kept for the last 3 runs) reached
 # 8.2 GB in a single day of local runs. A failed test still keeps its directory,
