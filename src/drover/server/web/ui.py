@@ -9,6 +9,7 @@ _ALLOWED = {
     "observatory.html",
     "harness.html",
     "harness_terminal.html",
+    "history.html",
     "login.html",
 }
 
@@ -16,6 +17,7 @@ _ALLOWED = {
 # documents behind the existing auth gate (no new static route to protect).
 _INCLUDES = {
     "/*@include harness_capabilities.js*/": "harness_capabilities.js",
+    "/*@include history_view.js*/": "history_view.js",
 }
 
 

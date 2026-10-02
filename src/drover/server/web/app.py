@@ -981,6 +981,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/ui/harness":
             self._send(200, "text/html; charset=utf-8", load_page("harness.html"))
             return
+        if path == "/ui/history":
+            self._send(200, "text/html; charset=utf-8", load_page("history.html"))
+            return
         if path in {_HISTORY_PATH, f"{_HISTORY_PATH}/facets"}:
             self._send_session_history(path, parsed.query)
             return

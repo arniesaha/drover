@@ -637,6 +637,14 @@ def test_http_history_contract(fleet, tmp_path):
         finally:
             for _ in range(held):
                 slots.release()
+        # The web view is served behind the same gate.
+        page = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/ui/history",
+            headers={"Authorization": "Bearer operator"},
+        )
+        with urllib.request.urlopen(page) as resp:
+            assert resp.status == 200
+            assert "const DroverHistory" in resp.read().decode()
         # The existing live list is untouched.
         assert _get(server, "/harness/sessions")[0] == 200
         # A history row opens through the existing paged transcript endpoint.

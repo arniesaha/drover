@@ -145,7 +145,9 @@ own maximum of 500 is unchanged for existing callers.
 | Search query | ≤ 200 chars, ≤ 8 terms | `MAX_QUERY_CHARS`, `MAX_QUERY_TERMS` |
 | Concurrent history requests | 4, then `503` + `Retry-After` | `history_slots` |
 | Pool wait | 2 s, then `503` + `Retry-After` | `control_plane_connection(timeout=2.0)` |
-| Web client rows in memory | all fetched rows; ~25 DOM rows rendered | row virtualization |
+| Web DOM rows | viewport + 8 overscan each side (~40 at 800 px) | `history_view.js` virtual window |
+| Web rows in memory | every fetched row (fixed shape); snapshot ≤ 1,500 | `SNAPSHOT_MAX_ITEMS` |
+| Web transcript drawer | ≤ 1,000 messages, 200 per page | `TRANSCRIPT_MAX_MESSAGES` |
 | iOS rows in memory | ≤ 300 full rows (10 pages) | `HistoryModel` window |
 | Transcript page size | ≤ 200 events | clients pass `limit=200` |
 | Latency target | p95 < 150 ms per page at 10K sessions | `tests/test_session_history_perf.py` |
@@ -220,13 +222,27 @@ are nearly all of history, do not move.
 - Fixed-height row virtualization. Only the visible rows plus overscan are in
   the DOM.
 - Empty, error (honouring `Retry-After`) and loading states.
-- Filters and the cursor chain live in the URL query. The loaded rows and
-  scroll offset live in `sessionStorage`, so Back from a transcript restores
-  the same position without refetching.
-- Rows open `/ui/harness/sessions/{id}`.
+- A row opens a transcript drawer over the list.
+  - The drawer pages `/harness/sessions/{id}/messages` with `limit=200`, newest
+    first, with "Load earlier" by `before_seq`. It shows at most 1,000
+    messages; past that, it links to the live console.
+  - The list stays mounted underneath. Close, Escape or Back returns to the
+    exact scroll position with nothing refetched.
+  - `?session=` deep-links the drawer.
+  - The existing console page (`/ui/harness/sessions/{id}`) loads every event
+    and proxies to the host, so History does not use it for reading.
+    "Open in console" (or a modified click) still goes there.
+- Filters live in the URL query. On Back from the console, or on reload, the
+  loaded rows, cursor and scroll offset are restored from `sessionStorage`
+  without refetching. A list over 1,500 rows keeps only its offset and
+  re-pages to it.
 
-The pure logic (query building, day grouping, the virtual window, debounce and
-merge/dedupe) is `history_view.js`. Node tests exercise it under pytest.
+The pure logic is `history_view.js`: query building, day grouping, the
+virtual window, debounce, merge/dedupe, snapshots and transcript paging. Node
+tests run it under pytest (`tests/test_web_history.py`). The same file
+boots the page's real script against a stub DOM with canned hub responses,
+covering paging, debounce, empty/busy/unavailable states, the drawer and Back
+restoration.
 
 ## iOS
 

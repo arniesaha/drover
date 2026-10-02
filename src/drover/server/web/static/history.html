@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drover Session History</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #eef2f5;
+      --text: #171b1f;
+      --muted: #65717d;
+      --line: #d9e0e7;
+      --ok: #16834a;
+      --warn: #a56300;
+      --bad: #b42318;
+      --accent: #1769aa;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #101316;
+        --panel: #171b20;
+        --panel-2: #20262d;
+        --text: #eef2f6;
+        --muted: #9aa6b2;
+        --line: #303943;
+        --ok: #4fc078;
+        --warn: #d89a33;
+        --bad: #ff6b5f;
+        --accent: #6cb6ff;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 { margin: 0; font-size: 20px; font-weight: 750; }
+    main { padding: 14px 20px 32px; max-width: 1080px; margin: 0 auto; }
+    button, a.button {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button:hover, a.button:hover { border-color: var(--accent); }
+    input, select {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      min-width: 0;
+    }
+    .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .muted { color: var(--muted); }
+    .filters { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+    .filters .group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .filters .label { color: var(--muted); font-size: 12px; min-width: 64px; }
+    #q { flex: 1; min-width: 220px; }
+    .chip {
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 12px;
+      background: var(--panel);
+    }
+    .chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 650; }
+    .chip .retired { color: var(--muted); font-weight: 400; }
+    .list { position: relative; }
+    .row, .day { position: absolute; left: 0; right: 0; }
+    .day {
+      height: 34px;
+      display: flex;
+      align-items: flex-end;
+      padding: 0 4px 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }
+    .row {
+      height: 76px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 2px 12px;
+      padding: 9px 12px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: inherit;
+      text-decoration: none;
+      overflow: hidden;
+    }
+    .row + .row { margin-top: 0; }
+    .row:hover, .row:focus { border-color: var(--accent); outline: none; }
+    .title { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .meta, .summary { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .side { text-align: right; font-size: 12px; color: var(--muted); white-space: nowrap; }
+    .state { display: inline-flex; align-items: center; gap: 6px; font-weight: 650; }
+    .state::before { content: ""; width: 8px; height: 8px; border-radius: 999px; background: currentColor; }
+    .state.ok { color: var(--ok); }
+    .state.warn { color: var(--warn); }
+    .state.bad { color: var(--bad); }
+    .state.muted { color: var(--muted); }
+    .notice { padding: 28px 0; text-align: center; color: var(--muted); }
+    .notice.error { color: var(--bad); }
+    .hidden { display: none; }
+    #sentinel { height: 1px; }
+    body.drawer-open { overflow: hidden; }
+    .drawer {
+      position: fixed;
+      inset: 0 0 0 auto;
+      width: min(760px, 100vw);
+      background: var(--panel);
+      border-left: 1px solid var(--line);
+      box-shadow: -12px 0 32px rgba(0, 0, 0, 0.18);
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+    }
+    .drawer.hidden { display: none; }
+    .drawer-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .drawer-head h2 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+    .drawer-body { flex: 1; overflow-y: auto; padding: 12px 16px 24px; }
+    .msg { padding: 8px 0; border-bottom: 1px solid var(--line); }
+    .msg .who { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--muted); }
+    .msg.user .who { color: var(--accent); }
+    .msg pre {
+      margin: 4px 0 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .msg.assistant pre, .msg.user pre { font: inherit; }
+    @media (max-width: 760px) {
+      header { position: static; align-items: flex-start; flex-direction: column; }
+      main { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Session History</h1>
+      <div class="muted" id="statusline">Every session across your hosts, newest first.</div>
+    </div>
+    <div class="toolbar">
+      <a class="button" href="/ui/harness">Sessions</a>
+      <a class="button" href="/ui">Observatory</a>
+    </div>
+  </header>
+  <main>
+    <section class="filters" aria-label="Filters">
+      <div class="group">
+        <input id="q" type="search" placeholder="Search titles, summaries and repos" aria-label="Search history" autocomplete="off">
+        <button id="clear" type="button" class="hidden">Clear filters</button>
+      </div>
+      <div class="group" id="chips-state"><span class="label">State</span></div>
+      <div class="group" id="chips-host"><span class="label">Host</span></div>
+      <div class="group" id="chips-harness"><span class="label">Harness</span></div>
+      <div class="group" id="chips-repo">
+        <span class="label">Repo</span>
+        <select id="repo-picker" aria-label="Add repository filter"><option value="">Add repo…</option></select>
+      </div>
+      <div class="group" id="chips-date">
+        <span class="label">When</span>
+        <button class="chip" type="button" data-days="1">24 hours</button>
+        <button class="chip" type="button" data-days="7">7 days</button>
+        <button class="chip" type="button" data-days="30">30 days</button>
+        <label class="muted">from <input id="since" type="date" aria-label="From date"></label>
+        <label class="muted">to <input id="until" type="date" aria-label="To date"></label>
+      </div>
+    </section>
+    <div class="list" id="list" role="list" aria-label="Sessions"></div>
+    <div id="sentinel"></div>
+    <div class="notice" id="notice" role="status" aria-live="polite">Loading history…</div>
+  </main>
+  <aside class="drawer hidden" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+    <div class="drawer-head">
+      <div>
+        <h2 id="drawer-title"></h2>
+        <div class="muted" id="drawer-meta"></div>
+      </div>
+      <div class="toolbar">
+        <a class="button" id="drawer-console" href="/ui/harness">Open in console</a>
+        <button type="button" id="drawer-close">Close</button>
+      </div>
+    </div>
+    <div class="drawer-body" id="drawer-body">
+      <button type="button" id="older" class="hidden">Load earlier messages</button>
+      <div id="messages"></div>
+      <div class="notice" id="drawer-status" role="status" aria-live="polite"></div>
+    </div>
+  </aside>
+  <script>
+    /*@include history_view.js*/
+  </script>
+  <script>
+    const H = DroverHistory;
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+    const SNAPSHOT_KEY = "drover.history.v1";
+
+    let state = {
+      filters: H.filtersFromSearch(location.search),
+      items: [],
+      nextCursor: null,
+      hasMore: true,
+      loading: false,
+      error: null,
+      generation: 0,
+    };
+    let facets = {hosts: [], harnesses: [], repos: [], states: H.STATES};
+    let displayRows = [];
+    let lay = {offsets: [], total: 0};
+    let retryTimer = null;
+
+    function relative(iso) {
+      const t = Date.parse(iso || "");
+      if (!Number.isFinite(t)) return "";
+      return new Date(t).toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"});
+    }
+
+    function rowHtml(row, top) {
+      if (row.kind === "day") {
+        return `<div class="day" style="top:${top}px" role="presentation">${esc(row.label)}</div>`;
+      }
+      const s = row.item;
+      const host = s.host ? `${s.host.name}${s.host.retired ? " (retired)" : ""}` : "";
+      const meta = [s.repo && (s.branch ? `${s.repo} · ${s.branch}` : s.repo), s.harness, s.model, host]
+        .filter(Boolean).join(" · ");
+      const tokens = H.tokenLabel(s.tokens);
+      return `<a class="row" role="listitem" style="top:${top}px;height:${H.ROW_HEIGHT - 6}px"
+          href="/ui/harness/sessions/${encodeURIComponent(s.id)}" data-id="${esc(s.id)}">
+        <div class="title" title="${esc(s.title)}">${esc(s.title)}</div>
+        <div class="side"><span class="state ${H.stateTone(s.state)}">${esc(s.state)}</span></div>
+        <div class="meta">${esc(meta)}</div>
+        <div class="side">${esc(relative(s.last_activity))}${tokens ? " · " + esc(tokens) : ""}</div>
+        <div class="summary">${esc(s.summary || (s.has_transcript ? "" : "No transcript recorded"))}</div>
+      </a>`;
+    }
+
+    function listTop() {
+      return $("list").getBoundingClientRect().top + window.scrollY;
+    }
+
+    function paint() {
+      const range = H.visibleRange(lay, window.scrollY - listTop(), window.innerHeight);
+      const html = [];
+      for (let i = range.start; i < range.end; i++) html.push(rowHtml(displayRows[i], lay.offsets[i]));
+      $("list").innerHTML = html.join("");
+      if (H.shouldLoadMore(range, displayRows.length, state.hasMore, state.loading)) loadMore();
+    }
+
+    // Back from a transcript into a list too large to snapshot: page forward
+    // until the saved offset exists, then jump to it.
+    let pendingScroll = null;
+
+    function relayout() {
+      displayRows = H.rows(state.items);
+      lay = H.layout(displayRows);
+      $("list").style.height = lay.total + "px";
+      if (pendingScroll !== null) {
+        if (listTop() + lay.total >= pendingScroll + window.innerHeight || !state.hasMore) {
+          window.scrollTo(0, pendingScroll);
+          pendingScroll = null;
+        } else {
+          setTimeout(loadMore, 0);
+        }
+      }
+      paint();
+      renderNotice();
+    }
+
+    function renderNotice() {
+      const notice = $("notice");
+      notice.className = "notice";
+      notice.innerHTML = "";
+      if (state.error) {
+        notice.classList.add("error");
+        notice.innerHTML = `${esc(state.error)} <button type="button" id="retry">Retry</button>`;
+        $("retry").onclick = () => { state.error = null; loadMore(); };
+      } else if (state.loading) {
+        notice.textContent = state.items.length ? "Loading more…" : "Loading history…";
+      } else if (!state.items.length) {
+        notice.textContent = H.hasFilters(state.filters)
+          ? "No sessions match these filters."
+          : "No sessions yet. Sessions you run on any host appear here.";
+      } else if (!state.hasMore) {
+        notice.textContent = `${state.items.length} session${state.items.length === 1 ? "" : "s"} — that's everything.`;
+      } else {
+        notice.classList.add("hidden");
+      }
+      $("clear").classList.toggle("hidden", !H.hasFilters(state.filters));
+    }
+
+    async function loadMore() {
+      if (state.loading || !state.hasMore || state.error) return;
+      const generation = state.generation;
+      state.loading = true;
+      renderNotice();
+      let res;
+      try {
+        res = await fetch(H.pageUrl(state.filters, state.nextCursor), {cache: "no-store"});
+      } catch (_) {
+        if (generation !== state.generation) return;
+        state.loading = false;
+        state.error = "Could not reach the hub.";
+        renderNotice();
+        return;
+      }
+      if (generation !== state.generation) return;  // filters changed meanwhile
+      state.loading = false;
+      if (res.status === 401 || res.redirected) {
+        location.href = "/auth/login";
+        return;
+      }
+      if (res.status === 503) {
+        const wait = H.retryAfterMs(res.headers.get("Retry-After"));
+        state.error = `Hub busy — retrying in ${Math.ceil(wait / 1000)}s.`;
+        renderNotice();
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          if (generation !== state.generation) return;
+          state.error = null;
+          loadMore();
+        }, wait);
+        return;
+      }
+      let body = {};
+      try { body = await res.json(); } catch (_) { body = {}; }
+      if (!res.ok) {
+        state.error = res.status === 501
+          ? "History needs the PostgreSQL control store on this hub."
+          : (body.error || `History failed (HTTP ${res.status}).`);
+        if (res.status === 400) state.hasMore = false;
+        renderNotice();
+        return;
+      }
+      state.items = H.merge(state.items, body.items);
+      state.nextCursor = body.next_cursor;
+      state.hasMore = Boolean(body.has_more && body.next_cursor);
+      relayout();
+    }
+
+    function restart(filters) {
+      state.generation += 1;
+      clearTimeout(retryTimer);
+      state.filters = H.normalizeFilters(filters);
+      state.items = [];
+      state.nextCursor = null;
+      state.hasMore = true;
+      state.loading = false;
+      state.error = null;
+      const query = H.filtersKey(state.filters);
+      history.replaceState(null, "", "/ui/history" + (query ? "?" + query : ""));
+      window.scrollTo(0, 0);
+      renderChips();
+      relayout();
+    }
+
+    function chip(label, pressed, onClick, extra) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "chip";
+      button.setAttribute("aria-pressed", pressed ? "true" : "false");
+      button.innerHTML = esc(label) + (extra ? ` <span class="retired">${esc(extra)}</span>` : "");
+      button.onclick = onClick;
+      return button;
+    }
+
+    function fillGroup(id, values) {
+      const group = $(id);
+      group.querySelectorAll(".chip").forEach((node) => node.remove());
+      for (const node of values) group.appendChild(node);
+    }
+
+    function renderChips() {
+      const f = state.filters;
+      fillGroup("chips-state", H.STATES.map((value) =>
+        chip(value, f.states.includes(value), () => restart(H.toggle(f, "states", value)))));
+      fillGroup("chips-host", facets.hosts.map((host) =>
+        chip(host.name, f.hosts.includes(host.id), () => restart(H.toggle(f, "hosts", host.id)),
+          host.retired ? "retired" : "")));
+      fillGroup("chips-harness", facets.harnesses.map((value) =>
+        chip(value, f.harnesses.includes(value), () => restart(H.toggle(f, "harnesses", value)))));
+      fillGroup("chips-repo", f.repos.map((value) =>
+        chip(value + " ✕", true, () => restart(H.toggle(f, "repos", value)))));
+      const picker = $("repo-picker");
+      picker.innerHTML = '<option value="">Add repo…</option>' + facets.repos
+        .filter((repo) => !f.repos.includes(repo))
+        .map((repo) => `<option value="${esc(repo)}">${esc(repo)}</option>`).join("");
+      $("q").value = f.q;
+      $("since").value = f.since ? f.since.slice(0, 10) : "";
+      $("until").value = f.until ? f.until.slice(0, 10) : "";
+    }
+
+    async function loadFacets() {
+      try {
+        const res = await fetch("/sessions/history/facets", {cache: "no-store"});
+        if (res.ok) facets = await res.json();
+      } catch (_) { /* chips stay empty; history still pages */ }
+      renderChips();
+    }
+
+    function saveSnapshot() {
+      try {
+        sessionStorage.setItem(SNAPSHOT_KEY, H.snapshot({...state, scrollTop: window.scrollY}));
+      } catch (_) { /* storage full or disabled: Back just reloads */ }
+    }
+
+    const search = H.debounce((value) => restart({...state.filters, q: value}));
+    $("q").addEventListener("input", (event) => search(event.target.value));
+    $("clear").onclick = () => { search.cancel(); restart(H.emptyFilters()); };
+    $("repo-picker").onchange = (event) => {
+      if (event.target.value) restart(H.toggle(state.filters, "repos", event.target.value));
+    };
+    document.querySelectorAll("#chips-date [data-days]").forEach((button) => {
+      button.onclick = () => restart(H.rangeFilters(state.filters, Number(button.dataset.days)));
+    });
+    $("since").onchange = (event) => restart({...state.filters, since: event.target.value});
+    $("until").onchange = (event) => restart({...state.filters, until: event.target.value});
+    // Transcript drawer. The list stays mounted underneath, so closing it (or
+    // Back) returns to the exact scroll position with nothing refetched.
+    let transcript = null;
+
+    function messageHtml(message) {
+      const m = H.messageView(message);
+      const body = m.unavailable ? "(archived content unavailable)" : m.text;
+      if (!body) return "";
+      return `<div class="msg ${esc(m.role)}"><div class="who">${esc(m.role)} · #${esc(m.seq)}</div><pre>${esc(body)}</pre></div>`;
+    }
+
+    async function loadTranscriptPage() {
+      const t = transcript;
+      if (!t || t.loading) return;
+      t.loading = true;
+      $("older").classList.add("hidden");
+      $("drawer-status").textContent = t.count ? "Loading earlier messages…" : "Loading transcript…";
+      let res, body = {};
+      try {
+        res = await fetch(H.transcriptUrl(t.id, t.minSeq), {cache: "no-store"});
+        body = await res.json();
+      } catch (_) {
+        res = res || {ok: false, status: 0};
+      }
+      if (transcript !== t) return;  // closed or switched meanwhile
+      t.loading = false;
+      if (!res.ok) {
+        const wait = res.status === 503 && res.headers ? H.retryAfterMs(res.headers.get("Retry-After")) : 0;
+        $("drawer-status").textContent = wait
+          ? `Hub busy — retrying in ${Math.ceil(wait / 1000)}s.`
+          : (body.error || "Could not load the transcript.");
+        if (wait) setTimeout(() => { if (transcript === t) loadTranscriptPage(); }, wait);
+        else $("older").classList.remove("hidden");
+        return;
+      }
+      const messages = body.messages || [];
+      const scroller = $("drawer-body");
+      const before = scroller.scrollHeight - scroller.scrollTop;
+      $("messages").insertAdjacentHTML("afterbegin", messages.map(messageHtml).join(""));
+      const first = t.count === 0;
+      t.count += messages.length;
+      t.minSeq = body.page_min_seq || t.minSeq;
+      t.hasOlder = Boolean(body.has_older && body.page_min_seq);
+      // Newest page lands at the bottom; earlier pages keep the reader's place.
+      scroller.scrollTop = first ? scroller.scrollHeight : scroller.scrollHeight - before;
+      const capped = t.count >= H.TRANSCRIPT_MAX_MESSAGES;
+      $("older").classList.toggle("hidden", !t.hasOlder || capped);
+      $("drawer-status").textContent = !t.count
+        ? "No transcript recorded for this session."
+        : capped && t.hasOlder
+          ? "Earlier messages: open in console for the full transcript."
+          : "";
+    }
+
+    function openTranscript(item, push) {
+      transcript = {id: item.id, minSeq: null, hasOlder: false, loading: false, count: 0, pushed: push};
+      $("drawer-title").textContent = item.title || item.id;
+      $("drawer-meta").textContent = [item.repo, item.harness, item.host && item.host.name, item.state]
+        .filter(Boolean).join(" · ");
+      $("drawer-console").href = `/ui/harness/sessions/${encodeURIComponent(item.id)}`;
+      $("messages").innerHTML = "";
+      $("drawer").classList.remove("hidden");
+      document.body.classList.add("drawer-open");
+      if (push) {
+        const params = new URLSearchParams(location.search);
+        params.set("session", item.id);
+        history.pushState({session: item.id}, "", "/ui/history?" + params);
+      }
+      $("drawer-close").focus();
+      loadTranscriptPage();
+    }
+
+    function closeTranscript(pop) {
+      if (!transcript) return;
+      const pushed = transcript.pushed;
+      transcript = null;
+      $("drawer").classList.add("hidden");
+      document.body.classList.remove("drawer-open");
+      if (pop) return;
+      if (pushed) {
+        history.back();
+      } else {
+        const params = new URLSearchParams(location.search);
+        params.delete("session");
+        history.replaceState(null, "", "/ui/history" + (params.toString() ? "?" + params : ""));
+      }
+    }
+
+    $("older").onclick = () => loadTranscriptPage();
+    $("drawer-close").onclick = () => closeTranscript(false);
+    $("drawer-console").addEventListener("click", saveSnapshot);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && transcript) closeTranscript(false);
+    });
+    window.addEventListener("popstate", () => {
+      const id = new URLSearchParams(location.search).get("session");
+      if (!id) closeTranscript(true);
+      else if (!transcript || transcript.id !== id) {
+        openTranscript(state.items.find((item) => item.id === id) || {id}, false);
+      }
+    });
+    $("list").addEventListener("click", (event) => {
+      const row = event.target.closest("a.row");
+      if (!row) return;
+      // Modified clicks keep their browser meaning: open the live console.
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) {
+        saveSnapshot();
+        return;
+      }
+      event.preventDefault();
+      const item = state.items.find((candidate) => candidate.id === row.dataset.id);
+      if (item) openTranscript(item, true);
+    });
+    let frame = 0;
+    window.addEventListener("scroll", () => {
+      if (!frame) frame = requestAnimationFrame(() => { frame = 0; paint(); });
+    }, {passive: true});
+    window.addEventListener("resize", () => paint());
+    new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) loadMore();
+    }, {rootMargin: "800px 0px"}).observe($("sentinel"));
+
+    // Only Back/Forward and reload restore; a fresh visit always starts fresh.
+    const navigation = (performance.getEntriesByType("navigation")[0] || {}).type;
+    const restored = ["back_forward", "reload"].includes(navigation)
+      ? H.restore(sessionStorage.getItem(SNAPSHOT_KEY), state.filters)
+      : null;
+    sessionStorage.removeItem(SNAPSHOT_KEY);
+    window.addEventListener("pagehide", saveSnapshot);
+    renderChips();
+    loadFacets();
+    if (restored && restored.complete) {
+      state.items = restored.items;
+      state.nextCursor = restored.nextCursor;
+      state.hasMore = restored.hasMore;
+      relayout();
+      window.scrollTo(0, restored.scrollTop);
+      paint();
+    } else {
+      if (restored) pendingScroll = restored.scrollTop;
+      relayout();
+      loadMore();
+    }
+    const deepLink = new URLSearchParams(location.search).get("session");
+    if (deepLink) openTranscript(state.items.find((item) => item.id === deepLink) || {id: deepLink}, false);
+  </script>
+</body>
+</html>
