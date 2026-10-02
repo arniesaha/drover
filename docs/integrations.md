@@ -121,6 +121,9 @@ codex mcp add drover --url http://127.0.0.1:7077/mcp
 ```
 
 Use `uv run drover-server mcp tools` to inspect the live server surface.
+All agents use the hub as the single recall endpoint; per-host analytical MCP
+instances are unsupported. See the [MCP read contract](mcp.md) for response caps,
+deadlines, store identity, and data watermarks.
 
 ## Context Backends
 

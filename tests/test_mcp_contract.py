@@ -17,6 +17,7 @@ def call(server, name, arguments):
     content = asyncio.run(server.call_tool(name, arguments))
     if isinstance(content, tuple):
         content = content[0]
+    assert len(content[0].text.encode("utf-8")) <= READ_CAPS[name].response_bytes
     return json.loads(content[0].text)
 
 
@@ -51,8 +52,9 @@ def test_every_registered_read_enforces_caps(tmp_path, monkeypatch):
         args = {key: "test" for key in tool.inputSchema.get("required", [])}
         if "harness_ids" in args:
             args["harness_ids"] = ["test"] * 26
-            with pytest.raises(Exception, match="at most 25"):
-                call(server, tool.name, args)
+            rejected = call(server, tool.name, args)
+            assert rejected["status"] == "error"
+            assert "at most 25" in rejected["error"]
             args["harness_ids"] = ["test"] * 25
         oversized = False
         for key in (
@@ -112,6 +114,8 @@ def test_deadline_retains_admission_until_work_finishes(monkeypatch):
         result = await read()
         assert started.is_set()
         assert result["status"] == "timeout"
+        assert result["store"] == "hub"
+        assert result["data_watermark"]["timestamp"] is None
         assert (await read())["status"] == "busy"
 
     try:
@@ -165,3 +169,17 @@ def test_fleet_reads_registry_without_analytical_connection(tmp_path, monkeypatc
         assert result["authoritative"] is True
         assert result["state_source"] == "control_plane.harness_sessions+harness_hosts"
         assert [s["session_id"] for s in result["active_sessions"]] == ["running"]
+
+
+def test_public_validation_errors_are_bounded_and_identified(tmp_path):
+    server = build_mcp_server(duckdb_path=tmp_path / "unused", embedding_model="hub")
+    result = call(
+        server,
+        "drover_recall",
+        {"query_embedding": [1.0] * 768, "query_embedding_model": "x" * 100000},
+    )
+    assert result["status"] == "error"
+    assert result["error_type"] == "EmbeddingMismatch"
+    assert result["store"] == "hub"
+    assert result["data_watermark"]["timestamp"] is None
+    assert result["truncated"] is True

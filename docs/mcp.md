@@ -53,3 +53,35 @@ identify `state_source`, `control_store` (Postgres on the hub), and `authoritati
 `query_embedding_model`; a mismatch with the configured hub model is an error.
 Omitting it asserts that the vector uses the configured model.
 `drover_session_close` is a mutation and is outside the read contract.
+
+## Single hub recall endpoint and freshness
+
+The hub is the single supported recall endpoint. Register the hub's `/mcp` URL
+in every agent, including agents on collector hosts. Per-host analytical MCP
+instances are **unsupported**: there is no recall federation or fallback to a
+host's analytical database. Hosts collect events and run harnesses; the hub
+serves recall from its ingested events and PostgreSQL memory. Pond is removed;
+recall bundles identify `sources: ["hub"]`.
+
+Every MCP read envelope and each returned recall/search/summary/handoff record
+includes:
+
+- `store: "hub"`, the logical store identity.
+- `host`, the answering hub's hostname on the envelope; on individual records,
+  the recorded producer host/agent identity when available, otherwise the hub.
+- `data_watermark: {"timestamp": "<UTC ISO-8601>", "basis": "..."}`.
+  Summary and project-brief records use their generation time
+  (`summary_generated_at`), and active handoffs use their saved brief time
+  (`brief_generated_at`); event records use the ingested event's timestamp
+  (`event_time`). Context/control records can use their saved update time.
+  Bundle projections carry their source time. The envelope uses the latest
+  watermark among returned data items, so unrelated fresh activity cannot hide
+  a stale scoped result.
+
+A missing watermark is explicit: `{"timestamp": null, "basis": "unknown"}`.
+Retrieval timestamps and healthy host heartbeats do not imply fresh recall data.
+No-data optional MCP reads return an `unavailable` envelope with identity and an
+unknown watermark. `timeout` and `busy` envelopes also carry identity and an
+unknown watermark. Implementation/validation failures return a bounded
+`status: error` envelope with `error_type`, `error`, identity, and an unknown
+watermark. Identity and watermark metadata count toward the byte budget.

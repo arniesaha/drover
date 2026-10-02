@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from drover.server.mcp.freshness import with_freshness
 from drover.server.mcp.tools import (
     drover_open_loops,
     drover_project_brief,
@@ -63,7 +64,7 @@ class RecallBundleService:
             "effective_chars": effective_chars,
             "retrieval_timestamp": retrieval_timestamp,
         }
-        return self._build_projected_bundle(**build_arguments)
+        return with_freshness(self._build_projected_bundle(**build_arguments))
 
     def _build_projected_bundle(
         self,
@@ -257,6 +258,11 @@ def _source_item(
     text: str,
 ) -> dict:
     return {
+        "generated_at": (
+            source_timestamp
+            if source_type in {"session_summary", "project_brief"}
+            else None
+        ),
         "source_type": source_type,
         "source_identifiers": {
             key: value for key, value in source_identifiers.items() if value is not None
@@ -312,7 +318,7 @@ def _project_session_summary(
             "task_id": row.get("task_id"),
         },
         source_agent=row.get("agent_id"),
-        source_timestamp=row.get("ended_at") or row.get("generated_at"),
+        source_timestamp=row.get("generated_at"),
         retrieval_timestamp=retrieval_timestamp,
         join_basis=join_basis,
         text=text,
@@ -338,7 +344,7 @@ def _project_brief(row: dict, *, retrieval_timestamp: str) -> dict | None:
             "repo_name": row.get("repo_name"),
         },
         source_agent=None,
-        source_timestamp=row.get("generated_at") or row.get("last_activity_at"),
+        source_timestamp=row.get("generated_at"),
         retrieval_timestamp=retrieval_timestamp,
         join_basis="caller_repo_scope",
         text=text,

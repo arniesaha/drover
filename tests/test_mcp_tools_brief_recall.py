@@ -330,6 +330,10 @@ def test_recent_sessions_prefers_session_memory_project_key(
         "open_questions",
         "files_touched",
         "generator_model",
+        "generated_at",
+        "store",
+        "host",
+        "data_watermark",
     }
 
 

@@ -13,6 +13,8 @@ import json
 import threading
 from dataclasses import dataclass
 
+from drover.server.mcp.freshness import with_freshness
+
 
 @dataclass(frozen=True)
 class ReadCaps:
@@ -75,7 +77,7 @@ def bounded_arguments(arguments, caps):
 
 def serialized_bytes(value):
     # Default JSON escaping is deliberately counted: MCP may escape Unicode.
-    return len(json.dumps(value, ensure_ascii=True).encode("utf-8"))
+    return len(json.dumps(value, ensure_ascii=True, indent=2).encode("utf-8"))
 
 
 def bound_response(value, caps, *, truncated=False):
@@ -149,7 +151,7 @@ def bounded_read(fn):
         arguments = signature.bind(*args, **kwargs)
         arguments.apply_defaults()
         bounded, truncated = bounded_arguments(arguments.arguments, caps)
-        return bound_response(fn(**bounded), caps, truncated=truncated)
+        return bound_response(with_freshness(fn(**bounded)), caps, truncated=truncated)
 
     return wrapped
 
@@ -164,11 +166,13 @@ class ReadAdmission:
         @functools.wraps(fn)
         async def wrapped(*args, **kwargs):
             if not self.slots.acquire(blocking=False):
-                return {
-                    "status": "busy",
-                    "reason": "MCP read admission full",
-                    "truncated": False,
-                }
+                return with_freshness(
+                    {
+                        "status": "busy",
+                        "reason": "MCP read admission full",
+                        "truncated": False,
+                    }
+                )
             loop = asyncio.get_running_loop()
             future = loop.create_future()
 
@@ -182,9 +186,23 @@ class ReadAdmission:
             def run():
                 value, error = None, None
                 try:
-                    value = bounded_read(fn)(*args, **kwargs)
+                    value = bound_response(
+                        with_freshness(
+                            bounded_read(fn)(*args, **kwargs), empty_envelope=True
+                        ),
+                        caps,
+                    )
                 except Exception as exc:
-                    error = exc
+                    value = bound_response(
+                        with_freshness(
+                            {
+                                "status": "error",
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                            }
+                        ),
+                        caps,
+                    )
                 finally:
                     self.slots.release()
                 try:
@@ -196,10 +214,12 @@ class ReadAdmission:
             try:
                 return await asyncio.wait_for(future, caps.deadline_seconds)
             except asyncio.TimeoutError:
-                return {
-                    "status": "timeout",
-                    "deadline_seconds": caps.deadline_seconds,
-                    "truncated": False,
-                }
+                return with_freshness(
+                    {
+                        "status": "timeout",
+                        "deadline_seconds": caps.deadline_seconds,
+                        "truncated": False,
+                    }
+                )
 
         return wrapped

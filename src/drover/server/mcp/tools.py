@@ -246,7 +246,10 @@ def _memory(duckdb_path: Path) -> MemoryRepository | None:
 def _summary_row(memory_row: Any, keys: Sequence[str]) -> dict:
     """A SessionSummary/ProjectBrief in a tool's legacy row shape."""
     full = memory_row.as_dict()
-    return {key: _coerce(full.get(key)) for key in keys}
+    return {
+        **{key: _coerce(full.get(key)) for key in keys},
+        "generated_at": _coerce(full.get("generated_at")),
+    }
 
 
 def _newest_first(summaries: Iterable[SessionSummary]) -> list[SessionSummary]:
@@ -1183,6 +1186,7 @@ def _recall_row(
         "span_id": None,
         "agent_id": summary.agent_id if summary else None,
         "ended_at": _coerce(summary.ended_at) if summary else None,
+        "generated_at": _coerce(summary.generated_at) if summary else None,
         "summary_md": summary.summary_md if summary else None,
         "next_steps_md": summary.next_steps_md if summary else None,
         "open_questions": list(summary.open_questions) if summary else [],

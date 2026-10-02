@@ -113,6 +113,9 @@ def test_recall_bundle_invocation_returns_the_public_hub_bundle(
         "drover_context",
         "limits",
         "sources",
+        "store",
+        "host",
+        "data_watermark",
         "truncated",
     ]
     assert result["sources"] == ["hub"]
@@ -140,6 +143,9 @@ def test_recall_bundle_returns_hub_context(
         "drover_context",
         "limits",
         "sources",
+        "store",
+        "host",
+        "data_watermark",
         "truncated",
     ]
     assert result["sources"] == ["hub"]
