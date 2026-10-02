@@ -100,9 +100,14 @@ def test_first_start_moves_existing_control_plane_rows_into_their_own_store(tmp_
     assert [row[0] for row in _control_plane_rows(duckdb_path, "harness_events")] == [
         "e1"
     ]
-    assert [
-        row[0] for row in _control_plane_rows(duckdb_path, "live_session_recaps")
-    ] == ["legacy-1"]
+    # Live recaps are derived memory (#480): rebuilt in PostgreSQL, never
+    # copied, so the legacy recap tables are left behind.
+    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+    try:
+        tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
+    finally:
+        con.close()
+    assert not {"live_session_recaps", "live_recap_jobs"} & tables
     assert HarnessRegistry(duckdb_path).get_session("legacy-1") is not None
 
 

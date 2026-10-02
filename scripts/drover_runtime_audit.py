@@ -3,6 +3,11 @@
 
 Usage:
     python scripts/drover_runtime_audit.py --db ~/.drover/drover.duckdb --incoming-dir ~/.drover/incoming
+
+Derived memory (summaries, briefs, embeddings, job ledger) lives in the
+PostgreSQL control store. Pass ``--config`` (default: the standard config path,
+when it exists) so the audit can register that store for ``--db``; without it
+the memory section reports unavailable.
 """
 
 from __future__ import annotations
@@ -30,7 +35,20 @@ def main() -> int:
     parser.add_argument(
         "--hours", type=int, default=24, help="Repo attribution lookback window"
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="drover-server config (for the PostgreSQL control store)",
+    )
     args = parser.parse_args()
+
+    from drover.config import default_config_path, load_config
+    from drover.server.control_store import configure_control_store
+
+    config_path = args.config or default_config_path()
+    if config_path.exists():
+        configure_control_store(args.db, load_config(config_path).control_store)
 
     report = runtime_audit(
         duckdb_path=args.db, incoming_dir=args.incoming_dir, hours=args.hours

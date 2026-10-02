@@ -169,29 +169,78 @@ def test_bootstrap_creates_expected_tables(tmp_lakehouse):
         assert t in tables, f"missing table {t}"
 
 
-def test_bootstrap_creates_live_recap_tables(tmp_lakehouse):
-    """A fresh lakehouse persists both recap projections and queued work.
+#: Derived memory lives in the PostgreSQL control store (#480); none of it is
+#: DuckDB DDL any more.
+_DERIVED_MEMORY_TABLES = {
+    "session_summaries",
+    "project_briefs",
+    "session_embeddings",
+    "span_embeddings",
+    "summarize_jobs",
+    "embed_jobs",
+    "brief_jobs",
+    "span_embed_jobs",
+}
 
-    In the control-plane store since #95: ``HarnessRegistry`` enqueues a recap
-    in the same transaction as the event that triggered it, so the queue has to
-    live wherever the events do.
-    """
-    from drover.server.db import control_plane_path
 
-    parquet_dir, duckdb_path = tmp_lakehouse
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    con = duckdb.connect(str(control_plane_path(duckdb_path)))
+def _base_tables(path) -> set[str]:
+    con = duckdb.connect(str(path))
     try:
-        tables = {
+        return {
             row[0]
             for row in con.execute(
                 "SELECT table_name FROM information_schema.tables "
                 "WHERE table_type='BASE TABLE'"
             ).fetchall()
         }
-        assert {"live_session_recaps", "live_recap_jobs"} <= tables
     finally:
         con.close()
+
+
+def test_bootstrap_creates_no_derived_memory_tables(tmp_lakehouse):
+    """Neither the analytical store nor the DuckDB control plane holds memory."""
+    from drover.server.db import control_plane_path
+
+    parquet_dir, duckdb_path = tmp_lakehouse
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+
+    assert not _DERIVED_MEMORY_TABLES & _base_tables(duckdb_path)
+    assert not _DERIVED_MEMORY_TABLES & set(EXPECTED_TABLES)
+    assert not {"live_session_recaps", "live_recap_jobs"} & _base_tables(
+        control_plane_path(duckdb_path)
+    )
+    # The analytical ledger for receipts and advisory checks stays.
+    assert {"pipeline_receipts", "pipeline_jobs"} <= _base_tables(duckdb_path)
+
+
+def test_bootstrap_leaves_legacy_memory_tables_in_an_existing_store(tmp_lakehouse):
+    """Rebuild, don't migrate -- and don't silently drop: an explicit purge does."""
+    parquet_dir, duckdb_path = tmp_lakehouse
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute(
+            "CREATE TABLE session_summaries (session_id VARCHAR, summary_md VARCHAR)"
+        )
+        con.execute("INSERT INTO session_summaries VALUES ('legacy', 'kept')")
+    finally:
+        con.close()
+
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        assert con.execute("SELECT count(*) FROM session_summaries").fetchone() == (1,)
+        # The views no longer join it.
+        columns = {
+            row[0]
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'sessions'"
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    assert not {"summary_md", "next_steps_md"} & columns
 
 
 def test_bootstrap_is_idempotent(tmp_lakehouse):
@@ -226,36 +275,6 @@ def test_tasks_table_has_expected_columns(tmp_lakehouse):
         "total_cost_usd",
     }
     assert expected.issubset(cols), f"tasks missing: {expected - cols}"
-
-
-def test_session_summaries_table_has_expected_columns(tmp_lakehouse):
-    parquet_dir, db_path = tmp_lakehouse
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
-    con = duckdb.connect(str(db_path))
-    cols = {
-        row[0]
-        for row in con.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = 'session_summaries'"
-        ).fetchall()
-    }
-    expected = {
-        "session_id",
-        "task_id",
-        "agent_id",
-        "ended_at",
-        "summary_md",
-        "files_touched",
-        "tools_used",
-        "last_user_prompt",
-        "last_assistant",
-        "next_steps_md",
-        "open_questions",
-        "status",
-        "generator_model",
-        "generated_at",
-    }
-    assert expected.issubset(cols), f"session_summaries missing: {expected - cols}"
 
 
 def test_sessions_view_counts_canonical_logical_events(tmp_lakehouse):

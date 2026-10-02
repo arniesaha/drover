@@ -8,12 +8,12 @@ import threading
 import time
 from pathlib import Path
 
-import duckdb
 import pytest
 from click.testing import CliRunner
 
 from drover.hook.__main__ import main as hook_main
 from drover.schema import bootstrap
+from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
 from drover.server.mcp.server import build_mcp_server
 
 # The offline tests assert on *which* sentinel the hook prints, and the hook
@@ -212,7 +212,9 @@ def test_session_end_timeout_sentinel(live_server) -> None:
     assert "offline" not in res.output.lower()
 
 
-def test_session_end_enqueues_summarize_job(tmp_path: Path, live_server) -> None:
+def test_session_end_enqueues_summarize_job(
+    tmp_path: Path, pg_control_path: Path, monkeypatch, live_server
+) -> None:
     runner = CliRunner()
     res = runner.invoke(
         hook_main,
@@ -228,14 +230,11 @@ def test_session_end_enqueues_summarize_job(tmp_path: Path, live_server) -> None
     )
     assert res.exit_code == 0, res.output
 
-    con = duckdb.connect(str(live_server["duckdb_path"]))
-    try:
-        row = con.execute(
-            "SELECT status FROM summarize_jobs WHERE session_id='sess-cli-end'"
-        ).fetchone()
-        assert row is not None and row[0] == "pending"
-    finally:
-        con.close()
+    # The summary job is on the PostgreSQL job ledger (#480).
+    job = JobLedger(live_server["duckdb_path"]).latest(
+        SUMMARIZE_SESSION, "sess-cli-end"
+    )
+    assert job is not None and job.status == "pending"
 
 
 def test_session_end_offline_exits_zero(tmp_path: Path) -> None:

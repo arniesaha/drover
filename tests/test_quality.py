@@ -10,10 +10,14 @@ from typing import Any
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from click.testing import CliRunner
+from conftest import pgvector_available
+from memory_helpers import drive_job, put_embedding, put_summary
 
 from drover.schema import bootstrap
 from drover.server.__main__ import main
+from drover.server.ledger import EMBED_SESSION, SUMMARIZE_SESSION
 from drover.server.quality import (
     FRESH_EVENT_CRITICAL_HOURS,
     format_prometheus,
@@ -86,7 +90,14 @@ def _write_span(parquet_dir: Path, row: dict) -> None:
     pq.write_table(pa.table(cols, schema=_SPAN_SCHEMA), out / "part.parquet")
 
 
-def _seed_lakehouse(tmp_path: Path, *, degraded: bool) -> tuple[Path, Path]:
+def _seed_lakehouse(
+    tmp_path: Path, *, degraded: bool, vectors: bool = False
+) -> tuple[Path, Path]:
+    """Analytical DuckDB plus derived memory in the PostgreSQL store.
+
+    Callers request ``pg_control_path`` (registered for this same path);
+    ``vectors`` writes session embeddings, which needs pgvector.
+    """
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     incoming = tmp_path / "incoming"
@@ -153,51 +164,46 @@ def _seed_lakehouse(tmp_path: Path, *, degraded: bool) -> tuple[Path, Path]:
         con.execute(
             "INSERT INTO tasks (task_id, repo_owner, repo_name, branch, status, title) VALUES ('t1', 'arniesaha', 'nexus', 'main', 'active', 'quality')"
         )
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('s1', 'done', 1, NULL, now())"
-        )
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('s1', ?, 0, ?, now())",
-            ["pending" if degraded else "done", "embed offline" if degraded else None],
-        )
-        if not degraded:
-            con.execute("""INSERT INTO session_summaries
-                   (session_id, task_id, agent_id, ended_at, summary_md,
-                    files_touched, tools_used, last_user_prompt, last_assistant,
-                    next_steps_md, open_questions, status, generator_model, generated_at)
-                   VALUES (
-                    's1', 't1', 'agent-a', now(), 'Summary',
-                    ['src/drover/server/quality.py'], MAP {'duckdb': 1},
-                    'please summarize the latest run', 'captured the summary bundle',
-                    'run the quality verification suite', ['Should we widen the window?'],
-                    'complete', 'test-model', now()
-                   )""")
-            con.execute("""INSERT INTO session_summaries
-                   (session_id, task_id, agent_id, ended_at, summary_md,
-                    files_touched, tools_used, last_user_prompt, last_assistant,
-                    next_steps_md, open_questions, status, generator_model, generated_at)
-                   VALUES (
-                    's2', 't1', 'agent-a', now(), 'Second summary',
-                    ['tests/test_quality.py'], MAP {'pytest': 1},
-                    'confirm the degraded path', 'recorded the second bundle',
-                    'watch the next embedding run', ['Do we need a wider fixture?'],
-                    'complete', 'test-model', now()
-                   )""")
-            con.execute(
-                "INSERT INTO session_embeddings (session_id, embedding, model, dim, embedded_at) VALUES ('s1', [0.1, 0.2], 'm', 2, now())"
-            )
-            con.execute(
-                "INSERT INTO session_embeddings (session_id, embedding, model, dim, embedded_at) VALUES ('s2', [0.3, 0.4], 'm', 2, now())"
-            )
-            con.execute("""INSERT INTO span_embeddings
-                   (span_id, trace_id, session_id, task_id, agent_id, repo_owner, repo_name,
-                    branch, source_text, source_fields, embedding, model, dim, embedded_at)
-                   VALUES (
-                    'span-1', 'trace-1', 's1', 't1', 'agent-a', 'arniesaha', 'nexus',
-                    'main', 'llm_call', ['name'], [0.5, 0.6], 'm', 2, now()
-                   )""")
     finally:
         con.close()
+    drive_job(duckdb_path, SUMMARIZE_SESSION, "s1", "succeeded")
+    drive_job(duckdb_path, EMBED_SESSION, "s1", "pending" if degraded else "succeeded")
+    if not degraded:
+        put_summary(
+            duckdb_path,
+            "s1",
+            task_id="t1",
+            agent_id="agent-a",
+            ended_at=now,
+            summary_md="Summary",
+            files_touched=("src/drover/server/quality.py",),
+            tools_used={"duckdb": 1},
+            last_user_prompt="please summarize the latest run",
+            last_assistant="captured the summary bundle",
+            next_steps_md="run the quality verification suite",
+            open_questions=("Should we widen the window?",),
+            status="complete",
+            generator_model="test-model",
+        )
+        put_summary(
+            duckdb_path,
+            "s2",
+            task_id="t1",
+            agent_id="agent-a",
+            ended_at=now,
+            summary_md="Second summary",
+            files_touched=("tests/test_quality.py",),
+            tools_used={"pytest": 1},
+            last_user_prompt="confirm the degraded path",
+            last_assistant="recorded the second bundle",
+            next_steps_md="watch the next embedding run",
+            open_questions=("Do we need a wider fixture?",),
+            status="complete",
+            generator_model="test-model",
+        )
+        if vectors:
+            put_embedding(duckdb_path, "s1")
+            put_embedding(duckdb_path, "s2")
 
     if degraded:
         (incoming / "agent-a").mkdir(parents=True)
@@ -205,8 +211,16 @@ def _seed_lakehouse(tmp_path: Path, *, degraded: bool) -> tuple[Path, Path]:
     return duckdb_path, incoming
 
 
-def test_quality_snapshot_reports_healthy_categories(tmp_path: Path) -> None:
-    duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=False)
+@pytest.fixture
+def pgvector(postgres_dsn: str) -> None:
+    if not pgvector_available(postgres_dsn):
+        pytest.skip("pgvector is not installed on the test PostgreSQL server")
+
+
+def test_quality_snapshot_reports_healthy_categories(
+    tmp_path: Path, pg_control_path: Path, pgvector: None
+) -> None:
+    duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=False, vectors=True)
 
     snapshot = quality_snapshot(duckdb_path=duckdb_path, incoming_dir=incoming)
 
@@ -229,32 +243,100 @@ def test_quality_snapshot_reports_healthy_categories(tmp_path: Path) -> None:
     assert snapshot["categories"]["derived_context"]["details"]["handoff_ready"] == 1
 
 
-def test_quality_snapshot_does_not_judge_an_absent_span_feed_by_default(
+def test_quality_snapshot_without_pgvector_is_critical_on_embeddings_only(
+    tmp_path: Path, pg_control_path: Path, postgres_dsn: str
+) -> None:
+    """pgvector missing is a hard embedding failure, not a slow queue."""
+    if pgvector_available(postgres_dsn):
+        pytest.skip("pgvector is installed on the test server")
+    duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=False)
+
+    snapshot = quality_snapshot(duckdb_path=duckdb_path, incoming_dir=incoming)
+    categories = snapshot["categories"]
+
+    assert categories["completeness"]["status"] == "ok"
+    assert categories["summary_coverage"]["status"] == "ok"
+    embedding = categories["embedding_coverage"]
+    assert embedding["status"] == "critical"
+    assert embedding["details"]["embedding_status"] == "vector_unavailable"
+    assert embedding["details"]["vector_ready"] is False
+    assert categories["derived_context"]["status"] == "critical"
+    assert categories["derived_context"]["details"]["handoff_ready"] == 0
+
+
+def test_quality_snapshot_without_postgres_reports_memory_unavailable(
     tmp_path: Path,
 ) -> None:
-    import shutil
+    """A DuckDB control store: no crash, categories say memory is missing."""
+    duckdb_path, incoming = _seed_lakehouse_without_memory(tmp_path)
 
-    duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=False)
-    for partition in (tmp_path / "parquet" / "spans").glob("date=*"):
-        if partition.name != "date=_seed":
-            shutil.rmtree(partition)
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    snapshot = quality_snapshot(duckdb_path=duckdb_path, incoming_dir=incoming)
+    categories = snapshot["categories"]
 
-    default = quality_snapshot(duckdb_path=duckdb_path, incoming_dir=incoming)
-    enabled = quality_snapshot(
-        duckdb_path=duckdb_path, incoming_dir=incoming, spans_enabled=True
+    assert snapshot["runtime_audit"]["memory"]["available"] is False
+    assert categories["completeness"]["status"] == "critical"
+    assert categories["completeness"]["details"]["memory_available"] is False
+    assert any(
+        "derived memory unavailable" in w
+        for w in categories["completeness"]["warnings"]
     )
-
-    # Spans are optional since #473: no feed is the expected state.
-    assert default["span_integration"] == "disabled"
-    assert default["status"] == "ok"
-    assert not [w for w in default["warnings"] if "span" in w]
-    assert enabled["span_integration"] == "enabled"
-    assert enabled["status"] != "ok"
-    assert any("span" in w for w in enabled["warnings"])
+    assert categories["summary_coverage"]["status"] == "unknown"
+    assert categories["embedding_coverage"]["status"] == "critical"
+    assert categories["derived_context"]["status"] == "critical"
+    assert categories["freshness"]["status"] == "ok"
 
 
-def test_quality_snapshot_reports_degraded_categories(tmp_path: Path) -> None:
+def _seed_lakehouse_without_memory(tmp_path: Path) -> tuple[Path, Path]:
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    now = datetime.now(timezone.utc)
+    _write_events(
+        parquet_dir,
+        [
+            {
+                "id": "evt-1",
+                "session_id": "s1",
+                "agent_id": "agent-a",
+                "task_id": "t1",
+                "timestamp": now - timedelta(minutes=8),
+                "event_type": "Stop",
+                "role": "assistant",
+                "content": "done",
+                "repo_owner": "arniesaha",
+                "repo_name": "nexus",
+                "branch": "main",
+                "principal_id": "arnab",
+                "dedup_key": "dedup-1",
+                "raw_data": "{}",
+            }
+        ],
+    )
+    _write_span(
+        parquet_dir,
+        {
+            "trace_id": "trace-1",
+            "span_id": "span-1",
+            "parent_span_id": None,
+            "name": "llm_call",
+            "service_name": "claude-code",
+            "start_time": now - timedelta(minutes=3),
+            "end_time": now - timedelta(minutes=2),
+            "duration_ms": 60_000.0,
+            "session_id": "s1",
+            "task_id": "t1",
+            "agent_id": "agent-a",
+            "cost_usd": 0.01,
+            "dedup_key": "span-dedup-1",
+        },
+    )
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    return duckdb_path, tmp_path / "incoming"
+
+
+def test_quality_snapshot_reports_degraded_categories(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=True)
 
     snapshot = quality_snapshot(duckdb_path=duckdb_path, incoming_dir=incoming)
@@ -274,25 +356,22 @@ def test_quality_snapshot_reports_degraded_categories(tmp_path: Path) -> None:
     assert any("duplicate dedup_key" in warning for warning in snapshot["warnings"])
 
 
-def test_bundle_quality_uses_recall_usable_not_rich_metadata(tmp_path: Path) -> None:
+def test_bundle_quality_uses_recall_usable_not_rich_metadata(
+    tmp_path: Path, pg_control_path: Path, pgvector: None
+) -> None:
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            """INSERT INTO session_summaries
-               (session_id, task_id, agent_id, ended_at, summary_md,
-                files_touched, tools_used, last_user_prompt, last_assistant,
-                next_steps_md, open_questions, status, generator_model, generated_at)
-               VALUES
-               ('historical-completed', 't1', 'agent-a', now(), 'Useful historical summary',
-                NULL, MAP {}, NULL, NULL, NULL, NULL, 'completed', 'old-model', now())"""
-        )
-        con.execute(
-            "INSERT INTO session_embeddings (session_id, embedding, model, dim, embedded_at) VALUES ('historical-completed', [0.1, 0.2], 'm', 2, now())"
-        )
-    finally:
-        con.close()
+    put_summary(
+        duckdb_path,
+        "historical-completed",
+        task_id="t1",
+        agent_id="agent-a",
+        ended_at=datetime.now(timezone.utc),
+        summary_md="Useful historical summary",
+        status="completed",
+        generator_model="old-model",
+    )
+    put_embedding(duckdb_path, "historical-completed")
 
     snapshot = quality_snapshot(duckdb_path=duckdb_path)
     category = snapshot["categories"]["bundle_quality"]
@@ -316,26 +395,25 @@ def test_bundle_quality_uses_recall_usable_not_rich_metadata(tmp_path: Path) -> 
 
 
 def test_bundle_quality_warns_on_missing_processing_not_missing_evidence(
-    tmp_path: Path,
+    tmp_path: Path, pg_control_path: Path, pgvector: None
 ) -> None:
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute("""INSERT INTO session_summaries
-               (session_id, task_id, agent_id, ended_at, summary_md,
-                files_touched, tools_used, last_user_prompt, last_assistant,
-                next_steps_md, open_questions, status, generator_model, generated_at)
-               VALUES
-               ('embedded', 't1', 'agent-a', now(), 'Embedded summary',
-                NULL, MAP {}, NULL, NULL, NULL, NULL, 'complete', 'm', now()),
-               ('not-embedded', 't1', 'agent-a', now(), 'Summary without embedding',
-                NULL, MAP {}, NULL, NULL, NULL, NULL, 'complete', 'm', now())""")
-        con.execute(
-            "INSERT INTO session_embeddings (session_id, embedding, model, dim, embedded_at) VALUES ('embedded', [0.1, 0.2], 'm', 2, now())"
+    for session_id, text in (
+        ("embedded", "Embedded summary"),
+        ("not-embedded", "Summary without embedding"),
+    ):
+        put_summary(
+            duckdb_path,
+            session_id,
+            task_id="t1",
+            agent_id="agent-a",
+            ended_at=datetime.now(timezone.utc),
+            summary_md=text,
+            status="complete",
+            generator_model="m",
         )
-    finally:
-        con.close()
+    put_embedding(duckdb_path, "embedded")
 
     snapshot = quality_snapshot(duckdb_path=duckdb_path)
     category = snapshot["categories"]["bundle_quality"]
@@ -345,6 +423,25 @@ def test_bundle_quality_warns_on_missing_processing_not_missing_evidence(
     assert category["details"]["missing_recall_processing_summaries"] == 1
     assert category["details"]["missing_rich_evidence_summaries"] == 2
     assert any("recall-usable summaries cover 1/2" in w for w in snapshot["warnings"])
+
+
+def test_bundle_quality_counts_nothing_recall_usable_without_pgvector(
+    tmp_path: Path, pg_control_path: Path, postgres_dsn: str
+) -> None:
+    """Recall needs an embedding; with no vector store none qualifies."""
+    if pgvector_available(postgres_dsn):
+        pytest.skip("pgvector is installed on the test server")
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    put_summary(duckdb_path, "s1", summary_md="Complete summary", status="complete")
+
+    details = quality_snapshot(duckdb_path=duckdb_path)["categories"]["bundle_quality"][
+        "details"
+    ]
+
+    assert details["total_summaries"] == 1
+    assert details["complete_summaries"] == 1
+    assert details["recall_usable_summaries"] == 0
 
 
 def test_freshness_uses_stalest_agent_latest_event(tmp_path: Path) -> None:
@@ -843,7 +940,9 @@ def test_quality_uses_attributed_count_for_zero_attribution_classification(
     ]
 
 
-def test_quality_prometheus_output_has_stable_metric_names(tmp_path: Path) -> None:
+def test_quality_prometheus_output_has_stable_metric_names(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=True)
     snapshot = quality_snapshot(duckdb_path=duckdb_path, incoming_dir=incoming)
 
@@ -864,7 +963,9 @@ def test_quality_prometheus_output_has_stable_metric_names(tmp_path: Path) -> No
 
 
 def test_cli_quality_emits_json_and_prometheus(tmp_path: Path) -> None:
-    duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=False)
+    # The CLI registers no PostgreSQL store for --db: memory is unavailable,
+    # and the snapshot still renders.
+    duckdb_path, incoming = _seed_lakehouse_without_memory(tmp_path)
     runner = CliRunner()
 
     json_res = runner.invoke(

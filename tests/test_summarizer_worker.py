@@ -1,4 +1,9 @@
-"""Tests for SummarizerWorker — drains summarize_jobs into session_summaries."""
+"""Tests for SummarizerWorker — drains summarize_session ledger jobs into session memory.
+
+Jobs and derived rows live in the PostgreSQL control store (#480); the
+session events the worker reads stay in the analytical DuckDB, bootstrapped at
+the same registration path.
+"""
 
 from __future__ import annotations
 
@@ -6,26 +11,34 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from drover.schema import bootstrap
-from drover.server.jobs import JobStream
-from drover.server.summarizer.jobs import (
-    enqueue_summary_generation,
-    publish_summary_generation,
-    summary_jobs_transaction,
+from drover.server.db import control_plane_connection
+from drover.server.ledger import (
+    BRIEF_PROJECT,
+    EMBED_SESSION,
+    SUMMARIZE_SESSION,
+    JobLedger,
 )
-from drover.server.summarizer.worker import SummarizerWorker, _session_agent_events_ctes
+from drover.server.memory_store import MemoryRepository
+from drover.server.summarizer.jobs import enqueue_summary_generation
+from drover.server.summarizer.worker import (
+    UNCONFIGURED_RELEASE_SECONDS,
+    SummarizerWorker,
+    _session_agent_events_ctes,
+)
 
 
-def _seed(tmp_path: Path) -> tuple[Path, Path]:
+def _seed(tmp_path: Path, store_path: Path, *session_ids: str) -> Path:
+    """Write events for ``session_ids`` and bootstrap the analytical DuckDB."""
     parquet_dir = tmp_path / "parquet"
-    duckdb_path = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    return parquet_dir, duckdb_path
+    for session_id in session_ids:
+        _write_events(parquet_dir, session_id)
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=store_path)
+    return parquet_dir
 
 
 def _write_events(parquet_dir: Path, session_id: str) -> None:
@@ -50,7 +63,7 @@ def _write_events(parquet_dir: Path, session_id: str) -> None:
     )
     rows = [
         (
-            "e1",
+            f"{session_id}-e1",
             session_id,
             "macmini-claude",
             "tid1",
@@ -66,7 +79,7 @@ def _write_events(parquet_dir: Path, session_id: str) -> None:
             "{}",
         ),
         (
-            "e2",
+            f"{session_id}-e2",
             session_id,
             "macmini-claude",
             "tid1",
@@ -93,20 +106,9 @@ def _write_events(parquet_dir: Path, session_id: str) -> None:
         {k: pa.array(v, type=schema.field(k).type) for k, v in cols.items()},
         schema=schema,
     )
-    out = parquet_dir / "agent_events" / "date=2026-05-09" / f"agent_id=macmini-claude"
+    out = parquet_dir / "agent_events" / "date=2026-05-09" / "agent_id=macmini-claude"
     out.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, out / f"part-{session_id}.parquet")
-
-
-def _enqueue(duckdb_path: Path, session_id: str) -> None:
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts) VALUES (?, 'pending', 0)",
-            [session_id],
-        )
-    finally:
-        con.close()
 
 
 def _fake_llm_call(prompt: str, *, api_key, model, _client=None, **kw) -> dict:
@@ -117,163 +119,6 @@ def _fake_llm_call(prompt: str, *, api_key, model, _client=None, **kw) -> dict:
         "last_user_prompt": "do the thing",
         "last_assistant": "edited foo.py",
     }
-
-
-def test_session_agent_events_cte_filters_before_canonical_dedupe() -> None:
-    sql = _session_agent_events_ctes()
-
-    assert "session_agent_events AS" in sql
-    assert "FROM agent_events\n  WHERE session_id = ?" in sql
-    assert "FROM session_agent_events ae" in sql
-
-
-def test_worker_drains_one_pending_job(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-W1")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-W1")
-
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        api_key="sk-test",
-        _llm_call=_fake_llm_call,
-    )
-    drained = worker.drain_once()
-
-    assert drained == 1
-
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        rows = con.execute(
-            "SELECT session_id, summary_md, status, generator_model FROM session_summaries"
-        ).fetchall()
-        assert len(rows) == 1
-        assert rows[0][0] == "sess-W1"
-        assert "Fixture summary" in rows[0][1]
-        assert rows[0][2] == "completed"
-
-        job_status = con.execute(
-            "SELECT status FROM summarize_jobs WHERE session_id='sess-W1'"
-        ).fetchone()
-        assert job_status[0] == "done"
-    finally:
-        con.close()
-
-
-def test_successful_summary_clears_the_dead_letter_streak(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-W1b")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-W1b")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "UPDATE summarize_jobs SET dead_letter_streak=2 WHERE session_id='sess-W1b'"
-        )
-    finally:
-        con.close()
-
-    SummarizerWorker(
-        duckdb_path=duckdb_path,
-        api_key="sk-test",
-        _llm_call=_fake_llm_call,
-    ).drain_once()
-
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT status, dead_letter_streak FROM summarize_jobs "
-            "WHERE session_id='sess-W1b'"
-        ).fetchone() == ("done", 0)
-    finally:
-        con.close()
-
-
-def test_failed_summary_jobs_transaction_releases_the_row_with_the_writer(
-    tmp_path: Path,
-) -> None:
-    """#308: an aborted rewrite must not outlive the writer that made it."""
-    _, duckdb_path = _seed(tmp_path)
-    worker_con = duckdb.connect(str(duckdb_path))
-    watcher_con = duckdb.connect(str(duckdb_path))
-    try:
-        assert enqueue_summary_generation(watcher_con, "sess-abort", "v1") is True
-        with pytest.raises(RuntimeError):
-            with summary_jobs_transaction(worker_con):
-                worker_con.execute("BEGIN TRANSACTION")
-                # UPDATE ... RETURNING is a delete plus insert in DuckDB.
-                worker_con.execute(
-                    """UPDATE summarize_jobs SET status='done'
-                        WHERE session_id='sess-abort' RETURNING session_id"""
-                ).fetchone()
-                raise RuntimeError("completion failed mid-transaction")
-        # worker_con is still open: only the rollback inside the writer frees
-        # the row for the next generation.
-        assert enqueue_summary_generation(watcher_con, "sess-abort", "v2") is True
-        assert watcher_con.execute(
-            "SELECT status, source_version FROM summarize_jobs "
-            "WHERE session_id='sess-abort'"
-        ).fetchone() == ("pending", "v2")
-    finally:
-        worker_con.close()
-        watcher_con.close()
-
-
-def test_worker_parks_failure_until_retry_time_when_no_api_key(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-W2")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-W2")
-
-    worker = SummarizerWorker(duckdb_path=duckdb_path, api_key=None)
-    worker.drain_once()
-
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        status = con.execute(
-            "SELECT status, last_error FROM summarize_jobs WHERE session_id='sess-W2'"
-        ).fetchone()
-        assert status[0] == "retry_wait"
-        assert status[1] and "api_key" in status[1].lower()
-
-        # No session_summaries row written
-        n = con.execute("SELECT count(*) FROM session_summaries").fetchone()[0]
-        assert n == 0
-    finally:
-        con.close()
-
-
-def test_worker_handles_llm_failure_with_retry_wait(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-W3")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-W3")
-
-    def boom(prompt, **kw):
-        raise RuntimeError("simulated network blip")
-
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path, api_key="sk-test", _llm_call=boom
-    )
-    worker.drain_once()
-
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        status = con.execute(
-            "SELECT status, last_error FROM summarize_jobs WHERE session_id='sess-W3'"
-        ).fetchone()
-        assert status[0] == "retry_wait"
-        assert "simulated network blip" in status[1]
-    finally:
-        con.close()
-
-
-def test_drain_once_returns_zero_when_empty(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path, api_key="sk-test", _llm_call=_fake_llm_call
-    )
-    assert worker.drain_once() == 0
 
 
 class _StubBackend:
@@ -296,695 +141,334 @@ class _StubBackend:
         }
 
 
-def test_worker_uses_backend_when_provided(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-B1")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-B1")
+class _FailingBackend(_StubBackend):
+    def __init__(self, message: str):
+        super().__init__()
+        self.message = message
 
-    backend = _StubBackend()
-    worker = SummarizerWorker(duckdb_path=duckdb_path, backend=backend)
-    drained = worker.drain_once()
-    assert drained == 1
-    assert backend.calls == 1
-    # ensure_ready called once at batch start
-    assert backend.ensure_calls == 1
-
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        row = con.execute(
-            "SELECT summary_md, generator_model FROM session_summaries WHERE session_id='sess-B1'"
-        ).fetchone()
-    finally:
-        con.close()
-    assert row[0] == "backend summary #1"
-    # generator_model came from backend.model, not worker.model
-    assert row[1] == "stub-model-v1"
+    def summarize(self, prompt: str) -> dict:
+        self.calls += 1
+        raise RuntimeError(self.message)
 
 
-def test_worker_drain_batch_processes_multiple_jobs_with_one_warmup(
-    tmp_path: Path,
+def _jobs(store_path: Path, job_kind: str) -> list[tuple]:
+    with control_plane_connection(store_path) as con:
+        return con.execute(
+            """SELECT subject_key, source_version, status, failures, payload_json
+                 FROM pipeline_jobs WHERE job_kind = ?
+                ORDER BY enqueued_at, subject_key""",
+            [job_kind],
+        ).fetchall()
+
+
+def test_session_agent_events_cte_filters_before_canonical_dedupe() -> None:
+    sql = _session_agent_events_ctes()
+
+    assert "session_agent_events AS" in sql
+    assert "FROM agent_events\n  WHERE session_id = ?" in sql
+    assert "FROM session_agent_events ae" in sql
+
+
+def test_success_writes_final_memory_and_fans_out_in_one_commit(
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    for sid in ("sess-B2", "sess-B3", "sess-B4"):
-        _write_events(parquet_dir, sid)
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    for sid in ("sess-B2", "sess-B3", "sess-B4"):
-        _enqueue(duckdb_path, sid)
-
-    backend = _StubBackend()
-    worker = SummarizerWorker(duckdb_path=duckdb_path, backend=backend, batch_size=10)
-    drained = worker.drain_batch()
-    assert drained == 3
-    assert backend.calls == 3
-    # ensure_ready fires once per drain_batch call, not per job
-    assert backend.ensure_calls == 1
-
-
-def test_worker_drain_batch_stops_when_queue_empty(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-B5")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-B5")
-
-    backend = _StubBackend()
-    worker = SummarizerWorker(duckdb_path=duckdb_path, backend=backend, batch_size=20)
-    drained = worker.drain_batch()
-    # Only one job enqueued — drain_batch should not loop past the empty queue
-    assert drained == 1
-    assert backend.calls == 1
-
-
-def test_worker_writes_deterministic_files_touched(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-W4")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-W4")
+    _seed(tmp_path, pg_control_path, "sess-W1")
+    assert enqueue_summary_generation(pg_control_path, "sess-W1", "v1") == "queued"
 
     worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        api_key="sk-test",
-        _llm_call=_fake_llm_call,
+        duckdb_path=pg_control_path, api_key="sk-test", _llm_call=_fake_llm_call
     )
-    worker.drain_once()
-
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        files, tools = con.execute(
-            "SELECT files_touched, tools_used FROM session_summaries WHERE session_id='sess-W4'"
-        ).fetchone()
-        assert files == ["src/foo.py"]
-        assert tools == {"Edit": 1}
-    finally:
-        con.close()
-
-
-def test_worker_acks_stream_job_after_durable_summary_write(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-stream-ok")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-stream-ok")
-    stream = JobStream("summarize_jobs")
-    stream.add({"session_id": "sess-stream-ok"})
-
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        api_key="sk-test",
-        _llm_call=_fake_llm_call,
-        job_stream=stream,
-        worker_id="worker-a",
-    )
-
     assert worker.drain_once() == 1
-    assert stream.pending() == []
-    assert stream.length() == 0
 
+    repo = MemoryRepository(pg_control_path)
+    memory = repo.latest(["sess-W1"])["sess-W1"]
+    assert memory.phase == "final"
+    summary = memory.summary
+    assert summary.summary_md == "Fixture summary describing the session."
+    assert summary.next_steps_md == "Move on to Plan 6."
+    assert summary.status == "completed"
+    assert summary.source_version == "v1"
+    assert summary.generator_model == worker.model
+    assert summary.project_key == "arniesaha/nexus"
+    assert summary.task_id == "tid1"
+    assert summary.agent_id == "macmini-claude"
+    assert summary.files_touched == ("src/foo.py",)
+    assert summary.tools_used == {"Edit": 1}
+    assert summary.open_questions == ("use sse or streamable-http?",)
+    assert summary.ended_at is not None and summary.ended_at.tzinfo is not None
 
-def test_stream_worker_does_not_resolve_backend_when_idle(tmp_path: Path) -> None:
-    _parquet_dir, duckdb_path = _seed(tmp_path)
-    stream = JobStream("summarize_jobs")
-
-    class FailingBackend:
-        def ensure_ready(self):
-            raise AssertionError("backend should not be warmed on idle stream tick")
-
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        api_key="sk-test",
-        backend=FailingBackend(),
-        job_stream=stream,
-        worker_id="worker-idle",
+    ledger = JobLedger(pg_control_path)
+    assert ledger.latest(SUMMARIZE_SESSION, "sess-W1").status == "succeeded"
+    assert _jobs(pg_control_path, EMBED_SESSION) == [
+        ("sess-W1", "v1", "pending", 0, "{}")
+    ]
+    ((subject, version, status, failures, payload),) = _jobs(
+        pg_control_path, BRIEF_PROJECT
+    )
+    assert (subject, version, status, failures) == (
+        "arniesaha/nexus",
+        "sess-W1:v1",
+        "pending",
+        0,
+    )
+    assert json.loads(payload) == {
+        "source_session_id": "sess-W1",
+        "source_version": "v1",
+    }
+    # The same generation is not summarized twice.
+    assert (
+        enqueue_summary_generation(pg_control_path, "sess-W1", "v1") == "already_done"
     )
 
-    assert worker.drain_once() == 0
 
-
-def test_worker_leaves_failed_stream_job_unacked_for_reclaim(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "sess-stream-fail")
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-stream-fail")
-    start = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
-
-    class StreamClock:
-        now = int(start.timestamp() * 1000)
-
-        def __call__(self) -> int:
-            return self.now
-
-    stream_clock = StreamClock()
-    stream = JobStream("summarize_jobs", visibility_timeout_ms=0, clock=stream_clock)
-    stream.add({"session_id": "sess-stream-fail"})
-
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        api_key=None,
-        job_stream=stream,
-        worker_id="worker-a",
-        _clock=lambda: start,
-        _jitter=lambda _low, _high: 0,
-    )
-
-    assert worker.drain_once() == 1
-    pending = stream.pending()
-    assert len(pending) == 1
-    assert pending[0].last_error and "api_key" in pending[0].last_error.lower()
-    assert stream.reclaim("worker-b") == []
-    stream_clock.now += 60_000
-    reclaimed = stream.reclaim("worker-b")
-    assert len(reclaimed) == 1
-    assert reclaimed[0].fields["session_id"] == "sess-stream-fail"
-
-
-def test_worker_acks_redelivery_when_summary_already_done(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _enqueue(duckdb_path, "sess-stream-written")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "UPDATE summarize_jobs SET status='done' WHERE session_id='sess-stream-written'"
-        )
-    finally:
-        con.close()
-    stream = JobStream("summarize_jobs", visibility_timeout_ms=0)
-    stream.add({"session_id": "sess-stream-written"})
-
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        api_key="sk-test",
-        _llm_call=_fake_llm_call,
-        job_stream=stream,
-        worker_id="worker-b",
-    )
-
-    assert worker.drain_once() == 1
-    assert stream.pending() == []
-    assert stream.length() == 0
-
-
-def test_fifth_failure_dead_letters_serving_and_pipeline_job(tmp_path: Path) -> None:
-    _parquet_dir, duckdb_path = _seed(tmp_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs "
-            "(session_id, status, attempts, source_version) "
-            "VALUES ('s1', 'running', 4, 'v1')"
-        )
-    finally:
-        con.close()
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        _clock=lambda: datetime(2026, 8, 6, tzinfo=timezone.utc),
-        _jitter=lambda _low, _high: 0,
-    )
-
-    worker._finish_failure("s1", "v1", RuntimeError("backend failed"))
-
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT status,attempts FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == ("dead_lettered", 5)
-        assert con.execute(
-            "SELECT status FROM pipeline_jobs "
-            "WHERE job_kind='summarize_session' AND subject_key='s1'"
-        ).fetchone() == ("dead_lettered",)
-    finally:
-        con.close()
-
-
-def test_duckdb_worker_honors_retry_wait_until_due(tmp_path: Path) -> None:
-    _parquet_dir, duckdb_path = _seed(tmp_path)
-    due = datetime(2026, 8, 6, 12, 5)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs "
-            "(session_id, status, attempts, source_version, next_run_at) "
-            "VALUES ('s1', 'retry_wait', 1, 'v1', ?)",
-            [due],
-        )
-    finally:
-        con.close()
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        _clock=lambda: datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
-    )
-
-    assert worker._claim_duckdb_job() is None
-
-    worker._clock = lambda: datetime(2026, 8, 6, 12, 6, tzinfo=timezone.utc)
-    claim = worker._claim_duckdb_job()
-    assert claim is not None
-    assert claim[0] == "s1"
-
-
-def test_stream_worker_acks_stale_source_generation_without_backend_call(
-    tmp_path: Path,
+def test_downstream_enqueue_failure_rolls_the_summary_back(
+    tmp_path: Path, pg_control_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _parquet_dir, duckdb_path = _seed(tmp_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, source_version) "
-            "VALUES ('s1', 'pending', 'v2')"
-        )
-    finally:
-        con.close()
-    stream = JobStream("summarize_jobs")
-    stream.add({"session_id": "s1", "source_version": "v1"})
-    backend = _StubBackend()
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path, backend=backend, job_stream=stream
-    )
+    """Summary, completion and fan-out commit together or not at all."""
+    _seed(tmp_path, pg_control_path, "sess-atomic")
+    enqueue_summary_generation(pg_control_path, "sess-atomic", "v1")
+    real_enqueue = JobLedger.enqueue
 
+    def brief_enqueue_fails(self, job_kind, subject_key, **kwargs):
+        if job_kind == BRIEF_PROJECT:
+            raise RuntimeError("brief enqueue exploded")
+        return real_enqueue(self, job_kind, subject_key, **kwargs)
+
+    monkeypatch.setattr(JobLedger, "enqueue", brief_enqueue_fails)
+    worker = SummarizerWorker(duckdb_path=pg_control_path, backend=_StubBackend())
     assert worker.drain_once() == 1
-    assert backend.calls == 0
-    assert stream.pending() == []
+
+    assert MemoryRepository(pg_control_path).latest(["sess-atomic"]) == {}
+    assert _jobs(pg_control_path, EMBED_SESSION) == []
+    job = JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "sess-atomic")
+    assert (job.status, job.failures) == ("retry_wait", 1)
+    assert "brief enqueue exploded" in job.last_error
 
 
-def test_stream_worker_acks_dead_lettered_generation_without_backend_call(
-    tmp_path: Path,
+def test_superseded_generation_is_discarded_without_side_effects(
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
-    _parquet_dir, duckdb_path = _seed(tmp_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs "
-            "(session_id, status, attempts, source_version, dead_lettered_at) "
-            "VALUES ('s1', 'dead_lettered', 5, 'v1', now())"
-        )
-    finally:
-        con.close()
-    stream = JobStream("summarize_jobs")
-    stream.add({"session_id": "s1", "source_version": "v1"})
-    backend = _StubBackend()
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path, backend=backend, job_stream=stream
-    )
-
-    assert worker.drain_once() == 1
-    assert backend.calls == 0
-    assert stream.pending() == []
-
-
-def test_stream_worker_leaves_retry_wait_unacked_until_due(tmp_path: Path) -> None:
-    _parquet_dir, duckdb_path = _seed(tmp_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs "
-            "(session_id, status, attempts, source_version, next_run_at) "
-            "VALUES ('s1', 'retry_wait', 1, 'v1', ?)",
-            [datetime(2026, 8, 6, 12, 5)],
-        )
-    finally:
-        con.close()
-    stream = JobStream("summarize_jobs", visibility_timeout_ms=0)
-    stream.add({"session_id": "s1", "source_version": "v1"})
-    backend = _StubBackend()
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        backend=backend,
-        job_stream=stream,
-        _clock=lambda: datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
-    )
-
-    assert worker.drain_once() == 0
-    assert backend.calls == 0
-    assert len(stream.pending()) == 1
-
-
-def test_stream_retry_backoff_allows_exactly_five_backend_executions(
-    tmp_path: Path,
-) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "s1")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, source_version) "
-            "VALUES ('s1', 'pending', 'v1')"
-        )
-    finally:
-        con.close()
-
-    start = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
-
-    class MillisecondClock:
-        now = int(start.timestamp() * 1000)
-
-        def __call__(self) -> int:
-            return self.now
-
-        def advance(self, milliseconds: int) -> None:
-            self.now += milliseconds
-
-    class AlwaysFailBackend(_StubBackend):
-        def summarize(self, prompt: str) -> dict:
-            self.calls += 1
-            raise RuntimeError("backend failed")
-
-    stream_clock = MillisecondClock()
-    stream = JobStream(
-        "summarize_jobs",
-        clock=stream_clock,
-        visibility_timeout_ms=60_000,
-        max_deliveries=5,
-    )
-    stream.add({"session_id": "s1", "source_version": "v1"})
-    backend = AlwaysFailBackend()
-    elapsed_seconds = 0
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        backend=backend,
-        job_stream=stream,
-        _clock=lambda: start + timedelta(seconds=elapsed_seconds),
-        _jitter=lambda _low, _high: 0,
-    )
-
-    assert worker.drain_once() == 1
-    ticks = 0
-    while backend.calls < 5 and ticks < 30:
-        ticks += 1
-        elapsed_seconds += 60
-        stream_clock.advance(60_000)
-        worker.drain_once()
-
-    assert backend.calls == 5
-    assert stream.dead_letters() == []
-    assert stream.pending() == []
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT status, attempts FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == ("dead_lettered", 5)
-    finally:
-        con.close()
-
-
-def test_stale_inflight_success_cannot_overwrite_new_generation(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "s1")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, source_version) "
-            "VALUES ('s1', 'pending', 'v1')"
-        )
-    finally:
-        con.close()
+    _seed(tmp_path, pg_control_path, "s1")
+    enqueue_summary_generation(pg_control_path, "s1", "v1")
 
     class SupersedingBackend(_StubBackend):
         def summarize(self, prompt: str) -> dict:
-            self.calls += 1
-            con = duckdb.connect(str(duckdb_path))
-            try:
-                enqueue_summary_generation(con, "s1", "v2")
-            finally:
-                con.close()
+            # The session's next batch lands while the model runs.
+            assert enqueue_summary_generation(pg_control_path, "s1", "v2") == "requeued"
             return super().summarize(prompt)
 
-    stream = JobStream("summarize_jobs")
-    stream.add({"session_id": "s1", "source_version": "v1"})
-    brief_stream = JobStream("brief_jobs")
-    embed_stream = JobStream("embed_jobs")
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        backend=SupersedingBackend(),
-        job_stream=stream,
-        brief_job_stream=brief_stream,
-        embed_job_stream=embed_stream,
-    )
-
+    backend = SupersedingBackend()
+    worker = SummarizerWorker(duckdb_path=pg_control_path, backend=backend)
     assert worker.drain_once() == 1
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT source_version, status, attempts FROM summarize_jobs "
-            "WHERE session_id='s1'"
-        ).fetchone() == ("v2", "pending", 0)
-        assert con.execute(
-            "SELECT count(*) FROM session_summaries WHERE session_id='s1'"
-        ).fetchone() == (0,)
-        assert con.execute(
-            "SELECT status FROM pipeline_jobs WHERE subject_key='s1'"
-        ).fetchone() == ("dead_lettered",)
-    finally:
-        con.close()
-    assert stream.pending() == []
-    assert brief_stream.length() == 0
-    assert embed_stream.length() == 0
+
+    assert backend.calls == 1
+    assert MemoryRepository(pg_control_path).latest(["s1"]) == {}
+    assert _jobs(pg_control_path, EMBED_SESSION) == []
+    assert _jobs(pg_control_path, BRIEF_PROJECT) == []
+    jobs = _jobs(pg_control_path, SUMMARIZE_SESSION)
+    assert [(v, s, f) for _, v, s, f, _ in jobs] == [
+        ("v1", "superseded", 0),
+        ("v2", "pending", 0),
+    ]
 
 
-def test_stale_inflight_failure_acks_and_closes_ledger_attempt(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "s1")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, source_version) "
-            "VALUES ('s1', 'pending', 'v1')"
-        )
-    finally:
-        con.close()
-
-    class SupersedingFailureBackend(_StubBackend):
-        def summarize(self, prompt: str) -> dict:
-            self.calls += 1
-            con = duckdb.connect(str(duckdb_path))
-            try:
-                enqueue_summary_generation(con, "s1", "v2")
-            finally:
-                con.close()
-            raise RuntimeError("obsolete backend failure")
-
-    stream = JobStream("summarize_jobs")
-    stream.add({"session_id": "s1", "source_version": "v1"})
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        backend=SupersedingFailureBackend(),
-        job_stream=stream,
-    )
-
-    assert worker.drain_once() == 1
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT source_version, status, attempts FROM summarize_jobs "
-            "WHERE session_id='s1'"
-        ).fetchone() == ("v2", "pending", 0)
-        assert con.execute(
-            "SELECT status FROM pipeline_jobs WHERE subject_key='s1'"
-        ).fetchone() == ("dead_lettered",)
-    finally:
-        con.close()
-    assert stream.pending() == []
-
-
-def test_generation_change_at_post_persist_seam_blocks_all_success_effects(
-    tmp_path: Path,
+def test_generation_change_at_success_seam_blocks_all_success_effects(
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "s1")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, source_version) "
-            "VALUES ('s1', 'pending', 'v1')"
-        )
-    finally:
-        con.close()
+    _seed(tmp_path, pg_control_path, "s1")
+    enqueue_summary_generation(pg_control_path, "s1", "v1")
+    committed: list[str] = []
 
-    def supersede_before_success_effects() -> None:
-        con = duckdb.connect(str(duckdb_path))
-        try:
-            enqueue_summary_generation(con, "s1", "v2")
-        finally:
-            con.close()
-
-    stream = JobStream("summarize_jobs")
-    stream.add({"session_id": "s1", "source_version": "v1"})
-    brief_stream = JobStream("brief_jobs")
-    embed_stream = JobStream("embed_jobs")
     worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
+        duckdb_path=pg_control_path,
         backend=_StubBackend(),
-        job_stream=stream,
-        brief_job_stream=brief_stream,
-        embed_job_stream=embed_stream,
-        _before_success_effects=supersede_before_success_effects,
+        _before_success_effects=lambda: enqueue_summary_generation(
+            pg_control_path, "s1", "v2"
+        ),
+        _after_completion_commit=lambda: committed.append("s1"),
     )
-
     assert worker.drain_once() == 1
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT source_version, status FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == ("v2", "pending")
-        assert con.execute(
-            "SELECT count(*) FROM session_summaries WHERE session_id='s1'"
-        ).fetchone() == (0,)
-        assert con.execute(
-            "SELECT status FROM pipeline_jobs WHERE subject_key='s1'"
-        ).fetchone() == ("dead_lettered",)
-        assert con.execute("SELECT count(*) FROM brief_jobs").fetchone() == (0,)
-        assert con.execute("SELECT count(*) FROM embed_jobs").fetchone() == (0,)
-    finally:
-        con.close()
-    assert brief_stream.length() == 0
-    assert embed_stream.length() == 0
-    assert stream.pending() == []
+
+    assert committed == []
+    assert MemoryRepository(pg_control_path).summary("s1") is None
+    assert _jobs(pg_control_path, EMBED_SESSION) == []
+    latest = JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "s1")
+    assert (latest.source_version, latest.status) == ("v2", "pending")
 
 
-def test_generation_change_at_failure_finish_seam_is_atomically_stale(
-    tmp_path: Path,
+def test_retryable_failure_waits_for_retry(
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "s1")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, source_version) "
-            "VALUES ('s1', 'pending', 'v1')"
-        )
-    finally:
-        con.close()
+    _seed(tmp_path, pg_control_path, "sess-W3")
+    enqueue_summary_generation(pg_control_path, "sess-W3", "v1")
 
-    def supersede_before_failure_finish() -> None:
-        con = duckdb.connect(str(duckdb_path))
-        try:
-            enqueue_summary_generation(con, "s1", "v2")
-        finally:
-            con.close()
+    def boom(prompt, **kw):
+        raise RuntimeError("simulated network blip")
 
-    class FailingBackend(_StubBackend):
-        def summarize(self, prompt: str) -> dict:
-            self.calls += 1
-            raise RuntimeError("backend failed")
-
-    stream = JobStream("summarize_jobs")
-    stream.add({"session_id": "s1", "source_version": "v1"})
     worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        backend=FailingBackend(),
-        job_stream=stream,
-        _before_failure_finish=supersede_before_failure_finish,
+        duckdb_path=pg_control_path, api_key="sk-test", _llm_call=boom
     )
-
     assert worker.drain_once() == 1
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT source_version, status, attempts FROM summarize_jobs "
-            "WHERE session_id='s1'"
-        ).fetchone() == ("v2", "pending", 0)
-        assert con.execute(
-            "SELECT status FROM pipeline_jobs WHERE subject_key='s1'"
-        ).fetchone() == ("dead_lettered",)
-    finally:
-        con.close()
-    assert stream.pending() == []
 
-
-def test_generation_change_after_commit_suppresses_old_downstream_publication(
-    tmp_path: Path,
-) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    _write_events(parquet_dir, "s1")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, source_version) "
-            "VALUES ('s1', 'pending', 'v1')"
-        )
-    finally:
-        con.close()
-
-    summarize_stream = JobStream("summarize_jobs")
-    summarize_stream.add({"session_id": "s1", "source_version": "v1"})
-
-    def supersede_after_commit() -> None:
-        con = duckdb.connect(str(duckdb_path))
-        try:
-            assert enqueue_summary_generation(con, "s1", "v2") is True
-        finally:
-            con.close()
-        summarize_stream.add({"session_id": "s1", "source_version": "v2"})
-
-    brief_stream = JobStream("brief_jobs")
-    embed_stream = JobStream("embed_jobs")
-    worker = SummarizerWorker(
-        duckdb_path=duckdb_path,
-        backend=_StubBackend(),
-        job_stream=summarize_stream,
-        brief_job_stream=brief_stream,
-        embed_job_stream=embed_stream,
-        _after_completion_commit=supersede_after_commit,
-    )
-
-    assert worker.drain_once() == 1
-    assert brief_stream.length() == 0
-    assert embed_stream.length() == 0
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT source_version, status FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == ("v2", "pending")
-        assert con.execute(
-            "SELECT source_version, status FROM embed_jobs WHERE session_id='s1'"
-        ).fetchone() == ("v1", "superseded")
-        assert con.execute(
-            "SELECT source_session_id, source_version, status FROM brief_jobs"
-        ).fetchone() == ("s1", "v1", "superseded")
-    finally:
-        con.close()
-
-    (v2_delivery,) = summarize_stream.read_group("next-worker")
-    assert v2_delivery.fields == {"session_id": "s1", "source_version": "v2"}
-
-
-def test_stream_poll_recovers_durable_publish_without_producer_reentry(
-    tmp_path: Path,
-) -> None:
-    _, duckdb_path = _seed(tmp_path)
-
-    class FlakyIdleStream:
-        def __init__(self) -> None:
-            self.add_calls = 0
-            self.published: list[dict] = []
-
-        def add(self, fields: dict) -> str:
-            self.add_calls += 1
-            if self.add_calls == 1:
-                raise RuntimeError("redis unavailable")
-            self.published.append(fields)
-            return "1-0"
-
-        def read_group(self, consumer: str, count: int = 1) -> list:
-            return []
-
-        def reclaim(self, consumer: str, count: int = 1) -> list:
-            return []
-
-    stream = FlakyIdleStream()
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert enqueue_summary_generation(con, "s1", "v1") is True
-        with pytest.raises(RuntimeError, match="redis unavailable"):
-            publish_summary_generation(con, "s1", "v1", stream)
-    finally:
-        con.close()
-
-    worker = SummarizerWorker(duckdb_path=duckdb_path, job_stream=stream)
+    job = JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "sess-W3")
+    assert (job.status, job.failures) == ("retry_wait", 1)
+    assert "simulated network blip" in job.last_error
+    assert job.next_run_at > datetime.now(timezone.utc)
+    assert MemoryRepository(pg_control_path).summary("sess-W3") is None
+    # Not due yet: the next tick has nothing to do.
     assert worker.drain_once() == 0
-    assert stream.published == [{"session_id": "s1", "source_version": "v1"}]
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        assert con.execute(
-            "SELECT stream_publish_needed FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == (False,)
-    finally:
-        con.close()
+
+
+def test_validation_failure_is_quarantined_with_reason(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    _seed(tmp_path, pg_control_path, "sess-bad-json")
+    enqueue_summary_generation(pg_control_path, "sess-bad-json", "v1")
+    backend = _FailingBackend(
+        "anthropic: LLM response missing required keys: next_steps_md"
+    )
+
+    worker = SummarizerWorker(duckdb_path=pg_control_path, backend=backend)
+    assert worker.drain_once() == 1
+
+    job = JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "sess-bad-json")
+    assert job.status == "quarantined"
+    assert job.error_category == "validation"
+    assert "quarantined (validation)" in job.disposition_reason
+    assert "missing required keys" in job.disposition_reason
+    assert backend.calls == 1
+
+
+def test_session_without_events_is_quarantined(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    _seed(tmp_path, pg_control_path)
+    enqueue_summary_generation(pg_control_path, "sess-ghost", "v1")
+    backend = _StubBackend()
+
+    worker = SummarizerWorker(duckdb_path=pg_control_path, backend=backend)
+    assert worker.drain_once() == 1
+
+    job = JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "sess-ghost")
+    assert (job.status, job.error_category) == ("quarantined", "no_events")
+    assert "no events for session sess-ghost" in job.disposition_reason
+    assert backend.calls == 0
+
+
+def test_missing_api_key_releases_without_spending_an_attempt(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    _seed(tmp_path, pg_control_path, "sess-W2", "sess-W2b")
+    enqueue_summary_generation(pg_control_path, "sess-W2", "v1")
+    enqueue_summary_generation(pg_control_path, "sess-W2b", "v1")
+
+    worker = SummarizerWorker(duckdb_path=pg_control_path, api_key=None, batch_size=5)
+    # The batch stops at the first release: every job would hit the same wall.
+    assert worker.drain_batch() == 1
+
+    ledger = JobLedger(pg_control_path)
+    released = [
+        ledger.latest(SUMMARIZE_SESSION, sid) for sid in ("sess-W2", "sess-W2b")
+    ]
+    released = [job for job in released if job.status == "retry_wait"]
+    assert len(released) == 1
+    job = released[0]
+    assert (job.failures, job.error_category) == (0, "released")
+    assert "api_key" in job.last_error.lower()
+    assert job.next_run_at > datetime.now(timezone.utc) + timedelta(
+        seconds=UNCONFIGURED_RELEASE_SECONDS - 60
+    )
+    assert MemoryRepository(pg_control_path).counts()["session_summaries"] == 0
+
+
+def test_failure_at_supersession_does_not_spend_the_new_budget(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    _seed(tmp_path, pg_control_path, "s1")
+    enqueue_summary_generation(pg_control_path, "s1", "v1")
+
+    worker = SummarizerWorker(
+        duckdb_path=pg_control_path,
+        backend=_FailingBackend("backend failed"),
+        _before_failure_finish=lambda: enqueue_summary_generation(
+            pg_control_path, "s1", "v2"
+        ),
+    )
+    assert worker.drain_once() == 1
+
+    jobs = _jobs(pg_control_path, SUMMARIZE_SESSION)
+    assert [(v, s, f) for _, v, s, f, _ in jobs] == [
+        ("v1", "superseded", 0),
+        ("v2", "pending", 0),
+    ]
+
+
+def test_idle_drain_does_not_resolve_the_backend(
+    tmp_path: Path, pg_control_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#55: no backend selection (and no fallback warning) on an empty queue."""
+    _seed(tmp_path, pg_control_path)
+
+    class ExplodingBackend:
+        def ensure_ready(self):
+            raise AssertionError("backend should not be warmed on an idle tick")
+
+    worker = SummarizerWorker(duckdb_path=pg_control_path, backend=ExplodingBackend())
+    monkeypatch.setattr(
+        worker,
+        "_resolve_backend",
+        lambda: pytest.fail("backend resolved on an idle tick"),
+    )
+    assert worker.drain_once() == 0
+
+    # A job that is waiting out its backoff is not due either.
+    enqueue_summary_generation(pg_control_path, "later", "v1")
+    with control_plane_connection(pg_control_path) as con:
+        con.execute(
+            "UPDATE pipeline_jobs SET status = 'retry_wait', "
+            "next_run_at = now() + interval '1 hour'"
+        )
+    assert worker.drain_once() == 0
+
+
+def test_drain_batch_processes_multiple_jobs_with_one_warmup(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    _seed(tmp_path, pg_control_path, "sess-B2", "sess-B3", "sess-B4")
+    for sid in ("sess-B2", "sess-B3", "sess-B4"):
+        enqueue_summary_generation(pg_control_path, sid, "v1")
+
+    backend = _StubBackend()
+    worker = SummarizerWorker(
+        duckdb_path=pg_control_path, backend=backend, batch_size=10
+    )
+    assert worker.drain_batch() == 3
+    assert backend.calls == 3
+    # ensure_ready fires once per drain_batch call, not per job
+    assert backend.ensure_calls == 1
+    summaries = MemoryRepository(pg_control_path).summaries(
+        ["sess-B2", "sess-B3", "sess-B4"]
+    )
+    assert {s.generator_model for s in summaries.values()} == {"stub-model-v1"}
+    # The queue is empty: drain_batch stops instead of looping past it.
+    assert worker.drain_batch() == 0
+    assert backend.calls == 3
+
+
+def test_memory_unavailable_is_a_quiet_no_op(tmp_path: Path) -> None:
+    """A DuckDB control store has no ledger: enqueue and drain must not crash."""
+    duckdb_path = tmp_path / "drover.duckdb"
+    _seed(tmp_path, duckdb_path, "sess-duck")
+
+    assert enqueue_summary_generation(duckdb_path, "sess-duck", "v1") == "unavailable"
+
+    class ExplodingBackend:
+        def ensure_ready(self):
+            raise AssertionError("no backend work without a ledger")
+
+        def summarize(self, prompt):
+            raise AssertionError("no backend work without a ledger")
+
+    worker = SummarizerWorker(duckdb_path=duckdb_path, backend=ExplodingBackend())
+    assert worker.drain_once() == 0
+    assert worker.drain_batch(max_jobs=5) == 0

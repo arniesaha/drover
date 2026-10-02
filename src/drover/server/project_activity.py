@@ -86,6 +86,7 @@ def project_activity(
     days: int = 7,
     now: datetime | None = None,
     max_sessions: int = MAX_SESSIONS,
+    memory_store_path=None,
 ) -> dict[str, Any]:
     """Return a bounded per-project timeline from one analytical connection.
 
@@ -140,24 +141,16 @@ def project_activity(
             ids,
         )
     )
-    summaries = _by_session(
-        _optional_rows(
-            con,
-            f"""SELECT session_id, ended_at, summary_md, next_steps_md,
-                       open_questions
-                  FROM session_summaries
-                 WHERE session_id IN ({_placeholders(ids)})""",
-            ids,
-        )
-    )
-    recaps = _by_session(
-        _optional_rows(
-            con,
-            f"""SELECT session_id, recap_text FROM live_session_recaps
-                 WHERE session_id IN ({_placeholders(ids)})""",
-            ids,
-        )
-    )
+    from drover.server.ledger import memory_store_available
+    from drover.server.memory_store import MemoryRepository
+
+    summaries, recaps = {}, {}
+    if memory_store_path and memory_store_available(memory_store_path):
+        repo = MemoryRepository(memory_store_path)
+        summaries = {sid: row.as_dict() for sid, row in repo.summaries(ids).items()}
+        recaps = {
+            sid: {"recap_text": row.text} for sid, row in repo.live_recaps(ids).items()
+        }
 
     by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
     open_items: list[dict[str, Any]] = []

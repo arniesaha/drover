@@ -10,7 +10,7 @@ import pytest
 
 import drover.server.harness.registry as registry_module
 from drover.schema import bootstrap
-from drover.server.db import control_plane_path
+from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_duplicate_harness_events,
@@ -733,8 +733,13 @@ def _record(event_id, **overrides):
     return record
 
 
-def _structured_registry(tmp_path, *, harness="codex"):
-    registry, duckdb_path = _registry(tmp_path)
+def _structured_registry(path, *, harness="codex"):
+    """A structured session on the PostgreSQL control store.
+
+    Live recaps are derived memory (#480): their ``recap_session`` jobs live in
+    the PostgreSQL job ledger, so enqueue behaviour is only observable there.
+    """
+    registry = HarnessRegistry(path)
     registry.create_session(
         session_id="s1",
         host_id="laptop",
@@ -742,20 +747,24 @@ def _structured_registry(tmp_path, *, harness="codex"):
         command=harness,
         mode="structured",
     )
-    return registry, duckdb_path
+    return registry, path
 
 
-def _recap_job(duckdb_path, session_id):
-    with duckdb.connect(str(duckdb_path)) as con:
-        return con.execute(
-            "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
+def _recap_job(path, session_id):
+    """The live recap job's source sequence, as a 1-tuple, or None."""
+    with control_plane_connection(path) as con:
+        row = con.execute(
+            """SELECT source_version FROM pipeline_jobs
+                WHERE job_kind = 'recap_session' AND subject_key = ?
+                  AND status IN ('pending', 'running', 'retry_wait')""",
             [session_id],
         ).fetchone()
+    return (int(row[0]),) if row is not None else None
 
 
-def test_structured_turn_complete_enqueues_live_recap(tmp_path):
+def test_structured_turn_complete_enqueues_live_recap(pg_control_path):
     """A missing structured-completion enqueue would leave live recaps stale."""
-    registry, duckdb_path = _structured_registry(tmp_path)
+    registry, path = _structured_registry(pg_control_path)
 
     registry.append_event(
         session_id="s1",
@@ -764,16 +773,30 @@ def test_structured_turn_complete_enqueues_live_recap(tmp_path):
         seq=12,
     )
 
-    assert _recap_job(duckdb_path, "s1") == (12,)
+    assert _recap_job(path, "s1") == (12,)
+
+
+def test_out_of_order_completion_does_not_move_the_recap_backwards(pg_control_path):
+    """A late older completion must not retarget the waiting job to its seq."""
+    registry, path = _structured_registry(pg_control_path)
+    for seq in (12, 9):
+        registry.append_event(
+            session_id="s1",
+            event_type="status",
+            payload={"turn_complete": True},
+            seq=seq,
+        )
+
+    assert _recap_job(path, "s1") == (12,)
 
 
 def test_structured_completion_insert_rolls_back_when_enqueue_fails(
-    tmp_path, monkeypatch
+    pg_control_path, monkeypatch
 ):
     """A queue failure must not persist an unqueued completion event."""
-    registry, duckdb_path = _structured_registry(tmp_path)
+    registry, path = _structured_registry(pg_control_path)
 
-    def unavailable(*_args):
+    def unavailable(*_args, **_kwargs):
         raise RuntimeError("queue unavailable")
 
     monkeypatch.setattr(registry_module, "enqueue_live_recap", unavailable)
@@ -787,33 +810,62 @@ def test_structured_completion_insert_rolls_back_when_enqueue_fails(
         )
 
     assert registry.list_events("s1") == []
-    assert _recap_job(duckdb_path, "s1") is None
+    assert _recap_job(path, "s1") is None
 
 
-def test_terminal_and_noncompletion_events_do_not_enqueue_live_recap(tmp_path):
+def test_terminal_and_noncompletion_events_do_not_enqueue_live_recap(pg_control_path):
     """Terminal activity and partial structured output are not recap boundaries."""
-    terminal, terminal_db = _session_for_events(tmp_path / "terminal")
-    terminal.append_event(
-        session_id="s1",
+    registry, path = _structured_registry(pg_control_path)
+    registry.create_session(
+        session_id="term",
+        host_id="laptop",
+        harness="shell",
+        command="/bin/sh",
+        status="running",
+    )
+    registry.append_event(
+        session_id="term",
         event_type="status",
         payload={"turn_complete": True},
         seq=12,
     )
-    structured, structured_db = _structured_registry(tmp_path / "structured")
-    structured.append_event(
+    registry.append_event(
         session_id="s1",
         event_type="assistant_output",
         payload={"text": "Still working."},
         seq=12,
     )
 
-    assert _recap_job(terminal_db, "s1") is None
-    assert _recap_job(structured_db, "s1") is None
+    assert _recap_job(path, "term") is None
+    assert _recap_job(path, "s1") is None
 
 
-def test_batch_mirror_preserves_sequence_and_enqueues_live_recap(tmp_path):
+def test_duckdb_control_plane_completion_appends_without_a_recap(tmp_path):
+    """Without PostgreSQL live recaps are unavailable; the event still lands."""
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="s1",
+        host_id="laptop",
+        harness="codex",
+        command="codex",
+        mode="structured",
+    )
+
+    registry.append_event(
+        session_id="s1",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=12,
+    )
+
+    assert [event.seq for event in registry.list_events("s1")] == [12]
+    assert registry.latest_live_recaps(["s1"]) == {}
+    assert registry.reconcile_orphan_completions() == 0
+
+
+def test_batch_mirror_preserves_sequence_and_enqueues_live_recap(pg_control_path):
     """The mirrored wire envelope must enqueue at the preserved host sequence."""
-    registry, duckdb_path = _structured_registry(tmp_path)
+    registry, path = _structured_registry(pg_control_path)
 
     inserted = registry.append_events_if_new(
         [
@@ -835,14 +887,37 @@ def test_batch_mirror_preserves_sequence_and_enqueues_live_recap(tmp_path):
 
     assert inserted == 1
     assert registry.get_event("e12").seq == 12
-    assert _recap_job(duckdb_path, "s1") == (12,)
+    assert _recap_job(path, "s1") == (12,)
+
+
+def test_orphan_completion_is_enqueued_when_its_session_arrives(pg_control_path):
+    """A completion stored before its session row is recovered on creation."""
+    registry = HarnessRegistry(pg_control_path)
+    registry.append_event(
+        event_id="e12",
+        session_id="s1",
+        event_type="status",
+        payload={"type": "status", "payload": {"turn_complete": True}},
+        seq=12,
+    )
+    assert _recap_job(pg_control_path, "s1") is None
+
+    registry.create_session(
+        session_id="s1",
+        host_id="laptop",
+        harness="codex",
+        command="codex",
+        mode="structured",
+    )
+
+    assert _recap_job(pg_control_path, "s1") == (12,)
 
 
 def test_session_materialization_survives_when_orphan_recap_enqueue_fails(
-    tmp_path, monkeypatch
+    pg_control_path, monkeypatch
 ):
     """A derived recap queue failure must not roll back the core session row."""
-    registry, duckdb_path = _registry(tmp_path)
+    registry = HarnessRegistry(pg_control_path)
     registry.append_event(
         event_id="e12",
         session_id="s1",
@@ -851,7 +926,7 @@ def test_session_materialization_survives_when_orphan_recap_enqueue_fails(
         seq=12,
     )
 
-    def unavailable(*_args):
+    def unavailable(*_args, **_kwargs):
         raise RuntimeError("queue unavailable")
 
     monkeypatch.setattr(registry_module, "enqueue_live_recap", unavailable)
@@ -867,7 +942,12 @@ def test_session_materialization_survives_when_orphan_recap_enqueue_fails(
 
     assert registry.get_session("s1") is not None
     assert registry.get_event("e12") is not None
-    assert _recap_job(duckdb_path, "s1") is None
+    assert _recap_job(pg_control_path, "s1") is None
+
+    # The session kept its reconcile marker; the worker's poll recovers it.
+    monkeypatch.undo()
+    assert registry.reconcile_orphan_completions() == 1
+    assert _recap_job(pg_control_path, "s1") == (12,)
 
 
 def test_append_events_if_new_writes_a_batch_in_one_window(tmp_path):

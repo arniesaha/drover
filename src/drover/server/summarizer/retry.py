@@ -1,4 +1,4 @@
-"""Retry tooling for failed summarize_jobs.
+"""Retry tooling for failed ``summarize_session`` ledger jobs (#480).
 
 By default this only requeues errors that are plausibly runtime/transient
 (auth, rate-limit, backend availability) and deliberately skips schema/model
@@ -10,10 +10,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import duckdb
+from drover.server.ledger import (
+    DEAD_LETTERED,
+    FAILED_STATUSES,
+    QUARANTINED,
+    SUMMARIZE_SESSION,
+    JobLedger,
+)
 
-from drover.server.db import open_duckdb_connection
-from drover.server.summarizer.jobs import summary_jobs_writer
+#: How many failed rows one requeue pass inspects. Several generations of
+#: one session can each have failed; only the newest per session is a
+#: candidate, so this is a scan bound, not the requeue bound (``limit``).
+_SCAN_LIMIT = 10_000
 
 _AUTH_PATTERNS = (
     "401",
@@ -105,56 +113,79 @@ def classify_summarize_error(
 
 
 def retry_errored_jobs(
-    duckdb_path: str | Path,
+    store_path: str | Path,
     *,
     apply: bool = False,
     include_validation: bool = False,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Reset matching errored or dead-lettered summarize_jobs to pending.
+    """Requeue failed ``summarize_session`` ledger jobs (operator escape hatch).
 
-    ``apply=False`` is a dry run and returns the jobs that would be reset.
-    ``attempts`` is left intact so operators keep failure history.
+    ``store_path`` is the control-store registration path (the configured
+    ``duckdb_path``). ``apply=False`` is a dry run and returns the sessions
+    that would be requeued.
 
-    Dead-lettered jobs are included because ``dead_letter_streak`` is
-    otherwise terminal: once a session has burned its generations, nothing
-    re-enqueues it, so fixing the backend would never bring it back. This is
-    that escape hatch, and the only place the streak is cleared by hand.
+    Candidates are each session's newest summarize job, and only when it is
+    failed: ``dead_lettered`` when its error classifies as retryable (auth,
+    rate limit, runtime, repeated lease expiry), and ``quarantined`` --
+    validation failures and
+    sessions with no events -- only with ``include_validation``. A session
+    whose newest job is live or succeeded is left alone, so a requeue can
+    never replace newer work with an older source generation.
+
+    Applying opens a fresh job for the same source version with ``force``:
+    a new attempt budget, past the "this version already failed" check and
+    the dead-letter streak cap. The streak is otherwise terminal -- once a
+    session has burned its generations nothing re-enqueues it, so fixing the
+    backend would never bring it back. The failed rows stay as history.
+
+    Raises :class:`~drover.server.ledger.MemoryStoreUnavailable` when the
+    control store is not PostgreSQL (there is no ledger to requeue).
     """
-    con = open_duckdb_connection(duckdb_path)
-    try:
-        rows = con.execute(
-            """SELECT session_id, last_error
-               FROM summarize_jobs
-               WHERE status IN ('errored', 'dead_lettered')
-               ORDER BY updated_at NULLS LAST, enqueued_at ASC, session_id ASC"""
-        ).fetchall()
-        matched = [
-            (sid, err)
-            for sid, err in rows
-            if classify_retryable_error(err, include_validation=include_validation)
-        ]
-        if limit is not None:
-            matched = matched[: max(0, int(limit))]
-        if apply and matched:
-            with summary_jobs_writer():
-                con.executemany(
-                    """UPDATE summarize_jobs
-                       SET status='pending', updated_at=now(),
-                           next_run_at=NULL, dead_lettered_at=NULL,
-                           dead_letter_streak=0
-                       WHERE session_id=? AND status IN ('errored', 'dead_lettered')""",
-                    [(sid,) for sid, _ in matched],
-                )
-            updated = [sid for sid, _ in matched]
-        else:
-            updated = []
-        return {
-            "dry_run": not apply,
-            "include_validation": include_validation,
-            "matched": [sid for sid, _ in matched],
-            "updated": updated,
-            "count": len(matched),
-        }
-    finally:
-        con.close()
+    ledger = JobLedger(store_path)
+    newest_failed: dict[str, Any] = {}
+    for row in ledger.jobs(
+        SUMMARIZE_SESSION, statuses=FAILED_STATUSES, limit=_SCAN_LIMIT
+    ):
+        # Rows arrive newest first; keep the newest failure per session.
+        newest_failed.setdefault(row.subject_key, row)
+
+    matched = []
+    for row in sorted(
+        newest_failed.values(), key=lambda r: (r.enqueued_at, r.subject_key)
+    ):
+        if row.status == QUARANTINED:
+            if not include_validation:
+                continue
+        elif row.status == DEAD_LETTERED:
+            # A lease that kept expiring is a worker crash or timeout, which
+            # is runtime trouble whatever the message says.
+            if row.error_category != "lease_expired" and not classify_retryable_error(
+                row.last_error, include_validation=include_validation
+            ):
+                continue
+        latest = ledger.latest(SUMMARIZE_SESSION, row.subject_key)
+        if latest is None or latest.job_id != row.job_id:
+            continue
+        matched.append(row)
+    if limit is not None:
+        matched = matched[: max(0, int(limit))]
+
+    updated: list[str] = []
+    if apply:
+        for row in matched:
+            outcome = ledger.enqueue(
+                SUMMARIZE_SESSION,
+                row.subject_key,
+                source_version=row.source_version,
+                force=True,
+            )
+            if outcome in ("queued", "requeued"):
+                updated.append(row.subject_key)
+    return {
+        "dry_run": not apply,
+        "include_validation": include_validation,
+        "matched": [row.subject_key for row in matched],
+        "updated": updated,
+        "count": len(matched),
+    }

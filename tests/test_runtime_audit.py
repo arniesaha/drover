@@ -10,7 +10,11 @@ from pathlib import Path
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from click.testing import CliRunner
+from conftest import pgvector_available
+from memory_helpers import drive_job as _job
+from memory_helpers import put_embedding
 
 from drover.event_identity import audit_agent_event_identity, scan_agent_events_once
 from drover.schema import bootstrap
@@ -18,9 +22,14 @@ from drover.server.__main__ import main
 from drover.server.doctor import format_runtime_audit
 from drover.server.doctor import runtime_audit as _runtime_audit
 
-# Many audits here assert span sections, so the module opts into the optional
-# span integration (#473); the spans-off default is tested explicitly below.
 runtime_audit = functools.partial(_runtime_audit, spans_enabled=True)
+from drover.server.ledger import (
+    BRIEF_PROJECT,
+    EMBED_SESSION,
+    RECAP_SESSION,
+    SUMMARIZE_SESSION,
+    JobLedger,
+)
 
 _SPAN_SCHEMA = pa.schema(
     [
@@ -209,42 +218,23 @@ def _write_span(parquet_dir: Path, **row) -> None:
     )
 
 
-def _seed_runtime_db(tmp_path: Path) -> tuple[Path, Path]:
+def _seed_runtime_db(
+    tmp_path: Path, *, store: Path | None = None, vectors: bool = False
+) -> tuple[Path, Path]:
+    """The analytical DuckDB; with ``store`` (pg_control_path) also memory jobs."""
     parquet_dir = tmp_path / "parquet"
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db)
     _write_agent_events(parquet_dir)
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('s1', 'done', 1, NULL, now())"
-        )
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('s2', 'errored', 2, 'boom', now())"
-        )
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('s3', 'pending', 0, NULL, now())"
-        )
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('s1', 'pending', 0, NULL, now())"
-        )
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('s2', 'done', 1, NULL, now())"
-        )
-        con.execute(
-            "INSERT INTO session_embeddings (session_id, embedding, model, dim, embedded_at) VALUES ('s2', [0.1, 0.2], 'm', 2, now())"
-        )
-        con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status, attempts, last_error, updated_at) VALUES ('span-1', 'pending', 0, NULL, now())"
-        )
-        con.execute("""INSERT INTO span_embeddings
-               (span_id, trace_id, session_id, task_id, agent_id, source_text,
-                source_fields, embedding, model, dim, embedded_at)
-               VALUES ('span-2', 'trace-2', 'aw-s2', 'task', 'agent-a', 'prompt: ok',
-                       ['prompt_preview'], [0.1, 0.2], 'm', 2, now())""")
-    finally:
-        con.close()
+    if store is not None:
+        _job(store, SUMMARIZE_SESSION, "s1", "succeeded")
+        _job(store, SUMMARIZE_SESSION, "s2", "retry_wait", error="boom")
+        _job(store, SUMMARIZE_SESSION, "s3")
+        _job(store, EMBED_SESSION, "s2", "succeeded")
+        _job(store, EMBED_SESSION, "s1")
+        if vectors:
+            put_embedding(store, "s2")
     incoming = tmp_path / "incoming"
     (incoming / "agent-a" / ".processed").mkdir(parents=True)
     (incoming / "agent-a").mkdir(parents=True, exist_ok=True)
@@ -253,30 +243,55 @@ def _seed_runtime_db(tmp_path: Path) -> tuple[Path, Path]:
     return db, incoming
 
 
-def test_runtime_audit_reports_operational_health(tmp_path: Path, monkeypatch) -> None:
+def test_runtime_audit_reports_operational_health(
+    tmp_path: Path, monkeypatch, pg_control_path: Path, postgres_dsn: str
+) -> None:
     monkeypatch.setenv(
         "DROVER_GENERAL_WORKSPACE_ROOTS",
         "/Users/arnabmac:/home/Arnab:/Users/arnabmac/.claude-mem/observer-sessions",
     )
-    db, incoming = _seed_runtime_db(tmp_path)
+    vectors = pgvector_available(postgres_dsn)
+    db, incoming = _seed_runtime_db(tmp_path, store=pg_control_path, vectors=vectors)
 
     report = runtime_audit(duckdb_path=db, incoming_dir=incoming, hours=24)
 
-    assert report["table_counts"]["summarize_jobs"] == 3
+    memory = report["memory"]
+    assert memory["available"] is True
+    assert set(memory["jobs"]) == {
+        SUMMARIZE_SESSION,
+        EMBED_SESSION,
+        BRIEF_PROJECT,
+        RECAP_SESSION,
+    }
+    summarize_stats = memory["jobs"][SUMMARIZE_SESSION]
+    assert summarize_stats["pending"] == 1
+    assert summarize_stats["retry_wait"] == 1
+    assert summarize_stats["last_success_at"] is not None
+    assert summarize_stats["last_error"] == "boom"
+    assert memory["vector"]["ready"] is vectors
+    assert report["table_counts"]["session_summaries"] == 0
+    assert report["table_counts"]["project_briefs"] == 0
     assert report["latest_events"]["agent-a"]["event_type"] == "Stop"
     assert report["summarize_jobs"]["status_counts"] == {
-        "done": 1,
-        "errored": 1,
         "pending": 1,
+        "running": 0,
+        "errored": 1,
+        "dead_lettered": 0,
+        "quarantined": 0,
     }
     assert report["summarize_jobs"]["recent_errors"][0]["last_error"] == "boom"
-    assert report["embed_jobs"]["status_counts"] == {"done": 1, "pending": 1}
-    assert report["span_embed_jobs"]["status_counts"] == {"pending": 1}
-    assert report["embedding_status"]["state"] == "backlog"
-    assert "pending" in report["embedding_status"]["message"]
-    assert report["session_embeddings_count"] == 1
-    assert report["span_embedding_coverage"]["embedded_spans"] == 1
-    assert report["span_embedding_coverage"]["pending_jobs"] == 1
+    assert report["summarize_jobs"]["recent_errors"][0]["session_id"] == "s2"
+    assert report["embed_jobs"]["status_counts"]["pending"] == 1
+    assert "span_embed_jobs" not in report
+    assert "span_embedding_coverage" not in report
+    if vectors:
+        assert report["embedding_status"]["state"] == "backlog"
+        assert "pending" in report["embedding_status"]["message"]
+        assert report["session_embeddings_count"] == 1
+    else:
+        assert report["embedding_status"]["state"] == "vector_unavailable"
+        assert "pgvector" in report["embedding_status"]["message"]
+        assert report["session_embeddings_count"] is None
     assert report["repo_attribution"]["agent-a"]["percent"] == 100.0
     assert report["repo_attribution"]["agent-a"]["general_workspace"] == 2
     assert report["repo_attribution"]["agent-a"]["project_total"] == 1
@@ -384,7 +399,7 @@ def test_runtime_audit_reports_spans_disabled_without_reading_them(
     assert report["span_integration"] == "disabled"
     assert report["span_health"]["status"] == "disabled"
     assert report["openclaw_agentweave_health"]["status"] == "disabled"
-    assert report["span_embedding_coverage"]["status"] == "disabled"
+    assert "span_embedding_coverage" not in report
     assert report["table_counts"]["spans"] is None
     assert not [w for w in report["warnings"] if "span" in w.lower()]
     assert "span integration: disabled" in text
@@ -451,110 +466,112 @@ def test_runtime_audit_groups_pending_incoming_by_source_without_db_writes(
     assert "Mac watcher bottleneck" not in rendered
 
 
-def test_runtime_audit_separates_stale_running_span_jobs_and_bounds_coverage(
-    tmp_path: Path,
+def test_runtime_audit_reports_per_kind_memory_job_health(
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
+    """Briefs and recaps get the same queue health as summaries (#480)."""
     db = tmp_path / "drover.duckdb"
-    parquet_dir = tmp_path / "parquet"
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=db)
-    now = datetime.now(timezone.utc)
-    _write_span(
-        parquet_dir,
-        trace_id="trace-current",
-        span_id="span-current",
-        parent_span_id=None,
-        name="llm_call",
-        service_name="agentweave",
-        start_time=now,
-        end_time=now + timedelta(seconds=1),
-        duration_ms=1000.0,
-        session_id="session-current",
-        task_id="task-current",
-        agent_id="agent-a",
-        cost_usd=0.01,
-        attributes_json="{}",
-        dedup_key="dedup-current",
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+    _job(pg_control_path, BRIEF_PROJECT, "arniesaha/drover")
+    _job(
+        pg_control_path, RECAP_SESSION, "live-1", "quarantined", error="bad transcript"
     )
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
+    _job(pg_control_path, SUMMARIZE_SESSION, "stuck", "running")
+    # A worker that died mid-job: its lease ran out without a heartbeat.
+    with JobLedger(pg_control_path).connection() as con:
         con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status, attempts, updated_at) VALUES ('span-current', 'done', 1, now())"
+            "UPDATE pipeline_jobs SET lease_expires_at = now() - interval '1 minute' "
+            "WHERE subject_key = 'stuck'"
         )
-        con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status, attempts, updated_at) VALUES ('span-stale', 'running', 1, now() - INTERVAL '3 days')"
-        )
-        con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status, attempts, updated_at) VALUES ('span-running-fresh', 'running', 1, now())"
-        )
-        con.execute("""INSERT INTO span_embeddings
-               (span_id, trace_id, session_id, task_id, agent_id, source_text,
-                source_fields, embedding, model, dim, embedded_at)
-               VALUES ('span-current', 'trace-current', 'session-current', 'task-current', 'agent-a', 'prompt: ok',
-                       ['prompt_preview'], [0.1, 0.2], 'm', 2, now()),
-                      ('span-derived-old', 'trace-old', 'session-old', 'task-old', 'agent-a', 'prompt: old',
-                       ['prompt_preview'], [0.1, 0.2], 'm', 2, now())""")
-    finally:
-        con.close()
 
-    report = runtime_audit(duckdb_path=db, incoming_dir=tmp_path / "incoming", hours=24)
+    report = runtime_audit(duckdb_path=db, incoming_dir=None, hours=24)
 
-    span_jobs = report["span_embed_jobs"]
-    assert span_jobs["status_counts"] == {"done": 1, "running": 2}
-    assert span_jobs["running_jobs"] == 2
-    assert span_jobs["stale_running_jobs"] == 1
-    assert span_jobs["stale_running_age_hours"] >= 72
-    assert span_jobs["stale_running"][0]["span_id"] == "span-stale"
-    coverage = report["span_embedding_coverage"]
-    assert coverage["embedded_spans"] == 2
-    assert coverage["embedded_recent_spans"] == 1
-    assert coverage["total_recent_spans"] == 1
-    assert coverage["pending_jobs"] == 0
-    assert coverage["stale_running_jobs"] == 1
-    assert coverage["coverage_percent"] == 100.0
-    assert "derived or historical" in coverage["coverage_note"]
+    jobs = report["memory"]["jobs"]
+    assert jobs[BRIEF_PROJECT]["pending"] == 1
+    assert jobs[RECAP_SESSION]["quarantined"] == 1
+    assert jobs[SUMMARIZE_SESSION]["running"] == 1
+    assert jobs[SUMMARIZE_SESSION]["expired_leases"] == 1
+    assert report["brief_jobs"]["status_counts"]["pending"] == 1
+    assert report["recap_jobs"]["status_counts"]["quarantined"] == 1
+    assert report["recap_jobs"]["recent_errors"][0]["retryable"] is False
+    assert any("past their lease" in w for w in report["warnings"])
 
     formatted = format_runtime_audit(report)
-    assert "span_embed_jobs: done=1, running=2 (stale_running=1" in formatted
-    assert "coverage=100.0%" in formatted
-    assert "2 total embedded; 1 in recent span denominator" in formatted
+    assert "derived memory (PostgreSQL): available" in formatted
+    assert "brief_jobs: " in formatted and "recap_jobs: " in formatted
+    assert "expired_leases=1" in formatted
+
+
+def test_runtime_audit_reports_memory_unavailable_without_postgres(
+    tmp_path: Path,
+) -> None:
+    """A DuckDB control store: the memory section says why, nothing crashes."""
+    db, incoming = _seed_runtime_db(tmp_path)
+
+    report = runtime_audit(duckdb_path=db, incoming_dir=incoming, hours=24)
+
+    memory = report["memory"]
+    assert memory["available"] is False
+    assert "PostgreSQL" in memory["detail"]
+    assert memory["jobs"] == {}
+    assert memory["vector"]["ready"] is False
+    assert report["table_counts"]["session_summaries"] is None
+    assert report["session_embeddings_count"] is None
+    assert report["embedding_status"]["state"] == "unavailable"
+    assert report["session_consistency"]["summaries_available"] is False
+    assert report["table_counts"]["agent_events"] == 10
+    assert any(w.startswith("derived memory unavailable") for w in report["warnings"])
+    assert "derived memory (PostgreSQL): unavailable" in format_runtime_audit(report)
 
 
 def test_runtime_audit_reports_summarizer_retryability_without_raw_error_dump(
-    tmp_path: Path,
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.executemany(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error, updated_at) VALUES (?, 'errored', ?, ?, now())",
-            [
-                (
-                    "runtime-failure",
-                    2,
-                    "GPU WoL relay unreachable: No route to host; token=secret-value",
-                ),
-                ("auth-failure", 1, "Error code: 401 - invalid authentication"),
-                ("schema-failure", 1, "LLM response missing required keys"),
-            ],
-        )
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('pending-job', 'pending', 0, NULL, now())"
-        )
-    finally:
-        con.close()
+    # Retryable failures wait to retry; a non-retryable input fault is
+    # quarantined -- the ledger's retryable vs non-retryable split.
+    _job(
+        pg_control_path,
+        SUMMARIZE_SESSION,
+        "runtime-failure",
+        "retry_wait",
+        error="GPU WoL relay unreachable: No route to host; token=secret-value",
+    )
+    _job(
+        pg_control_path,
+        SUMMARIZE_SESSION,
+        "auth-failure",
+        "retry_wait",
+        error="Error code: 401 - invalid authentication",
+    )
+    _job(
+        pg_control_path,
+        SUMMARIZE_SESSION,
+        "schema-failure",
+        "quarantined",
+        error="LLM response missing required keys",
+    )
+    _job(pg_control_path, SUMMARIZE_SESSION, "pending-job")
 
     report = runtime_audit(duckdb_path=db, incoming_dir=None, hours=24)
 
     health = report["summarize_jobs"]["backend_health"]
-    assert health == {
+    assert health["oldest_pending_age_seconds"] is not None
+    assert {
+        key: value
+        for key, value in health.items()
+        if key not in {"oldest_pending_age_seconds"}
+    } == {
         "state": "backlog_with_retryable_errors",
         "pending": 1,
         "running": 0,
         "errored": 3,
         "retryable_errors": 2,
         "non_retryable_errors": 1,
+        "dead_lettered": 0,
+        "expired_leases": 0,
+        "last_success_at": None,
         "error_categories": {"auth": 1, "runtime": 1, "validation": 1},
     }
     errors_by_session = {
@@ -570,17 +587,11 @@ def test_runtime_audit_reports_summarizer_retryability_without_raw_error_dump(
 
 
 def test_runtime_audit_reports_summarizer_idle_when_no_pending_or_errors(
-    tmp_path: Path,
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('done-job', 'done', 1, NULL, now())"
-        )
-    finally:
-        con.close()
+    _job(pg_control_path, SUMMARIZE_SESSION, "done-job", "succeeded")
 
     report = runtime_audit(duckdb_path=db, incoming_dir=None, hours=24)
 
@@ -1442,16 +1453,6 @@ def test_runtime_audit_reports_agent_event_identity_duplicates(tmp_path: Path) -
             """)
         con.execute("CREATE TABLE spans (span_id VARCHAR)")
         con.execute("CREATE TABLE tasks (task_id VARCHAR)")
-        con.execute("CREATE TABLE session_summaries (session_id VARCHAR)")
-        con.execute(
-            "CREATE TABLE summarize_jobs (session_id VARCHAR, status VARCHAR, attempts INTEGER, last_error VARCHAR, updated_at TIMESTAMP, enqueued_at TIMESTAMP)"
-        )
-        con.execute(
-            "CREATE TABLE embed_jobs (session_id VARCHAR, status VARCHAR, attempts INTEGER, last_error VARCHAR, updated_at TIMESTAMP, enqueued_at TIMESTAMP)"
-        )
-        con.execute(
-            "CREATE TABLE session_embeddings (session_id VARCHAR, embedding FLOAT[], model VARCHAR, dim INTEGER, embedded_at TIMESTAMP)"
-        )
     finally:
         con.close()
 
@@ -1499,10 +1500,6 @@ def test_runtime_audit_flags_duplicate_canonical_dedup_keys(tmp_path: Path) -> N
             """)
         con.execute("CREATE TABLE spans (span_id VARCHAR)")
         con.execute("CREATE TABLE tasks (task_id VARCHAR)")
-        con.execute("CREATE TABLE session_summaries (session_id VARCHAR)")
-        con.execute("CREATE TABLE summarize_jobs (session_id VARCHAR, status VARCHAR)")
-        con.execute("CREATE TABLE embed_jobs (session_id VARCHAR, status VARCHAR)")
-        con.execute("CREATE TABLE session_embeddings (session_id VARCHAR)")
     finally:
         con.close()
 
@@ -1518,19 +1515,36 @@ def test_runtime_audit_flags_duplicate_canonical_dedup_keys(tmp_path: Path) -> N
     )
 
 
-def test_runtime_audit_flags_embedding_queue_with_no_vectors(tmp_path: Path) -> None:
+def test_runtime_audit_flags_missing_pgvector_as_vector_unavailable(
+    tmp_path: Path, pg_control_path: Path, postgres_dsn: str
+) -> None:
+    if pgvector_available(postgres_dsn):
+        pytest.skip("pgvector is installed on the test server")
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status, attempts, updated_at) VALUES ('s1', 'pending', 0, now())"
-        )
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status, attempts, updated_at) VALUES ('s2', 'pending', 0, now())"
-        )
-    finally:
-        con.close()
+    _job(pg_control_path, EMBED_SESSION, "s1")
+
+    report = runtime_audit(duckdb_path=duckdb_path, hours=24)
+
+    assert report["memory"]["available"] is True
+    assert report["memory"]["vector"]["ready"] is False
+    assert report["embedding_status"]["state"] == "vector_unavailable"
+    assert "pgvector" in report["embedding_status"]["message"]
+    assert report["table_counts"]["session_embeddings"] is None
+    assert any(
+        w.startswith("session embeddings unavailable") for w in report["warnings"]
+    )
+
+
+def test_runtime_audit_flags_embedding_queue_with_no_vectors(
+    tmp_path: Path, pg_control_path: Path, postgres_dsn: str
+) -> None:
+    if not pgvector_available(postgres_dsn):
+        pytest.skip("pgvector is not installed on the test server")
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    _job(pg_control_path, EMBED_SESSION, "s1")
+    _job(pg_control_path, EMBED_SESSION, "s2")
 
     report = runtime_audit(duckdb_path=duckdb_path, hours=24)
     text = format_runtime_audit(report)
@@ -1767,25 +1781,29 @@ def test_agent_event_identity_counts_rows_with_null_ids() -> None:
 def test_runtime_audit_handles_missing_tables_and_incoming_dir(tmp_path: Path) -> None:
     db = tmp_path / "minimal.duckdb"
     con = duckdb.connect(str(db))
-    con.execute("CREATE TABLE summarize_jobs (session_id VARCHAR, status VARCHAR)")
+    con.execute("CREATE TABLE tasks (task_id VARCHAR)")
     con.close()
 
     report = runtime_audit(duckdb_path=db, incoming_dir=tmp_path / "missing", hours=24)
 
-    assert report["table_counts"]["summarize_jobs"] == 0
+    assert report["table_counts"]["tasks"] == 0
     assert report["table_counts"]["agent_events"] is None
     assert report["latest_events"] == {}
     assert report["agent_event_identity"]["status"] == "missing"
     assert report["unprocessed_incoming"] == []
-    assert report["warnings"] == []
+    # The only warning is the absent memory store (no PostgreSQL here).
+    assert len(report["warnings"]) == 1
+    assert report["warnings"][0].startswith("derived memory unavailable")
 
 
-def test_format_runtime_audit_is_concise(tmp_path: Path, monkeypatch) -> None:
+def test_format_runtime_audit_is_concise(
+    tmp_path: Path, monkeypatch, pg_control_path: Path
+) -> None:
     monkeypatch.setenv(
         "DROVER_GENERAL_WORKSPACE_ROOTS",
         "/Users/arnabmac:/home/Arnab:/Users/arnabmac/.claude-mem/observer-sessions",
     )
-    db, incoming = _seed_runtime_db(tmp_path)
+    db, incoming = _seed_runtime_db(tmp_path, store=pg_control_path)
     text = format_runtime_audit(
         runtime_audit(duckdb_path=db, incoming_dir=incoming, hours=24)
     )

@@ -41,20 +41,62 @@ def test_requires_the_postgres_control_store(tmp_path):
         JobLedger(tmp_path / "drover.duckdb")
 
 
-def test_migration_records_version_five(pg_control_path):
+def test_memory_migration_preserves_existing_control_migrations_and_legacy_data(
+    pg_control_path,
+):
     with control_plane_connection(pg_control_path) as con:
-        versions = [r[0] for r in con.execute(
-            "SELECT version FROM control_schema_migrations ORDER BY version"
-        ).fetchall()]
+        versions = [
+            r[0]
+            for r in con.execute(
+                "SELECT version FROM control_schema_migrations ORDER BY version"
+            ).fetchall()
+        ]
         legacy = con.execute("SELECT to_regclass('live_recap_jobs')").fetchone()[0]
-    assert 5 in versions
-    assert legacy is None
+    assert {5, 6, 7} <= set(versions)
+    assert legacy is not None
+
+
+def test_upgrade_from_main_preserves_legacy_recaps_and_host_metadata(pg_control_path):
+    from drover.schema import bootstrap_control_plane_store
+
+    # Recreate main's pre-Phase-3 state in this disposable schema.
+    with control_plane_connection(pg_control_path) as con:
+        con.execute("DROP TABLE IF EXISTS session_embeddings")
+        con.execute(
+            "DROP TABLE pipeline_job_attempts, pipeline_jobs, session_memory, project_briefs"
+        )
+        con.execute("DELETE FROM control_schema_migrations WHERE version IN (7, 8)")
+        con.execute(
+            """INSERT INTO live_recap_jobs (session_id, desired_source_seq, status)
+            VALUES ('legacy', 9, 'pending')"""
+        )
+        con.execute(
+            """INSERT INTO harness_hosts (host_id, display_name, kind, retired_reason, status, capabilities_json)
+            VALUES ('retired', 'Retired host', 'test', 'preserved', 'offline', '{}')"""
+        )
+        con.execute("""INSERT INTO harness_sessions
+            (session_id, host_id, harness, command, parent_session_id, status)
+            VALUES ('child', 'retired', 'codex', 'codex', 'parent', 'exited')""")
+    bootstrap_control_plane_store(pg_control_path)
+    with control_plane_connection(pg_control_path) as con:
+        assert con.execute(
+            "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id='legacy'"
+        ).fetchone() == (9,)
+        assert con.execute(
+            "SELECT retired_reason FROM harness_hosts WHERE host_id='retired'"
+        ).fetchone() == ("preserved",)
+        assert con.execute(
+            "SELECT parent_session_id FROM harness_sessions WHERE session_id='child'"
+        ).fetchone() == ("parent",)
+        assert con.execute("SELECT count(*) FROM pipeline_jobs").fetchone() == (0,)
 
 
 def test_enqueue_is_idempotent_per_source_version(pg_control_path):
     ledger = _ledger(pg_control_path)
     assert ledger.enqueue(SUMMARIZE_SESSION, "s1", source_version="v1") == "queued"
-    assert ledger.enqueue(SUMMARIZE_SESSION, "s1", source_version="v1") == "already_queued"
+    assert (
+        ledger.enqueue(SUMMARIZE_SESSION, "s1", source_version="v1") == "already_queued"
+    )
     # A newer generation retargets the waiting job in place: still one live row.
     assert ledger.enqueue(SUMMARIZE_SESSION, "s1", source_version="v2") == "requeued"
     with control_plane_connection(pg_control_path) as con:
@@ -110,7 +152,12 @@ def test_non_retryable_failure_quarantines_one_row_only(pg_control_path):
     ledger.enqueue(EMBED_SESSION, "healthy")
     jobs = ledger.claim(EMBED_SESSION, worker_id="w", limit=2)
     by_subject = {j.subject_key: j for j in jobs}
-    assert ledger.fail(by_subject["poison"], "bad input", retryable=False, category="validation") == "quarantined"
+    assert (
+        ledger.fail(
+            by_subject["poison"], "bad input", retryable=False, category="validation"
+        )
+        == "quarantined"
+    )
     assert ledger.complete(by_subject["healthy"])
     row = _row(pg_control_path, by_subject["poison"].job_id)
     assert row["status"] == "quarantined"
@@ -124,7 +171,10 @@ def test_summary_streak_cap_suppresses_new_generations(pg_control_path):
         [job] = ledger.claim(SUMMARIZE_SESSION, worker_id="w")
         assert ledger.fail(job, "nope", retryable=False) == "quarantined"
     assert ledger.enqueue(SUMMARIZE_SESSION, "s", source_version="v4") == "suppressed"
-    assert ledger.enqueue(SUMMARIZE_SESSION, "s", source_version="v4", force=True) == "queued"
+    assert (
+        ledger.enqueue(SUMMARIZE_SESSION, "s", source_version="v4", force=True)
+        == "queued"
+    )
 
 
 def test_running_job_is_superseded_and_its_completion_is_fenced(pg_control_path):
@@ -155,6 +205,64 @@ def test_expired_lease_is_reclaimed_and_counts_as_failure(pg_control_path):
     row = _row(pg_control_path, job.job_id)
     assert row["status"] == "retry_wait" and row["failures"] == 1
     assert row["error_category"] == "lease_expired"
+
+
+def test_expired_token_cannot_finish_or_extend_before_reclamation(pg_control_path):
+    ledger = _ledger(pg_control_path)
+    ledger.enqueue(EMBED_SESSION, "expired")
+    [job] = ledger.claim(EMBED_SESSION, worker_id="w")
+    with control_plane_connection(pg_control_path) as con:
+        con.execute(
+            "UPDATE pipeline_jobs SET lease_expires_at=now()-interval '1 second' WHERE job_id=?",
+            [job.job_id],
+        )
+    assert not ledger.complete(job)
+    assert not ledger.heartbeat(job)
+    assert ledger.fail(job, "late failure") == "stale"
+    assert not ledger.release(job, delay_seconds=0, reason="late release")
+    assert not ledger.supersede(job, "late retirement")
+    assert ledger.reclaim_expired(EMBED_SESSION) == 1
+
+
+def test_locked_due_job_does_not_block_another_claim(pg_control_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    ledger = _ledger(pg_control_path)
+    ledger.enqueue(EMBED_SESSION, "locked", priority=100)
+    ledger.enqueue(EMBED_SESSION, "free")
+    with ledger.connection() as con, transaction(con):
+        con.execute(
+            "SELECT job_id FROM pipeline_jobs WHERE subject_key='locked' FOR UPDATE"
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            jobs = pool.submit(ledger.claim, EMBED_SESSION, worker_id="w").result(
+                timeout=3
+            )
+        assert [job.subject_key for job in jobs] == ["free"]
+
+
+def test_concurrent_caller_enqueue_retains_second_generation(pg_control_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    ledger = _ledger(pg_control_path)
+    entered = Event()
+
+    def enqueue_next():
+        with ledger.connection() as con, transaction(con):
+            entered.set()
+            return ledger.enqueue(EMBED_SESSION, "s", source_version="v2", con=con)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with ledger.connection() as con, transaction(con):
+            assert (
+                ledger.enqueue(EMBED_SESSION, "s", source_version="v1", con=con)
+                == "queued"
+            )
+            future = pool.submit(enqueue_next)
+            assert entered.wait(timeout=2)
+        assert future.result(timeout=3) == "requeued"
+    assert ledger.latest(EMBED_SESSION, "s").source_version == "v2"
 
 
 def test_release_does_not_spend_the_budget(pg_control_path):
@@ -228,12 +336,10 @@ def test_due_claim_uses_the_partial_index(pg_control_path):
     with control_plane_connection(pg_control_path) as con:
         con.execute("SET enable_seqscan = off")
         plan = "\n".join(
-            r[0] for r in con.execute(
-                """EXPLAIN SELECT job_id FROM pipeline_jobs
+            r[0] for r in con.execute("""EXPLAIN SELECT job_id FROM pipeline_jobs
                     WHERE job_kind = 'embed_session' AND status IN ('pending', 'retry_wait')
                       AND next_run_at <= now()
                     ORDER BY priority DESC, next_run_at, enqueued_at
-                    LIMIT 5 FOR UPDATE SKIP LOCKED"""
-            ).fetchall()
+                    LIMIT 5 FOR UPDATE SKIP LOCKED""").fetchall()
         )
     assert "pipeline_jobs_due" in plan

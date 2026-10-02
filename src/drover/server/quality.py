@@ -205,8 +205,30 @@ def _spans_disabled(audit: dict) -> bool:
     return audit.get("span_integration") == "disabled"
 
 
+def _memory(audit: dict) -> dict:
+    """The audit's derived-memory section (PostgreSQL control store, #480).
+
+    Audits that predate the section (or test fixtures without it) carried
+    summaries in DuckDB; treat them as available.
+    """
+    memory = audit.get("memory")
+    if memory is None:
+        return {"available": True, "detail": "", "jobs": {}, "vector": {"ready": True}}
+    return memory
+
+
+#: Embedding states that mean the embedding path is broken, not just slow.
+_EMBEDDING_FAILED_STATES = {
+    "offline_or_unconfigured",
+    "errors",
+    "vector_unavailable",
+    "unavailable",
+}
+
+
 def _completeness_category(audit: dict) -> dict:
     counts = audit.get("table_counts", {})
+    memory = _memory(audit)
     span_relations = {"spans"} if _spans_disabled(audit) else set()
     missing = [
         name
@@ -220,7 +242,7 @@ def _completeness_category(audit: dict) -> dict:
     errored_summaries = int(summarize_counts.get("errored", 0))
     warnings: list[str] = []
     status = "ok"
-    if missing or empty_core:
+    if missing or empty_core or not memory.get("available"):
         status = "critical"
     elif errored_summaries:
         status = "warn"
@@ -228,6 +250,8 @@ def _completeness_category(audit: dict) -> dict:
         warnings.append(f"missing relations: {', '.join(missing)}")
     if empty_core:
         warnings.append(f"empty core relations: {', '.join(empty_core)}")
+    if not memory.get("available"):
+        warnings.append(f"derived memory unavailable: {memory.get('detail')}")
     if errored_summaries:
         warnings.append(f"{errored_summaries} summarize_jobs are errored")
     return _category(
@@ -236,6 +260,7 @@ def _completeness_category(audit: dict) -> dict:
             "table_counts": counts,
             "missing_relations": missing,
             "empty_core_relations": empty_core,
+            "memory_available": bool(memory.get("available")),
             "errored_summarize_jobs": errored_summaries,
             "summarizer_backend_health": summarize_health,
         },
@@ -388,22 +413,48 @@ def _derived_context_category(audit: dict) -> dict:
     summaries = audit.get("table_counts", {}).get("session_summaries")
     embedding_state = audit.get("embedding_status", {}).get("state", "unknown")
     session_consistency = audit.get("session_consistency", {})
+    memory = _memory(audit)
+    memory_jobs = memory.get("jobs") or {}
     pending_embed = int(embed_counts.get("pending", 0) or 0)
     errored_embed = int(embed_counts.get("errored", 0) or 0)
     pending_summary = int(summarize_counts.get("pending", 0) or 0)
     errored_summary = int(summarize_counts.get("errored", 0) or 0)
-    handoff_ready = int(bool((summaries or 0) > 0 and (embeddings or 0) > 0))
+    # Embeddings configured off: summaries alone are the handoff context.
+    embeddings_required = embedding_state != "disabled"
+    handoff_ready = int(
+        bool(
+            (summaries or 0) > 0 and (not embeddings_required or (embeddings or 0) > 0)
+        )
+    )
 
     statuses = ["ok"]
     warnings: list[str] = []
+    if not memory.get("available"):
+        statuses.append("critical")
+        warnings.append(f"derived memory unavailable: {memory.get('detail')}")
     if not handoff_ready:
         statuses.append("critical")
         warnings.append("handoff context is not ready: summaries or embeddings missing")
-    if embedding_state in {"offline_or_unconfigured", "errors"}:
+    if embedding_state in _EMBEDDING_FAILED_STATES and memory.get("available"):
         statuses.append("critical")
         warnings.append(audit.get("embedding_status", {}).get("message", ""))
     elif pending_embed or pending_summary or errored_embed or errored_summary:
         statuses.append("warn")
+    # Briefs and recaps: terminal failures need an operator, expired leases
+    # mean a worker died mid-job.
+    for kind in ("brief_project", "recap_session"):
+        stats = memory_jobs.get(kind) or {}
+        failed = int(stats.get("dead_lettered") or 0) + int(
+            stats.get("quarantined") or 0
+        )
+        if failed:
+            statuses.append("warn")
+            warnings.append(f"{failed} {kind} jobs are dead-lettered or quarantined")
+        if int(stats.get("expired_leases") or 0):
+            statuses.append("warn")
+            warnings.append(
+                f"{stats.get('expired_leases')} {kind} jobs are running past their lease"
+            )
     if session_consistency.get("status") not in {"ok", "missing"}:
         statuses.append("warn")
         warnings.append(
@@ -414,6 +465,7 @@ def _derived_context_category(audit: dict) -> dict:
         _worst_status(*statuses),
         {
             "handoff_ready": handoff_ready,
+            "memory_available": bool(memory.get("available")),
             "session_summaries": summaries,
             "session_embeddings": embeddings,
             "summarize_job_status_counts": summarize_counts,
@@ -424,6 +476,13 @@ def _derived_context_category(audit: dict) -> dict:
             "summarizer_backend_health": summarize_health,
             "pending_embed_jobs": pending_embed,
             "errored_embed_jobs": errored_embed,
+            "brief_job_status_counts": audit.get("brief_jobs", {}).get(
+                "status_counts", {}
+            ),
+            "recap_job_status_counts": audit.get("recap_jobs", {}).get(
+                "status_counts", {}
+            ),
+            "memory_jobs": memory_jobs,
             "session_consistency_status": session_consistency.get("status"),
         },
         [warning for warning in warnings if warning],
@@ -447,7 +506,10 @@ def _summary_coverage_category(audit: dict) -> dict:
         covered = max(int(event_sessions) - int(missing_summaries), 0)
         coverage_percent = round((covered / int(event_sessions)) * 100.0, 1)
 
-    if session_consistency.get("status") == "missing":
+    memory_unavailable = not _memory(audit).get("available") or (
+        session_consistency.get("summaries_available") is False
+    )
+    if session_consistency.get("status") == "missing" or memory_unavailable:
         return _category(
             "unknown",
             {
@@ -460,7 +522,13 @@ def _summary_coverage_category(audit: dict) -> dict:
                 "retryable_summarize_errors": retryable_summary,
                 "non_retryable_summarize_errors": non_retryable_summary,
             },
-            ["summary coverage unavailable"],
+            [
+                (
+                    "summary coverage unavailable: no PostgreSQL memory store"
+                    if memory_unavailable
+                    else "summary coverage unavailable"
+                )
+            ],
         )
 
     statuses = ["ok"]
@@ -512,10 +580,10 @@ def _embedding_coverage_category(audit: dict) -> dict:
     summaries = audit.get("table_counts", {}).get("session_summaries")
     session_embeddings = audit.get("session_embeddings_count")
     embed_counts = audit.get("embed_jobs", {}).get("status_counts", {})
-    span_coverage = audit.get("span_embedding_coverage", {})
     embedding_status = audit.get("embedding_status", {})
     pending_embed = int(embed_counts.get("pending", 0) or 0)
     errored_embed = int(embed_counts.get("errored", 0) or 0)
+    vector = _memory(audit).get("vector") or {}
 
     session_coverage_percent = None
     if summaries:
@@ -528,34 +596,25 @@ def _embedding_coverage_category(audit: dict) -> dict:
     warnings: list[str] = []
     state = embedding_status.get("state", "unknown")
     message = embedding_status.get("message", "")
-    if summaries and int(session_embeddings or 0) == 0:
+    if state == "disabled":
+        # Embeddings configured off: there is no coverage to expect.
+        pass
+    elif summaries and int(session_embeddings or 0) == 0:
         statuses.append("critical")
         warnings.append("session summary embeddings are missing")
     elif summaries and int(session_embeddings or 0) < int(summaries):
         statuses.append("warn")
         warnings.append("session summary embedding coverage is partial")
 
-    if state in {"offline_or_unconfigured", "errors"}:
+    if state in _EMBEDDING_FAILED_STATES:
         statuses.append("critical")
         warnings.append(message)
-    elif pending_embed or errored_embed:
+    elif state != "disabled" and (pending_embed or errored_embed):
         statuses.append("warn")
         if pending_embed:
             warnings.append(f"{pending_embed} embed_jobs are still pending")
         if errored_embed:
             warnings.append(f"{errored_embed} embed_jobs are errored")
-
-    span_percent = span_coverage.get("coverage_percent")
-    if _spans_disabled(audit):
-        pass
-    elif span_percent is not None and float(span_percent) < 100.0:
-        statuses.append("warn")
-        warnings.append(f"span embedding coverage is {span_percent:.1f}%")
-    if int(span_coverage.get("stale_running_jobs", 0) or 0):
-        statuses.append("warn")
-        warnings.append(
-            f"{span_coverage.get('stale_running_jobs', 0)} span_embed_jobs are stale-running"
-        )
 
     return _category(
         _worst_status(*statuses),
@@ -566,7 +625,12 @@ def _embedding_coverage_category(audit: dict) -> dict:
             "embed_job_status_counts": embed_counts,
             "embedding_status": state,
             "embedding_status_message": message,
-            "span_embedding_coverage": span_coverage,
+            "vector_ready": vector.get("ready"),
+            "vector_detail": vector.get("detail"),
+            # Span embeddings left the core path (#473); nothing to cover.
+            "span_embedding_coverage": {
+                "note": "span embeddings are not produced (drover#473)"
+            },
         },
         [warning for warning in warnings if warning],
     )
@@ -701,6 +765,8 @@ def quality_snapshot(
     deep: bool = True,
     role: str = "diagnostic",
     spans_enabled: bool = False,
+    memory_store_path: Optional[Path] = None,
+    embedding_model: Optional[str] = None,
 ) -> dict:
     """Return a structured Drover data-quality snapshot.
 
@@ -714,7 +780,9 @@ def quality_snapshot(
     ``role`` is the DuckDB connection profile, defaulting to the
     single-threaded ``diagnostic`` one because this is reachable from the CLI
     against the live database. Pass ``role="snapshot"`` only when
-    ``duckdb_path`` is a private copy (see ``drover.server.db``).
+    ``duckdb_path`` is a private copy (see ``drover.server.db``) -- and then
+    pass the live path as ``memory_store_path``, since derived memory is read
+    from the PostgreSQL control store registered for that path.
     """
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     audit = runtime_audit(
@@ -724,6 +792,8 @@ def quality_snapshot(
         deep=deep,
         role=role,
         spans_enabled=spans_enabled,
+        memory_store_path=memory_store_path,
+        embedding_model=embedding_model,
     )
     categories = {
         "freshness": _freshness_category(

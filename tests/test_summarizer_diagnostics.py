@@ -6,9 +6,11 @@ import json
 import time
 from unittest.mock import patch
 
-import duckdb
+import pytest
 
 from drover.schema import bootstrap
+from drover.server.db import control_plane_connection
+from drover.server.ledger import SUMMARIZE_SESSION, JobLedger, MemoryStoreUnavailable
 from drover.server.summarizer.diagnostics import summarize_backend_auth
 from drover.server.summarizer.retry import (
     classify_retryable_error,
@@ -167,31 +169,52 @@ def test_summarizer_auth_diagnostics_reports_local_policy_as_retired(
     assert "retired" in " ".join(report["warnings"])
 
 
-def test_retry_clears_the_dead_letter_streak_so_capped_jobs_can_run_again(tmp_path):
-    db = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs "
-            "(session_id, status, attempts, last_error, dead_letter_streak) "
-            "VALUES ('capped', 'dead_lettered', 5, "
-            "'claude-code readiness: CLI not found on PATH', 3)"
+def _fail_summary(
+    store_path, session_id: str, version: str, error: str, *, retryable: bool = True
+) -> str:
+    """Drive one summarize generation to dead_lettered (or quarantined)."""
+    ledger = JobLedger(store_path, jitter=lambda _low, _high: 0)
+    ledger.enqueue(SUMMARIZE_SESSION, session_id, source_version=version)
+    while True:
+        with control_plane_connection(store_path) as con:
+            con.execute(
+                "UPDATE pipeline_jobs SET next_run_at = now() "
+                "WHERE subject_key = ? AND status = 'retry_wait'",
+                [session_id],
+            )
+        (job,) = ledger.claim(SUMMARIZE_SESSION, worker_id="test")
+        outcome = ledger.fail(
+            job,
+            error,
+            retryable=retryable,
+            category=None if retryable else "validation",
         )
-    finally:
-        con.close()
+        if outcome != "retry_wait":
+            return outcome
 
-    applied = retry_errored_jobs(db, apply=True)
+
+def test_retry_requeues_past_the_dead_letter_streak_so_capped_jobs_run_again(
+    pg_control_path,
+):
+    for version in ("v1", "v2", "v3"):
+        _fail_summary(
+            pg_control_path,
+            "capped",
+            version,
+            "claude-code readiness: CLI not found on PATH",
+        )
+    ledger = JobLedger(pg_control_path)
+    assert (
+        ledger.enqueue(SUMMARIZE_SESSION, "capped", source_version="v4") == "suppressed"
+    )
+
+    applied = retry_errored_jobs(pg_control_path, apply=True)
 
     assert applied["updated"] == ["capped"]
-    con = duckdb.connect(str(db))
-    try:
-        assert con.execute(
-            "SELECT status, dead_letter_streak FROM summarize_jobs "
-            "WHERE session_id='capped'"
-        ).fetchone() == ("pending", 0)
-    finally:
-        con.close()
+    job = ledger.latest(SUMMARIZE_SESSION, "capped")
+    assert (job.source_version, job.status, job.failures) == ("v3", "pending", 0)
+    # The failed generations stay as history.
+    assert len(ledger.jobs(SUMMARIZE_SESSION)) == 3
 
 
 def test_classify_retryable_auth_and_rate_limit_errors_only_by_default():
@@ -248,40 +271,59 @@ def test_classify_summarize_error_groups_runtime_auth_and_validation_failures():
     ) == {"category": "validation", "retryable": True}
 
 
-def test_retry_errored_jobs_dry_run_and_apply_skip_validation_errors(tmp_path):
-    db = tmp_path / "drover.duckdb"
-    parquet = tmp_path / "parquet"
-    bootstrap(parquet_dir=parquet, duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.executemany(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error) VALUES (?, 'errored', ?, ?)",
-            [
-                ("auth", 2, "401 invalid authentication credentials"),
-                ("rate", 1, "429 rate limit exceeded"),
-                ("schema", 1, "missing required keys: summary_md"),
-                ("done", 1, "401 invalid authentication credentials"),
-            ],
+def test_retry_errored_jobs_dry_run_and_apply_skip_validation_errors(pg_control_path):
+    _fail_summary(
+        pg_control_path, "auth", "v1", "401 invalid authentication credentials"
+    )
+    _fail_summary(pg_control_path, "rate", "v1", "429 rate limit exceeded")
+    _fail_summary(pg_control_path, "opaque", "v1", "something nobody classified")
+    assert (
+        _fail_summary(
+            pg_control_path,
+            "schema",
+            "v1",
+            "missing required keys: summary_md",
+            retryable=False,
         )
-        con.execute("UPDATE summarize_jobs SET status='done' WHERE session_id='done'")
-    finally:
-        con.close()
+        == "quarantined"
+    )
+    # A failed generation with newer work behind it is not a candidate.
+    _fail_summary(pg_control_path, "moved-on", "v1", "429 rate limit exceeded")
+    ledger = JobLedger(pg_control_path)
+    ledger.enqueue(SUMMARIZE_SESSION, "moved-on", source_version="v2")
 
-    dry = retry_errored_jobs(db, apply=False)
+    dry = retry_errored_jobs(pg_control_path, apply=False)
+    assert dry["dry_run"] is True
     assert dry["matched"] == ["auth", "rate"]
     assert dry["updated"] == []
+    assert ledger.latest(SUMMARIZE_SESSION, "auth").status == "dead_lettered"
 
-    applied = retry_errored_jobs(db, apply=True)
+    applied = retry_errored_jobs(pg_control_path, apply=True)
     assert applied["updated"] == ["auth", "rate"]
 
-    con = duckdb.connect(str(db))
-    try:
-        rows = dict(
-            con.execute("SELECT session_id, status FROM summarize_jobs").fetchall()
-        )
-    finally:
-        con.close()
-    assert rows["auth"] == "pending"
-    assert rows["rate"] == "pending"
-    assert rows["schema"] == "errored"
-    assert rows["done"] == "done"
+    status = {
+        sid: ledger.latest(SUMMARIZE_SESSION, sid).status
+        for sid in ("auth", "rate", "opaque", "schema", "moved-on")
+    }
+    assert status == {
+        "auth": "pending",
+        "rate": "pending",
+        "opaque": "dead_lettered",
+        "schema": "quarantined",
+        "moved-on": "pending",
+    }
+    assert ledger.latest(SUMMARIZE_SESSION, "moved-on").source_version == "v2"
+
+    with_validation = retry_errored_jobs(
+        pg_control_path, apply=True, include_validation=True, limit=5
+    )
+    assert with_validation["updated"] == ["schema"]
+    assert ledger.latest(SUMMARIZE_SESSION, "schema").status == "pending"
+
+
+def test_retry_errored_jobs_requires_the_postgres_ledger(tmp_path):
+    db = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
+
+    with pytest.raises(MemoryStoreUnavailable):
+        retry_errored_jobs(db)

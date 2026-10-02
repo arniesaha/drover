@@ -1,66 +1,84 @@
-"""Tests for the durable live-session recap worker."""
+"""Tests for the live-session recap worker on the PostgreSQL job ledger (#480)."""
 
 from __future__ import annotations
 
 import threading
 from pathlib import Path
 
-import duckdb
+import pytest
 
 from drover.schema import bootstrap
-from drover.server.db import control_plane_path
-from drover.server.harness.recap_jobs import enqueue_live_recap
+from drover.server.db import control_plane_connection
 from drover.server.harness.recap_worker import LiveRecapWorker
+from drover.server.harness.registry import HarnessRegistry
+from drover.server.ledger import POLICIES, RECAP_SESSION, JobLedger, transaction
+from drover.server.memory_store import MemoryRepository
 from drover.server.summarizer.backends import BackendError
 
 
-def recap_db(
-    tmp_path: Path,
-    *,
-    session_id: str,
-    recap: tuple[str, int] | None = None,
-) -> tuple[Path, duckdb.DuckDBPyConnection]:
-    """Create a bootstrapped database with one content-bearing event."""
-    db = tmp_path / "recaps.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(control_plane_path(db)))
-    con.execute(
-        """INSERT INTO harness_events
-           (event_id, session_id, event_type, content_preview, payload_json, seq)
-           VALUES (?, ?, 'user_input', 'Fix the recap cards.', '{}', 8)""",
-        [f"{session_id}-event-8", session_id],
+def recap_store(
+    path: Path, *, session_id: str = "s1", completion_seq: int = 8
+) -> HarnessRegistry:
+    """A structured session with one content event and one turn completion.
+
+    The completion is what enqueues the ``recap_session`` job, exactly as in
+    production: the registry enqueues in the event's own transaction.
+    """
+    registry = HarnessRegistry(path)
+    registry.create_session(
+        session_id=session_id,
+        host_id="laptop",
+        harness="codex",
+        command="codex",
+        mode="structured",
     )
-    if recap is not None:
+    registry.append_event(
+        session_id=session_id,
+        event_type="user_input",
+        payload={"text": "Fix the recap cards."},
+        content_preview="Fix the recap cards.",
+        seq=completion_seq - 1,
+    )
+    complete(registry, session_id, completion_seq)
+    return registry
+
+
+def complete(registry: HarnessRegistry, session_id: str, seq: int) -> None:
+    registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=seq,
+    )
+
+
+def recap_row(path: Path, session_id: str) -> tuple[object, ...] | None:
+    with control_plane_connection(path) as con:
+        return con.execute(
+            """SELECT recap_text, recap_source_seq, recap_model, phase
+                 FROM session_memory WHERE session_id = ?""",
+            [session_id],
+        ).fetchone()
+
+
+def jobs(path: Path, session_id: str) -> list[tuple[object, ...]]:
+    """(source_version, status, failures, error_category), oldest first."""
+    with control_plane_connection(path) as con:
+        return con.execute(
+            """SELECT source_version, status, failures, error_category
+                 FROM pipeline_jobs WHERE job_kind = ? AND subject_key = ?
+                ORDER BY enqueued_at, updated_at""",
+            [RECAP_SESSION, session_id],
+        ).fetchall()
+
+
+def make_due(path: Path) -> None:
+    with control_plane_connection(path) as con:
         con.execute(
-            """INSERT INTO live_session_recaps
-               (session_id, recap_text, source_seq, generator_model, generated_at)
-               VALUES (?, ?, ?, 'prior-model', now())""",
-            [session_id, recap[0], recap[1]],
+            """UPDATE pipeline_jobs SET next_run_at = now() - interval '1 second'
+                WHERE job_kind = ? AND status IN ('pending', 'retry_wait')""",
+            [RECAP_SESSION],
         )
-    return db, con
-
-
-def recap_row(db: Path, session_id: str) -> tuple[object, ...] | None:
-    with duckdb.connect(str(control_plane_path(db))) as con:
-        return con.execute(
-            """SELECT recap_text, source_seq, generator_model
-               FROM live_session_recaps WHERE session_id=?""",
-            [session_id],
-        ).fetchone()
-
-
-def recap_job(db: Path, session_id: str) -> tuple[object, ...] | None:
-    with duckdb.connect(str(control_plane_path(db))) as con:
-        return con.execute(
-            """SELECT desired_source_seq, status FROM live_recap_jobs
-               WHERE session_id=?""",
-            [session_id],
-        ).fetchone()
-
-
-def job_status(db: Path, session_id: str) -> str | None:
-    row = recap_job(db, session_id)
-    return str(row[1]) if row is not None else None
 
 
 class StubBackend:
@@ -98,172 +116,193 @@ class BlockingBackend:
 
     def summarize(self, prompt: str) -> dict:
         self._called.set()
-        assert self._release.wait(timeout=2)
+        assert self._release.wait(timeout=5)
         assert self._result is not None
         return self._result
 
     def wait_until_called(self) -> None:
-        assert self._called.wait(timeout=2)
+        assert self._called.wait(timeout=5)
 
     def release(self, result: dict[str, object]) -> None:
         self._result = result
         self._release.set()
 
 
-def test_worker_persists_normalized_recap_and_marks_matching_job_done(
-    tmp_path: Path,
+def test_worker_writes_the_live_phase_and_completes_the_job(
+    pg_control_path: Path,
 ) -> None:
-    db, con = recap_db(tmp_path, session_id="s1")
-    enqueue_live_recap(con, "s1", 8)
-    con.close()
+    recap_store(pg_control_path)
+    backend = StubBackend({"recap": "**Fix cards** and verify snapshots."})
 
-    worker = LiveRecapWorker(
-        duckdb_path=db,
-        backend=StubBackend({"recap": "**Fix cards** and verify snapshots."}),
+    assert (
+        LiveRecapWorker(duckdb_path=pg_control_path, backend=backend).drain_once() == 1
     )
 
-    assert worker.drain_once() == 1
-    assert recap_row(db, "s1")[:2] == ("Fix cards and verify snapshots.", 8)
-    assert job_status(db, "s1") == "done"
+    assert recap_row(pg_control_path, "s1") == (
+        "Fix cards and verify snapshots.",
+        8,
+        "stub-recap-v1",
+        "live",
+    )
+    assert jobs(pg_control_path, "s1") == [("8", "succeeded", 0, None)]
+    # The single latest-memory reader shows the live phase.
+    latest = MemoryRepository(pg_control_path).latest(["s1"])["s1"]
+    assert latest.phase == "live" and latest.text == "Fix cards and verify snapshots."
+    # Nothing left to do: the next poll is idle and never calls the model.
+    assert (
+        LiveRecapWorker(duckdb_path=pg_control_path, backend=backend).drain_once() == 0
+    )
+    assert backend.calls == 1
 
 
-def test_stale_worker_result_does_not_replace_newer_requested_recap(
-    tmp_path: Path,
-) -> None:
-    db, con = recap_db(tmp_path, session_id="s1")
-    enqueue_live_recap(con, "s1", 8)
-    con.close()
+def test_superseded_generation_discards_its_stale_recap(pg_control_path: Path) -> None:
+    """A newer completion while a recap generates fences the older result out."""
+    registry = recap_store(pg_control_path)
     backend = BlockingBackend()
     thread = threading.Thread(
-        target=LiveRecapWorker(duckdb_path=db, backend=backend).drain_once
+        target=LiveRecapWorker(duckdb_path=pg_control_path, backend=backend).drain_once
     )
     thread.start()
     backend.wait_until_called()
-    with duckdb.connect(str(control_plane_path(db))) as con:
-        enqueue_live_recap(con, "s1", 10)
+    complete(registry, "s1", 10)
     backend.release({"recap": "Stale source eight recap."})
-    thread.join(timeout=2)
+    thread.join(timeout=5)
 
     assert not thread.is_alive()
-    assert recap_row(db, "s1") is None
-    assert recap_job(db, "s1") == (10, "pending")
+    assert recap_row(pg_control_path, "s1") is None
+    assert [row[:2] for row in jobs(pg_control_path, "s1")] == [
+        ("8", "superseded"),
+        ("10", "pending"),
+    ]
+
+    fresh = StubBackend({"recap": "Fresh source ten recap."})
+    assert LiveRecapWorker(duckdb_path=pg_control_path, backend=fresh).drain_once() == 1
+    assert recap_row(pg_control_path, "s1")[:2] == ("Fresh source ten recap.", 10)
 
 
-def test_failed_refresh_keeps_previous_successful_recap(tmp_path: Path) -> None:
-    db, con = recap_db(tmp_path, session_id="s1", recap=("Existing recap.", 8))
-    enqueue_live_recap(con, "s1", 10)
-    con.close()
-    worker = LiveRecapWorker(duckdb_path=db, backend=FailingBackend("offline"))
+def test_failures_retry_then_dead_letter_and_keep_the_previous_recap(
+    pg_control_path: Path,
+) -> None:
+    recap_store(pg_control_path, completion_seq=8)
+    assert (
+        LiveRecapWorker(
+            duckdb_path=pg_control_path,
+            backend=StubBackend({"recap": "Existing recap."}),
+        ).drain_once()
+        == 1
+    )
+    complete(HarnessRegistry(pg_control_path), "s1", 10)
+    worker = LiveRecapWorker(
+        duckdb_path=pg_control_path, backend=FailingBackend("offline")
+    )
 
     assert worker.drain_once() == 1
-    assert recap_row(db, "s1")[:2] == ("Existing recap.", 8)
-    assert job_status(db, "s1") == "retry_wait"
+    assert jobs(pg_control_path, "s1")[-1] == ("10", "retry_wait", 1, "backend_error")
+    assert recap_row(pg_control_path, "s1")[:2] == ("Existing recap.", 8)
+    # Backoff: a retry_wait job is not due yet, so the next poll is idle.
+    assert worker.drain_once() == 0
+
+    max_attempts = POLICIES[RECAP_SESSION].max_attempts
+    for _ in range(max_attempts - 1):
+        make_due(pg_control_path)
+        assert worker.drain_once() == 1
+
+    assert jobs(pg_control_path, "s1")[-1][:3] == ("10", "dead_lettered", max_attempts)
+    make_due(pg_control_path)
+    assert worker.drain_once() == 0
+    assert recap_row(pg_control_path, "s1")[:2] == ("Existing recap.", 8)
 
 
-def test_stream_worker_acks_stale_source_sequence_without_generating(
-    tmp_path: Path,
+def test_missing_backend_releases_without_spending_an_attempt(
+    pg_control_path: Path,
 ) -> None:
-    """Redis duplicates cannot spend work on a superseded durable generation."""
-    from drover.server.jobs import JobStream
+    recap_store(pg_control_path)
 
-    db, con = recap_db(tmp_path, session_id="s1")
-    enqueue_live_recap(con, "s1", 10)
-    con.execute("UPDATE live_recap_jobs SET stream_publish_needed=FALSE")
-    con.close()
-    stream = JobStream("live-recap")
-    stream.add({"session_id": "s1", "source_seq": 8})
-    backend = StubBackend({"recap": "This must not be generated."})
+    assert LiveRecapWorker(duckdb_path=pg_control_path).drain_once() == 1
 
-    assert (
-        LiveRecapWorker(duckdb_path=db, backend=backend, job_stream=stream).drain_once()
-        == 1
+    assert jobs(pg_control_path, "s1") == [("8", "retry_wait", 0, "released")]
+    assert recap_row(pg_control_path, "s1") is None
+
+
+def test_new_worker_recovers_an_expired_lease(pg_control_path: Path) -> None:
+    """A crashed worker's lease expires, counts as a failure, and is retried."""
+    recap_store(pg_control_path)
+    [job] = JobLedger(pg_control_path).claim(RECAP_SESSION, worker_id="crashed")
+    with control_plane_connection(pg_control_path) as con:
+        con.execute(
+            "UPDATE pipeline_jobs SET lease_expires_at = now() - interval '1 second' "
+            "WHERE job_id = ?",
+            [job.job_id],
+        )
+    worker = LiveRecapWorker(
+        duckdb_path=pg_control_path, backend=StubBackend({"recap": "Recovered recap."})
     )
+
+    worker.drain_once()
+    assert jobs(pg_control_path, "s1") == [("8", "retry_wait", 1, "lease_expired")]
+    make_due(pg_control_path)
+    assert worker.drain_once() == 1
+
+    assert recap_row(pg_control_path, "s1")[:2] == ("Recovered recap.", 8)
+    assert jobs(pg_control_path, "s1")[0][:2] == ("8", "succeeded")
+    # The crashed owner's late completion cannot land.
+    assert JobLedger(pg_control_path).complete(job) is False
+
+
+def test_concurrent_workers_generate_one_recap_per_generation(
+    pg_control_path: Path,
+) -> None:
+    """SKIP LOCKED claims: two workers never both take one job."""
+    recap_store(pg_control_path)
+    backends = [StubBackend({"recap": "First."}), StubBackend({"recap": "Second."})]
+    barrier = threading.Barrier(2)
+    handled: list[int] = []
+
+    def drain(backend: StubBackend) -> None:
+        barrier.wait(timeout=5)
+        handled.append(
+            LiveRecapWorker(duckdb_path=pg_control_path, backend=backend).drain_once()
+        )
+
+    threads = [threading.Thread(target=drain, args=(b,)) for b in backends]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert sorted(handled) == [0, 1]
+    assert sum(b.calls for b in backends) == 1
+    assert jobs(pg_control_path, "s1") == [("8", "succeeded", 0, None)]
+
+
+def test_completion_and_recap_commit_together(pg_control_path: Path) -> None:
+    """A recap write failure rolls the job transition back with it."""
+    recap_store(pg_control_path)
+    ledger = JobLedger(pg_control_path)
+    [job] = ledger.claim(RECAP_SESSION, worker_id="w")
+    with pytest.raises(Exception, match="division by zero"):
+        with control_plane_connection(pg_control_path) as con:
+            with transaction(con):
+                assert ledger.complete(job, con=con) is True
+                con.execute("SELECT 1/0")
+    assert jobs(pg_control_path, "s1")[0][:2] == ("8", "running")
+
+
+def test_duckdb_control_plane_drain_is_a_noop(tmp_path: Path) -> None:
+    """Without PostgreSQL there is no memory store; the worker must not crash."""
+    duckdb_path = tmp_path / "recaps.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.create_session(
+        session_id="s1",
+        host_id="laptop",
+        harness="codex",
+        command="codex",
+        mode="structured",
+    )
+    complete(registry, "s1", 8)
+    backend = StubBackend({"recap": "Never generated."})
+
+    assert LiveRecapWorker(duckdb_path=duckdb_path, backend=backend).drain_once() == 0
     assert backend.calls == 0
-    assert stream.pending() == []
-
-
-def test_new_worker_recovers_an_expired_running_claim(tmp_path: Path) -> None:
-    """A process crash cannot leave a live-recap generation running forever."""
-    db, con = recap_db(tmp_path, session_id="s1")
-    enqueue_live_recap(con, "s1", 8)
-    con.execute("""UPDATE live_recap_jobs
-           SET status='running', attempts=1,
-               updated_at=now() - INTERVAL '6 minutes'
-           WHERE session_id='s1'""")
-    con.close()
-
-    assert (
-        LiveRecapWorker(
-            duckdb_path=db, backend=StubBackend({"recap": "Recovered recap."})
-        ).drain_once()
-        == 1
-    )
-    assert recap_row(db, "s1")[:2] == ("Recovered recap.", 8)
-    with duckdb.connect(str(control_plane_path(db))) as con:
-        assert con.execute(
-            "SELECT status, attempts FROM live_recap_jobs WHERE session_id='s1'"
-        ).fetchone() == ("done", 2)
-
-
-def test_stream_retry_acknowledges_delivery_and_retries_from_durable_due_time(
-    tmp_path: Path,
-) -> None:
-    """A retry wait does not consume Redis redelivery budget before it is due."""
-    from drover.server.jobs import JobStream
-
-    db, con = recap_db(tmp_path, session_id="s1")
-    enqueue_live_recap(con, "s1", 8)
-    con.close()
-    stream = JobStream("live-recap", max_deliveries=1)
-    failing = LiveRecapWorker(
-        duckdb_path=db, backend=FailingBackend("offline"), job_stream=stream
-    )
-
-    assert failing.drain_once() == 1
-    assert stream.pending() == []
-    assert stream.dead_letters() == []
-    with duckdb.connect(str(control_plane_path(db))) as con:
-        con.execute("""UPDATE live_recap_jobs
-               SET next_run_at=now() - INTERVAL '1 second'
-               WHERE session_id='s1'""")
-
-    assert (
-        LiveRecapWorker(
-            duckdb_path=db,
-            backend=StubBackend({"recap": "Retried from durable queue."}),
-            job_stream=stream,
-        ).drain_once()
-        == 1
-    )
-    assert recap_row(db, "s1")[:2] == ("Retried from durable queue.", 8)
-    assert job_status(db, "s1") == "done"
-    assert stream.dead_letters() == []
-
-
-def test_stream_redelivery_does_not_steal_an_unexpired_running_claim(
-    tmp_path: Path,
-) -> None:
-    """A live worker retains its generation until the durable lease expires."""
-    from drover.server.jobs import JobStream
-
-    db, con = recap_db(tmp_path, session_id="s1")
-    enqueue_live_recap(con, "s1", 8)
-    con.execute("""UPDATE live_recap_jobs
-           SET status='running', attempts=1, stream_publish_needed=FALSE,
-               updated_at=now()
-           WHERE session_id='s1'""")
-    con.close()
-    stream = JobStream("live-recap", visibility_timeout_ms=0)
-    stream.add({"session_id": "s1", "source_seq": 8})
-    assert stream.read_group("original", count=1)
-    backend = StubBackend({"recap": "A second worker must not run."})
-
-    assert (
-        LiveRecapWorker(duckdb_path=db, backend=backend, job_stream=stream).drain_once()
-        == 0
-    )
-    assert backend.calls == 0
-    with duckdb.connect(str(control_plane_path(db))) as con:
-        assert con.execute(
-            "SELECT status, attempts FROM live_recap_jobs WHERE session_id='s1'"
-        ).fetchone() == ("running", 1)
+    assert registry.latest_live_recaps(["s1"]) == {}

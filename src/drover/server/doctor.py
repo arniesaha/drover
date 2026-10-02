@@ -32,16 +32,25 @@ from drover.session_audit import audit_session_consistency
 log = logging.getLogger("drover.doctor")
 
 
+#: Analytical (DuckDB) relations whose absence makes the lakehouse incomplete.
 RUNTIME_KEY_RELATIONS = (
     "agent_events",
     "spans",
     "tasks",
+)
+
+#: Derived-memory row counts, read from the PostgreSQL control store (#480).
+#: ``None`` when there is no memory store (or, for embeddings, no pgvector).
+MEMORY_KEY_RELATIONS = (
     "session_summaries",
-    "summarize_jobs",
-    "embed_jobs",
+    "project_briefs",
     "session_embeddings",
-    "span_embed_jobs",
-    "span_embeddings",
+)
+
+MEMORY_UNAVAILABLE_DETAIL = (
+    "derived memory (summaries, briefs, embeddings, recaps and their job "
+    "ledger) requires the PostgreSQL control store (control_store.backend = "
+    "'postgres'); this hub runs a DuckDB control store, so none is produced"
 )
 
 _CWD_SQL = """COALESCE(
@@ -130,14 +139,6 @@ def _relation_exists(con: duckdb.DuckDBPyConnection, name: str) -> bool:
         return False
 
 
-def _status_counts(con: duckdb.DuckDBPyConnection, table: str) -> dict[str, int]:
-    rows = _safe_rows(
-        con,
-        f"SELECT COALESCE(status, '<null>') AS status, count(*) FROM {table} GROUP BY 1 ORDER BY 1",
-    )
-    return {str(status): int(n) for status, n in rows}
-
-
 _SECRET_ERROR_PATTERNS = (
     re.compile(r"(?i)(token|api[_-]?key|authorization|bearer)=([^\s;,]+)"),
     re.compile(r"(?i)(sk-ant-[A-Za-z0-9_-]+)"),
@@ -158,28 +159,62 @@ def _redact_error_summary(message: object, *, max_len: int = 160) -> str:
     return text
 
 
-def _summarize_job_backend_health(
-    con: duckdb.DuckDBPyConnection, counts: dict[str, int]
-) -> dict:
-    pending = int(counts.get("pending", 0) or 0)
-    running = int(counts.get("running", 0) or 0)
-    errored = int(counts.get("errored", 0) or 0)
-    categories: dict[str, int] = {}
-    retryable = 0
-    error_rows = _safe_rows(
-        con,
-        "SELECT last_error FROM summarize_jobs WHERE status='errored' AND last_error IS NOT NULL",
+# --------------------------------------------------------------------------- #
+# Derived memory (PostgreSQL control store, #480)                             #
+# --------------------------------------------------------------------------- #
+
+#: How many failed jobs per kind are read to classify errors.
+_FAILED_JOB_SAMPLE = 100
+
+
+def _ledger_status_counts(stats: dict) -> dict[str, int]:
+    """One kind's ledger stats in the legacy ``*_jobs`` status vocabulary.
+
+    ``errored`` is every failure still on the books that is not a dead letter:
+    ``retry_wait`` (retryable, will run again) plus ``quarantined``
+    (non-retryable input fault). ``dead_lettered`` stays separate, as it was.
+    """
+    return {
+        "pending": int(stats.get("pending") or 0),
+        "running": int(stats.get("running") or 0),
+        "errored": int(stats.get("retry_wait") or 0)
+        + int(stats.get("quarantined") or 0),
+        "dead_lettered": int(stats.get("dead_lettered") or 0),
+        "quarantined": int(stats.get("quarantined") or 0),
+    }
+
+
+def _failed_job_rows(store_path: Path, job_kind: str) -> list:
+    from drover.server.ledger import DEAD_LETTERED, QUARANTINED, RETRY_WAIT, JobLedger
+
+    return JobLedger(store_path).jobs(
+        job_kind,
+        statuses=(RETRY_WAIT, QUARANTINED, DEAD_LETTERED),
+        limit=_FAILED_JOB_SAMPLE,
     )
-    for (last_error,) in error_rows:
-        classification = classify_summarize_error(last_error)
-        category = str(classification.get("category") or "unknown")
+
+
+def _job_error_category(row) -> str:
+    if row.error_category and row.error_category not in {"released", "lease_expired"}:
+        return str(row.error_category)
+    return str(classify_summarize_error(row.last_error).get("category") or "unknown")
+
+
+def _job_backend_health(stats: dict, failed_rows: list) -> dict:
+    """Queue health for one kind: retryable = retry_wait, non-retryable = quarantined."""
+    pending = int(stats.get("pending") or 0)
+    running = int(stats.get("running") or 0)
+    retryable = int(stats.get("retry_wait") or 0)
+    non_retryable = int(stats.get("quarantined") or 0)
+    categories: dict[str, int] = {}
+    for row in failed_rows:
+        if row.status == "dead_lettered":
+            continue
+        category = _job_error_category(row)
         categories[category] = categories.get(category, 0) + 1
-        if classification.get("retryable"):
-            retryable += 1
-    non_retryable = max(len(error_rows) - retryable, 0)
     if pending or running:
         state = "backlog_with_retryable_errors" if retryable else "backlog"
-    elif errored:
+    elif retryable or non_retryable:
         state = "retryable_errors" if retryable else "errors"
     else:
         state = "idle"
@@ -187,44 +222,230 @@ def _summarize_job_backend_health(
         "state": state,
         "pending": pending,
         "running": running,
-        "errored": errored,
+        "errored": retryable + non_retryable,
         "retryable_errors": retryable,
         "non_retryable_errors": non_retryable,
+        "dead_lettered": int(stats.get("dead_lettered") or 0),
+        "expired_leases": int(stats.get("expired_leases") or 0),
+        "oldest_pending_age_seconds": stats.get("oldest_pending_age_seconds"),
+        "last_success_at": stats.get("last_success_at"),
         "error_categories": categories,
     }
 
 
-def _recent_job_errors(
-    con: duckdb.DuckDBPyConnection, table: str, *, limit: int = 5
-) -> list[dict]:
-    rows = _safe_rows(
-        con,
-        f"""
-        SELECT session_id, status, attempts, last_error, COALESCE(updated_at, enqueued_at) AS ts
-        FROM {table}
-        WHERE COALESCE(status, '') <> 'done'
-          AND last_error IS NOT NULL
-        ORDER BY COALESCE(updated_at, enqueued_at) DESC NULLS LAST
-        LIMIT ?
-        """,
-        [limit],
-    )
+def _recent_job_errors(failed_rows: list, *, limit: int = 5) -> list[dict]:
     errors = []
-    for session_id, status, attempts, last_error, ts in rows:
-        classification = classify_summarize_error(last_error)
+    for row in failed_rows:
+        if not row.last_error:
+            continue
         errors.append(
             {
-                "session_id": session_id,
-                "status": status,
-                "attempts": attempts,
-                "last_error": last_error,
-                "last_error_summary": _redact_error_summary(last_error),
-                "error_category": classification["category"],
-                "retryable": classification["retryable"],
-                "timestamp": str(ts) if ts is not None else None,
+                "session_id": row.subject_key,
+                "status": row.status,
+                "attempts": row.claims,
+                "last_error": row.last_error,
+                "last_error_summary": _redact_error_summary(row.last_error),
+                "error_category": _job_error_category(row),
+                "retryable": row.status == "retry_wait",
+                "timestamp": (
+                    str(row.finished_at or row.next_run_at or row.enqueued_at)
+                    if (row.finished_at or row.next_run_at or row.enqueued_at)
+                    else None
+                ),
             }
         )
+        if len(errors) >= limit:
+            break
     return errors
+
+
+def _job_section(store_path: Path, job_kind: str, stats: dict) -> dict:
+    failed = _failed_job_rows(store_path, job_kind)
+    return {
+        "status_counts": _ledger_status_counts(stats),
+        "recent_errors": _recent_job_errors(failed),
+        "backend_health": _job_backend_health(stats, failed),
+    }
+
+
+_BUNDLE_QUALITY_SQL = """
+    SELECT
+      count(*) AS total_summaries,
+      count(*) FILTER (
+        WHERE NULLIF(trim(COALESCE(sm.summary_md, '')), '') IS NOT NULL
+      ) AS summaries_with_summary_md,
+      count(*) FILTER (
+        WHERE NULLIF(trim(COALESCE(sm.next_steps_md, '')), '') IS NOT NULL
+      ) AS summaries_with_next_steps_md,
+      count(*) FILTER (WHERE cardinality(sm.files_touched) > 0)
+        AS summaries_with_files_touched,
+      count(*) FILTER (WHERE cardinality(sm.open_questions) > 0)
+        AS summaries_with_open_questions,
+      count(*) FILTER (
+        WHERE NULLIF(trim(COALESCE(sm.last_user_prompt, '')), '') IS NOT NULL
+      ) AS summaries_with_last_user_prompt,
+      count(*) FILTER (
+        WHERE NULLIF(trim(COALESCE(sm.last_assistant, '')), '') IS NOT NULL
+      ) AS summaries_with_last_assistant,
+      count(*) FILTER (
+        WHERE NULLIF(trim(COALESCE(sm.summary_model, '')), '') IS NOT NULL
+      ) AS summaries_with_generator_model,
+      count(*) FILTER (
+        WHERE COALESCE(sm.summary_status, '') IN ('complete', 'completed')
+      ) AS complete_summaries,
+      count(*) FILTER (
+        WHERE NULLIF(trim(COALESCE(sm.summary_md, '')), '') IS NOT NULL
+          AND COALESCE(sm.summary_status, '') IN ('complete', 'completed')
+          AND {embedded}
+      ) AS recall_usable_summaries,
+      count(*) FILTER (
+        WHERE NULLIF(trim(COALESCE(sm.summary_md, '')), '') IS NOT NULL
+          AND NULLIF(trim(COALESCE(sm.next_steps_md, '')), '') IS NOT NULL
+          AND NULLIF(trim(COALESCE(sm.last_user_prompt, '')), '') IS NOT NULL
+          AND NULLIF(trim(COALESCE(sm.last_assistant, '')), '') IS NOT NULL
+          AND (cardinality(sm.files_touched) > 0 OR cardinality(sm.open_questions) > 0)
+      ) AS rich_bundle_ready_summaries
+    FROM session_memory sm
+    {join}
+    WHERE sm.phase = 'final'
+"""
+
+
+def _bundle_quality_summary(
+    pg,
+    *,
+    vector_ready: bool,
+    embedding_model: Optional[str],
+) -> dict[str, int | float | None]:
+    """Bundle completeness over final summaries in ``session_memory``.
+
+    A summary is recall-usable only once it is embedded; without pgvector
+    nothing is, so ``recall_usable_summaries`` is 0 rather than unknown.
+    """
+    params: list = []
+    if vector_ready:
+        join = "LEFT JOIN session_embeddings se ON se.session_id = sm.session_id"
+        if embedding_model:
+            join += " AND se.model = ?"
+            params.append(embedding_model)
+        embedded = "se.session_id IS NOT NULL"
+    else:
+        join, embedded = "", "FALSE"
+    (
+        total_summaries,
+        summaries_with_summary_md,
+        summaries_with_next_steps_md,
+        summaries_with_files_touched,
+        summaries_with_open_questions,
+        summaries_with_last_user_prompt,
+        summaries_with_last_assistant,
+        summaries_with_generator_model,
+        complete_summaries,
+        recall_usable_summaries,
+        rich_bundle_ready_summaries,
+    ) = pg.execute(
+        _BUNDLE_QUALITY_SQL.format(join=join, embedded=embedded), params
+    ).fetchone()
+    total = int(total_summaries or 0)
+    usable = int(recall_usable_summaries or 0)
+    ready = int(rich_bundle_ready_summaries or 0)
+    usable_percent = None
+    ready_percent = None
+    if total:
+        usable_percent = round((usable / total) * 100.0, 1)
+        ready_percent = round((ready / total) * 100.0, 1)
+    return {
+        "total_summaries": total,
+        "summaries_with_summary_md": int(summaries_with_summary_md or 0),
+        "summaries_with_next_steps_md": int(summaries_with_next_steps_md or 0),
+        "summaries_with_files_touched": int(summaries_with_files_touched or 0),
+        "summaries_with_open_questions": int(summaries_with_open_questions or 0),
+        "summaries_with_last_user_prompt": int(summaries_with_last_user_prompt or 0),
+        "summaries_with_last_assistant": int(summaries_with_last_assistant or 0),
+        "summaries_with_generator_model": int(summaries_with_generator_model or 0),
+        "complete_summaries": int(complete_summaries or 0),
+        "recall_usable_summaries": usable,
+        "recall_usable_percent": usable_percent,
+        "missing_recall_processing_summaries": max(total - usable, 0),
+        "missing_rich_evidence_summaries": max(total - ready, 0),
+        "bundle_ready_summaries": ready,
+        "bundle_ready_percent": ready_percent,
+    }
+
+
+def _session_embeddings_count(
+    pg, store_path: Path, *, vector_ready: bool, embedding_model: Optional[str]
+) -> int | None:
+    """Embeddings in the configured model's space; any model when unknown."""
+    if not vector_ready:
+        return None
+    if embedding_model:
+        from drover.server.memory_store import EmbeddingStore
+
+        return EmbeddingStore(store_path, model=embedding_model).count(con=pg)[
+            "embedded"
+        ]
+    row = pg.execute("SELECT count(*) FROM session_embeddings").fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def memory_audit(store_path: Path, *, embedding_model: Optional[str] = None) -> dict:
+    """Derived-memory health: availability, per-kind job stats, vectors, counts.
+
+    Never raises: an unreachable control store is ``available: False`` with
+    the error as ``detail``.
+    """
+    from drover.server.ledger import memory_store_available
+
+    unavailable = {
+        "available": False,
+        "detail": MEMORY_UNAVAILABLE_DETAIL,
+        "jobs": {},
+        "vector": {"ready": False, "detail": "no PostgreSQL control store"},
+        "counts": {},
+        "session_embeddings_count": None,
+        "bundle_quality": None,
+        "job_sections": {},
+    }
+    if not memory_store_available(store_path):
+        return unavailable
+    try:
+        from drover.server.db import control_plane_connection
+        from drover.server.ledger import ledger_stats
+        from drover.server.memory_store import MemoryRepository, vector_status
+
+        with control_plane_connection(store_path) as pg:
+            jobs = ledger_stats(pg)
+            counts = MemoryRepository(store_path).counts(con=pg)
+            vector_ready, vector_detail = vector_status(pg)
+            embeddings = _session_embeddings_count(
+                pg,
+                store_path,
+                vector_ready=vector_ready,
+                embedding_model=embedding_model,
+            )
+            bundle = _bundle_quality_summary(
+                pg, vector_ready=vector_ready, embedding_model=embedding_model
+            )
+        sections = {
+            kind: _job_section(store_path, kind, stats) for kind, stats in jobs.items()
+        }
+    except Exception as exc:  # noqa: BLE001 - an audit reports, never raises
+        return {
+            **unavailable,
+            "detail": f"PostgreSQL control store unreachable: {type(exc).__name__}: {exc}",
+            "vector": {"ready": False, "detail": "control store unreachable"},
+        }
+    return {
+        "available": True,
+        "detail": "PostgreSQL control store",
+        "jobs": jobs,
+        "vector": {"ready": vector_ready, "detail": vector_detail},
+        "counts": counts,
+        "session_embeddings_count": embeddings,
+        "bundle_quality": bundle,
+        "job_sections": sections,
+    }
 
 
 def _repo_attribution_for_window(
@@ -914,19 +1135,43 @@ def _openclaw_agentweave_health_for_window(
 
 def _embedding_status(
     *,
-    embed_counts: dict[str, int],
+    memory: dict,
     session_embeddings_count: int | None,
 ) -> dict[str, str]:
-    """Summarize whether the embeddings queue appears to be making progress."""
-    pending = int(embed_counts.get("pending", 0))
-    running = int(embed_counts.get("running", 0))
-    errored = int(embed_counts.get("errored", 0))
-    done = int(embed_counts.get("done", 0))
+    """Summarize whether session embeddings are being produced.
 
-    if not embed_counts:
+    ``unavailable`` means there is no memory store at all and
+    ``vector_unavailable`` that pgvector is missing from it -- both are hard
+    failures of the embedding path, not a slow queue. Otherwise the state is
+    inferred from the ``embed_session`` ledger stats. (``disabled`` -- embeddings
+    configured off -- is only known to the running server; see readiness.)
+    """
+    if not memory.get("available"):
+        return {"state": "unavailable", "message": str(memory.get("detail") or "")}
+    vector = memory.get("vector") or {}
+    if not vector.get("ready"):
+        return {
+            "state": "vector_unavailable",
+            "message": str(vector.get("detail") or ""),
+        }
+    stats = (memory.get("jobs") or {}).get("embed_session") or {}
+    pending = int(stats.get("pending") or 0)
+    running = int(stats.get("running") or 0)
+    errored = (
+        int(stats.get("retry_wait") or 0)
+        + int(stats.get("quarantined") or 0)
+        + int(stats.get("dead_lettered") or 0)
+    )
+
+    if not (pending or running or errored or stats.get("last_success_at")):
+        if session_embeddings_count:
+            return {
+                "state": "idle",
+                "message": f"no embed jobs queued ({session_embeddings_count} session embeddings)",
+            }
         return {
             "state": "unknown",
-            "message": "embed_jobs table is missing or empty; no embedding queue activity found",
+            "message": "no embedding job activity found in the job ledger",
         }
     if pending == 0 and running == 0:
         if errored:
@@ -936,7 +1181,7 @@ def _embedding_status(
             }
         return {
             "state": "idle",
-            "message": f"no pending embed jobs ({done} done, {session_embeddings_count or 0} session embeddings)",
+            "message": f"no pending embed jobs ({session_embeddings_count or 0} session embeddings)",
         }
     if running:
         return {
@@ -1030,198 +1275,59 @@ def _pending_incoming_by_source(
     return dict(sorted(grouped.items()))
 
 
-def _stale_running_span_embed_jobs(
-    con: duckdb.DuckDBPyConnection,
-    *,
-    stale_after_hours: int,
-    limit: int = 10,
-    warnings: list[str],
-) -> dict:
-    count_rows = _safe_rows(
-        con,
-        """
-        SELECT count(*),
-               max(date_diff('hour', COALESCE(updated_at, enqueued_at), now()))
-          FROM span_embed_jobs
-         WHERE status = 'running'
-           AND COALESCE(updated_at, enqueued_at) < now() - (? * INTERVAL '1 hour')
-        """,
-        [stale_after_hours],
-        warnings=warnings,
-        label="stale span embed job count",
-    )
-    total_stale = int(count_rows[0][0] or 0) if count_rows else 0
-    max_age = int(count_rows[0][1] or 0) if count_rows else 0
-    rows = _safe_rows(
-        con,
-        """
-        SELECT span_id,
-               attempts,
-               COALESCE(updated_at, enqueued_at) AS last_touched_at,
-               date_diff('hour', COALESCE(updated_at, enqueued_at), now()) AS age_hours
-          FROM span_embed_jobs
-         WHERE status = 'running'
-           AND COALESCE(updated_at, enqueued_at) < now() - (? * INTERVAL '1 hour')
-         ORDER BY COALESCE(updated_at, enqueued_at) ASC NULLS FIRST, span_id
-         LIMIT ?
-        """,
-        [stale_after_hours, limit],
-        warnings=warnings,
-        label="stale span embed jobs",
-    )
-    stale = [
-        {
-            "span_id": str(span_id),
-            "attempts": int(attempts or 0),
-            "last_touched_at": (
-                str(last_touched_at) if last_touched_at is not None else None
-            ),
-            "age_hours": int(age_hours or 0),
-        }
-        for span_id, attempts, last_touched_at, age_hours in rows
-    ]
-    return {
-        "stale_running": stale,
-        "stale_running_jobs": total_stale,
-        "stale_running_age_hours": max_age,
+_JOB_SECTIONS = {
+    "summarize_session": "summarize_jobs",
+    "embed_session": "embed_jobs",
+    "brief_project": "brief_jobs",
+    "recap_session": "recap_jobs",
+}
+
+
+def _apply_memory_audit(
+    report: dict, store_path: Path, *, embedding_model: Optional[str]
+) -> None:
+    """Fill the derived-memory parts of a runtime audit report."""
+    memory = memory_audit(store_path, embedding_model=embedding_model)
+    report["memory"] = {
+        "available": memory["available"],
+        "detail": memory["detail"],
+        "jobs": memory["jobs"],
+        "vector": memory["vector"],
     }
-
-
-def _embedded_recent_span_count(
-    con: duckdb.DuckDBPyConnection,
-    *,
-    days: int,
-    warnings: list[str],
-) -> int | None:
-    rows = _safe_rows(
-        con,
-        """
-        SELECT count(DISTINCT e.span_id)
-          FROM span_embeddings e
-          JOIN spans s ON s.span_id = e.span_id
-         WHERE s.date >= strftime(current_date - ? * INTERVAL '1 day', '%Y-%m-%d')
-           AND s.date <> '_seed'
-        """,
-        [days],
-        warnings=warnings,
-        label="recent span embedding coverage",
+    counts = memory["counts"]
+    report["table_counts"]["session_summaries"] = counts.get("session_summaries")
+    report["table_counts"]["project_briefs"] = counts.get("project_briefs")
+    report["table_counts"]["session_embeddings"] = memory["session_embeddings_count"]
+    report["session_embeddings_count"] = memory["session_embeddings_count"]
+    for kind, key in _JOB_SECTIONS.items():
+        section = memory["job_sections"].get(kind)
+        if section is not None:
+            report[key] = section
+    if memory["bundle_quality"] is not None:
+        report["bundle_quality"] = memory["bundle_quality"]
+    report["embedding_status"] = _embedding_status(
+        memory=memory, session_embeddings_count=memory["session_embeddings_count"]
     )
-    if not rows:
-        return None
-    return int(rows[0][0] or 0)
 
-
-def _bundle_quality_summary(
-    con: duckdb.DuckDBPyConnection,
-    *,
-    warnings: list[str],
-) -> dict[str, int | float | None]:
-    rows = _safe_rows(
-        con,
-        """
-        SELECT
-          count(*) AS total_summaries,
-          count(*) FILTER (
-            WHERE NULLIF(trim(COALESCE(ss.summary_md, '')), '') IS NOT NULL
-          ) AS summaries_with_summary_md,
-          count(*) FILTER (
-            WHERE NULLIF(trim(COALESCE(ss.next_steps_md, '')), '') IS NOT NULL
-          ) AS summaries_with_next_steps_md,
-          count(*) FILTER (
-            WHERE ss.files_touched IS NOT NULL AND array_length(ss.files_touched) > 0
-          ) AS summaries_with_files_touched,
-          count(*) FILTER (
-            WHERE ss.open_questions IS NOT NULL AND array_length(ss.open_questions) > 0
-          ) AS summaries_with_open_questions,
-          count(*) FILTER (
-            WHERE NULLIF(trim(COALESCE(ss.last_user_prompt, '')), '') IS NOT NULL
-          ) AS summaries_with_last_user_prompt,
-          count(*) FILTER (
-            WHERE NULLIF(trim(COALESCE(ss.last_assistant, '')), '') IS NOT NULL
-          ) AS summaries_with_last_assistant,
-          count(*) FILTER (
-            WHERE NULLIF(trim(COALESCE(ss.generator_model, '')), '') IS NOT NULL
-          ) AS summaries_with_generator_model,
-          count(*) FILTER (
-            WHERE COALESCE(ss.status, '') IN ('complete', 'completed')
-          ) AS complete_summaries,
-          count(*) FILTER (
-            WHERE NULLIF(trim(COALESCE(ss.summary_md, '')), '') IS NOT NULL
-              AND COALESCE(ss.status, '') IN ('complete', 'completed')
-              AND se.session_id IS NOT NULL
-          ) AS recall_usable_summaries,
-          count(*) FILTER (
-            WHERE NULLIF(trim(COALESCE(ss.summary_md, '')), '') IS NOT NULL
-              AND NULLIF(trim(COALESCE(ss.next_steps_md, '')), '') IS NOT NULL
-              AND NULLIF(trim(COALESCE(ss.last_user_prompt, '')), '') IS NOT NULL
-              AND NULLIF(trim(COALESCE(ss.last_assistant, '')), '') IS NOT NULL
-              AND (
-                (ss.files_touched IS NOT NULL AND array_length(ss.files_touched) > 0)
-                OR (ss.open_questions IS NOT NULL AND array_length(ss.open_questions) > 0)
-              )
-          ) AS rich_bundle_ready_summaries
-        FROM session_summaries ss
-        LEFT JOIN session_embeddings se USING (session_id)
-        """,
-        warnings=warnings,
-        label="bundle quality",
-    )
-    if not rows:
-        return {
-            "total_summaries": None,
-            "summaries_with_summary_md": None,
-            "summaries_with_next_steps_md": None,
-            "summaries_with_files_touched": None,
-            "summaries_with_open_questions": None,
-            "summaries_with_last_user_prompt": None,
-            "summaries_with_last_assistant": None,
-            "summaries_with_generator_model": None,
-            "complete_summaries": None,
-            "recall_usable_summaries": None,
-            "recall_usable_percent": None,
-            "missing_recall_processing_summaries": None,
-            "missing_rich_evidence_summaries": None,
-            "bundle_ready_summaries": None,
-            "bundle_ready_percent": None,
-        }
-    (
-        total_summaries,
-        summaries_with_summary_md,
-        summaries_with_next_steps_md,
-        summaries_with_files_touched,
-        summaries_with_open_questions,
-        summaries_with_last_user_prompt,
-        summaries_with_last_assistant,
-        summaries_with_generator_model,
-        complete_summaries,
-        recall_usable_summaries,
-        rich_bundle_ready_summaries,
-    ) = rows[0]
-    total = int(total_summaries or 0)
-    usable = int(recall_usable_summaries or 0)
-    ready = int(rich_bundle_ready_summaries or 0)
-    usable_percent = None
-    ready_percent = None
-    if total:
-        usable_percent = round((usable / total) * 100.0, 1)
-        ready_percent = round((ready / total) * 100.0, 1)
-    return {
-        "total_summaries": total,
-        "summaries_with_summary_md": int(summaries_with_summary_md or 0),
-        "summaries_with_next_steps_md": int(summaries_with_next_steps_md or 0),
-        "summaries_with_files_touched": int(summaries_with_files_touched or 0),
-        "summaries_with_open_questions": int(summaries_with_open_questions or 0),
-        "summaries_with_last_user_prompt": int(summaries_with_last_user_prompt or 0),
-        "summaries_with_last_assistant": int(summaries_with_last_assistant or 0),
-        "summaries_with_generator_model": int(summaries_with_generator_model or 0),
-        "complete_summaries": int(complete_summaries or 0),
-        "recall_usable_summaries": usable,
-        "recall_usable_percent": usable_percent,
-        "missing_recall_processing_summaries": max(total - usable, 0),
-        "missing_rich_evidence_summaries": max(total - ready, 0),
-        "bundle_ready_summaries": ready,
-        "bundle_ready_percent": ready_percent,
-    }
+    if not memory["available"]:
+        report["warnings"].append(f"derived memory unavailable: {memory['detail']}")
+        return
+    if not memory["vector"]["ready"]:
+        report["warnings"].append(
+            f"session embeddings unavailable: {memory['vector']['detail']}"
+        )
+    if report["embedding_status"]["state"] == "offline_or_unconfigured":
+        pending = int((memory["jobs"].get("embed_session") or {}).get("pending") or 0)
+        report["warnings"].append(
+            f"Embedding queue has {pending} pending jobs but 0 session_embeddings"
+        )
+    for kind, stats in memory["jobs"].items():
+        expired = int(stats.get("expired_leases") or 0)
+        if expired:
+            report["warnings"].append(
+                f"{kind} has {expired} running job(s) past their lease; the next "
+                "claim reclaims them"
+            )
 
 
 def runtime_audit(
@@ -1235,6 +1341,8 @@ def runtime_audit(
     deep: bool = True,
     role: str = "diagnostic",
     spans_enabled: bool = False,
+    memory_store_path: Optional[Path] = None,
+    embedding_model: Optional[str] = None,
 ) -> dict:
     """Return a read-only operational health report for a Drover runtime DB.
 
@@ -1244,6 +1352,13 @@ def runtime_audit(
     With the optional span integration off (the default, #473) no span
     Parquet is read: span sections report ``status: "disabled"`` and raise no
     warnings, so an absent span feed is never mistaken for a failure.
+    Derived memory (summaries, briefs, embeddings and their job ledger) is
+    read from the PostgreSQL control store registered for
+    ``memory_store_path`` -- default ``source_duckdb_path``, then
+    ``duckdb_path``. A private snapshot copy has no store registered, so
+    callers auditing one must pass the live path. ``embedding_model`` scopes
+    the embedding count to the configured embedding space (any model when
+    omitted).
 
     ``role`` picks the DuckDB connection profile. It defaults to
     ``diagnostic`` (one thread) because this function is reachable from the
@@ -1255,6 +1370,7 @@ def runtime_audit(
     duckdb_path = Path(duckdb_path)
     source_duckdb_path = Path(source_duckdb_path) if source_duckdb_path else duckdb_path
     diagnostic_db_path = Path(diagnostic_db_path) if diagnostic_db_path else None
+    store_path = Path(memory_store_path) if memory_store_path else source_duckdb_path
     hours = max(1, int(hours))
     report: dict = {
         "duckdb_path": str(duckdb_path),
@@ -1267,32 +1383,25 @@ def runtime_audit(
         "diagnostic_depth": "deep" if deep else "standard",
         "span_integration": "enabled" if spans_enabled else "disabled",
         "skipped_checks": [],
-        "table_counts": {},
+        "table_counts": {
+            name: None for name in (*RUNTIME_KEY_RELATIONS, *MEMORY_KEY_RELATIONS)
+        },
         "latest_events": {},
+        "memory": {
+            "available": False,
+            "detail": "memory store not checked",
+            "jobs": {},
+            "vector": {"ready": False, "detail": "memory store not checked"},
+        },
         "summarize_jobs": {
             "status_counts": {},
             "recent_errors": [],
             "backend_health": {"state": "missing"},
         },
         "embed_jobs": {"status_counts": {}, "recent_errors": []},
-        "span_embed_jobs": {
-            "status_counts": {},
-            "recent_errors": [],
-            "running_jobs": 0,
-            "stale_running_jobs": 0,
-            "stale_running_age_hours": 0,
-            "stale_running": [],
-        },
+        "brief_jobs": {"status_counts": {}, "recent_errors": []},
+        "recap_jobs": {"status_counts": {}, "recent_errors": []},
         "session_embeddings_count": None,
-        "span_embedding_coverage": {
-            "embedded_spans": None,
-            "embedded_recent_spans": None,
-            "pending_jobs": None,
-            "stale_running_jobs": None,
-            "total_recent_spans": None,
-            "coverage_percent": None,
-            "coverage_note": None,
-        },
         "bundle_quality": {
             "total_summaries": None,
             "summaries_with_summary_md": None,
@@ -1312,7 +1421,7 @@ def runtime_audit(
         },
         "embedding_status": {
             "state": "unknown",
-            "message": "embedding status unavailable until embed_jobs is readable",
+            "message": "embedding status unavailable until the memory store is readable",
         },
         "session_consistency": {"status": "missing"},
         "agent_event_identity": {"status": "missing"},
@@ -1350,6 +1459,7 @@ def runtime_audit(
         ),
         "warnings": [],
     }
+    _apply_memory_audit(report, store_path, embedding_model=embedding_model)
     if not duckdb_path.exists():
         report["warnings"].append(f"DuckDB path does not exist: {duckdb_path}")
         for name in RUNTIME_KEY_RELATIONS:
@@ -1456,98 +1566,13 @@ def runtime_audit(
             for agent_id, ts, event_type, session_id, repo_owner, repo_name in rows
         }
 
-        summarize_counts = _status_counts(con, "summarize_jobs")
-        summarize_errors = _recent_job_errors(con, "summarize_jobs")
-        report["summarize_jobs"] = {
-            "status_counts": summarize_counts,
-            "recent_errors": summarize_errors,
-            "backend_health": _summarize_job_backend_health(con, summarize_counts),
-        }
-        embed_counts = _status_counts(con, "embed_jobs")
-        report["embed_jobs"] = {
-            "status_counts": embed_counts,
-            "recent_errors": _recent_job_errors(con, "embed_jobs"),
-        }
-        report["session_embeddings_count"] = report["table_counts"].get(
-            "session_embeddings"
-        )
-        span_embed_counts = _status_counts(con, "span_embed_jobs")
-        stale_span_jobs = {
-            "stale_running": [],
-            "stale_running_jobs": 0,
-            "stale_running_age_hours": 0,
-        }
-        if spans_enabled and report["table_counts"].get("span_embed_jobs") is not None:
-            stale_span_jobs = _stale_running_span_embed_jobs(
-                con,
-                stale_after_hours=24,
-                warnings=report["warnings"],
-            )
-        report["span_embed_jobs"] = {
-            "status_counts": span_embed_counts,
-            "recent_errors": [],
-            "running_jobs": int(span_embed_counts.get("running", 0)),
-            **stale_span_jobs,
-        }
-        if stale_span_jobs["stale_running_jobs"]:
-            report["warnings"].append(
-                "span_embed_jobs has "
-                f"{stale_span_jobs['stale_running_jobs']} stale running job(s); "
-                "operator flow: run `drover-server embeddings reset-stale-spans` "
-                "to preview and add `--apply` to requeue them"
-            )
-        embedded_spans = report["table_counts"].get("span_embeddings")
-        total_recent_spans = report["span_health"].get("recent_count")
-        embedded_recent_spans = None
-        if total_recent_spans is not None and _relation_exists(con, "spans"):
-            embedded_recent_spans = _embedded_recent_span_count(
-                con, days=recent_days, warnings=report["warnings"]
-            )
-        coverage_percent = None
-        if total_recent_spans:
-            coverage_percent = round(
-                (int(embedded_recent_spans or 0) / int(total_recent_spans)) * 100, 1
-            )
-            coverage_percent = min(100.0, coverage_percent)
-        coverage_note = None
-        if (
-            embedded_spans is not None
-            and total_recent_spans is not None
-            and int(embedded_spans or 0) > int(total_recent_spans or 0)
-        ):
-            coverage_note = (
-                "embedded_spans is the total span_embeddings row count; derived or "
-                "historical embeddings can exceed the current recent span denominator. "
-                "coverage_percent uses embedded_recent_spans / total_recent_spans and is bounded at 100%."
-            )
-        report["span_embedding_coverage"] = {
-            "embedded_spans": embedded_spans,
-            "embedded_recent_spans": embedded_recent_spans,
-            "pending_jobs": int(span_embed_counts.get("pending", 0)),
-            "stale_running_jobs": int(stale_span_jobs["stale_running_jobs"]),
-            "total_recent_spans": total_recent_spans,
-            "coverage_percent": coverage_percent,
-            "coverage_note": coverage_note,
-        }
-        if not spans_enabled:
-            # Historical rows stay counted for the record; nothing is judged.
-            report["span_embedding_coverage"]["status"] = "disabled"
-            report["span_embedding_coverage"]["coverage_percent"] = None
-        report["embedding_status"] = _embedding_status(
-            embed_counts=embed_counts,
-            session_embeddings_count=report["session_embeddings_count"],
-        )
-        if report["embedding_status"]["state"] == "offline_or_unconfigured":
-            pending = int(embed_counts.get("pending", 0))
-            report["warnings"].append(
-                f"Embedding queue has {pending} pending jobs but 0 session_embeddings"
-            )
         if report["table_counts"].get("agent_events") is not None:
             report["session_consistency"] = audit_session_consistency(
                 con,
                 duckdb_path=duckdb_path,
                 include_expensive_checks=deep,
                 scan=scan,
+                memory_store_path=store_path,
             )
             session_status = report["session_consistency"].get("status")
             if session_status not in {"ok", "missing"}:
@@ -1566,11 +1591,6 @@ def runtime_audit(
                     "agent_events has duplicate dedup_key values; canonical event "
                     "dedupe is not clean"
                 )
-
-        if report["table_counts"].get("session_summaries") is not None:
-            report["bundle_quality"] = _bundle_quality_summary(
-                con, warnings=report["warnings"]
-            )
 
         if deep and report["table_counts"].get("agent_events") is not None:
             report["repo_attribution"] = _repo_attribution_for_window(
@@ -1765,40 +1785,33 @@ def _append_core_sections(lines: list[str], report: dict, *, spans_off: bool) ->
             f"embedding status: {embedding_status.get('state', 'unknown')} — {embedding_status.get('message', '-')}",
         ]
     )
-    if not spans_off:
-        _append_span_embedding_lines(lines, report)
-    _append_consistency_sections(lines, report)
-
-
-def _append_span_embedding_lines(lines: list[str], report: dict) -> None:
-    sej = report.get("span_embed_jobs", {})
-    span_cov = report.get("span_embedding_coverage", {})
-    stale_running = int(sej.get("stale_running_jobs") or 0)
-    stale_suffix = ""
-    if stale_running:
-        stale_suffix = (
-            f" (stale_running={stale_running} "
-            f"max_age_hours={sej.get('stale_running_age_hours', 0)})"
+    for key in ("brief_jobs", "recap_jobs"):
+        section = report.get(key, {})
+        lines.append(
+            f"{key}: {_format_status_counts(section.get('status_counts', {}))}"
         )
-    coverage_detail = ""
-    if span_cov.get("embedded_recent_spans") is not None:
-        coverage_detail = (
-            f" ({span_cov.get('embedded_spans')} total embedded; "
-            f"{span_cov.get('embedded_recent_spans')} in recent span denominator)"
-        )
+
+    memory = report.get("memory", {})
+    vector = memory.get("vector", {})
     lines.extend(
         [
-            f"span_embed_jobs: {_format_status_counts(sej.get('status_counts', {}))}{stale_suffix}",
-            "span embeddings: "
-            f"{span_cov.get('embedded_spans') if span_cov.get('embedded_spans') is not None else 'missing'} "
-            f"embedded; pending={span_cov.get('pending_jobs') if span_cov.get('pending_jobs') is not None else 'missing'} "
-            f"stale_running={span_cov.get('stale_running_jobs') if span_cov.get('stale_running_jobs') is not None else 'missing'} "
-            f"coverage={span_cov.get('coverage_percent') if span_cov.get('coverage_percent') is not None else '-'}%"
-            f"{coverage_detail}",
+            "",
+            "derived memory (PostgreSQL): "
+            f"{'available' if memory.get('available') else 'unavailable'} — {memory.get('detail') or '-'}",
+            f"  vectors: {'ready' if vector.get('ready') else 'not ready'} — {vector.get('detail') or '-'}",
         ]
     )
-    if span_cov.get("coverage_note"):
-        lines.append(f"  note: {span_cov.get('coverage_note')}")
+    for kind, stats in (memory.get("jobs") or {}).items():
+        lines.append(
+            f"  {kind:18s} pending={stats.get('pending', 0)} "
+            f"retry_wait={stats.get('retry_wait', 0)} running={stats.get('running', 0)} "
+            f"expired_leases={stats.get('expired_leases', 0)} "
+            f"dead_lettered={stats.get('dead_lettered', 0)} "
+            f"quarantined={stats.get('quarantined', 0)} "
+            f"last_success={stats.get('last_success_at') or '-'}"
+        )
+
+    _append_consistency_sections(lines, report)
 
 
 def _append_consistency_sections(lines: list[str], report: dict) -> None:
@@ -1960,6 +1973,20 @@ def _append_consistency_sections(lines: list[str], report: dict) -> None:
         lines.extend(f"  ⚠ {w}" for w in warnings)
 
 
+def _memory_summary_count(store_path: Path, warnings: list[str]) -> int:
+    """Final summaries in the PostgreSQL memory store; 0 without one."""
+    from drover.server.ledger import memory_store_available
+    from drover.server.memory_store import MemoryRepository
+
+    if not memory_store_available(store_path):
+        return 0
+    try:
+        return MemoryRepository(store_path).counts()["session_summaries"]
+    except Exception as exc:  # noqa: BLE001 - this audit never raises
+        warnings.append(f"session summary count failed: {exc}")
+        return 0
+
+
 def audit_lakehouse(
     *,
     parquet_dir: Path,
@@ -2001,7 +2028,7 @@ def audit_lakehouse(
             "SELECT count(DISTINCT session_id) FROM agent_events WHERE id IS NOT NULL",
         )
         tasks_total = _safe_count(con, "SELECT count(*) FROM tasks")
-        summaries_total = _safe_count(con, "SELECT count(*) FROM session_summaries")
+        summaries_total = _memory_summary_count(duckdb_path, warnings)
 
         # Per-(date, agent_id) breakdown
         by_partition: dict[tuple[str, str], int] = {}

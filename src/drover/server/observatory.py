@@ -1,4 +1,10 @@
-"""Read-only Drover Pipeline Observatory snapshots."""
+"""Read-only Drover Pipeline Observatory snapshots.
+
+Saved artifacts -- session summaries, project briefs and session embeddings --
+are derived memory in the PostgreSQL control store (#480); tasks still come
+from the analytical DuckDB. Without a PostgreSQL control store there are no
+artifacts, and the snapshot says so instead of failing.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,13 @@ import duckdb
 
 from drover.server.adoption import adoption_snapshot
 from drover.server.db import open_duckdb_connection
+from drover.server.ledger import memory_store_available
+from drover.server.memory_store import MemoryRepository, vector_status
+
+MEMORY_UNAVAILABLE_DETAIL = (
+    "derived memory requires the PostgreSQL control store; this hub runs a "
+    "DuckDB control store, so no summaries, briefs or embeddings exist"
+)
 
 
 def _coerce(value: Any) -> Any:
@@ -22,7 +35,7 @@ def _coerce(value: Any) -> Any:
     return value
 
 
-def _rows(cursor: duckdb.DuckDBPyConnection) -> list[dict[str, Any]]:
+def _rows(cursor: Any) -> list[dict[str, Any]]:
     cols = [desc[0] for desc in cursor.description]
     return [
         {col: _coerce(value) for col, value in zip(cols, row)}
@@ -30,16 +43,17 @@ def _rows(cursor: duckdb.DuckDBPyConnection) -> list[dict[str, Any]]:
     ]
 
 
-def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
-    row = con.execute(
-        """
-        SELECT count(*)
-          FROM information_schema.tables
-         WHERE table_name = ?
-        """,
-        [table_name],
-    ).fetchone()
-    return bool(row and row[0])
+def _instant(value: Any) -> datetime | None:
+    if isinstance(value, str) and value:
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _preview(text: str | None, limit: int = 360) -> str | None:
@@ -63,53 +77,68 @@ def _missing_summary_fields(row: dict[str, Any]) -> list[str]:
     return missing
 
 
-def _summary_artifacts(con: duckdb.DuckDBPyConnection, *, limit: int) -> dict[str, Any]:
-    if not _table_exists(con, "session_summaries"):
-        return {"total": 0, "bundle_ready": 0, "latest": []}
+def _task_repos(
+    con: duckdb.DuckDBPyConnection, task_ids: list[str]
+) -> dict[str, tuple[Any, Any, Any]]:
+    if not task_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in task_ids)
+    rows = con.execute(
+        f"""SELECT task_id, repo_owner, repo_name, branch
+              FROM tasks WHERE task_id IN ({placeholders})""",
+        task_ids,
+    ).fetchall()
+    return {str(row[0]): (row[1], row[2], row[3]) for row in rows}
+
+
+def _summary_artifacts(
+    pg: Any, con: duckdb.DuckDBPyConnection, *, limit: int
+) -> dict[str, Any]:
     rows = _rows(
-        con.execute(
+        pg.execute(
             """
-            SELECT ss.session_id, ss.task_id, ss.agent_id, ss.ended_at, ss.generated_at,
-                   ss.generator_model, ss.status, ss.summary_md, ss.next_steps_md,
-                   ss.last_user_prompt, ss.last_assistant, ss.files_touched,
-                   ss.open_questions,
-                   t.repo_owner, t.repo_name, t.branch
-              FROM session_summaries ss
-              LEFT JOIN tasks t ON ss.task_id = t.task_id
-             ORDER BY COALESCE(
-                      TRY_CAST(ss.generated_at AS TIMESTAMPTZ),
-                      TRY_CAST(ss.ended_at AS TIMESTAMPTZ)
-                    ) DESC NULLS LAST
+            SELECT session_id, task_id, agent_id, project_key, ended_at,
+                   summary_generated_at AS generated_at,
+                   summary_model AS generator_model, summary_status AS status,
+                   summary_md, next_steps_md, last_user_prompt, last_assistant,
+                   files_touched, open_questions
+              FROM session_memory
+             WHERE phase = 'final'
+             ORDER BY COALESCE(summary_generated_at, ended_at) DESC NULLS LAST
              LIMIT ?
             """,
             [int(limit)],
         )
     )
-    total, ready = con.execute("""
+    total, ready = pg.execute("""
         SELECT count(*),
                count(*) FILTER (
                  WHERE NULLIF(trim(COALESCE(summary_md, '')), '') IS NOT NULL
                    AND NULLIF(trim(COALESCE(next_steps_md, '')), '') IS NOT NULL
                    AND NULLIF(trim(COALESCE(last_user_prompt, '')), '') IS NOT NULL
                    AND NULLIF(trim(COALESCE(last_assistant, '')), '') IS NOT NULL
-                   AND (
-                     (files_touched IS NOT NULL AND array_length(files_touched) > 0)
-                     OR (open_questions IS NOT NULL AND array_length(open_questions) > 0)
-                   )
+                   AND (cardinality(files_touched) > 0 OR cardinality(open_questions) > 0)
                )
-          FROM session_summaries
+          FROM session_memory
+         WHERE phase = 'final'
         """).fetchone()
+    repos = _task_repos(
+        con, sorted({str(r["task_id"]) for r in rows if r.get("task_id")})
+    )
     latest = []
     for row in rows:
         missing = _missing_summary_fields(row)
+        owner, name, branch = repos.get(str(row.get("task_id")), (None, None, None))
+        if owner is None and row.get("project_key"):
+            owner, _, name = str(row["project_key"]).partition("/")
         latest.append(
             {
                 "session_id": row.get("session_id"),
                 "task_id": row.get("task_id"),
                 "agent_id": row.get("agent_id"),
-                "repo_owner": row.get("repo_owner"),
-                "repo_name": row.get("repo_name"),
-                "branch": row.get("branch"),
+                "repo_owner": owner,
+                "repo_name": name,
+                "branch": branch,
                 "ended_at": row.get("ended_at"),
                 "generated_at": row.get("generated_at"),
                 "generator_model": row.get("generator_model"),
@@ -125,131 +154,113 @@ def _summary_artifacts(con: duckdb.DuckDBPyConnection, *, limit: int) -> dict[st
     return {"total": int(total or 0), "bundle_ready": int(ready or 0), "latest": latest}
 
 
-def _brief_artifacts(con: duckdb.DuckDBPyConnection, *, limit: int) -> dict[str, Any]:
-    if not _table_exists(con, "project_briefs"):
-        return {"total": 0, "latest": []}
-    total = con.execute("SELECT count(*) FROM project_briefs").fetchone()[0]
-    rows = _rows(
-        con.execute(
-            """
-            SELECT project_key, repo_owner, repo_name, session_count, last_activity_at,
-                   generated_at, generator_model, key_files, open_questions,
-                   brief_md, recent_themes_md, next_steps_md
-              FROM project_briefs
-             ORDER BY COALESCE(
-                      TRY_CAST(generated_at AS TIMESTAMPTZ),
-                      TRY_CAST(last_activity_at AS TIMESTAMPTZ)
-                    ) DESC NULLS LAST
-             LIMIT ?
-            """,
-            [int(limit)],
-        )
-    )
+def _brief_artifacts(repo: MemoryRepository, pg: Any, *, limit: int) -> dict[str, Any]:
+    total = repo.counts(con=pg)["project_briefs"]
     latest = []
-    for row in rows:
+    for brief in repo.briefs(limit=limit):
         latest.append(
             {
-                "project_key": row.get("project_key"),
-                "repo_owner": row.get("repo_owner"),
-                "repo_name": row.get("repo_name"),
-                "session_count": row.get("session_count"),
-                "last_activity_at": row.get("last_activity_at"),
-                "generated_at": row.get("generated_at"),
-                "generator_model": row.get("generator_model"),
-                "key_files_count": len(row.get("key_files") or []),
-                "open_questions_count": len(row.get("open_questions") or []),
-                "brief_preview": _preview(row.get("brief_md")),
-                "recent_themes_preview": _preview(row.get("recent_themes_md")),
-                "next_steps_preview": _preview(row.get("next_steps_md")),
+                "project_key": brief.project_key,
+                "repo_owner": brief.repo_owner,
+                "repo_name": brief.repo_name,
+                "session_count": brief.session_count,
+                "last_activity_at": _coerce(brief.last_activity_at),
+                "generated_at": _coerce(brief.generated_at),
+                "generator_model": brief.generator_model,
+                "key_files_count": len(brief.key_files or ()),
+                "open_questions_count": len(brief.open_questions or ()),
+                "brief_preview": _preview(brief.brief_md),
+                "recent_themes_preview": _preview(brief.recent_themes_md),
+                "next_steps_preview": _preview(brief.next_steps_md),
             }
         )
     return {"total": int(total or 0), "latest": latest}
 
 
 def _project_readiness(
-    con: duckdb.DuckDBPyConnection, *, limit: int
+    pg: Any | None, con: duckdb.DuckDBPyConnection, *, limit: int
 ) -> list[dict[str, Any]]:
-    rows = _rows(
-        con.execute(
-            """
-            WITH task_projects AS (
-              SELECT repo_owner, repo_name,
-                     count(*) AS task_count,
-                     sum(COALESCE(session_count, 0)) AS task_session_count,
-                     max(last_activity_at) AS latest_task_activity_at
-                FROM tasks
-               WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
-               GROUP BY repo_owner, repo_name
-            ),
-            summary_projects AS (
-              SELECT t.repo_owner AS repo_owner,
-                     t.repo_name AS repo_name,
-                     count(DISTINCT ss.session_id) AS summary_count,
-                     count(DISTINCT se.session_id) AS session_embedding_count,
-                     max(COALESCE(
-                       TRY_CAST(ss.generated_at AS TIMESTAMPTZ),
-                       TRY_CAST(ss.ended_at AS TIMESTAMPTZ)
-                     )) AS latest_summary_at
-                FROM session_summaries ss
-                JOIN tasks t ON ss.task_id = t.task_id
-                LEFT JOIN session_embeddings se ON ss.session_id = se.session_id
-               WHERE t.repo_owner IS NOT NULL
-                 AND t.repo_name IS NOT NULL
-               GROUP BY 1, 2
-            ),
-            span_projects AS (
-              SELECT repo_owner, repo_name,
-                     count(*) AS span_count,
-                     count(*) AS span_embedding_count,
-                     max(embedded_at) AS latest_span_at
-                FROM span_embeddings
-               WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
-               GROUP BY repo_owner, repo_name
-            ),
-            projects AS (
-              SELECT repo_owner, repo_name FROM task_projects
-              UNION
-              SELECT repo_owner, repo_name FROM summary_projects
-              UNION
-              SELECT repo_owner, repo_name FROM span_projects
-              UNION
-              SELECT repo_owner, repo_name FROM project_briefs
-            )
-            SELECT p.repo_owner, p.repo_name,
-                   p.repo_owner || '/' || p.repo_name AS project_key,
-                   COALESCE(tp.task_count, 0) AS task_count,
-                   COALESCE(tp.task_session_count, 0) AS task_session_count,
-                   tp.latest_task_activity_at,
-                   COALESCE(sp.summary_count, 0) AS summary_count,
-                   COALESCE(sp.session_embedding_count, 0) AS session_embedding_count,
-                   sp.latest_summary_at,
-                   COALESCE(spanp.span_count, 0) AS span_count,
-                   COALESCE(spanp.span_embedding_count, 0) AS span_embedding_count,
-                   spanp.latest_span_at,
-                   pb.generated_at AS project_brief_generated_at,
-                   pb.generator_model AS project_brief_model
-              FROM projects p
-              LEFT JOIN task_projects tp USING (repo_owner, repo_name)
-              LEFT JOIN summary_projects sp USING (repo_owner, repo_name)
-              LEFT JOIN span_projects spanp USING (repo_owner, repo_name)
-              LEFT JOIN project_briefs pb USING (repo_owner, repo_name)
-             ORDER BY COALESCE(
-                      TRY_CAST(tp.latest_task_activity_at AS TIMESTAMPTZ),
-                      TRY_CAST(sp.latest_summary_at AS TIMESTAMPTZ),
-                      TRY_CAST(spanp.latest_span_at AS TIMESTAMPTZ),
-                      TRY_CAST(pb.generated_at AS TIMESTAMPTZ)
-                    ) DESC NULLS LAST
-             LIMIT ?
-            """,
-            [int(limit)],
+    task_projects = {
+        (row["repo_owner"], row["repo_name"]): row for row in _rows(con.execute("""
+                SELECT repo_owner, repo_name,
+                       count(*) AS task_count,
+                       sum(COALESCE(session_count, 0)) AS task_session_count,
+                       max(last_activity_at) AS latest_task_activity_at
+                  FROM tasks
+                 WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL
+                 GROUP BY repo_owner, repo_name
+                """))
+    }
+    summary_projects: dict[tuple[Any, Any], dict[str, Any]] = {}
+    briefs: dict[tuple[Any, Any], dict[str, Any]] = {}
+    if pg is not None:
+        # Summaries attribute to a project through session_memory.project_key,
+        # which the summarizer stamps from the session's own events.
+        embeddings_ready = vector_status(pg)[0]
+        embedding_join = (
+            "LEFT JOIN session_embeddings se ON se.session_id = sm.session_id"
+            if embeddings_ready
+            else ""
         )
+        embedding_count = "count(DISTINCT se.session_id)" if embeddings_ready else "0"
+        for row in _rows(pg.execute(f"""
+                SELECT split_part(sm.project_key, '/', 1) AS repo_owner,
+                       substr(sm.project_key, strpos(sm.project_key, '/') + 1) AS repo_name,
+                       count(DISTINCT sm.session_id) AS summary_count,
+                       {embedding_count} AS session_embedding_count,
+                       max(COALESCE(sm.summary_generated_at, sm.ended_at)) AS latest_summary_at
+                  FROM session_memory sm
+                  {embedding_join}
+                 WHERE sm.phase = 'final' AND strpos(COALESCE(sm.project_key, ''), '/') > 0
+                 GROUP BY 1, 2
+                """)):
+            summary_projects[(row["repo_owner"], row["repo_name"])] = row
+        for row in _rows(
+            pg.execute("""SELECT repo_owner, repo_name, generated_at, generator_model
+                     FROM project_briefs""")
+        ):
+            briefs[(row["repo_owner"], row["repo_name"])] = row
+
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    keys = set(task_projects) | set(summary_projects) | set(briefs)
+    rows = []
+    for key in keys:
+        tp = task_projects.get(key, {})
+        sp = summary_projects.get(key, {})
+        pb = briefs.get(key, {})
+        rows.append(
+            {
+                "repo_owner": key[0],
+                "repo_name": key[1],
+                "project_key": f"{key[0]}/{key[1]}",
+                "task_count": int(tp.get("task_count") or 0),
+                "task_session_count": int(tp.get("task_session_count") or 0),
+                "latest_task_activity_at": tp.get("latest_task_activity_at"),
+                "summary_count": int(sp.get("summary_count") or 0),
+                "session_embedding_count": int(sp.get("session_embedding_count") or 0),
+                "latest_summary_at": sp.get("latest_summary_at"),
+                # Span embeddings are out of the core path (#473); the keys
+                # stay so the payload shape does not change.
+                "span_count": 0,
+                "span_embedding_count": 0,
+                "latest_span_at": None,
+                "project_brief_generated_at": pb.get("generated_at"),
+                "project_brief_model": pb.get("generator_model"),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            _instant(r["latest_task_activity_at"])
+            or _instant(r["latest_summary_at"])
+            or _instant(r["project_brief_generated_at"])
+            or floor
+        ),
+        reverse=True,
     )
     projects = []
-    for row in rows:
-        summary_count = int(row.get("summary_count") or 0)
-        session_embedding_count = int(row.get("session_embedding_count") or 0)
-        span_count = int(row.get("span_count") or 0)
-        span_embedding_count = int(row.get("span_embedding_count") or 0)
+    for row in rows[: int(limit)]:
+        summary_count = row["summary_count"]
+        session_embedding_count = row["session_embedding_count"]
         project_brief_ready = bool(row.get("project_brief_generated_at"))
         projects.append(
             {
@@ -258,18 +269,22 @@ def _project_readiness(
                 "summary_embedding_ready": (
                     summary_count > 0 and session_embedding_count >= summary_count
                 ),
-                "span_embedding_ready": (
-                    span_count == 0 or span_embedding_count >= span_count
-                ),
+                "span_embedding_ready": True,
                 "ready": bool(
                     summary_count > 0
                     and project_brief_ready
                     and session_embedding_count >= summary_count
-                    and (span_count == 0 or span_embedding_count >= span_count)
                 ),
             }
         )
     return projects
+
+
+def _empty_artifacts() -> dict[str, Any]:
+    return {
+        "session_summaries": {"total": 0, "bundle_ready": 0, "latest": []},
+        "project_briefs": {"total": 0, "latest": []},
+    }
 
 
 def pipeline_observatory_snapshot(
@@ -279,31 +294,49 @@ def pipeline_observatory_snapshot(
     max_artifacts: int = 10,
     max_projects: int = 10,
     role: str = "diagnostic",
+    memory_store_path: Path | None = None,
 ) -> dict[str, Any]:
     """Return artifact and project drilldown for the Drover pipeline.
 
     ``role`` is the DuckDB connection profile; pass ``role="snapshot"`` only
-    when ``duckdb_path`` is a private copy (see ``drover.server.db``).
+    when ``duckdb_path`` is a private copy (see ``drover.server.db``). A
+    private copy has no control store registered for it, so such callers
+    pass the live path as ``memory_store_path`` (default: ``duckdb_path``).
     """
+    store_path = Path(memory_store_path or duckdb_path)
+    memory_available = memory_store_available(store_path)
+    memory = {
+        "available": memory_available,
+        "detail": (
+            "PostgreSQL control store"
+            if memory_available
+            else MEMORY_UNAVAILABLE_DETAIL
+        ),
+    }
 
     if not Path(duckdb_path).exists():
         return {
             "snapshot_version": 1,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "duckdb_path": str(duckdb_path),
-            "artifacts": {
-                "session_summaries": {"total": 0, "bundle_ready": 0, "latest": []},
-                "project_briefs": {"total": 0, "latest": []},
-            },
+            "artifacts": _empty_artifacts(),
             "projects": [],
+            "memory": memory,
             "agent_adoption": adoption_snapshot(runtime_audit or {}),
         }
 
     con = open_duckdb_connection(duckdb_path, read_only=True, role=role)
     try:
-        summaries = _summary_artifacts(con, limit=max_artifacts)
-        briefs = _brief_artifacts(con, limit=max_artifacts)
-        projects = _project_readiness(con, limit=max_projects)
+        if memory_available:
+            repo = MemoryRepository(store_path)
+            with repo.connection() as pg:
+                summaries = _summary_artifacts(pg, con, limit=max_artifacts)
+                briefs = _brief_artifacts(repo, pg, limit=max_artifacts)
+                projects = _project_readiness(pg, con, limit=max_projects)
+            artifacts = {"session_summaries": summaries, "project_briefs": briefs}
+        else:
+            artifacts = _empty_artifacts()
+            projects = _project_readiness(None, con, limit=max_projects)
     finally:
         con.close()
 
@@ -311,10 +344,8 @@ def pipeline_observatory_snapshot(
         "snapshot_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "duckdb_path": str(duckdb_path),
-        "artifacts": {
-            "session_summaries": summaries,
-            "project_briefs": briefs,
-        },
+        "artifacts": artifacts,
         "projects": projects,
+        "memory": memory,
         "agent_adoption": adoption_snapshot(runtime_audit or {}),
     }

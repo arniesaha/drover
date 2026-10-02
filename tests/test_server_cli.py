@@ -31,15 +31,11 @@ from drover.server import __main__ as server_main
 from drover.server import setup_readiness_transport as transport_module
 from drover.server.__main__ import (
     _bootstrap_harnessd_schema,
-    _build_redis_job_streams,
-    _seed_redis_job_streams,
     _summarizer_backend_available,
     main,
 )
 from drover.server.db import control_plane_path
 from drover.server.harness import cli as harness_cli
-from drover.server.harness.recap_jobs import enqueue_live_recap
-from drover.server.analytical_ledger import ArtifactSpec, Ledger
 from drover.server.setup_readiness import SetupCheck, SetupReadinessReport
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.wol import GpuRig
@@ -112,17 +108,6 @@ def seeded_server_db(tmp_path: Path) -> Path:
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
     return db
-
-
-class RecordingJobStream:
-    """Capture the payloads mirrored into a startup job stream."""
-
-    def __init__(self) -> None:
-        self.items: list[dict[str, str]] = []
-
-    def add(self, fields: dict[str, str]) -> str:
-        self.items.append(fields)
-        return f"{len(self.items)}-0"
 
 
 def _write_spans(parquet_dir: Path, rows: list[dict]) -> None:
@@ -303,44 +288,16 @@ def test_summarizer_backend_available_requires_api_or_claude_code(
         )
 
 
-def test_build_redis_job_streams_includes_live_recap(monkeypatch) -> None:
-    """A Redis-enabled server gives live recaps their own consumer stream."""
-    captured_suffixes: list[str] = []
-
-    def fake_from_url(_url, config):
-        captured_suffixes.append(config.stream.rsplit(":", maxsplit=1)[-1])
-        return RecordingJobStream()
-
-    monkeypatch.setattr(
-        server_main.RedisJobStream, "from_url", staticmethod(fake_from_url)
-    )
-    cfg = replace(default_config(), redis_jobs_enabled=True)
-
-    streams = _build_redis_job_streams(cfg)
-
-    assert "live_recap" in streams
-    assert "summarize_live_session" in captured_suffixes
-
-
-def test_seed_redis_streams_publishes_live_recap_source_seq(tmp_path):
-    db = seeded_server_db(tmp_path)
-    # The recap queue moved to the control-plane store in #95; seeding has to
-    # read it where the control plane keeps it.
-    with duckdb.connect(str(control_plane_path(db))) as con:
-        enqueue_live_recap(con, "s1", 12)
-    stream = RecordingJobStream()
-    counts = _seed_redis_job_streams(duckdb_path=db, streams={"live_recap": stream})
-    assert counts == {"live_recap": 1}
-    assert stream.items == [{"session_id": "s1", "source_seq": "12"}]
-
-
 @pytest.mark.parametrize(
     "summarizer_start_error",
     [False, True],
     ids=["summarizer-starts", "summarizer-start-fails"],
 )
+@pytest.mark.parametrize(
+    "memory_available", [True, False], ids=["postgres-memory", "duckdb-only"]
+)
 def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
-    tmp_path, monkeypatch, summarizer_start_error
+    tmp_path, monkeypatch, summarizer_start_error, memory_available
 ) -> None:
     """The foreground server owns recap worker lifecycle beside summarization."""
     events: list[tuple[str, str]] = []
@@ -434,6 +391,9 @@ def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
     monkeypatch.setattr(server_main, "_summarizer_backend_available", lambda _cfg: True)
     monkeypatch.setattr(server_main, "bootstrap", lambda **_kwargs: None)
     monkeypatch.setattr(server_main.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        server_main, "memory_store_available", lambda _path: memory_available
+    )
 
     class RecordingOTLPReceiver:
         def __init__(self, **_kwargs) -> None:
@@ -457,7 +417,12 @@ def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
     )
 
     assert result.exit_code == 0, result.output
-    assert ("otlp", "constructed") not in events
+    if not memory_available:
+        # Memory lives in the PostgreSQL control store (#480): a DuckDB-only
+        # hub records sessions but starts none of the derived-memory workers.
+        assert not any(name == "live_recap" for name, _ in events)
+        assert "summarizer" not in worker_configs
+        return
     assert ("live_recap", "constructed") in events
     assert ("live_recap", "start") in events
     assert ("live_recap", "stop") in events
@@ -640,9 +605,6 @@ def test_cli_status_shows_config_and_counts(tmp_path):
     [
         ["trace-tail"],
         ["recent-traces"],
-        ["embeddings", "enqueue-spans"],
-        ["embeddings", "reset-stale-spans"],
-        ["embeddings", "prune-orphan-spans"],
         ["decisions", "derive"],
     ],
 )
@@ -716,108 +678,6 @@ def test_cli_doctor_uses_read_only_connection_when_db_exists(tmp_path):
         writer.wait(timeout=5)
     assert res.exit_code == 0, res.output
     assert "drover-server doctor" in res.output
-
-
-def test_cli_ledger_reconcile_dry_run_uses_snapshot_when_db_locked(tmp_path):
-    runner = CliRunner()
-    cfg = _make_config(tmp_path)
-    duckdb_path = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, updated_at) "
-            "VALUES ('sess-locked', 'running', now())"
-        )
-    finally:
-        con.close()
-
-    writer = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import duckdb, sys, time; duckdb.connect(sys.argv[1]); print('ready', flush=True); time.sleep(10)",
-            str(duckdb_path),
-        ],
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        assert writer.stdout is not None
-        assert writer.stdout.readline().strip() == "ready"
-        res = runner.invoke(
-            main,
-            [
-                "--config",
-                str(cfg),
-                "ledger",
-                "reconcile",
-                "--job-kind",
-                "summarize_session",
-            ],
-        )
-    finally:
-        writer.terminate()
-        writer.wait(timeout=5)
-    assert res.exit_code == 0, res.output
-    assert "ledger reconcile (dry-run)" in res.output
-    assert "serving_running=1" in res.output
-
-
-def test_cli_ledger_replay_dry_run_uses_snapshot_when_db_locked(tmp_path):
-    runner = CliRunner()
-    cfg = _make_config(tmp_path)
-    duckdb_path = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        ledger = Ledger(con)
-        job = ledger.open_job(
-            job_kind="summarize_session", subject_key="sess-replay"
-        ).job
-        ledger.lease_job(job.job_id, worker_id="test")
-        ledger.succeed_job(
-            job.job_id,
-            artifact=ArtifactSpec(
-                artifact_kind="session_summary", subject_key="sess-replay"
-            ),
-        )
-    finally:
-        con.close()
-
-    writer = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import duckdb, sys, time; duckdb.connect(sys.argv[1]); print('ready', flush=True); time.sleep(10)",
-            str(duckdb_path),
-        ],
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        assert writer.stdout is not None
-        assert writer.stdout.readline().strip() == "ready"
-        res = runner.invoke(
-            main,
-            [
-                "--config",
-                str(cfg),
-                "ledger",
-                "replay",
-                "--job-kind",
-                "summarize_session",
-                "--subject",
-                "sess-replay",
-            ],
-        )
-    finally:
-        writer.terminate()
-        writer.wait(timeout=5)
-    assert res.exit_code == 0, res.output
-    assert "ledger replay (dry-run) summarize_session/sess-replay" in res.output
-    assert "ledger_status=succeeded" in res.output
-    assert "eligible=True" in res.output
 
 
 def test_cli_help_lists_subcommands():
@@ -1844,7 +1704,15 @@ def test_cli_export_bundle_requires_selector(tmp_path):
     assert "repo-owner" in res.output
 
 
-def test_cli_export_bundle_task_outputs_yaml(tmp_path):
+def _keep_postgres_memory(monkeypatch) -> None:
+    """The CLI's config registers DuckDB; keep the fixture's PostgreSQL store."""
+    monkeypatch.setattr(server_main, "configure_control_store", lambda *a, **k: None)
+
+
+def test_cli_export_bundle_task_outputs_yaml(tmp_path, pg_control_path, monkeypatch):
+    from memory_helpers import put_summary
+
+    _keep_postgres_memory(monkeypatch)
     runner = CliRunner()
     cfg = _make_config(tmp_path)
     db = tmp_path / "drover.duckdb"
@@ -1875,29 +1743,21 @@ def test_cli_export_bundle_task_outputs_yaml(tmp_path):
                 0.0,
             ],
         )
-        con.execute(
-            """
-            INSERT INTO session_summaries (
-              session_id, task_id, agent_id, ended_at, summary_md, last_user_prompt,
-              last_assistant, next_steps_md, status, generator_model, generated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                "session-export",
-                "task-42",
-                "agent-a",
-                now,
-                "Added context bundle export command",
-                "Build the context bundle",
-                "Done",
-                "Wire command into handoff review flow",
-                "complete",
-                "test-model",
-                now,
-            ],
-        )
     finally:
         con.close()
+    put_summary(
+        pg_control_path,
+        "session-export",
+        task_id="task-42",
+        agent_id="agent-a",
+        project_key="acme/nexus",
+        ended_at=now,
+        summary_md="Added context bundle export command",
+        last_user_prompt="Build the context bundle",
+        last_assistant="Done",
+        next_steps_md="Wire command into handoff review flow",
+        generator_model="test-model",
+    )
 
     res = runner.invoke(
         main,
@@ -1923,40 +1783,28 @@ def test_cli_export_bundle_task_outputs_yaml(tmp_path):
     assert "Added context bundle export command" in res.output
 
 
-def test_cli_export_bundle_session_outputs_markdown(tmp_path):
+def test_cli_export_bundle_session_outputs_markdown(
+    tmp_path, pg_control_path, monkeypatch
+):
+    from memory_helpers import put_summary
+
+    _keep_postgres_memory(monkeypatch)
     runner = CliRunner()
     cfg = _make_config(tmp_path)
-    db = tmp_path / "drover.duckdb"
-    parquet = tmp_path / "parquet"
-    bootstrap(parquet_dir=parquet, duckdb_path=db)
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=pg_control_path)
     now = datetime.now(timezone.utc)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            """
-            INSERT INTO session_summaries (
-              session_id, task_id, agent_id, ended_at, summary_md, last_user_prompt,
-              last_assistant, next_steps_md, open_questions, status, generator_model,
-              generated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                "session-export",
-                None,
-                "agent-a",
-                now,
-                "Implemented the session bundle path",
-                "Export this session",
-                "Done",
-                "Hand off to reviewer",
-                ["Is the markdown shape right?"],
-                "complete",
-                "test-model",
-                now,
-            ],
-        )
-    finally:
-        con.close()
+    put_summary(
+        pg_control_path,
+        "session-export",
+        agent_id="agent-a",
+        ended_at=now,
+        summary_md="Implemented the session bundle path",
+        last_user_prompt="Export this session",
+        last_assistant="Done",
+        next_steps_md="Hand off to reviewer",
+        open_questions=("Is the markdown shape right?",),
+        generator_model="test-model",
+    )
 
     res = runner.invoke(
         main,
@@ -1976,209 +1824,14 @@ def test_cli_export_bundle_session_outputs_markdown(tmp_path):
     assert "Is the markdown shape right?" in res.output
 
 
-def test_cli_embeddings_enqueue_spans_dry_run_and_apply(tmp_path):
-    runner = CliRunner()
-    cfg = _make_config(tmp_path, spans=True)
-    parquet_dir = tmp_path / "parquet"
-    now = datetime.now(timezone.utc)
-    _write_spans(
-        parquet_dir,
-        [
-            {
-                "trace_id": "trace-1",
-                "span_id": "span-cli",
-                "parent_span_id": None,
-                "name": "llm_call",
-                "service_name": "agentweave",
-                "start_time": now,
-                "end_time": now + timedelta(seconds=1),
-                "duration_ms": 1000.0,
-                "session_id": "session-cli",
-                "task_id": "task-cli",
-                "agent_id": "agent-cli",
-                "cost_usd": 0.01,
-                "dedup_key": "dedup-cli",
-            }
-        ],
-    )
-
-    dry = runner.invoke(
-        main,
-        ["--config", str(cfg), "embeddings", "enqueue-spans", "--limit", "10"],
-    )
-    assert dry.exit_code == 0, dry.output
-    assert "candidate_count=1" in dry.output
-    assert "enqueued=0" in dry.output
-
-    applied = runner.invoke(
-        main,
-        [
-            "--config",
-            str(cfg),
-            "embeddings",
-            "enqueue-spans",
-            "--limit",
-            "10",
-            "--apply",
-        ],
-    )
-    assert applied.exit_code == 0, applied.output
-    assert "candidate_count=1" in applied.output
-    assert "enqueued=1" in applied.output
-
-    con = duckdb.connect(str(tmp_path / "drover.duckdb"))
-    try:
-        assert con.execute("SELECT count(*) FROM span_embed_jobs").fetchone()[0] == 1
-    finally:
-        con.close()
-
-
-def test_cli_embeddings_reset_stale_spans_dry_run_and_apply(tmp_path):
-    runner = CliRunner()
-    cfg = _make_config(tmp_path, spans=True)
-    db = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status, attempts, last_error, updated_at) VALUES ('stale', 'running', 2, 'worker died', now() - INTERVAL '2 days')"
-        )
-        con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status, attempts, last_error, updated_at) VALUES ('fresh', 'running', 1, NULL, now())"
-        )
-    finally:
-        con.close()
-
-    dry = runner.invoke(main, ["--config", str(cfg), "embeddings", "reset-stale-spans"])
-    assert dry.exit_code == 0, dry.output
-    assert "mode=dry-run" in dry.output
-    assert "matched=1" in dry.output
-    assert "reset=0" in dry.output
-
-    applied = runner.invoke(
-        main,
-        ["--config", str(cfg), "embeddings", "reset-stale-spans", "--apply"],
-    )
-    assert applied.exit_code == 0, applied.output
-    assert "mode=apply" in applied.output
-    assert "matched=1" in applied.output
-    assert "reset=1" in applied.output
-
-    con = duckdb.connect(str(db))
-    try:
-        rows = dict(
-            con.execute("SELECT span_id, status FROM span_embed_jobs").fetchall()
-        )
-    finally:
-        con.close()
-    assert rows == {"stale": "pending", "fresh": "running"}
-
-
-def test_cli_embeddings_reset_stale_sessions_dry_run_and_apply(tmp_path):
+def test_cli_embeddings_drain_once_requires_the_postgres_memory_store(tmp_path):
     runner = CliRunner()
     cfg = _make_config(tmp_path)
-    db = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('stale', 'running', 2, 'worker died', now() - INTERVAL '2 days')"
-        )
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status, attempts, last_error, updated_at) VALUES ('fresh', 'running', 1, NULL, now())"
-        )
-    finally:
-        con.close()
-
-    dry = runner.invoke(
-        main, ["--config", str(cfg), "embeddings", "reset-stale-sessions"]
-    )
-    assert dry.exit_code == 0, dry.output
-    assert "mode=dry-run" in dry.output
-    assert "matched=1" in dry.output
-    assert "reset=0" in dry.output
-
-    applied = runner.invoke(
-        main,
-        ["--config", str(cfg), "embeddings", "reset-stale-sessions", "--apply"],
-    )
-    assert applied.exit_code == 0, applied.output
-    assert "mode=apply" in applied.output
-    assert "matched=1" in applied.output
-    assert "reset=1" in applied.output
-
-    con = duckdb.connect(str(db))
-    try:
-        rows = dict(con.execute("SELECT session_id, status FROM embed_jobs").fetchall())
-    finally:
-        con.close()
-    assert rows == {"stale": "pending", "fresh": "running"}
-
-
-def test_cli_embeddings_prune_orphan_spans_dry_run_and_apply(tmp_path):
-    runner = CliRunner()
-    cfg = _make_config(tmp_path, spans=True)
-    db = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status, attempts, last_error, updated_at) VALUES ('inf', 'errored', 142, 'span row missing', now())"
-        )
-        con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status, attempts, last_error, updated_at) VALUES ('keep', 'errored', 1, 'other error', now())"
-        )
-    finally:
-        con.close()
-
-    dry = runner.invoke(
-        main, ["--config", str(cfg), "embeddings", "prune-orphan-spans"]
-    )
-    assert dry.exit_code == 0, dry.output
-    assert "mode=dry-run" in dry.output
-    assert "matched=1" in dry.output
-    assert "deleted=0" in dry.output
-
-    applied = runner.invoke(
-        main,
-        ["--config", str(cfg), "embeddings", "prune-orphan-spans", "--apply"],
-    )
-    assert applied.exit_code == 0, applied.output
-    assert "mode=apply" in applied.output
-    assert "matched=1" in applied.output
-    assert "deleted=1" in applied.output
-
-    con = duckdb.connect(str(db))
-    try:
-        rows = dict(
-            con.execute("SELECT span_id, status FROM span_embed_jobs").fetchall()
-        )
-    finally:
-        con.close()
-    assert rows == {"keep": "errored"}
-
-
-def test_cli_embeddings_drain_once_dry_run_reports_pending_counts(tmp_path):
-    runner = CliRunner()
-    cfg = _make_config(tmp_path, spans=True)
-    db = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO embed_jobs (session_id, status) VALUES ('s1', 'pending')"
-        )
-        con.execute(
-            "INSERT INTO span_embed_jobs (span_id, status) VALUES ('sp1', 'pending')"
-        )
-    finally:
-        con.close()
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
 
     dry = runner.invoke(main, ["--config", str(cfg), "embeddings", "drain-once"])
-    assert dry.exit_code == 0, dry.output
-    assert "mode=dry-run" in dry.output
-    assert "pending_sessions=1" in dry.output
-    assert "pending_spans=1" in dry.output
+    assert dry.exit_code != 0
+    assert "postgres" in dry.output
 
 
 def test_cli_incoming_ingest_once_dry_run_and_apply(tmp_path):
@@ -2230,29 +1883,8 @@ def test_cli_incoming_ingest_once_dry_run_and_apply(tmp_path):
             ).fetchone()[0]
             == 1
         )
-        assert (
-            con.execute(
-                "SELECT status FROM summarize_jobs WHERE session_id='sess-incoming-cli'"
-            ).fetchone()[0]
-            == "pending"
-        )
     finally:
         con.close()
-
-
-def test_cli_embeddings_reset_stale_spans_dry_run_does_not_bootstrap_missing_db(
-    tmp_path,
-):
-    runner = CliRunner()
-    cfg = _make_config(tmp_path)
-    db = tmp_path / "drover.duckdb"
-    parquet_dir = tmp_path / "parquet"
-
-    dry = runner.invoke(main, ["--config", str(cfg), "embeddings", "reset-stale-spans"])
-
-    assert dry.exit_code != 0
-    assert not db.exists()
-    assert not parquet_dir.exists()
 
 
 def test_cli_session_graph_help_lists_formats():
@@ -2509,89 +2141,61 @@ def test_cli_summarizer_doctor_reports_auth_without_network(tmp_path, monkeypatc
     assert "tok-live" not in res.output
 
 
-def test_cli_retry_summarize_jobs_is_dry_run_by_default(tmp_path):
+def test_cli_retry_summarize_jobs_requires_the_postgres_memory_store(tmp_path):
     runner = CliRunner()
     cfg = _make_config(tmp_path)
-    db = tmp_path / "drover.duckdb"
-    parquet = tmp_path / "parquet"
-    bootstrap(parquet_dir=parquet, duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error) VALUES (?, 'errored', 1, ?)",
-            ["auth-failed", "401 invalid authentication credentials"],
-        )
-    finally:
-        con.close()
-
     res = runner.invoke(main, ["--config", str(cfg), "retry-summarize-jobs"])
+    assert res.exit_code != 0
+    assert "postgres" in res.output
 
-    assert res.exit_code == 0, res.output
-    assert "dry-run" in res.output
-    assert "auth-failed" in res.output
-    con = duckdb.connect(str(db))
-    try:
-        assert (
-            con.execute(
-                "SELECT status FROM summarize_jobs WHERE session_id='auth-failed'"
-            ).fetchone()[0]
-            == "errored"
+
+def _dead_lettered_summary(path: Path, session_id: str, error: str) -> None:
+    from drover.server.db import control_plane_connection
+    from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
+
+    JobLedger(path).enqueue(SUMMARIZE_SESSION, session_id, source_version="v1")
+    with control_plane_connection(path) as con:
+        con.execute(
+            """UPDATE pipeline_jobs
+                  SET status = 'dead_lettered', failures = max_attempts,
+                      last_error = ?, disposition_reason = ?, finished_at = now()
+                WHERE subject_key = ?""",
+            [error, f"exhausted 5/5 attempts: {error}", session_id],
         )
-    finally:
-        con.close()
 
 
-def test_cli_retry_summarize_jobs_accepts_db_override(tmp_path):
+def test_cli_retry_summarize_jobs_dry_run_then_apply(
+    tmp_path, pg_control_path, monkeypatch
+):
+    from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
+
+    _dead_lettered_summary(
+        pg_control_path, "auth-failed", "401 invalid authentication credentials"
+    )
+    _dead_lettered_summary(pg_control_path, "bad-json", "invalid json response")
+    monkeypatch.setattr(
+        server_main,
+        "_resolve_config",
+        lambda *a, **k: replace(default_config(), duckdb_path=pg_control_path),
+    )
     runner = CliRunner()
-    db = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error) VALUES (?, 'errored', 1, ?)",
-            ["auth-failed", "Error code: 401 - Invalid authentication credentials"],
-        )
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error) VALUES (?, 'errored', 1, ?)",
-            ["bad-json", "invalid json response"],
-        )
-    finally:
-        con.close()
 
-    res = runner.invoke(main, ["retry-summarize-jobs", "--db", str(db)])
+    dry = runner.invoke(main, ["retry-summarize-jobs"])
+    assert dry.exit_code == 0, dry.output
+    assert "dry-run" in dry.output and "matched: 1" in dry.output
+    assert "auth-failed" in dry.output and "bad-json" not in dry.output
+    assert (
+        JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "auth-failed").status
+        == "dead_lettered"
+    )
 
-    assert res.exit_code == 0, res.output
-    assert "matched: 1" in res.output
-    assert "auth-failed" in res.output
-    assert "bad-json" not in res.output
-
-
-def test_cli_retry_summarize_jobs_apply_resets_matching_jobs(tmp_path):
-    runner = CliRunner()
-    db = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
-    con = duckdb.connect(str(db))
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs (session_id, status, attempts, last_error) VALUES (?, 'errored', 1, ?)",
-            ["auth-failed", "unauthorized"],
-        )
-    finally:
-        con.close()
-
-    res = runner.invoke(main, ["retry-summarize-jobs", "--db", str(db), "--apply"])
-
-    assert res.exit_code == 0, res.output
-    assert "matched: 1" in res.output
-    assert "updated" in res.output
-    con = duckdb.connect(str(db))
-    try:
-        status = con.execute(
-            "SELECT status FROM summarize_jobs WHERE session_id='auth-failed'"
-        ).fetchone()[0]
-    finally:
-        con.close()
-    assert status == "pending"
+    applied = runner.invoke(main, ["retry-summarize-jobs", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    assert "updated" in applied.output
+    assert (
+        JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "auth-failed").status
+        == "pending"
+    )
 
 
 def test_summarizer_backend_config_forwards_launchd_overrides(tmp_path, monkeypatch):

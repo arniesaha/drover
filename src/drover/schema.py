@@ -9,7 +9,7 @@ Layout:
     pr_events/part-*.parquet
     routing/part-*.parquet
   drover.duckdb
-    Tables: tasks, session_summaries, summarize_jobs, decisions
+    Tables: tasks, decisions, pipeline ledger (receipts/advisory checks)
     Views:  agent_events, spans, spans_enriched, session_links, pr_events, routing, sessions, active_sessions
 """
 
@@ -52,14 +52,6 @@ PARQUET_SUBDIRS = (
 
 EXPECTED_TABLES = (
     "tasks",
-    "session_summaries",
-    "summarize_jobs",
-    "project_briefs",
-    "brief_jobs",
-    "session_embeddings",
-    "embed_jobs",
-    "span_embeddings",
-    "span_embed_jobs",
     "active_session_briefs",
     "decisions",
     "context_containers",
@@ -80,6 +72,12 @@ EXPECTED_TABLES = (
     # `drover-server status` counts against the lakehouse, so leaving them here
     # would report an error on every healthy hub. `db.CONTROL_PLANE_TABLES` is
     # the list for the control-plane store.
+    #
+    # Derived memory (session_summaries, project_briefs, session/span
+    # embeddings and every *_jobs queue for them) is not here either: it lives
+    # in the PostgreSQL control store (#480). Older hubs' DuckDB files may
+    # still carry those legacy tables; nothing reads them, and bootstrap does
+    # not drop them (an explicit purge command does).
 )
 EXPECTED_VIEWS = (
     "agent_events",
@@ -141,179 +139,10 @@ CREATE TABLE IF NOT EXISTS agent_event_partition_activity (
 );
 """
 
-_SESSION_SUMMARIES_DDL = """
-CREATE TABLE IF NOT EXISTS session_summaries (
-  session_id        VARCHAR PRIMARY KEY,
-  task_id           VARCHAR,
-  agent_id          VARCHAR,
-  ended_at          TIMESTAMP,
-  summary_md        VARCHAR,
-  files_touched     VARCHAR[],
-  tools_used        MAP(VARCHAR, INTEGER),
-  last_user_prompt  VARCHAR,
-  last_assistant    VARCHAR,
-  next_steps_md     VARCHAR,
-  open_questions    VARCHAR[],
-  status            VARCHAR,
-  generator_model   VARCHAR,
-  generated_at      TIMESTAMP
-);
-"""
-
-_SUMMARIZE_JOBS_DDL = """
-CREATE TABLE IF NOT EXISTS summarize_jobs (
-  session_id       VARCHAR PRIMARY KEY,
-  status           VARCHAR,
-  attempts         INTEGER DEFAULT 0,
-  last_error       VARCHAR,
-  enqueued_at      TIMESTAMP DEFAULT now(),
-  updated_at       TIMESTAMP,
-  source_version   VARCHAR,
-  max_attempts     INTEGER DEFAULT 5,
-  next_run_at      TIMESTAMP,
-  dead_lettered_at TIMESTAMP,
-  stream_publish_needed BOOLEAN DEFAULT FALSE,
-  dead_letter_streak INTEGER DEFAULT 0
-);
-"""
-
-_SUMMARIZE_JOBS_COLUMNS = {
-    "source_version": "VARCHAR",
-    "max_attempts": "INTEGER DEFAULT 5",
-    "next_run_at": "TIMESTAMP",
-    "dead_lettered_at": "TIMESTAMP",
-    "stream_publish_needed": "BOOLEAN DEFAULT FALSE",
-    # Survives the per-generation attempt reset, so a session that keeps
-    # producing events can no longer buy an unbounded number of fresh
-    # retry budgets for a summary that never succeeds.
-    "dead_letter_streak": "INTEGER DEFAULT 0",
-}
-
-_LIVE_SESSION_RECAPS_DDL = """
-CREATE TABLE IF NOT EXISTS live_session_recaps (
-  session_id       VARCHAR PRIMARY KEY,
-  recap_text       VARCHAR NOT NULL,
-  source_seq       INTEGER NOT NULL,
-  generator_model  VARCHAR,
-  generated_at     TIMESTAMP NOT NULL DEFAULT now()
-);
-"""
-
-_LIVE_RECAP_JOBS_DDL = """
-CREATE TABLE IF NOT EXISTS live_recap_jobs (
-  session_id            VARCHAR PRIMARY KEY,
-  desired_source_seq    INTEGER NOT NULL,
-  status                VARCHAR NOT NULL,
-  attempts              INTEGER NOT NULL DEFAULT 0,
-  last_error            VARCHAR,
-  enqueued_at           TIMESTAMP NOT NULL DEFAULT now(),
-  updated_at            TIMESTAMP NOT NULL DEFAULT now(),
-  next_run_at           TIMESTAMP,
-  stream_publish_needed BOOLEAN NOT NULL DEFAULT FALSE
-);
-"""
-
-# Project-level rollup keyed by `<repo_owner>/<repo_name>`. One row per
-# project; regenerated from session_summaries when activity warrants.
-_PROJECT_BRIEFS_DDL = """
-CREATE TABLE IF NOT EXISTS project_briefs (
-  project_key       VARCHAR PRIMARY KEY,   -- '<repo_owner>/<repo_name>'
-  repo_owner        VARCHAR,
-  repo_name         VARCHAR,
-  brief_md          VARCHAR,                -- "what is this project, current state"
-  recent_themes_md  VARCHAR,                -- last 7-day themes / decisions
-  key_files         VARCHAR[],              -- files touched most often
-  open_questions    VARCHAR[],
-  next_steps_md     VARCHAR,
-  session_count     INTEGER,
-  last_activity_at  TIMESTAMP,
-  generator_model   VARCHAR,
-  generated_at      TIMESTAMP
-);
-"""
-
-_BRIEF_JOBS_DDL = """
-CREATE TABLE IF NOT EXISTS brief_jobs (
-  project_key VARCHAR PRIMARY KEY,
-  status      VARCHAR,
-  attempts    INTEGER DEFAULT 0,
-  last_error  VARCHAR,
-  enqueued_at TIMESTAMP DEFAULT now(),
-  updated_at  TIMESTAMP,
-  source_session_id VARCHAR,
-  source_version VARCHAR
-);
-"""
-
-_BRIEF_JOBS_COLUMNS = {
-    "source_session_id": "VARCHAR",
-    "source_version": "VARCHAR",
-}
-
-# Embeddings of session_summaries.summary_md, keyed by session_id.
-# Stored as FLOAT[] so DuckDB's array_cosine_similarity works directly.
-_SESSION_EMBEDDINGS_DDL = """
-CREATE TABLE IF NOT EXISTS session_embeddings (
-  session_id  VARCHAR PRIMARY KEY,
-  embedding   FLOAT[],
-  model       VARCHAR,
-  dim         INTEGER,
-  embedded_at TIMESTAMP
-);
-"""
-
-_EMBED_JOBS_DDL = """
-CREATE TABLE IF NOT EXISTS embed_jobs (
-  session_id  VARCHAR PRIMARY KEY,
-  status      VARCHAR,
-  attempts    INTEGER DEFAULT 0,
-  last_error  VARCHAR,
-  enqueued_at TIMESTAMP DEFAULT now(),
-  updated_at  TIMESTAMP,
-  source_version VARCHAR
-);
-"""
-
-_EMBED_JOBS_COLUMNS = {"source_version": "VARCHAR"}
-
-# Span-derived embeddings are intentionally separate from session-summary
-# embeddings: span_id is the source identity, and source_text/source_fields record
-# the exact redacted/truncated material embedded from the span row.
-_SPAN_EMBEDDINGS_DDL = """
-CREATE TABLE IF NOT EXISTS span_embeddings (
-  span_id       VARCHAR PRIMARY KEY,
-  trace_id      VARCHAR,
-  session_id    VARCHAR,
-  task_id       VARCHAR,
-  agent_id      VARCHAR,
-  repo_owner    VARCHAR,
-  repo_name     VARCHAR,
-  branch        VARCHAR,
-  source_text   VARCHAR,
-  source_fields VARCHAR[],
-  embedding     FLOAT[],
-  model         VARCHAR,
-  dim           INTEGER,
-  embedded_at   TIMESTAMP
-);
-"""
-
-_SPAN_EMBED_JOBS_DDL = """
-CREATE TABLE IF NOT EXISTS span_embed_jobs (
-  span_id     VARCHAR PRIMARY KEY,
-  status      VARCHAR,
-  attempts    INTEGER DEFAULT 0,
-  last_error  VARCHAR,
-  enqueued_at TIMESTAMP DEFAULT now(),
-  updated_at  TIMESTAMP
-);
-"""
-
-_SPAN_EMBEDDINGS_COLUMNS = {
-    "repo_owner": "VARCHAR",
-    "repo_name": "VARCHAR",
-    "branch": "VARCHAR",
-}
+#: Derived memory -- session summaries, live recaps, project briefs, session
+#: embeddings and their job queues -- is not DuckDB DDL any more. It lives in
+#: the PostgreSQL control store (``postgres_schema`` migration 7/8, #480);
+#: span embeddings were dropped from the core path outright (#473).
 
 # Compact rolling brief for an OPEN session, so another agent can pick up
 # the work mid-task without waiting for SessionEnd to fire. Cached with a
@@ -1261,13 +1090,13 @@ SELECT
   any_value(e.task_id)  AS task_id,
   min(TRY_CAST(e.timestamp AS TIMESTAMP WITH TIME ZONE)) AS started_at,
   max(TRY_CAST(e.timestamp AS TIMESTAMP WITH TIME ZONE)) AS ended_at,
-  count(*)              AS event_count,
-  ss.summary_md,
-  ss.next_steps_md
+  count(*)              AS event_count
 FROM canonical_agent_events e
-LEFT JOIN session_summaries ss USING (session_id)
-GROUP BY e.session_id, ss.summary_md, ss.next_steps_md;
+GROUP BY e.session_id;
 """
+# Summaries are derived memory in the PostgreSQL control store (#480), not a
+# DuckDB table: callers that need summary_md/next_steps_md enrich these rows
+# through MemoryRepository.summaries(session_ids).
 
 
 #: Partition slack for the 30-minute window. `date` is the hive key, derived
@@ -1315,18 +1144,12 @@ recently_active AS (
 SELECT
   s.session_id, s.agent_id, s.task_id, s.repo_owner, s.repo_name, s.branch,
   s.started_at, s.last_event_at, s.event_count
-FROM recently_active s
--- A summary is not an ending. The summarizer fires on an idle gap, so a
--- session that is still working has one long before it stops, and treating
--- "has a summary" as "closed" hid live sessions from every handoff. Only a
--- receipt that already covers the newest event closes the session.
--- `ended_at` is the newest event's own timestamp stored naive (see
--- summarizer/worker.py), so compare in that same wall-clock space.
-LEFT JOIN session_summaries ss USING (session_id)
-WHERE ss.session_id IS NULL
-   OR ss.ended_at IS NULL
-   OR ss.ended_at < CAST(s.last_event_at AS TIMESTAMP);
+FROM recently_active s;
 """
+# "A summary whose ended_at covers the newest event closes the session" used
+# to be a join on session_summaries here. Summaries are derived memory in the
+# PostgreSQL control store now (#480), so readers of this view apply that
+# filter themselves (mcp/tools.py `_drop_closed_active_sessions`).
 
 
 _SESSION_LINKS_VIEW = f"""
@@ -1906,8 +1729,8 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
         return registry_path
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     with control_plane_connection(registry_path) as con:
-        con.execute(_LIVE_SESSION_RECAPS_DDL)
-        con.execute(_LIVE_RECAP_JOBS_DDL)
+        # No live recap tables: recaps are derived memory and need the
+        # PostgreSQL control store (#480). A DuckDB control plane has none.
         bootstrap_harness_tables(con)
         con.execute(_ADVISORY_FINDINGS_DDL)
         con.execute(_ADVISORY_OCCURRENCES_DDL)
@@ -2347,26 +2170,8 @@ def bootstrap(
         con.execute(_SPAN_PARTITION_ACTIVITY_DDL)
         con.execute(_AGENT_EVENT_PARTITION_ACTIVITY_DDL)
         con.execute(_AGENT_EVENT_DAY_SUMMARY_DDL)
-        con.execute(_SESSION_SUMMARIES_DDL)
-        con.execute("""CREATE OR REPLACE VIEW canonical_session_summaries AS
-            SELECT ss.* FROM session_summaries ss
-            WHERE NOT EXISTS (
-              SELECT 1 FROM memory_session_identity m
-              JOIN session_summaries canonical ON canonical.session_id=m.harness_session_id
-              WHERE ss.session_id=m.native_session_id
-                AND ss.session_id<>m.harness_session_id
-            )""")
-        con.execute(_SUMMARIZE_JOBS_DDL)
-        _ensure_table_columns(con, "summarize_jobs", _SUMMARIZE_JOBS_COLUMNS)
-        con.execute(_PROJECT_BRIEFS_DDL)
-        con.execute(_BRIEF_JOBS_DDL)
-        _ensure_table_columns(con, "brief_jobs", _BRIEF_JOBS_COLUMNS)
-        con.execute(_SESSION_EMBEDDINGS_DDL)
-        con.execute(_EMBED_JOBS_DDL)
-        _ensure_table_columns(con, "embed_jobs", _EMBED_JOBS_COLUMNS)
-        con.execute(_SPAN_EMBEDDINGS_DDL)
-        _ensure_table_columns(con, "span_embeddings", _SPAN_EMBEDDINGS_COLUMNS)
-        con.execute(_SPAN_EMBED_JOBS_DDL)
+        # Derived memory tables are deliberately not created here (#480).
+        # Legacy copies in an existing file are left alone, not dropped.
         con.execute(_ACTIVE_SESSION_BRIEFS_DDL)
         con.execute(_DECISIONS_DDL)
         con.execute(_CONTEXT_CONTAINERS_DDL)

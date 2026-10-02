@@ -48,7 +48,9 @@ _NAIVE_UTC_TIMESTAMP_COLUMNS = frozenset(
 
 # These values define control-plane identity and replayability. Optional
 # source columns may evolve, but their absence must not turn an import into a
-# synthetic or relationally incomplete serving store.
+# synthetic or relationally incomplete serving store. A legacy snapshot's
+# `live_recap_jobs`/`live_session_recaps` are not imported: live recaps are
+# derived memory (#480), rebuilt in the ledger and `session_memory`.
 _REQUIRED_SOURCE_COLUMNS: dict[str, frozenset[str]] = {
     "harness_hosts": frozenset(
         {"host_id", "display_name", "kind", "status", "capabilities_json"}
@@ -59,8 +61,6 @@ _REQUIRED_SOURCE_COLUMNS: dict[str, frozenset[str]] = {
     "harness_events": frozenset(
         {"event_id", "session_id", "event_type", "payload_json", "created_at"}
     ),
-    "live_session_recaps": frozenset({"session_id", "recap_text", "source_seq"}),
-    "live_recap_jobs": frozenset({"session_id", "desired_source_seq", "status"}),
     "advisory_findings": frozenset(
         {
             "finding_id",

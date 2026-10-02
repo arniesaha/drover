@@ -28,7 +28,6 @@ import pyarrow.parquet as pq
 from drover.attribution import enrich_raw_repo_attribution
 from drover.dedup import make_dedup_key
 from drover.models import AgentEvent
-from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
 from drover.server.harness.usage import session_totals
 from drover.server.parquet_io import atomic_write_table
@@ -46,7 +45,6 @@ class IngestStats:
     skipped_dupes: int = 0
     errors: int = 0
     shadow_published: int = 0
-    ledger_receipts: int = 0
     new_session_ids: Set[str] = field(default_factory=set)
 
 
@@ -366,20 +364,6 @@ def ingest_file(
                 dates=sorted({r["date"] for r in new_rows}),
             )
             stats.inserted = len(new_rows)
-            # Shadow-write a durable receipt per accepted source unit (AGE-44).
-            # The dedup_key is the durable identity, so a re-arriving event is a
-            # ledger no-op. Best-effort: never blocks the authoritative write.
-            for row in new_rows:
-                result = ledger_shadow.record_receipt(
-                    con,
-                    source_kind="agent_event",
-                    source_key=row["dedup_key"],
-                    subject_kind="session",
-                    subject_key=row.get("session_id"),
-                    payload_hash=row["dedup_key"],
-                )
-                if result is not None and not result.is_duplicate:
-                    stats.ledger_receipts += 1
             if shadow_publisher is not None:
                 # Mirror only after the authoritative write succeeds. The
                 # publisher itself is best-effort and never raises.

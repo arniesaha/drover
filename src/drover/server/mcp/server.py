@@ -24,8 +24,8 @@ def build_mcp_server(
     host: str = "127.0.0.1",
     port: int = 7077,
     backend_config: Optional[SummarizerBackendConfig] = None,
-    summarize_job_stream: object | None = None,
     spans_enabled: bool = False,
+    embedding_model: Optional[str] = None,
 ) -> FastMCP:
     """Construct a FastMCP server with all Drover tools registered.
 
@@ -35,6 +35,9 @@ def build_mcp_server(
 
     ``spans_enabled`` mirrors ``[telemetry] spans_enabled``: off, no tool
     reads span Parquet or span embeddings (#473).
+    ``embedding_model`` names the embedding space ``drover_recall`` searches
+    (the model the embedding worker writes session vectors with). Without it,
+    recall falls back to keyword matching over summaries.
     """
     mcp = FastMCP(name, host=host, port=port)
     db = Path(duckdb_path)
@@ -93,7 +96,8 @@ def build_mcp_server(
 
     @mcp.tool()
     def drover_active_sessions(task_id: Optional[str] = None) -> dict:
-        """List currently-active sessions (no summary, event within last 30 min)."""
+        """List currently-active sessions: an event within the last 30 min and no
+        summary that already covers the newest event."""
         return t.drover_active_sessions(duckdb_path=db, task_id=task_id)
 
     @mcp.tool()
@@ -158,12 +162,12 @@ def build_mcp_server(
 
     @mcp.tool()
     def drover_session_close(session_id: str) -> dict:
-        """Enqueue a source-versioned summary generation for the session."""
-        return t.drover_session_close(
-            duckdb_path=db,
-            session_id=session_id,
-            summarize_job_stream=summarize_job_stream,
-        )
+        """Enqueue a source-versioned summary generation for the session.
+
+        ``status`` is the job ledger's outcome: queued, requeued,
+        already_queued, already_done, already_failed, suppressed, or
+        unavailable (no PostgreSQL memory store)."""
+        return t.drover_session_close(duckdb_path=db, session_id=session_id)
 
     @mcp.tool()
     def drover_project_brief(
@@ -263,17 +267,20 @@ def build_mcp_server(
 
     @mcp.tool()
     def drover_recall(
-        query_embedding: list[float],
+        query_embedding: Optional[list[float]] = None,
         limit: int = 5,
         repo_owner: Optional[str] = None,
         repo_name: Optional[str] = None,
         session_id: Optional[str] = None,
+        query: Optional[str] = None,
     ) -> dict:
         """Semantic recall: return session summaries ranked by cosine similarity
         to ``query_embedding``. Caller supplies the embedding (encode the query
         with the same model that produced the stored embeddings — typically
-        nomic-embed-text via Ollama). Filter by repo if you want recall scoped
-        to one project."""
+        nomic-embed-text via Ollama, 768 dimensions). Pass ``query`` as a
+        keyword fallback for when semantic search is unavailable; ``mode`` and
+        ``reason`` in the response say which ran. Filter by repo if you want
+        recall scoped to one project."""
         return t.drover_recall(
             duckdb_path=db,
             session_id=session_id,
@@ -281,7 +288,8 @@ def build_mcp_server(
             limit=limit,
             repo_owner=repo_owner,
             repo_name=repo_name,
-            include_spans=spans_enabled,
+            query=query,
+            embedding_model=embedding_model,
         )
 
     @mcp.tool()
@@ -339,7 +347,8 @@ def build_mcp_server(
     @mcp.tool()
     def drover_fleet_status() -> dict:
         """Snapshot of all currently-active sessions (event in last 30 min, no
-        summary yet) with their repo, agent, and latest user message. Use this
+        summary covering the newest event) with their repo, agent, and latest
+        user message. Use this
         to answer 'what is every agent doing right now?'"""
         return t.drover_fleet_status(duckdb_path=db)
 

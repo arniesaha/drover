@@ -99,7 +99,9 @@ class JobPolicy:
 
 
 POLICIES: Mapping[str, JobPolicy] = {
-    SUMMARIZE_SESSION: JobPolicy(max_attempts=5, lease_seconds=900, max_failed_streak=3),
+    SUMMARIZE_SESSION: JobPolicy(
+        max_attempts=5, lease_seconds=900, max_failed_streak=3
+    ),
     EMBED_SESSION: JobPolicy(max_attempts=5, lease_seconds=300),
     BRIEF_PROJECT: JobPolicy(max_attempts=5, lease_seconds=900),
     RECAP_SESSION: JobPolicy(max_attempts=8, lease_seconds=300),
@@ -230,20 +232,39 @@ class JobLedger:
             raise ValueError(f"unknown job kind {job_kind!r}")
         if con is not None:
             outcome = self._enqueue_in(
-                con, job_kind, subject_key, source_version or "", payload,
-                priority, delay_seconds, force,
+                con,
+                job_kind,
+                subject_key,
+                source_version or "",
+                payload,
+                priority,
+                delay_seconds,
+                force,
             )
             return "already_queued" if outcome == "_raced" else outcome
         with self.connection() as own:
             for _ in range(3):
                 with transaction(own):
                     outcome = self._enqueue_in(
-                        own, job_kind, subject_key, source_version or "", payload,
-                        priority, delay_seconds, force,
+                        own,
+                        job_kind,
+                        subject_key,
+                        source_version or "",
+                        payload,
+                        priority,
+                        delay_seconds,
+                        force,
                     )
                 if outcome != "_raced":
                     return outcome
         return "already_queued"
+
+    @staticmethod
+    def lock_subject(con, job_kind: str, subject_key: str) -> None:
+        con.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            [json.dumps(["memory-job", job_kind, subject_key])],
+        )
 
     def _enqueue_in(
         self,
@@ -256,6 +277,9 @@ class JobLedger:
         delay_seconds: float,
         force: bool,
     ):
+        # A missing live row cannot be row-locked. Serialize enqueues even
+        # on the caller's transaction so a competing generation is never lost.
+        self.lock_subject(con, job_kind, subject_key)
         policy = POLICIES[job_kind]
         payload_json = json.dumps(dict(payload or {}), sort_keys=True)
         live = con.execute(
@@ -280,11 +304,19 @@ class JobLedger:
                               last_error = NULL, error_category = NULL,
                               enqueued_at = now(), updated_at = now()
                         WHERE job_id = ?""",
-                    [source_version, payload_json, priority, float(delay_seconds), job_id],
+                    [
+                        source_version,
+                        payload_json,
+                        priority,
+                        float(delay_seconds),
+                        job_id,
+                    ],
                 )
                 return "requeued"
             self._supersede_in(
-                con, job_id, f"superseded by source version {source_version or '(none)'}"
+                con,
+                job_id,
+                f"superseded by source version {source_version or '(none)'}",
             )
             replaced = True
         else:
@@ -295,7 +327,13 @@ class JobLedger:
                          WHERE job_kind = ? AND subject_key = ? AND source_version = ?
                            AND status IN (?, ?, ?)
                          ORDER BY enqueued_at DESC LIMIT 1""",
-                    [job_kind, subject_key, source_version, SUCCEEDED, *FAILED_STATUSES],
+                    [
+                        job_kind,
+                        subject_key,
+                        source_version,
+                        SUCCEEDED,
+                        *FAILED_STATUSES,
+                    ],
                 ).fetchone()
                 if prior is not None:
                     return "already_done" if prior[0] == SUCCEEDED else "already_failed"
@@ -313,8 +351,15 @@ class JobLedger:
                    WHERE status IN ({", ".join(repr(s) for s in LIVE_STATUSES)})
                 DO NOTHING
                 RETURNING job_id""",
-            [job_kind, subject_key, source_version, payload_json, priority,
-             policy.max_attempts, float(delay_seconds)],
+            [
+                job_kind,
+                subject_key,
+                source_version,
+                payload_json,
+                priority,
+                policy.max_attempts,
+                float(delay_seconds),
+            ],
         ).fetchone()
         if inserted is None:
             # A concurrent enqueue opened the live row between our lookup and
@@ -411,7 +456,9 @@ class JobLedger:
             ).fetchone()
         return row is not None
 
-    def heartbeat(self, job: ClaimedJob, *, lease_seconds: Optional[int] = None) -> bool:
+    def heartbeat(
+        self, job: ClaimedJob, *, lease_seconds: Optional[int] = None
+    ) -> bool:
         lease = int(lease_seconds or POLICIES[job.job_kind].lease_seconds)
         with self.connection() as con:
             row = con.execute(
@@ -419,6 +466,7 @@ class JobLedger:
                       SET lease_expires_at = now() + make_interval(secs => ?),
                           updated_at = now()
                     WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                      AND lease_expires_at > now()
                 RETURNING job_id""",
                 [lease, job.job_id, job.lease_token],
             ).fetchone()
@@ -426,7 +474,9 @@ class JobLedger:
 
     # -- finish ------------------------------------------------------------- #
 
-    def complete(self, job: ClaimedJob, *, con=None, metrics: Optional[Mapping[str, Any]] = None) -> bool:
+    def complete(
+        self, job: ClaimedJob, *, con=None, metrics: Optional[Mapping[str, Any]] = None
+    ) -> bool:
         """Mark a leased job succeeded. False if the lease is no longer ours.
 
         With ``con``, joins the caller's transaction so the derived row and the
@@ -447,6 +497,7 @@ class JobLedger:
                       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
                       last_error = NULL, error_category = NULL
                 WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                      AND lease_expires_at > now()
             RETURNING job_id""",
             [job.job_id, job.lease_token],
         ).fetchone()
@@ -456,7 +507,11 @@ class JobLedger:
             """UPDATE pipeline_job_attempts
                   SET finished_at = now(), result = 'succeeded', metrics_json = ?
                 WHERE job_id = ? AND lease_token = ? AND finished_at IS NULL""",
-            [json.dumps(dict(metrics)) if metrics else None, job.job_id, job.lease_token],
+            [
+                json.dumps(dict(metrics)) if metrics else None,
+                job.job_id,
+                job.lease_token,
+            ],
         )
         return True
 
@@ -474,15 +529,25 @@ class JobLedger:
                 row = con.execute(
                     """SELECT failures, max_attempts FROM pipeline_jobs
                         WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                      AND lease_expires_at > now()
                         FOR UPDATE""",
                     [job.job_id, job.lease_token],
                 ).fetchone()
                 if row is None:
                     return "stale"
                 return self._spend_failure(
-                    con, job.job_id, job.lease_token, job.job_kind,
-                    int(row[0]), int(row[1]), error, retryable, category,
-                    attempt_result="retryable_failed" if retryable else "terminal_failed",
+                    con,
+                    job.job_id,
+                    job.lease_token,
+                    job.job_kind,
+                    int(row[0]),
+                    int(row[1]),
+                    error,
+                    retryable,
+                    category,
+                    attempt_result=(
+                        "retryable_failed" if retryable else "terminal_failed"
+                    ),
                 )
 
     def _spend_failure(
@@ -526,8 +591,17 @@ class JobLedger:
                       lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
                       updated_at = now()
                 WHERE job_id = ?""",
-            [status, spent, error, category, _clip(reason), status, float(delay),
-             status, job_id],
+            [
+                status,
+                spent,
+                error,
+                category,
+                _clip(reason),
+                status,
+                float(delay),
+                status,
+                job_id,
+            ],
         )
         con.execute(
             """UPDATE pipeline_job_attempts
@@ -552,6 +626,7 @@ class JobLedger:
                               lease_token = NULL, lease_owner = NULL,
                               lease_expires_at = NULL, updated_at = now()
                         WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                      AND lease_expires_at > now()
                     RETURNING job_id""",
                     [_clip(reason), float(delay_seconds), job.job_id, job.lease_token],
                 ).fetchone()
@@ -577,6 +652,7 @@ class JobLedger:
         row = con.execute(
             """SELECT 1 FROM pipeline_jobs
                 WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                      AND lease_expires_at > now()
                 FOR UPDATE""",
             [job.job_id, job.lease_token],
         ).fetchone()
@@ -620,9 +696,16 @@ class JobLedger:
                 ).fetchall()
                 for job_id, token, kind, failures, max_attempts in rows:
                     self._spend_failure(
-                        con, job_id, token, kind, int(failures), int(max_attempts),
-                        "lease expired before the worker finished", True,
-                        "lease_expired", attempt_result="lease_expired",
+                        con,
+                        job_id,
+                        token,
+                        kind,
+                        int(failures),
+                        int(max_attempts),
+                        "lease expired before the worker finished",
+                        True,
+                        "lease_expired",
+                        attempt_result="lease_expired",
                     )
                     reclaimed += 1
         return reclaimed
@@ -655,7 +738,9 @@ class JobLedger:
             ).fetchall()
         return [JobRow(*row) for row in rows]
 
-    def stats(self, *, con=None, timeout: float | None = None) -> dict[str, dict[str, Any]]:
+    def stats(
+        self, *, con=None, timeout: float | None = None
+    ) -> dict[str, dict[str, Any]]:
         """Per-kind queue health for ``/readyz`` and ``drover_data_quality``."""
         if con is None:
             with self.connection(timeout=timeout) as own:
@@ -681,8 +766,7 @@ def ledger_stats(con) -> dict[str, dict[str, Any]]:
         for kind in JOB_KINDS
     }
     # job_kind is CHECK-constrained to JOB_KINDS, so every row has a slot.
-    for row in con.execute(
-        """SELECT job_kind,
+    for row in con.execute("""SELECT job_kind,
                   count(*) FILTER (WHERE status = 'pending'),
                   count(*) FILTER (WHERE status = 'retry_wait'),
                   count(*) FILTER (WHERE status = 'running'),
@@ -692,8 +776,7 @@ def ledger_stats(con) -> dict[str, dict[str, Any]]:
                           FILTER (WHERE status IN ('pending', 'retry_wait')))
              FROM pipeline_jobs
             WHERE status IN ('pending', 'running', 'retry_wait')
-            GROUP BY job_kind"""
-    ).fetchall():
+            GROUP BY job_kind""").fetchall():
         out[row[0]].update(
             pending=int(row[1]),
             retry_wait=int(row[2]),

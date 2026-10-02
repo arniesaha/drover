@@ -20,12 +20,14 @@ harness launches and session state, agent events, session summaries and the
 | --- | --- |
 | OTLP receiver (`:4317`) | Not started. `drover-server run --no-otlp` is implied. |
 | Cockpit activity | Sessions and tokens from events and `session_usage`. Cost and latency report zero coverage and the app hides them. Span Parquet is never read. |
-| Span embeddings | No new jobs are enqueued or claimed. Existing rows are left untouched. |
+| Span embeddings | Removed from the core memory path in Phase 3 (#480), regardless of this flag. Existing data is preserved. |
 | `drover_recall` | Session-summary hits only; span-embedding hits are not unioned in. |
-| `drover-server trace-tail`, `recent-traces`, `embeddings enqueue-spans`, `decisions derive` | Exit with a message naming the flag. |
+| `drover-server trace-tail`, `recent-traces`, `decisions derive` | Exit with a message naming the flag. |
 | `drover-server session graph` | Delegation tree from launch metadata. `--spans` (legacy span tree) needs the flag. |
 | `drover_project_activity` (MCP) | Event and summary based; never reads spans regardless of the flag. |
 | `doctor` / `data_quality` / advisory | Span checks report `disabled` rather than a failure. |
+
+The legacy span embedding maintenance commands have been removed.
 
 Historical span Parquet under `spans/` and every span table remain on disk.
 Nothing is deleted and no schema is dropped.

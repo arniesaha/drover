@@ -883,42 +883,41 @@ def _mark_terminal_recap_dependencies_done(control_path: Path) -> int:
     """
 
     from drover.server.db import control_plane_connection
+    from drover.server.ledger import transaction
+    from drover.server.memory_store import MemoryRepository
 
+    # Live recaps are `recap_session` jobs in the ledger and the live phase of
+    # `session_memory` (#480). Retire each waiting job as succeeded and write
+    # a recap at the session's newest sequence, which is exactly what the
+    # payload-retention gate checks.
     with control_plane_connection(control_path) as connection:
         rows = connection.execute("""
-            SELECT job.session_id, COALESCE(max(event.seq), 0) AS max_seq
-              FROM live_recap_jobs job
-              JOIN harness_events event ON event.session_id = job.session_id
-             WHERE job.status = 'pending'
-             GROUP BY job.session_id
-             ORDER BY job.session_id
+            SELECT job.subject_key, COALESCE(max(event.seq), 0) AS max_seq
+              FROM pipeline_jobs job
+              JOIN harness_events event ON event.session_id = job.subject_key
+             WHERE job.job_kind = 'recap_session' AND job.status = 'pending'
+             GROUP BY job.subject_key
+             ORDER BY job.subject_key
             """).fetchall()
         for session_id, source_seq in rows:
-            connection.execute(
-                "UPDATE live_recap_jobs SET desired_source_seq = ? WHERE session_id = ?",
-                [source_seq, session_id],
-            )
-            connection.execute(
-                """
-                INSERT INTO live_session_recaps
-                  (session_id, recap_text, source_seq, generated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (session_id) DO UPDATE SET
-                  recap_text = excluded.recap_text,
-                  source_seq = excluded.source_seq,
-                  generated_at = excluded.generated_at
-                """,
-                [
+            with transaction(connection):
+                connection.execute(
+                    """
+                    UPDATE pipeline_jobs
+                       SET status = 'succeeded', source_version = ?,
+                           finished_at = now(), updated_at = now()
+                     WHERE job_kind = 'recap_session' AND subject_key = ?
+                       AND status = 'pending'
+                    """,
+                    [str(source_seq), session_id],
+                )
+                MemoryRepository.put_recap(
+                    connection,
                     session_id,
                     "synthetic benchmark completion",
-                    source_seq,
-                    datetime.now(timezone.utc),
-                ],
-            )
-            connection.execute(
-                "UPDATE live_recap_jobs SET status = 'done' WHERE session_id = ?",
-                [session_id],
-            )
+                    int(source_seq),
+                    None,
+                )
     return len(rows)
 
 

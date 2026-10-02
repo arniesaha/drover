@@ -147,14 +147,13 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
 }
 
 #: Tables that belong to the control plane and live in ``control_plane_path``.
-#: The recap queue and its projection are here because ``HarnessRegistry``
-#: writes them in the same transaction as the event that triggers them.
+#: The live recap queue and its projection used to be here; recaps are derived
+#: memory in the PostgreSQL ``session_memory``/``pipeline_jobs`` tables now
+#: (#480), rebuilt rather than migrated, so they are neither copied nor pruned.
 CONTROL_PLANE_TABLES = (
     "harness_hosts",
     "harness_sessions",
     "harness_events",
-    "live_session_recaps",
-    "live_recap_jobs",
     "advisory_findings",
     "advisory_occurrences",
     "session_usage",
@@ -168,8 +167,6 @@ CONTROL_PLANE_PRIMARY_KEYS = {
     "harness_hosts": "host_id",
     "harness_sessions": "session_id",
     "harness_events": "event_id",
-    "live_session_recaps": "session_id",
-    "live_recap_jobs": "session_id",
     "advisory_findings": "finding_id",
     "advisory_occurrences": "occurrence_id",
     "session_usage": "session_id",

@@ -97,6 +97,8 @@ def test_ingest_writes_n_rows_into_spans(tmp_path: Path) -> None:
     assert stats.read == 3
     assert stats.inserted == 3
     assert stats.skipped_dupes == 0
+    # Span embedding jobs (#473) and ledger-shadow receipts (#480) are gone.
+    assert not hasattr(stats, "ledger_receipts")
 
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)  # refresh view
     con = duckdb.connect(str(duckdb_path))
@@ -105,8 +107,6 @@ def test_ingest_writes_n_rows_into_spans(tmp_path: Path) -> None:
             "SELECT count(*) FROM spans WHERE dedup_key IS NOT NULL"
         ).fetchone()[0]
         assert n == 3
-        jobs = con.execute("SELECT count(*) FROM span_embed_jobs").fetchone()[0]
-        assert jobs == 3
     finally:
         con.close()
 

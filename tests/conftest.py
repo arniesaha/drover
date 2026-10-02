@@ -70,16 +70,41 @@ def postgres_dsn():
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
     try:
         subprocess.run(
-            [str(bindir / "initdb"), "-D", str(data), "-A", "trust", "-U",
-             getpass.getuser(), "--no-sync", "-E", "UTF8"],
-            check=True, capture_output=True, timeout=120, env=env,
+            [
+                str(bindir / "initdb"),
+                "-D",
+                str(data),
+                "-A",
+                "trust",
+                "-U",
+                getpass.getuser(),
+                "--no-sync",
+                "-E",
+                "UTF8",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+            env=env,
         )
         subprocess.run(
-            [str(bindir / "pg_ctl"), "-D", str(data), "-w", "-t", "60", "-l",
-             str(root / "log"), "-o",
-             f"-k {root} -p {port} -c listen_addresses='' -c fsync=off",
-             "start"],
-            check=True, capture_output=True, timeout=120, env=env,
+            [
+                str(bindir / "pg_ctl"),
+                "-D",
+                str(data),
+                "-w",
+                "-t",
+                "60",
+                "-l",
+                str(root / "log"),
+                "-o",
+                f"-k {root} -p {port} -c listen_addresses='' -c fsync=off",
+                "start",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log = root / "log"
@@ -91,7 +116,9 @@ def postgres_dsn():
     finally:
         subprocess.run(
             [str(bindir / "pg_ctl"), "-D", str(data), "-m", "immediate", "stop"],
-            capture_output=True, timeout=60, env=env,
+            capture_output=True,
+            timeout=60,
+            env=env,
         )
         shutil.rmtree(root, ignore_errors=True)
 

@@ -4,6 +4,13 @@ These are pure functions over a DuckDB lakehouse path: each opens its
 own connection, executes a query, and returns a JSON-serializable dict.
 The MCP transport layer (server.py) thinly wraps them; tests exercise
 them directly so we can validate behavior without a transport.
+
+Derived memory -- session summaries, project briefs and session embeddings --
+is read from the PostgreSQL control store registered for the same path
+(:mod:`drover.server.memory_store`, #480). Events, tasks and the other
+analytical relations still come from DuckDB. With a DuckDB control store
+there is no derived memory at all: the tools answer with empty summaries
+rather than failing.
 """
 
 from __future__ import annotations
@@ -12,20 +19,31 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 import duckdb
 
 from drover.context_containers import normalize_context_type
 from drover.event_identity import canonical_agent_events_cte
 from drover.server.db import attached_control_plane_snapshot, open_duckdb_connection
+from drover.server.ledger import (
+    SUMMARIZE_SESSION,
+    JobLedger,
+    MemoryStoreUnavailable,
+    memory_store_available,
+)
+from drover.server.memory_store import (
+    EmbeddingStore,
+    MemoryRepository,
+    SessionSummary,
+    VectorStoreUnavailable,
+)
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.project_activity import MAX_DAYS as PROJECT_ACTIVITY_MAX_DAYS
 from drover.server.project_activity import project_activity
 from drover.server.quality import quality_snapshot
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
-    publish_summary_generation,
     source_version_for_session,
 )
 from drover.task_id import compute_task_id
@@ -36,6 +54,92 @@ log = logging.getLogger("drover.mcp.tools")
 #: active had an event in the last 30 minutes; its newest *user* message can be
 #: older than that when a long run is under way, but not older than this.
 _FLEET_SNIPPET_DAYS = 7
+
+#: Ingest placeholders that are never a real session; summaries keyed on them
+#: are noise in every handoff.
+_PLACEHOLDER_SESSIONS = frozenset({"unknown_openclaw"})
+
+#: Bound on the repo -> task fan-out when resolving a repository's summaries
+#: through ``tasks`` (one task per branch, plus explicit task ids).
+_REPO_TASK_LOOKUP_LIMIT = 50
+
+#: Newest summaries considered when deciding whether a project brief is stale.
+_BRIEF_FRESHNESS_SUMMARIES = 50
+
+#: Sessions a repo-scoped recall searches over (newest summaries first).
+_RECALL_SCOPE_LIMIT = 1000
+
+MEMORY_UNAVAILABLE_REASON = (
+    "derived memory (summaries, briefs, embeddings) requires the PostgreSQL "
+    "control store; this hub runs a DuckDB control store"
+)
+
+# Per-tool summary row shapes (the columns each tool used to select from the
+# DuckDB session_summaries table).
+_HANDOFF_SUMMARY_KEYS = (
+    "session_id",
+    "agent_id",
+    "ended_at",
+    "summary_md",
+    "next_steps_md",
+    "open_questions",
+    "files_touched",
+    "status",
+    "generator_model",
+)
+_SESSION_SUMMARY_KEYS = (
+    "session_id",
+    "task_id",
+    "agent_id",
+    "ended_at",
+    "summary_md",
+    "files_touched",
+    "tools_used",
+    "last_user_prompt",
+    "last_assistant",
+    "next_steps_md",
+    "open_questions",
+    "status",
+    "generator_model",
+    "generated_at",
+    "project_key",
+    "source_version",
+)
+_RECENT_SESSION_KEYS = (
+    "session_id",
+    "agent_id",
+    "ended_at",
+    "summary_md",
+    "next_steps_md",
+    "open_questions",
+    "files_touched",
+    "generator_model",
+)
+_RESUME_SUMMARY_KEYS = (
+    "session_id",
+    "agent_id",
+    "ended_at",
+    "summary_md",
+    "next_steps_md",
+    "open_questions",
+    "status",
+    "generator_model",
+)
+_TASK_SUMMARY_KEYS = ("session_id", "agent_id", "summary_md", "ended_at")
+_BRIEF_KEYS = (
+    "project_key",
+    "repo_owner",
+    "repo_name",
+    "brief_md",
+    "recent_themes_md",
+    "key_files",
+    "open_questions",
+    "next_steps_md",
+    "session_count",
+    "last_activity_at",
+    "generator_model",
+    "generated_at",
+)
 
 
 def _connect(duckdb_path: Path) -> duckdb.DuckDBPyConnection:
@@ -79,7 +183,7 @@ def _resolve(duckdb_path: Path, session_id: str) -> dict:
     try:
         con = _connect(duckdb_path)
         try:
-            return resolve_session(con, session_id)
+            return resolve_session(con, session_id, store_path=duckdb_path)
         finally:
             con.close()
     except (duckdb.Error, OSError):
@@ -102,7 +206,7 @@ def drover_memory_acceptance(*, duckdb_path: Path, harness_ids: list[str]) -> di
             reports = []
             for sid in harness_ids:
                 try:
-                    reports.append(audit_session(con, sid))
+                    reports.append(audit_session(con, sid, store_path=duckdb_path))
                 except duckdb.Error:
                     reports.append({"harness_id": sid, "status": "unavailable"})
             return {"sessions": reports}
@@ -114,6 +218,137 @@ def drover_memory_acceptance(*, duckdb_path: Path, harness_ids: list[str]) -> di
                 {"harness_id": sid, "status": "unavailable"} for sid in harness_ids
             ]
         }
+
+
+def _as_utc(value: Any) -> datetime | None:
+    """An aware UTC instant. Naive values are taken as UTC wall-clock.
+
+    PostgreSQL hands back TIMESTAMPTZ (aware) while DuckDB TIMESTAMP columns
+    are naive; comparing the two directly raises.
+    """
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+# --- derived memory (PostgreSQL) ---------------------------------------------
+
+
+def _memory(duckdb_path: Path) -> MemoryRepository | None:
+    """The memory repository for this hub, or None without PostgreSQL."""
+    if not memory_store_available(duckdb_path):
+        return None
+    try:
+        return MemoryRepository(duckdb_path)
+    except MemoryStoreUnavailable:
+        return None
+
+
+def _summary_row(memory_row: Any, keys: Sequence[str]) -> dict:
+    """A SessionSummary/ProjectBrief in a tool's legacy row shape."""
+    full = memory_row.as_dict()
+    return {key: _coerce(full.get(key)) for key in keys}
+
+
+def _newest_first(summaries: Iterable[SessionSummary]) -> list[SessionSummary]:
+    """Order like ``ORDER BY ended_at DESC NULLS LAST``."""
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    return sorted(
+        summaries,
+        key=lambda s: (s.ended_at is not None, _as_utc(s.ended_at) or floor),
+        reverse=True,
+    )
+
+
+def _repo_summaries(
+    repo: MemoryRepository,
+    con: duckdb.DuckDBPyConnection,
+    *,
+    owner: str,
+    name: str,
+    branch: Optional[str] = None,
+    limit: int,
+    include_day_summary: bool = False,
+) -> list[SessionSummary]:
+    """A repository's newest final summaries.
+
+    ``session_memory.project_key`` is the primary key into a repository: the
+    summarizer stamps it from the session's own events. Summaries without one
+    (or a branch-scoped question, which project_key cannot answer) resolve
+    through DuckDB instead -- the repo's ``tasks`` rows, and optionally the
+    ``agent_event_day_summary`` session index -- and are fetched by id.
+    """
+    limit = max(1, int(limit))
+    # Each source may return a placeholder session that is dropped below.
+    fetch = limit + len(_PLACEHOLDER_SESSIONS)
+    found: dict[str, SessionSummary] = {}
+    task_ids = [
+        str(row[0])
+        for row in con.execute(
+            """SELECT task_id FROM tasks
+                WHERE repo_owner = ? AND repo_name = ?
+                  AND (? IS NULL OR branch = ?)
+                ORDER BY last_activity_at DESC NULLS LAST
+                LIMIT ?""",
+            [owner, name, branch, branch, _REPO_TASK_LOOKUP_LIMIT],
+        ).fetchall()
+        if row[0]
+    ]
+    for task_id in task_ids:
+        for summary in repo.recent_summaries(task_id=task_id, limit=fetch):
+            found[summary.session_id] = summary
+    if branch is None:
+        for summary in repo.recent_summaries(
+            project_key=f"{owner}/{name}", limit=fetch
+        ):
+            found[summary.session_id] = summary
+        if include_day_summary:
+            session_ids = [
+                str(row[0])
+                for row in con.execute(
+                    """SELECT DISTINCT session_id FROM agent_event_day_summary
+                        WHERE repo_owner = ? AND repo_name = ?""",
+                    [owner, name],
+                ).fetchall()
+                if row[0]
+            ]
+            if session_ids:
+                for summary in repo.recent_summaries(
+                    session_ids=session_ids, limit=fetch
+                ):
+                    found[summary.session_id] = summary
+    kept = [s for s in found.values() if s.session_id not in _PLACEHOLDER_SESSIONS]
+    return _newest_first(kept)[:limit]
+
+
+def _drop_closed_active_sessions(duckdb_path: Path, rows: list[dict]) -> list[dict]:
+    """Apply the "a summary that covers the newest event closes it" rule.
+
+    A summary is not an ending. The summarizer fires on an idle gap, so a
+    session that is still working has one long before it stops, and treating
+    "has a summary" as "closed" hid live sessions from every handoff. Only a
+    summary whose ``ended_at`` already covers the newest event closes the
+    session: a row stays when it has no summary, the summary has no
+    ``ended_at``, or ``ended_at < last_event_at``. This used to be a join in
+    the ``active_sessions`` view; summaries live in PostgreSQL now (#480).
+    """
+    if not rows:
+        return rows
+    repo = _memory(duckdb_path)
+    if repo is None:
+        return rows
+    summaries = repo.summaries(row["session_id"] for row in rows)
+    kept: list[dict] = []
+    for row in rows:
+        summary = summaries.get(row["session_id"])
+        ended_at = _as_utc(summary.ended_at) if summary is not None else None
+        last_event_at = _as_utc(row.get("last_event_at"))
+        if ended_at is None or (last_event_at is not None and ended_at < last_event_at):
+            kept.append(row)
+    return kept
 
 
 # --- drover_handoff -----------------------------------------------------------
@@ -158,24 +393,22 @@ def drover_handoff(
             "active_sessions": [],
         }
     by_repo = repo_owner is not None and repo_name is not None and task_id is None
+    repo = _memory(duckdb_path)
 
     con = _connect(duckdb_path)
     try:
         if by_repo:
-            summaries = _row_to_dict(
-                con.execute(
-                    """SELECT ss.session_id, ss.agent_id, ss.ended_at,
-                              ss.summary_md, ss.next_steps_md, ss.open_questions,
-                              ss.files_touched, ss.status, ss.generator_model
-                         FROM canonical_session_summaries ss
-                         JOIN tasks t ON ss.task_id = t.task_id
-                        WHERE t.repo_owner = ? AND t.repo_name = ?
-                          AND (? IS NULL OR t.branch = ?)
-                          AND ss.session_id <> 'unknown_openclaw'
-                        ORDER BY ss.ended_at DESC
-                        LIMIT ?""",
-                    [repo_owner, repo_name, branch, branch, max_summaries],
+            found = (
+                _repo_summaries(
+                    repo,
+                    con,
+                    owner=repo_owner,
+                    name=repo_name,
+                    branch=branch,
+                    limit=max_summaries,
                 )
+                if repo is not None
+                else []
             )
             active = _row_to_dict(
                 con.execute(
@@ -193,17 +426,17 @@ def drover_handoff(
             )
         else:
             tid = task_id or compute_task_id(None, repo_owner, repo_name, branch)
-            summaries = _row_to_dict(
-                con.execute(
-                    """SELECT session_id, agent_id, ended_at, summary_md, next_steps_md,
-                              open_questions, files_touched, status, generator_model
-                         FROM canonical_session_summaries
-                        WHERE task_id = ?
-                          AND session_id <> 'unknown_openclaw'
-                        ORDER BY ended_at DESC
-                        LIMIT ?""",
-                    [tid, max_summaries],
-                )
+            found = (
+                [
+                    s
+                    for s in repo.recent_summaries(
+                        task_id=tid,
+                        limit=int(max_summaries) + len(_PLACEHOLDER_SESSIONS),
+                    )
+                    if s.session_id not in _PLACEHOLDER_SESSIONS
+                ][: max(1, int(max_summaries))]
+                if repo is not None
+                else []
             )
             active = _row_to_dict(
                 con.execute(
@@ -218,6 +451,8 @@ def drover_handoff(
     finally:
         con.close()
 
+    summaries = [_summary_row(s, _HANDOFF_SUMMARY_KEYS) for s in found]
+    active = _drop_closed_active_sessions(duckdb_path, active)
     return {
         "task_id": tid,
         "repo_owner": repo_owner,
@@ -279,42 +514,30 @@ def drover_session_summary(
     resolution = _resolve(duckdb_path, session_id)
     if resolution["status"] != "ok":
         return resolution
-    session_id = resolution.get("summary_session_id") or resolution["session_id"]
-    con = _connect(duckdb_path)
-    try:
-        cur = con.execute(
-            """SELECT session_id, task_id, agent_id, ended_at, summary_md,
-                      files_touched, tools_used, last_user_prompt, last_assistant,
-                      next_steps_md, open_questions, status, generator_model, generated_at
-               FROM session_summaries
-               WHERE session_id = ?""",
-            [session_id],
-        )
-        rows = _row_to_dict(cur)
-        job = (
-            con.execute(
-                "SELECT status FROM summarize_jobs WHERE session_id=?",
-                [resolution["session_id"]],
-            ).fetchone()
-            if not rows
-            else None
-        )
-
-    finally:
-        con.close()
-    if rows:
+    repo = _memory(duckdb_path)
+    if repo is None:
+        return {**_missing(resolution), "memory_unavailable": True}
+    summary = repo.summary(
+        resolution.get("summary_session_id") or resolution["session_id"]
+    )
+    if summary is not None:
         return {
-            **rows[0],
+            **_summary_row(summary, _SESSION_SUMMARY_KEYS),
             **resolution,
-            "status": rows[0]["status"],
-            "artifact_session_id": rows[0]["session_id"],
+            "status": summary.status,
+            "artifact_session_id": summary.session_id,
         }
-    if job and job[0] == "insufficient_input":
-        return {**resolution, "status": "insufficient_input"}
-    return {**_missing(resolution), "summary_status": job[0] if job else "unavailable"}
-
-
-# --- drover_active_sessions ---------------------------------------------------
+    job = JobLedger(duckdb_path).latest(SUMMARIZE_SESSION, resolution["session_id"])
+    status = (
+        "insufficient_input"
+        if job and job.error_category == "no_events"
+        else "unavailable"
+    )
+    return {
+        **resolution,
+        "status": status,
+        "summary_status": job.status if job else "unavailable",
+    }
 
 
 def drover_active_sessions(
@@ -342,7 +565,7 @@ def drover_active_sessions(
         active = _row_to_dict(cur)
     finally:
         con.close()
-    return {"active_sessions": active}
+    return {"active_sessions": _drop_closed_active_sessions(duckdb_path, active)}
 
 
 # --- drover_search ------------------------------------------------------------
@@ -514,38 +737,33 @@ def drover_session_close(
     *,
     duckdb_path: Path,
     session_id: str,
-    summarize_job_stream: object | None = None,
 ) -> dict:
     """Enqueue the current source generation for ``session_id``.
 
-    Only a changed source generation resets the serving row and publishes a
-    stream delivery. Legacy null versions are backfilled without resetting the
-    row's existing retry budget.
+    The source version is fingerprinted from the session's events in DuckDB;
+    the job itself goes on the PostgreSQL job ledger (#480). ``status`` is the
+    ledger's enqueue outcome: ``queued``, ``requeued`` (a different
+    generation replaced a live job), ``already_queued``, ``already_done``,
+    ``already_failed``, ``suppressed`` (dead-letter streak cap) or
+    ``unavailable`` (no PostgreSQL control store).
     """
+    resolution = _resolve(duckdb_path, session_id)
+    # A native SessionEnd hook can arrive before collector ingestion. Keep
+    # accepting that intent, while known harness identities must map explicitly.
+    if resolution["status"] in ("unmapped", "unavailable"):
+        return resolution
+    session_id = resolution["session_id"]
     con = open_duckdb_connection(duckdb_path)
     try:
-        existing = con.execute(
-            "SELECT status FROM summarize_jobs WHERE session_id=?",
-            [session_id],
-        ).fetchone()
         source_version = source_version_for_session(con, session_id)
-        created = enqueue_summary_generation(con, session_id, source_version)
-        publish_summary_generation(
-            con, session_id, source_version, summarize_job_stream
-        )
     finally:
         con.close()
-    if existing is None:
-        status = "queued"
-    elif created:
-        status = "requeued"
-    elif existing[0] == "done":
-        status = "already_done"
-    elif existing[0] == "dead_lettered":
-        status = "dead_lettered"
-    else:
-        status = "already_queued"
-    return {"session_id": session_id, "status": status}
+    status = enqueue_summary_generation(duckdb_path, session_id, source_version)
+    job_status = None
+    if memory_store_available(duckdb_path):
+        latest = JobLedger(duckdb_path).latest(SUMMARIZE_SESSION, session_id)
+        job_status = latest.status if latest is not None else None
+    return {"session_id": session_id, "status": status, "job_status": job_status}
 
 
 # --- drover_project_brief -----------------------------------------------------
@@ -572,48 +790,38 @@ def drover_project_brief(
             )
         project_key = f"{repo_owner}/{repo_name}"
     owner, _, name = project_key.partition("/")
+    repo = _memory(duckdb_path)
+    if repo is None:
+        return None
+    brief = repo.brief(project_key)
+    if brief is None:
+        return None
+    row = _summary_row(brief, _BRIEF_KEYS)
     con = _connect(duckdb_path)
     try:
-        rows = _row_to_dict(
-            con.execute(
-                """SELECT project_key, repo_owner, repo_name, brief_md, recent_themes_md,
-                      key_files, open_questions, next_steps_md,
-                      session_count, last_activity_at, generator_model, generated_at
-               FROM project_briefs WHERE project_key=?""",
-                [project_key],
+        # Newest activity the brief could have missed: summaries of the repo's
+        # sessions (ended or regenerated) and the tasks' own activity marker.
+        candidates: list[datetime | None] = []
+        for summary in _repo_summaries(
+            repo, con, owner=owner, name=name, limit=_BRIEF_FRESHNESS_SUMMARIES
+        ):
+            candidates.extend(
+                [_as_utc(summary.ended_at), _as_utc(summary.generated_at)]
             )
-        )
-        if not rows:
-            return None
-        row = rows[0]
-        latest = con.execute(
-            """SELECT MAX(activity_at)
-                 FROM (
-                   SELECT TRY_CAST(ss.ended_at AS TIMESTAMP) AS activity_at
-                     FROM canonical_session_summaries ss
-                     JOIN tasks t USING (task_id)
-                    WHERE t.repo_owner = ? AND t.repo_name = ?
-                      AND ss.session_id <> 'unknown_openclaw'
-                   UNION ALL
-                   SELECT TRY_CAST(ss.generated_at AS TIMESTAMP) AS activity_at
-                     FROM canonical_session_summaries ss
-                     JOIN tasks t USING (task_id)
-                    WHERE t.repo_owner = ? AND t.repo_name = ?
-                      AND ss.session_id <> 'unknown_openclaw'
-                   UNION ALL
-                   SELECT TRY_CAST(last_activity_at AS TIMESTAMP) AS activity_at
-                     FROM tasks
-                    WHERE repo_owner = ? AND repo_name = ?
-                 )""",
-            [owner, name, owner, name, owner, name],
+        task_latest = con.execute(
+            """SELECT MAX(TRY_CAST(last_activity_at AS TIMESTAMP))
+                 FROM tasks WHERE repo_owner = ? AND repo_name = ?""",
+            [owner, name],
         ).fetchone()
-        latest_activity = latest[0] if latest else None
+        candidates.append(_as_utc(task_latest[0]) if task_latest else None)
     finally:
         con.close()
+    present = [value for value in candidates if value is not None]
+    latest_activity = max(present) if present else None
 
-    generated_at = _parse_datetime(row.get("generated_at"))
-    last_activity_at = _parse_datetime(row.get("last_activity_at"))
-    latest_activity_dt = _parse_datetime(latest_activity)
+    generated_at = _as_utc(brief.generated_at)
+    last_activity_at = _as_utc(brief.last_activity_at)
+    latest_activity_dt = latest_activity
     stale = False
     warning = ""
     if latest_activity_dt and generated_at and latest_activity_dt > generated_at:
@@ -652,7 +860,7 @@ def drover_recent_sessions(
     project_key: Optional[str] = None,
     limit: int = 5,
 ) -> dict:
-    """Return the N most recent session_summaries for a repository.
+    """Return the N most recent session summaries for a repository.
 
     Useful for "what was the last session about?" — strictly more
     fine-grained than ``drover_project_brief`` (which is a synthesis).
@@ -666,39 +874,26 @@ def drover_recent_sessions(
         owner, _, name = project_key.partition("/")
     else:
         owner, name = repo_owner, repo_name
-    con = _connect(duckdb_path)
-    try:
-        # Prefer the task-keyed join (covers tasks linked via task_id); fall
-        # back to the day-summary index so unlinked summaries still surface.
-        #
-        # That fallback used to rank every event in the lakehouse by dedup_key
-        # to learn which sessions belong to a repository, which cost the whole
-        # analytical budget and returned an OOM instead of five rows
-        # (drover#369). `agent_event_day_summary` already records
-        # (date, session_id, repo) per summarised partition, newest days first,
-        # so the same question is a small table lookup. A session older than
-        # the summarised horizon is still reachable through its task link.
-        cur = con.execute(
-            """SELECT DISTINCT ss.session_id, ss.agent_id, ss.ended_at,
-                      ss.summary_md, ss.next_steps_md, ss.open_questions,
-                      ss.files_touched, ss.generator_model
-               FROM canonical_session_summaries ss
-               LEFT JOIN tasks t USING (task_id)
-               WHERE ss.session_id <> 'unknown_openclaw'
-                 AND (
-                   (t.repo_owner = ? AND t.repo_name = ?)
-                   OR ss.session_id IN (
-                       SELECT DISTINCT session_id FROM agent_event_day_summary
-                       WHERE repo_owner=? AND repo_name=?
-                     )
-                 )
-               ORDER BY ss.ended_at DESC
-               LIMIT ?""",
-            [owner, name, owner, name, int(limit)],
-        )
-        sessions = _row_to_dict(cur)
-    finally:
-        con.close()
+    repo = _memory(duckdb_path)
+    sessions: list[dict] = []
+    if repo is not None:
+        con = _connect(duckdb_path)
+        try:
+            # session_memory.project_key first, then the task link, then the
+            # day-summary index so unlinked summaries still surface.
+            #
+            # That last fallback used to rank every event in the lakehouse by
+            # dedup_key to learn which sessions belong to a repository, which
+            # cost the whole analytical budget and returned an OOM instead of
+            # five rows (drover#369). `agent_event_day_summary` already
+            # records (date, session_id, repo) per summarised partition, so
+            # the same question is a small table lookup.
+            found = _repo_summaries(
+                repo, con, owner=owner, name=name, limit=limit, include_day_summary=True
+            )
+        finally:
+            con.close()
+        sessions = [_summary_row(s, _RECENT_SESSION_KEYS) for s in found]
     return {
         "project_key": project_key or f"{owner}/{name}",
         "repo_owner": owner,
@@ -840,22 +1035,12 @@ def drover_resume_context(
         return None
     session_ids = container.get("session_ids") or []
     summaries: list[dict] = []
-    if session_ids:
-        con = _connect(duckdb_path)
-        try:
-            summaries = _row_to_dict(
-                con.execute(
-                    """SELECT session_id, agent_id, ended_at, summary_md,
-                              next_steps_md, open_questions, status, generator_model
-                         FROM canonical_session_summaries
-                        WHERE session_id = ANY(?::VARCHAR[])
-                        ORDER BY ended_at DESC NULLS LAST
-                        LIMIT ?""",
-                    [session_ids, int(max_summaries)],
-                )
-            )
-        finally:
-            con.close()
+    repo = _memory(duckdb_path) if session_ids else None
+    if repo is not None:
+        summaries = [
+            _summary_row(s, _RESUME_SUMMARY_KEYS)
+            for s in repo.recent_summaries(session_ids=session_ids, limit=max_summaries)
+        ]
     return {"context": container, "session_summaries": summaries}
 
 
@@ -899,6 +1084,7 @@ def drover_project_activity(
         with attached_control_plane_snapshot(con, duckdb_path):
             return project_activity(
                 con,
+                memory_store_path=duckdb_path,
                 project_key=project_key,
                 days=window_days,
                 now=now,
@@ -918,7 +1104,8 @@ def drover_fleet_status(
     """Return a snapshot of every currently-active session with repo context.
 
     "Active" means: an agent_event within the last 30 minutes and no session
-    summary (open session). Combines active_sessions with tasks for repo info.
+    summary that already covers the newest event (open session). Combines
+    active_sessions with tasks for repo info.
     """
     con = _connect(duckdb_path)
     try:
@@ -961,6 +1148,7 @@ def drover_fleet_status(
             if session["agent_id"] not in retired
             and session["session_id"] not in retired_sessions
         ]
+        sessions = _drop_closed_active_sessions(duckdb_path, sessions)
         # One bounded pass for every snippet. The previous loop ran a
         # whole-history canonical scan *per session*, so the cost of the tool
         # grew with the size of the fleet it was reporting on and a busy hub
@@ -1051,6 +1239,25 @@ def drover_pipeline_observatory(
 # --- drover_recall (semantic search) -----------------------------------------
 
 
+def _recall_row(
+    session_id: str, summary: Optional[SessionSummary], score: Optional[float]
+) -> dict:
+    """One recall hit. ``span_id``/``source_text`` stay for shape compatibility:
+    span embeddings are out of the core path (#473), so they are always null."""
+    return {
+        "source_type": "session_summary",
+        "session_id": session_id,
+        "span_id": None,
+        "agent_id": summary.agent_id if summary else None,
+        "ended_at": _coerce(summary.ended_at) if summary else None,
+        "summary_md": summary.summary_md if summary else None,
+        "next_steps_md": summary.next_steps_md if summary else None,
+        "open_questions": list(summary.open_questions) if summary else [],
+        "source_text": None,
+        "score": score,
+    }
+
+
 def drover_recall(
     *,
     duckdb_path: Path,
@@ -1060,93 +1267,101 @@ def drover_recall(
     repo_name: Optional[str] = None,
     include_spans: bool = False,
     session_id: Optional[str] = None,
+    query: Optional[str] = None,
+    embedding_model: Optional[str] = None,
 ) -> dict:
     """Return session summaries ranked by cosine similarity to ``query_embedding``.
 
-    The embedding has to be supplied by the caller — Drover's MCP layer
-    doesn't (yet) call out to the embedder for ad-hoc query encoding;
-    that's a one-line addition once we settle on always-on availability.
-    Until then, the typical caller is the brief worker or a CLI script
-    that owns the embedder.
+    The embedding has to be supplied by the caller -- Drover's MCP layer
+    doesn't call out to the embedder for ad-hoc query encoding. It must come
+    from ``embedding_model`` (the hub's configured embedding model): search is
+    exact cosine within that one embedding space in pgvector, and a vector of
+    the wrong dimension is an error, not an empty result.
 
-    Filters by ``(repo_owner, repo_name)`` if both are provided. Raw-span hits
-    are only unioned in when the optional span integration is on (#473).
+    ``query`` is the keyword fallback: when no semantic search is possible
+    (no embedding given, no model configured, pgvector missing) it does a
+    case-insensitive match over summaries instead. ``mode`` says which ran
+    (``semantic``/``keyword``/``none``) and ``reason`` why semantic did not.
+
+    Filters by ``(repo_owner, repo_name)`` if both are provided. Span
+    embeddings have been removed from the core memory path (#480).
     """
     resolution = _resolve(duckdb_path, session_id) if session_id else None
     if resolution and resolution["status"] != "ok":
         return resolution
-    if not query_embedding:
-        raise ValueError("recall: query_embedding is required (list[float])")
-    where = ["se.embedding IS NOT NULL", "se.dim = ?"]
-    params: list[Any] = [len(query_embedding)]
-    if resolution:
-        where.append("ss.session_id = ?")
-        params.append(resolution.get("summary_session_id") or resolution["session_id"])
-    if repo_owner and repo_name:
-        where.append(
-            "ss.session_id IN (SELECT DISTINCT session_id FROM canonical_agent_events "
-            "WHERE repo_owner=? AND repo_name=?)"
+    if not query_embedding and not query:
+        raise ValueError(
+            "recall: query_embedding (list[float]) or a keyword query is required"
         )
-        params.extend([repo_owner, repo_name])
-    # list_cosine_similarity (vs array_cosine_similarity) accepts
-    # variable-length lists, which is what we store. Span and summary hits are
-    # unioned with an explicit source_type so callers never mistake raw-span
-    # recall for synthesized session-summary recall.
-    span_where = ["spe.embedding IS NOT NULL", "spe.dim = ?"]
-    span_params: list[Any] = [len(query_embedding)]
-    if resolution:
-        span_where.append("spe.session_id = ?")
-        span_params.append(resolution["session_id"])
+    limit = max(1, int(limit))
+    out: dict[str, Any] = {
+        "results": [],
+        "limit": limit,
+        "mode": "none",
+        "memory_unavailable": False,
+        "reason": None,
+    }
+    repo = _memory(duckdb_path)
+    if repo is None:
+        out.update(memory_unavailable=True, reason=MEMORY_UNAVAILABLE_REASON)
+        return out
+
+    scope: Optional[set[str]] = (
+        {resolution.get("summary_session_id") or resolution["session_id"]}
+        if resolution
+        else None
+    )
     if repo_owner and repo_name:
-        span_where.append("spe.repo_owner = ? AND spe.repo_name = ?")
-        span_params.extend([repo_owner, repo_name])
-    span_hits = f"""
-            UNION ALL
-            SELECT 'span' AS source_type,
-                   spe.session_id AS session_id,
-                   spe.span_id AS span_id,
-                   spe.agent_id AS agent_id,
-                   NULL::TIMESTAMP AS ended_at,
-                   NULL::VARCHAR AS summary_md,
-                   NULL::VARCHAR AS next_steps_md,
-                   []::VARCHAR[] AS open_questions,
-                   spe.source_text AS source_text,
-                   list_cosine_similarity(spe.embedding::DOUBLE[], ?::DOUBLE[]) AS score
-            FROM span_embeddings spe
-            WHERE {' AND '.join(span_where)}"""
-    sql = f"""
-        WITH {canonical_agent_events_cte()}, hits AS (
-            SELECT 'session_summary' AS source_type,
-                   ss.session_id AS session_id,
-                   NULL::VARCHAR AS span_id,
-                   ss.agent_id AS agent_id,
-                   ss.ended_at AS ended_at,
-                   ss.summary_md AS summary_md,
-                   ss.next_steps_md AS next_steps_md,
-                   ss.open_questions AS open_questions,
-                   NULL::VARCHAR AS source_text,
-                   list_cosine_similarity(se.embedding::DOUBLE[], ?::DOUBLE[]) AS score
-            FROM session_embeddings se
-            JOIN canonical_session_summaries ss USING (session_id)
-            WHERE {' AND '.join(where)}{span_hits if include_spans else ""}
-        )
-        SELECT source_type, session_id, span_id, agent_id, ended_at, summary_md,
-               next_steps_md, open_questions, source_text, score
-        FROM hits
-        ORDER BY score DESC
-        LIMIT {int(limit)}
-    """
-    con = _connect(duckdb_path)
-    try:
-        bound = [query_embedding, *params]
-        if include_spans:
-            bound.extend([query_embedding, *span_params])
-        results = _row_to_dict(con.execute(sql, bound))
-    finally:
-        con.close()
-    if resolution and not results:
-        return _missing(resolution)
-    return {"status": "ok", "results": results, "limit": int(limit)}
+        con = _connect(duckdb_path)
+        try:
+            repo_scope = {
+                s.session_id
+                for s in _repo_summaries(
+                    repo,
+                    con,
+                    owner=repo_owner,
+                    name=repo_name,
+                    limit=_RECALL_SCOPE_LIMIT,
+                    include_day_summary=True,
+                )
+            }
+        finally:
+            con.close()
+        scope = repo_scope if scope is None else scope & repo_scope
+        if not scope:
+            out["reason"] = f"no summarized sessions for {repo_owner}/{repo_name}"
+            return out
+
+    if query_embedding:
+        if not embedding_model:
+            out["reason"] = "no embedding model is configured for semantic recall"
+        else:
+            store = EmbeddingStore(duckdb_path, model=embedding_model)
+            try:
+                hits = store.search(query_embedding, limit=limit, session_ids=scope)
+            except VectorStoreUnavailable as exc:
+                out["reason"] = str(exc)
+            else:
+                summaries = repo.summaries(hit.session_id for hit in hits)
+                out["results"] = [
+                    _recall_row(
+                        hit.session_id, summaries.get(hit.session_id), hit.similarity
+                    )
+                    for hit in hits
+                ]
+                out["mode"] = "semantic"
+                return out
+
+    if query:
+        fetch = limit if scope is None else max(limit, _RECALL_SCOPE_LIMIT)
+        matches = [
+            s
+            for s in repo.search_summaries(query, limit=fetch)
+            if scope is None or s.session_id in scope
+        ][:limit]
+        out["results"] = [_recall_row(s.session_id, s, None) for s in matches]
+        out["mode"] = "keyword"
+    return out
 
 
 def drover_active_handoff(
@@ -1222,17 +1437,17 @@ def drover_task_status(
                FROM canonical_agent_events WHERE task_id = ?""",
             [task_id],
         ).fetchone()
-        latest_summary = _row_to_dict(
-            con.execute(
-                """SELECT session_id, agent_id, summary_md, ended_at
-               FROM canonical_session_summaries
-               WHERE task_id = ?
-               ORDER BY ended_at DESC LIMIT 1""",
-                [task_id],
-            )
-        )
     finally:
         con.close()
+    repo = _memory(duckdb_path)
+    latest_summary = (
+        [
+            _summary_row(s, _TASK_SUMMARY_KEYS)
+            for s in repo.recent_summaries(task_id=task_id, limit=1)
+        ]
+        if repo is not None
+        else []
+    )
 
     out = task_rows[0]
     out["session_count"] = ev[0] or 0

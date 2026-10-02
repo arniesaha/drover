@@ -7,8 +7,8 @@ from drover.server.memory_identity import resolve_session
 from drover.server.summarizer.derive import final_references
 
 
-def audit_session(con, harness_id: str) -> dict:
-    resolution = resolve_session(con, harness_id)
+def audit_session(con, harness_id: str, *, store_path=None) -> dict:
+    resolution = resolve_session(con, harness_id, store_path=store_path)
     out = {
         "harness_id": harness_id,
         "status": resolution["status"],
@@ -44,19 +44,30 @@ def audit_session(con, harness_id: str) -> dict:
     ).fetchone()
     refs = final_references(final[0] if final else "")
     out["final_references"] = refs
-    summary = con.execute(
-        "SELECT status, summary_md, files_touched FROM session_summaries WHERE session_id=?",
-        [resolution.get("summary_session_id") or sid],
-    ).fetchone()
+    from drover.server.ledger import (
+        SUMMARIZE_SESSION,
+        JobLedger,
+        memory_store_available,
+    )
+    from drover.server.memory_store import MemoryRepository
+
+    if store_path is None or not memory_store_available(store_path):
+        out["summary_status"] = "unavailable"
+        return out
+    summary = MemoryRepository(store_path).summary(
+        resolution.get("summary_session_id") or sid
+    )
     if summary:
-        out["summary_status"] = summary[0]
+        out["summary_status"] = summary.status
         out["summary_contains_final_references"] = all(
-            ref in (summary[1] or "") for ref in refs
+            ref in summary.summary_md for ref in refs
         )
-        out["files_touched_non_empty"] = bool(summary[2])
+        out["files_touched_non_empty"] = bool(summary.files_touched)
     else:
-        job = con.execute(
-            "SELECT status FROM summarize_jobs WHERE session_id=?", [sid]
-        ).fetchone()
-        out["summary_status"] = job[0] if job else "unavailable"
+        job = JobLedger(store_path).latest(SUMMARIZE_SESSION, sid)
+        out["summary_status"] = (
+            "insufficient_input"
+            if job and job.error_category == "no_events"
+            else job.status if job else "unavailable"
+        )
     return out

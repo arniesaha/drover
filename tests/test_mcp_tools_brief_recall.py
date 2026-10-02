@@ -9,8 +9,11 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from conftest import pgvector_available
+from memory_helpers import put_brief, put_summary
 
 from drover.schema import bootstrap
+from drover.server.db import control_plane_connection
 from drover.server.mcp.tools import (
     drover_open_loops,
     drover_project_activity,
@@ -18,13 +21,22 @@ from drover.server.mcp.tools import (
     drover_recall,
     drover_recent_sessions,
 )
+from drover.server.memory_store import EmbeddingMismatch, EmbeddingStore
+
+EMBED_MODEL = "test-embed"
 
 
 def _seed(tmp_path: Path) -> tuple[Path, Path]:
+    # `pg_control_path` registers PostgreSQL for this same path.
     parquet_dir = tmp_path / "parquet"
-    duckdb_path = tmp_path / "nexus.duckdb"
+    duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
     return parquet_dir, duckdb_path
+
+
+def _vec(*head: float) -> list[float]:
+    """A 768-dimension vector (the session_embeddings space) from its head."""
+    return [*head, *([0.0] * (768 - len(head)))]
 
 
 def _write_agent_events(
@@ -137,52 +149,52 @@ def _write_span(
 
 
 def _insert_brief(duckdb_path: Path) -> None:
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute("""INSERT INTO project_briefs
-               (project_key, repo_owner, repo_name, brief_md, recent_themes_md,
-                key_files, open_questions, next_steps_md, session_count,
-                last_activity_at, generator_model, generated_at)
-               VALUES ('arniesaha/nexus', 'arniesaha', 'nexus',
-                       'Nexus is the local lakehouse.',
-                       'Recent: hybrid summarization.',
-                       ['src/nexus/server/wol.py'], ['which embed model?'],
-                       'Land embeddings worker.', 5, now(), 'test-v1', now())""")
-    finally:
-        con.close()
+    put_brief(
+        duckdb_path,
+        "arniesaha/nexus",
+        brief_md="Nexus is the local lakehouse.",
+        recent_themes_md="Recent: hybrid summarization.",
+        key_files=("src/nexus/server/wol.py",),
+        open_questions=("which embed model?",),
+        next_steps_md="Land embeddings worker.",
+        session_count=5,
+        last_activity_at=datetime.now(timezone.utc),
+        generator_model="test-v1",
+    )
 
 
 def _insert_summary(
-    duckdb_path: Path, session_id: str, *, ended_minutes_ago: int = 0
+    duckdb_path: Path,
+    session_id: str,
+    *,
+    ended_minutes_ago: int = 0,
+    summary_md: str | None = None,
+    project_key: str | None = None,
 ) -> None:
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            """INSERT INTO session_summaries
-               (session_id, task_id, agent_id, ended_at, summary_md,
-                files_touched, tools_used, last_user_prompt, last_assistant,
-                next_steps_md, open_questions, status, generator_model, generated_at)
-               VALUES (?, NULL, 'a', now() - INTERVAL (?) MINUTE, ?,
-                       [], MAP{}, '', '', '', [], 'completed', 't', now())""",
-            [session_id, ended_minutes_ago, f"summary {session_id}"],
-        )
-    finally:
-        con.close()
+    put_summary(
+        duckdb_path,
+        session_id,
+        agent_id="a",
+        project_key=project_key,
+        ended_at=datetime.now(timezone.utc) - timedelta(minutes=ended_minutes_ago),
+        summary_md=summary_md or f"summary {session_id}",
+        generator_model="t",
+    )
 
 
 def _insert_embedding(duckdb_path: Path, session_id: str, vector: list[float]) -> None:
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute(
-            """INSERT INTO session_embeddings (session_id, embedding, model, dim, embedded_at)
-               VALUES (?, ?, 'test-embed', ?, now())""",
-            [session_id, vector, len(vector)],
-        )
-    finally:
-        con.close()
+    store = EmbeddingStore(duckdb_path, model=EMBED_MODEL)
+    with store.connection() as con:
+        store.put(con, session_id, vector, model=EMBED_MODEL)
 
 
-def test_project_brief_returns_row(tmp_path: Path) -> None:
+@pytest.fixture
+def pgvector(postgres_dsn):
+    if not pgvector_available(postgres_dsn):
+        pytest.skip("pgvector is not installed on the test PostgreSQL server")
+
+
+def test_project_brief_returns_row(tmp_path: Path, pg_control_path: Path) -> None:
     _, duckdb_path = _seed(tmp_path)
     _insert_brief(duckdb_path)
     out = drover_project_brief(
@@ -191,39 +203,43 @@ def test_project_brief_returns_row(tmp_path: Path) -> None:
     assert out is not None
     assert out["brief_md"] == "Nexus is the local lakehouse."
     assert "src/nexus/server/wol.py" in out["key_files"]
+    assert out["session_count"] == 5
+    assert out["stale"] is False
 
 
 def test_project_brief_marks_stale_when_newer_session_activity_exists(
-    tmp_path: Path,
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
     _, duckdb_path = _seed(tmp_path)
+    forty_days_ago = datetime.now(timezone.utc) - timedelta(days=40)
+    put_brief(
+        duckdb_path,
+        "arniesaha/nexus",
+        brief_md="Old marketplace-era brief.",
+        recent_themes_md="old themes",
+        session_count=1,
+        last_activity_at=forty_days_ago,
+        generator_model="test-v1",
+        generated_at=forty_days_ago,
+    )
     con = duckdb.connect(str(duckdb_path))
     try:
-        con.execute(
-            """INSERT INTO project_briefs
-               (project_key, repo_owner, repo_name, brief_md, recent_themes_md,
-                key_files, open_questions, next_steps_md, session_count,
-                last_activity_at, generator_model, generated_at)
-               VALUES ('arniesaha/nexus', 'arniesaha', 'nexus',
-                       'Old marketplace-era brief.', 'old themes', [], [], '',
-                       1, now() - INTERVAL 40 DAY, 'test-v1', now() - INTERVAL 40 DAY)"""
-        )
-        con.execute("""INSERT INTO session_summaries
-               (session_id, task_id, agent_id, ended_at, summary_md,
-                files_touched, tools_used, last_user_prompt, last_assistant,
-                next_steps_md, open_questions, status, generator_model, generated_at)
-               VALUES ('new-session', NULL, 'a', now(), 'new observatory work',
-                       [], MAP{}, '', '', '', [], 'completed', 't', now())""")
         con.execute("""INSERT INTO tasks
                (task_id, repo_owner, repo_name, branch, principal_id, status,
                 created_at, last_activity_at, session_count, total_cost_usd)
                VALUES ('task-new', 'arniesaha', 'nexus', 'main', 'arnab', 'open',
-                       now(), now(), 1, 0.0)""")
-        con.execute(
-            "UPDATE session_summaries SET task_id='task-new' WHERE session_id='new-session'"
-        )
+                       now() - INTERVAL 50 DAY, now() - INTERVAL 50 DAY, 1, 0.0)""")
     finally:
         con.close()
+    # Newer than the brief, linked to the repo only through its task.
+    put_summary(
+        duckdb_path,
+        "new-session",
+        task_id="task-new",
+        agent_id="a",
+        ended_at=datetime.now(timezone.utc),
+        summary_md="new observatory work",
+    )
 
     out = drover_project_brief(
         duckdb_path=duckdb_path, repo_owner="arniesaha", repo_name="nexus"
@@ -236,7 +252,9 @@ def test_project_brief_marks_stale_when_newer_session_activity_exists(
     assert out["latest_session_activity_at"] is not None
 
 
-def test_project_brief_returns_none_for_unknown(tmp_path: Path) -> None:
+def test_project_brief_returns_none_for_unknown(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     _, duckdb_path = _seed(tmp_path)
     out = drover_project_brief(duckdb_path=duckdb_path, project_key="ghost/repo")
     assert out is None
@@ -248,7 +266,9 @@ def test_project_brief_requires_identifier(tmp_path: Path) -> None:
         drover_project_brief(duckdb_path=duckdb_path)
 
 
-def test_recent_sessions_returns_recent_first(tmp_path: Path) -> None:
+def test_recent_sessions_returns_recent_first(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _write_agent_events(parquet_dir, session_id="S-old", repo_owner="o", repo_name="r")
     _write_agent_events(parquet_dir, session_id="S-new", repo_owner="o", repo_name="r")
@@ -262,7 +282,9 @@ def test_recent_sessions_returns_recent_first(tmp_path: Path) -> None:
     assert [s["session_id"] for s in out["sessions"]] == ["S-new", "S-old"]
 
 
-def test_recent_sessions_quarantines_unknown_openclaw_summary(tmp_path: Path) -> None:
+def test_recent_sessions_quarantines_unknown_openclaw_summary(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _write_agent_events(
         parquet_dir,
@@ -290,7 +312,28 @@ def test_recent_sessions_quarantines_unknown_openclaw_summary(tmp_path: Path) ->
     assert [s["session_id"] for s in out["sessions"]] == ["b58fbd05-native-openclaw"]
 
 
-def test_recent_sessions_respects_limit(tmp_path: Path) -> None:
+def test_recent_sessions_prefers_session_memory_project_key(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    """project_key alone attributes a summary: no tasks row, no day summary."""
+    _, duckdb_path = _seed(tmp_path)
+    _insert_summary(duckdb_path, "S-keyed", project_key="o/r")
+    _insert_summary(duckdb_path, "S-elsewhere", project_key="o/other")
+    out = drover_recent_sessions(duckdb_path=duckdb_path, project_key="o/r")
+    assert [s["session_id"] for s in out["sessions"]] == ["S-keyed"]
+    assert set(out["sessions"][0]) == {
+        "session_id",
+        "agent_id",
+        "ended_at",
+        "summary_md",
+        "next_steps_md",
+        "open_questions",
+        "files_touched",
+        "generator_model",
+    }
+
+
+def test_recent_sessions_respects_limit(tmp_path: Path, pg_control_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     for i in range(4):
         _write_agent_events(
@@ -309,6 +352,7 @@ def _sessions(out: dict) -> dict[str, dict]:
 
 def test_project_activity_builds_a_timeline_from_events_and_summaries(
     tmp_path: Path,
+    pg_control_path: Path,
 ) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _write_agent_events(
@@ -319,14 +363,11 @@ def test_project_activity_builds_a_timeline_from_events_and_summaries(
     )
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
     _insert_summary(duckdb_path, "native-1")
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute("""UPDATE session_summaries
+    with control_plane_connection(duckdb_path) as con:
+        con.execute("""UPDATE session_memory
                   SET next_steps_md = 'Ship the graph route.',
-                      open_questions = ['Which cap for days?']
+                      open_questions = ARRAY['Which cap for days?']
                 WHERE session_id = 'native-1'""")
-    finally:
-        con.close()
 
     out = drover_project_activity(
         duckdb_path=duckdb_path, project_key="arniesaha/nexus"
@@ -499,99 +540,103 @@ def test_open_loops_scopes_project_key_to_exact_repository(tmp_path: Path) -> No
     assert [row["context_id"] for row in scoped["open_loops"]] == ["ctx-drover-loop"]
 
 
-def test_recall_orders_by_cosine_similarity(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+def test_recall_orders_by_cosine_similarity(
+    tmp_path: Path, pg_control_path: Path, pgvector
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
     _insert_summary(duckdb_path, "near")
     _insert_summary(duckdb_path, "far")
-    # query: [1, 0]; near is close, far is orthogonal
-    _insert_embedding(duckdb_path, "near", [0.99, 0.01])
-    _insert_embedding(duckdb_path, "far", [0.0, 1.0])
+    # query: [1, 0, ...]; near is close, far is orthogonal
+    _insert_embedding(duckdb_path, "near", _vec(0.99, 0.01))
+    _insert_embedding(duckdb_path, "far", _vec(0.0, 1.0))
 
-    out = drover_recall(duckdb_path=duckdb_path, query_embedding=[1.0, 0.0], limit=2)
+    out = drover_recall(
+        duckdb_path=duckdb_path,
+        query_embedding=_vec(1.0, 0.0),
+        limit=2,
+        embedding_model=EMBED_MODEL,
+    )
     ids = [r["session_id"] for r in out["results"]]
     assert ids == ["near", "far"]
+    assert out["mode"] == "semantic"
     assert [r["source_type"] for r in out["results"]] == [
         "session_summary",
         "session_summary",
     ]
     assert out["results"][0]["score"] > out["results"][1]["score"]
+    assert out["results"][0]["summary_md"] == "summary near"
 
 
-def test_recall_can_return_span_hits_distinct_from_summary_hits(tmp_path: Path) -> None:
+def test_recall_scopes_semantic_hits_to_a_repo(
+    tmp_path: Path, pg_control_path: Path, pgvector
+) -> None:
     _, duckdb_path = _seed(tmp_path)
-    _insert_summary(duckdb_path, "summary-near")
-    _insert_embedding(duckdb_path, "summary-near", [0.8, 0.2])
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute("""INSERT INTO span_embeddings
-               (span_id, trace_id, session_id, task_id, agent_id, repo_owner,
-                repo_name, branch, source_text, source_fields, embedding, model,
-                dim, embedded_at)
-               VALUES ('span-near', 'trace-1', 'span-session', 'task', 'agent',
-                       NULL, NULL, NULL, 'prompt: vector search bug',
-                       ['prompt_preview'], [1.0, 0.0], 'test-embed', 2, now())""")
-    finally:
-        con.close()
+    _insert_summary(duckdb_path, "in-repo", project_key="arniesaha/nexus")
+    _insert_summary(duckdb_path, "elsewhere", project_key="arniesaha/other")
+    _insert_embedding(duckdb_path, "in-repo", _vec(0.5, 0.5))
+    _insert_embedding(duckdb_path, "elsewhere", _vec(1.0, 0.0))
 
     out = drover_recall(
         duckdb_path=duckdb_path,
-        query_embedding=[1.0, 0.0],
-        limit=2,
-        include_spans=True,
-    )
-    default = drover_recall(
-        duckdb_path=duckdb_path, query_embedding=[1.0, 0.0], limit=2
-    )
-
-    assert [r["source_type"] for r in out["results"]] == ["span", "session_summary"]
-    assert out["results"][0]["span_id"] == "span-near"
-    assert out["results"][0]["source_text"] == "prompt: vector search bug"
-    # Span hits are optional-integration data and stay out by default (#473).
-    assert [r["source_type"] for r in default["results"]] == ["session_summary"]
-
-
-def test_recall_filters_span_hits_by_persisted_span_repo(tmp_path: Path) -> None:
-    _, duckdb_path = _seed(tmp_path)
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        con.execute("""INSERT INTO span_embeddings
-               (span_id, trace_id, session_id, task_id, agent_id, repo_owner,
-                repo_name, branch, source_text, source_fields, embedding, model,
-                dim, embedded_at)
-               VALUES
-               ('span-nexus', 'trace-1', 'agentweave-session', 'task', 'agent',
-                'arniesaha', 'nexus', 'main', 'prompt: nexus trace recall',
-                ['prompt_preview'], [1.0, 0.0], 'test-embed', 2, now()),
-               ('span-other', 'trace-2', 'agentweave-session-2', 'task', 'agent',
-                'arniesaha', 'other', 'main', 'prompt: unrelated',
-                ['prompt_preview'], [1.0, 0.0], 'test-embed', 2, now())""")
-    finally:
-        con.close()
-
-    out = drover_recall(
-        duckdb_path=duckdb_path,
-        query_embedding=[1.0, 0.0],
+        query_embedding=_vec(1.0, 0.0),
         repo_owner="arniesaha",
         repo_name="nexus",
         limit=5,
-        include_spans=True,
+        embedding_model=EMBED_MODEL,
     )
 
-    assert [r["span_id"] for r in out["results"]] == ["span-nexus"]
+    assert [r["session_id"] for r in out["results"]] == ["in-repo"]
 
 
-def test_recall_ignores_embeddings_with_different_dimensions(tmp_path: Path) -> None:
-    parquet_dir, duckdb_path = _seed(tmp_path)
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    _insert_summary(duckdb_path, "same-dim")
-    _insert_summary(duckdb_path, "other-provider-dim")
-    _insert_embedding(duckdb_path, "same-dim", [0.99, 0.01])
-    _insert_embedding(duckdb_path, "other-provider-dim", [1.0, 0.0, 0.0])
+def test_recall_rejects_a_query_from_another_embedding_space(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    """A wrong-dimension query is an explicit error, never a silent empty result."""
+    _, duckdb_path = _seed(tmp_path)
+    with pytest.raises(EmbeddingMismatch):
+        drover_recall(
+            duckdb_path=duckdb_path,
+            query_embedding=[1.0, 0.0, 0.0],
+            embedding_model=EMBED_MODEL,
+        )
 
-    out = drover_recall(duckdb_path=duckdb_path, query_embedding=[1.0, 0.0], limit=5)
 
-    assert [r["session_id"] for r in out["results"]] == ["same-dim"]
+def test_recall_falls_back_to_keywords_without_pgvector(
+    tmp_path: Path, pg_control_path: Path, postgres_dsn: str
+) -> None:
+    if pgvector_available(postgres_dsn):
+        pytest.skip(
+            "pgvector is installed; the vector-unavailable path is not reachable"
+        )
+    _, duckdb_path = _seed(tmp_path)
+    _insert_summary(duckdb_path, "match", summary_md="fixed the vector search bug")
+    _insert_summary(duckdb_path, "miss", summary_md="unrelated work")
+
+    out = drover_recall(
+        duckdb_path=duckdb_path,
+        query_embedding=_vec(1.0),
+        query="vector search",
+        embedding_model=EMBED_MODEL,
+    )
+
+    assert out["mode"] == "keyword"
+    assert "pgvector" in out["reason"]
+    assert out["memory_unavailable"] is False
+    assert [r["session_id"] for r in out["results"]] == ["match"]
+    assert out["results"][0]["score"] is None
+
+
+def test_recall_without_a_configured_model_uses_keywords(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    _, duckdb_path = _seed(tmp_path)
+    _insert_summary(duckdb_path, "match", summary_md="recall keyword fallback")
+    out = drover_recall(
+        duckdb_path=duckdb_path, query_embedding=_vec(1.0), query="keyword"
+    )
+    assert out["mode"] == "keyword"
+    assert "embedding model" in out["reason"]
+    assert [r["session_id"] for r in out["results"]] == ["match"]
 
 
 def test_recall_requires_embedding(tmp_path: Path) -> None:

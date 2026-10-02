@@ -378,15 +378,50 @@ def _make_collector(tmp_path) -> MetricsCollector:
     )
 
 
+def _make_pg_collector(control_path, tmp_path) -> MetricsCollector:
+    """A collector on the PostgreSQL control store, where live recaps exist (#480)."""
+    return MetricsCollector(
+        duckdb_path=control_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+
+
+def _live_recap_jobs(control_path, session_id: str) -> list[tuple]:
+    """(source_version, status) of every recap_session ledger job for a session."""
+    from drover.server.db import control_plane_connection
+
+    with control_plane_connection(control_path) as con:
+        return con.execute(
+            """SELECT source_version, status FROM pipeline_jobs
+                WHERE job_kind = 'recap_session' AND subject_key = ?""",
+            [session_id],
+        ).fetchall()
+
+
 def collector_with_session(
     tmp_path,
     *,
     preview: str,
     recap: tuple[str, int] | None = None,
     event_type: str = "user_input",
+    control_path=None,
 ) -> MetricsCollector:
-    """Create one fleet session with a prompt and optional recap projection."""
-    collector = _make_collector(tmp_path)
+    """Create one fleet session with a prompt and optional live recap.
+
+    Live recaps are the live phase of ``session_memory`` in the PostgreSQL
+    control store (#480), so seeding one needs ``control_path`` (the
+    ``pg_control_path`` fixture). Without it the collector runs on a DuckDB
+    control plane, where live recaps are unavailable.
+    """
+    if recap is not None and control_path is None:
+        raise ValueError("a live recap needs the PostgreSQL control store")
+    collector = (
+        _make_pg_collector(control_path, tmp_path)
+        if control_path is not None
+        else _make_collector(tmp_path)
+    )
     registry = HarnessRegistry(collector.duckdb_path)
     session = registry.create_session(
         host_id="mac-mini",
@@ -401,13 +436,15 @@ def collector_with_session(
         content_preview=preview,
     )
     if recap is not None:
-        with registry._connect() as con:
-            con.execute(
-                """INSERT INTO live_session_recaps
-                   (session_id, recap_text, source_seq, generator_model, generated_at)
-                   VALUES (?, ?, ?, 'test-recap-model', now())""",
-                [session.session_id, recap[0], recap[1]],
-            )
+        from drover.server.db import control_plane_connection
+        from drover.server.ledger import transaction
+        from drover.server.memory_store import MemoryRepository
+
+        with control_plane_connection(control_path) as con:
+            with transaction(con):
+                MemoryRepository.put_recap(
+                    con, session.session_id, recap[0], recap[1], "test-recap-model"
+                )
     return collector
 
 
@@ -544,9 +581,7 @@ def test_metrics_collector_renders_quality_summarizer_and_redis(monkeypatch, tmp
     assert 'drover_agent_adoption_observed_events{runtime="openclaw-main"} 12' in text
 
 
-def test_metrics_sequence_and_bounded_retry_health_hide_session_ids(
-    monkeypatch, tmp_path
-):
+def test_metrics_sequence_health_hides_session_ids(monkeypatch, tmp_path):
     monkeypatch.setattr(metrics, "quality_snapshot", lambda **_: _snapshot())
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
@@ -561,34 +596,6 @@ def test_metrics_sequence_and_bounded_retry_health_hide_session_ids(
                 ("mixed-2", "private-mixed-session", None),
             ],
         )
-    # summarize_jobs is analytical and stayed in the lakehouse.
-    with duckdb.connect(str(db)) as con:
-        con.executemany(
-            "INSERT INTO summarize_jobs "
-            "(session_id, status, attempts, max_attempts, next_run_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    "private-retry-session",
-                    "retry_wait",
-                    2,
-                    5,
-                    datetime.now(timezone.utc).replace(tzinfo=None)
-                    + timedelta(minutes=5),
-                    datetime.now(timezone.utc).replace(tzinfo=None)
-                    - timedelta(minutes=2),
-                ),
-                (
-                    "private-dead-session",
-                    "dead_lettered",
-                    7,
-                    7,
-                    None,
-                    datetime.now() - timedelta(minutes=10),
-                ),
-                ("private-unbounded-label", "private-status", 1, 99, None, None),
-            ],
-        )
     collector = MetricsCollector(
         duckdb_path=db,
         incoming_dir=tmp_path / "incoming",
@@ -601,16 +608,9 @@ def test_metrics_sequence_and_bounded_retry_health_hide_session_ids(
 
     assert "drover_harness_legacy_unsequenced_events 2" in text
     assert "drover_harness_mixed_sequence_sessions 1" in text
-    assert 'drover_summarize_jobs{status="retry_wait"} 1' in text
-    assert 'drover_summarize_jobs{status="dead_lettered"} 1' in text
-    assert "drover_summarize_max_attempts 99" in text
-    oldest = next(
-        line
-        for line in text.splitlines()
-        if line.startswith("drover_summarize_oldest_retry_seconds ")
-    )
-    oldest_seconds = float(oldest.rsplit(" ", 1)[1])
-    assert 119 <= oldest_seconds <= 125
+    # Job health is per-kind ledger state now; a DuckDB-only hub has no
+    # memory ledger to report (see test_readiness_memory for PostgreSQL).
+    assert "drover_summarize_jobs" not in text
     assert "private-retry-session" not in text
     assert "private-dead-session" not in text
     assert 'status="private-status"' not in text
@@ -1451,11 +1451,14 @@ def test_harness_snapshot_includes_latest_user_or_assistant_preview(tmp_path):
     assert payload["sessions"][0]["preview"] == "Refactor session screen cards"
 
 
-def test_harness_snapshot_includes_live_recap_and_preview_fallback(tmp_path):
+def test_harness_snapshot_includes_live_recap_and_preview_fallback(
+    tmp_path, pg_control_path
+):
     collector = collector_with_session(
         tmp_path,
         preview="Improve the chat list",
         recap=("Improving chat titles; wiring recap refresh.", 12),
+        control_path=pg_control_path,
     )
 
     payload = collector.harness_snapshot()
@@ -1466,7 +1469,20 @@ def test_harness_snapshot_includes_live_recap_and_preview_fallback(tmp_path):
     assert session["recap_source_seq"] == 12
 
 
-def test_harness_snapshot_missing_recap_emits_null_fields(tmp_path):
+def test_harness_snapshot_missing_recap_emits_null_fields(tmp_path, pg_control_path):
+    collector = collector_with_session(
+        tmp_path, preview="Improve the chat list", control_path=pg_control_path
+    )
+
+    session = collector.harness_snapshot()["sessions"][0]
+
+    assert session["preview"] == "Improve the chat list"
+    assert session["recap"] is None
+    assert session["recap_source_seq"] is None
+
+
+def test_harness_snapshot_on_duckdb_control_plane_emits_null_recap_fields(tmp_path):
+    """Without PostgreSQL live recaps are unavailable; the fleet still renders."""
     collector = collector_with_session(tmp_path, preview="Improve the chat list")
 
     session = collector.harness_snapshot()["sessions"][0]
@@ -1476,12 +1492,13 @@ def test_harness_snapshot_missing_recap_emits_null_fields(tmp_path):
     assert session["recap_source_seq"] is None
 
 
-def test_harness_snapshot_recap_preserves_terminal_preview(tmp_path):
+def test_harness_snapshot_recap_preserves_terminal_preview(tmp_path, pg_control_path):
     collector = collector_with_session(
         tmp_path,
         preview="git status --short",
         recap=("Checking the working tree before the snapshot change.", 9),
         event_type="terminal.input",
+        control_path=pg_control_path,
     )
 
     session = collector.harness_snapshot()["sessions"][0]
@@ -3658,8 +3675,10 @@ def _ingest_events(port: int, events: list[dict]) -> None:
     assert status == 200
 
 
-def test_harness_events_wire_completion_enqueues_recap_at_host_sequence(tmp_path):
-    collector = _make_collector(tmp_path)
+def test_harness_events_wire_completion_enqueues_recap_at_host_sequence(
+    tmp_path, pg_control_path
+):
+    collector = _make_pg_collector(pg_control_path, tmp_path)
     registry = HarnessRegistry(collector.duckdb_path)
     registry.create_session(
         host_id="nas",
@@ -3694,18 +3713,18 @@ def test_harness_events_wire_completion_enqueues_recap_at_host_sequence(tmp_path
     finally:
         server.shutdown()
 
-    with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
-        assert con.execute(
-            "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
-            ["harness-recap-wire"],
-        ).fetchone() == (12,)
+    assert _live_recap_jobs(pg_control_path, "harness-recap-wire") == [
+        ("12", "pending")
+    ]
 
 
 def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, pg_control_path
 ):
     """Removing the worker orphan-reconcile poll permanently loses the newest recap."""
-    collector = _make_collector(tmp_path)
+    from drover.server.db import control_plane_connection
+
+    collector = _make_pg_collector(pg_control_path, tmp_path)
     registry = HarnessRegistry(collector.duckdb_path)
     event = {
         "event_id": "harness-event-race-23",
@@ -3740,11 +3759,7 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
         )
         assert status == 200
         assert body == {"ingested": 2}
-        with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
-            assert con.execute(
-                "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
-                ["harness-race"],
-            ).fetchone() == (0,)
+        assert _live_recap_jobs(pg_control_path, "harness-race") == []
 
         response_body = json.dumps(
             {
@@ -3758,12 +3773,12 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
         real_enqueue = registry_module.enqueue_live_recap
         attempts = 0
 
-        def unavailable_once(con, session_id, source_seq):
+        def unavailable_once(con, session_id, source_seq, **kwargs):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
                 raise RuntimeError("queue temporarily unavailable")
-            return real_enqueue(con, session_id, source_seq)
+            return real_enqueue(con, session_id, source_seq, **kwargs)
 
         monkeypatch.setattr(registry_module, "enqueue_live_recap", unavailable_once)
         collector._sync_created_harness_session(
@@ -3771,11 +3786,8 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
         )
 
         assert registry.get_session("harness-race") is not None
-        with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
-            assert con.execute(
-                "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
-                ["harness-race"],
-            ).fetchone() == (0,)
+        assert _live_recap_jobs(pg_control_path, "harness-race") == []
+        with control_plane_connection(pg_control_path) as con:
             assert con.execute(
                 "SELECT recap_reconcile_needed FROM harness_sessions "
                 "WHERE session_id = ?",
@@ -3783,42 +3795,39 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
             ).fetchone() == (True,)
 
         # drain_once is the production worker loop's scheduled retry boundary.
-        # No backend is needed to prove queue recovery: generation moves the
-        # recovered row to retry_wait after reporting its missing backend.
+        # No backend is needed to prove queue recovery: the worker releases
+        # the recovered job to retry_wait after reporting its missing backend.
         assert LiveRecapWorker(duckdb_path=collector.duckdb_path).drain_once() == 1
     finally:
         server.shutdown()
 
-    with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
+    with control_plane_connection(pg_control_path) as con:
         marker_after_recovery = con.execute(
             "SELECT recap_reconcile_needed FROM harness_sessions "
             "WHERE session_id = ?",
             ["harness-race"],
         ).fetchone()
-        assert con.execute(
-            "SELECT desired_source_seq, status, count(*) FROM live_recap_jobs "
-            "WHERE session_id = ? GROUP BY desired_source_seq, status",
-            ["harness-race"],
-        ).fetchone() == (23, "retry_wait", 1)
+    # The newest completion (23), not the older one (7), is what recovers.
+    assert _live_recap_jobs(pg_control_path, "harness-race") == [("23", "retry_wait")]
+    with control_plane_connection(pg_control_path) as con:
         # Remove ordinary due-job work from the second poll. If reconciliation
         # cleanup were missing, the still-marked session would recreate this
         # row from the stored completion and drain_once would handle it again.
         con.execute(
-            "DELETE FROM live_recap_jobs WHERE session_id = ?", ["harness-race"]
+            "DELETE FROM pipeline_jobs WHERE job_kind = 'recap_session' "
+            "AND subject_key = ?",
+            ["harness-race"],
         )
 
     assert LiveRecapWorker(duckdb_path=collector.duckdb_path).drain_once() == 0
     assert marker_after_recovery == (False,)
-    with duckdb.connect(str(control_plane_path(collector.duckdb_path))) as con:
+    with control_plane_connection(pg_control_path) as con:
         assert con.execute(
             "SELECT recap_reconcile_needed FROM harness_sessions "
             "WHERE session_id = ?",
             ["harness-race"],
         ).fetchone() == (False,)
-        assert con.execute(
-            "SELECT count(*) FROM live_recap_jobs WHERE session_id = ?",
-            ["harness-race"],
-        ).fetchone() == (0,)
+    assert _live_recap_jobs(pg_control_path, "harness-race") == []
 
 
 def _event(seq: int, text: str) -> dict:
@@ -5048,7 +5057,11 @@ def test_copy_backed_snapshots_use_the_parallel_snapshot_role(tmp_path, monkeypa
 def test_live_database_metrics_stay_on_the_single_threaded_role(tmp_path, monkeypatch):
     """Everything in the same refresh that reads the *live* file keeps
     threads=1. Those connections share the hub's DuckDB instance, and that is
-    the sharing that caused the 2026-08-04 outage (#91)."""
+    the sharing that caused the 2026-08-04 outage (#91).
+
+    Job health moved to the PostgreSQL ledger (#480), so the operational
+    metrics no longer open the analytical file at all -- the strongest form
+    of staying off its shared instance."""
     collector = _make_collector(tmp_path)
     roles: list[str] = []
     real_open = metrics.open_duckdb_connection
@@ -5062,8 +5075,7 @@ def test_live_database_metrics_stay_on_the_single_threaded_role(tmp_path, monkey
         [], Path(collector.duckdb_path), {"categories": {}}
     )
 
-    assert roles, "expected at least one live-database read"
-    assert set(roles) == {"diagnostic"}
+    assert roles == []
 
 
 class _CountingQuality:

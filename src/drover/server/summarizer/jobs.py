@@ -1,71 +1,32 @@
-"""Durable state transitions for source-versioned session summaries."""
+"""Source-versioned summary generations on the PostgreSQL job ledger (#480).
+
+A session's *source version* is a hash of stable facts about its canonical
+events (read from the analytical DuckDB). Each distinct version is one
+summary generation, and enqueueing it is a ``summarize_session`` job in the
+one authoritative ledger (:mod:`drover.server.ledger`).
+
+The DuckDB ``summarize_jobs`` state machine that used to live here is gone,
+and with it the in-process writer lock that serialized its transitions
+(#308, #460): PostgreSQL row locks on ``pipeline_jobs`` make concurrent
+enqueue/complete safe across threads and processes. The retry budget, the
+backoff and the dead-letter streak cap (``SUMMARY_MAX_DEAD_LETTERS`` here,
+once) are owned by ``ledger.POLICIES`` now.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import threading
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Callable, Iterator, Literal
+import logging
+from pathlib import Path
 
 import duckdb
 
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.ledger import SUMMARIZE_SESSION, JobLedger, memory_store_available
 from drover.server.summarizer.derive import SUBSTANTIVE_SQL
 
-SUMMARY_MAX_ATTEMPTS = 5
-# Attempts are scoped to one source generation, and a live session mints a new
-# generation on every event — so the per-generation cap alone bounded nothing.
-# One live session was observed at 410 attempts. This bounds the *session*: a
-# summary that dead-lettered this many generations in a row stops being
-# re-enqueued until it succeeds again, so a permanently failing job can no
-# longer spend an unbounded number of backend invocations.
-SUMMARY_MAX_DEAD_LETTERS = 3
-
-# DuckDB runs an UPDATE ... RETURNING, and an upsert whose DO UPDATE fires, as
-# a delete plus an insert. Two of those on one summarize_jobs row in
-# overlapping transactions fail the second with "Conflict on tuple deletion!":
-# the watcher enqueueing a live session's next generation while the summarizer
-# worker was still committing the previous one did exactly that about once a
-# day, and the batch was left to be re-parsed (#308). Plain UPDATEs do not
-# conflict, which is worse rather than better: they overwrite each other. Only
-# one process can open the store read-write, so one lock in that process makes
-# every summarize_jobs transition a single writer. Hold it around the write
-# transaction only -- never around a model call, a scan or a stream publish.
-_SUMMARY_JOBS_WRITE_LOCK = threading.RLock()
-
-
-@contextmanager
-def summary_jobs_writer() -> Iterator[None]:
-    """Serialize one write transaction on ``summarize_jobs`` in this process."""
-    with _SUMMARY_JOBS_WRITE_LOCK:
-        yield
-
-
-@contextmanager
-def summary_jobs_transaction(con: duckdb.DuckDBPyConnection) -> Iterator[None]:
-    """Hold the writer for one explicit transaction on ``con``.
-
-    A failed transaction is rolled back before the writer is released: until
-    then its uncommitted rewrite still owns the row, and the next writer would
-    conflict with it exactly as before.
-    """
-    with _SUMMARY_JOBS_WRITE_LOCK:
-        try:
-            yield
-        except BaseException:
-            try:
-                con.execute("ROLLBACK")
-            except duckdb.Error:
-                pass
-            raise
-
-
-def _duckdb_timestamp(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
+log = logging.getLogger("drover.summarizer.jobs")
 
 
 def source_version_for_session(con: duckdb.DuckDBPyConnection, session_id: str) -> str:
@@ -95,206 +56,28 @@ def source_version_for_session(con: duckdb.DuckDBPyConnection, session_id: str) 
 
 
 def enqueue_summary_generation(
-    con: duckdb.DuckDBPyConnection, session_id: str, source_version: str
-) -> bool:
-    """Open a runnable generation only when the immutable source changed.
+    store_path: str | Path, session_id: str, source_version: str
+) -> str:
+    """Open the summary job for one source generation; return the ledger outcome.
 
-    A genuinely new ``source_version`` describes different events, so it earns
-    a fresh attempt budget — the previous generation's failure says nothing
-    about whether this one can be summarized. An identical version that already
-    dead-lettered earns nothing: it would replay the same input for the same
-    answer. What a new generation cannot do is erase the record: ``last_error``
-    and ``dead_letter_streak`` carry across, and once the streak reaches
-    ``SUMMARY_MAX_DEAD_LETTERS`` no further generation opens at all.
+    The ledger decides what a generation earns: a new ``source_version``
+    replaces a waiting job (fresh budget) or supersedes a running one; the
+    same version that already succeeded or dead-lettered earns nothing
+    (``already_done``/``already_failed``); and once a session has failed
+    ``max_failed_streak`` generations in a row no further one opens
+    (``suppressed``) until an operator requeues it.
+
+    Without a PostgreSQL control store derived memory is unavailable, and
+    this is a logged no-op returning ``"unavailable"`` rather than an error:
+    ingest must keep working on a hub that has not moved to PostgreSQL.
     """
-    with summary_jobs_writer():
-        return _open_summary_generation(con, session_id, source_version)
-
-
-def _open_summary_generation(
-    con: duckdb.DuckDBPyConnection, session_id: str, source_version: str
-) -> bool:
-    try:
-        con.execute("BEGIN TRANSACTION")
-        legacy = con.execute(
-            """UPDATE summarize_jobs
-                  SET source_version = ?, updated_at = now()
-                WHERE session_id = ? AND source_version IS NULL
-                RETURNING session_id""",
-            [source_version, session_id],
-        ).fetchone()
-        if legacy is not None:
-            # A null legacy version carries no evidence that its source changed.
-            # Backfill its identity without resetting or republishing the generation.
-            con.execute("COMMIT")
-            return False
-
-        row = con.execute(
-            """INSERT INTO summarize_jobs
-                 (session_id, status, attempts, source_version, max_attempts,
-                  last_error, next_run_at, dead_lettered_at, updated_at,
-                  stream_publish_needed, dead_letter_streak)
-                 VALUES (?, 'pending', 0, ?, ?, NULL, NULL, NULL, now(), TRUE, 0)
-                 ON CONFLICT (session_id) DO UPDATE SET
-                   source_version = excluded.source_version,
-                   status = 'pending',
-                   attempts = 0,
-                   max_attempts = excluded.max_attempts,
-                   next_run_at = NULL,
-                   dead_lettered_at = NULL,
-                   updated_at = now(),
-                   stream_publish_needed = TRUE
-                 WHERE summarize_jobs.source_version IS DISTINCT FROM excluded.source_version
-                   AND COALESCE(summarize_jobs.dead_letter_streak, 0) < ?
-                 RETURNING session_id""",
-            [
-                session_id,
-                source_version,
-                SUMMARY_MAX_ATTEMPTS,
-                SUMMARY_MAX_DEAD_LETTERS,
-            ],
-        ).fetchone()
-        if row is not None:
-            con.execute(
-                """UPDATE embed_jobs SET status='superseded', updated_at=now()
-                     WHERE session_id=?
-                       AND source_version IS NOT NULL
-                       AND source_version IS DISTINCT FROM ?
-                       AND status <> 'superseded'""",
-                [session_id, source_version],
-            )
-            con.execute(
-                """UPDATE brief_jobs SET status='superseded', updated_at=now()
-                     WHERE source_session_id=?
-                       AND source_version IS NOT NULL
-                       AND source_version IS DISTINCT FROM ?
-                       AND status <> 'superseded'""",
-                [session_id, source_version],
-            )
-        con.execute("COMMIT")
-        return row is not None
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except duckdb.Error:
-            pass
-        raise
-
-
-def publish_summary_generation(
-    con: duckdb.DuckDBPyConnection,
-    session_id: str,
-    source_version: str,
-    stream: object | None,
-) -> bool:
-    """Publish a durable pending generation with at-least-once semantics."""
-    if stream is None:
-        return False
-    pending = con.execute(
-        """SELECT 1 FROM summarize_jobs
-             WHERE session_id=?
-               AND source_version IS NOT DISTINCT FROM ?
-               AND COALESCE(stream_publish_needed, FALSE)""",
-        [session_id, source_version],
-    ).fetchone()
-    if pending is None:
-        return False
-    stream.add({"session_id": session_id, "source_version": source_version})
-    with summary_jobs_writer():
-        con.execute(
-            """UPDATE summarize_jobs SET stream_publish_needed=FALSE
-                 WHERE session_id=?
-                   AND source_version IS NOT DISTINCT FROM ?""",
-            [session_id, source_version],
-        )
-    return True
-
-
-def flush_summary_publications(
-    con: duckdb.DuckDBPyConnection, stream: object | None, *, limit: int = 100
-) -> int:
-    """Retry durable summary-generation publications from the worker poll path."""
-    if stream is None:
-        return 0
-    rows = con.execute(
-        """SELECT session_id, source_version FROM summarize_jobs
-             WHERE COALESCE(stream_publish_needed, FALSE)
-             ORDER BY enqueued_at ASC
-             LIMIT ?""",
-        [max(1, int(limit))],
-    ).fetchall()
-    published = 0
-    for session_id, source_version in rows:
-        if publish_summary_generation(con, session_id, source_version, stream):
-            published += 1
-    return published
-
-
-def finish_summary_failure(
-    con: duckdb.DuckDBPyConnection,
-    session_id: str,
-    source_version: str,
-    error: str,
-    *,
-    now: datetime,
-    jitter: Callable[[float, float], float],
-) -> Literal["retry_wait", "dead_lettered", "stale"]:
-    """Spend one failure from the matching source generation's retry budget."""
-    stored_now = _duckdb_timestamp(now)
-    jitter_fraction = jitter(0, 0.2)
-    with summary_jobs_writer():
-        updated = _spend_summary_failure(
-            con, session_id, source_version, error, stored_now, jitter_fraction
-        )
-    if updated is None:
-        return "stale"
-    return updated[0]
-
-
-def _spend_summary_failure(
-    con: duckdb.DuckDBPyConnection,
-    session_id: str,
-    source_version: str,
-    error: str,
-    stored_now: datetime,
-    jitter_fraction: float,
-) -> tuple | None:
-    return con.execute(
-        """UPDATE summarize_jobs
-              SET status = CASE
-                    WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
-                    THEN 'dead_lettered' ELSE 'retry_wait' END,
-                  attempts = COALESCE(attempts, 0) + 1,
-                  last_error = ?,
-                  next_run_at = CASE
-                    WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
-                    THEN NULL
-                    ELSE ? + (
-                      LEAST(60 * POWER(2, COALESCE(attempts, 0)), 3600)
-                      * (1 + ?)
-                    ) * INTERVAL '1 second'
-                  END,
-                  dead_lettered_at = CASE
-                    WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
-                    THEN ? ELSE NULL END,
-                  dead_letter_streak = CASE
-                    WHEN COALESCE(attempts, 0) + 1 >= COALESCE(max_attempts, ?)
-                    THEN COALESCE(dead_letter_streak, 0) + 1
-                    ELSE COALESCE(dead_letter_streak, 0) END,
-                  updated_at = ?
-            WHERE session_id = ? AND source_version IS NOT DISTINCT FROM ?
-            RETURNING status, next_run_at""",
-        [
-            SUMMARY_MAX_ATTEMPTS,
-            error,
-            SUMMARY_MAX_ATTEMPTS,
-            stored_now,
-            jitter_fraction,
-            SUMMARY_MAX_ATTEMPTS,
-            stored_now,
-            SUMMARY_MAX_ATTEMPTS,
-            stored_now,
+    if not memory_store_available(store_path):
+        log.debug(
+            "summary for session %s not enqueued: derived memory requires the "
+            "PostgreSQL control store",
             session_id,
-            source_version,
-        ],
-    ).fetchone()
+        )
+        return "unavailable"
+    return JobLedger(store_path).enqueue(
+        SUMMARIZE_SESSION, session_id, source_version=source_version
+    )

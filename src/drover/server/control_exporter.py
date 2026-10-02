@@ -176,7 +176,9 @@ class ControlOutboxExporter:
                 with control_plane_connection(self.control_path) as control:
                     register_published_harness_events_relation(analytics, control)
                 self._relation_initialized = True
-            links = refresh_memory_projection(analytics, sessions)
+            links = refresh_memory_projection(
+                analytics, sessions, store_path=self.control_path
+            )
         finally:
             analytics.close()
         with control_plane_connection(self.control_path) as control:

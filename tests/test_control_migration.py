@@ -16,10 +16,8 @@ from click.testing import CliRunner
 
 
 @pytest.fixture
-def postgres_target(tmp_path: Path, monkeypatch):
-    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
-    if not dsn:
-        pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
+def postgres_target(tmp_path: Path, monkeypatch, postgres_dsn):
+    dsn = postgres_dsn
     from drover.config import ControlStoreConfig
     from drover.schema import bootstrap
     from drover.server.control_store import close_control_store, configure_control_store
@@ -80,6 +78,22 @@ def _legacy_snapshot(tmp_path: Path, *, created_at: datetime) -> Path:
                 ),
             ],
         )
+        # A pre-#480 snapshot still carries the DuckDB recap tables. They are
+        # derived memory and must not be imported (rebuild, don't migrate).
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS live_session_recaps (
+              session_id VARCHAR PRIMARY KEY, recap_text VARCHAR NOT NULL,
+              source_seq INTEGER NOT NULL, generator_model VARCHAR,
+              generated_at TIMESTAMP NOT NULL DEFAULT now())
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS live_recap_jobs (
+              session_id VARCHAR PRIMARY KEY, desired_source_seq INTEGER NOT NULL,
+              status VARCHAR NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+              last_error VARCHAR, enqueued_at TIMESTAMP NOT NULL DEFAULT now(),
+              updated_at TIMESTAMP NOT NULL DEFAULT now(), next_run_at TIMESTAMP,
+              stream_publish_needed BOOLEAN NOT NULL DEFAULT FALSE)
+        """)
         con.execute(
             "INSERT INTO live_session_recaps (session_id, recap_text, source_seq, generated_at) "
             "VALUES ('legacy-session', 'Legacy recap', 4, ?)",
@@ -197,8 +211,6 @@ def test_fenced_import_preserves_legacy_identity_timezone_and_event_order(
         "harness_hosts",
         "harness_sessions",
         "harness_events",
-        "live_session_recaps",
-        "live_recap_jobs",
         "advisory_findings",
         "advisory_occurrences",
         "session_usage",

@@ -15,7 +15,7 @@ import duckdb
 import pytest
 
 from drover.schema import bootstrap
-from drover.server.db import control_plane_path
+from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.summarizer.jobs import source_version_for_session
 from drover.server.watcher import (
     IncomingWatcher,
@@ -356,10 +356,38 @@ def _write_two_session_events(jsonl_path: Path) -> None:
     jsonl_path.write_text("\n".join(lines) + "\n")
 
 
-def test_watcher_enqueues_summarize_jobs(lh):
-    """After ingesting a JSONL with 2 distinct sessions, both must appear in summarize_jobs
-    with status='pending'.  Re-ingesting the same file must not duplicate the rows."""
-    incoming, parquet_dir, db_path = lh
+@pytest.fixture
+def pg_lh(tmp_path, pg_control_path):
+    """Like ``lh``, with the PostgreSQL control store (and so the job ledger)."""
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    parquet_dir = tmp_path / "parquet"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=pg_control_path)
+    return incoming, parquet_dir, pg_control_path
+
+
+def _summary_jobs(store_path: Path) -> list[tuple]:
+    with control_plane_connection(store_path) as con:
+        return con.execute(
+            """SELECT subject_key, status, source_version FROM pipeline_jobs
+                WHERE job_kind = 'summarize_session'
+                ORDER BY subject_key, enqueued_at"""
+        ).fetchall()
+
+
+def _source_version(db_path: Path, session_id: str) -> str:
+    con = duckdb.connect(str(db_path))
+    try:
+        return source_version_for_session(con, session_id)
+    finally:
+        con.close()
+
+
+def test_watcher_enqueues_summarize_jobs(pg_lh):
+    """After ingesting a JSONL with 2 distinct sessions, both get a pending
+    summarize_session ledger job. Re-ingesting the same file must not
+    duplicate them."""
+    incoming, parquet_dir, db_path = pg_lh
     host_dir = incoming / "macmini"
     host_dir.mkdir()
 
@@ -373,32 +401,16 @@ def test_watcher_enqueues_summarize_jobs(lh):
         _write_two_session_events(tmp)
         tmp.rename(target)
 
-        def jobs_enqueued():
-            con = duckdb.connect(str(db_path))
-            try:
-                rows = con.execute(
-                    "SELECT session_id, status FROM summarize_jobs"
-                    " WHERE session_id IN ('sess-w1', 'sess-w2')"
-                ).fetchall()
-                return len(rows) == 2
-            finally:
-                con.close()
-
         assert _wait_for(
-            jobs_enqueued
-        ), "summarize_jobs never populated for new sessions"
-
-        # Verify status values
-        con = duckdb.connect(str(db_path))
-        try:
-            rows = con.execute(
-                "SELECT session_id, status FROM summarize_jobs"
-                " WHERE session_id IN ('sess-w1', 'sess-w2')"
-                " ORDER BY session_id"
-            ).fetchall()
-        finally:
-            con.close()
-        assert rows == [("sess-w1", "pending"), ("sess-w2", "pending")]
+            lambda: len(_summary_jobs(db_path)) == 2
+        ), "summarize jobs never enqueued for new sessions"
+        versions = {
+            sid: _source_version(db_path, sid) for sid in ("sess-w1", "sess-w2")
+        }
+        assert _summary_jobs(db_path) == [
+            ("sess-w1", "pending", versions["sess-w1"]),
+            ("sess-w2", "pending", versions["sess-w2"]),
+        ]
 
         # Re-ingest: write same events under a different filename and drop it
         target2 = host_dir / "batch-multi-dup.jsonl"
@@ -412,20 +424,37 @@ def test_watcher_enqueues_summarize_jobs(lh):
 
         assert _wait_for(dup_processed), "duplicate batch file never processed"
 
-        # Row count must remain exactly 2 (ON CONFLICT DO NOTHING)
-        con = duckdb.connect(str(db_path))
-        try:
-            count = con.execute(
-                "SELECT count(*) FROM summarize_jobs"
-                " WHERE session_id IN ('sess-w1', 'sess-w2')"
-            ).fetchone()[0]
-        finally:
-            con.close()
-        assert (
-            count == 2
-        ), "re-ingesting same sessions must not create duplicate summarize_jobs"
+        # Same source generations: the live jobs are reused, not duplicated.
+        assert len(_summary_jobs(db_path)) == 2
     finally:
         w.stop()
+
+
+def test_ingest_without_postgres_skips_summary_enqueue(
+    lh, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DuckDB control store has no ledger: ingest proceeds, nothing is enqueued."""
+    incoming, parquet_dir, db_path = lh
+    host_dir = incoming / "macmini"
+    host_dir.mkdir()
+    batch = host_dir / "batch.jsonl"
+    _write_two_session_events(batch)
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("no summary work without the PostgreSQL ledger")
+
+    monkeypatch.setattr("drover.server.watcher.source_version_for_session", never)
+    monkeypatch.setattr("drover.server.watcher.enqueue_summary_generation", never)
+    _Handler(parquet_dir, db_path, max_lock_retries=0)._maybe_ingest(batch)
+
+    assert (host_dir / ".processed" / "batch.jsonl").exists()
+    con = duckdb.connect(str(db_path))
+    try:
+        assert con.execute(
+            "SELECT count(*) FROM agent_events WHERE session_id IN ('sess-w1', 'sess-w2')"
+        ).fetchone() == (2,)
+    finally:
+        con.close()
 
 
 def test_handler_retries_duckdb_lock_and_moves_only_after_success(
@@ -444,7 +473,6 @@ def test_handler_retries_duckdb_lock_and_moves_only_after_success(
         skipped_dupes = 0
         errors = 0
         shadow_published = 0
-        ledger_receipts = 0
         new_session_ids = []
 
     def fake_ingest_file(
@@ -477,7 +505,7 @@ def test_handler_retries_duckdb_lock_and_moves_only_after_success(
 
 
 def test_handler_recovers_summarize_enqueue_after_post_ingest_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, pg_control_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     incoming = tmp_path / "incoming"
     host_dir = incoming / "nas-claude"
@@ -497,7 +525,7 @@ def test_handler_recovers_summarize_enqueue_after_post_ingest_lock(
         + "\n"
     )
     parquet_dir = tmp_path / "parquet"
-    db_path = tmp_path / "drover.duckdb"
+    db_path = pg_control_path
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
     calls = {"ingest": 0, "connect": 0}
     real_connect = duckdb.connect
@@ -508,7 +536,6 @@ def test_handler_recovers_summarize_enqueue_after_post_ingest_lock(
         skipped_dupes = 0
         errors = 0
         shadow_published = 0
-        ledger_receipts = 0
 
         def __init__(self, new_session_ids):
             self.new_session_ids = new_session_ids
@@ -544,121 +571,9 @@ def test_handler_recovers_summarize_enqueue_after_post_ingest_lock(
     assert calls["ingest"] == 2
     assert not batch.exists()
     assert (host_dir / ".processed" / "openclaw.jsonl").exists()
-    con = real_connect(str(db_path))
-    try:
-        rows = con.execute(
-            "SELECT session_id, status FROM summarize_jobs WHERE session_id = ?",
-            ["sess-after-ingest-lock"],
-        ).fetchall()
-    finally:
-        con.close()
-    assert rows == [("sess-after-ingest-lock", "pending")]
-
-
-def test_handler_publishes_summarize_jobs_to_stream(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    incoming = tmp_path / "incoming"
-    host_dir = incoming / "nas-claude"
-    host_dir.mkdir(parents=True)
-    batch = host_dir / "openclaw.jsonl"
-    batch.write_text(
-        json.dumps(
-            {
-                "id": "event-stream-enqueue",
-                "session_id": "sess-stream-enqueue",
-                "timestamp": "2026-05-08T10:00:00Z",
-                "agent_id": "test-agent",
-                "event_type": "user_message",
-                "message": {"role": "user", "content": "hi"},
-            }
-        )
-        + "\n"
-    )
-    parquet_dir = tmp_path / "parquet"
-    db_path = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
-    published: list[dict] = []
-
-    class Stats:
-        read = 1
-        inserted = 1
-        skipped_dupes = 0
-        errors = 0
-        shadow_published = 0
-        ledger_receipts = 0
-        new_session_ids = {"sess-stream-enqueue"}
-
-    class FakeStream:
-        def add(self, fields: dict) -> str:
-            published.append(fields)
-            return "1-0"
-
-    def fake_ingest_file(
-        path: Path, *, parquet_dir: Path, duckdb_path: Path, shadow_publisher=None
-    ):
-        return Stats()
-
-    monkeypatch.setattr("drover.server.watcher.ingest_file", fake_ingest_file)
-    handler = _Handler(
-        parquet_dir=parquet_dir,
-        duckdb_path=db_path,
-        summarize_job_stream=FakeStream(),
-    )
-
-    handler._maybe_ingest(batch)
-
-    assert len(published) == 1
-    assert published[0]["session_id"] == "sess-stream-enqueue"
-    assert len(published[0]["source_version"]) == 64
-    assert not batch.exists()
-    assert (host_dir / ".processed" / "openclaw.jsonl").exists()
-
-
-def test_handler_publishes_only_when_source_generation_is_created(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    incoming = tmp_path / "incoming"
-    host_dir = incoming / "nas-claude"
-    host_dir.mkdir(parents=True)
-    batch = host_dir / "duplicate.jsonl"
-    _write_event(batch, "duplicate-generation")
-    parquet_dir = tmp_path / "parquet"
-    db_path = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
-    published: list[dict] = []
-
-    class Stats:
-        read = 1
-        inserted = 0
-        skipped_dupes = 1
-        errors = 0
-        shadow_published = 0
-        ledger_receipts = 0
-        new_session_ids = {"sess-x"}
-
-    class FakeStream:
-        def add(self, fields: dict) -> str:
-            published.append(fields)
-            return "1-0"
-
-    monkeypatch.setattr("drover.server.watcher.ingest_file", lambda *a, **kw: Stats())
-    monkeypatch.setattr(
-        "drover.server.watcher.source_version_for_session", lambda con, sid: "v1"
-    )
-    monkeypatch.setattr(
-        "drover.server.watcher.enqueue_summary_generation",
-        lambda con, sid, version: False,
-    )
-    handler = _Handler(
-        parquet_dir=parquet_dir,
-        duckdb_path=db_path,
-        summarize_job_stream=FakeStream(),
-    )
-
-    handler._maybe_ingest(batch)
-
-    assert published == []
+    assert [(sid, status) for sid, status, _ in _summary_jobs(db_path)] == [
+        ("sess-after-ingest-lock", "pending")
+    ]
 
 
 def _write_live_session_event(jsonl_path: Path, event_id: str, minute: int) -> None:
@@ -682,20 +597,21 @@ def _summary_llm(prompt: str, **_kwargs) -> dict:
 
 
 def test_enqueue_waits_for_a_worker_completing_the_same_session(
-    lh, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    pg_lh, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """#308: two writers on one summarize_jobs row, made deterministic.
+    """#308: the watcher enqueues generation N+1 while the worker commits N.
 
-    The summarizer worker finishes generation N inside one transaction whose
-    ``UPDATE ... RETURNING`` DuckDB executes as a delete plus insert. A live
-    session's next batch makes the watcher's enqueue upsert generation N+1 on
-    the same row, also a delete plus insert. Overlapping, the enqueue failed
-    with "Conflict on tuple deletion!" and the file was left to be re-parsed.
+    On DuckDB the two transactions conflicted on the summarize_jobs row
+    ("Conflict on tuple deletion!") and the file was left to be re-parsed;
+    an in-process writer lock serialized them. On the PostgreSQL ledger the
+    worker's ``complete`` holds the job's row lock until its commit, and the
+    enqueue's ``SELECT ... FOR UPDATE`` waits on it: N's summary lands, and
+    N+1 is queued behind it rather than being overwritten by N's completion.
     """
-    import drover.server.summarizer.worker as worker_module
+    from drover.server.memory_store import MemoryRepository
     from drover.server.summarizer.worker import SummarizerWorker
 
-    incoming, parquet_dir, db_path = lh
+    incoming, parquet_dir, db_path = pg_lh
     host_dir = incoming / "macmini-claude"
     host_dir.mkdir()
     handler = _Handler(parquet_dir, db_path, max_lock_retries=0)
@@ -703,19 +619,20 @@ def test_enqueue_waits_for_a_worker_completing_the_same_session(
     _write_live_session_event(first, "live-1", 0)
     handler._maybe_ingest(first)
     assert (host_dir / ".processed" / "batch-1.jsonl").exists()
+    first_version = _source_version(db_path, "sess-live")
 
     inside_completion = threading.Event()
     release_completion = threading.Event()
-    real_enqueue_embed = worker_module._enqueue_embed_on_connection
+    real_put_summary = MemoryRepository.put_summary
 
-    def held_completion(con, session_id, source_version):
-        # Runs inside the worker's open completion transaction, after its
-        # UPDATE ... RETURNING has claimed the summarize_jobs row.
+    def held_completion(con, summary):
+        # Runs inside the worker's open completion transaction, after
+        # ``complete`` has locked the summarize job row.
         inside_completion.set()
         assert release_completion.wait(10)
-        return real_enqueue_embed(con, session_id, source_version)
+        return real_put_summary(con, summary)
 
-    monkeypatch.setattr(worker_module, "_enqueue_embed_on_connection", held_completion)
+    monkeypatch.setattr(MemoryRepository, "put_summary", staticmethod(held_completion))
     worker = SummarizerWorker(duckdb_path=db_path, _llm_call=_summary_llm)
     drained: list[int] = []
     worker_thread = threading.Thread(target=lambda: drained.append(worker.drain_once()))
@@ -726,8 +643,8 @@ def test_enqueue_waits_for_a_worker_completing_the_same_session(
     _write_live_session_event(second, "live-2", 1)
     watcher_thread = threading.Thread(target=handler._maybe_ingest, args=(second,))
     watcher_thread.start()
-    # Without a single writer the enqueue fails right here, while the worker
-    # is still inside its transaction; with one it waits for the commit.
+    # The enqueue waits on the job's row lock while the worker is still
+    # inside its transaction, then proceeds once it commits.
     watcher_thread.join(timeout=0.5)
     release_completion.set()
     worker_thread.join(10)
@@ -735,62 +652,57 @@ def test_enqueue_waits_for_a_worker_completing_the_same_session(
     assert not worker_thread.is_alive() and not watcher_thread.is_alive()
 
     assert "ingest failed" not in caplog.text
+    assert "summary enqueue failed" not in caplog.text
     assert not second.exists(), "conflict left the batch to be re-parsed"
     assert (host_dir / ".processed" / "batch-2.jsonl").exists()
     assert drained == [1]
-    con = duckdb.connect(str(db_path))
-    try:
-        jobs = con.execute(
-            "SELECT status, source_version FROM summarize_jobs WHERE session_id = ?",
-            ["sess-live"],
-        ).fetchall()
-        summaries = con.execute(
-            "SELECT count(*) FROM session_summaries WHERE session_id = ?",
-            ["sess-live"],
-        ).fetchone()[0]
-        current = source_version_for_session(con, "sess-live")
-    finally:
-        con.close()
-    # Generation N's summary landed, and N+1 is queued behind it rather than
-    # being overwritten by N's completion.
-    assert summaries == 1
-    assert jobs == [("pending", current)]
+    current = _source_version(db_path, "sess-live")
+    assert current != first_version
+    summary = MemoryRepository(db_path).summary("sess-live")
+    assert summary is not None and summary.source_version == first_version
+    assert _summary_jobs(db_path) == [
+        ("sess-live", "succeeded", first_version),
+        ("sess-live", "pending", current),
+    ]
 
 
-def test_reparse_after_a_failed_enqueue_is_idempotent(
-    lh, monkeypatch: pytest.MonkeyPatch
+def test_failed_enqueue_does_not_fail_a_committed_ingest(
+    pg_lh, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A file left in place after a post-ingest failure re-parses cleanly."""
+    """#308: the events are committed, so one failed enqueue is logged and skipped.
+
+    Re-parsing the file would only dedupe the same rows and retry the same
+    enqueue. The file moves on, the failure names its session, and the other
+    sessions in the batch are still enqueued; a later batch (here, a
+    redelivered copy) enqueues the one that was missed.
+    """
     import drover.server.watcher as watcher_module
 
-    incoming, parquet_dir, db_path = lh
+    incoming, parquet_dir, db_path = pg_lh
     host_dir = incoming / "macmini-claude"
     host_dir.mkdir()
     batch = host_dir / "batch.jsonl"
     _write_two_session_events(batch)
     real_enqueue = watcher_module.enqueue_summary_generation
-    calls = {"count": 0}
 
-    def conflict_once(con, session_id, source_version):
-        calls["count"] += 1
-        if calls["count"] == 2:
-            # One session enqueued, the next one fails: a partial enqueue.
-            raise duckdb.TransactionException(
-                "TransactionContext Error: Conflict on tuple deletion!"
-            )
-        return real_enqueue(con, session_id, source_version)
+    def fails_for_w1(store_path, session_id, source_version):
+        if session_id == "sess-w1":
+            raise RuntimeError("control store connection reset")
+        return real_enqueue(store_path, session_id, source_version)
 
-    monkeypatch.setattr(watcher_module, "enqueue_summary_generation", conflict_once)
+    monkeypatch.setattr(watcher_module, "enqueue_summary_generation", fails_for_w1)
     handler = _Handler(parquet_dir, db_path, max_lock_retries=0)
 
-    handler._maybe_ingest(batch)
-    assert batch.exists(), "a failed enqueue must leave the file for re-parse"
-
-    handler._maybe_ingest(batch)
-    assert not batch.exists()
+    with caplog.at_level(logging.WARNING, logger="drover.watcher"):
+        handler._maybe_ingest(batch)
+    assert not batch.exists(), "a failed enqueue must not leave the file for re-parse"
     assert (host_dir / ".processed" / "batch.jsonl").exists()
+    assert "ingest failed" not in caplog.text
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("sess-w1" in r.getMessage() for r in warnings)
+    assert [sid for sid, _, _ in _summary_jobs(db_path)] == ["sess-w2"]
 
-    # A redelivered copy of the same batch is a no-op as well.
+    monkeypatch.setattr(watcher_module, "enqueue_summary_generation", real_enqueue)
     again = host_dir / "batch-redelivered.jsonl"
     _write_two_session_events(again)
     handler._maybe_ingest(again)
@@ -801,17 +713,11 @@ def test_reparse_after_a_failed_enqueue_is_idempotent(
         events = con.execute("""SELECT id, count(*) FROM agent_events
                 WHERE session_id IN ('sess-w1', 'sess-w2')
                 GROUP BY id ORDER BY id""").fetchall()
-        jobs = con.execute(
-            """SELECT session_id, status, source_version FROM summarize_jobs
-                WHERE session_id IN ('sess-w1', 'sess-w2') ORDER BY session_id"""
-        ).fetchall()
-        versions = {
-            sid: source_version_for_session(con, sid) for sid in ("sess-w1", "sess-w2")
-        }
     finally:
         con.close()
     assert events == [("watcher-s1-001", 1), ("watcher-s2-001", 1)]
-    assert jobs == [
+    versions = {sid: _source_version(db_path, sid) for sid in ("sess-w1", "sess-w2")}
+    assert _summary_jobs(db_path) == [
         ("sess-w1", "pending", versions["sess-w1"]),
         ("sess-w2", "pending", versions["sess-w2"]),
     ]

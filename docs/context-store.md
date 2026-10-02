@@ -138,14 +138,13 @@ Workers and explicit curation create mutable context records:
 
 | Table | Derived value |
 | --- | --- |
-| `session_summaries` | Post-session summaries with narrative, outcome, next steps, questions, files touched |
+| PostgreSQL `session_memory` | Live recaps and final summaries with narrative, outcome, next steps, questions, files touched |
 | `context_containers` | Confidence-aware grouping for code, operations, research, or general activity |
 | `context_links` | Links between context containers and sessions/span_ids with confidence scores |
 | `active_session_briefs` | Short-lived TTL-cached handoff briefs for mid-task transfers |
-| `project_briefs` | Repository-level summaries with open questions and current scope |
+| PostgreSQL `project_briefs` | Repository-level summaries with open questions and current scope |
 | `decisions` | Extracted decisions with rationale, alternatives, and selected action |
-| `session_embeddings` | Vector embeddings over session summaries for semantic search |
-| `span_embeddings` | Vector embeddings plus redacted span source fields |
+| PostgreSQL `session_embeddings` | pgvector `vector(768)` embeddings over session summaries for exact cosine search |
 | `curated_context_records` | User- or tool-curated Markdown context with stable hashes |
 | `curated_context_provenance` | Append-only history of generated, edited, and imported records |
 
@@ -194,10 +193,20 @@ The durable pipeline ledger captures derivation history and separates intent fro
 - **Audit** - compliance with provenance requirements
 - **Replay** - reconstruct state from ledger entries
 
-Compatibility job tables (`summarize_jobs`, `brief_jobs`, `embed_jobs`, and
-`span_embed_jobs`) remain while worker coordination evolves. Optional Redis
-Streams provides leases, retries, backpressure, and dead-letter coordination;
-DuckDB remains the durable source of job intent and results.
+Derived memory uses PostgreSQL `pipeline_jobs` and `pipeline_job_attempts`
+for summaries, embeddings, project briefs and live recaps (#480). Claims use
+`FOR UPDATE SKIP LOCKED`, expiring lease tokens, bounded retries and per-row
+quarantine. Summary publication and downstream job enqueue commit together.
+Redis streams and the DuckDB memory queues are no longer part of this path.
+The analytical ledger remains for advisory work.
+
+The PostgreSQL memory tables start empty. Regenerate them with
+`drover-server memory requeue --since <date> --substantive-only` after an
+operator-authorized upgrade. Schema bootstrap preserves legacy derived data;
+`memory purge-legacy` previews optional cleanup and requires `--apply` to drop
+legacy DuckDB tables. A DuckDB-only control store records sessions but cannot
+produce derived memory. Missing pgvector fails memory readiness explicitly.
+DuckLake and lake cutover remain Phase 4 work.
 
 ## Identity And Linking
 
@@ -273,7 +282,7 @@ handoff, and quality checks. Operators can use `drover-server status`,
 
 | Tool | Purpose | Query Pattern |
 | --- | --- | --- |
-| `drover_handoff` | Recent summaries + active sessions for a task/repo | `session_summaries` ↔ `tasks` |
+| `drover_handoff` | Recent summaries + active sessions for a task/repo | PostgreSQL memory + analytical `tasks` |
 | `drover_session_replay` | Last N turns for a session | Direct event lookup |
 | `drover_session_summary` | Summary for one session | Direct lookup |
 | `drover_active_sessions` | Currently active sessions (30 min window) | Direct lookup |
@@ -281,7 +290,7 @@ handoff, and quality checks. Operators can use `drover-server status`,
 | `drover_files_touched` | Files edited during session | Parses tool_use_blocks |
 | `drover_session_close` | Enqueue summary generation | Updates job queue |
 | `drover_project_brief` | Repo-level summary | Queries `context_containers` |
-| `drover_recent_sessions` | Recent summaries for a repo | `session_summaries` ordered |
+| `drover_recent_sessions` | Recent summaries for a repo | PostgreSQL final memory ordered |
 | `drover_recent_contexts` | Recent context containers | Query containers |
 | `drover_context_brief` | Context container details | Select container |
 | `drover_open_loops` | Contexts with open actions | Filter by open_loops |
@@ -297,25 +306,26 @@ handoff, and quality checks. Operators can use `drover-server status`,
 ### Example Query Patterns
 
 ```sql
--- Get recent summaries for a repo
-SELECT ss.session_id, ss.agent_id, ss.summary_md
-FROM session_summaries ss
-JOIN tasks t ON ss.task_id = t.task_id
-WHERE t.repo_owner = 'arniesaha' AND t.repo_name = 'drover'
-ORDER BY ss.ended_at DESC
+-- PostgreSQL: final memory for a repo (use the configured schema)
+SELECT session_id, agent_id, summary_md
+FROM session_memory
+WHERE phase = 'final' AND project_key = 'arniesaha/drover'
+ORDER BY ended_at DESC NULLS LAST
 LIMIT 5;
 
--- Get all files touched by a task
+-- DuckDB: source tool evidence for a task
 SELECT DISTINCT task_id,
        raw_data->>'$.tool_use_blocks[*].input.file_path' AS file_path
 FROM agent_events
 WHERE task_id = ? AND tool_use_blocks IS NOT NULL;
 
--- Semantic search by embedding
-SELECT session_id, summary_embedding,
-       (1.0 - cosine_similarity(summary_embedding, ?)) as similarity
-FROM session_summaries
-ORDER BY similarity
+-- PostgreSQL with pgvector in public: exact cosine search
+SELECT e.session_id, 1 - (e.embedding OPERATOR(public.<=>) $1::public.vector) AS similarity
+FROM session_embeddings e
+JOIN session_memory m USING (session_id)
+WHERE e.model = $2 AND m.phase = 'final'
+  AND e.source_version = COALESCE(m.summary_source_version, '')
+ORDER BY e.embedding OPERATOR(public.<=>) $1::public.vector
 LIMIT 5;
 ```
 
@@ -375,7 +385,7 @@ maintaining Drover's unified identity model.
 1. **Start** - Session begins, captured in `harness_sessions`
 2. **Active** - Events stream in, tracked in `harness_events`
 3. **Close** - Session ends, triggers summary generation
-4. **Summarized** - Summary written to `session_summaries`
+4. **Summarized** - Summary written to PostgreSQL `session_memory`
 
 ### Task Lifecycle
 

@@ -384,8 +384,7 @@ def _vector_migration_statements(extension_schema: str) -> tuple[str, ...]:
         sql.Identifier(extension_schema), sql.Literal(EMBEDDING_DIM)
     )
     return (
-        sql.SQL(
-            """
+        sql.SQL("""
             CREATE TABLE IF NOT EXISTS session_embeddings (
               session_id TEXT PRIMARY KEY,
               embedding {} NOT NULL,
@@ -394,8 +393,7 @@ def _vector_migration_statements(extension_schema: str) -> tuple[str, ...]:
               source_version TEXT NOT NULL DEFAULT '',
               embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
-            """
-        ).format(vector_type, sql.Literal(EMBEDDING_DIM)),
+            """).format(vector_type, sql.Literal(EMBEDDING_DIM)),
         sql.SQL(
             "CREATE INDEX IF NOT EXISTS session_embeddings_model ON session_embeddings (model)"
         ),

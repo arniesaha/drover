@@ -44,7 +44,6 @@ from drover.schema import (
     bootstrap_control_plane_store,
     prune_legacy_control_plane_tables,
 )
-from drover.server import ledger_shadow
 from drover.server.advisory import span_facts as advisory_span_facts
 from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
@@ -115,12 +114,7 @@ from drover.server.db import (
 from drover.server.decisions import derive_decisions
 from drover.server.doctor import audit_lakehouse, format_runtime_audit, runtime_audit
 from drover.server.embeddings.client import EmbeddingBackendConfig
-from drover.server.embeddings.worker import (
-    EmbedWorker,
-    enqueue_missing_span_embeds,
-    reset_stale_session_embed_jobs,
-    reset_stale_span_embed_jobs,
-)
+from drover.server.embeddings.worker import EmbedWorker
 from drover.server.harness.recap_worker import LiveRecapWorker
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
@@ -129,9 +123,16 @@ from drover.server.harness.schema import (
     migrate_duplicate_harness_events,
 )
 from drover.server.harness.usage_rollup import UsageRollupWorker
-from drover.server.jobs import RedisJobStream, RedisJobStreamConfig
+from drover.server.ledger import (
+    EMBED_SESSION,
+    JobLedger,
+    ledger_stats,
+    memory_store_available,
+)
 from drover.server.mcp import tools as mcp_tools
 from drover.server.mcp.server import build_mcp_server
+from drover.server.memory_requeue import requeue_memory
+from drover.server.memory_store import EmbeddingStore, MemoryRepository, vector_status
 from drover.server.metrics import (
     MetricsCollector,
     sequence_health_report,
@@ -181,14 +182,6 @@ from drover.session_audit import audit_session_consistency_db, format_session_au
 from drover.task_id import compute_task_id
 
 log = logging.getLogger("drover.server")
-
-_REDIS_JOB_STREAM_SUFFIXES = {
-    "summarize": "summarize_session",
-    "live_recap": "summarize_live_session",
-    "brief": "regenerate_project_brief",
-    "embed_session": "embed_session",
-    "embed_span": "embed_span",
-}
 
 
 def _summarizer_backend_available(backend_cfg: SummarizerBackendConfig) -> bool:
@@ -687,104 +680,6 @@ def _configure_push(cfg: DroverConfig, auth) -> None:
         log.exception("APNs push failed to configure; continuing without it")
 
 
-def _redis_job_stream_config(cfg: DroverConfig, suffix: str) -> RedisJobStreamConfig:
-    return RedisJobStreamConfig(
-        stream=f"{cfg.redis_jobs_stream_prefix}:{suffix}",
-        group=cfg.redis_jobs_group,
-        max_deliveries=cfg.redis_jobs_max_deliveries,
-        visibility_timeout_ms=cfg.redis_jobs_visibility_timeout_ms,
-        maxlen=cfg.redis_jobs_maxlen,
-        high_water=cfg.redis_jobs_high_water,
-    )
-
-
-def _build_redis_job_streams(cfg: DroverConfig) -> dict[str, RedisJobStream]:
-    """Create Redis streams for derived-job workers when enabled."""
-    if not cfg.redis_jobs_enabled:
-        return {}
-    streams: dict[str, RedisJobStream] = {}
-    for key, suffix in _REDIS_JOB_STREAM_SUFFIXES.items():
-        if key == "embed_span" and not cfg.spans_enabled:
-            # No stream means nothing seeds or publishes span embed jobs (#473).
-            continue
-        streams[key] = RedisJobStream.from_url(
-            cfg.redis_jobs_url, _redis_job_stream_config(cfg, suffix)
-        )
-    return streams
-
-
-def _seed_redis_job_streams(
-    *, duckdb_path: Path, streams: dict[str, RedisJobStream]
-) -> dict[str, int]:
-    """Mirror existing pending DuckDB jobs into Redis on startup.
-
-    This is intentionally idempotent enough for operational cutover. Redis
-    streams may receive duplicate entries across restarts; worker claim paths
-    still reconcile against DuckDB before doing durable work and ACK already
-    completed rows.
-    """
-    if not streams:
-        return {}
-    table_map = {
-        "summarize": ("summarize_jobs", "session_id", "session_id"),
-        "live_recap": ("live_recap_jobs", "session_id", "session_id"),
-        "brief": ("brief_jobs", "project_key", "project_key"),
-        "embed_session": ("embed_jobs", "session_id", "session_id"),
-        "embed_span": ("span_embed_jobs", "span_id", "span_id"),
-    }
-    counts: dict[str, int] = {}
-    con = open_duckdb_connection(duckdb_path, read_only=True, role="diagnostic")
-    try:
-        for key, stream in streams.items():
-            table, column, field = table_map[key]
-            if table in CONTROL_PLANE_TABLES:
-                # `live_recap_jobs` moved to the control-plane store in #95.
-                # Seeding is a startup read of a queue that the control plane
-                # owns, so it reads it where the control plane keeps it.
-                with control_plane_connection(duckdb_path) as cp_con:
-                    counts[key] = _seed_one_stream(
-                        cp_con, stream, key, table, column, field
-                    )
-                continue
-            counts[key] = _seed_one_stream(con, stream, key, table, column, field)
-    finally:
-        con.close()
-    return counts
-
-
-def _seed_one_stream(
-    con: Any,
-    stream: RedisJobStream,
-    key: str,
-    table: str,
-    column: str,
-    field: str,
-) -> int:
-    if key == "brief":
-        selected = f"{column}, source_session_id, source_version"
-    elif key in ("summarize", "embed_session"):
-        selected = f"{column}, source_version"
-    elif key == "live_recap":
-        selected = f"{column}, desired_source_seq"
-    else:
-        selected = column
-    rows = con.execute(
-        f"SELECT {selected} FROM {table} WHERE status='pending' ORDER BY enqueued_at ASC"
-    ).fetchall()
-    for row in rows:
-        payload = {field: str(row[0])}
-        if key == "brief" and row[1] is not None:
-            payload["source_session_id"] = str(row[1])
-        if key == "brief" and row[2] is not None:
-            payload["source_version"] = str(row[2])
-        elif key in ("summarize", "embed_session") and row[1] is not None:
-            payload["source_version"] = str(row[1])
-        elif key == "live_recap":
-            payload["source_seq"] = str(row[1])
-        stream.add(payload)
-    return len(rows)
-
-
 def _summarizer_backend_config(cfg: DroverConfig) -> SummarizerBackendConfig:
     return SummarizerBackendConfig.from_runtime(
         api_model=cfg.summarizer_api_model,
@@ -805,7 +700,6 @@ def _build_runtime_mcp_server(
     cfg: DroverConfig,
     host: str,
     backend_config: SummarizerBackendConfig,
-    summarize_job_stream: object | None,
 ) -> FastMCP:
     """Inject resolved runtime dependencies into the FastMCP server."""
     return build_mcp_server(
@@ -813,8 +707,8 @@ def _build_runtime_mcp_server(
         host=host,
         port=cfg.mcp_http_port,
         backend_config=backend_config,
-        summarize_job_stream=summarize_job_stream,
         spans_enabled=cfg.spans_enabled,
+        embedding_model=_configured_embedding_model(cfg),
     )
 
 
@@ -831,43 +725,56 @@ def _embedding_backend_config(
     )
 
 
-def _prune_orphan_span_embed_jobs(
-    *, duckdb_path: Path, limit: int, apply: bool
-) -> dict[str, int]:
-    con = open_duckdb_connection(duckdb_path)
-    try:
-        rows = con.execute(
-            """
-            SELECT j.span_id
-            FROM span_embed_jobs j
-            LEFT JOIN spans s ON s.span_id = j.span_id
-            WHERE s.span_id IS NULL
-              AND j.status = 'errored'
-              AND COALESCE(j.last_error, '') = 'span row missing'
-            ORDER BY j.updated_at NULLS LAST, j.enqueued_at NULLS LAST, j.span_id
-            LIMIT ?
-            """,
-            [limit],
-        ).fetchall()
-        span_ids = [str(row[0]) for row in rows]
-        deleted = 0
-        if apply and span_ids:
-            con.execute(
-                """
-                DELETE FROM span_embed_jobs
-                WHERE span_id IN (SELECT unnest(?))
-                  AND status = 'errored'
-                  AND COALESCE(last_error, '') = 'span row missing'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM spans WHERE spans.span_id = span_embed_jobs.span_id
-                  )
-                """,
-                [span_ids],
-            )
-            deleted = len(span_ids)
-        return {"matched": len(span_ids), "deleted": deleted, "limit": limit}
-    finally:
-        con.close()
+def _configured_embedding_model(cfg: DroverConfig) -> str:
+    """The embedding space session vectors are written and searched in.
+
+    The API embedder wins when it is configured, exactly as
+    ``EmbeddingBackendConfig.select_embedder`` chooses; otherwise the local
+    Ollama model. ``EmbeddingStore`` rejects a vector from any other model, so
+    switching models is an explicit re-embed rather than a mixed index.
+    """
+    embeddings_cfg = EmbeddingBackendConfig.from_runtime(
+        api_base_url=cfg.embeddings_api_base_url or None,
+        api_key=cfg.embeddings_api_key or None,
+        api_model=cfg.embeddings_api_model or None,
+        mac_ollama_url=cfg.embeddings_mac_ollama_url or None,
+        local_model=cfg.embeddings_local_model or None,
+    )
+    if embeddings_cfg.has_api_embedder:
+        return embeddings_cfg.api_model
+    return embeddings_cfg.local_model
+
+
+def _embeddings_state(cfg: DroverConfig, *, enabled: bool) -> dict[str, Any]:
+    """What /readyz says about embeddings on this hub (#471)."""
+    embeddings_cfg = EmbeddingBackendConfig.from_runtime(
+        api_base_url=cfg.embeddings_api_base_url or None,
+        api_key=cfg.embeddings_api_key or None,
+        api_model=cfg.embeddings_api_model or None,
+        mac_ollama_url=cfg.embeddings_mac_ollama_url or None,
+        local_model=cfg.embeddings_local_model or None,
+    )
+    if embeddings_cfg.has_api_embedder:
+        backend = "api"
+    elif embeddings_cfg.mac_ollama_url:
+        backend = "mac_ollama"
+    elif cfg.summarizer_gpu_ollama_url or cfg.summarizer_gpu_relay_url:
+        backend = "gpu_rig"
+    else:
+        backend = None
+    if not enabled:
+        detail = "embeddings disabled on this hub (--no-embeddings)"
+    elif backend is None:
+        detail = "no embedding backend configured; embed jobs wait in the ledger"
+    else:
+        detail = f"embedding with {backend}"
+    return {
+        "enabled": enabled,
+        "configured": backend is not None,
+        "backend": backend,
+        "model": _configured_embedding_model(cfg),
+        "detail": detail,
+    }
 
 
 def _default_mcp_url(cfg: DroverConfig) -> str:
@@ -1905,12 +1812,10 @@ def incoming_ingest_once_cmd(ctx: click.Context, jsonl_path: Path, apply: bool) 
         click.echo(f"mode=dry-run path={jsonl_path} size={jsonl_path.stat().st_size}")
         return
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
-    streams = _build_redis_job_streams(cfg)
     ingest_incoming_file_once(
         jsonl_path,
         parquet_dir=cfg.parquet_dir,
         duckdb_path=cfg.duckdb_path,
-        summarize_job_stream=streams.get("summarize"),
     )
     click.echo(f"mode=apply ingested={jsonl_path}")
 
@@ -1924,23 +1829,12 @@ def incoming_ingest_once_cmd(ctx: click.Context, jsonl_path: Path, apply: bool) 
 def embeddings_drain_once_cmd(ctx: click.Context, limit: int, apply: bool) -> None:
     """Drain pending embedding jobs once without starting the daemon loop."""
     cfg = _resolve_config(ctx.obj["config_path"])
+    _require_memory_store(cfg)
     if not apply:
-        con = open_duckdb_connection(cfg.duckdb_path, read_only=True, role="diagnostic")
-        try:
-            session_pending = con.execute(
-                "SELECT count(*) FROM embed_jobs WHERE status='pending'"
-            ).fetchone()[0]
-            span_pending = (
-                con.execute(
-                    "SELECT count(*) FROM span_embed_jobs WHERE status='pending'"
-                ).fetchone()[0]
-                if cfg.spans_enabled
-                else "disabled"
-            )
-        finally:
-            con.close()
+        stats = JobLedger(cfg.duckdb_path).stats()[EMBED_SESSION]
         click.echo(
-            f"mode=dry-run pending_sessions={session_pending} pending_spans={span_pending} limit={limit}"
+            f"mode=dry-run pending_sessions={stats['pending']} "
+            f"retry_wait={stats['retry_wait']} limit={limit}"
         )
         return
     backend_cfg = _summarizer_backend_config(cfg)
@@ -1954,127 +1848,6 @@ def embeddings_drain_once_cmd(ctx: click.Context, limit: int, apply: bool) -> No
     )
     processed = worker.drain_batch(max_jobs=limit)
     click.echo(f"mode=apply processed={processed} limit={limit}")
-
-
-@embeddings_cmd.command(name="prune-orphan-spans")
-@click.option("--limit", default=1000, show_default=True, type=click.IntRange(min=1))
-@click.option(
-    "--apply", is_flag=True, help="Delete matched orphan jobs. Default is dry-run."
-)
-@click.pass_context
-def embeddings_prune_orphan_spans_cmd(
-    ctx: click.Context, limit: int, apply: bool
-) -> None:
-    """Prune errored span embed jobs whose span rows are absent."""
-    cfg = _resolve_config(ctx.obj["config_path"])
-    _require_spans(cfg)
-    result = _prune_orphan_span_embed_jobs(
-        duckdb_path=cfg.duckdb_path, limit=limit, apply=apply
-    )
-    mode = "apply" if apply else "dry-run"
-    click.echo(
-        f"mode={mode} matched={result['matched']} deleted={result['deleted']} limit={result['limit']}"
-    )
-
-
-@embeddings_cmd.command(name="enqueue-spans")
-@click.option("--limit", default=1000, show_default=True, type=click.IntRange(min=1))
-@click.option(
-    "--since-days",
-    default=None,
-    type=click.IntRange(min=0),
-    help="Only scan span date partitions newer than this many days.",
-)
-@click.option(
-    "--apply", is_flag=True, help="Actually enqueue jobs. Default is dry-run."
-)
-@click.pass_context
-def embeddings_enqueue_spans_cmd(
-    ctx: click.Context, limit: int, since_days: Optional[int], apply: bool
-) -> None:
-    """Enqueue missing span embedding jobs for existing spans."""
-    cfg = _resolve_config(ctx.obj["config_path"])
-    _require_spans(cfg)
-    bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
-    result = enqueue_missing_span_embeds(
-        duckdb_path=cfg.duckdb_path,
-        parquet_dir=cfg.parquet_dir,
-        limit=limit,
-        apply=apply,
-        since_days=since_days,
-    )
-    mode = "apply" if apply else "dry-run"
-    click.echo(
-        f"mode={mode} candidate_count={result['candidate_count']} "
-        f"enqueued={result['enqueued']} limit={limit}"
-    )
-
-
-@embeddings_cmd.command(name="reset-stale-spans")
-@click.option(
-    "--stale-after-hours", default=24, show_default=True, type=click.IntRange(min=1)
-)
-@click.option("--limit", default=1000, show_default=True, type=click.IntRange(min=1))
-@click.option(
-    "--apply",
-    is_flag=True,
-    help="Actually reset stale running span jobs to pending. Default is dry-run.",
-)
-@click.pass_context
-def embeddings_reset_stale_spans_cmd(
-    ctx: click.Context, stale_after_hours: int, limit: int, apply: bool
-) -> None:
-    """Reset stranded running span embedding jobs back to pending.
-
-    Safe operator flow: run without --apply first to preview the number of
-    stale running jobs, then rerun with --apply to requeue them.
-    """
-    cfg = _resolve_config(ctx.obj["config_path"])
-    _require_spans(cfg)
-    result = reset_stale_span_embed_jobs(
-        duckdb_path=cfg.duckdb_path,
-        stale_after_hours=stale_after_hours,
-        limit=limit,
-        apply=apply,
-    )
-    mode = "apply" if apply else "dry-run"
-    click.echo(
-        f"mode={mode} matched={result['matched']} reset={result['reset']} "
-        f"stale_after_hours={result['stale_after_hours']} limit={result['limit']}"
-    )
-
-
-@embeddings_cmd.command(name="reset-stale-sessions")
-@click.option(
-    "--stale-after-hours", default=24, show_default=True, type=click.IntRange(min=1)
-)
-@click.option("--limit", default=1000, show_default=True, type=click.IntRange(min=1))
-@click.option(
-    "--apply",
-    is_flag=True,
-    help="Actually reset stale running session jobs to pending. Default is dry-run.",
-)
-@click.pass_context
-def embeddings_reset_stale_sessions_cmd(
-    ctx: click.Context, stale_after_hours: int, limit: int, apply: bool
-) -> None:
-    """Reset stranded running session embedding jobs back to pending.
-
-    Safe operator flow: run without --apply first to preview the number of
-    stale running jobs, then rerun with --apply to requeue them.
-    """
-    cfg = _resolve_config(ctx.obj["config_path"])
-    result = reset_stale_session_embed_jobs(
-        duckdb_path=cfg.duckdb_path,
-        stale_after_hours=stale_after_hours,
-        limit=limit,
-        apply=apply,
-    )
-    mode = "apply" if apply else "dry-run"
-    click.echo(
-        f"mode={mode} matched={result['matched']} reset={result['reset']} "
-        f"stale_after_hours={result['stale_after_hours']} limit={result['limit']}"
-    )
 
 
 @decisions_cmd.command(name="derive")
@@ -2142,143 +1915,161 @@ def context_import_cmd(ctx: click.Context, bundle_path: Path, apply: bool) -> No
     )
 
 
-@main.group(name="ledger")
-def ledger_cmd() -> None:
-    """Reconcile and replay durable pipeline-ledger jobs."""
+@main.group(name="memory")
+def memory_cmd() -> None:
+    """Operate derived memory: the job ledger, summaries and embeddings."""
 
 
-@ledger_cmd.command(name="reconcile")
-@click.option(
-    "--job-kind",
-    "job_kinds",
-    multiple=True,
-    type=click.Choice(sorted(ledger_shadow.SERVING_JOBS)),
-    help="Limit to these job kinds (default: all).",
-)
-@click.option(
-    "--stale-after-hours",
-    default=None,
-    type=click.IntRange(min=0),
-    help="Only reclaim leases/running rows older than this. Default: all in-flight.",
-)
-@click.option(
-    "--apply",
-    is_flag=True,
-    help="Actually reclaim leases and reset serving rows. Default is dry-run.",
-)
-@click.pass_context
-def ledger_reconcile_cmd(
-    ctx: click.Context,
-    job_kinds: tuple[str, ...],
-    stale_after_hours: Optional[int],
-    apply: bool,
-) -> None:
-    """Recover crashed in-flight jobs from DuckDB back to runnable.
-
-    Reclaims stale ledger leases (closing the crashed attempt append-only) and
-    resets the matching serving rows from ``running`` to ``pending``. Run without
-    ``--apply`` first to preview the counts.
-    """
-    cfg = _resolve_config(ctx.obj["config_path"])
-    kinds = list(job_kinds) or sorted(ledger_shadow.SERVING_JOBS)
-    stale_before = (
-        datetime.now(timezone.utc) - timedelta(hours=stale_after_hours)
-        if stale_after_hours is not None
-        else None
-    )
-    mode = "apply" if apply else "dry-run"
-    click.echo(f"ledger reconcile ({mode})")
-    if apply:
-        bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
-        for kind in kinds:
-            res = ledger_shadow.recover_runnable(
-                cfg.duckdb_path, job_kind=kind, stale_before=stale_before
-            )
-            click.echo(
-                f"  {kind}: serving_reset={res['serving_reset']} "
-                f"leases_reclaimed={len(res['leases_reclaimed'])}"
-            )
-        return
-
-    with _diagnostic_db_path(cfg.duckdb_path) as db_path:
-        for kind in kinds:
-            pending = _reconcile_preview(db_path, kind, stale_before)
-            click.echo(
-                f"  {kind}: serving_running={pending['serving_running']} "
-                f"leased={pending['leased']} (would reset)"
-            )
-
-
-def _reconcile_preview(
-    duckdb_path: Path, job_kind: str, stale_before: Optional[datetime]
-) -> dict[str, int]:
-    """Count in-flight serving/ledger rows a reconcile would reset (read-only)."""
-    from drover.server.analytical_ledger import Ledger
-
-    binding = ledger_shadow.SERVING_JOBS.get(job_kind)
-    con = open_duckdb_connection(duckdb_path, read_only=True, role="diagnostic")
-    try:
-        leased = len(
-            Ledger(con).list_leased_jobs(job_kind=job_kind, stale_before=stale_before)
+def _require_memory_store(cfg: DroverConfig) -> None:
+    if not memory_store_available(cfg.duckdb_path):
+        raise click.ClickException(
+            "derived memory requires control_store.backend = 'postgres'"
         )
-        serving_running = 0
-        if binding is not None:
-            where = "status='running'"
-            params: list[Any] = []
-            if stale_before is not None:
-                where += " AND updated_at < ?"
-                params.append(stale_before)
-            serving_running = con.execute(
-                f"SELECT count(*) FROM {binding.table} WHERE {where}", params
-            ).fetchone()[0]
-    finally:
-        con.close()
-    return {"serving_running": int(serving_running), "leased": leased}
+    bootstrap_control_plane_store(cfg.duckdb_path)
 
 
-@ledger_cmd.command(name="replay")
+@memory_cmd.command(name="status")
+@click.pass_context
+def memory_status_cmd(ctx: click.Context) -> None:
+    """Print per-kind job health, memory counts and pgvector status as JSON."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    _require_memory_store(cfg)
+    model = _configured_embedding_model(cfg)
+    with control_plane_connection(cfg.duckdb_path) as con:
+        vector_ready, vector_detail = vector_status(con)
+        payload = {
+            "jobs": ledger_stats(con),
+            "memory": MemoryRepository(cfg.duckdb_path).counts(con=con),
+            "embeddings": {
+                "model": model,
+                **EmbeddingStore(cfg.duckdb_path, model=model).count(con=con),
+            },
+            "vector": {"ready": vector_ready, "detail": vector_detail},
+        }
+    click.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+
+@memory_cmd.command(name="requeue")
 @click.option(
-    "--job-kind",
+    "--since",
     required=True,
-    type=click.Choice(sorted(ledger_shadow.SERVING_JOBS)),
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    help="Regenerate memory for sessions with canonical activity on or after this date.",
 )
-@click.option("--subject", "subject_key", required=True, help="Subject key to replay.")
 @click.option(
-    "--apply",
+    "--substantive-only",
     is_flag=True,
-    help="Actually promote the job to pending. Default is dry-run.",
+    help="Skip sessions without a non-empty user and assistant message.",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Count what would be enqueued; change nothing."
+)
+@click.option(
+    "--session",
+    "session_ids",
+    multiple=True,
+    help="Only these sessions, forcing a fresh generation even if current.",
+)
+@click.option(
+    "--rate",
+    default=20.0,
+    show_default=True,
+    type=click.FloatRange(min=0.0),
+    help="Maximum jobs enqueued per second (0 = unlimited).",
 )
 @click.pass_context
-def ledger_replay_cmd(
-    ctx: click.Context, job_kind: str, subject_key: str, apply: bool
+def memory_requeue_cmd(
+    ctx: click.Context,
+    since: datetime,
+    substantive_only: bool,
+    dry_run: bool,
+    session_ids: tuple[str, ...],
+    rate: float,
 ) -> None:
-    """Promote a finished ledger job back to pending without duplicating rows.
+    """Enqueue summarize/embed jobs from canonical sessions (#480 rebuild).
 
-    Regenerates the artifact for ``--subject`` by opening a fresh job generation
-    (prior winner superseded, attempt lineage preserved) and resetting the
-    subject's single serving row to ``pending``.
+    Derived memory is rebuilt, not migrated: after the upgrade the PostgreSQL
+    memory tables are empty and this refills them. Sessions without a current
+    summary get a summarize job (embedding and brief follow on success);
+    sessions with a current summary but no embedding get an embed job.
+    Requeued work runs below live sessions' priority.
     """
     cfg = _resolve_config(ctx.obj["config_path"])
-    if apply:
-        bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
-        res = ledger_shadow.replay(
-            cfg.duckdb_path, job_kind=job_kind, subject_key=subject_key, apply=True
-        )
-    else:
-        with _diagnostic_db_path(cfg.duckdb_path) as db_path:
-            res = ledger_shadow.replay(
-                db_path, job_kind=job_kind, subject_key=subject_key, apply=False
-            )
-    mode = "apply" if apply else "dry-run"
-    click.echo(
-        f"ledger replay ({mode}) {job_kind}/{subject_key}: "
-        f"ledger_status={res['ledger_status']} eligible={res['eligible']} "
-        f"serving_reset={res['serving_reset']}"
+    _require_memory_store(cfg)
+    report = requeue_memory(
+        cfg.duckdb_path,
+        since=since.date(),
+        substantive_only=substantive_only,
+        dry_run=dry_run,
+        embedding_model=_configured_embedding_model(cfg),
+        session_ids=session_ids or None,
+        rate_per_second=rate,
     )
-    if res["ledger_status"] is None:
-        click.echo("  no ledger job found for that subject")
-    elif not res["eligible"]:
-        click.echo("  not eligible (job is leased / in flight — reconcile first)")
+    click.echo(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+
+
+#: DuckDB relations Phase 3 retired. Their rows were derived; nothing reads
+#: them any more and `memory requeue` regenerates the content in PostgreSQL.
+_LEGACY_MEMORY_TABLES = (
+    "summarize_jobs",
+    "embed_jobs",
+    "brief_jobs",
+    "span_embed_jobs",
+    "session_summaries",
+    "project_briefs",
+    "session_embeddings",
+    "span_embeddings",
+)
+_LEGACY_CONTROL_PLANE_MEMORY_TABLES = ("live_recap_jobs", "live_session_recaps")
+
+
+@memory_cmd.command(name="purge-legacy")
+@click.option("--apply", is_flag=True, help="Drop the tables. Default is dry-run.")
+@click.pass_context
+def memory_purge_legacy_cmd(ctx: click.Context, apply: bool) -> None:
+    """Drop the retired DuckDB memory queues and derived tables.
+
+    Run once after `memory requeue` has refilled PostgreSQL. Dry-run lists
+    what exists and how many rows each holds.
+    """
+    cfg = _resolve_config(ctx.obj["config_path"])
+    _require_memory_store(cfg)
+    mode = "apply" if apply else "dry-run"
+    click.echo(f"memory purge-legacy ({mode})")
+    targets: list[tuple[str, Path, tuple[str, ...]]] = [
+        ("analytical", cfg.duckdb_path, _LEGACY_MEMORY_TABLES)
+    ]
+    control_path = control_plane_path(cfg.duckdb_path)
+    if not memory_store_available(cfg.duckdb_path) and control_path.exists():
+        targets.append(
+            ("control_plane", control_path, _LEGACY_CONTROL_PLANE_MEMORY_TABLES)
+        )
+    for label, path, tables in targets:
+        if not path.exists():
+            continue
+        con = (
+            open_duckdb_connection(path, read_only=not apply, role="diagnostic")
+            if label == "analytical"
+            else duckdb.connect(str(path), read_only=not apply)
+        )
+        try:
+            existing = {
+                row[0]
+                for row in con.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_type = 'BASE TABLE'"
+                ).fetchall()
+            }
+            for table in tables:
+                if table not in existing:
+                    continue
+                rows = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                if apply:
+                    con.execute(f"DROP TABLE {table}")
+                verb = "dropped" if apply else "would drop"
+                click.echo(f"  {label}.{table}: {verb} ({rows} rows)")
+        finally:
+            con.close()
 
 
 @main.command()
@@ -2372,6 +2163,20 @@ def status(ctx: click.Context) -> None:
                 click.echo(f"  {t:20s} {n}")
     except duckdb.Error as exc:
         click.echo(f"  control plane        error: {exc}")
+
+    # Derived memory lives in the PostgreSQL control store (#480).
+    if not memory_store_available(cfg.duckdb_path):
+        click.echo(
+            "  session_summaries    unavailable (requires control_store.backend = 'postgres')"
+        )
+        return
+    try:
+        counts = MemoryRepository(cfg.duckdb_path).counts()
+    except Exception as exc:  # noqa: BLE001 - status reports, never raises
+        click.echo(f"  memory store         error: {exc}")
+        return
+    for name, n in counts.items():
+        click.echo(f"  {name:20s} {n}")
 
 
 @main.command(name="export-bundle")
@@ -2767,31 +2572,10 @@ def run(
 
     stop = threading.Event()
 
-    job_streams: dict[str, RedisJobStream] = {}
-    if cfg.redis_jobs_enabled:
-        try:
-            job_streams = _build_redis_job_streams(cfg)
-            seeded = _seed_redis_job_streams(
-                duckdb_path=cfg.duckdb_path, streams=job_streams
-            )
-            log.info(
-                "Redis job streams enabled url=%s prefix=%s group=%s seeded=%s",
-                cfg.redis_jobs_url,
-                cfg.redis_jobs_stream_prefix,
-                cfg.redis_jobs_group,
-                seeded,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "Redis job streams failed to initialize; continuing with DuckDB queues"
-            )
-            job_streams = {}
-
     watcher = IncomingWatcher(
         incoming_dir=cfg.incoming_dir,
         parquet_dir=cfg.parquet_dir,
         duckdb_path=cfg.duckdb_path,
-        summarize_job_stream=job_streams.get("summarize"),
         # The setting has existed since the beginning; until now nothing read
         # it, and the audit copies grew without bound (9.7GB on this hub).
         retention_days=cfg.processed_retention_days,
@@ -2918,7 +2702,6 @@ def run(
                 port=cfg.otlp_grpc_port,
                 parquet_dir=cfg.parquet_dir,
                 duckdb_path=cfg.duckdb_path,
-                span_job_stream=job_streams.get("embed_span"),
             )
             receiver.start()
         except Exception:  # noqa: BLE001
@@ -2942,7 +2725,6 @@ def run(
                 cfg=cfg,
                 host=mcp_host,
                 backend_config=mcp_backend_cfg,
-                summarize_job_stream=job_streams.get("summarize"),
             )
 
             def _run_mcp() -> None:
@@ -2976,6 +2758,7 @@ def run(
     metrics_server = None
     metrics_collector: MetricsCollector | None = None
     provider_refresh: ProviderRefreshLoop | None = None
+    embeddings_state = _embeddings_state(cfg, enabled=not no_embeddings)
     config_path = (
         Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     )
@@ -2998,7 +2781,7 @@ def run(
                     gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
                     gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
                 ),
-                job_streams=job_streams,
+                embeddings_state=embeddings_state,
                 api_token=auth.api_token if auth.enabled else "",
                 favorite_cwds=cfg.harness_favorite_cwds,
                 advisory_service=InsightsService(
@@ -3132,7 +2915,7 @@ def run(
                 duckdb_path=cfg.duckdb_path,
                 incoming_dir=cfg.incoming_dir,
                 summarizer_report={},
-                job_streams=job_streams,
+                embeddings_state=embeddings_state,
                 api_token=auth.api_token if auth.enabled else "",
                 favorite_cwds=cfg.harness_favorite_cwds,
                 advisory_service=InsightsService(
@@ -3194,6 +2977,17 @@ def run(
         log.exception("content advisory worker failed to start; continuing without it")
         content_advisory_worker = None
 
+    if not memory_store_available(cfg.duckdb_path):
+        # Summaries, recaps, embeddings and briefs live in the PostgreSQL
+        # control store with their job ledger (#480). A DuckDB-only hub keeps
+        # recording sessions; it just does not derive memory from them, and
+        # /readyz says so under `memory`.
+        log.warning(
+            "derived memory requires control_store.backend = 'postgres'; "
+            "summarizer, live recap, embedding and brief workers are not started"
+        )
+        no_summarizer = no_embeddings = no_briefs = True
+
     summarizer: SummarizerWorker | None = None
     live_recap: LiveRecapWorker | None = None
     if not no_summarizer:
@@ -3226,9 +3020,6 @@ def run(
                         backend_config=backend_cfg,
                         job_kind="incremental",
                         batch_size=cfg.summarizer_batch_size,
-                        job_stream=job_streams.get("summarize"),
-                        brief_job_stream=job_streams.get("brief"),
-                        embed_job_stream=job_streams.get("embed_session"),
                     )
                     summarizer.start()
                     log.info(
@@ -3244,7 +3035,6 @@ def run(
                     live_recap = LiveRecapWorker(
                         duckdb_path=cfg.duckdb_path,
                         backend_config=backend_cfg,
-                        job_stream=job_streams.get("live_recap"),
                     )
                     live_recap.start()
                     log.info("live recap worker ready")
@@ -3279,9 +3069,7 @@ def run(
                 duckdb_path=cfg.duckdb_path,
                 backend_config=backend_cfg,
                 embedding_config=embeddings_cfg,
-                session_job_stream=job_streams.get("embed_session"),
-                span_job_stream=job_streams.get("embed_span"),
-                spans_enabled=cfg.spans_enabled,
+                embed_model=_configured_embedding_model(cfg),
             )
             embeddings.start()
             if (
@@ -3325,7 +3113,6 @@ def run(
                 briefs = BriefWorker(
                     duckdb_path=cfg.duckdb_path,
                     backend_config=backend_cfg,
-                    job_stream=job_streams.get("brief"),
                 )
                 briefs.start()
         except Exception:  # noqa: BLE001
@@ -4058,6 +3845,8 @@ def runtime_audit_cmd(
             diagnostic_db_path=diagnostic_db,
             deep=deep,
             spans_enabled=cfg.spans_enabled,
+            memory_store_path=cfg.duckdb_path,
+            embedding_model=_configured_embedding_model(cfg),
         )
     click.echo(format_runtime_audit(report))
 
@@ -4128,6 +3917,8 @@ def quality_cmd(
             required_agent_ids=required_agent_ids,
             deep=deep,
             spans_enabled=cfg.spans_enabled,
+            memory_store_path=cfg.duckdb_path,
+            embedding_model=_configured_embedding_model(cfg),
         )
     if as_prometheus:
         click.echo(format_prometheus(snapshot), nl=False)
@@ -4177,12 +3968,15 @@ def observatory_cmd(
             incoming_dir=incoming_dir or cfg.incoming_dir,
             deep=False,
             spans_enabled=cfg.spans_enabled,
+            memory_store_path=cfg.duckdb_path,
+            embedding_model=_configured_embedding_model(cfg),
         )
         payload = pipeline_observatory_snapshot(
             duckdb_path=db_path,
             runtime_audit=quality.get("runtime_audit", {}),
             max_artifacts=max_artifacts,
             max_projects=max_projects,
+            memory_store_path=cfg.duckdb_path,
         )
     click.echo(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -4268,22 +4062,15 @@ def summarizer_doctor(ctx: click.Context) -> None:
     "--apply",
     "apply_changes",
     is_flag=True,
-    help="Actually reset matching jobs to pending (default is dry-run)",
+    help="Actually requeue matching ledger jobs (default is dry-run)",
 )
 @click.option(
     "--include-validation",
     is_flag=True,
-    help="Also retry JSON/schema validation failures",
+    help="Also retry quarantined JSON/schema validation failures",
 )
 @click.option(
-    "--limit", type=int, default=None, help="Maximum number of errored jobs to match"
-)
-@click.option(
-    "--db",
-    "duckdb_path",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="DuckDB database path (default: configured paths.duckdb_path)",
+    "--limit", type=int, default=None, help="Maximum number of failed jobs to match"
 )
 @click.pass_context
 def retry_summarize_jobs(
@@ -4291,17 +4078,12 @@ def retry_summarize_jobs(
     apply_changes: bool,
     include_validation: bool,
     limit: Optional[int],
-    duckdb_path: Optional[Path],
 ) -> None:
-    """Requeue errored summarize_jobs caused by auth/rate-limit/runtime failures."""
-    cfg = _resolve_config(
-        ctx.obj["config_path"], allow_missing_default=duckdb_path is not None
-    )
-    db_path = duckdb_path or cfg.duckdb_path
-    if duckdb_path is None:
-        bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    """Requeue dead-lettered summarize jobs caused by auth/rate-limit/runtime failures."""
+    cfg = _resolve_config(ctx.obj["config_path"])
+    _require_memory_store(cfg)
     result = retry_errored_jobs(
-        db_path,
+        cfg.duckdb_path,
         apply=apply_changes,
         include_validation=include_validation,
         limit=limit,

@@ -141,6 +141,17 @@ class ProjectBrief:
         }
 
 
+# Match Phase 2's canonical-summary contract using authoritative PG identity.
+# An explicit native alias is hidden only once its harness summary exists.
+CANONICAL_MEMORY = """NOT EXISTS (
+    SELECT 1 FROM harness_sessions identity
+    JOIN session_memory canonical ON canonical.session_id = identity.session_id
+    WHERE identity.native_session_id = session_memory.session_id
+      AND canonical.session_id <> session_memory.session_id
+      AND canonical.phase = 'final'
+)"""
+
+
 _SUMMARY_COLUMNS = (
     "session_id, summary_md, next_steps_md, task_id, agent_id, project_key, ended_at, "
     "files_touched, tools_used, open_questions, last_user_prompt, last_assistant, "
@@ -265,7 +276,9 @@ class MemoryRepository:
         )
 
     @staticmethod
-    def put_recap(con, session_id: str, text: str, source_seq: int, model: Optional[str]) -> bool:
+    def put_recap(
+        con, session_id: str, text: str, source_seq: int, model: Optional[str]
+    ) -> bool:
         """Advance the live phase. An older ``source_seq`` never overwrites a newer one."""
         row = con.execute(
             """INSERT INTO session_memory
@@ -347,7 +360,7 @@ class MemoryRepository:
         since: Optional[datetime] = None,
     ) -> list[SessionSummary]:
         """Final summaries, newest ``ended_at`` first, optionally scoped."""
-        clauses = ["phase = 'final'"]
+        clauses = ["phase = 'final'", CANONICAL_MEMORY]
         params: list[Any] = []
         if project_key is not None:
             clauses.append("project_key = ?")
@@ -376,11 +389,15 @@ class MemoryRepository:
 
     def search_summaries(self, query: str, *, limit: int = 20) -> list[SessionSummary]:
         """Case-insensitive substring match over summary and next steps."""
-        pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        pattern = (
+            "%"
+            + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            + "%"
+        )
         with self.connection() as con:
             rows = con.execute(
                 f"""SELECT {_SUMMARY_COLUMNS} FROM session_memory
-                     WHERE phase = 'final'
+                     WHERE phase = 'final' AND {CANONICAL_MEMORY}
                        AND (summary_md ILIKE ? OR next_steps_md ILIKE ?)
                      ORDER BY ended_at DESC NULLS LAST LIMIT ?""",
                 [pattern, pattern, max(1, int(limit))],
@@ -400,7 +417,12 @@ class MemoryRepository:
             ).fetchall()
         out: dict[str, SessionMemory] = {}
         for row in rows:
-            phase, updated_at, summary_row, recap_row = row[0], row[1], row[2:18], row[18:]
+            phase, updated_at, summary_row, recap_row = (
+                row[0],
+                row[1],
+                row[2:18],
+                row[18:],
+            )
             session_id = summary_row[0]
             out[session_id] = SessionMemory(
                 session_id=session_id,
@@ -429,7 +451,11 @@ class MemoryRepository:
                 f"SELECT {_BRIEF_COLUMNS} FROM project_briefs WHERE project_key = ?",
                 [project_key],
             ).fetchone()
-        return ProjectBrief(*row[:5], tuple(row[5] or ()), tuple(row[6] or ()), *row[7:]) if row else None
+        return (
+            ProjectBrief(*row[:5], tuple(row[5] or ()), tuple(row[6] or ()), *row[7:])
+            if row
+            else None
+        )
 
     def briefs(self, *, limit: int = 20) -> list[ProjectBrief]:
         with self.connection() as con:
@@ -448,14 +474,12 @@ class MemoryRepository:
         if con is None:
             with self.connection() as own:
                 return self.counts(con=own)
-        row = con.execute(
-            """SELECT count(*) FILTER (WHERE phase = 'final'),
+        row = con.execute("""SELECT count(*) FILTER (WHERE phase = 'final'),
                       count(*) FILTER (WHERE recap_text IS NOT NULL),
                       count(*) FILTER (WHERE phase = 'final'
                         AND NULLIF(trim(COALESCE(summary_md, '')), '') IS NOT NULL
                         AND NULLIF(trim(COALESCE(next_steps_md, '')), '') IS NOT NULL)
-                 FROM session_memory"""
-        ).fetchone()
+                 FROM session_memory""").fetchone()
         briefs = con.execute("SELECT count(*) FROM project_briefs").fetchone()[0]
         return {
             "session_summaries": int(row[0] or 0),
@@ -514,7 +538,9 @@ class EmbeddingHit:
 class EmbeddingStore:
     """Session embeddings in one embedding space (model + dimension)."""
 
-    def __init__(self, store_path: str | Path, *, model: str, dim: int = EMBEDDING_DIM) -> None:
+    def __init__(
+        self, store_path: str | Path, *, model: str, dim: int = EMBEDDING_DIM
+    ) -> None:
         require_memory_store(store_path)
         if dim != EMBEDDING_DIM:
             raise EmbeddingMismatch(
@@ -547,12 +573,20 @@ class EmbeddingStore:
             raise EmbeddingMismatch(
                 f"embedding model {model!r} does not match the configured model {self.model!r}"
             )
+        if not isinstance(vector, (list, tuple)):
+            raise EmbeddingMismatch("embedding must be a numeric sequence")
         if len(vector) != self.dim:
             raise EmbeddingMismatch(
                 f"embedding has {len(vector)} dimensions; {self.model!r} space is {self.dim}"
             )
-        if not all(math.isfinite(float(v)) for v in vector):
+        try:
+            values = [float(v) for v in vector]
+        except (TypeError, ValueError) as exc:
+            raise EmbeddingMismatch("embedding contains a non-numeric value") from exc
+        if not all(math.isfinite(v) for v in values):
             raise EmbeddingMismatch("embedding contains a non-finite value")
+        if not any(values):
+            raise EmbeddingMismatch("zero vector has no cosine similarity")
 
     def put(
         self,
@@ -565,7 +599,7 @@ class EmbeddingStore:
     ) -> None:
         """Upsert one session vector on the caller's connection/transaction."""
         self._validate(vector, model)
-        schema = self._vector_schema(con)
+        schema = self._vector_schema(con).replace('"', '""')
         con.execute(
             f"""INSERT INTO session_embeddings
                   (session_id, embedding, model, dim, source_version, embedded_at)
@@ -574,7 +608,13 @@ class EmbeddingStore:
                   embedding = excluded.embedding, model = excluded.model,
                   dim = excluded.dim, source_version = excluded.source_version,
                   embedded_at = now()""",
-            [session_id, _vector_literal(vector), model, len(vector), source_version or ""],
+            [
+                session_id,
+                _vector_literal(vector),
+                model,
+                len(vector),
+                source_version or "",
+            ],
         )
 
     def search(
@@ -588,23 +628,29 @@ class EmbeddingStore:
         """Exact cosine search within this store's embedding space."""
         self._validate(query, model or self.model)
         with self.connection() as con:
-            schema = self._vector_schema(con)
-            clauses = ["model = ?"]
+            schema = self._vector_schema(con).replace('"', '""')
+            clauses = [
+                "e.model = ?",
+                "e.source_version = COALESCE(m.summary_source_version, '')",
+                "m.phase = 'final'",
+                CANONICAL_MEMORY.replace("session_memory.session_id", "m.session_id"),
+            ]
             params: list[Any] = [_vector_literal(query), self.model]
             if session_ids is not None:
                 ids = sorted({str(s) for s in session_ids if s})
                 if not ids:
                     return []
-                clauses.append("session_id = ANY(?)")
+                clauses.append("e.session_id = ANY(?)")
                 params.append(ids)
             rows = con.execute(
-                f"""SELECT session_id,
-                           1 - (embedding OPERATOR("{schema}".<=>) q.v) AS similarity,
-                           model
-                      FROM session_embeddings,
+                f"""SELECT e.session_id,
+                           1 - (e.embedding OPERATOR("{schema}".<=>) q.v) AS similarity,
+                           e.model
+                      FROM session_embeddings e
+                      JOIN session_memory m ON m.session_id = e.session_id,
                            (SELECT ?::"{schema}".vector AS v) q
                      WHERE {' AND '.join(clauses)}
-                     ORDER BY embedding OPERATOR("{schema}".<=>) q.v
+                     ORDER BY e.embedding OPERATOR("{schema}".<=>) q.v
                      LIMIT ?""",
                 [*params, max(1, int(limit))],
             ).fetchall()
@@ -632,7 +678,11 @@ class EmbeddingStore:
             if not vector_status(con)[0]:
                 return set()
             rows = con.execute(
-                "SELECT session_id FROM session_embeddings WHERE model = ? AND session_id = ANY(?)",
+                """SELECT e.session_id FROM session_embeddings e
+                JOIN session_memory m ON m.session_id=e.session_id
+                WHERE e.model = ? AND e.session_id = ANY(?)
+                  AND e.source_version = COALESCE(m.summary_source_version, '')
+                  AND m.phase = 'final'""",
                 [self.model, ids],
             ).fetchall()
         return {r[0] for r in rows}
