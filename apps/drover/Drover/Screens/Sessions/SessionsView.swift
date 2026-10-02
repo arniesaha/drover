@@ -41,6 +41,7 @@ struct SessionsView: View {
     @State private var showAnalytics = false
     @State private var showAccounts = false
     @State private var showInsights = false
+    @State private var showHistory = false
 
     init(
         client: DroverClient,
@@ -107,6 +108,12 @@ struct SessionsView: View {
 
                     if !store.finished.isEmpty {
                         finishedSection
+                    }
+
+                    // The live list holds only recent finished sessions per
+                    // host; everything older, across every host, is History.
+                    if store.hasLoadedOnce {
+                        historyEntry
                     }
 
                     if cockpitStore.isCockpitAvailable {
@@ -286,6 +293,29 @@ struct SessionsView: View {
         .navigationDestination(isPresented: $showInsights) {
             InsightsView(client: client, store: cockpitStore)
         }
+        .navigationDestination(isPresented: $showHistory) {
+            HistoryView(client: client)
+        }
+    }
+
+    private var historyEntry: some View {
+        Button { showHistory = true } label: {
+            CockpitCard {
+                HStack(spacing: 12) {
+                    Image(systemName: "clock.arrow.circlepath").foregroundStyle(DroverColor.accentHi)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("History").droverText(.h2)
+                        Text("Every session across your hosts").droverText(.subtitle)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(DroverColor.faint)
+                }
+                .frame(minHeight: 44, alignment: .leading)
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 4)
+        .accessibilityIdentifier("history-entry")
     }
 
     private var summary: FleetSummaryPresentation {

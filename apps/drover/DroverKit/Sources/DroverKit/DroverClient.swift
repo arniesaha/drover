@@ -442,6 +442,28 @@ public actor DroverClient {
         }
     }
 
+    /// One keyset page of session history across every host. `cursor` is the
+    /// previous page's `nextCursor`, and must be replayed with the same filter.
+    public func historyPage(
+        filter: HistoryFilter,
+        cursor: String?,
+        limit: Int = HistoryPager.pageSize
+    ) async throws -> HistoryPage {
+        var items = filter.queryItems
+        items.append(("limit", String(min(max(limit, 1), 50))))
+        items.append(("cursor", cursor))
+        let url = try queryURL(path: "/sessions/history", items: items)
+        let data = try await request(url: url, method: "GET", body: nil)
+        return try decode(HistoryPage.self, from: data)
+    }
+
+    /// Bounded filter values for the history filter sheet.
+    public func historyFacets() async throws -> HistoryFacets {
+        let url = try queryURL(path: "/sessions/history/facets", items: [])
+        let data = try await request(url: url, method: "GET", body: nil)
+        return try decode(HistoryFacets.self, from: data)
+    }
+
     public func createSession(hostID: String, harness: String, mode: String,
                               prompt: String?, cwd: String?,
                               images: [TurnAttachment] = [],
@@ -735,7 +757,13 @@ public actor DroverClient {
         }
         let analytical = ["/cockpit", "/analytics", "/insights", "/metrics", "/observability"]
             .contains { path == $0 || path.hasPrefix($0 + "/") }
-        return analytical ? baseURL.appendingPathComponent("analytics-lane") : baseURL
+        if analytical { return baseURL.appendingPathComponent("analytics-lane") }
+        // History has its own admission lane on the hub, so a busy history
+        // read must not stall the fleet poll either.
+        if path == "/sessions/history" || path.hasPrefix("/sessions/history/") {
+            return baseURL.appendingPathComponent("history-lane")
+        }
+        return baseURL
     }
 
     private func send(
