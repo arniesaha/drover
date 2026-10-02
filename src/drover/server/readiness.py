@@ -258,6 +258,8 @@ class ReadinessReport:
         return tuple(store for store in self.stores if not store.ok)
 
     def as_dict(self, *, include_detail: bool = True) -> dict[str, object]:
+        from drover.server.process_memory import memory_guard
+
         return {
             "ready": self.ok,
             "checked_at": datetime.fromtimestamp(
@@ -266,11 +268,14 @@ class ReadinessReport:
             "stores": [
                 store.as_dict(include_detail=include_detail) for store in self.stores
             ],
-            **(
-                {"memory": _public_memory(self.memory, include_detail)}
-                if self.memory is not None
-                else {}
-            ),
+            "memory": {
+                **(
+                    _public_memory(self.memory, include_detail)
+                    if self.memory is not None
+                    else {}
+                ),
+                **memory_guard().snapshot(),
+            },
         }
 
     def as_response(self, *, include_detail: bool = True) -> tuple[int, str]:

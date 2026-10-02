@@ -824,7 +824,10 @@ def quality_snapshot(
     for name, category in categories.items():
         for warning in category.get("warnings", []):
             warnings.append(f"{name}: {warning}")
+    from drover.server.process_memory import memory_guard
+
     return {
+        "memory": memory_guard().snapshot(),
         "snapshot_version": 1,
         "generated_at": now.isoformat(),
         "duckdb_path": str(duckdb_path),

@@ -364,6 +364,12 @@ max_request_bytes = 262144
 max_response_bytes = 4194304
 max_concurrent_requests = 8
 
+[memory]
+# This server process only; disposable query children retain a 2 GiB ceiling.
+rss_budget_bytes = 4294967296
+sample_interval_seconds = 1.0
+warn_fraction = 0.8
+
 [server]
 otlp_grpc_port = 4317  # only bound when [telemetry] spans_enabled = true
 mcp_http_port  = 7077
@@ -2340,6 +2346,9 @@ def _run_api_role(
 ) -> None:
     """Run the public/control role without opening any analytical resource."""
 
+    from drover.server.process_memory import configure_memory_guard
+
+    configure_memory_guard(cfg.memory)
     bootstrap_control_plane_store(cfg.duckdb_path)
     require_control_store_ready(cfg.duckdb_path)
     consent = CentralContentConsent(cfg.duckdb_path, legacy_config_path=config_path)
@@ -2533,6 +2542,9 @@ def run(
     _register_stack_dump()
     with _startup_phase("resolve_startup_config"):
         cfg = _resolve_config(ctx.obj["config_path"])
+    from drover.server.process_memory import configure_memory_guard
+
+    configure_memory_guard(cfg.memory)
     runtime_config_path = (
         Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     )

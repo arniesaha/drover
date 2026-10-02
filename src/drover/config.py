@@ -295,6 +295,33 @@ class SetupCheckConfig:
                 raise ValueError(f"setup_check.{name} must be a finite positive number")
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryBudgetConfig:
+    """Server RSS only; disposable analytical children have their own ceilings."""
+
+    rss_budget_bytes: int = 4 * 1024**3
+    sample_interval_seconds: float = 1.0
+    warn_fraction: float = 0.8
+
+    def __post_init__(self):
+        if type(self.rss_budget_bytes) is not int or self.rss_budget_bytes <= 0:
+            raise ValueError("memory.rss_budget_bytes must be a positive integer")
+        if (
+            type(self.sample_interval_seconds) not in (int, float)
+            or not math.isfinite(self.sample_interval_seconds)
+            or self.sample_interval_seconds <= 0
+        ):
+            raise ValueError(
+                "memory.sample_interval_seconds must be finite and positive"
+            )
+        if (
+            type(self.warn_fraction) not in (int, float)
+            or not math.isfinite(self.warn_fraction)
+            or not 0 < self.warn_fraction < 1
+        ):
+            raise ValueError("memory.warn_fraction must be between zero and one")
+
+
 @dataclass(frozen=True)
 class DroverConfig:
     incoming_dir: Path
@@ -420,6 +447,7 @@ class DroverConfig:
     # is a USB SSD whose read stalls (57-120s measured) blocked every session
     # launch; worktree creation must not share a volume with slow bulk data.
     worktrees_dir: Path | None = None
+    memory: MemoryBudgetConfig = MemoryBudgetConfig()
     setup_check: SetupCheckConfig = SetupCheckConfig()
     # Optional span integration (AgentWeave proxy -> Tempo -> tempo-relay ->
     # OTLP :4317 -> Parquet spans/). Off by default since #473: spans only
@@ -431,6 +459,11 @@ class DroverConfig:
 
 
 _DEFAULTS = {
+    "memory": {
+        "rss_budget_bytes": 4 * 1024**3,
+        "sample_interval_seconds": 1.0,
+        "warn_fraction": 0.8,
+    },
     "setup_check": {
         "spawn_timeout_seconds": 20.0,
         "request_timeout_seconds": 5.0,
@@ -710,6 +743,7 @@ def _from_dict(d: dict) -> DroverConfig:
             else None
         ),
         setup_check=SetupCheckConfig(**d["setup_check"]),
+        memory=MemoryBudgetConfig(**d["memory"]),
         control_store=control_store_config,
         runtime=runtime_config,
         analytics_boundary=AnalyticsBoundaryConfig(

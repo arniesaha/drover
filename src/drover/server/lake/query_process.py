@@ -86,6 +86,10 @@ def run_disposable(
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            from drover.server.process_memory import memory_guard
+
+            guard = memory_guard()
+            guard.child_started(child.pid)
             try:
                 while child.poll() is None:
                     if time.monotonic() >= deadline:
@@ -93,7 +97,9 @@ def run_disposable(
                     if os.fstat(output.fileno()).st_size > limits.bytes:
                         raise LakeError("analytics_byte_limit_exceeded")
                     try:
-                        peak = max(peak, _rss(child.pid))
+                        sample = _rss(child.pid)
+                        guard.child_sample(sample)
+                        peak = max(peak, sample)
                     except LakeError:
                         if child.poll() is None:
                             raise
@@ -129,6 +135,7 @@ def run_disposable(
 
                     os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
+                guard.child_finished(child.pid)
 
 
 def query(
