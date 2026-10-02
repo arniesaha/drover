@@ -598,7 +598,7 @@ class InsightsService:
                 raise
 
     def _cancel_pending_model_jobs(self) -> int:
-        from drover.server.ledger import Ledger
+        from drover.server.analytical_ledger import Ledger
 
         con = open_duckdb_connection(self.duckdb_path, role="worker")
         try:

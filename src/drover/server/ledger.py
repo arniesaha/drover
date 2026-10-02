@@ -1,919 +1,735 @@
-"""Durable pipeline ledger helpers (AGE-31 / AGE-42).
+"""The one authoritative job ledger for derived memory work (#464, #480).
 
-This is the DuckDB-backed *system of record* for ingestion and derived-job
-execution. It is the durable-truth counterpart to the Redis execution layer in
-:mod:`drover.server.jobs`:
+Every derived-memory job -- session summaries, session embeddings, project
+briefs and live recaps -- is a row in ``pipeline_jobs`` in the PostgreSQL
+control store. There is no second queue: the legacy DuckDB ``*_jobs`` tables,
+the DuckDB ledger shadow and the Redis delivery streams are gone from this
+path, so there is nothing left to disagree with.
 
-* **DuckDB (here) owns durable truth.** Receipts, logical jobs, attempt history,
-  artifact lineage, idempotency, and final status all live in DuckDB so an
-  operator can reconstruct what happened from the lakehouse alone, even after a
-  crash or with Redis entirely absent.
-* **Redis (``drover.server.jobs``) is optional execution coordination only.**
-  Ready/delay queues, leases, and consumer-group fan-out can accelerate
-  delivery, but losing Redis must never lose durable job state — it is a
-  reconstructable cache, reconciled *from* this ledger.
+State machine::
 
-The four tables live in :mod:`drover.schema` (``pipeline_receipts``,
-``pipeline_jobs``, ``pipeline_job_attempts``, ``pipeline_artifacts``). This
-module owns the *behaviour*: the legal state machines, idempotency rules, and
-the small helper API the watcher/workers call.
+    pending ──claim──▶ running ──complete──▶ succeeded
+       ▲                  │
+       │ (next_run_at)    ├──fail (retryable, budget left)──▶ retry_wait ──┐
+       └──────────────────┼──────────────────────────────────────────────┘
+                          ├──fail (budget spent / lease lost too often)──▶ dead_lettered
+                          ├──fail (non-retryable input fault)───────────▶ quarantined
+                          └──newer source generation / stale input──────▶ superseded
 
-Like :mod:`drover.server.jobs.streams`, this is written to double as executable
-documentation: the transition maps below are the spec, and
-:class:`IllegalTransition` is raised on any move not in them. It assumes the
-existing single-process DuckDB queue model (claim-by-conditional-update); it
-does not add cross-process locking.
+``succeeded``, ``dead_lettered``, ``quarantined`` and ``superseded`` are
+terminal. Every terminal failure carries a ``disposition_reason``; the schema
+refuses one without it.
 
-State machines
---------------
-Receipts::
+Claims take due rows with ``FOR UPDATE SKIP LOCKED``, so two workers never
+block on, or both take, one row, and one poisoned row cannot head the queue:
+it is claimed, fails, and moves out of the due set like any other (#471).
+Each claim mints a fresh lease token. ``complete``/``fail``/``heartbeat``
+match on that token, so a worker whose lease expired and was reclaimed --
+or whose generation was superseded -- cannot overwrite the newer owner.
+Expired leases are reclaimed on every claim and count as a failure, so a job
+that keeps killing its worker dead-letters instead of looping.
 
-    observed ──▶ applied        (source unit accepted, downstream effect committed)
-    observed ──▶ duplicate      (same durable identity already applied)
-    observed ──▶ quarantined    (payload malformed/unsafe; no job created)
-    observed ──▶ failed         (unexpected persistence failure; safe to reconcile)
-    failed   ──▶ observed|applied
-
-Jobs::
-
-    pending      ──▶ leased | cancelled
-    leased       ──▶ succeeded | retry_wait | terminal_failed | cancelled
-    retry_wait   ──▶ pending | cancelled
-    succeeded    ──▶ superseded            (later replay produced a newer winner)
-    terminal_failed ──▶ dead_lettered
-
-Attempts are append-only: created on lease, closed in exactly one terminal
-result (``succeeded``/``retryable_failed``/``terminal_failed``/``cancelled``/
-``superseded``). A retry never mutates a logical job's identity — it appends a
-new attempt row and advances the job snapshot.
+At most one *live* (pending/running/retry_wait) job exists per
+``(job_kind, subject_key)``; a unique partial index enforces it. Enqueueing a
+different ``source_version`` replaces a waiting job in place (it has not
+started, so there is no history to keep) and supersedes a running one.
 """
 
 from __future__ import annotations
 
 import json
-import uuid
+import random
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Sequence
 
-import duckdb
+from drover.server.control_store import is_postgres_control_store
+from drover.server.db import control_plane_connection
 
 # --------------------------------------------------------------------------- #
-# Status vocabularies and legal transitions                                   #
+# Vocabulary                                                                  #
 # --------------------------------------------------------------------------- #
 
-# Receipts ------------------------------------------------------------------ #
-RECEIPT_OBSERVED = "observed"
-RECEIPT_APPLIED = "applied"
-RECEIPT_DUPLICATE = "duplicate"
-RECEIPT_QUARANTINED = "quarantined"
-RECEIPT_FAILED = "failed"
+SUMMARIZE_SESSION = "summarize_session"
+EMBED_SESSION = "embed_session"
+BRIEF_PROJECT = "brief_project"
+RECAP_SESSION = "recap_session"
 
-RECEIPT_STATUSES = frozenset(
-    {
-        RECEIPT_OBSERVED,
-        RECEIPT_APPLIED,
-        RECEIPT_DUPLICATE,
-        RECEIPT_QUARANTINED,
-        RECEIPT_FAILED,
-    }
-)
+JOB_KINDS = (SUMMARIZE_SESSION, EMBED_SESSION, BRIEF_PROJECT, RECAP_SESSION)
 
-RECEIPT_TRANSITIONS: dict[str, frozenset[str]] = {
-    RECEIPT_OBSERVED: frozenset(
-        {RECEIPT_APPLIED, RECEIPT_DUPLICATE, RECEIPT_QUARANTINED, RECEIPT_FAILED}
-    ),
-    # A failed receipt can be reconciled and retried.
-    RECEIPT_FAILED: frozenset({RECEIPT_OBSERVED, RECEIPT_APPLIED}),
-    # applied / duplicate / quarantined are terminal.
-    RECEIPT_APPLIED: frozenset(),
-    RECEIPT_DUPLICATE: frozenset(),
-    RECEIPT_QUARANTINED: frozenset(),
+PENDING = "pending"
+RUNNING = "running"
+RETRY_WAIT = "retry_wait"
+SUCCEEDED = "succeeded"
+DEAD_LETTERED = "dead_lettered"
+QUARANTINED = "quarantined"
+SUPERSEDED = "superseded"
+
+LIVE_STATUSES = (PENDING, RUNNING, RETRY_WAIT)
+FAILED_STATUSES = (DEAD_LETTERED, QUARANTINED)
+TERMINAL_STATUSES = (SUCCEEDED, DEAD_LETTERED, QUARANTINED, SUPERSEDED)
+JOB_STATUSES = LIVE_STATUSES + TERMINAL_STATUSES
+
+EnqueueOutcome = Literal[
+    "queued",  # a new live job
+    "requeued",  # replaced/superseded a live job for an older source version
+    "already_queued",  # a live job for this exact source version exists
+    "already_done",  # this exact source version already succeeded
+    "already_failed",  # this exact source version already dead-lettered
+    "suppressed",  # the subject hit its dead-letter streak cap
+]
+FailOutcome = Literal["retry_wait", "dead_lettered", "quarantined", "stale"]
+
+
+@dataclass(frozen=True)
+class JobPolicy:
+    """Retry, lease and streak bounds for one job kind."""
+
+    max_attempts: int = 5
+    lease_seconds: int = 600
+    retry_base_seconds: int = 60
+    retry_max_seconds: int = 3600
+    # Consecutive failed generations (since the last success) after which new
+    # generations stop opening. A live session mints a generation on every
+    # ingest, so a per-generation budget alone bounds nothing: one session
+    # was once observed at 410 summary attempts.
+    max_failed_streak: Optional[int] = None
+
+
+POLICIES: Mapping[str, JobPolicy] = {
+    SUMMARIZE_SESSION: JobPolicy(max_attempts=5, lease_seconds=900, max_failed_streak=3),
+    EMBED_SESSION: JobPolicy(max_attempts=5, lease_seconds=300),
+    BRIEF_PROJECT: JobPolicy(max_attempts=5, lease_seconds=900),
+    RECAP_SESSION: JobPolicy(max_attempts=8, lease_seconds=300),
 }
 
-# Jobs ---------------------------------------------------------------------- #
-JOB_PENDING = "pending"
-JOB_LEASED = "leased"
-JOB_SUCCEEDED = "succeeded"
-JOB_RETRY_WAIT = "retry_wait"
-JOB_TERMINAL_FAILED = "terminal_failed"
-JOB_DEAD_LETTERED = "dead_lettered"
-JOB_CANCELLED = "cancelled"
-JOB_SUPERSEDED = "superseded"
 
-JOB_STATUSES = frozenset(
-    {
-        JOB_PENDING,
-        JOB_LEASED,
-        JOB_SUCCEEDED,
-        JOB_RETRY_WAIT,
-        JOB_TERMINAL_FAILED,
-        JOB_DEAD_LETTERED,
-        JOB_CANCELLED,
-        JOB_SUPERSEDED,
-    }
-)
-
-JOB_TRANSITIONS: dict[str, frozenset[str]] = {
-    # terminal_failed from pending is for a job that cannot open an attempt at
-    # all (see Ledger.abandon_job). Without it such a job has no exit and is
-    # re-leased forever, which is #143.
-    JOB_PENDING: frozenset({JOB_LEASED, JOB_CANCELLED, JOB_TERMINAL_FAILED}),
-    JOB_LEASED: frozenset(
-        {JOB_SUCCEEDED, JOB_RETRY_WAIT, JOB_TERMINAL_FAILED, JOB_CANCELLED}
-    ),
-    JOB_RETRY_WAIT: frozenset({JOB_PENDING, JOB_CANCELLED}),
-    JOB_SUCCEEDED: frozenset({JOB_SUPERSEDED}),
-    JOB_TERMINAL_FAILED: frozenset({JOB_DEAD_LETTERED}),
-    JOB_DEAD_LETTERED: frozenset(),
-    JOB_CANCELLED: frozenset(),
-    JOB_SUPERSEDED: frozenset(),
-}
-
-# A logical job is reused (not duplicated) by ``open_job`` while it is in one of
-# these states; retries (retry_wait) and replays (succeeded) reuse the same row.
-# A fully-parked job (dead_lettered/cancelled/superseded) lets a fresh
-# generation start.
-JOB_REUSABLE_STATUSES = frozenset(
-    {JOB_PENDING, JOB_LEASED, JOB_RETRY_WAIT, JOB_SUCCEEDED, JOB_TERMINAL_FAILED}
-)
-
-# Attempts ------------------------------------------------------------------ #
-ATTEMPT_SUCCEEDED = "succeeded"
-ATTEMPT_RETRYABLE_FAILED = "retryable_failed"
-ATTEMPT_TERMINAL_FAILED = "terminal_failed"
-ATTEMPT_CANCELLED = "cancelled"
-ATTEMPT_SUPERSEDED = "superseded"
-
-ATTEMPT_RESULTS = frozenset(
-    {
-        ATTEMPT_SUCCEEDED,
-        ATTEMPT_RETRYABLE_FAILED,
-        ATTEMPT_TERMINAL_FAILED,
-        ATTEMPT_CANCELLED,
-        ATTEMPT_SUPERSEDED,
-    }
-)
+class MemoryStoreUnavailable(RuntimeError):
+    """Derived memory needs the PostgreSQL control store, and it is not configured."""
 
 
-class IllegalTransition(ValueError):
-    """Raised when a receipt/job is moved through a transition not in the map."""
-
-
-def assert_receipt_transition(current: str, new: str) -> None:
-    _assert_transition("receipt", RECEIPT_TRANSITIONS, current, new)
-
-
-def assert_job_transition(current: str, new: str) -> None:
-    _assert_transition("job", JOB_TRANSITIONS, current, new)
-
-
-def _assert_transition(
-    label: str, table: Mapping[str, frozenset[str]], current: str, new: str
-) -> None:
-    allowed = table.get(current)
-    if allowed is None:
-        raise IllegalTransition(f"unknown {label} status {current!r}")
-    if new not in allowed:
-        raise IllegalTransition(
-            f"illegal {label} transition {current!r} -> {new!r}; "
-            f"allowed: {sorted(allowed) or '(terminal)'}"
+def require_memory_store(store_path: str | Path) -> None:
+    if not is_postgres_control_store(store_path):
+        raise MemoryStoreUnavailable(
+            "derived memory (summaries, briefs, embeddings, recaps and their "
+            "job ledger) requires control_store.backend = 'postgres'"
         )
 
 
-# --------------------------------------------------------------------------- #
-# Lightweight row views                                                       #
-# --------------------------------------------------------------------------- #
-
-
-#: Stored in place of a missing ``source_version``. A UNIQUE constraint does not
-#: constrain NULLs, so the fence on ``pipeline_receipts`` needs a real value to
-#: bite (#256). Storage-only: it is normalised away on the way out.
-_ABSENT_VERSION = ""
+def memory_store_available(store_path: str | Path) -> bool:
+    return is_postgres_control_store(store_path)
 
 
 @dataclass(frozen=True)
-class Receipt:
-    receipt_id: str
-    source_kind: str
-    source_key: str
-    source_version: Optional[str]
-    subject_kind: Optional[str]
-    subject_key: Optional[str]
-    status: str
+class ClaimedJob:
+    """One leased job. Pass it back to ``complete``/``fail``/``heartbeat``."""
 
-
-@dataclass(frozen=True)
-class ReceiptResult:
-    """Outcome of :meth:`Ledger.record_receipt`."""
-
-    receipt: Receipt
-    is_duplicate: bool
-
-
-@dataclass(frozen=True)
-class Job:
     job_id: str
     job_kind: str
     subject_key: str
-    status: str
-    attempt_count: int
+    source_version: str
+    payload: Mapping[str, Any]
+    attempt: int
+    failures: int
     max_attempts: int
-    latest_attempt_id: Optional[str]
-    latest_artifact_id: Optional[str]
+    lease_token: str
+    lease_expires_at: datetime
 
 
 @dataclass(frozen=True)
-class JobResult:
-    """Outcome of :meth:`Ledger.open_job`."""
-
-    job: Job
-    created: bool
-
-
-@dataclass(frozen=True)
-class Attempt:
-    attempt_id: str
+class JobRow:
     job_id: str
-    attempt_no: int
-    worker_id: Optional[str]
-    result: Optional[str]
+    job_kind: str
+    subject_key: str
+    source_version: str
+    status: str
+    claims: int
+    failures: int
+    max_attempts: int
+    last_error: Optional[str]
+    error_category: Optional[str]
+    disposition_reason: Optional[str]
+    next_run_at: Optional[datetime]
+    enqueued_at: datetime
+    finished_at: Optional[datetime]
 
 
-# --------------------------------------------------------------------------- #
-# Ledger helper                                                               #
-# --------------------------------------------------------------------------- #
+_JOB_ROW_COLUMNS = (
+    "job_id, job_kind, subject_key, source_version, status, claims, failures, "
+    "max_attempts, last_error, error_category, disposition_reason, next_run_at, "
+    "enqueued_at, finished_at"
+)
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+@contextmanager
+def transaction(con) -> Iterator[Any]:
+    """One explicit transaction on an autocommit control-store connection."""
+    con.execute("BEGIN")
+    try:
+        yield con
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    con.execute("COMMIT")
 
 
-class Ledger:
-    """Helper API over the durable pipeline-ledger tables.
+def _clip(message: Optional[str], limit: int = 2000) -> Optional[str]:
+    if message is None:
+        return None
+    return message if len(message) <= limit else message[: limit - 1] + "…"
 
-    Parameters
-    ----------
-    con:
-        An open DuckDB connection whose schema has been bootstrapped.
-    id_factory:
-        Returns a unique id string. Overridable for deterministic tests.
-    clock:
-        Returns the current time. Overridable for deterministic tests.
-    """
+
+def _placeholders(values: Sequence[Any]) -> str:
+    return ", ".join("?" for _ in values)
+
+
+class JobLedger:
+    """Operations on ``pipeline_jobs`` for one registered control-store path."""
 
     def __init__(
         self,
-        con: duckdb.DuckDBPyConnection,
+        store_path: str | Path,
         *,
-        id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
-        clock: Callable[[], datetime] = _utcnow,
+        jitter: Callable[[float, float], float] = random.uniform,
     ) -> None:
-        self._con = con
-        self._new_id = id_factory
-        self._now = clock
+        require_memory_store(store_path)
+        self.store_path = Path(store_path)
+        self._jitter = jitter
 
-    # -- receipts ----------------------------------------------------------- #
+    @contextmanager
+    def connection(self, timeout: float | None = None):
+        with control_plane_connection(self.store_path, timeout=timeout) as con:
+            yield con
 
-    def record_receipt(
+    # -- enqueue ------------------------------------------------------------ #
+
+    def enqueue(
         self,
-        *,
-        source_kind: str,
-        source_key: str,
-        source_version: Optional[str] = None,
-        subject_kind: Optional[str] = None,
-        subject_key: Optional[str] = None,
-        payload_hash: Optional[str] = None,
-        metadata: Optional[Mapping[str, Any]] = None,
-    ) -> ReceiptResult:
-        """Idempotently record a source unit.
-
-        The ``(source_kind, source_key, source_version)`` triple is the durable
-        idempotency fence. If a row already exists for it, this is a *lookup*:
-        the existing receipt is returned with ``is_duplicate=True`` and no new
-        row (and therefore no new downstream job) is created. Otherwise a fresh
-        ``observed`` receipt is inserted.
-        """
-        # The schema stores '' rather than NULL so the unique constraint fences
-        # (#256). Callers still pass and receive None; the sentinel does not
-        # leave this module.
-        stored_version = source_version or _ABSENT_VERSION
-        existing = self._find_receipt(source_kind, source_key, stored_version)
-        if existing is not None:
-            return ReceiptResult(receipt=existing, is_duplicate=True)
-
-        receipt_id = self._new_id()
-        self._con.execute(
-            """
-            INSERT INTO pipeline_receipts
-              (receipt_id, source_kind, source_key, source_version,
-               subject_kind, subject_key, payload_hash, status,
-               first_seen_at, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                receipt_id,
-                source_kind,
-                source_key,
-                stored_version,
-                subject_kind,
-                subject_key,
-                payload_hash,
-                RECEIPT_OBSERVED,
-                self._now(),
-                _dumps(metadata),
-            ],
-        )
-        receipt = self._load_receipt(receipt_id)
-        return ReceiptResult(receipt=receipt, is_duplicate=False)
-
-    def mark_receipt(
-        self, receipt_id: str, status: str, *, last_error: Optional[str] = None
-    ) -> Receipt:
-        """Move a receipt to ``status``, enforcing the receipt state machine."""
-        current = self._load_receipt(receipt_id)
-        assert_receipt_transition(current.status, status)
-        applied_at = self._now() if status == RECEIPT_APPLIED else None
-        self._con.execute(
-            """
-            UPDATE pipeline_receipts
-               SET status = ?,
-                   applied_at = COALESCE(?, applied_at),
-                   last_error = COALESCE(?, last_error)
-             WHERE receipt_id = ?
-            """,
-            [status, applied_at, last_error, receipt_id],
-        )
-        return self._load_receipt(receipt_id)
-
-    # -- jobs --------------------------------------------------------------- #
-
-    def open_job(
-        self,
-        *,
         job_kind: str,
         subject_key: str,
-        subject_kind: Optional[str] = None,
-        caused_by_receipt_id: Optional[str] = None,
+        *,
+        source_version: str = "",
+        payload: Optional[Mapping[str, Any]] = None,
         priority: int = 0,
-        max_attempts: int = 5,
-    ) -> JobResult:
-        """Get-or-create the logical job for ``(job_kind, subject_key)``.
+        delay_seconds: float = 0.0,
+        force: bool = False,
+        con=None,
+    ) -> EnqueueOutcome:
+        """Open (or refresh) the live job for one subject and source version.
 
-        A live job (see :data:`JOB_REUSABLE_STATUSES`) is reused so retries and
-        replays never duplicate the logical row. A previously parked job
-        (dead-lettered / cancelled / superseded) lets a fresh generation start.
+        With ``con`` the enqueue joins the caller's open transaction -- the
+        summarizer enqueues embed/brief work in the same commit as the summary
+        it depends on. Without it, the enqueue is its own transaction.
+
+        ``force`` skips the "this version already succeeded/failed" and streak
+        checks; operator requeue uses it.
         """
-        existing = self._find_reusable_job(job_kind, subject_key)
-        if existing is not None:
-            return JobResult(job=existing, created=False)
+        if job_kind not in POLICIES:
+            raise ValueError(f"unknown job kind {job_kind!r}")
+        if con is not None:
+            outcome = self._enqueue_in(
+                con, job_kind, subject_key, source_version or "", payload,
+                priority, delay_seconds, force,
+            )
+            return "already_queued" if outcome == "_raced" else outcome
+        with self.connection() as own:
+            for _ in range(3):
+                with transaction(own):
+                    outcome = self._enqueue_in(
+                        own, job_kind, subject_key, source_version or "", payload,
+                        priority, delay_seconds, force,
+                    )
+                if outcome != "_raced":
+                    return outcome
+        return "already_queued"
 
-        job_id = self._new_id()
-        now = self._now()
-        self._con.execute(
-            """
-            INSERT INTO pipeline_jobs
-              (job_id, job_kind, subject_kind, subject_key, caused_by_receipt_id,
-               status, priority, attempt_count, max_attempts,
-               created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-            """,
-            [
-                job_id,
-                job_kind,
-                subject_kind,
-                subject_key,
-                caused_by_receipt_id,
-                JOB_PENDING,
-                priority,
-                max_attempts,
-                now,
-                now,
-            ],
-        )
-        return JobResult(job=self._load_job(job_id), created=True)
-
-    def lease_job(
+    def _enqueue_in(
         self,
-        job_id: str,
+        con,
+        job_kind: str,
+        subject_key: str,
+        source_version: str,
+        payload: Optional[Mapping[str, Any]],
+        priority: int,
+        delay_seconds: float,
+        force: bool,
+    ):
+        policy = POLICIES[job_kind]
+        payload_json = json.dumps(dict(payload or {}), sort_keys=True)
+        live = con.execute(
+            f"""SELECT job_id, status, source_version FROM pipeline_jobs
+                 WHERE job_kind = ? AND subject_key = ?
+                   AND status IN ({_placeholders(LIVE_STATUSES)})
+                 FOR UPDATE""",
+            [job_kind, subject_key, *LIVE_STATUSES],
+        ).fetchone()
+        if live is not None:
+            job_id, status, live_version = live
+            if live_version == source_version and not force:
+                return "already_queued"
+            if status in (PENDING, RETRY_WAIT):
+                # Nothing has started on it: retarget in place with a fresh
+                # budget. A different source is a different input.
+                con.execute(
+                    """UPDATE pipeline_jobs
+                          SET source_version = ?, payload_json = ?, status = 'pending',
+                              failures = 0, priority = GREATEST(priority, ?),
+                              next_run_at = now() + make_interval(secs => ?),
+                              last_error = NULL, error_category = NULL,
+                              enqueued_at = now(), updated_at = now()
+                        WHERE job_id = ?""",
+                    [source_version, payload_json, priority, float(delay_seconds), job_id],
+                )
+                return "requeued"
+            self._supersede_in(
+                con, job_id, f"superseded by source version {source_version or '(none)'}"
+            )
+            replaced = True
+        else:
+            replaced = False
+            if not force:
+                prior = con.execute(
+                    f"""SELECT status FROM pipeline_jobs
+                         WHERE job_kind = ? AND subject_key = ? AND source_version = ?
+                           AND status IN (?, ?, ?)
+                         ORDER BY enqueued_at DESC LIMIT 1""",
+                    [job_kind, subject_key, source_version, SUCCEEDED, *FAILED_STATUSES],
+                ).fetchone()
+                if prior is not None:
+                    return "already_done" if prior[0] == SUCCEEDED else "already_failed"
+                if policy.max_failed_streak is not None:
+                    streak = self._failed_streak(con, job_kind, subject_key)
+                    if streak >= policy.max_failed_streak:
+                        return "suppressed"
+        inserted = con.execute(
+            f"""INSERT INTO pipeline_jobs
+                  (job_id, job_kind, subject_key, source_version, payload_json,
+                   status, priority, max_attempts, next_run_at)
+                VALUES (gen_random_uuid()::text, ?, ?, ?, ?, 'pending', ?, ?,
+                        now() + make_interval(secs => ?))
+                ON CONFLICT (job_kind, subject_key)
+                   WHERE status IN ({", ".join(repr(s) for s in LIVE_STATUSES)})
+                DO NOTHING
+                RETURNING job_id""",
+            [job_kind, subject_key, source_version, payload_json, priority,
+             policy.max_attempts, float(delay_seconds)],
+        ).fetchone()
+        if inserted is None:
+            # A concurrent enqueue opened the live row between our lookup and
+            # insert. Re-run against it rather than dropping this version.
+            return "_raced"
+        return "requeued" if replaced else "queued"
+
+    @staticmethod
+    def _failed_streak(con, job_kind: str, subject_key: str) -> int:
+        row = con.execute(
+            """SELECT count(*) FROM pipeline_jobs
+                WHERE job_kind = ? AND subject_key = ?
+                  AND status IN ('dead_lettered', 'quarantined')
+                  AND enqueued_at > COALESCE((
+                    SELECT max(enqueued_at) FROM pipeline_jobs
+                     WHERE job_kind = ? AND subject_key = ? AND status = 'succeeded'
+                  ), '-infinity'::timestamptz)""",
+            [job_kind, subject_key, job_kind, subject_key],
+        ).fetchone()
+        return int(row[0] or 0)
+
+    # -- claim -------------------------------------------------------------- #
+
+    def claim(
+        self,
+        job_kind: str,
         *,
         worker_id: str,
-        lease_expires_at: Optional[datetime] = None,
-    ) -> Attempt:
-        """Claim a ``pending`` job: open a new attempt and mark it ``leased``.
-
-        Increments ``attempt_count`` and appends a ``pipeline_job_attempts`` row
-        (append-only history). Returns the freshly-opened attempt.
-        """
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_LEASED)
-        # Numbered from the attempts themselves, not from `attempt_count`.
-        # The counter is a denormalisation and it is the field that drifts: in
-        # #143 a job sat at attempt_count = 0 with history against it, so every
-        # lease recomputed attempt_no = 1, collided with UNIQUE(job_id,
-        # attempt_no), and retried forever without max_attempts ever engaging.
-        attempt_no = int(
-            self._con.execute(
-                """
-                SELECT COALESCE(MAX(attempt_no), 0) + 1
-                  FROM pipeline_job_attempts
-                 WHERE job_id = ?
-                """,
-                [job_id],
-            ).fetchone()[0]
-        )
-        attempt_id = self._new_id()
-        now = self._now()
-        # One unit: an attempt row the job does not count is precisely the
-        # half-state that cannot be leased again and cannot give up either.
-        self._con.execute("BEGIN TRANSACTION")
-        try:
-            self._con.execute(
-                """
-                INSERT INTO pipeline_job_attempts
-                  (attempt_id, job_id, attempt_no, worker_id, started_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [attempt_id, job_id, attempt_no, worker_id, now],
+        limit: int = 1,
+        lease_seconds: Optional[int] = None,
+    ) -> list[ClaimedJob]:
+        """Lease up to ``limit`` due jobs of one kind, oldest first."""
+        policy = POLICIES[job_kind]
+        lease = int(lease_seconds or policy.lease_seconds)
+        self.reclaim_expired(job_kind)
+        with self.connection() as con:
+            with transaction(con):
+                rows = con.execute(
+                    """WITH due AS (
+                         SELECT job_id FROM pipeline_jobs
+                          WHERE job_kind = ? AND status IN ('pending', 'retry_wait')
+                            AND next_run_at <= now()
+                          ORDER BY priority DESC, next_run_at, enqueued_at
+                          LIMIT ?
+                          FOR UPDATE SKIP LOCKED
+                       ), claimed AS (
+                         UPDATE pipeline_jobs j
+                            SET status = 'running', claims = j.claims + 1,
+                                lease_owner = ?, lease_token = gen_random_uuid()::text,
+                                lease_expires_at = now() + make_interval(secs => ?),
+                                started_at = now(), updated_at = now()
+                           FROM due WHERE j.job_id = due.job_id
+                         RETURNING j.job_id, j.job_kind, j.subject_key, j.source_version,
+                                   j.payload_json, j.claims, j.failures, j.max_attempts,
+                                   j.lease_token, j.lease_expires_at, j.lease_owner,
+                                   j.enqueued_at, j.priority, j.next_run_at
+                       ), opened AS (
+                         INSERT INTO pipeline_job_attempts
+                           (job_id, attempt_no, worker_id, lease_token)
+                         SELECT job_id, claims, lease_owner, lease_token FROM claimed
+                       )
+                       SELECT job_id, job_kind, subject_key, source_version, payload_json,
+                              claims, failures, max_attempts, lease_token, lease_expires_at
+                         FROM claimed
+                        ORDER BY priority DESC, next_run_at, enqueued_at""",
+                    [job_kind, max(1, int(limit)), worker_id, lease],
+                ).fetchall()
+        return [
+            ClaimedJob(
+                job_id=r[0],
+                job_kind=r[1],
+                subject_key=r[2],
+                source_version=r[3],
+                payload=json.loads(r[4] or "{}"),
+                attempt=int(r[5]),
+                failures=int(r[6]),
+                max_attempts=int(r[7]),
+                lease_token=r[8],
+                lease_expires_at=r[9],
             )
-            self._set_job_status(
-                job_id,
-                JOB_LEASED,
-                attempt_count=attempt_no,
-                lease_owner=worker_id,
-                lease_expires_at=lease_expires_at,
-                latest_attempt_id=attempt_id,
-            )
-        except Exception:
-            self._con.execute("ROLLBACK")
-            raise
-        self._con.execute("COMMIT")
-        return self._load_attempt(attempt_id)
+            for r in rows
+        ]
 
-    def abandon_job(
-        self,
-        job_id: str,
-        *,
-        error_category: Optional[str] = None,
-        error_message: Optional[str] = None,
-    ) -> Job:
-        """Fail a job that could never open an attempt.
-
-        ``fail_job`` closes the live attempt, and a job in this state has none
-        to close: it is ``pending`` and every lease was rejected before an
-        attempt row landed. Without a way out of ``pending`` other than
-        ``leased``, such a job is retried for the life of the process (#143).
-
-        The caller is expected to dead-letter it afterwards. ``terminal_failed``
-        is still a reusable status, so parking there alone would let the next
-        cycle requeue the same poisoned row and resume the loop.
-        """
-
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_TERMINAL_FAILED)
-        del error_category, error_message  # recorded by the caller's log
-        self._set_job_status(
-            job_id, JOB_TERMINAL_FAILED, lease_owner=None, lease_expires_at=None
-        )
-        return self._load_job(job_id)
-
-    def succeed_job(
-        self,
-        job_id: str,
-        *,
-        artifact: Optional["ArtifactSpec"] = None,
-        metrics: Optional[Mapping[str, Any]] = None,
-    ) -> Job:
-        """Close the live attempt as succeeded and mark the job ``succeeded``.
-
-        Optionally records the winning artifact (with explicit supersession of
-        any prior current artifact for the same kind+subject).
-        """
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_SUCCEEDED)
-        self._close_attempt(job.latest_attempt_id, ATTEMPT_SUCCEEDED, metrics=metrics)
-        artifact_id = None
-        if artifact is not None:
-            artifact_id = self.record_artifact(
-                job_id=job_id,
-                attempt_id=job.latest_attempt_id,
-                spec=artifact,
-            )
-        self._set_job_status(
-            job_id,
-            JOB_SUCCEEDED,
-            succeeded_at=self._now(),
-            lease_owner=None,
-            lease_expires_at=None,
-            latest_artifact_id=artifact_id,
-        )
-        return self._load_job(job_id)
-
-    def retry_job(
-        self,
-        job_id: str,
-        *,
-        error_category: Optional[str] = None,
-        error_message: Optional[str] = None,
-        next_run_at: Optional[datetime] = None,
-    ) -> Job:
-        """Close the live attempt as retryable and park the job in ``retry_wait``."""
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_RETRY_WAIT)
-        self._close_attempt(
-            job.latest_attempt_id,
-            ATTEMPT_RETRYABLE_FAILED,
-            error_category=error_category,
-            error_message=error_message,
-            retry_at=next_run_at,
-        )
-        self._set_job_status(
-            job_id,
-            JOB_RETRY_WAIT,
-            next_run_at=next_run_at,
-            lease_owner=None,
-            lease_expires_at=None,
-        )
-        return self._load_job(job_id)
-
-    def requeue_job(self, job_id: str) -> Job:
-        """Reconciler step: make a ``retry_wait`` job runnable again (``pending``)."""
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_PENDING)
-        self._set_job_status(job_id, JOB_PENDING, next_run_at=None)
-        return self._load_job(job_id)
-
-    def reclaim_lease(
-        self,
-        job_id: str,
-        *,
-        error_message: str = "lease reclaimed during reconcile",
-        error_category: str = "lease_reclaimed",
-    ) -> Job:
-        """Recover a crashed/stale ``leased`` job back to a runnable state.
-
-        This is the durable crash-recovery primitive: a worker that dies while
-        holding a lease leaves the job ``leased`` with an open attempt. Reconciling
-        from DuckDB closes that attempt as ``retryable_failed`` (append-only — the
-        crashed attempt is recorded, never dropped) and walks the job back to
-        ``pending`` so the next worker re-runs it. Redis is never consulted.
-        """
-        job = self._load_job(job_id)
-        if job.status != JOB_LEASED:
-            raise IllegalTransition(
-                f"reclaim_lease expects a leased job, got {job.status!r}"
-            )
-        self.retry_job(
-            job_id, error_category=error_category, error_message=error_message
-        )
-        return self.requeue_job(job_id)
-
-    def list_leased_jobs(
-        self,
-        *,
-        job_kind: Optional[str] = None,
-        stale_before: Optional[datetime] = None,
-    ) -> list[Job]:
-        """Return ``leased`` jobs, optionally scoped to a kind and a staleness cut.
-
-        ``stale_before`` matches jobs whose ``lease_expires_at`` has passed, or —
-        when no lease expiry was recorded — whose ``updated_at`` is older than the
-        cut. With ``stale_before=None`` every leased job is returned (the
-        single-process model treats any lease still held at reconcile time as
-        crashed).
-        """
-        clauses = ["status = ?"]
-        params: list[Any] = [JOB_LEASED]
-        if job_kind is not None:
-            clauses.append("job_kind = ?")
-            params.append(job_kind)
-        if stale_before is not None:
-            clauses.append(
-                "(lease_expires_at < ? OR "
-                "(lease_expires_at IS NULL AND updated_at < ?))"
-            )
-            params.extend([stale_before, stale_before])
-        rows = self._con.execute(
-            f"""
-            SELECT job_id FROM pipeline_jobs
-             WHERE {' AND '.join(clauses)}
-             ORDER BY updated_at ASC
-            """,
-            params,
-        ).fetchall()
-        return [self._load_job(r[0]) for r in rows]
-
-    def reclaim_stale_leases(
-        self,
-        *,
-        job_kind: Optional[str] = None,
-        stale_before: Optional[datetime] = None,
-    ) -> list[str]:
-        """Reclaim every matching ``leased`` job; return the reclaimed job ids."""
-        reclaimed: list[str] = []
-        for job in self.list_leased_jobs(job_kind=job_kind, stale_before=stale_before):
-            self.reclaim_lease(job.job_id)
-            reclaimed.append(job.job_id)
-        return reclaimed
-
-    def latest_job(self, job_kind: str, subject_key: str) -> Optional[Job]:
-        """Most-recent job snapshot for a subject, any status (read-only peek)."""
-        return self._find_latest_job(job_kind, subject_key)
-
-    def replay_job(
-        self,
-        *,
-        job_kind: str,
-        subject_key: str,
-    ) -> Optional[JobResult]:
-        """Promote the latest job for ``(job_kind, subject_key)`` back to ``pending``.
-
-        This is the operator replay primitive. It never duplicates the logical job
-        for a subject: a finished generation is first parked terminally
-        (``succeeded`` → ``superseded``, ``terminal_failed`` → ``dead_lettered``)
-        and a fresh generation is opened, so attempt history and artifact lineage
-        stay append-only and the next success supersedes the prior current
-        artifact rather than forking a parallel one.
-
-        Returns the resulting :class:`JobResult`, or ``None`` when there is nothing
-        to replay (no job yet) or the job is still ``leased`` (in flight — reconcile
-        the lease first instead of racing it).
-        """
-        job = self._find_latest_job(job_kind, subject_key)
-        if job is None:
-            return None
-        if job.status == JOB_LEASED:
-            return None
-        if job.status == JOB_PENDING:
-            return JobResult(job=job, created=False)
-        if job.status == JOB_RETRY_WAIT:
-            return JobResult(job=self.requeue_job(job.job_id), created=False)
-        if job.status == JOB_SUCCEEDED:
-            self.supersede_job(job.job_id)
-        elif job.status == JOB_TERMINAL_FAILED:
-            self.dead_letter_job(job.job_id)
-        # dead_lettered / cancelled / superseded (and the parked cases above) all
-        # fall through to a fresh generation.
-        return self.open_job(job_kind=job_kind, subject_key=subject_key)
-
-    def fail_job(
-        self,
-        job_id: str,
-        *,
-        error_category: Optional[str] = None,
-        error_message: Optional[str] = None,
-    ) -> Job:
-        """Close the live attempt as terminal and mark the job ``terminal_failed``."""
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_TERMINAL_FAILED)
-        self._close_attempt(
-            job.latest_attempt_id,
-            ATTEMPT_TERMINAL_FAILED,
-            error_category=error_category,
-            error_message=error_message,
-        )
-        self._set_job_status(
-            job_id, JOB_TERMINAL_FAILED, lease_owner=None, lease_expires_at=None
-        )
-        return self._load_job(job_id)
-
-    def dead_letter_job(self, job_id: str) -> Job:
-        """Park a ``terminal_failed`` job in the dead-letter state."""
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_DEAD_LETTERED)
-        self._set_job_status(job_id, JOB_DEAD_LETTERED, dead_lettered_at=self._now())
-        return self._load_job(job_id)
-
-    def cancel_job(self, job_id: str) -> Job:
-        """Operator stop for a ``pending``, ``retry_wait``, or ``leased`` job.
-
-        Cancelling a ``leased`` job also closes its open attempt as ``cancelled``
-        so attempt history stays append-only with exactly one terminal result.
-        """
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_CANCELLED)
-        if job.status == JOB_LEASED:
-            self._close_attempt(job.latest_attempt_id, ATTEMPT_CANCELLED)
-        self._set_job_status(
-            job_id, JOB_CANCELLED, lease_owner=None, lease_expires_at=None
-        )
-        return self._load_job(job_id)
-
-    def supersede_job(self, job_id: str) -> Job:
-        """Mark a ``succeeded`` job superseded by a newer winning generation."""
-        job = self._load_job(job_id)
-        assert_job_transition(job.status, JOB_SUPERSEDED)
-        self._set_job_status(job_id, JOB_SUPERSEDED)
-        return self._load_job(job_id)
-
-    # -- artifacts ---------------------------------------------------------- #
-
-    def record_artifact(
-        self,
-        *,
-        job_id: str,
-        attempt_id: Optional[str],
-        spec: "ArtifactSpec",
-    ) -> str:
-        """Append a durable artifact row, superseding the prior current version.
-
-        For singleton projections (one current ``session_summary`` per session,
-        etc.) the previous current artifact with the same
-        ``(artifact_kind, subject_key)`` is flipped to ``is_current = FALSE`` and
-        linked via ``supersedes_artifact_id`` so history is preserved.
-        """
-        prior_id = None
-        if spec.subject_key is not None:
-            row = self._con.execute(
-                """
-                SELECT artifact_id FROM pipeline_artifacts
-                 WHERE artifact_kind = ? AND subject_key = ? AND is_current
-                 ORDER BY created_at DESC
-                 LIMIT 1
-                """,
-                [spec.artifact_kind, spec.subject_key],
+    def has_due(self, job_kind: str) -> bool:
+        """Cheap idle check, so workers never warm a model on an empty queue."""
+        with self.connection() as con:
+            row = con.execute(
+                """SELECT 1 FROM pipeline_jobs
+                    WHERE job_kind = ?
+                      AND ((status IN ('pending', 'retry_wait') AND next_run_at <= now())
+                        OR (status = 'running' AND lease_expires_at < now()))
+                    LIMIT 1""",
+                [job_kind],
             ).fetchone()
-            if row is not None:
-                prior_id = row[0]
-                self._con.execute(
-                    "UPDATE pipeline_artifacts SET is_current = FALSE "
-                    "WHERE artifact_id = ?",
-                    [prior_id],
+        return row is not None
+
+    def heartbeat(self, job: ClaimedJob, *, lease_seconds: Optional[int] = None) -> bool:
+        lease = int(lease_seconds or POLICIES[job.job_kind].lease_seconds)
+        with self.connection() as con:
+            row = con.execute(
+                """UPDATE pipeline_jobs
+                      SET lease_expires_at = now() + make_interval(secs => ?),
+                          updated_at = now()
+                    WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                RETURNING job_id""",
+                [lease, job.job_id, job.lease_token],
+            ).fetchone()
+        return row is not None
+
+    # -- finish ------------------------------------------------------------- #
+
+    def complete(self, job: ClaimedJob, *, con=None, metrics: Optional[Mapping[str, Any]] = None) -> bool:
+        """Mark a leased job succeeded. False if the lease is no longer ours.
+
+        With ``con``, joins the caller's transaction so the derived row and the
+        job transition commit together (and roll back together when this
+        returns False and the caller aborts).
+        """
+        if con is not None:
+            return self._complete_in(con, job, metrics)
+        with self.connection() as own:
+            with transaction(own):
+                return self._complete_in(own, job, metrics)
+
+    @staticmethod
+    def _complete_in(con, job: ClaimedJob, metrics) -> bool:
+        row = con.execute(
+            """UPDATE pipeline_jobs
+                  SET status = 'succeeded', finished_at = now(), updated_at = now(),
+                      lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                      last_error = NULL, error_category = NULL
+                WHERE job_id = ? AND lease_token = ? AND status = 'running'
+            RETURNING job_id""",
+            [job.job_id, job.lease_token],
+        ).fetchone()
+        if row is None:
+            return False
+        con.execute(
+            """UPDATE pipeline_job_attempts
+                  SET finished_at = now(), result = 'succeeded', metrics_json = ?
+                WHERE job_id = ? AND lease_token = ? AND finished_at IS NULL""",
+            [json.dumps(dict(metrics)) if metrics else None, job.job_id, job.lease_token],
+        )
+        return True
+
+    def fail(
+        self,
+        job: ClaimedJob,
+        error: str,
+        *,
+        retryable: bool = True,
+        category: Optional[str] = None,
+    ) -> FailOutcome:
+        """Spend one failure: retry with backoff, dead-letter, or quarantine."""
+        with self.connection() as con:
+            with transaction(con):
+                row = con.execute(
+                    """SELECT failures, max_attempts FROM pipeline_jobs
+                        WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                        FOR UPDATE""",
+                    [job.job_id, job.lease_token],
+                ).fetchone()
+                if row is None:
+                    return "stale"
+                return self._spend_failure(
+                    con, job.job_id, job.lease_token, job.job_kind,
+                    int(row[0]), int(row[1]), error, retryable, category,
+                    attempt_result="retryable_failed" if retryable else "terminal_failed",
                 )
 
-        artifact_id = self._new_id()
-        self._con.execute(
-            """
-            INSERT INTO pipeline_artifacts
-              (artifact_id, job_id, attempt_id, artifact_kind, subject_key,
-               storage_uri, content_hash, version_token, supersedes_artifact_id,
-               is_current, created_at, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?)
-            """,
-            [
-                artifact_id,
-                job_id,
-                attempt_id,
-                spec.artifact_kind,
-                spec.subject_key,
-                spec.storage_uri,
-                spec.content_hash,
-                spec.version_token,
-                prior_id,
-                self._now(),
-                _dumps(spec.metadata),
-            ],
-        )
-        return artifact_id
-
-    # -- internal helpers --------------------------------------------------- #
-
-    def _set_job_status(self, job_id: str, status: str, **fields: Any) -> None:
-        sets = ["status = ?", "updated_at = ?"]
-        params: list[Any] = [status, self._now()]
-        for name, value in fields.items():
-            sets.append(f"{name} = ?")
-            params.append(value)
-        params.append(job_id)
-        self._con.execute(
-            f"UPDATE pipeline_jobs SET {', '.join(sets)} WHERE job_id = ?", params
-        )
-
-    def _close_attempt(
+    def _spend_failure(
         self,
-        attempt_id: Optional[str],
-        result: str,
+        con,
+        job_id: str,
+        lease_token: str,
+        job_kind: str,
+        failures: int,
+        max_attempts: int,
+        error: str,
+        retryable: bool,
+        category: Optional[str],
         *,
-        error_category: Optional[str] = None,
-        error_message: Optional[str] = None,
-        retry_at: Optional[datetime] = None,
-        metrics: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        if result not in ATTEMPT_RESULTS:
-            raise IllegalTransition(f"unknown attempt result {result!r}")
-        if attempt_id is None:
-            raise IllegalTransition("no open attempt to close for this job")
-        self._con.execute(
-            """
-            UPDATE pipeline_job_attempts
-               SET result = ?, finished_at = ?, error_category = ?,
-                   error_message = ?, retry_at = ?, metrics_json = ?
-             WHERE attempt_id = ?
-            """,
-            [
-                result,
-                self._now(),
-                error_category,
-                error_message,
-                retry_at,
-                _dumps(metrics),
-                attempt_id,
-            ],
+        attempt_result: str,
+    ) -> FailOutcome:
+        policy = POLICIES[job_kind]
+        spent = failures + 1
+        error = _clip(error) or "unknown error"
+        if not retryable:
+            status: FailOutcome = "quarantined"
+            reason = f"quarantined ({category or 'non_retryable'}): {error}"
+        elif spent >= max_attempts:
+            status = "dead_lettered"
+            reason = f"exhausted {spent}/{max_attempts} attempts ({category or 'error'}): {error}"
+        else:
+            status = "retry_wait"
+            reason = None
+        delay = min(
+            policy.retry_base_seconds * (2 ** max(spent - 1, 0)),
+            policy.retry_max_seconds,
+        ) * (1 + self._jitter(0, 0.2))
+        con.execute(
+            """UPDATE pipeline_jobs
+                  SET status = ?, failures = ?, last_error = ?, error_category = ?,
+                      disposition_reason = ?,
+                      next_run_at = CASE WHEN ? = 'retry_wait'
+                                         THEN now() + make_interval(secs => ?)
+                                         ELSE next_run_at END,
+                      finished_at = CASE WHEN ? = 'retry_wait' THEN NULL ELSE now() END,
+                      lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                      updated_at = now()
+                WHERE job_id = ?""",
+            [status, spent, error, category, _clip(reason), status, float(delay),
+             status, job_id],
         )
+        con.execute(
+            """UPDATE pipeline_job_attempts
+                  SET finished_at = now(), result = ?, error_category = ?, error_message = ?
+                WHERE job_id = ? AND lease_token = ? AND finished_at IS NULL""",
+            [attempt_result, category, error, job_id, lease_token],
+        )
+        return status
 
-    def _find_receipt(
-        self, source_kind: str, source_key: str, source_version: str
-    ) -> Optional[Receipt]:
-        """Look a receipt up by its fence triple.
+    def release(self, job: ClaimedJob, *, delay_seconds: float, reason: str) -> bool:
+        """Give a lease back without spending an attempt.
 
-        Takes the stored form, so an absent version is '' rather than None and
-        this is a plain equality match. The version that branched on NULL is
-        gone with the nullable column (#256): it was the only thing standing
-        between a racing pair of ingests and two receipts for one source unit,
-        and being the only thing is what made it a check-then-act.
+        For conditions outside the job (no backend configured, model host
+        asleep): the job is fine, the worker just cannot run it right now.
         """
-        row = self._con.execute(
-            """
-            SELECT receipt_id FROM pipeline_receipts
-             WHERE source_kind = ? AND source_key = ? AND source_version = ?
-            """,
-            [source_kind, source_key, source_version],
-        ).fetchone()
-        return self._load_receipt(row[0]) if row is not None else None
+        with self.connection() as con:
+            with transaction(con):
+                row = con.execute(
+                    """UPDATE pipeline_jobs
+                          SET status = 'retry_wait', last_error = ?, error_category = 'released',
+                              next_run_at = now() + make_interval(secs => ?),
+                              lease_token = NULL, lease_owner = NULL,
+                              lease_expires_at = NULL, updated_at = now()
+                        WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                    RETURNING job_id""",
+                    [_clip(reason), float(delay_seconds), job.job_id, job.lease_token],
+                ).fetchone()
+                if row is None:
+                    return False
+                con.execute(
+                    """UPDATE pipeline_job_attempts
+                          SET finished_at = now(), result = 'released', error_message = ?
+                        WHERE job_id = ? AND lease_token = ? AND finished_at IS NULL""",
+                    [_clip(reason), job.job_id, job.lease_token],
+                )
+        return True
 
-    def _find_reusable_job(self, job_kind: str, subject_key: str) -> Optional[Job]:
-        placeholders = ", ".join("?" for _ in JOB_REUSABLE_STATUSES)
-        row = self._con.execute(
-            f"""
-            SELECT job_id FROM pipeline_jobs
-             WHERE job_kind = ? AND subject_key = ? AND status IN ({placeholders})
-             ORDER BY created_at DESC
-             LIMIT 1
-            """,
-            [job_kind, subject_key, *sorted(JOB_REUSABLE_STATUSES)],
-        ).fetchone()
-        return self._load_job(row[0]) if row is not None else None
+    def supersede(self, job: ClaimedJob, reason: str, *, con=None) -> bool:
+        """Retire a leased job whose input moved on (stale generation)."""
+        if con is not None:
+            return self._supersede_leased(con, job, reason)
+        with self.connection() as own:
+            with transaction(own):
+                return self._supersede_leased(own, job, reason)
 
-    def _find_latest_job(self, job_kind: str, subject_key: str) -> Optional[Job]:
-        """Most-recent job for a subject regardless of status (for replay)."""
-        row = self._con.execute(
-            """
-            SELECT job_id FROM pipeline_jobs
-             WHERE job_kind = ? AND subject_key = ?
-             ORDER BY created_at DESC
-             LIMIT 1
-            """,
-            [job_kind, subject_key],
-        ).fetchone()
-        return self._load_job(row[0]) if row is not None else None
-
-    def _load_receipt(self, receipt_id: str) -> Receipt:
-        row = self._con.execute(
-            """
-            SELECT receipt_id, source_kind, source_key, source_version,
-                   subject_kind, subject_key, status
-              FROM pipeline_receipts WHERE receipt_id = ?
-            """,
-            [receipt_id],
+    def _supersede_leased(self, con, job: ClaimedJob, reason: str) -> bool:
+        row = con.execute(
+            """SELECT 1 FROM pipeline_jobs
+                WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                FOR UPDATE""",
+            [job.job_id, job.lease_token],
         ).fetchone()
         if row is None:
-            raise KeyError(f"receipt {receipt_id!r} not found")
-        receipt_id_, source_kind, source_key, source_version, *rest = row
-        return Receipt(
-            receipt_id_,
-            source_kind,
-            source_key,
-            source_version or None,
-            *rest,
+            return False
+        self._supersede_in(con, job.job_id, reason)
+        return True
+
+    @staticmethod
+    def _supersede_in(con, job_id: str, reason: str) -> None:
+        con.execute(
+            """UPDATE pipeline_job_attempts
+                  SET finished_at = now(), result = 'superseded', error_message = ?
+                WHERE job_id = ? AND finished_at IS NULL""",
+            [_clip(reason), job_id],
+        )
+        con.execute(
+            """UPDATE pipeline_jobs
+                  SET status = 'superseded', disposition_reason = ?, finished_at = now(),
+                      lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                      updated_at = now()
+                WHERE job_id = ?""",
+            [_clip(reason), job_id],
         )
 
-    def _load_job(self, job_id: str) -> Job:
-        row = self._con.execute(
-            """
-            SELECT job_id, job_kind, subject_key, status, attempt_count,
-                   max_attempts, latest_attempt_id, latest_artifact_id
-              FROM pipeline_jobs WHERE job_id = ?
-            """,
-            [job_id],
+    # -- recovery ----------------------------------------------------------- #
+
+    def reclaim_expired(self, job_kind: Optional[str] = None) -> int:
+        """Return expired leases to the due set, spending one failure each."""
+        kinds = [job_kind] if job_kind else list(JOB_KINDS)
+        reclaimed = 0
+        with self.connection() as con:
+            with transaction(con):
+                rows = con.execute(
+                    f"""SELECT job_id, lease_token, job_kind, failures, max_attempts
+                          FROM pipeline_jobs
+                         WHERE status = 'running' AND lease_expires_at < now()
+                           AND job_kind IN ({_placeholders(kinds)})
+                         FOR UPDATE SKIP LOCKED""",
+                    kinds,
+                ).fetchall()
+                for job_id, token, kind, failures, max_attempts in rows:
+                    self._spend_failure(
+                        con, job_id, token, kind, int(failures), int(max_attempts),
+                        "lease expired before the worker finished", True,
+                        "lease_expired", attempt_result="lease_expired",
+                    )
+                    reclaimed += 1
+        return reclaimed
+
+    # -- reads -------------------------------------------------------------- #
+
+    def latest(self, job_kind: str, subject_key: str) -> Optional[JobRow]:
+        with self.connection() as con:
+            row = con.execute(
+                f"""SELECT {_JOB_ROW_COLUMNS} FROM pipeline_jobs
+                     WHERE job_kind = ? AND subject_key = ?
+                     ORDER BY enqueued_at DESC, updated_at DESC LIMIT 1""",
+                [job_kind, subject_key],
+            ).fetchone()
+        return JobRow(*row) if row is not None else None
+
+    def jobs(
+        self,
+        job_kind: str,
+        *,
+        statuses: Sequence[str] = FAILED_STATUSES,
+        limit: int = 100,
+    ) -> list[JobRow]:
+        with self.connection() as con:
+            rows = con.execute(
+                f"""SELECT {_JOB_ROW_COLUMNS} FROM pipeline_jobs
+                     WHERE job_kind = ? AND status IN ({_placeholders(statuses)})
+                     ORDER BY updated_at DESC LIMIT ?""",
+                [job_kind, *statuses, max(1, int(limit))],
+            ).fetchall()
+        return [JobRow(*row) for row in rows]
+
+    def stats(self, *, con=None, timeout: float | None = None) -> dict[str, dict[str, Any]]:
+        """Per-kind queue health for ``/readyz`` and ``drover_data_quality``."""
+        if con is None:
+            with self.connection(timeout=timeout) as own:
+                return self.stats(con=own)
+        return ledger_stats(con)
+
+
+def ledger_stats(con) -> dict[str, dict[str, Any]]:
+    """Per-kind health from one control-store connection (index-backed reads)."""
+    out: dict[str, dict[str, Any]] = {
+        kind: {
+            "pending": 0,
+            "retry_wait": 0,
+            "running": 0,
+            "expired_leases": 0,
+            "oldest_lease_age_seconds": None,
+            "oldest_pending_age_seconds": None,
+            "dead_lettered": 0,
+            "quarantined": 0,
+            "last_success_at": None,
+            "last_error": None,
+        }
+        for kind in JOB_KINDS
+    }
+    # job_kind is CHECK-constrained to JOB_KINDS, so every row has a slot.
+    for row in con.execute(
+        """SELECT job_kind,
+                  count(*) FILTER (WHERE status = 'pending'),
+                  count(*) FILTER (WHERE status = 'retry_wait'),
+                  count(*) FILTER (WHERE status = 'running'),
+                  count(*) FILTER (WHERE status = 'running' AND lease_expires_at < now()),
+                  EXTRACT(EPOCH FROM now() - min(started_at) FILTER (WHERE status = 'running')),
+                  EXTRACT(EPOCH FROM now() - min(enqueued_at)
+                          FILTER (WHERE status IN ('pending', 'retry_wait')))
+             FROM pipeline_jobs
+            WHERE status IN ('pending', 'running', 'retry_wait')
+            GROUP BY job_kind"""
+    ).fetchall():
+        out[row[0]].update(
+            pending=int(row[1]),
+            retry_wait=int(row[2]),
+            running=int(row[3]),
+            expired_leases=int(row[4]),
+            oldest_lease_age_seconds=_seconds(row[5]),
+            oldest_pending_age_seconds=_seconds(row[6]),
+        )
+    for job_kind, status, count in con.execute(
+        """SELECT job_kind, status, count(*) FROM pipeline_jobs
+            WHERE status IN ('dead_lettered', 'quarantined')
+            GROUP BY job_kind, status"""
+    ).fetchall():
+        out[job_kind][status] = int(count)
+    for job_kind in JOB_KINDS:
+        success = con.execute(
+            """SELECT finished_at FROM pipeline_jobs
+                WHERE job_kind = ? AND status = 'succeeded'
+                ORDER BY finished_at DESC LIMIT 1""",
+            [job_kind],
         ).fetchone()
-        if row is None:
-            raise KeyError(f"job {job_id!r} not found")
-        return Job(*row)
-
-    def _load_attempt(self, attempt_id: str) -> Attempt:
-        row = self._con.execute(
-            """
-            SELECT attempt_id, job_id, attempt_no, worker_id, result
-              FROM pipeline_job_attempts WHERE attempt_id = ?
-            """,
-            [attempt_id],
+        if success is not None and success[0] is not None:
+            out[job_kind]["last_success_at"] = success[0].isoformat()
+        error = con.execute(
+            """SELECT last_error FROM pipeline_jobs
+                WHERE job_kind = ? AND last_error IS NOT NULL
+                  AND status IN ('retry_wait', 'dead_lettered', 'quarantined')
+                ORDER BY updated_at DESC LIMIT 1""",
+            [job_kind],
         ).fetchone()
-        if row is None:
-            raise KeyError(f"attempt {attempt_id!r} not found")
-        return Attempt(*row)
+        if error is not None:
+            out[job_kind]["last_error"] = _clip(error[0], 300)
+    return out
 
 
-@dataclass(frozen=True)
-class ArtifactSpec:
-    """Description of a durable output to record via :meth:`Ledger.record_artifact`."""
-
-    artifact_kind: str
-    subject_key: Optional[str] = None
-    storage_uri: Optional[str] = None
-    content_hash: Optional[str] = None
-    version_token: Optional[str] = None
-    metadata: Optional[Mapping[str, Any]] = None
-
-
-def _dumps(value: Optional[Mapping[str, Any]]) -> Optional[str]:
-    return None if value is None else json.dumps(value, sort_keys=True)
+def _seconds(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    return round(max(0.0, float(value)), 1)

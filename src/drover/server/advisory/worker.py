@@ -69,7 +69,7 @@ from drover.server.db import (
     control_plane_connection,
     open_duckdb_connection,
 )
-from drover.server.ledger import ArtifactSpec, Job, Ledger
+from drover.server.analytical_ledger import ArtifactSpec, Job, Ledger
 
 log = logging.getLogger("drover.advisory")
 SnapshotFactory = Callable[[str, str, str], AnalysisSnapshot]

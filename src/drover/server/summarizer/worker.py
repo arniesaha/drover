@@ -37,7 +37,7 @@ from drover.server import ledger_shadow
 from drover.server.claim_quarantine import ClaimQuarantine
 from drover.server.db import open_duckdb_connection
 from drover.server.jobs import Delivery
-from drover.server.ledger import ArtifactSpec, Ledger
+from drover.server.analytical_ledger import ArtifactSpec, Ledger
 from drover.server.summarizer.backends import (
     BackendError,
     LLMBackend,

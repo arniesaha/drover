@@ -2213,7 +2213,7 @@ def _reconcile_preview(
     duckdb_path: Path, job_kind: str, stale_before: Optional[datetime]
 ) -> dict[str, int]:
     """Count in-flight serving/ledger rows a reconcile would reset (read-only)."""
-    from drover.server.ledger import Ledger
+    from drover.server.analytical_ledger import Ledger
 
     binding = ledger_shadow.SERVING_JOBS.get(job_kind)
     con = open_duckdb_connection(duckdb_path, read_only=True, role="diagnostic")

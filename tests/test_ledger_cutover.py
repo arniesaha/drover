@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 
 from drover.schema import bootstrap
 from drover.server import ledger_shadow
-from drover.server.ledger import Ledger
+from drover.server.analytical_ledger import Ledger
 from drover.server.summarizer.worker import SummarizerWorker
 
 

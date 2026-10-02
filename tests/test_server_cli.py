@@ -39,7 +39,7 @@ from drover.server.__main__ import (
 from drover.server.db import control_plane_path
 from drover.server.harness import cli as harness_cli
 from drover.server.harness.recap_jobs import enqueue_live_recap
-from drover.server.ledger import ArtifactSpec, Ledger
+from drover.server.analytical_ledger import ArtifactSpec, Ledger
 from drover.server.setup_readiness import SetupCheck, SetupReadinessReport
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.wol import GpuRig

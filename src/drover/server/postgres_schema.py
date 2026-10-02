@@ -255,7 +255,203 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE harness_hosts ADD COLUMN IF NOT EXISTS retired_reason TEXT",
         ),
     ),
+    (
+        7,
+        (
+            # #480: the one job ledger and the derived memory it produces.
+            # Rebuild, don't migrate derived rows. Preserve legacy tables;
+            # removal is an explicit, separately authorized maintenance step.
+            """
+            CREATE TABLE pipeline_jobs (
+              job_id TEXT PRIMARY KEY,
+              job_kind TEXT NOT NULL CHECK (job_kind IN
+                ('summarize_session', 'embed_session', 'brief_project', 'recap_session')),
+              subject_key TEXT NOT NULL,
+              source_version TEXT NOT NULL DEFAULT '',
+              payload_json TEXT NOT NULL DEFAULT '{}',
+              status TEXT NOT NULL CHECK (status IN
+                ('pending', 'running', 'retry_wait', 'succeeded',
+                 'dead_lettered', 'quarantined', 'superseded')),
+              priority INTEGER NOT NULL DEFAULT 0,
+              claims INTEGER NOT NULL DEFAULT 0 CHECK (claims >= 0),
+              failures INTEGER NOT NULL DEFAULT 0 CHECK (failures >= 0),
+              max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+              next_run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              lease_owner TEXT, lease_token TEXT, lease_expires_at TIMESTAMPTZ,
+              last_error TEXT, error_category TEXT, disposition_reason TEXT,
+              enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              CHECK ((status = 'running') = (lease_token IS NOT NULL)),
+              CHECK (status = 'running' OR lease_expires_at IS NULL),
+              CHECK (status NOT IN ('dead_lettered', 'quarantined', 'superseded')
+                     OR disposition_reason IS NOT NULL)
+            )
+            """,
+            # At most one live job per subject; enqueue conflicts on this.
+            """
+            CREATE UNIQUE INDEX pipeline_jobs_one_live ON pipeline_jobs (job_kind, subject_key)
+             WHERE status IN ('pending', 'running', 'retry_wait')
+            """,
+            # The due-work claim: SELECT ... FOR UPDATE SKIP LOCKED walks this.
+            """
+            CREATE INDEX pipeline_jobs_due ON pipeline_jobs
+              (job_kind, priority DESC, next_run_at, enqueued_at)
+             WHERE status IN ('pending', 'retry_wait')
+            """,
+            """
+            CREATE INDEX pipeline_jobs_leases ON pipeline_jobs (job_kind, lease_expires_at)
+             WHERE status = 'running'
+            """,
+            """
+            CREATE INDEX pipeline_jobs_failed ON pipeline_jobs (job_kind, updated_at DESC)
+             WHERE status IN ('retry_wait', 'dead_lettered', 'quarantined')
+            """,
+            """
+            CREATE INDEX pipeline_jobs_succeeded ON pipeline_jobs (job_kind, finished_at DESC)
+             WHERE status = 'succeeded'
+            """,
+            "CREATE INDEX pipeline_jobs_subject ON pipeline_jobs (job_kind, subject_key, enqueued_at DESC)",
+            """
+            CREATE TABLE pipeline_job_attempts (
+              attempt_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+              job_id TEXT NOT NULL REFERENCES pipeline_jobs (job_id) ON DELETE CASCADE,
+              attempt_no INTEGER NOT NULL, worker_id TEXT, lease_token TEXT NOT NULL,
+              started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ,
+              result TEXT CHECK (result IN
+                ('succeeded', 'retryable_failed', 'terminal_failed', 'lease_expired',
+                 'released', 'superseded')),
+              error_category TEXT, error_message TEXT, metrics_json TEXT,
+              UNIQUE (job_id, attempt_no)
+            )
+            """,
+            "CREATE INDEX pipeline_job_attempts_open ON pipeline_job_attempts (job_id, lease_token) WHERE finished_at IS NULL",
+            # One memory row per session. The live recap and the final summary
+            # are two phases of it; `phase` says which the latest reader shows.
+            """
+            CREATE TABLE session_memory (
+              session_id TEXT PRIMARY KEY,
+              phase TEXT NOT NULL CHECK (phase IN ('live', 'final')),
+              task_id TEXT, agent_id TEXT, project_key TEXT, ended_at TIMESTAMPTZ,
+              summary_md TEXT, next_steps_md TEXT,
+              files_touched TEXT[] NOT NULL DEFAULT '{}',
+              tools_used JSONB NOT NULL DEFAULT '{}'::jsonb,
+              open_questions TEXT[] NOT NULL DEFAULT '{}',
+              last_user_prompt TEXT, last_assistant TEXT, summary_status TEXT,
+              summary_source_version TEXT, summary_model TEXT,
+              summary_generated_at TIMESTAMPTZ,
+              recap_text TEXT, recap_source_seq INTEGER, recap_model TEXT,
+              recap_generated_at TIMESTAMPTZ,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              CHECK ((phase = 'final') = (summary_generated_at IS NOT NULL)),
+              CHECK ((recap_text IS NULL) = (recap_source_seq IS NULL))
+            )
+            """,
+            """
+            CREATE INDEX session_memory_final_recent ON session_memory (ended_at DESC NULLS LAST)
+             WHERE phase = 'final'
+            """,
+            "CREATE INDEX session_memory_project ON session_memory (project_key, ended_at DESC NULLS LAST)",
+            "CREATE INDEX session_memory_task ON session_memory (task_id)",
+            """
+            CREATE TABLE project_briefs (
+              project_key TEXT PRIMARY KEY, repo_owner TEXT NOT NULL, repo_name TEXT NOT NULL,
+              brief_md TEXT NOT NULL, recent_themes_md TEXT,
+              key_files TEXT[] NOT NULL DEFAULT '{}',
+              open_questions TEXT[] NOT NULL DEFAULT '{}',
+              next_steps_md TEXT, session_count INTEGER NOT NULL DEFAULT 0,
+              last_activity_at TIMESTAMPTZ, source_session_id TEXT,
+              source_version TEXT, generator_model TEXT,
+              generated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+        ),
+    ),
 )
+
+#: Session embeddings need pgvector, which is a server-side extension the
+#: control store may not have. They are a separate, conditional migration so a
+#: server without pgvector still bootstraps everything else -- and readiness
+#: then fails loudly instead of the embedding path silently falling back.
+VECTOR_MIGRATION = 8
+EMBEDDING_DIM = 768
+
+
+def _vector_migration_statements(extension_schema: str) -> tuple[str, ...]:
+    from psycopg import sql
+
+    vector_type = sql.SQL("{}.vector({})").format(
+        sql.Identifier(extension_schema), sql.Literal(EMBEDDING_DIM)
+    )
+    return (
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS session_embeddings (
+              session_id TEXT PRIMARY KEY,
+              embedding {} NOT NULL,
+              model TEXT NOT NULL,
+              dim INTEGER NOT NULL CHECK (dim = {}),
+              source_version TEXT NOT NULL DEFAULT '',
+              embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        ).format(vector_type, sql.Literal(EMBEDDING_DIM)),
+        sql.SQL(
+            "CREATE INDEX IF NOT EXISTS session_embeddings_model ON session_embeddings (model)"
+        ),
+    )
+
+
+def vector_extension_schema(con: Any) -> str | None:
+    """Schema pgvector is installed in for this database, or None."""
+    row = con.execute(
+        "SELECT extnamespace::regnamespace::text FROM pg_extension WHERE extname = 'vector'"
+    ).fetchone()
+    return None if row is None else str(row[0]).strip('"')
+
+
+def _apply_vector_migration(con: Any, raw: Any) -> None:
+    """Create session_embeddings when pgvector can be enabled; otherwise skip.
+
+    Runs inside the bootstrap transaction under a savepoint, so a missing or
+    unprivileged extension rolls back only this step. It is retried on every
+    bootstrap until it succeeds. The extension is pinned to ``public`` so a
+    per-schema drop (tests, a second hub) can never remove it from under
+    another schema.
+    """
+    applied = con.execute(
+        "SELECT 1 FROM control_schema_migrations WHERE version = ?",
+        [VECTOR_MIGRATION],
+    ).fetchone()
+    if applied is not None:
+        return
+    available = con.execute(
+        "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'"
+    ).fetchone()
+    if available is None:
+        return
+    con.execute("SAVEPOINT drover_vector")
+    try:
+        if vector_extension_schema(con) is None:
+            con.execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
+        extension_schema = vector_extension_schema(con) or "public"
+        for statement in _vector_migration_statements(extension_schema):
+            raw.execute(statement)
+        con.execute(
+            "INSERT INTO control_schema_migrations (version) VALUES (?)",
+            [VECTOR_MIGRATION],
+        )
+    except Exception:
+        con.execute("ROLLBACK TO SAVEPOINT drover_vector")
+        import logging
+
+        logging.getLogger("drover.postgres_schema").warning(
+            "pgvector is available but could not be enabled; session embeddings "
+            "stay unavailable until it can be",
+            exc_info=True,
+        )
+    finally:
+        con.execute("RELEASE SAVEPOINT drover_vector")
 
 
 def bootstrap_postgres_control_store(store: Any) -> None:
@@ -297,6 +493,7 @@ def bootstrap_postgres_control_store(store: Any) -> None:
                     "INSERT INTO control_schema_migrations (version) VALUES (?)",
                     [version],
                 )
+            _apply_vector_migration(con, raw)
             con.execute("COMMIT")
         except Exception:
             con.execute("ROLLBACK")
