@@ -180,3 +180,294 @@ def test_query_limit_configuration_cannot_weaken_release_caps():
     ):
         with pytest.raises(ValueError):
             QueryLimits(**kwargs)
+
+
+def _fixture_tar(tmp_path):
+    import tarfile
+    from datetime import datetime, timezone
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source = tmp_path / "source"
+    # Exact ties use row payload hash/file lineage; all null keys are retained.
+    rows = [
+        {
+            "id": "old",
+            "session_id": "s",
+            "timestamp": "2026-10-01T01:00:00Z",
+            "dedup_key": "a",
+            "repo_owner": None,
+            "repo_name": None,
+            "content": "old",
+        },
+        {
+            "id": "winner",
+            "session_id": "s",
+            "timestamp": "2026-10-01T00:00:00Z",
+            "dedup_key": "a",
+            "repo_owner": "o",
+            "repo_name": "r",
+            "content": "attributed",
+        },
+        {
+            "id": "n",
+            "session_id": "s",
+            "timestamp": "2026-10-01T02:00:00Z",
+            "dedup_key": None,
+            "repo_owner": None,
+            "repo_name": None,
+            "content": "null",
+        },
+        {
+            "id": "n",
+            "session_id": "s",
+            "timestamp": "2026-10-01T02:00:00Z",
+            "dedup_key": None,
+            "repo_owner": None,
+            "repo_name": None,
+            "content": "null",
+        },
+    ]
+    path = source / "parquet/agent_events/date=2026-10-01/agent_id=test/part.parquet"
+    path.parent.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    # A mixed-era typed timestamp must bind in the same unified scan.
+    path = path.with_name("typed.parquet")
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "id": "typed",
+                    "session_id": "s",
+                    "timestamp": datetime(2026, 10, 1, tzinfo=timezone.utc),
+                    "dedup_key": "b",
+                }
+            ]
+        ),
+        path,
+    )
+    for table, row in (
+        (
+            "provider_usage_snapshots",
+            {
+                "snapshot_id": "p",
+                "observed_at": datetime(2026, 10, 1, tzinfo=timezone.utc),
+            },
+        ),
+        (
+            "control_outbox_batches",
+            {"event_id": "e", "created_at": datetime(2026, 10, 1, tzinfo=timezone.utc)},
+        ),
+    ):
+        path = source / "parquet" / table / "part.parquet"
+        path.parent.mkdir(parents=True)
+        pq.write_table(pa.Table.from_pylist([row]), path)
+    # Never import spans or AppleDouble resource forks.
+    (source / "parquet/spans").mkdir()
+    (source / "parquet/spans/part.parquet").write_bytes(b"not parquet")
+    (source / "parquet/agent_events/._part.parquet").write_bytes(b"not parquet")
+    archive = tmp_path / "frozen.tar"
+    with tarfile.open(archive, "w") as tar:
+        tar.add(source / "parquet", arcname="parquet")
+    return archive
+
+
+def test_rebuild_accounting_and_fresh_catalog_roundtrip(lake_spec, tmp_path):
+    from drover.server.lake.rebuild import rebuild, verify
+
+    spec = replace(lake_spec, data_root=tmp_path / "rebuilt")
+    report = rebuild(_fixture_tar(tmp_path), spec)
+    assert report["raw"]["agent_events"]["rows"] == 5
+    assert report["canonical_agent_events"]["rows"] == 4
+    assert report["null_key_rows_retained"] == 2
+    assert report["losers"] == 1
+    actual = verify(spec)
+    assert actual["agent_events"] == report["canonical_agent_events"]
+    assert (
+        actual["provider_usage_snapshots"] == report["raw"]["provider_usage_snapshots"]
+    )
+    assert query(spec, "SELECT content FROM lake.agent_events WHERE dedup_key='a'")[
+        "rows"
+    ] == [["attributed"]]
+    with lake_connection(spec) as con:
+        assert (
+            con.execute(
+                "SELECT count(DISTINCT (_import_file, _import_row)) FROM lake.agent_events WHERE dedup_key IS NULL"
+            ).fetchone()[0]
+            == 2
+        )
+    import pyarrow.parquet as pq
+
+    mapping = pq.read_table(
+        spec.data_root / "verification/winner-loser.parquet"
+    ).to_pylist()
+    assert len(mapping) == 1
+    assert mapping[0]["dedup_key"] == "a"
+    with pytest.raises(LakeError, match="requires_new_data_root"):
+        rebuild(tmp_path / "frozen.tar", spec)
+
+
+def test_rebuild_dry_run_never_contacts_postgres(lake_spec, tmp_path, monkeypatch):
+    from drover.server.lake.rebuild import rebuild
+
+    monkeypatch.delenv(lake_spec.catalog_dsn_env)
+    report = rebuild(
+        _fixture_tar(tmp_path),
+        replace(lake_spec, data_root=tmp_path / "dry"),
+        dry_run=True,
+    )
+    assert report["dry_run"]
+    assert report["canonical_agent_events"]["rows"] == 4
+
+
+def test_rebuild_rejects_unsafe_tar(tmp_path):
+    import io
+    import tarfile
+
+    from drover.server.lake.rebuild import extract_frozen
+
+    path = tmp_path / "unsafe.tar"
+    with tarfile.open(path, "w") as tar:
+        member = tarfile.TarInfo("../agent_events/evil.parquet")
+        member.size = 1
+        tar.addfile(member, io.BytesIO(b"x"))
+    with pytest.raises(LakeError, match="unsafe_tar_path"):
+        extract_frozen(path, tmp_path / "output")
+
+
+def test_rebuild_refuses_nonempty_catalog(lake_spec, tmp_path):
+    from drover.server.lake.rebuild import rebuild
+
+    with psycopg.connect(lake_spec.dsn(), autocommit=True) as con:
+        con.execute("CREATE TABLE must_preserve (id INT)")
+    with pytest.raises(LakeError, match="requires_fresh_catalog"):
+        rebuild(
+            _fixture_tar(tmp_path), replace(lake_spec, data_root=tmp_path / "fresh")
+        )
+    with psycopg.connect(lake_spec.dsn(), autocommit=True) as con:
+        assert con.execute("SELECT count(*) FROM must_preserve").fetchone() == (0,)
+
+
+def test_verify_recomputes_payload_hashes(lake_spec, tmp_path):
+    from drover.server.lake.rebuild import rebuild, verify
+
+    spec = replace(lake_spec, data_root=tmp_path / "verify-changed")
+    rebuild(_fixture_tar(tmp_path), spec)
+    with lake_connection(spec, read_only=False) as con:
+        # Keeping the recorded row digest must not conceal altered contents.
+        con.execute(
+            "UPDATE lake.agent_events SET content='changed' WHERE dedup_key='a'"
+        )
+    with pytest.raises(LakeError, match="verification_mismatch"):
+        verify(spec)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DROVER_PHASE4_REHEARSAL_TAR"),
+    reason="explicit local backup rehearsal only",
+)
+def test_local_backup_rehearsal(lake_spec):
+    import json
+
+    from drover.server.lake.rebuild import rebuild, verify
+
+    if os.environ.get("DROVER_TEST_POSTGRES_DSN"):
+        pytest.fail("large rehearsal requires an initdb-created private cluster")
+    root = Path(os.environ["DROVER_PHASE4_REHEARSAL_ROOT"]).resolve()
+    assert root.is_relative_to(Path("/tmp").resolve())
+    spec = replace(lake_spec, data_root=root)
+    report = rebuild(Path(os.environ["DROVER_PHASE4_REHEARSAL_TAR"]), spec)
+    assert verify(spec)["agent_events"] == report["canonical_agent_events"]
+    print(json.dumps(report, indent=2))
+
+
+def test_rebuild_cli_does_not_resolve_live_config(lake_spec, tmp_path, monkeypatch):
+    import json
+
+    from click.testing import CliRunner
+
+    from drover.server import __main__ as cli
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline lake tooling must never load the live hub config")
+
+    monkeypatch.setattr(cli, "_resolve_config", forbidden)
+    monkeypatch.delenv(lake_spec.catalog_dsn_env)
+    monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(lake_spec.extension_dir))
+    monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", lake_spec.engine_sha256)
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "--config",
+            str(tmp_path / "does-not-exist.toml"),
+            "lake",
+            "rebuild",
+            "--from-tar",
+            str(_fixture_tar(tmp_path)),
+            "--data-root",
+            str(tmp_path / "cli-dry"),
+            "--catalog-dsn-env",
+            "UNSET_SCRATCH_DSN",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["dry_run"]
+
+
+def test_rebuild_slices_keep_one_global_timestamp_binding(tmp_path):
+    from datetime import datetime, timezone
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from drover.server.lake.rebuild import stage_relation
+
+    extracted = tmp_path / "input"
+    inventory = []
+    for index in range(21):
+        path = (
+            extracted
+            / f"parquet/agent_events/date=2026-10-01/agent_id=test/{index:02}.parquet"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = (
+            datetime(2026, 10, 1, tzinfo=timezone.utc)
+            if index == 20
+            else "2026-10-01T00:00:00Z"
+        )
+        pq.write_table(
+            pa.Table.from_pylist([{"id": f"{index:02}", "timestamp": timestamp}]), path
+        )
+        inventory.append({"path": str(path.relative_to(extracted))})
+    with duckdb.connect() as con:
+        stage_relation(con, "agent_events", inventory, extracted)
+        expected = con.execute(
+            "SELECT CAST(timestamp AS VARCHAR) FROM input_agent_events ORDER BY id"
+        ).fetchall()
+        actual = con.execute(
+            "SELECT timestamp FROM raw_agent_events ORDER BY id"
+        ).fetchall()
+        assert actual == expected
+
+
+def test_admission_wait_has_same_deadline_and_never_starts_second_child(tmp_path):
+    import fcntl
+
+    path = tmp_path / "admission"
+    sentinel = tmp_path / "started"
+    with path.open("a+b") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(LakeError, match="admission_deadline"):
+            run_disposable(
+                [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(sentinel)!r}).touch()",
+                ],
+                admission_path=path,
+                limits=QueryLimits(deadline_seconds=0.1),
+                cwd=tmp_path,
+            )
+    assert not sentinel.exists()

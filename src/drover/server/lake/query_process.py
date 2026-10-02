@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -52,18 +53,21 @@ def run_disposable(
     limits: QueryLimits,
     cwd: Path,
     env: dict[str, str] | None = None,
+    started_at: float | None = None,
 ) -> dict:
     """Supervise a child writing a bounded JSON reply to stdout.
 
     The admission lock is shared across processes, not a per-client semaphore.
     Waiting for admission consumes the same end-to-end five-second deadline.
     """
-    started = time.monotonic()
+    started = time.monotonic() if started_at is None else started_at
     deadline = started + limits.deadline_seconds
     peak = 0
     admission_path.parent.mkdir(parents=True, exist_ok=True)
     with admission_path.open("a+b") as admission:
         while True:
+            if time.monotonic() >= deadline:
+                raise LakeError("analytics_admission_deadline")
             try:
                 fcntl.flock(admission, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
@@ -134,6 +138,7 @@ def query(
     *,
     limits: QueryLimits = QueryLimits(),
 ) -> dict:
+    started_at = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="drover-lake-query-") as scratch:
         root = Path(scratch)
         request = root / "request.json"
@@ -151,19 +156,20 @@ def query(
                 }
             )
         )
+        if request.stat().st_size > 262_144:
+            raise LakeError("analytics_request_byte_limit_exceeded")
         request.chmod(0o600)
         return run_disposable(
             [sys.executable, "-m", __name__, str(request)],
             admission_path=Path(tempfile.gettempdir())
             / f"drover-lake-{os.getuid()}"
             / (
-                __import__("hashlib")
-                .sha256(str(spec.data_root.resolve()).encode())
-                .hexdigest()
+                hashlib.sha256(str(spec.data_root.resolve()).encode()).hexdigest()
                 + ".lock"
             ),
             limits=limits,
             cwd=root,
+            started_at=started_at,
         )
 
 

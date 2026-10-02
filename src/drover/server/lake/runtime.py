@@ -7,7 +7,6 @@ installer supplies an independently recorded engine digest for its wheel/ABI.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -105,32 +104,40 @@ def lake_connection(spec: LakeSpec, *, read_only: bool = True, create: bool = Fa
         }
     )
     try:
-        for name in ("postgres_scanner", "ducklake"):
-            con.execute(
-                f"LOAD {literal(str(spec.extension_dir / (name + '.duckdb_extension')))}"
-            )
-        con.execute("SET ducklake_default_data_inlining_row_limit = 0")
-        con.execute("SET TimeZone = 'UTC'")
-        options = [
-            "DATA_INLINING_ROW_LIMIT 0",
-            "AUTOMATIC_MIGRATION false",
-            f"CREATE_IF_NOT_EXISTS {'true' if create else 'false'}",
-            # Do not let a mistyped root silently redirect production reads.
-            "OVERRIDE_DATA_PATH false",
-            f"DATA_PATH {literal(str(spec.data_root.resolve()) + '/')}",
-        ]
-        if read_only:
-            options.append("READ_ONLY")
-        try:
-            con.execute(
-                f"ATTACH {literal('ducklake:postgres:' + spec.dsn())} AS lake ({', '.join(options)})"
-            )
-        except Exception:
-            raise LakeError("analytics_unavailable") from None
+        attach_lake(con, spec, read_only=read_only, create=create)
         con.execute("USE lake")
         yield con
     finally:
         con.close()
+
+
+def attach_lake(con, spec: LakeSpec, *, read_only: bool = True, create: bool = False):
+    """Attach to a caller-owned isolated admin engine without changing its default DB."""
+    if read_only and create:
+        raise ValueError("a reader cannot initialize a catalog")
+    verify_runtime(spec)
+    for name in ("postgres_scanner", "ducklake"):
+        con.execute(
+            f"LOAD {literal(str(spec.extension_dir / (name + '.duckdb_extension')))}"
+        )
+    con.execute("SET ducklake_default_data_inlining_row_limit = 0")
+    con.execute("SET TimeZone = 'UTC'")
+    options = [
+        "DATA_INLINING_ROW_LIMIT 0",
+        "AUTOMATIC_MIGRATION false",
+        f"CREATE_IF_NOT_EXISTS {'true' if create else 'false'}",
+        # Do not let a mistyped root silently redirect production reads.
+        "OVERRIDE_DATA_PATH false",
+        f"DATA_PATH {literal(str(spec.data_root.resolve()) + '/')}",
+    ]
+    if read_only:
+        options.append("READ_ONLY")
+    try:
+        con.execute(
+            f"ATTACH {literal('ducklake:postgres:' + spec.dsn())} AS lake ({', '.join(options)})"
+        )
+    except Exception:
+        raise LakeError("analytics_unavailable") from None
 
 
 def create_table(

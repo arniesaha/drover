@@ -134,6 +134,7 @@ from drover.server.harness.schema import (
     migrate_duplicate_harness_events,
 )
 from drover.server.harness.usage_rollup import UsageRollupWorker
+from drover.server.lake.cli import lake_cmd
 from drover.server.ledger import (
     EMBED_SESSION,
     JobLedger,
@@ -981,6 +982,9 @@ def _parse_listen_address(value: str) -> tuple[str, int]:
     from drover.server.harness.cli import parse_listen_address
 
     return parse_listen_address(value)
+
+
+main.add_command(lake_cmd)
 
 
 @main.group(name="session")
