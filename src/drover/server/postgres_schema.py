@@ -367,6 +367,146 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        9,
+        (
+            # Session history (docs/design/session-history.md). The keyset
+            # order is (activity_at DESC, session_id DESC), where activity_at
+            # is COALESCE(last_activity, updated_at): updated_at is NOT NULL,
+            # so every row has a sort key. Queries must repeat the expression
+            # verbatim for the planner to use these indexes.
+            """
+            CREATE INDEX IF NOT EXISTS harness_sessions_history
+              ON harness_sessions ((COALESCE(last_activity, updated_at)), session_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS harness_sessions_history_host
+              ON harness_sessions (host_id, (COALESCE(last_activity, updated_at)), session_id)
+            """,
+            # session_memory may be keyed by the harness id or by its native id.
+            """
+            CREATE INDEX IF NOT EXISTS harness_sessions_native
+              ON harness_sessions (native_session_id) WHERE native_session_id IS NOT NULL
+            """,
+            # Title, repo and summary live in three tables, so one GIN index
+            # needs one denormalized document per session. Triggers keep it in
+            # the writer's transaction; nothing has to remember to refresh it.
+            """
+            CREATE TABLE IF NOT EXISTS session_search (
+              session_id TEXT PRIMARY KEY,
+              document TSVECTOR NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS session_search_document ON session_search USING GIN (document)",
+            # SET search_path FROM CURRENT pins the bootstrap schema, so a
+            # trigger fired from any session resolves this schema's tables.
+            """
+            CREATE OR REPLACE FUNCTION drover_refresh_session_search(sid TEXT)
+            RETURNS VOID LANGUAGE plpgsql SET search_path FROM CURRENT AS $fn$
+            BEGIN
+              INSERT INTO session_search (session_id, document, updated_at)
+              SELECT s.session_id,
+                     setweight(to_tsvector('simple', left(coalesce(p.content_preview, ''), 1000)), 'A')
+                  || setweight(to_tsvector('simple', concat_ws(' ',
+                       s.repo_owner, s.repo_name, replace(coalesce(s.repo_name, ''), '-', ' '),
+                       s.branch, s.harness)), 'B')
+                  || setweight(to_tsvector('simple', left(coalesce(
+                       (SELECT coalesce(m.summary_md, m.recap_text)
+                          FROM session_memory m
+                         WHERE m.session_id IN (s.session_id, s.native_session_id)
+                         ORDER BY (m.summary_md IS NOT NULL) DESC,
+                                  (m.session_id = s.session_id) DESC
+                         LIMIT 1), ''), 8000)), 'C'),
+                     now()
+                FROM harness_sessions s
+                LEFT JOIN harness_session_previews p ON p.session_id = s.session_id
+               WHERE s.session_id = sid
+              ON CONFLICT (session_id) DO UPDATE
+                SET document = excluded.document, updated_at = excluded.updated_at;
+            EXCEPTION WHEN OTHERS THEN
+              -- A stale search document is recoverable; a failed session or
+              -- event write is not. Never let the index veto the writer.
+              RAISE WARNING 'session_search refresh failed for %: %', sid, SQLERRM;
+            END
+            $fn$
+            """,
+            """
+            CREATE OR REPLACE FUNCTION drover_session_search_from_session()
+            RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $fn$
+            BEGIN
+              IF TG_OP = 'DELETE' THEN
+                DELETE FROM session_search WHERE session_id = OLD.session_id;
+                RETURN OLD;
+              END IF;
+              PERFORM drover_refresh_session_search(NEW.session_id);
+              RETURN NEW;
+            END
+            $fn$
+            """,
+            """
+            CREATE OR REPLACE FUNCTION drover_session_search_from_preview()
+            RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $fn$
+            BEGIN
+              PERFORM drover_refresh_session_search(
+                CASE WHEN TG_OP = 'DELETE' THEN OLD.session_id ELSE NEW.session_id END);
+              RETURN NULL;
+            END
+            $fn$
+            """,
+            # A memory row may be keyed by the native id; refresh every harness
+            # session it can belong to.
+            """
+            CREATE OR REPLACE FUNCTION drover_session_search_from_memory()
+            RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $fn$
+            DECLARE
+              key TEXT := CASE WHEN TG_OP = 'DELETE' THEN OLD.session_id ELSE NEW.session_id END;
+              harness_id TEXT;
+            BEGIN
+              FOR harness_id IN
+                SELECT session_id FROM harness_sessions WHERE session_id = key
+                UNION
+                SELECT session_id FROM harness_sessions WHERE native_session_id = key
+              LOOP
+                PERFORM drover_refresh_session_search(harness_id);
+              END LOOP;
+              RETURN NULL;
+            END
+            $fn$
+            """,
+            # Only the indexed columns: last_activity moves on every event and
+            # must not rewrite the search document each time.
+            "DROP TRIGGER IF EXISTS session_search_session_write ON harness_sessions",
+            """
+            CREATE TRIGGER session_search_session_write
+              AFTER INSERT OR UPDATE OF repo_owner, repo_name, branch, harness, native_session_id
+              ON harness_sessions FOR EACH ROW
+              EXECUTE FUNCTION drover_session_search_from_session()
+            """,
+            "DROP TRIGGER IF EXISTS session_search_session_delete ON harness_sessions",
+            """
+            CREATE TRIGGER session_search_session_delete
+              AFTER DELETE ON harness_sessions FOR EACH ROW
+              EXECUTE FUNCTION drover_session_search_from_session()
+            """,
+            "DROP TRIGGER IF EXISTS session_search_preview_write ON harness_session_previews",
+            """
+            CREATE TRIGGER session_search_preview_write
+              AFTER INSERT OR UPDATE OF content_preview OR DELETE
+              ON harness_session_previews FOR EACH ROW
+              EXECUTE FUNCTION drover_session_search_from_preview()
+            """,
+            "DROP TRIGGER IF EXISTS session_search_memory_write ON session_memory",
+            """
+            CREATE TRIGGER session_search_memory_write
+              AFTER INSERT OR UPDATE OF summary_md, recap_text OR DELETE
+              ON session_memory FOR EACH ROW
+              EXECUTE FUNCTION drover_session_search_from_memory()
+            """,
+            # Backfill what already exists (279 sessions on the live hub).
+            "SELECT drover_refresh_session_search(session_id) FROM harness_sessions",
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

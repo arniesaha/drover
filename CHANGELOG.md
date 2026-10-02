@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Session history across hosts: `GET /sessions/history` pages every session
+  in the PostgreSQL control plane, newest activity first. It uses a keyset
+  cursor and supports host, harness, repo, state, date-range and full-text
+  (`q`) filters. Pages default to 30 rows, are capped at 50 rows and 64 KiB,
+  and p95 is 6.8 ms per page at 10K sessions. `GET /sessions/history/facets`
+  serves filter values. Migration 9 adds the keyset indexes and a
+  trigger-maintained `session_search` document. See
+  `docs/design/session-history.md`.
+
 ### Changed
 
 - Host liveness (online / stale / offline / retired) is derived from heartbeat
