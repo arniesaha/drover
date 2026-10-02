@@ -142,7 +142,9 @@ def test_unknown_fields_are_ignored_and_missing_flags_are_false():
 
 def test_turn_preferences_follow_the_adapter_turn_dispatch_contract(tmp_path):
     host = state(tmp_path)
-    rows = {row["name"]: row["capabilities"] for row in host.capabilities()["harnesses"]}
+    rows = {
+        row["name"]: row["capabilities"] for row in host.capabilities()["harnesses"]
+    }
     for harness_id in host.adapters.ids():
         adapter = host.adapters.resolve(harness_id)
         assert rows[harness_id]["turn_preferences"] is (
@@ -158,7 +160,11 @@ def test_turn_preferences_must_be_a_strict_boolean():
     with pytest.raises(InvalidCapabilities):
         validate_capabilities(
             envelope(
-                {"schema_version": 1, "launch_modes": ["structured"], "turn_preferences": 1}
+                {
+                    "schema_version": 1,
+                    "launch_modes": ["structured"],
+                    "turn_preferences": 1,
+                }
             ),
             "test-host",
         )
@@ -411,3 +417,55 @@ def test_defaults_cannot_grow_persisted_envelope_past_limit():
     assert len(json.dumps(payload)) <= MAX_ENVELOPE_BYTES
     with pytest.raises(InvalidCapabilities):
         validate_capabilities(payload, "test-host")
+
+
+@pytest.mark.parametrize(
+    "matrix,enabled,expected",
+    [
+        ({"schema_version": 1, "launch_modes": ["structured"]}, True, 200),
+        ({"schema_version": 2, "launch_modes": ["structured"]}, True, 400),
+        ({"schema_version": 1, "launch_modes": []}, True, 400),
+        ({"schema_version": 1, "launch_modes": ["structured"]}, False, 400),
+    ],
+)
+def test_handoff_to_an_unknown_adapter_uses_its_matrix(
+    collector, monkeypatch, matrix, enabled, expected
+):
+    from types import SimpleNamespace
+
+    source = SimpleNamespace(
+        session_id="source",
+        host_id="test-host",
+        harness="fixture-lab",
+        cwd="/tmp",
+        repo_owner=None,
+        repo_name=None,
+        branch=None,
+    )
+    host = SimpleNamespace(
+        capabilities={
+            "harnesses": [
+                {"name": "fixture-lab", "enabled": enabled, "capabilities": matrix}
+            ]
+        }
+    )
+    monkeypatch.setattr(collector, "_harness_session", lambda _: source)
+    monkeypatch.setattr(collector, "_harness_host", lambda _: host)
+    monkeypatch.setattr(
+        collector, "_build_handoff_prompt", lambda *args, **kwargs: "seed"
+    )
+    launches = []
+
+    def launch(host_id, payload):
+        launches.append(payload)
+        return 200, "{}"
+
+    monkeypatch.setattr(collector, "proxy_create_harness_session", launch)
+    status, _ = collector.continue_harness_session("source", {})
+    assert status == expected
+    if expected == 200:
+        assert launches[0]["mode"] == "structured"
+        assert launches[0]["prompt"] == "seed"
+        assert "initial_input" not in launches[0]
+    else:
+        assert not launches

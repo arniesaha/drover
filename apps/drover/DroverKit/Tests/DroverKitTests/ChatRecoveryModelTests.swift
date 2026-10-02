@@ -1640,13 +1640,15 @@ private func lifecycleRecoveryModel(
         credentialBindingID: binding,
         session: MockURLProtocol.session()
     )
-    return ChatModel(
+    let model = ChatModel(
         client: client,
         sessionID: "recovery-session",
         recoveryStore: recoveryStore,
         recoveryWriteGate: recoveryWriteGate,
         recoveryGeneration: recoveryWriteGate.generation
     )
+    model.controls = .everythingAdvertised
+    return model
 }
 
 private func waitForRecoveryRecord(

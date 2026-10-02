@@ -75,7 +75,16 @@ const DroverCapabilities = (() => {
     if (matrix.harness_id !== undefined && matrix.harness_id !== name) {
       return closed(name, "invalid", REASONS.invalid);
     }
-    const advertised = Array.isArray(matrix.launch_modes) ? matrix.launch_modes : [];
+    const booleanFields = ["approvals", "interrupt", "native_resume", "model_catalog",
+      "usage", "worktree", "interactive_auth", "turn_preferences"];
+    if (!Array.isArray(matrix.launch_modes) ||
+        matrix.launch_modes.some((mode) => typeof mode !== "string") ||
+        booleanFields.some((key) => matrix[key] !== undefined && typeof matrix[key] !== "boolean") ||
+        (matrix.attachments !== undefined && (!Array.isArray(matrix.attachments) ||
+          matrix.attachments.some((mime) => typeof mime !== "string" || !MIME.test(mime))))) {
+      return closed(name, "invalid", REASONS.invalid);
+    }
+    const advertised = matrix.launch_modes;
     const modes = CLIENT_MODES.filter((mode) => advertised.includes(mode));
     const flag = (key) => matrix[key] === true;
     const attachments = Array.isArray(matrix.attachments)

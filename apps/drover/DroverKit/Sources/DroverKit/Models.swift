@@ -507,10 +507,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
 
     /// Legacy sessions predating the `mode` field send neither the key nor a
     /// value — a `nil` here does not mean PTY, it means "ask the harness".
-    /// Every harness except "shell" only ever runs in structured mode, so a
-    /// null-mode claude-code/codex/gemini session is structured too. Mirrors
-    /// `LaunchModel.isStructured`'s harness-based fallback for the
-    /// pre-creation case.
+    /// Legacy null-mode rows keep their historical chat/terminal navigation.
+    /// Actual controls require an explicit mode and capability advertisement.
     public var isStructured: Bool {
         mode == "structured" || (mode == nil && harness != "shell")  // harness-name: picks chat vs terminal for stored pre-`mode` rows; not a control
     }

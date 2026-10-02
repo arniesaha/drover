@@ -541,6 +541,7 @@ struct ChatModelTests {
         return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.handoffHarnesses = [model.harnessPresentation.harness]
     let continued = await model.handOff()
     #expect(continued?.sessionID == "harness-continued")
     #expect(continued?.isStructured == false)
@@ -552,6 +553,7 @@ struct ChatModelTests {
         (201, Data(#"{"session_id": "harness-continued", "mode": "structured"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.handoffHarnesses = ["codex"]
     let continued = await model.handOff(targetHarness: "codex")
     #expect(continued?.isStructured == true)
 }
@@ -565,6 +567,7 @@ struct ChatModelTests {
         return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.handoffHarnesses = ["codex"]
     let continued = await model.handOff(targetHarness: "codex")
     #expect(continued?.sessionID == "harness-continued")
     #expect(sentTarget == "codex")
@@ -745,6 +748,7 @@ struct ChatModelTests {
         (409, Data(#"{"error": "host offline"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.handoffHarnesses = [model.harnessPresentation.harness]
     let continued = await model.handOff()
     #expect(continued == nil)
     #expect(model.hint == "host offline")

@@ -581,15 +581,13 @@ struct ChatView: View {
                 }
                 .disabled(!model.controls.canInterrupt)
                 .accessibilityIdentifier("chat-interrupt")
-                // nil target = same harness. Structured-capable harnesses now
-                // continue into a fresh structured chat (the handoff context
-                // becomes its first turn); only shell sources land in a
-                // terminal.
+                // Same-harness handoff also needs an advertised structured target.
                 Button {
                     Task { await handOff(to: nil) }
                 } label: {
                     Label("Continue in a new session", systemImage: "arrow.triangle.branch")
                 }
+                .disabled(!model.handoffHarnesses.contains(model.harnessPresentation.harness))
                 // Per-harness targets from the session's host: only those it
                 // advertises a structured launch for. A PTY-only target would
                 // have the seed typed into a terminal and run as commands.

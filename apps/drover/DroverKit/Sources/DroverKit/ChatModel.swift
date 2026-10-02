@@ -320,7 +320,8 @@ public final class ChatModel {
     /// preserved while the previous one confirms, but must not leapfrog or
     /// duplicate that delivery.
     public var canSendTurn: Bool {
-        !isSending
+        controls.capabilities.launchModes.contains(.structured)
+            && !isSending
             && !isCommittingPendingDeliveryAction
             && pendingTurn == nil
             && recoveryStatusMessage == nil
@@ -708,6 +709,10 @@ public final class ChatModel {
         guard canSendTurn else { return }
         let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         let images = pendingAttachments
+        guard images.allSatisfy({ controls.capabilities.accepts(mediaType: $0.mediaType) }) else {
+            hint = HarnessCapabilityCopy.attachmentsUnsupported
+            return
+        }
         guard !text.isEmpty || !images.isEmpty else { return }
         let clientTurnID = UUID().uuidString
         let turn = ChatPendingTurn(
@@ -1030,6 +1035,12 @@ public final class ChatModel {
 
     private func submitPendingTurn(_ turn: ChatPendingTurn) async {
         guard pendingTurn?.clientTurnID == turn.clientTurnID else { return }
+        guard controls.capabilities.launchModes.contains(.structured),
+              turn.attachments.allSatisfy({ controls.capabilities.accepts(mediaType: $0.mediaType) }) else {
+            holdForManualReview(turn, message: "This host no longer advertises support for this turn. The draft is held for review.")
+            scheduleRecoveryCheckpoint()
+            return
+        }
         isSending = true
         defer { isSending = false }
         let preferences = turnPreferences
@@ -1477,6 +1488,11 @@ public final class ChatModel {
     /// whether it's structured, for navigation), or nil on failure (with
     /// the server's explanation surfaced as a hint).
     public func handOff(targetHarness: String? = nil) async -> ContinuedSession? {
+        let target = targetHarness ?? harnessPresentation.harness
+        guard handoffHarnesses.contains(target) else {
+            hint = HarnessCapabilityCopy.noLaunchableHarness
+            return nil
+        }
         do {
             let continued = try await client.continueSession(sessionID: sessionID,
                                                              targetHarness: targetHarness)
@@ -1492,9 +1508,8 @@ public final class ChatModel {
     /// the handoff target picker: the handoff seed becomes their first turn.
     /// PTY-only targets are excluded because the seed would be typed into a
     /// terminal and run as commands. Loaded on demand by
-    /// `loadSessionMetadata()`; empty until then (the UI falls back to the
-    /// plain same-harness handoff).
-    public private(set) var handoffHarnesses: [String] = []
+    /// `loadSessionMetadata()`; empty until then, withholding handoff.
+    public internal(set) var handoffHarnesses: [String] = []
 
     /// Session controls this session's host advertises for its harness.
     /// `.unresolved` until the first snapshot read, which withholds every
@@ -1562,7 +1577,9 @@ public final class ChatModel {
             recap = preview
             recapSourceSeq = nil
         }
-        controls = HarnessControls(snapshot: snapshot, hostID: session.hostID, harness: session.harness)
+        controls = session.mode == "structured"
+            ? HarnessControls(snapshot: snapshot, hostID: session.hostID, harness: session.harness)
+            : HarnessControls(offer: nil)
         let host = snapshot.hosts.first { $0.id == session.hostID }
         handoffHarnesses = (host?.launchableOffers ?? [])
             .filter { $0.launchMode == .structured }

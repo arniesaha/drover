@@ -24,7 +24,9 @@ STATIC = Path(__file__).resolve().parents[1] / "src/drover/server/web/static"
 MODULE = STATIC / "harness_capabilities.js"
 FIXTURE = Path(__file__).parent / "fixtures/web/harness_capabilities_hosts.json"
 NODE = shutil.which("node")
-needs_node = pytest.mark.skipif(NODE is None, reason="node is required for web JS tests")
+needs_node = pytest.mark.skipif(
+    NODE is None, reason="node is required for web JS tests"
+)
 
 
 def _fixture() -> dict:
@@ -154,7 +156,7 @@ def test_unusual_fixture_adapter_fails_closed_on_what_it_does_not_understand():
     assert echo["approvals"] is True
     assert echo["interrupt"] is False
     assert echo["usage"] is True
-    assert echo["interactiveAuth"] is False  # "yes" is not a JSON boolean
+    assert echo["interactiveAuth"] is False
     assert echo["attachments"] == ["application/pdf", "text/*"]
     assert "teleport" not in echo
     assert (out["pdf"], out["text"], out["png"]) == (True, True, False)
@@ -262,7 +264,11 @@ def test_launch_body_carries_the_advertised_mode_and_only_supported_preferences(
         "cols": 120,
     }
     # No model catalog advertised: a model choice is never sent.
-    assert out["echo"] == {"harness": "fixture-echo", "mode": "structured", "cwd": "/repo"}
+    assert out["echo"] == {
+        "harness": "fixture-echo",
+        "mode": "structured",
+        "cwd": "/repo",
+    }
     assert out["stale"].startswith("error:")
 
 
@@ -396,10 +402,46 @@ def test_page_scripts_parse(name):
 
 def test_pages_route_every_action_through_a_capability_guard():
     console = load_page("harness.html")
-    assert "DroverCapabilities.requireLaunch(hostById(host.host_id), harness)" in console
+    assert (
+        "DroverCapabilities.requireLaunch(hostById(host.host_id), harness)" in console
+    )
     assert "DroverCapabilities.launchBody(controls" in console
     session = load_page("harness_terminal.html")
     for action in ("approve", "interrupt", "turns"):
         assert f'guardSessionAction("{action}")' in session
-    assert "DroverCapabilities.requireLaunch(hostById(targetHost), targetHarness)" in session
+    assert (
+        "DroverCapabilities.requireLaunch(hostById(targetHost), targetHarness)"
+        in session
+    )
     assert "!continueTarget().nativeResume" in session
+
+
+@needs_node
+def test_malformed_known_fields_close_the_entire_web_matrix():
+    cases = {
+        "approvals": '"yes"',
+        "launch_modes": '["structured", 7]',
+        "attachments": '["image/jpeg", "not-a-mime"]',
+        "turn_preferences": "1",
+    }
+    out = _js(
+        {
+            key: "(() => { const h = JSON.parse(JSON.stringify(host('mac-mini'))); "
+            + f"h.capabilities.harnesses[1].capabilities.{key} = {value}; "
+            + "return C.harnessControls(h, 'claude-code'); })()"
+            for key, value in cases.items()
+        }
+    )
+    for controls in out.values():
+        assert controls["status"] == "invalid"
+        assert not controls["launchable"]
+        assert not controls["approvals"]
+        assert not controls["interrupt"]
+
+
+def test_session_refresh_uses_new_host_matrix_instead_of_initial_fleet():
+    page = load_page("harness_terminal.html")
+    # Session responses include the current public host; the fleet loaded on
+    # page entry is only for handoff targets and must not override it.
+    assert "hostById(session.host_id) || sessionData?.host" not in page
+    assert "hostById(session?.host_id) || sessionData?.host" not in page

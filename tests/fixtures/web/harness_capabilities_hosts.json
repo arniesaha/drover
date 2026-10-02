@@ -27,6 +27,7 @@
               "usage": false,
               "worktree": false,
               "attachments": [],
+              "turn_preferences": false,
               "interactive_auth": false
             }
           },
@@ -46,6 +47,7 @@
               "usage": false,
               "worktree": false,
               "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+              "turn_preferences": false,
               "interactive_auth": true
             }
           },
@@ -65,6 +67,7 @@
               "usage": false,
               "worktree": true,
               "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+              "turn_preferences": false,
               "interactive_auth": true
             }
           },
@@ -84,6 +87,7 @@
               "usage": false,
               "worktree": true,
               "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+              "turn_preferences": false,
               "interactive_auth": true
             }
           },
@@ -103,6 +107,7 @@
               "usage": false,
               "worktree": true,
               "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+              "turn_preferences": false,
               "interactive_auth": false
             }
           }
@@ -133,8 +138,8 @@
               "model_catalog": false,
               "usage": true,
               "worktree": false,
-              "attachments": ["application/pdf", "text/*", "NOT A MIME"],
-              "interactive_auth": "yes",
+              "attachments": ["application/pdf", "text/*"],
+              "interactive_auth": false,
               "teleport": true
             }
           },

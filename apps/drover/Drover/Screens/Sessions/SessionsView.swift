@@ -454,6 +454,7 @@ struct SessionsView: View {
             } label: {
                 Label("Continue session", systemImage: "arrow.triangle.branch")
             }
+            .disabled(!crossHarnessTargets(for: session).contains(session.harness))
             // Cross-harness targets from the session's host (via the polled
             // snapshot): structured launchers only — a PTY-only target would
             // execute the typed-in handoff seed as commands.

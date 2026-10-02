@@ -270,8 +270,9 @@ questions #418 left to clients:
 
 - **Fail closed.** Only a row with a schema v1 matrix, `enabled: true` and a launch
   mode this client drives can be launched or chosen as a Continue target. Flags
-  must be JSON `true`; unknown fields, unknown modes and malformed MIME types are
-  ignored. A null, malformed or identity-mismatched matrix, or any other
+  must be JSON `true`; unknown additive fields and unknown mode strings are
+  ignored. Malformed known flags, modes or MIME types close the whole matrix.
+  A null, malformed or identity-mismatched matrix, or any other
   `schema_version`, offers nothing. A harness the host does not list (for
   example observe-only OpenClaw) has no controls.
 - **Preferred mode.** The web drives both modes. If a harness advertises both,
@@ -291,7 +292,9 @@ questions #418 left to clients:
   resume candidates are fetched only for a Continue target with
   `native_resume`. Worktree isolation is explained only when `worktree` is true.
 - **No stale controls.** Launch, Continue, turn, approval and interrupt handlers
-  re-resolve capabilities from the latest envelope when they run. They do not
+  re-resolve capabilities from the latest envelope when they run. Session
+  polling uses the current host returned with the session; handoff refreshes
+  the fleet before submission. They do not
   trust a hidden or previously rendered control. An approval is answered only if
   its `request_id` is still the newest unanswered `approval_prompt`.
 - **Upgrade guidance.** A host whose rows have no matrix shows its harnesses as
@@ -313,6 +316,7 @@ page. `shell` remains a PTY terminal. The PTY Send button now ends input with
 `\r` for every harness. The Codex-only `\n` special case is gone, so an
 already-running Codex PTY session from before this change gets a terminal
 Enter.
+
 ### iOS client decisions (#420)
 
 The iOS app implements the rules above in DroverKit `HarnessCapabilities`,
@@ -324,8 +328,9 @@ this way:
   chat controls are unresolved and withheld. That covers Allow/Deny, interrupt,
   mid-session preferences and attachments. A harness missing from the snapshot
   is treated the same way. The model also refuses unadvertised actions before
-  any request: `launch`, `interrupt`, `approve`, attachment admission and
-  turn-preference overrides.
+  any request: `launch`, `interrupt`, `approve`, turns, handoff, attachment
+  admission and turn-preference overrides. Withdrawn attachment support leaves
+  the draft intact; a pending delivery is held for review before any retry.
 - **Missing or unsupported matrices.** A host with no envelope, or rows with no
   matrix (string rows and matrix-less objects), is legacy metadata. Its
   sessions stay listable and openable, and its enabled names stay in
@@ -369,6 +374,13 @@ this way:
   Each is marked `// harness-name:`. `NoHarnessNameBranchingTests` fails on any
   other quoted harness ID in iOS app or DroverKit sources, and on the retired
   `structuredCapableHarnesses` and `interactiveAuthHarnesses` names.
+
+The additive `turn_preferences` flag needs both an upgraded host and hub to
+reach clients. A schema v1 hub predating this field drops it during projection;
+clients read its absence as false, keeping launch preferences while withholding
+mid-session overrides. Older clients ignore the new field. Matrix-less hosts
+remain visible but cannot launch or send structured operations; existing PTY
+terminal input remains the bounded legacy path.
 
 ## Compatibility and rollout
 

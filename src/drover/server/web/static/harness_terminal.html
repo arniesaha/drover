@@ -708,7 +708,7 @@
       const session = sessionData?.session;
       if (!session) return null;
       return DroverCapabilities.sessionControls(
-        hostById(session.host_id) || sessionData?.host,
+        sessionData?.host,
         session,
       );
     }
@@ -777,7 +777,7 @@
     function guardSessionAction(action) {
       const session = sessionData?.session;
       return DroverCapabilities.requireSessionAction(
-        hostById(session?.host_id) || sessionData?.host,
+        sessionData?.host,
         session,
         action,
       );
@@ -1022,6 +1022,9 @@
       const targetHarness = $("continue-harness").value;
       if (!targetHost || !targetHarness) return;
       try {
+        const res = await fetch("/harness", {cache: "no-store"});
+        if (!res.ok) throw new Error("Could not refresh host capabilities.");
+        harnessState = await res.json();
         DroverCapabilities.requireLaunch(hostById(targetHost), targetHarness);
       } catch (err) {
         $("continue-status").textContent = `Cannot continue in ${targetHarness}: ${err.message || err}`;

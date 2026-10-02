@@ -112,7 +112,9 @@ public struct HarnessCapabilities: Sendable, Equatable, Hashable {
         case nil: break
         case .array(let values)?:
             for value in values {
-                guard let mime = value.stringValue else { return nil }
+                guard let mime = value.stringValue,
+                      mime.range(of: #"^[a-z0-9.+-]+/(?:[a-z0-9.+-]+|\*)$"#, options: .regularExpression) != nil
+                else { return nil }
                 attachments.append(mime)
             }
         default: return nil

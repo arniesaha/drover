@@ -30,7 +30,7 @@ _BOOL_FIELDS = (
 # `turn_preferences_mutable` class attribute, which turn dispatch already
 # enforces. Older hosts omit it, so clients read it as false (fail closed).
 _TURN_PREFERENCES = "turn_preferences"
-_ID =re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
+_ID = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _MIME = re.compile(r"[a-z0-9.+-]+/(?:[a-z0-9.+-]+|\*)\Z")
 
 

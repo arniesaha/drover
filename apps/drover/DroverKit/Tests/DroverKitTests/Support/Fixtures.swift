@@ -243,7 +243,7 @@ func recoveryChatModel(
     streamFactory: ((DroverClient, String) -> MessageStream)? = nil
 ) -> ChatModel {
     let recoveryWriteGate = ChatRecoveryWriteGate()
-    return ChatModel(
+    let model = ChatModel(
         client: client,
         sessionID: sessionID,
         harness: harness,
@@ -259,6 +259,8 @@ func recoveryChatModel(
         recoveryGeneration: recoveryWriteGate.generation,
         streamFactory: streamFactory
     )
+    model.controls = .everythingAdvertised
+    return model
 }
 
 // MARK: - HarnessMessage/ChatModel test factories (Task 7+)

@@ -97,6 +97,19 @@ struct HarnessCapabilityDecodingTests {
         }
     }
 
+    @Test func malformedAttachmentMIMETypesInvalidateTheMatrix() throws {
+        let row = HarnessOffer(row: .object([
+            "name": .string("fixture"), "enabled": .bool(true),
+            "capabilities": .object([
+                "schema_version": .number(1),
+                "launch_modes": .array([.string("structured")]),
+                "attachments": .array([.string("image/jpeg"), .string("not a MIME")])
+            ])
+        ]))
+        #expect(row?.advertisement == .invalid)
+        #expect(row?.isLaunchable == false)
+    }
+
     @Test func futureSchemasAreRetainedButNeverInterpreted() throws {
         let studio = try host("studio", in: mixedSnapshot())
         let future = try #require(studio.offer(named: "future-harness"))
@@ -429,6 +442,60 @@ struct CapabilityDrivenChatTests {
         #expect(legacy.controls.interruptUnavailableReason == HarnessCapabilityCopy.legacyHost)
         #expect(legacy.handoffHarnesses.isEmpty)
         #expect(legacy.runPreferences.isCatalogAvailable == false)
+    }
+
+    @Test @MainActor func withdrawnAttachmentsPreserveDraftAndNeverPost() async throws {
+        let model = ChatModel.fixture()
+        model.composerText = "preserve this"
+        let jpeg = TurnAttachment(mediaType: "image/jpeg", data: Data([1]))
+        model.pendingAttachments = [jpeg]
+        model.controls = HarnessControls(offer: HarnessOffer(
+            name: "fixture", capabilities: HarnessCapabilities(launchModes: [.structured])
+        ))
+        MockURLProtocol.handler = { _ in
+            Issue.record("withdrawn attachments must not reach the hub")
+            return (500, Data())
+        }
+        await model.sendTurn()
+        #expect(model.composerText == "preserve this")
+        #expect(model.pendingAttachments == [jpeg])
+        #expect(model.pendingTurn == nil)
+    }
+
+    @Test @MainActor func unresolvedAndLegacyTurnsAndHandoffsNeverPost() async throws {
+        let legacy = try await loadedChat("s-legacy", harness: "codex")
+        let unresolved = ChatModel.fixture()
+        unresolved.controls = .unresolved
+        MockURLProtocol.handler = { _ in
+            Issue.record("unadvertised turns and handoffs must not reach the hub")
+            return (500, Data())
+        }
+        for model in [legacy, unresolved] {
+            model.composerText = "preserve this"
+            #expect(!model.canSendTurn)
+            await model.sendTurn()
+            #expect(model.composerText == "preserve this")
+            #expect(await model.handOff() == nil)
+            #expect(await model.handOff(targetHarness: "fixture-lab") == nil)
+        }
+    }
+
+    @Test @MainActor func sessionListHandoffRejectsMissingAndWithdrawnTargets() async throws {
+        let store = SessionStore(client: client())
+        MockURLProtocol.handler = { _ in
+            Issue.record("an unresolved handoff must not reach the hub")
+            return (500, Data())
+        }
+        #expect(await store.continueSession("s-claude") == nil)
+        MockURLProtocol.handler = { _ in (200, try! fixtureData()) }
+        await store.refresh()
+        MockURLProtocol.handler = { _ in
+            Issue.record("an unadvertised handoff target must not reach the hub")
+            return (500, Data())
+        }
+        #expect(await store.continueSession("s-legacy") == nil)
+        #expect(await store.continueSession("s-claude", targetHarness: "shell") == nil)
+        #expect(await store.continueSession("s-claude", targetHarness: "removed-harness") == nil)
     }
 
     @Test @MainActor func approvalAnswersNeedTheCapability() async throws {
