@@ -55,9 +55,12 @@ Samples come from an owner's idle connection just before close, **never** from
 borrowing a worker's active cursor. `duckdb_memory()` reports all attached
 catalogs in that instance. RSS is current process RSS from `ps`, not the
 lifetime peak. Sampling is limited to once per file per minute; the bookkeeping
-is capped at 64 paths. Short-lived snapshot paths may each produce a sample.
+is capped at 64 hashed identities and total samples at 64 per process per minute.
+Instance identifiers are truncated SHA-256 hashes; paths and diagnostic exception
+payloads are not logged. Short-lived snapshot paths may each produce a sample.
 Reader-child diagnostics are forwarded to the parent's log with the child's
-PID. Do not add RSS values from two records of the same PID; they each describe
+PID. Forwarding accepts only bounded numeric memory records, excluding unrelated
+child stderr and malformed records. Do not add RSS values from two records of the same PID; they each describe
 the whole process. Samples at different times cannot be summed into an exact
 process memory breakdown. Idle pinned instances with no closes are not sampled.
 Diagnostics are opt-in because the query and bounded `ps` subprocess have cost;
@@ -191,3 +194,206 @@ uv run black --check src/drover/server/db.py src/drover/server/memory.py src/dro
 uv run isort --check-only src/drover/server/db.py src/drover/server/memory.py src/drover/server/cockpit/activity_reader.py src/drover/server/cockpit/service.py src/drover/server/web/app.py tests/test_analytical_memory.py tests/test_analytical_admission_http.py tests/test_db_self_heal.py tests/test_cockpit_analytics.py scripts/measure_cockpit_memory.py
 git diff --check
 ```
+
+## RSS investigation (#466, 2026-10-01)
+
+The reference hub's **6.6 GB one minute after restart / 8.3 GB before a hang**
+are operator-reported observations, not measurements from this checkout. Its
+explicit **6 GB analytical budget** is a buffer-manager ceiling, not evidence
+that 6 GB was allocated. We have no reference-hub memory samples or access to
+its data in this investigation. The cause of that hang remains unproven.
+
+DuckDB 1.5.5 enables an in-memory external file cache by default. Drover now
+sets `enable_external_file_cache=false` for live analytical and private snapshot
+connections. This avoids retaining local Parquet contents in DuckDB in addition
+to the OS file cache. It neither changes query results nor reduces the explicit
+6 GB budget. The separate control store's configuration is unchanged.
+[DuckDB configuration reference](https://duckdb.org/docs/stable/configuration/overview)
+describes this setting. No cache opt-in or new instance is introduced. The
+existing 1 GB analytical default stays: previous 512 MB cockpit OOM evidence
+is stronger than this synthetic workload as justification for its floor.
+
+The #438 diagnostics now also report nonzero DuckDB tags, Arrow pool bytes and
+Python traced bytes (or `None` when tracing is off). They do not import Arrow,
+start tracemalloc, collect garbage, or touch another owner's cursor. They remain
+opt-in and close-only, now with an additional process-wide limit
+of 64 samples per minute even when private snapshot paths churn. They still
+exclude idle pins that never close. Python tracing and the Arrow pool do not
+cover all native allocations, and neither should be subtracted from RSS to
+claim an exact residual breakdown.
+
+### Historical synthetic measurements (stopped commit `b4a3819`)
+
+`scripts/measure_hub_memory.py` uses 50,000 sessions and 1,000,000 spans in
+4,000 Parquet files (~32 MiB on disk), with persistent views over those files.
+Data generation happens in a separate process. A fresh measurement process
+opens and holds the live instance (like a runtime pin), rebinds the views,
+then makes three uncached cockpit overview and three insights list service
+calls. Insights findings are empty; this verifies the bounded control-store
+read path, not a large content-analysis workload. The schema comes from the
+analytics test fixture. The recovered probe explicitly sets `spans_enabled=True`
+because current main defaults span telemetry off; it models the optional span
+workload, not the default deployment. Its Python allocation summaries contain
+only byte/count totals, without source paths. **Startup here means open/view
+binding, not the full server CLI bootstrap**: background ingestion, provider refresh, summarization,
+production JSON payloads and startup rollups are excluded.
+
+psutil samples parent and child RSS every 10 ms. tracemalloc starts after module
+imports, so its numbers attribute incremental workload Python allocations;
+they exclude import-time Python memory and do not trace the reader subprocess.
+The Arrow default pool count covers live pool buffers, not allocator retention.
+Child DuckDB close samples come from #438 diagnostics. Peaks are sampled lower
+bounds. Parent and child peaks are independent and must not be added as an
+exact simultaneous process-tree peak.
+
+The stopped work recorded the following **synthetic** results, MiB
+(1 MiB = 1,048,576 bytes), baseline
+`4e1b434`, macOS arm64 / Python 3.14.7 / DuckDB 1.5.5 / Arrow 24.0.0. Both
+revisions used the hub's **6 GB live analytical budget**, one live thread and
+the existing default 1 GB private-reader budget:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Clone-supported startup parent RSS | 209.91 | 172.06 |
+| Clone-supported parent RSS after requests | 219.98 | 181.62 |
+| Reader child sampled peak RSS | 936.11 | 526.67 |
+| Reader DuckDB memory at close | 360.03 | 0.25 |
+| Live fallback startup parent RSS | 212.98 | 170.25 |
+| Live fallback parent RSS after requests | 1282.27 | 824.75 |
+| Live fallback DuckDB memory after requests | 360.03 | 0.25 |
+| Live fallback parent RSS after final close | 1266.31 | 824.75 |
+
+The cache accounts for **359.78 MiB** of retained DuckDB memory after the live
+scan. At view binding it accounts for **31.25 MiB**, plus ~0.41 MiB of object
+cache and 0.25 MiB of base-table pages. The cache's logical `nr_bytes` was only
+5.92 MiB at binding; use the memory tag to see allocated storage, not just
+logical file bytes. After disabling it the sampled live DuckDB memory is
+0.25 MiB. Incremental traced Python stayed below 0.8 MiB after requests
+(<1 MiB traced peak); live Arrow pool usage was zero at every sample.
+The remaining **~825 MiB fallback RSS is not explained by buffer-manager,
+traced Python or live Arrow-pool bytes**. Native query/Parquet allocations,
+imported libraries and allocator-retained pages are plausible contributors;
+this probe cannot distinguish their exact shares. Closing the instance did
+not return most pages to the OS. This is evidence against claiming connection
+closure alone fixes RSS.
+
+Cockpit times were 2.21–2.28 s before / 2.08–2.09 s after with isolated readers,
+and 2.59–2.87 s before / 2.54–2.81 s after with the live fallback. These are
+three warm-local-disk calls, not a latency guarantee. Disabling the cache can
+increase repeated I/O and CPU on cold or remote storage. Startup RSS decreased
+~38–43 MiB, reader peak ~409 MiB, and live retained RSS ~458 MiB in this probe;
+none is a claimed production saving. Raw samples and close diagnostics are in
+[measurements/drover-466.json](measurements/drover-466.json).
+
+To run the recovered probe on current sources (this does not reproduce the
+historical before/after numbers), run from the repository with no inherited `DROVER_DUCKDB_*` values. The
+following runner explicitly clears them, then sets only the two probe settings:
+
+```sh
+uv sync --extra dev
+# Pick a new, absent workload path; preparation refuses an existing directory.
+```
+
+```python
+import os
+import subprocess
+
+env = {k: v for k, v in os.environ.items()
+       if not k.startswith("DROVER_DUCKDB_")}
+python = ".venv/bin/python"
+probe = "scripts/measure_hub_memory.py"
+root = "/tmp/drover-466-new-workload"
+subprocess.run([python, probe, "--prepare", root], env=env, check=True)
+env.update(DROVER_DUCKDB_MEMORY_DIAGNOSTICS="1",
+           DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT="6GB")
+for mode in [[], ["--live-reader"]]:
+    with open(f"/tmp/466-current-{'live' if mode else 'clone'}.json", "w") as out:
+        subprocess.run([python, probe, root, *mode],
+                       env={**env, "PYTHONPATH": os.path.abspath("src")},
+                       stdout=out, check=True)
+```
+
+### Scope and remaining risks
+
+In the historical synthetic run on a clone-capable volume, the ~527 MiB reader
+exited after each uncached request, while the parent retained ~182 MiB.
+The fallback retained much more native memory. Extending #364's split
+on non-clone volumes still requires the consistent publisher/lease design
+above; copying a mutable file or checkpointing on each foreground refresh
+would risk #363 recovery semantics. This change does not enable either.
+
+Inspection found request closes, snapshot detaches, bounded insights scope
+cache, single-response cockpit caches and throttled Arrow release already on
+main. Their invariants stay intact. Lazy view binding alone would defer rather
+than remove the measured scan/cache cost and could move it into the first
+foreground request, so no new lazy-attachment behavior is added. `/healthz`,
+#331 admission gates, and #363 generation-based recovery/no-replay are unchanged.
+For the hub follow-up, collect per-PID diagnostics through startup and uncached
+requests, alongside process-tree RSS; include every live instance and avoid
+summing repeated whole-process RSS records. A native allocation profiler is
+needed to attribute the untracked residual before attempting allocator-specific
+reclamation or a new cross-platform snapshot mechanism.
+
+### Historical validation for #466 (`b4a3819`)
+
+Both test invocations ran in the foreground via `subprocess.run(...,
+check=True)`, with every inherited `DROVER_DUCKDB_*` key removed from the child
+environment before launch (including the diagnostics and 6 GB probe settings):
+
+```sh
+.venv/bin/python -m pytest -q tests/test_analytical_memory.py tests/test_db.py tests/test_db_self_heal.py tests/test_cockpit_analytics.py tests/test_analytical_admission_http.py tests/test_analytical_recovery_http.py tests/test_control_plane_isolation.py tests/test_control_plane_store.py
+.venv/bin/python -m pytest tests/ -n 2 -q
+```
+
+Focused: **201 passed in 35.89 s**. Full backend: **4,419 passed, 69 skipped,
+9 warnings in 342.74 s**, exit 0. Warnings concern multithreaded `fork()` and
+the MCP `streamable_http_client` rename. The new four-role regression verifies
+view binding and repeated Parquet scans return the expected aggregate and leave
+zero `EXTERNAL_FILE_CACHE` bytes, including with a second handle to the same
+instance. Existing admission tests cover `/healthz` under analytical pressure;
+recovery tests cover generation invalidation and no statement replay.
+
+Black, isort and `git diff --check` passed. The probe also completed a separate
+7-session / 13-span / 3-file-per-view smoke run to check preparation with
+non-divisible row counts and all eleven sampling phases.
+
+
+### Recovery review on current main (`97849f2`, 2026-10-01)
+
+Recovered from `b4a3819` in a new isolated worktree; the stopped worktree was
+read only and remains at its original clean commit. In addition to the cache
+setting and allocation counters, recovery redacts instance paths, suppresses
+exception payloads in memory-sample failures, caps process-wide diagnostic
+samples, and forwards only bounded numeric memory records from reader stderr.
+The probe explicitly enables the optional span workload and emits only numeric
+Python allocation summaries. The raw large-run artifact above is historical,
+with source-commit provenance; no new production or large-workload memory
+improvement is claimed.
+
+Foreground Studio validation (macOS arm64, Python 3.14.7, DuckDB 1.5.5):
+**209 passed in 34.61 s**, using the eight-module focused command above with
+all inherited `DROVER_DUCKDB_*` values removed and `PYTHONPATH` pointing to this
+worktree's `src`. This covers cache semantics for all four analytical roles,
+unchanged control-plane cache settings, admission/recovery behavior, opt-in
+sampling, throttling under path churn, failure redaction, loaded allocation
+pools, and filtering malformed/unrelated reader stderr.
+
+Probe smoke commands used a new workload under this worktree's `.venv`, with
+that same clean environment and current `PYTHONPATH`:
+
+```sh
+.venv/bin/python scripts/measure_hub_memory.py --prepare .venv/probe-466-fixture --sessions 7 --spans 13 --files 3
+# Both measurements added only MEMORY_DIAGNOSTICS=1 and ANALYTICAL_MEMORY_LIMIT=6GB
+# under the DROVER_DUCKDB_ prefix:
+.venv/bin/python scripts/measure_hub_memory.py .venv/probe-466-fixture
+.venv/bin/python scripts/measure_hub_memory.py .venv/probe-466-fixture --live-reader
+```
+
+Both modes passed: eleven phases, optional spans enabled, zero external-cache
+logical bytes and memory-tag bytes at every sample, numeric-only Python top
+summaries, and no workload path in diagnostic stderr. The default mode used an
+isolated reader on this Studio volume; the forced fallback did not. Black,
+isort, lock consistency and `git diff --check` passed. The full backend suite
+and large historical comparison were **not rerun** during recovery. This is
+ready for PR review as a targeted cache/observability change; #466's reported
+6–8 GB production residency and hang remain unproven and unresolved.

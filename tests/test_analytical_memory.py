@@ -91,6 +91,7 @@ def test_diagnostics_are_bounded_and_observational(tmp_path, monkeypatch, caplog
     monkeypatch.setenv("DROVER_DUCKDB_MEMORY_DIAGNOSTICS", "1")
     monkeypatch.setattr(memory, "process_rss_bytes", lambda: 123456)
     monkeypatch.setattr(memory, "_MAX_INSTANCES", 2)
+    monkeypatch.setattr(memory, "_sample_times", memory.deque())
     monkeypatch.setattr(memory, "_samples", memory.OrderedDict())
     caplog.set_level(logging.INFO, logger="drover.memory")
     for index in range(3):
@@ -101,6 +102,10 @@ def test_diagnostics_are_bounded_and_observational(tmp_path, monkeypatch, caplog
     assert len(caplog.records) == 3  # close doesn't sample again
     assert "rss_bytes=123456 duckdb_memory_bytes=" in caplog.text
     assert "duckdb_spill_bytes=" in caplog.text
+    assert "duckdb_tags=" in caplog.text
+    assert "arrow_pool_bytes=" in caplog.text
+    assert "python_traced_bytes=" in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 def test_arrow_release_is_throttled(monkeypatch):
@@ -161,3 +166,134 @@ def test_reader_timeout_removes_private_directory(tmp_path, monkeypatch):
         service._activity_in_reader_process(AnalyticsFilters(days=7))
     assert observed
     assert not observed[0].parent.exists()
+
+
+@pytest.mark.parametrize("role", ["worker", "summarizer", "diagnostic", "snapshot"])
+def test_parquet_scans_do_not_retain_external_file_cache(tmp_path, role):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    parquet = tmp_path / "rows.parquet"
+    pq.write_table(pa.table({"value": list(range(10000))}), parquet)
+    path = tmp_path / "db"
+    with db.open_duckdb_connection(path, role=role) as con:
+        assert con.execute(
+            "SELECT current_setting('enable_external_file_cache')"
+        ).fetchone() == (False,)
+        # View binding and repeated reads preserve results without keeping
+        # Parquet contents in the pinned DuckDB instance between requests.
+        con.execute(
+            f"CREATE VIEW rows AS SELECT * FROM read_parquet({db.sql_path_literal(parquet)})"
+        )
+        for _ in range(2):
+            assert con.execute("SELECT sum(value) FROM rows").fetchone() == (49995000,)
+        assert con.execute(
+            "SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory() "
+            "WHERE tag = 'EXTERNAL_FILE_CACHE'"
+        ).fetchone() == (0,)
+        with db.open_duckdb_connection(path, role=role) as second:
+            assert second.execute("SELECT count(*) FROM rows").fetchone() == (10000,)
+            assert second.execute(
+                "SELECT current_setting('enable_external_file_cache')"
+            ).fetchone() == (False,)
+
+
+def test_diagnostics_are_opt_in(monkeypatch):
+    def forbidden(*args):
+        pytest.fail("diagnostics touched an idle connection without opt-in")
+
+    memory.log_instance_memory(SimpleNamespace(execute=forbidden), "secret-path")
+
+
+def test_diagnostics_limit_churning_paths(monkeypatch, caplog):
+    monkeypatch.setenv("DROVER_DUCKDB_MEMORY_DIAGNOSTICS", "1")
+    monkeypatch.setattr(memory, "process_rss_bytes", lambda: 1)
+    monkeypatch.setattr(memory, "_samples", memory.OrderedDict())
+    monkeypatch.setattr(memory, "_sample_times", memory.deque())
+    monkeypatch.setattr(memory, "_MAX_SAMPLES_PER_MINUTE", 2)
+    now = [10.0]
+    monkeypatch.setattr(memory.time, "monotonic", lambda: now[0])
+    con = SimpleNamespace(execute=lambda _: SimpleNamespace(fetchall=lambda: []))
+    caplog.set_level(logging.INFO, logger="drover.memory")
+    for index in range(10):
+        memory.log_instance_memory(con, f"secret-{index}")
+    assert len(caplog.records) == 2
+    assert len(memory._sample_times) == 2
+    assert "secret" not in caplog.text
+    now[0] += 60
+    memory.log_instance_memory(con, "secret-10")
+    assert len(caplog.records) == 3
+
+
+def test_diagnostic_failure_is_non_secret_and_harmless(monkeypatch, caplog):
+    monkeypatch.setenv("DROVER_DUCKDB_MEMORY_DIAGNOSTICS", "1")
+    monkeypatch.setattr(memory, "_samples", memory.OrderedDict())
+    monkeypatch.setattr(memory, "_sample_times", memory.deque())
+
+    def fail(_):
+        raise RuntimeError("secret-query-and-path")
+
+    caplog.set_level(logging.DEBUG, logger="drover.memory")
+    memory.log_instance_memory(SimpleNamespace(execute=fail), "secret-db")
+    assert "memory sample unavailable" in caplog.text
+    assert "secret" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_diagnostics_observe_loaded_pools_without_starting_tracing(monkeypatch, caplog):
+    monkeypatch.setenv("DROVER_DUCKDB_MEMORY_DIAGNOSTICS", "1")
+    monkeypatch.setattr(memory, "process_rss_bytes", lambda: 1)
+    monkeypatch.setattr(memory, "_samples", memory.OrderedDict())
+    monkeypatch.setattr(memory, "_sample_times", memory.deque())
+    monkeypatch.setitem(
+        sys.modules, "pyarrow", SimpleNamespace(total_allocated_bytes=lambda: 7)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tracemalloc",
+        SimpleNamespace(is_tracing=lambda: True, get_traced_memory=lambda: (11, 12)),
+    )
+    con = SimpleNamespace(
+        execute=lambda _: SimpleNamespace(
+            fetchall=lambda: [("EXTERNAL_FILE_CACHE", 0, 0), ("BASE_TABLE", 13, 17)]
+        )
+    )
+    caplog.set_level(logging.INFO, logger="drover.memory")
+    memory.log_instance_memory(con, "secret-db")
+    assert "arrow_pool_bytes=7 python_traced_bytes=11" in caplog.text
+    assert 'duckdb_tags={"BASE_TABLE":13}' in caplog.text
+    assert "duckdb_memory_bytes=13 duckdb_spill_bytes=17" in caplog.text
+
+
+def test_control_plane_cache_configuration_is_unchanged():
+    import duckdb
+
+    with duckdb.connect() as con:
+        previous = con.execute(
+            "SELECT current_setting('enable_external_file_cache')"
+        ).fetchone()
+        db._apply_role_settings(con, "control_plane")
+        assert (
+            con.execute(
+                "SELECT current_setting('enable_external_file_cache')"
+            ).fetchone()
+            == previous
+        )
+
+
+def test_reader_diagnostics_exclude_unrelated_and_malformed_stderr():
+    line = (
+        "INFO:drover.memory:analytical_memory pid=42 instance=0123456789abcdef "
+        "rss_bytes=123 duckdb_memory_bytes=13 duckdb_spill_bytes=0 phase=before_close "
+        'arrow_pool_bytes=0 python_traced_bytes=None duckdb_tags={"BASE_TABLE":13}'
+    )
+    stderr = (
+        "private-error-query-and-path\n"
+        + line
+        + "\n"
+        + line.replace("0123456789abcdef", "/private/path")
+    )
+    assert memory.reader_memory_samples(stderr) == [
+        line.removeprefix("INFO:drover.memory:")
+    ]
+    assert len(memory.reader_memory_samples((line + "\n") * 1000)) == 64

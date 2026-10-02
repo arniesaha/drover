@@ -1196,6 +1196,14 @@ def _apply_role_settings(
             raise ValueError("DROVER_DUCKDB_ANALYTICAL_MAX_THREADS must be positive")
         settings["threads"] = str(min(int(settings["threads"]), cap))
 
+    # DuckDB 1.5 caches local Parquet contents by default, in addition to the
+    # OS page cache. A pinned hub keeps those pages between requests. Avoid
+    # retaining a second copy; this changes caching, not query semantics or
+    # admission/recovery. Apply to private readers too, whose peak overlaps
+    # the live instance. The small control store has no Parquet workload.
+    if role != "control_plane":
+        con.execute("SET enable_external_file_cache=false")
+
     con.execute("SET memory_limit=?", [settings["memory_limit"]])
     con.execute("SET threads=?", [int(settings["threads"])])
     con.execute(
