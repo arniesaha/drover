@@ -477,10 +477,13 @@ def test_session_summary_returns_one_row(tmp_path: Path) -> None:
     assert "Plan 1" in out["summary_md"]
 
 
-def test_session_summary_returns_none_for_unknown(tmp_path: Path) -> None:
+def test_session_summary_reports_unknown(tmp_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _populate(parquet_dir, duckdb_path)
-    assert drover_session_summary(duckdb_path=duckdb_path, session_id="nope") is None
+    assert (
+        drover_session_summary(duckdb_path=duckdb_path, session_id="nope")["status"]
+        == "unknown"
+    )
 
 
 def test_active_sessions_list(tmp_path: Path) -> None:

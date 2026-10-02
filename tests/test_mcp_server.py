@@ -28,6 +28,7 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
     tools = asyncio.run(server.list_tools())
     names = {t.name for t in tools}
     assert names == {
+        "drover_memory_acceptance",
         "drover_handoff",
         "drover_session_replay",
         "drover_session_summary",

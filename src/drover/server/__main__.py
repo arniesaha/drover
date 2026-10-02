@@ -3721,7 +3721,12 @@ def _build_session_bundle(
     summary = mcp_tools.drover_session_summary(
         duckdb_path=duckdb_path, session_id=session_id
     )
-    if summary is None:
+    if summary is None or summary.get("status") in {
+        "unknown",
+        "unmapped",
+        "unavailable",
+        "insufficient_input",
+    }:
         raise click.ClickException(
             f"no session_summary exists for session_id={session_id!r}; "
             "run a summarize pass before export"

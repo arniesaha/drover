@@ -258,11 +258,11 @@ def test_source_version_hashes_stable_facts_not_content(tmp_path: Path) -> None:
         con.execute("""CREATE TABLE agent_events (
                  id VARCHAR, session_id VARCHAR, timestamp TIMESTAMPTZ,
                  dedup_key VARCHAR, repo_owner VARCHAR, repo_name VARCHAR,
-                 content VARCHAR
+                 content VARCHAR, role VARCHAR, event_type VARCHAR, raw_data VARCHAR
                )""")
         con.execute("""INSERT INTO agent_events VALUES
                  ('e1', 's1', '2026-08-06T12:00:00Z', 'k1', 'acme', 'app',
-                  'original private message')""")
+                  'original private message', 'user', 'user_message', '{}')""")
         before = source_version_for_session(con, "s1")
         con.execute(
             "UPDATE agent_events SET content='different private message' WHERE id='e1'"
@@ -270,7 +270,7 @@ def test_source_version_hashes_stable_facts_not_content(tmp_path: Path) -> None:
         after_content_change = source_version_for_session(con, "s1")
         con.execute("""INSERT INTO agent_events VALUES
                  ('e2', 's1', '2026-08-06T12:01:00Z', 'k2', 'acme', 'app',
-                  'another message')""")
+                  'another message', 'assistant', 'assistant_message', '{}')""")
         after_new_event = source_version_for_session(con, "s1")
 
         assert before == after_content_change

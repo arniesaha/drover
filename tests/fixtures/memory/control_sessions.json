@@ -1,0 +1,72 @@
+{
+  "final_output": "Committed abc123def456789 for arniesaha/drover#479; fixes #468, #469 and #470. Tests passed.",
+  "harnesses": [
+    "codex",
+    "claude-code",
+    "deepseek",
+    "agy"
+  ],
+  "turns": [
+    {
+      "event_type": "user_input",
+      "payload": {
+        "type": "user_input",
+        "role": "user",
+        "text": "Implement memory integrity for #479",
+        "payload": {}
+      }
+    },
+    {
+      "event_type": "tool_action",
+      "payload": {
+        "type": "tool_action",
+        "role": "assistant",
+        "text": "Edit",
+        "payload": {
+          "tool": "Edit",
+          "tool_use_id": "call-1",
+          "input": {
+            "file_path": "src/drover/server/memory_identity.py",
+            "old_string": "null",
+            "new_string": "unknown"
+          }
+        }
+      }
+    },
+    {
+      "event_type": "tool_result",
+      "payload": {
+        "type": "tool_result",
+        "role": "tool",
+        "text": "File updated successfully",
+        "payload": {
+          "tool_use_id": "call-1"
+        }
+      }
+    },
+    {
+      "event_type": "tool_action",
+      "payload": {
+        "type": "tool_action",
+        "role": "assistant",
+        "text": "shell",
+        "payload": {
+          "tool": "shell",
+          "input": {
+            "command": "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: tests/test_memory_integrity.py\n@@\n+fixture\n*** End Patch\nPATCH"
+          }
+        }
+      }
+    },
+    {
+      "event_type": "assistant_output",
+      "payload": {
+        "type": "assistant_output",
+        "role": "assistant",
+        "text": "Committed abc123def456789 for arniesaha/drover#479; fixes #468, #469 and #470. Tests passed.",
+        "payload": {}
+      }
+    }
+  ],
+  "metadata_tail_count": 35
+}

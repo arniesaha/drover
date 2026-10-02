@@ -65,6 +65,12 @@ def _extract_content(ev: AgentEvent) -> str:
 
 def _row_from_event(ev: AgentEvent, env_task_id: Optional[str]) -> dict:
     rd = enrich_raw_repo_attribution(ev.raw_data)
+    rd.setdefault("source", "native")
+    if ev.tool_calls:
+        rd.setdefault(
+            "tool_use_blocks",
+            [{"name": t.tool_name, "input": t.input} for t in ev.tool_calls],
+        )
     repo_owner = rd.get("_repo_owner")
     repo_name = rd.get("_repo_name")
     branch = rd.get("gitBranch") or rd.get("git_branch")
@@ -185,7 +191,8 @@ def _existing_dedup_keys(con, rows: Iterable[dict]) -> set:
         return set()
 
     source_sql = "\nUNION ALL\n".join(
-        "SELECT dedup_key, agent_id FROM agent_events_for_date(?)" for _ in partitions
+        "SELECT dedup_key, agent_id FROM raw_agent_events_for_date(?)"
+        for _ in partitions
     )
     params: list = list(partitions)
     agent_ids = sorted({agent for agents in partitions.values() for agent in agents})

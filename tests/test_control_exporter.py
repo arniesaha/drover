@@ -33,6 +33,9 @@ def postgres_control_store(tmp_path: Path, monkeypatch):
     monkeypatch.setenv(config.dsn_env, dsn)
     configure_control_store(control_path, config)
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=control_path)
+    bootstrap(
+        parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "analytics.duckdb"
+    )
     try:
         yield control_path, tmp_path / "parquet"
     finally:

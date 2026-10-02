@@ -71,6 +71,7 @@ class ControlOutboxExporter:
         self._shutdown: threading.Event | None = None
         self._lock = threading.Lock()
         self._last_error: str | None = None
+        self._relation_initialized = False
         self._last_result: dict[str, Any] = self._empty_result()
 
     @staticmethod
@@ -159,7 +160,27 @@ class ControlOutboxExporter:
             if published:
                 acknowledged += self._rebuild_relation_and_acknowledge()
 
+        # Detach control reads before projection/model-job work. Summary link
+        # writes are short retry-safe effects after the analytical connection closes.
+        from drover.server.memory_identity import (
+            apply_memory_links,
+            read_memory_sessions,
+            refresh_memory_projection,
+        )
+
         with control_plane_connection(self.control_path) as control:
+            sessions = read_memory_sessions(control)
+        analytics = open_duckdb_connection(self.analytical_path)
+        try:
+            if not self._relation_initialized:
+                with control_plane_connection(self.control_path) as control:
+                    register_published_harness_events_relation(analytics, control)
+                self._relation_initialized = True
+            links = refresh_memory_projection(analytics, sessions)
+        finally:
+            analytics.close()
+        with control_plane_connection(self.control_path) as control:
+            apply_memory_links(control, links)
             current = outbox_status(control)
         retention = self._prune_verified_payloads()
         result = {
@@ -201,6 +222,7 @@ class ControlOutboxExporter:
             analytics = open_duckdb_connection(self.analytical_path)
             try:
                 register_published_harness_events_relation(analytics, control)
+                self._relation_initialized = True
             finally:
                 analytics.close()
             acknowledged = 0
