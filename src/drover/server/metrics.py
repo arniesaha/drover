@@ -36,8 +36,11 @@ from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.models import HARNESS_STALE_AFTER_SECONDS
 from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.recap_prompt import drop_user_subject
-from drover.server.harness.registry import HostBusyError, HostRetiredError
-from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.registry import (
+    HarnessRegistry,
+    HostBusyError,
+    HostRetiredError,
+)
 from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
     migrate_legacy_harness_event_sequences,
@@ -968,7 +971,7 @@ def _harness_session_dict(
     item = dict(session.__dict__)
     if host is not None:
         item["host_display_name"] = host.display_name
-        item["host_retired_at"] = _wire_datetime(host.retired_at)
+        item["host_retired_at"] = _wire_datetime(getattr(host, "retired_at", None))
     # Factory is deliberately not a Drover ledger.  The projection is derived
     # from existing session correlation fields and therefore vanishes with the
     # session; it cannot approve, cancel, or advance a Factory run.
@@ -2402,11 +2405,15 @@ class MetricsCollector:
             # registered central store was healthy.  HarnessRegistry resolves
             # the selected control backend without consulting the lake.
             registry = HarnessRegistry(self.duckdb_path)
-            hosts = (
-                registry.list_hosts(include_retired=include_retired)
-                if include_hosts
-                else []
-            )
+            # The default listing already excludes retired hosts; pass the
+            # opt-in flag only when asked so the live-fleet path keeps the
+            # plain ``list_hosts()`` contract every registry implements.
+            if not include_hosts:
+                hosts = []
+            elif include_retired:
+                hosts = registry.list_hosts(include_retired=True)
+            else:
+                hosts = registry.list_hosts()
             sessions = (
                 registry.list_sessions(archived_limit=archived_limit)
                 if include_sessions
@@ -2495,7 +2502,11 @@ class MetricsCollector:
         try:
             registry = HarnessRegistry(self.duckdb_path)
             host = registry.get_host(host_id)
-            return host if host is not None and host.retired_at is None else None
+            return (
+                host
+                if host is not None and getattr(host, "retired_at", None) is None
+                else None
+            )
         except Exception as exc:  # noqa: BLE001
             if raise_errors:
                 raise

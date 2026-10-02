@@ -949,10 +949,10 @@ def test_postgres_advisory_occurrence_sweep_counts_empty_and_keeps_newest_failin
 
 
 def test_postgres_retirement_migration_and_credentials(postgres_control_store):
+    from drover.server.control_store import postgres_control_store as pg_store
+    from drover.server.db import control_plane_connection
     from drover.server.harness.registry import HarnessRegistry, HostRetiredError
     from drover.server.web.credentials import PostgresCredentialStore
-    from drover.server.db import control_plane_connection
-    from drover.server.control_store import postgres_control_store as pg_store
 
     path, _ = postgres_control_store
     registry = HarnessRegistry(path)
