@@ -625,9 +625,7 @@ class ProviderRefreshLoop:
                     self.provider_usage.mark_host_unavailable(
                         host_id,
                         error_category=(
-                            "host_retired"
-                            if liveness == "retired"
-                            else "host_offline"
+                            "host_retired" if liveness == "retired" else "host_offline"
                         ),
                     )
                 except Exception as exc:  # noqa: BLE001 - status overlay is isolated

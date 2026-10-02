@@ -112,7 +112,9 @@ def host_liveness(
     """
     default_stale, default_offline = liveness_thresholds()
     stale_s = default_stale if stale_after is None else stale_after
-    offline_s = max(default_offline if offline_after is None else offline_after, stale_s)
+    offline_s = max(
+        default_offline if offline_after is None else offline_after, stale_s
+    )
     age = heartbeat_age_seconds(getattr(host, "last_seen_at", None), now)
 
     def result(state: Liveness) -> HostLiveness:
@@ -125,7 +127,10 @@ def host_liveness(
         return result("retired")
     if stored != "online":
         return result("offline")
-    if getattr(host, "connection_kind", "direct") == "relay" and relay_responsive is False:
+    if (
+        getattr(host, "connection_kind", "direct") == "relay"
+        and relay_responsive is False
+    ):
         return result("offline")
     if age is None:
         return result("online")

@@ -1127,9 +1127,7 @@ def drover_fleet_status(
         registry = HarnessRegistry(duckdb_path)
         all_hosts = registry.list_hosts(include_retired=True)
         liveness = {host.host_id: host.liveness().state for host in all_hosts}
-        retired = {
-            host.host_id for host in all_hosts if host.retired_at is not None
-        }
+        retired = {host.host_id for host in all_hosts if host.retired_at is not None}
         retired_sessions = set()
         for host_id in retired:
             for session in registry.list_sessions(host_id=host_id):
