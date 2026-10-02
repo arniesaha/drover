@@ -6,6 +6,7 @@ import json
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
@@ -679,3 +680,125 @@ def test_facets_are_bounded(fleet):
     facets = fetch_history_facets(path)
     assert len(facets["repos"]) == history.MAX_FACET_REPOS
     assert facets["repos"][0] == f"o/r{history.MAX_FACET_REPOS + 4}"
+
+
+# --------------------------------------------------------------------------- #
+# Client fixture contract                                                     #
+# --------------------------------------------------------------------------- #
+
+SWIFT_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "apps/drover/DroverKit/Tests/DroverKitTests/Fixtures/session-history-page.json"
+)
+
+
+def _wire_type(value):
+    return type(value).__name__ if value is not None else "null"
+
+
+def test_swift_fixture_matches_the_live_history_response(fleet, tmp_path):
+    """The iOS decoder fixture is a real /sessions/history page, not a guess.
+
+    Seeds the fixture's two sessions, fetches them over HTTP, and requires the
+    same envelope, item, host and token shapes, and the same values. The
+    fixture's deliberately malformed third row (no id) and its unknown state
+    are the only parts the backend never emits; they exercise client leniency.
+    """
+    fixture = json.loads(SWIFT_FIXTURE.read_text(encoding="utf-8"))
+    expected = [item for item in fixture["items"] if "id" in item]
+    assert len(expected) == 2 and len(fixture["items"]) == 3
+
+    registry, path = fleet
+    registry.register_host(host_id="mac-mini", display_name="Studio Mac", kind="mac")
+    registry.register_host(host_id="old-laptop", display_name="Old Laptop", kind="mac")
+    first, second = expected
+    registry.create_session(
+        session_id=first["id"],
+        host_id="mac-mini",
+        harness=first["harness"],
+        command=first["harness"],
+        status=first["status"],
+        repo_owner="arniesaha",
+        repo_name="drover",
+        branch=first["branch"],
+        model=first["model"],
+    )
+    registry.append_event(
+        session_id=first["id"],
+        event_type="user_input",
+        content_preview=first["title"],
+        seq=1,
+    )
+    _summary(path, first["id"], first["summary"])
+    registry.create_session(
+        session_id=second["id"],
+        host_id="old-laptop",
+        harness=second["harness"],
+        command=second["harness"],
+        status="running",
+    )
+    registry.retire_host("old-laptop", reason="replaced", force=True)
+    # An older row, so a two-row page has a next cursor like the fixture's.
+    _session(registry, path, "older", T0)
+    tokens = first["tokens"]
+    with control_plane_connection(path) as con:
+        for item in expected:
+            con.execute(
+                """UPDATE harness_sessions SET started_at = ?, ended_at = ?,
+                   last_activity = ?, status = ?, model = ? WHERE session_id = ?""",
+                [
+                    item["started_at"] and datetime.fromisoformat(item["started_at"]),
+                    item["ended_at"] and datetime.fromisoformat(item["ended_at"]),
+                    datetime.fromisoformat(item["last_activity"]),
+                    item["status"],
+                    item["model"],
+                    item["id"],
+                ],
+            )
+        con.execute(
+            """INSERT INTO session_usage (session_id, input_tokens, output_tokens,
+               cache_read_tokens, cache_write_tokens, source, source_seq,
+               source_event_count) VALUES (?, ?, ?, ?, ?, 'test', 1, 1)""",
+            [
+                first["id"],
+                tokens["input"],
+                tokens["output"],
+                tokens["cache_read"],
+                tokens["cache_write"],
+            ],
+        )
+
+    server = _serve(path, tmp_path)
+    try:
+        status, _, body = _get(server, "/sessions/history?limit=2")
+    finally:
+        server.shutdown()
+    assert status == 200
+
+    # Envelope: same keys and wire types (as_of and the cursor are opaque).
+    assert set(body) == set(fixture)
+    for key in ("has_more", "page_size", "truncated", "next_cursor", "as_of"):
+        assert _wire_type(body[key]) == _wire_type(fixture[key]), key
+    assert body["page_size"] == 2
+
+    actual = {item["id"]: item for item in body["items"]}
+    assert list(actual) == [first["id"], second["id"]]
+    for want in expected:
+        got = actual[want["id"]]
+        assert set(got) == set(want), want["id"]
+        assert set(got["host"]) == set(want["host"])
+        if want["tokens"] is not None:
+            assert set(got["tokens"]) == set(want["tokens"])
+        for key, value in want.items():
+            if key == "state" and value not in history.STATES:
+                # The fixture's unknown state tests client leniency; the
+                # backend derives a known one from the same raw status.
+                assert got[key] == history.session_state(want["status"], None)
+            elif key in {"started_at", "ended_at", "last_activity"} and value:
+                assert datetime.fromisoformat(got[key]) == datetime.fromisoformat(
+                    value
+                ), (want["id"], key)
+            else:
+                assert got[key] == value, (want["id"], key)
+    # Every state the fixture uses for a real row is one the backend emits.
+    assert first["state"] in history.STATES
