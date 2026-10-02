@@ -366,6 +366,13 @@ public final class SessionStore {
     /// new session's harness; nil keeps the source session's own.
     public func continueSession(_ sessionID: String, targetHarness: String? = nil) async -> ContinuedSession? {
         guard let client else { return nil }
+        guard let session = snapshot?.sessions.first(where: { $0.id == sessionID }),
+              let host = snapshot?.hosts.first(where: { $0.id == session.hostID }),
+              host.offer(named: targetHarness ?? session.harness)?.launchMode == .structured else {
+            lastError = HarnessCapabilityCopy.noLaunchableHarness
+            lastRefreshFailure = nil
+            return nil
+        }
         do {
             let continued = try await client.continueSession(sessionID: sessionID,
                                                              targetHarness: targetHarness)

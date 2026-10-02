@@ -7,7 +7,11 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     @Binding var attachments: [TurnAttachment]
 
     let runPreferences: HarnessModelCatalogState
+    /// False when the host does not advertise a model catalog for this
+    /// harness: the model and effort chips are not drawn at all.
+    let showsPreferences: Bool
     let arePreferencesEditable: Bool
+    let preferencesLockedReason: String?
     let placeholder: String
     let sendSystemImage: String
     let isSending: Bool
@@ -23,7 +27,9 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         text: Binding<String>,
         attachments: Binding<[TurnAttachment]>,
         runPreferences: HarnessModelCatalogState,
+        showsPreferences: Bool,
         arePreferencesEditable: Bool = true,
+        preferencesLockedReason: String? = nil,
         placeholder: String,
         sendSystemImage: String = "arrow.up",
         isSending: Bool = false,
@@ -36,7 +42,9 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         _text = text
         _attachments = attachments
         self.runPreferences = runPreferences
+        self.showsPreferences = showsPreferences
         self.arePreferencesEditable = arePreferencesEditable
+        self.preferencesLockedReason = preferencesLockedReason
         self.placeholder = placeholder
         self.sendSystemImage = sendSystemImage
         self.isSending = isSending
@@ -78,10 +86,13 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                 attachmentButton
                     .frame(width: 32, height: 32)
 
-                HarnessPreferenceControls(
-                    runPreferences: runPreferences,
-                    isEditable: arePreferencesEditable
-                )
+                if showsPreferences {
+                    HarnessPreferenceControls(
+                        runPreferences: runPreferences,
+                        isEditable: arePreferencesEditable,
+                        lockedReason: preferencesLockedReason
+                    )
+                }
 
                 Spacer(minLength: 8)
 

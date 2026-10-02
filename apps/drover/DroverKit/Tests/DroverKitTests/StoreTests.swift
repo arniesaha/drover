@@ -147,7 +147,8 @@ struct StoreTests {
     MockURLProtocol.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
     await store.refresh()
-    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8)) }
+    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8))
+    }
     await store.refresh()
     #expect(store.snapshot != nil)          // cached snapshot survives
     #expect(store.lastError?.localizedCaseInsensitiveContains("token") == true)
@@ -250,8 +251,12 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func continueSessionReturnsNewIDOnSuccess() async throws {
-    MockURLProtocol.handler = { _ in (200, Data(#"{"session_id": "harness-9"}"#.utf8)) }
+    MockURLProtocol.handler = { request in
+        if request.url?.path == "/harness" { return (200, snapshotJSON) }
+        return (200, Data(#"{"session_id": "harness-9"}"#.utf8))
+    }
     let store = SessionStore(client: client())
+    await store.refresh()
     let continued = await store.continueSession("harness-1")
     #expect(continued?.sessionID == "harness-9")
     #expect(continued?.isStructured == false)
@@ -259,10 +264,12 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func continueSessionSurfacesStructuredMode() async throws {
-    MockURLProtocol.handler = { _ in
-        (200, Data(#"{"session_id": "harness-9", "mode": "structured"}"#.utf8))
+    MockURLProtocol.handler = { request in
+        if request.url?.path == "/harness" { return (200, snapshotJSON) }
+        return (200, Data(#"{"session_id": "harness-9", "mode": "structured"}"#.utf8))
     }
     let store = SessionStore(client: client())
+    await store.refresh()
     let continued = await store.continueSession("harness-1", targetHarness: "agy")
     #expect(continued?.isStructured == true)
 }
@@ -270,19 +277,25 @@ private final class LockedCount: @unchecked Sendable {
 @Test @MainActor func continueSessionPostsTargetHarness() async throws {
     nonisolated(unsafe) var sentTarget: String?
     MockURLProtocol.handler = { request in
+        if request.url?.path == "/harness" { return (200, snapshotJSON) }
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         sentTarget = body["target_harness"] as? String
         return (200, Data(#"{"session_id": "harness-9"}"#.utf8))
     }
     let store = SessionStore(client: client())
+    await store.refresh()
     let continued = await store.continueSession("harness-1", targetHarness: "agy")
     #expect(continued?.sessionID == "harness-9")
     #expect(sentTarget == "agy")
 }
 
 @Test @MainActor func continueSessionSurfacesServerExplanation() async throws {
-    MockURLProtocol.handler = { _ in (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8)) }
+    MockURLProtocol.handler = { request in
+        if request.url?.path == "/harness" { return (200, snapshotJSON) }
+        return (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8))
+    }
     let store = SessionStore(client: client())
+    await store.refresh()
     let newID = await store.continueSession("harness-1")
     #expect(newID == nil)
     #expect(store.lastError == "host mac-mini is offline")
@@ -294,7 +307,9 @@ private final class LockedCount: @unchecked Sendable {
                                session: MockURLProtocol.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    MockURLProtocol.handler = { request in
+        if request.url?.path == "/harness" { return (200, snapshotJSON) }
+        return (200, snapshotJSON) }
     await store.refresh()
 
     MockURLProtocol.transportError = URLError(.cannotConnectToHost)
@@ -303,7 +318,10 @@ private final class LockedCount: @unchecked Sendable {
     #expect(store.isTailscaleTransportFailure)
 
     MockURLProtocol.transportError = nil
-    MockURLProtocol.handler = { _ in (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8)) }
+    MockURLProtocol.handler = { request in
+        if request.url?.path == "/harness" { return (200, snapshotJSON) }
+        return (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8))
+    }
     let continued = await store.continueSession("harness-1")
 
     #expect(continued == nil)
@@ -321,8 +339,12 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func continueSessionNonServerFailureGetsGenericError() async throws {
-    MockURLProtocol.handler = { _ in (200, Data("not json".utf8)) }
+    MockURLProtocol.handler = { request in
+        if request.url?.path == "/harness" { return (200, snapshotJSON) }
+        return (200, Data("not json".utf8))
+    }
     let store = SessionStore(client: client())
+    await store.refresh()
     let newID = await store.continueSession("harness-1")
     #expect(newID == nil)
     #expect(store.lastError == "Couldn't start handoff — is the host online?")
@@ -675,19 +697,22 @@ private final class LockedCount: @unchecked Sendable {
                                session: MockURLProtocol.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
-    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8)) }
+    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8))
+    }
     await store.refresh()
     #expect(store.lastRefreshFailure == .authentication)
     #expect(store.lastError == "Token rejected — check Settings")
     #expect(!store.isTailscaleTransportFailure)
 
-    MockURLProtocol.handler = { _ in (200, Data("not json".utf8)) }
+    MockURLProtocol.handler = { _ in (200, Data("not json".utf8))
+    }
     await store.refresh()
     #expect(store.lastRefreshFailure == .decoding)
     #expect(store.lastError == "Unexpected response from the hub")
     #expect(!store.isTailscaleTransportFailure)
 
-    MockURLProtocol.handler = { _ in (503, Data(#"{"error": "Hub is restarting"}"#.utf8)) }
+    MockURLProtocol.handler = { _ in (503, Data(#"{"error": "Hub is restarting"}"#.utf8))
+    }
     await store.refresh()
     #expect(store.lastRefreshFailure == .http)
     #expect(store.lastError?.hasPrefix("Hub busy, retrying in ") == true)

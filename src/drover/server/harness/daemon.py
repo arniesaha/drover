@@ -1373,16 +1373,22 @@ class HarnessDaemonState:
                 # The daemon owns the generic terminal, outside the provider
                 # adapter registry. It makes no structured-operation claims.
                 capabilities = HarnessCapabilities(frozenset({"pty"}))
+                turn_preferences = False
             else:
                 try:
-                    capabilities = self.adapters.resolve(preset.name).capabilities
+                    adapter = self.adapters.resolve(preset.name)
+                    capabilities = adapter.capabilities
+                    turn_preferences = adapter.turn_preferences_mutable
                 except KeyError:
                     capabilities = HarnessCapabilities(frozenset())
+                    turn_preferences = False
             row = preset.as_json()
             # Commands may contain environment assignments, auth or prompt
             # arguments. Keep the legacy field, never publish the invocation.
             row["command"] = []
-            row["capabilities"] = capability_matrix(preset.name, capabilities)
+            row["capabilities"] = capability_matrix(
+                preset.name, capabilities, turn_preferences=turn_preferences
+            )
             harnesses.append(row)
         return validate_capabilities(
             {

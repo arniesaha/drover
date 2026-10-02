@@ -17,6 +17,9 @@ public final class HarnessModelCatalogState {
     public private(set) var catalog: HarnessModelCatalog?
     public private(set) var isRefreshing = false
     public private(set) var statusMessage: String?
+    /// Whether the selection's host advertises `model_catalog` (#420). When
+    /// false nothing is fetched, nothing is shown and no override is sent.
+    public private(set) var isCatalogAvailable = false
     public var selectedModel = "" { didSet { selectionDidChange() } }
     public var thinkingEffort = "" { didSet { selectionDidChange() } }
 
@@ -25,12 +28,19 @@ public final class HarnessModelCatalogState {
         self.store = store
     }
 
-    public var modelOverride: String? { normalized(selectedModel) }
-    public var thinkingEffortOverride: String? { normalized(thinkingEffort) }
+    public var modelOverride: String? {
+        isCatalogAvailable ? normalized(selectedModel) : nil
+    }
+    public var thinkingEffortOverride: String? {
+        isCatalogAvailable ? normalized(thinkingEffort) : nil
+    }
 
+    /// `catalogAvailable` has no default on purpose: every caller states
+    /// what the capability envelope advertised for this host and harness.
     public func select(
         hostID: String,
         harness: String,
+        catalogAvailable: Bool,
         seedModel: String? = nil,
         seedThinkingEffort: String? = nil
     ) {
@@ -40,6 +50,18 @@ public final class HarnessModelCatalogState {
         self.hostID = hostID
         self.harness = harness
         statusMessage = nil
+        isCatalogAvailable = catalogAvailable
+
+        guard catalogAvailable else {
+            pendingSeedModel = nil
+            pendingSeedThinkingEffort = nil
+            reconcileWithoutCallbacks {
+                catalog = nil
+                selectedModel = ""
+                thinkingEffort = ""
+            }
+            return
+        }
 
         let requestedModel = seedModel.flatMap(normalized)
         let requestedThinkingEffort = seedThinkingEffort.flatMap(normalized)
@@ -75,7 +97,7 @@ public final class HarnessModelCatalogState {
     }
 
     public func refresh(force: Bool = false) async {
-        guard !hostID.isEmpty, !harness.isEmpty else { return }
+        guard isCatalogAvailable, !hostID.isEmpty, !harness.isEmpty else { return }
         refreshGeneration &+= 1
         let requestGeneration = refreshGeneration
         let expectedSelectionGeneration = selectionGeneration
@@ -123,7 +145,8 @@ public final class HarnessModelCatalogState {
     }
 
     public func apply(_ freshCatalog: HarnessModelCatalog) {
-        guard freshCatalog.hostID == hostID, freshCatalog.harness == harness else { return }
+        guard isCatalogAvailable,
+              freshCatalog.hostID == hostID, freshCatalog.harness == harness else { return }
 
         let requestedModel = pendingSeedModel
         let requestedThinkingEffort = pendingSeedThinkingEffort

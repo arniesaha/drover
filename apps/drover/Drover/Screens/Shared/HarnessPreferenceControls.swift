@@ -4,6 +4,8 @@ import DroverKit
 struct HarnessPreferenceControls: View {
     let runPreferences: HarnessModelCatalogState
     let isEditable: Bool
+    /// Spoken by VoiceOver on the lock: why these can't change right now.
+    var lockedReason: String? = nil
 
     @State private var showsModelPicker = false
 
@@ -52,6 +54,8 @@ struct HarnessPreferenceControls: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("Run preferences locked for this session")
+                    .accessibilityHint(lockedReason ?? "")
+                    .accessibilityIdentifier("run-preferences-locked")
             }
         }
         .layoutPriority(1)

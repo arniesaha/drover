@@ -1783,7 +1783,8 @@ def test_metrics_http_server_serves_harness_ui_and_api(tmp_path):
     assert 'id="cwd-suggestions"' in page
     assert 'id="advanced-status"' in page
     assert "focusNextLaunchField" in page
-    assert "HARNESS_PREFERENCE" in page
+    assert "HARNESS_PREFERENCE" not in page
+    assert "DroverCapabilities.preferredLaunchTarget(host)" in page
     assert "renderWorkspaces" in page
     assert "startWorkspaceByIndex" in page
     assert "sessionState" in page
@@ -1837,7 +1838,8 @@ def test_metrics_http_server_serves_harness_ui_and_api(tmp_path):
     assert '"ctrl-c": "\\u0003"' in terminal_page
     assert 'id="paste"' in terminal_page
     assert "function submitSuffix()" in terminal_page
-    assert 'sessionData?.session?.harness === "codex" ? "\\n" : "\\r"' in terminal_page
+    assert 'harness === "codex"' not in terminal_page
+    assert 'return "\\r";' in terminal_page
     assert "data.endsWith" in terminal_page
     assert "data += suffix" in terminal_page
     assert 'id="continue-session"' in terminal_page

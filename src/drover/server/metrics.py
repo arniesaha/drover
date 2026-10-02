@@ -2246,7 +2246,35 @@ class MetricsCollector:
         target_harness = str(payload.get("target_harness") or source.harness)
         native_resume = payload.get("native_resume")
         handoff_mode = "native_resume" if native_resume else "nexus_handoff"
-        if not native_resume and target_harness in _STRUCTURED_HANDOFF_HARNESSES:
+        # Current hosts choose their handoff mode from the same envelope as
+        # clients. Keep the old routing only for matrix-less hosts during the
+        # mixed-version window; unknown adapter IDs must not become PTY seeds.
+        target_host = self._harness_host(target_host_id)
+        target_row = next(
+            (
+                row
+                for row in (
+                    target_host.capabilities.get("harnesses", []) if target_host else []
+                )
+                if isinstance(row, dict) and row.get("name") == target_harness
+            ),
+            None,
+        )
+        structured_target = target_harness in _STRUCTURED_HANDOFF_HARNESSES
+        if target_row is not None and "capabilities" in target_row:
+            matrix = target_row["capabilities"]
+            modes = matrix.get("launch_modes", []) if isinstance(matrix, dict) else []
+            if (
+                not isinstance(matrix, dict)
+                or matrix.get("schema_version") != 1
+                or target_row.get("enabled") is not True
+                or not modes
+            ):
+                return _json_response(
+                    400, {"error": "target harness is not launchable"}
+                )
+            structured_target = "structured" in modes
+        if not native_resume and structured_target:
             # Nexus handoff to a structured-capable harness: launch a
             # structured session and deliver the handoff text as the first
             # turn ("prompt"). The daemon sends it once the driver is up, so

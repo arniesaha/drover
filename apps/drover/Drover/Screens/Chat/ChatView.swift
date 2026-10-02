@@ -151,13 +151,20 @@ struct ChatView: View {
                 ArtifactRows(artifacts: artifacts)
             }
 
+            // Allow/Deny only when the host advertises approvals. Otherwise the
+            // request is still shown as pending, with why iOS can't answer it.
             if let approval = model.pendingApproval {
-                DecisionBlock(
-                    approval: approval,
-                    isBusy: model.isAnswering,
-                    onApprove: { Task { await model.approve("allow") } },
-                    onDeny: { Task { await model.approve("deny") } }
-                )
+                if model.controls.showsApprovals {
+                    DecisionBlock(
+                        approval: approval,
+                        isBusy: model.isAnswering,
+                        onApprove: { Task { await model.approve("allow") } },
+                        onDeny: { Task { await model.approve("deny") } }
+                    )
+                } else if let reason = model.controls.approvalsUnavailableReason {
+                    ChatHintBanner(reason)
+                        .accessibilityIdentifier("approval-unavailable")
+                }
             }
 
             // Deliberately not gated on `hint`: approve, interrupt, terminate
@@ -188,7 +195,7 @@ struct ChatView: View {
                 Composer(text: $model.composerText,
                      attachments: $model.pendingAttachments,
                      runPreferences: model.runPreferences,
-                     harness: model.harnessPresentation.harness,
+                     controls: model.controls,
                      isSending: model.isSending,
                      canSend: model.canSendTurn,
                      canAddAttachments: !model.isCommittingPendingDeliveryAction,
@@ -559,24 +566,32 @@ struct ChatView: View {
 
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
+                // Disabled rather than hidden, so the menu says why: the
+                // host does not advertise interrupt for this harness (or has
+                // not been heard from yet).
                 Button {
                     Task { await model.interrupt() }
                 } label: {
+                    // A trailing Text is the menu item's subtitle, which the
+                    // system also speaks with the title.
                     Label("Interrupt", systemImage: "stop.circle")
+                    if let reason = model.controls.interruptUnavailableReason {
+                        Text(reason)
+                    }
                 }
-                // nil target = same harness. Structured-capable harnesses now
-                // continue into a fresh structured chat (the handoff context
-                // becomes its first turn); only shell sources land in a
-                // terminal.
+                .disabled(!model.controls.canInterrupt)
+                .accessibilityIdentifier("chat-interrupt")
+                // Same-harness handoff also needs an advertised structured target.
                 Button {
                     Task { await handOff(to: nil) }
                 } label: {
                     Label("Continue in a new session", systemImage: "arrow.triangle.branch")
                 }
-                // Per-harness targets from the session's host. "shell" is
-                // deliberately excluded: the seed gets typed into the PTY,
-                // and a bare shell would execute the handoff summary as
-                // commands. The nil-target button above already covers the
+                .disabled(!model.handoffHarnesses.contains(model.harnessPresentation.harness))
+                // Per-harness targets from the session's host: only those it
+                // advertises a structured launch for. A PTY-only target would
+                // have the seed typed into a terminal and run as commands.
+                // The nil-target button above already covers the
                 // same-harness case.
                 if !crossHarnessTargets.isEmpty {
                     Menu {
@@ -606,7 +621,7 @@ struct ChatView: View {
     }
 
     private var crossHarnessTargets: [String] {
-        model.handoffHarnesses.filter { $0 != "shell" }
+        model.handoffHarnesses
     }
 
     private func handOff(to targetHarness: String?) async {

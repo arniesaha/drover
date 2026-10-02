@@ -139,12 +139,20 @@ regardless of direct or relay transport. The nested matrix is schema v1:
         "usage": false,
         "worktree": true,
         "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
-        "interactive_auth": true
+        "interactive_auth": true,
+        "turn_preferences": true
       }
     }
   ]
 }
 ```
+
+`turn_preferences` (additive in v1, #420) means model and reasoning-effort
+overrides reach later turns of a running session. It is projected from the
+adapter's immutable `turn_preferences_mutable` attribute, the same flag turn
+dispatch already enforces, and is only true when `model_catalog` is too. Claude
+Code fixes them at process start, so it publishes `false`. Hosts that predate
+the flag omit it, which reads as `false` under the missing-boolean rule below.
 
 `attachments` is an array of accepted MIME types, not a boolean. `usage` follows
 the executable adapter contract; a separate provider usage probe does not imply
@@ -251,6 +259,128 @@ Web and iOS consume the same host capability envelope.
 
 These are deterministic rendering rules. No model decides which controls are
 visible.
+
+### Web console (#419)
+
+The web console derives every control from
+`src/drover/server/web/static/harness_capabilities.js`, which `ui.py` inlines into
+`harness.html` and `harness_terminal.html`. The pages and the module contain no
+harness names; a test fails if one appears in their scripts. Decisions for the
+questions #418 left to clients:
+
+- **Fail closed.** Only a row with a schema v1 matrix, `enabled: true` and a launch
+  mode this client drives can be launched or chosen as a Continue target. Flags
+  must be JSON `true`; unknown additive fields and unknown mode strings are
+  ignored. Malformed known flags, modes or MIME types close the whole matrix.
+  A null, malformed or identity-mismatched matrix, or any other
+  `schema_version`, offers nothing. A harness the host does not list (for
+  example observe-only OpenClaw) has no controls.
+- **Preferred mode.** The web drives both modes. If a harness advertises both,
+  it picks `structured`, because approvals, interrupt, attachments and the model
+  catalog are structured adapter operations, while a PTY session only exposes
+  raw terminal I/O. The one-click workspace start uses the first
+  structured-capable target in the host's advertised order, falling back to a
+  PTY-only target. The launch body always sends the chosen `mode`.
+- **Session controls.** A structured session (`session.mode == "structured"`)
+  gets a turn composer. Interrupt, Approve/Deny and attachments appear only if
+  its harness still advertises `structured` and the matching capability on that
+  host. The attachment picker accepts only the advertised MIME types. A PTY
+  session, including one from before the matrix, keeps terminal attach, Ctrl-C,
+  keys and Kill: these are part of the `pty` mode, not of the `interrupt`
+  capability. Model and effort pickers appear only for a structured launch with
+  `model_catalog`. They send only an effort the selected model lists. Native
+  resume candidates are fetched only for a Continue target with
+  `native_resume`. Worktree isolation is explained only when `worktree` is true.
+- **No stale controls.** Launch, Continue, turn, approval and interrupt handlers
+  re-resolve capabilities from the latest envelope when they run. Session
+  polling uses the current host returned with the session; handoff refreshes
+  the fleet before submission. They do not
+  trust a hidden or previously rendered control. An approval is answered only if
+  its `request_id` is still the newest unanswered `approval_prompt`.
+- **Upgrade guidance.** A host whose rows have no matrix shows its harnesses as
+  disabled pills, with "Upgrade Drover on this host to launch from the web. Its
+  existing sessions stay listed." A newer schema version asks the user to
+  upgrade the Drover hub. Neither case triggers a name-based fallback.
+- **Legacy window.** The web needs no legacy compatibility code: legacy rows are
+  rendered as metadata only. The upgrade explanation is removed once central
+  stops publishing matrix-less rows. That is the end of the compatibility window
+  in the rollout above, after #420 ships.
+- **Not offered on the web.** The web has no interactive sign-in or usage
+  surface. The module exposes `interactiveAuth` and `usage` for a future one, but
+  nothing is rendered.
+
+Behavior change: until now the web started provider CLIs (Claude Code, Codex,
+agy) as raw PTY terminals, even though their adapters advertise only
+`structured`. Now they start as structured sessions, driven from the session
+page. `shell` remains a PTY terminal. The PTY Send button now ends input with
+`\r` for every harness. The Codex-only `\n` special case is gone, so an
+already-running Codex PTY session from before this change gets a terminal
+Enter.
+
+### iOS client decisions (#420)
+
+The iOS app implements the rules above in DroverKit `HarnessCapabilities`,
+`HarnessOffer` and `HarnessControls`. It answers #418's open client questions
+this way:
+
+- **Fail closed.** iOS offers a control only when the session's host advertises
+  it in a supported matrix. Until the first snapshot names the session's host,
+  chat controls are unresolved and withheld. That covers Allow/Deny, interrupt,
+  mid-session preferences and attachments. A harness missing from the snapshot
+  is treated the same way. The model also refuses unadvertised actions before
+  any request: `launch`, `interrupt`, `approve`, turns, handoff, attachment
+  admission and turn-preference overrides. Withdrawn attachment support leaves
+  the draft intact; a pending delivery is held for review before any retry.
+- **Missing or unsupported matrices.** A host with no envelope, or rows with no
+  matrix (string rows and matrix-less objects), is legacy metadata. Its
+  sessions stay listable and openable, and its enabled names stay in
+  `HostSummary.harnesses`. It offers nothing to launch, and the launch sheet
+  says: "This host runs an older Drover that doesn't advertise harness
+  capabilities. Update Drover on the host to launch or control sessions from
+  iOS." A newer `schema_version` reports its version and asks for an app
+  update. A `null` or malformed matrix, including a non-boolean flag, an
+  unknown attachment element or a `harness_id` mismatch, is invalid and is
+  never treated as legacy. Unknown additive fields and unknown launch-mode
+  strings are ignored.
+- **Preferred mode.** When a harness advertises both, iOS launches
+  `structured`. Only structured sessions carry a starting prompt, attachments,
+  approvals and run preferences. iOS uses `pty` only when it is the sole
+  advertised mode. The default harness is the host's first structured-capable
+  launchable row, so there is no longer a "prefer `claude-code`" rule.
+- **Handoff targets** are the host's launchable rows whose preferred mode is
+  structured. A PTY-only target would have the handoff seed typed into a
+  terminal and run as commands.
+- **Native resume.** iOS has no native-resume control today. "Continue
+  session" is Drover's server-built handoff, not native resume. The flag is
+  decoded and exposed as `HarnessControls.supportsNativeResume` for a future
+  control.
+- **Terminal Ctrl-C** writes 0x03 into the PTY. It is a terminal key, not the
+  adapter `interrupt` operation, and stays available for PTY sessions.
+- **Refreshes.** Launch-sheet controls are derived from the current snapshot
+  on every read. A refresh that withdraws the selected harness's launch mode
+  moves the selection to the host's next launchable harness. A refresh that
+  changes `model_catalog` re-selects run preferences, so an unadvertised
+  catalog is never fetched or sent. Chat re-resolves controls on each metadata
+  load.
+- **Retiring legacy compatibility.** The legacy path is already metadata-only
+  on iOS, so retiring it means removing string-row decoding and the upgrade
+  copy, not withdrawing any operation. That retirement belongs to rollout step
+  6 below, in the first iOS release after the hub refuses matrix-less host
+  registrations. Until then, iOS keeps listing legacy hosts and explaining
+  them.
+- **Display versus control.** `HarnessPresentation` still maps known IDs to
+  display names and icons, and unknown IDs fall back to the raw name. A few
+  non-control lines still parse provider wire formats or legacy rows by name.
+  Each is marked `// harness-name:`. `NoHarnessNameBranchingTests` fails on any
+  other quoted harness ID in iOS app or DroverKit sources, and on the retired
+  `structuredCapableHarnesses` and `interactiveAuthHarnesses` names.
+
+The additive `turn_preferences` flag needs both an upgraded host and hub to
+reach clients. A schema v1 hub predating this field drops it during projection;
+clients read its absence as false, keeping launch preferences while withholding
+mid-session overrides. Older clients ignore the new field. Matrix-less hosts
+remain visible but cannot launch or send structured operations; existing PTY
+terminal input remains the bounded legacy path.
 
 ## Compatibility and rollout
 

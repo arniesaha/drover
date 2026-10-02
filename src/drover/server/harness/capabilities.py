@@ -25,6 +25,11 @@ _BOOL_FIELDS = (
     "worktree",
     "interactive_auth",
 )
+# Additive v1 flag (#420): model/effort overrides reach later turns of a
+# running session. Projected from the adapter's immutable
+# `turn_preferences_mutable` class attribute, which turn dispatch already
+# enforces. Older hosts omit it, so clients read it as false (fail closed).
+_TURN_PREFERENCES = "turn_preferences"
 _ID = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _MIME = re.compile(r"[a-z0-9.+-]+/(?:[a-z0-9.+-]+|\*)\Z")
 
@@ -81,7 +86,10 @@ def _legacy_identity(value: Any) -> str:
 
 
 def capability_matrix(
-    harness_id: str, capabilities: HarnessCapabilities
+    harness_id: str,
+    capabilities: HarnessCapabilities,
+    *,
+    turn_preferences: bool = False,
 ) -> dict[str, Any]:
     """Only immutable contract fields cross the wire; no hooks are invoked."""
     return {
@@ -89,6 +97,8 @@ def capability_matrix(
         "harness_id": harness_id,
         "launch_modes": sorted(capabilities.launch_modes),
         **{name: getattr(capabilities, name) for name in _BOOL_FIELDS},
+        # Preferences without a catalog have nothing to choose from.
+        _TURN_PREFERENCES: bool(turn_preferences and capabilities.model_catalog),
         "attachments": sorted(capabilities.attachments),
     }
 
@@ -127,7 +137,7 @@ def _matrix(value: Any, harness_id: str) -> dict[str, Any]:
         "harness_id": harness_id,
         "launch_modes": sorted(modes),
     }
-    for name in _BOOL_FIELDS:
+    for name in (*_BOOL_FIELDS, _TURN_PREFERENCES):
         flag = value.get(name, False)
         if type(flag) is not bool:
             raise InvalidCapabilities("capability flags must be booleans")

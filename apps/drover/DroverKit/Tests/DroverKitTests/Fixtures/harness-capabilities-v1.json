@@ -28,6 +28,7 @@
               "usage": false,
               "worktree": false,
               "interactive_auth": false,
+              "turn_preferences": false,
               "attachments": []
             }
           },
@@ -49,6 +50,7 @@
               "usage": false,
               "worktree": false,
               "interactive_auth": true,
+              "turn_preferences": false,
               "attachments": [
                 "image/gif",
                 "image/jpeg",
@@ -75,6 +77,7 @@
               "usage": false,
               "worktree": true,
               "interactive_auth": true,
+              "turn_preferences": true,
               "attachments": [
                 "image/gif",
                 "image/jpeg",
@@ -101,6 +104,7 @@
               "usage": false,
               "worktree": true,
               "interactive_auth": true,
+              "turn_preferences": true,
               "attachments": [
                 "image/gif",
                 "image/jpeg",
@@ -127,6 +131,7 @@
               "usage": false,
               "worktree": true,
               "interactive_auth": false,
+              "turn_preferences": true,
               "attachments": [
                 "image/gif",
                 "image/jpeg",

@@ -532,7 +532,10 @@ class CockpitService:
             os.environ.get("DROVER_DUCKDB_MEMORY_DIAGNOSTICS") == "1"
             and completed.stderr
         ):
-            log.info("activity reader diagnostics: %s", completed.stderr.strip())
+            from drover.server.memory import reader_memory_samples
+
+            for sample in reader_memory_samples(completed.stderr):
+                log.info("activity reader diagnostics: %s", sample)
         try:
             response = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:

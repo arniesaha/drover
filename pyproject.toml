@@ -62,6 +62,8 @@ dev = [
     # runs at 42% CPU. Worker count is measured, not derived from core count;
     # see roadmap operations/2026-08-18-test-suite-cost-baseline.md.
     "pytest-xdist",
+    # Synthetic hub memory probe; never imported by the runtime server.
+    "psutil>=7",
     "black",
     # CI installs this extra with pip while local verification uses uv.lock;
     # keep both on the formatter version that defines the checked import shape.
@@ -75,7 +77,7 @@ postgres = [
 ]
 
 [tool.setuptools.package-data]
-drover = ["prompts/*.md", "server/web/static/*.html"]
+drover = ["prompts/*.md", "server/web/static/*.html", "server/web/static/*.js"]
 
 [tool.pytest.ini_options]
 # `scripts` is here for the Loop Engine Phase 0 driver, which decision D4 puts

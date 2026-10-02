@@ -130,7 +130,7 @@ struct HarnessModelCatalogStateTests {
             return (200, stateCatalogJSON(model: "fresh-model"))
         }
 
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         let refresh = Task { await state.refresh() }
         await gate.waitUntilStarted()
 
@@ -147,31 +147,31 @@ struct HarnessModelCatalogStateTests {
             client: client(), store: HarnessModelCatalogStore(defaults: catalogDefaults())
         )
 
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         state.apply(fixtureCatalog(scope: "scope-mac", model: "mac-model"))
         state.selectedModel = "mac-model"
         state.thinkingEffort = "high"
 
-        state.select(hostID: "nas", harness: "codex")
+        state.select(hostID: "nas", harness: "codex", catalogAvailable: true)
         state.apply(fixtureCatalog(
             hostID: "nas", scope: "scope-nas", model: "nas-model"
         ))
         state.selectedModel = "nas-model"
         state.thinkingEffort = "low"
 
-        state.select(hostID: "mac-mini", harness: "agy")
+        state.select(hostID: "mac-mini", harness: "agy", catalogAvailable: true)
         state.apply(fixtureCatalog(
             harness: "agy", scope: "scope-agy", model: "agy-model"
         ))
         state.selectedModel = "agy-model"
 
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         #expect(state.selectedModel == "mac-model")
         #expect(state.thinkingEffort == "high")
-        state.select(hostID: "nas", harness: "codex")
+        state.select(hostID: "nas", harness: "codex", catalogAvailable: true)
         #expect(state.selectedModel == "nas-model")
         #expect(state.thinkingEffort == "low")
-        state.select(hostID: "mac-mini", harness: "agy")
+        state.select(hostID: "mac-mini", harness: "agy", catalogAvailable: true)
         #expect(state.selectedModel == "agy-model")
     }
 
@@ -191,7 +191,7 @@ struct HarnessModelCatalogStateTests {
         let state = HarnessModelCatalogState(client: client(), store: store)
 
         state.select(
-            hostID: "mac-mini", harness: "codex",
+            hostID: "mac-mini", harness: "codex", catalogAvailable: true,
             seedModel: "seed-model", seedThinkingEffort: "low"
         )
 
@@ -206,7 +206,7 @@ struct HarnessModelCatalogStateTests {
         ), hostID: "mac-mini", harness: "codex")
         let state = HarnessModelCatalogState(client: client(), store: store)
 
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
 
         #expect(state.catalog == nil)
         #expect(state.selectedModel.isEmpty)
@@ -228,7 +228,7 @@ struct HarnessModelCatalogStateTests {
         ), hostID: "mac-mini", harness: "codex")
         let state = HarnessModelCatalogState(client: client(), store: store)
 
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
 
         #expect(state.catalog?.accountScopeID == nil)
         #expect(state.catalog?.stale == true)
@@ -239,7 +239,7 @@ struct HarnessModelCatalogStateTests {
     @Test @MainActor func nilScopeCatalogNeverPersistsSelectionChanges() {
         let store = HarnessModelCatalogStore(defaults: catalogDefaults())
         let state = HarnessModelCatalogState(client: client(), store: store)
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         state.apply(fixtureCatalog(
             scope: nil,
             model: "session-model",
@@ -259,7 +259,7 @@ struct HarnessModelCatalogStateTests {
         let defaults = catalogDefaults()
         let store = HarnessModelCatalogStore(defaults: defaults)
         let state = HarnessModelCatalogState(client: client(), store: store)
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         state.apply(fixtureCatalog(scope: "scope-a", model: "gpt-5.6-terra"))
         state.selectedModel = "gpt-5.6-terra"
         state.thinkingEffort = "high"
@@ -278,7 +278,7 @@ struct HarnessModelCatalogStateTests {
         let state = HarnessModelCatalogState(
             client: client(), store: HarnessModelCatalogStore(defaults: catalogDefaults())
         )
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         state.apply(fixtureCatalog(scope: "scope-a", model: "old-model"))
         state.selectedModel = "old-model"
         state.thinkingEffort = "high"
@@ -301,7 +301,7 @@ struct HarnessModelCatalogStateTests {
         let state = HarnessModelCatalogState(
             client: client(), store: HarnessModelCatalogStore(defaults: catalogDefaults())
         )
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         state.apply(fixtureCatalog(
             scope: "scope-a", model: "full-model", additionalModels: [lowOnly]
         ))
@@ -329,7 +329,7 @@ struct HarnessModelCatalogStateTests {
         let state = HarnessModelCatalogState(
             client: client(), store: HarnessModelCatalogStore(defaults: catalogDefaults())
         )
-        state.select(hostID: "mac-mini", harness: "codex", seedThinkingEffort: "high")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true, seedThinkingEffort: "high")
 
         state.apply(catalog)
 
@@ -341,7 +341,7 @@ struct HarnessModelCatalogStateTests {
         let state = HarnessModelCatalogState(
             client: client(), store: HarnessModelCatalogStore(defaults: catalogDefaults())
         )
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
 
         #expect(state.modelOverride == nil)
         #expect(state.thinkingEffortOverride == nil)
@@ -360,7 +360,7 @@ struct HarnessModelCatalogStateTests {
         let rawEffort = " effort-with-space "
         let store = HarnessModelCatalogStore(defaults: catalogDefaults())
         let state = HarnessModelCatalogState(client: client(), store: store)
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         state.apply(fixtureCatalog(
             scope: "scope-a",
             model: rawModel,
@@ -398,10 +398,10 @@ struct HarnessModelCatalogStateTests {
         }
         defer { ConcurrentCatalogURLProtocol.handler = nil }
 
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         let oldRefresh = Task { await state.refresh() }
         await oldGate.waitUntilStarted()
-        state.select(hostID: "nas", harness: "codex")
+        state.select(hostID: "nas", harness: "codex", catalogAvailable: true)
         await state.refresh()
         oldGate.release()
         await oldRefresh.value
@@ -415,7 +415,7 @@ struct HarnessModelCatalogStateTests {
         let store = HarnessModelCatalogStore(defaults: catalogDefaults())
         store.save(catalog: fixtureCatalog(scope: "scope-a", model: "cached-model"))
         let state = HarnessModelCatalogState(client: client(), store: store)
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
         MockURLProtocol.transportError = URLError(.notConnectedToInternet)
         defer { MockURLProtocol.transportError = nil }
 
@@ -435,7 +435,7 @@ struct HarnessModelCatalogStateTests {
         let state = HarnessModelCatalogState(
             client: client(), store: HarnessModelCatalogStore(defaults: catalogDefaults())
         )
-        state.select(hostID: "mac-mini", harness: "codex")
+        state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
 
         await state.refresh(force: true)
 

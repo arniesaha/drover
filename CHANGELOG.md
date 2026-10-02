@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   include `sources: ["hub"]` while retaining their response envelope.
 - DuckLake and R2 catalog+files generation backups plus a Postgres dump are
   planned for Phase 4 (#481); `docs/backup.md` records the unimplemented design.
+- Web console launch and session controls come from the advertised harness
+  capability matrix, not harness names (#419). Launch offers only an enabled
+  schema v1 harness with a launch mode the web can drive, and sends that mode
+  (`structured` is preferred when both are advertised). Provider CLIs now start
+  as structured sessions with a web turn composer instead of raw PTY terminals.
+  Interrupt, Approve/Deny, attachments (advertised MIME types only), model and
+  effort pickers, native resume and the worktree note appear only when
+  advertised, and every action re-checks the latest envelope. Hosts without a
+  matrix are listed with an upgrade note and cannot launch.
 
 ### Added
 
@@ -56,6 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolated Git worktree, and Claude factory sessions run with
   `--permission-mode dontAsk`, so tools that would need approval are denied
   instead of parking the session (#445).
+- iOS harness controls are capability-driven (#420). The launch sheet, sign-in,
+  model and effort pickers, approvals, interrupt, handoff targets, worktree note
+  and attachments read the host's schema v1 capability matrix instead of
+  harness-name lists. Controls a host does not advertise are hidden or
+  disabled with a spoken reason. Hosts without a matrix are listed but offer
+  nothing to launch, with an "update Drover on the host" explanation. A
+  DroverKit test fails if a quoted harness ID appears in iOS control code.
+- Capability schema v1 gains an additive `turn_preferences` flag: model and
+  effort overrides reach later turns of a running session. It is projected
+  from the adapter's existing turn-dispatch contract, so it is false for
+  Claude Code and true for Codex, agy and DeepSeek. Hosts that predate the flag
+  omit it, and clients read that as false (#420).
 
 ### Fixed
 

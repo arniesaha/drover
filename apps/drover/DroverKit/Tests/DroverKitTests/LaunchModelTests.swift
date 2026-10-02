@@ -170,8 +170,9 @@ private func catalog(
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
     let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x0A, 0x0B]))
-    model.harness = "codex"
-    model.runPreferences.apply(catalog())
+    // The fixture host advertises agy (not codex) with a catalog and images.
+    model.harness = "agy"
+    model.runPreferences.apply(catalog(harness: "agy"))
     model.prompt = "inspect this"
     model.promptAttachments = [attachment]
     model.runPreferences.selectedModel = "gpt-5.6-terra"
@@ -181,7 +182,7 @@ private func catalog(
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         let images = body["images"] as! [[String: Any]]
-        #expect(body["harness"] as? String == "codex")
+        #expect(body["harness"] as? String == "agy")
         #expect(body["model"] as? String == "gpt-5.6-terra")
         #expect(body["thinking_effort"] as? String == "high")
         #expect(images[0]["data_base64"] as? String == attachment.data.base64EncodedString())
@@ -195,8 +196,8 @@ private func catalog(
 @Test @MainActor func launchOmitsHarnessDefaultAndAutoOverrides() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
-    model.harness = "codex"
-    model.runPreferences.apply(catalog())
+    model.harness = "agy"
+    model.runPreferences.apply(catalog(harness: "agy"))
 
     MockURLProtocol.handler = { request in
         let body = try! JSONSerialization.jsonObject(
@@ -387,9 +388,9 @@ private func catalog(
     let mixedJSON = Data("""
     {"hosts": [
       {"host_id": "nas-stale", "status": "stale",
-       "capabilities": {"display_name": "NAS", "harnesses": [{"name": "codex", "enabled": true}]}},
+       "capabilities": {"display_name": "NAS", "harnesses": [\(v1Row("codex"))]}},
       {"host_id": "mac-online", "status": "online",
-       "capabilities": {"display_name": "Mac", "harnesses": [{"name": "claude-code", "enabled": true}]}}
+       "capabilities": {"display_name": "Mac", "harnesses": [\(v1Row("claude-code"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
     let mixedSnapshot = try HarnessSnapshot.decode(from: mixedJSON)
@@ -401,9 +402,9 @@ private func catalog(
     let staleOnlyJSON = Data("""
     {"hosts": [
       {"host_id": "laptop-offline", "status": "offline",
-       "capabilities": {"display_name": "Laptop", "harnesses": [{"name": "codex", "enabled": true}]}},
+       "capabilities": {"display_name": "Laptop", "harnesses": [\(v1Row("codex"))]}},
       {"host_id": "nas-stale", "status": "stale",
-       "capabilities": {"display_name": "NAS", "harnesses": [{"name": "shell", "enabled": true}]}}
+       "capabilities": {"display_name": "NAS", "harnesses": [\(v1Row("shell"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
     let staleOnlySnapshot = try HarnessSnapshot.decode(from: staleOnlyJSON)
@@ -415,7 +416,7 @@ private func catalog(
     let offlineOnlyJSON = Data("""
     {"hosts": [
       {"host_id": "laptop-offline", "status": "offline",
-       "capabilities": {"display_name": "Laptop", "harnesses": [{"name": "codex", "enabled": true}]}}
+       "capabilities": {"display_name": "Laptop", "harnesses": [\(v1Row("codex"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
     let offlineOnlySnapshot = try HarnessSnapshot.decode(from: offlineOnlyJSON)
@@ -429,9 +430,9 @@ private func catalog(
     let initialJSON = Data("""
     {"hosts": [
       {"host_id": "mac-mini", "status": "online",
-       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [\(v1Row("claude-code"))]}},
       {"host_id": "studio", "status": "online",
-       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "claude-code", "enabled": true}]}}
+       "capabilities": {"display_name": "Studio", "harnesses": [\(v1Row("claude-code"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
     let initialSnapshot = try HarnessSnapshot.decode(from: initialJSON)
@@ -443,9 +444,9 @@ private func catalog(
     let refreshedJSON = Data("""
     {"hosts": [
       {"host_id": "mac-mini", "status": "stale",
-       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [\(v1Row("claude-code"))]}},
       {"host_id": "studio", "status": "online",
-       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "claude-code", "enabled": true}]}}
+       "capabilities": {"display_name": "Studio", "harnesses": [\(v1Row("claude-code"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
     MockURLProtocol.handler = { _ in (200, refreshedJSON) }
@@ -460,9 +461,9 @@ private func catalog(
     let initialJSON = Data("""
     {"hosts": [
       {"host_id": "mac-mini", "status": "online",
-       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [\(v1Row("claude-code"))]}},
       {"host_id": "studio", "status": "online",
-       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "codex", "enabled": true}]}}
+       "capabilities": {"display_name": "Studio", "harnesses": [\(v1Row("codex"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
     let model = LaunchModel(
@@ -476,9 +477,9 @@ private func catalog(
     let offlineJSON = Data("""
     {"hosts": [
       {"host_id": "mac-mini", "status": "offline",
-       "capabilities": {"display_name": "Mac Mini", "harnesses": [{"name": "claude-code", "enabled": true}]}},
+       "capabilities": {"display_name": "Mac Mini", "harnesses": [\(v1Row("claude-code"))]}},
       {"host_id": "studio", "status": "online",
-       "capabilities": {"display_name": "Studio", "harnesses": [{"name": "codex", "enabled": true}]}}
+       "capabilities": {"display_name": "Studio", "harnesses": [\(v1Row("codex"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
     MockURLProtocol.handler = { _ in (200, offlineJSON) }

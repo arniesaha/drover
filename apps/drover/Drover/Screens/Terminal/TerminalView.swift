@@ -56,7 +56,7 @@ struct TerminalScreen: View {
     }
 
     var body: some View {
-        let presentation = HarnessPresentation(harness ?? "shell")
+        let presentation = HarnessPresentation(harness ?? "shell")  // harness-name: title/icon fallback only
         VStack(spacing: 0) {
             if hasConnectedOnce && isReconnecting && !sessionEnded {
                 ReconnectingPill(accessibilityID: "terminal-reconnecting")

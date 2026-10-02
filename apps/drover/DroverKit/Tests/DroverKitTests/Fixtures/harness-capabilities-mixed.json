@@ -1,0 +1,246 @@
+{
+  "hosts": [
+    {
+      "host_id": "studio",
+      "status": "online",
+      "connection_kind": "relay",
+      "capabilities": {
+        "host_id": "studio",
+        "display_name": "Studio",
+        "kind": "macos",
+        "future_envelope_field": {"ignored": true},
+        "harnesses": [
+          {
+            "name": "shell",
+            "enabled": true,
+            "description": "Interactive POSIX shell",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "shell",
+              "launch_modes": ["pty"],
+              "approvals": false,
+              "interrupt": false,
+              "native_resume": false,
+              "model_catalog": false,
+              "usage": false,
+              "worktree": false,
+              "interactive_auth": false,
+              "turn_preferences": false,
+              "attachments": []
+            }
+          },
+          {
+            "name": "claude-code",
+            "enabled": true,
+            "description": "Claude Code CLI",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "claude-code",
+              "launch_modes": ["structured"],
+              "approvals": true,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": false,
+              "interactive_auth": true,
+              "turn_preferences": false,
+              "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"]
+            }
+          },
+          {
+            "name": "codex",
+            "enabled": true,
+            "description": "Codex CLI",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "codex",
+              "launch_modes": ["structured"],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "interactive_auth": true,
+              "turn_preferences": true,
+              "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"]
+            }
+          },
+          {
+            "name": "agy",
+            "enabled": true,
+            "description": "Antigravity CLI (agy)",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "agy",
+              "launch_modes": ["structured"],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "interactive_auth": true,
+              "turn_preferences": true,
+              "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"]
+            }
+          },
+          {
+            "name": "deepseek-harness",
+            "enabled": true,
+            "description": "DeepSeek Harness (local Web RPC)",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "deepseek-harness",
+              "launch_modes": ["structured"],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": true,
+              "interactive_auth": false,
+              "turn_preferences": true,
+              "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"]
+            }
+          },
+          {
+            "name": "fixture-lab",
+            "enabled": true,
+            "description": "Fixture adapter with an unusual capability mix",
+            "command": [],
+            "future_row_field": "ignored",
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "fixture-lab",
+              "launch_modes": ["pty", "structured"],
+              "approvals": true,
+              "interrupt": false,
+              "native_resume": false,
+              "model_catalog": false,
+              "usage": true,
+              "worktree": true,
+              "interactive_auth": false,
+              "turn_preferences": true,
+              "attachments": ["image/png"],
+              "future_capability": true
+            }
+          },
+          {
+            "name": "fixture-wildcard",
+            "enabled": true,
+            "description": "Fixture adapter accepting any image, without interrupt",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "launch_modes": ["structured"],
+              "model_catalog": true,
+              "turn_preferences": true,
+              "attachments": ["image/*"]
+            }
+          },
+          {
+            "name": "codex-disabled",
+            "enabled": false,
+            "description": "Advertised but switched off by the host",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "launch_modes": ["structured"],
+              "interrupt": true
+            }
+          },
+          {
+            "name": "future-harness",
+            "enabled": false,
+            "description": "Newer schema",
+            "command": [],
+            "capabilities": {
+              "schema_version": 2,
+              "harness_id": "future-harness",
+              "launch_modes": []
+            }
+          },
+          {
+            "name": "broken",
+            "enabled": true,
+            "description": "Null matrix is invalid, not legacy",
+            "command": [],
+            "capabilities": null
+          },
+          {
+            "name": "mismatched",
+            "enabled": true,
+            "description": "harness_id disagrees with the row",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "codex",
+              "launch_modes": ["structured"],
+              "interrupt": true
+            }
+          },
+          {
+            "name": "stringly",
+            "enabled": true,
+            "description": "Non-boolean flag makes the matrix invalid",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "launch_modes": ["structured"],
+              "interrupt": "yes"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "host_id": "old-mini",
+      "status": "online",
+      "connection_kind": "direct",
+      "capabilities": {
+        "display_name": "Old Mini",
+        "harnesses": [
+          "shell",
+          {"name": "codex", "enabled": true, "description": "Codex CLI", "command": ["codex"]},
+          {"name": "codex beta", "enabled": true},
+          {"name": "claude-code", "enabled": false}
+        ]
+      }
+    },
+    {
+      "host_id": "bare-nas",
+      "status": "stale",
+      "connection_kind": "direct"
+    },
+    {
+      "host_id": "future-host",
+      "status": "online",
+      "connection_kind": "direct",
+      "capabilities": {
+        "display_name": "Future Host",
+        "harnesses": [
+          {
+            "name": "codex",
+            "enabled": false,
+            "capabilities": {"schema_version": 2, "harness_id": "codex", "launch_modes": []}
+          }
+        ]
+      }
+    }
+  ],
+  "sessions": [
+    {"session_id": "s-claude", "host_id": "studio", "harness": "claude-code", "mode": "structured", "status": "working"},
+    {"session_id": "s-codex", "host_id": "studio", "harness": "codex", "mode": "structured", "status": "working"},
+    {"session_id": "s-lab", "host_id": "studio", "harness": "fixture-lab", "mode": "structured", "status": "working"},
+    {"session_id": "s-legacy", "host_id": "old-mini", "harness": "codex", "mode": "structured", "status": "working"},
+    {"session_id": "s-gone", "host_id": "studio", "harness": "removed-harness", "mode": "structured", "status": "working"}
+  ],
+  "cwd_suggestions": []
+}

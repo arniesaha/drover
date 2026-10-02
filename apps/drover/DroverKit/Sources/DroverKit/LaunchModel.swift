@@ -47,13 +47,6 @@ public final class LaunchModel {
     private var existenceTask: Task<Void, Never>?
     private var existenceTaskHostID: String?
 
-    /// Harness names the server can run in a structured (turn-based) mode;
-    /// anything else (currently just "shell") only supports a raw PTY.
-    static let structuredCapableHarnesses: Set<String> = [
-        "claude-code", "codex", "agy", "deepseek-harness"
-    ]
-    static let interactiveAuthHarnesses: Set<String> = ["claude-code", "codex", "agy"]
-
     public var hostID: String {
         didSet {
             guard oldValue != hostID else { return }
@@ -61,23 +54,17 @@ public final class LaunchModel {
             // wrong: which favorites exist there, and which directories the
             // typed text could complete to.
             hostDidChangeForSuggestions()
-            let newHarnesses = harnesses(forHostID: hostID)
-            // Keep the user's pick when the new host also offers it; only
+            // Keep the user's pick when the new host can also launch it; only
             // reset to the new host's default when it's no longer valid.
-            if !newHarnesses.contains(harness) {
-                let replacement = Self.defaultHarness(for: newHarnesses)
-                if replacement != harness {
-                    harness = replacement
-                    return
-                }
+            if !reconcileHarness() {
+                selectRunPreferences()
             }
-            runPreferences.select(hostID: hostID, harness: harness)
         }
     }
     public var harness: String {
         didSet {
             guard oldValue != harness else { return }
-            runPreferences.select(hostID: hostID, harness: harness)
+            selectRunPreferences()
         }
     }
     /// The typed working directory. Every change reschedules the debounced
@@ -105,8 +92,8 @@ public final class LaunchModel {
         let hosts = (snapshot?.hosts ?? []).filter { $0.status == "online" || $0.status == "stale" }
         let firstHost = hosts.first { $0.status == "online" } ?? hosts.first
         self.hostID = firstHost?.id ?? ""
-        self.harness = Self.defaultHarness(for: firstHost?.harnesses ?? [])
-        self.runPreferences.select(hostID: hostID, harness: harness)
+        self.harness = firstHost?.launchableOffers.first?.name ?? ""
+        selectRunPreferences()
     }
 
     /// Online and stale hosts, plus the selected host if it just went offline.
@@ -145,14 +132,36 @@ public final class LaunchModel {
         return nil
     }
 
-    /// True when a host and harness are selected and the host is not offline.
+    /// True when the selected host is not offline and advertises a launch
+    /// mode for the selected harness.
     public var canLaunch: Bool {
         selectedHost != nil && !hostID.isEmpty && !harness.isEmpty && !isHostOffline
+            && controls.launchMode != nil
     }
 
-    /// The selected host's enabled harnesses, structured-capable ones first.
+    /// The selected host's launchable harnesses, structured-capable ones first.
     public var availableHarnesses: [String] {
-        Self.ordered(harnesses(forHostID: hostID))
+        (selectedHost?.launchableOffers ?? []).map(\.name)
+    }
+
+    /// Harnesses the selected host lists but this app cannot launch, each
+    /// with the explanation the sheet shows (and VoiceOver reads).
+    public var unavailableHarnesses: [(name: String, reason: String)] {
+        (selectedHost?.unavailableOffers ?? []).map { ($0.offer.name, $0.reason) }
+    }
+
+    /// Why the selected host offers nothing to launch, e.g. a pre-capability
+    /// Drover host that needs upgrading. Nil when something can launch.
+    public var harnessUnavailableReason: String? {
+        guard let selectedHost else { return nil }
+        return selectedHost.launchUnavailableReason
+    }
+
+    /// Every launch-sheet control for the current selection. Derived from the
+    /// snapshot on each read, so a refresh can never leave a control enabled
+    /// for a selection the host no longer advertises.
+    public var controls: HarnessControls {
+        HarnessControls(offer: selectedHost?.offer(named: harness))
     }
 
     /// What the suggestions menu shows: curated paths first, then whatever
@@ -205,33 +214,50 @@ public final class LaunchModel {
         return nil
     }
 
-    /// False only for "shell" — every other harness runs in structured mode.
+    /// True when the selection launches in structured mode — the only mode
+    /// with a starting prompt. Structured wins when both are advertised.
     public var isStructured: Bool {
-        harness != "shell"
+        controls.launchMode == .structured
     }
 
-    /// Local snapshots lack auth capability metadata, so only known
-    /// interactive providers expose the sign-in flow.
+    /// Sign-in is offered only when the host advertises interactive auth.
     public var supportsInteractiveAuth: Bool {
-        Self.interactiveAuthHarnesses.contains(harness)
+        controls.offersSignIn
+    }
+
+    /// Model and effort pickers need an advertised catalog and a structured
+    /// launch to apply them to.
+    public var showsRunPreferences: Bool {
+        isStructured && controls.showsModelControls
+    }
+
+    /// Attachments ride the starting prompt, so they need structured mode
+    /// and an advertised MIME type for what the app produces (JPEG).
+    public var canAttachImages: Bool {
+        isStructured && controls.acceptsImageAttachments
     }
 
     /// Posts `createSession` for the current selection. On success returns
     /// the new session id; on failure sets `launchError` (server-authored
     /// text when available) and returns nil.
     public func launch() async -> String? {
-        let mode = isStructured ? "structured" : "pty"
+        // Fail closed: never ask a host for a mode it did not advertise.
+        guard canLaunch, let launchMode = controls.launchMode else {
+            launchError = harnessUnavailableReason ?? HarnessCapabilityCopy.noLaunchableHarness
+            return nil
+        }
+        let isStructured = launchMode == .structured
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectivePrompt = (isStructured && !trimmedPrompt.isEmpty) ? trimmedPrompt : nil
-        let effectiveImages = isStructured ? promptAttachments : []
+        let effectiveImages = canAttachImages ? promptAttachments : []
         let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveCwd = trimmedCwd.isEmpty ? nil : trimmedCwd
-        let effectiveModel = isStructured ? runPreferences.modelOverride : nil
-        let effectiveThinking = isStructured ? runPreferences.thinkingEffortOverride : nil
+        let effectiveModel = showsRunPreferences ? runPreferences.modelOverride : nil
+        let effectiveThinking = showsRunPreferences ? runPreferences.thinkingEffortOverride : nil
 
         do {
             let sessionID = try await client.createSession(
-                hostID: hostID, harness: harness, mode: mode,
+                hostID: hostID, harness: harness, mode: launchMode.rawValue,
                 prompt: effectivePrompt, cwd: effectiveCwd,
                 images: effectiveImages,
                 model: effectiveModel,
@@ -288,13 +314,24 @@ public final class LaunchModel {
     /// that no longer lists the selected host would do the same. Either way
     /// the selection is unusable, so it is replaced. A selection the new
     /// snapshot still offers is the user's and stays put.
+    ///
+    /// The harness gets the same treatment: a refresh that withdraws its
+    /// launch mode (host upgraded, downgraded, or disabled it) moves the
+    /// selection rather than leaving Launch enabled for it, and a refresh
+    /// that changes what it advertises re-selects run preferences.
     private func adopt(_ fresh: HarnessSnapshot) {
+        let previousControls = controls
         snapshot = fresh
-        guard !availableHosts.contains(where: { $0.id == hostID }) else { return }
-        let firstHost = availableHosts.first { $0.status == "online" } ?? availableHosts.first
-        hostID = firstHost?.id ?? ""
-        harness = Self.defaultHarness(for: firstHost?.harnesses ?? [])
-        runPreferences.select(hostID: hostID, harness: harness)
+        if !availableHosts.contains(where: { $0.id == hostID }) {
+            let firstHost = availableHosts.first { $0.status == "online" } ?? availableHosts.first
+            hostID = firstHost?.id ?? ""
+            harness = firstHost?.launchableOffers.first?.name ?? ""
+            selectRunPreferences()
+            return
+        }
+        if !reconcileHarness(), controls != previousControls {
+            selectRunPreferences()
+        }
     }
 
     // MARK: - Working-directory completion
@@ -434,22 +471,29 @@ public final class LaunchModel {
 
     // MARK: - Private helpers
 
-    private func harnesses(forHostID id: String) -> [String] {
-        (snapshot?.hosts ?? []).first { $0.id == id }?.harnesses ?? []
+    /// Replaces a harness the selected host can no longer launch with the
+    /// host's first launchable one (structured first, then host order).
+    /// Returns true when it changed `harness`, whose observer re-selects run
+    /// preferences.
+    @discardableResult
+    private func reconcileHarness() -> Bool {
+        let launchable = availableHarnesses
+        guard !launchable.contains(harness) else { return false }
+        let replacement = launchable.first ?? ""
+        guard replacement != harness else { return false }
+        harness = replacement
+        return true
     }
 
-    /// "claude-code" if the host offers it, else the first structured-capable
-    /// harness, else whatever the host offers first (e.g. shell-only hosts).
-    private static func defaultHarness(for harnesses: [String]) -> String {
-        if harnesses.contains("claude-code") { return "claude-code" }
-        return ordered(harnesses).first ?? ""
-    }
-
-    /// Stable-partitions structured-capable harnesses ahead of the rest,
-    /// preserving each group's original relative order.
-    private static func ordered(_ harnesses: [String]) -> [String] {
-        harnesses.filter { structuredCapableHarnesses.contains($0) }
-            + harnesses.filter { !structuredCapableHarnesses.contains($0) }
+    /// Points the model catalog at the selection, or at nothing when the
+    /// host does not advertise a catalog for it: an unadvertised catalog is
+    /// never fetched and its pickers never shown.
+    private func selectRunPreferences() {
+        runPreferences.select(
+            hostID: hostID,
+            harness: harness,
+            catalogAvailable: showsRunPreferences
+        )
     }
 
     private static func errorMessage(for error: Error) -> String {

@@ -81,7 +81,7 @@ public struct SessionActivityPresentation: Sendable, Equatable {
                 case "read", "read_file": title = "Reading files"
                 case "edit", "write", "apply_patch", "write_file": title = "Editing files"
                 case "grep", "glob", "search": title = "Searching files"
-                case "bash", "shell", "command_execution": title = "Running command"
+                case "bash", "shell", "command_execution": title = "Running command"  // harness-name: provider tool names, not a harness
                 default: title = "Using \(action.payload["tool"]?.stringValue ?? "tool")"
                 }
                 detail = input?["command"]?.stringValue ?? input?["file_path"]?.stringValue
