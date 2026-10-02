@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .admin_process import run_admin
-from .fence import drained_mutation
+from .fence import drained_mutation, reader_fence
 from .rebuild import SCHEMAS, extract_frozen
 from .rebuild_worker import LINEAGE, POLICY_SCHEMA
 from .runtime import (
@@ -203,6 +203,12 @@ def rebuild_partitioned(source: Path, spec: LakeSpec, *, dry_run=False):
 
 
 def _verify_jobs(spec, report, work):
+    # Retained-file cleanup must not run between the individual day reads.
+    with reader_fence(spec.dsn()):
+        return _verify_days(spec, report, work)
+
+
+def _verify_days(spec, report, work):
     peak = 0
     results = {}
     for table in (*SCHEMAS, "agent_events_legacy_metadata"):
