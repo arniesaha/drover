@@ -397,3 +397,32 @@ isort, lock consistency and `git diff --check` passed. The full backend suite
 and large historical comparison were **not rerun** during recovery. This is
 ready for PR review as a targeted cache/observability change; #466's reported
 6–8 GB production residency and hang remain unproven and unresolved.
+
+
+### Requeue while the hub is running
+
+`drover-server memory requeue --since 2026-09-01 --substantive-only --dry-run`
+reads canonical `harness_sessions` and full `harness_events` envelopes from
+PostgreSQL. It never opens the analytical DuckDB, so the hub can retain its
+writer lock. `--session` accepts a harness ID or an explicit native/summary ID
+from the Phase 2 identity links and queues work under the harness ID.
+
+The date range selects sessions with control-event activity from `--since`
+(midnight UTC, inclusive) through the report's `through` timestamp. Substantive
+filtering and source versions use the selected session's full event history:
+a non-empty user message and a non-empty assistant message are required by
+`--substantive-only`. The report includes counts for summarize, embed-only,
+skipped non-substantive, and already-current sessions. Omit `--dry-run` to
+apply the reported work at the configured rate and below live work's priority.
+
+Native-only sessions collected from transcript files, with no PostgreSQL
+control session/events, are **excluded**, including when explicitly targeted.
+This command does not enumerate or backfill those sessions. Its JSON output
+also declares this exclusion. No hub restart or analytical-file access is
+required for the PostgreSQL backfill.
+
+Source-version timestamps are now normalized to UTC in both readers. Summaries
+whose older hash used a non-UTC DuckDB timezone may be regenerated once.
+Other CLI commands that need the analytical file fail immediately on a
+cross-process lock conflict, with an explanation that read-only opens cannot
+bypass the hub's lock. PostgreSQL pools are closed before CLI interpreter exit.

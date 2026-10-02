@@ -1,7 +1,8 @@
 """Source-versioned summary generations on the PostgreSQL job ledger (#480).
 
 A session's *source version* is a hash of stable facts about its canonical
-events (read from the analytical DuckDB). Each distinct version is one
+events (read from analytical DuckDB or projected PostgreSQL control events).
+Each distinct version is one
 summary generation, and enqueueing it is a ``summarize_session`` job in the
 one authoritative ledger (:mod:`drover.server.ledger`).
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -43,10 +45,21 @@ def source_version_for_session(con: duckdb.DuckDBPyConnection, session_id: str) 
         [session_id],
     ).fetchone()
     event_count, max_timestamp, max_dedup_key = row or (0, None, None)
+    return source_version_from_facts(event_count, max_timestamp, max_dedup_key)
+
+
+def source_version_from_facts(
+    event_count: int, max_timestamp: datetime | None, max_dedup_key: str | None
+) -> str:
+    """Shared generation hash for analytical and control-plane event readers."""
     stable_facts = json.dumps(
         [
             int(event_count or 0),
-            max_timestamp.isoformat() if max_timestamp is not None else None,
+            (
+                max_timestamp.astimezone(timezone.utc).isoformat()
+                if max_timestamp is not None
+                else None
+            ),
             max_dedup_key,
         ],
         separators=(",", ":"),

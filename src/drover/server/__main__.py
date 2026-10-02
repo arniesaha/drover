@@ -99,9 +99,14 @@ from drover.server.control_migration import (
     verify_legacy_import,
 )
 from drover.server.control_outbox import LocalVerifiedArchiveResolver, published_batches
-from drover.server.control_store import configure_control_store
+from drover.server.control_store import (
+    close_all_postgres_control_stores,
+    configure_control_store,
+)
 from drover.server.db import (
     CONTROL_PLANE_TABLES,
+    AnalyticalStoreLocked,
+    _is_lock_conflict,
     close_analytical_connections,
     close_control_plane_connections,
     control_plane_connection,
@@ -814,7 +819,27 @@ def _diagnostic_db_path(path: Path):
         yield snapshot
 
 
-@click.group()
+class _ServerCLI(click.Group):
+    def invoke(self, ctx: click.Context):
+        try:
+            return super().invoke(ctx)
+        except duckdb.IOException as exc:
+            if isinstance(exc, AnalyticalStoreLocked):
+                raise click.ClickException(str(exc)) from exc
+            if _is_lock_conflict(exc):
+                raise click.ClickException(
+                    "DuckDB is locked by another process (possibly the running hub). "
+                    "The command cannot open this file, even read-only. "
+                    f"Lock conflict: {exc}"
+                ) from exc
+            raise
+        finally:
+            # Click context teardown also runs on failures and Ctrl-C, before
+            # Python finalization makes psycopg_pool worker joins unsafe.
+            close_all_postgres_control_stores()
+
+
+@click.group(cls=_ServerCLI)
 # Load-bearing beyond convenience. `drover-server --version` is the smoke test
 # install.sh runs before it will activate a freshly installed version, so
 # without this flag every install downloads, verifies, installs, and then
@@ -1993,6 +2018,7 @@ def memory_requeue_cmd(
     summary get a summarize job (embedding and brief follow on success);
     sessions with a current summary but no embedding get an embed job.
     Requeued work runs below live sessions' priority.
+    Reads PostgreSQL control sessions/events; file-only native sessions are excluded.
     """
     cfg = _resolve_config(ctx.obj["config_path"])
     _require_memory_store(cfg)
