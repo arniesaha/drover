@@ -166,28 +166,26 @@ def _check_project_activity(
     except Exception as exc:  # pragma: no cover - defensive CLI reporting
         return _error("project_activity", exc)
 
-    rows = payload.get("rows") or []
+    # Sessions and summaries, never spans: a missing span feed is not a
+    # dogfood failure since spans became an optional integration (#473).
+    projects = payload.get("projects") or []
+    sessions = [
+        session for day in payload.get("days") or [] for session in day["sessions"]
+    ]
     dimensions: list[str] = []
-    if not rows:
+    if not sessions:
         dimensions.append("activity_availability")
 
-    span_count = sum(int(row.get("span_count") or 0) for row in rows)
-    if span_count <= 0:
-        dimensions.append("span_freshness")
-
-    if rows and not any(row.get("project_key") == project_key for row in rows):
+    if projects and not any(row.get("project_key") == project_key for row in projects):
         dimensions.append("project_attribution")
 
-    if dimensions:
-        return _fail(
-            "project_activity",
-            dimensions,
-            f"{len(rows)} activity rows, {span_count} spans for {project_key}",
-        )
-    return _pass(
-        "project_activity",
-        f"{len(rows)} activity rows, {span_count} spans for {project_key}",
+    message = (
+        f"{len(sessions)} sessions, {len(payload.get('open_items') or [])} open "
+        f"items for {project_key}"
     )
+    if dimensions:
+        return _fail("project_activity", dimensions, message)
+    return _pass("project_activity", message)
 
 
 def _check_data_quality(

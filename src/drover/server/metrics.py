@@ -1114,6 +1114,9 @@ class MetricsCollector:
     # unavailable placeholder) until this backoff expires. Otherwise a broken
     # store turns every scrape/poll into another full snapshot attempt.
     audit_failure_backoff_seconds: float = 300.0
+    # Optional span integration (#473). Off, quality audits skip span checks
+    # instead of reporting an absent span feed as stale or missing.
+    spans_enabled: bool = False
     cockpit_service: "CockpitService | None" = None
     advisory_service: "InsightsService | None" = None
     # API-only role reads this narrow central state without constructing an
@@ -1330,6 +1333,47 @@ class MetricsCollector:
         if self.cockpit_service is None:
             return _json_response(503, {"error": "cockpit service unavailable"})
         return _json_response(200, self.cockpit_service.overview(filters))
+
+    def render_session_graph_json(
+        self, *, session_id: str | None = None, run_id: str | None = None
+    ) -> tuple[int, str]:
+        """Delegation tree from recorded launch metadata (#473)."""
+        from drover.server.session_graph import delegation_graph_payload
+
+        target = session_id if session_id is not None else run_id
+        if not target or "/" in target:
+            return _json_response(400, {"error": "invalid graph target"})
+        payload = delegation_graph_payload(
+            HarnessRegistry(self.duckdb_path), session_id=session_id, run_id=run_id
+        )
+        if payload is None:
+            return _json_response(404, {"error": "harness session not found"})
+        return _json_response(200, payload)
+
+    def render_project_activity_json(
+        self, *, project_key: str | None, days: int, limit: int
+    ) -> tuple[int, str]:
+        """Per-project timeline from Drover's own records (#473)."""
+        from drover.server.db import (
+            attached_control_plane_snapshot,
+            require_analytical_store,
+        )
+        from drover.server.project_activity import project_activity
+
+        require_analytical_store(self.duckdb_path)
+        con = open_duckdb_connection(
+            self.duckdb_path, read_only=True, role="diagnostic"
+        )
+        try:
+            with attached_control_plane_snapshot(con, self.duckdb_path):
+                payload = project_activity(
+                    con, project_key=project_key, days=days, max_sessions=limit
+                )
+        except ValueError as exc:
+            return _json_response(400, {"error": str(exc)})
+        finally:
+            con.close()
+        return _json_response(200, payload)
 
     def render_analytics_json(self, filters: Any) -> tuple[int, str]:
         from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
@@ -2498,6 +2542,10 @@ class MetricsCollector:
                         payload.get("thinking_effort")
                         or request_payload.get("thinking_effort")
                     ),
+                    parent_session_id=_optional_str(
+                        payload.get("parent_session_id")
+                        or request_payload.get("parent_session_id")
+                    ),
                 )
             else:
                 registry.update_session_status(session_id, status)
@@ -2844,6 +2892,7 @@ class MetricsCollector:
                 duckdb_path=source,
                 incoming_dir=self.incoming_dir,
                 deep=False,
+                spans_enabled=self.spans_enabled,
             )
             return quality, {}
 
@@ -2857,6 +2906,7 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
                 role="snapshot",
+                spans_enabled=self.spans_enabled,
             )
             observatory = pipeline_observatory_snapshot(
                 duckdb_path=snapshot,
@@ -2945,6 +2995,7 @@ class MetricsCollector:
                 duckdb_path=source,
                 incoming_dir=self.incoming_dir,
                 deep=False,
+                spans_enabled=self.spans_enabled,
             )
         # Deliberately a COPY, unlike harness_snapshot's live read.
         #
@@ -2974,6 +3025,7 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
                 role="snapshot",
+                spans_enabled=self.spans_enabled,
             )
 
     def _observatory_snapshot(self, quality: dict) -> dict:

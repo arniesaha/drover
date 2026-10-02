@@ -229,6 +229,31 @@ def test_quality_snapshot_reports_healthy_categories(tmp_path: Path) -> None:
     assert snapshot["categories"]["derived_context"]["details"]["handoff_ready"] == 1
 
 
+def test_quality_snapshot_does_not_judge_an_absent_span_feed_by_default(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=False)
+    for partition in (tmp_path / "parquet" / "spans").glob("date=*"):
+        if partition.name != "date=_seed":
+            shutil.rmtree(partition)
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+
+    default = quality_snapshot(duckdb_path=duckdb_path, incoming_dir=incoming)
+    enabled = quality_snapshot(
+        duckdb_path=duckdb_path, incoming_dir=incoming, spans_enabled=True
+    )
+
+    # Spans are optional since #473: no feed is the expected state.
+    assert default["span_integration"] == "disabled"
+    assert default["status"] == "ok"
+    assert not [w for w in default["warnings"] if "span" in w]
+    assert enabled["span_integration"] == "enabled"
+    assert enabled["status"] != "ok"
+    assert any("span" in w for w in enabled["warnings"])
+
+
 def test_quality_snapshot_reports_degraded_categories(tmp_path: Path) -> None:
     duckdb_path, incoming = _seed_lakehouse(tmp_path, degraded=True)
 

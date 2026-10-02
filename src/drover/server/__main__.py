@@ -46,6 +46,7 @@ from drover.schema import (
     prune_legacy_control_plane_tables,
 )
 from drover.server import ledger_shadow
+from drover.server.advisory import span_facts as advisory_span_facts
 from drover.server.advisory.content_targets import content_bundle_from_payload
 from drover.server.advisory.jobs import AdvisoryScheduler, enqueue_operational_checks
 from drover.server.advisory.model_analyzer import build_configured_analysis_backend
@@ -164,7 +165,14 @@ from drover.server.providers.service import ProviderUsageService
 from drover.server.quality import format_prometheus, quality_snapshot
 from drover.server.rollup import rollup_tasks
 from drover.server.runtime import RuntimeLayout
-from drover.server.session_graph import format_ascii, format_dot, session_graph_payload
+from drover.server.session_graph import (
+    delegation_graph_payload,
+    format_ascii,
+    format_dot,
+    format_graph_ascii,
+    format_graph_dot,
+    session_graph_payload,
+)
 from drover.server.setup_readiness import (
     SetupTarget,
     evaluate_setup,
@@ -402,9 +410,14 @@ max_response_bytes = 4194304
 max_concurrent_requests = 8
 
 [server]
-otlp_grpc_port = 4317
+otlp_grpc_port = 4317  # only bound when [telemetry] spans_enabled = true
 mcp_http_port  = 7077
 metrics_http_port = 7080  # cockpit HTTP API and Prometheus metrics
+
+[telemetry]
+# Optional span integration (OTLP traces from an external proxy). Off by
+# default; no core feature depends on it. Historical span data stays on disk.
+spans_enabled = false
 
 [auth]
 # Central API auth. Token resolution order: DROVER_API_TOKEN env var,
@@ -512,6 +525,18 @@ def _resolve_config(
     # store even when a hub has PostgreSQL credentials in its environment.
     configure_control_store(cfg.duckdb_path, cfg.control_store)
     return cfg
+
+
+SPANS_DISABLED_MESSAGE = (
+    "span integration is disabled; set [telemetry] spans_enabled = true "
+    "to use span commands (historical span data is kept on disk)"
+)
+
+
+def _require_spans(cfg: DroverConfig) -> None:
+    """Span-only commands are optional integration surface (#473)."""
+    if not cfg.spans_enabled:
+        raise click.ClickException(SPANS_DISABLED_MESSAGE)
 
 
 def _advertised_host_port(cfg: DroverConfig) -> str:
@@ -741,6 +766,9 @@ def _build_redis_job_streams(cfg: DroverConfig) -> dict[str, RedisJobStream]:
         return {}
     streams: dict[str, RedisJobStream] = {}
     for key, suffix in _REDIS_JOB_STREAM_SUFFIXES.items():
+        if key == "embed_span" and not cfg.spans_enabled:
+            # No stream means nothing seeds or publishes span embed jobs (#473).
+            continue
         streams[key] = RedisJobStream.from_url(
             cfg.redis_jobs_url, _redis_job_stream_config(cfg, suffix)
         )
@@ -857,6 +885,7 @@ def _build_runtime_mcp_server(
         summarize_job_stream=summarize_job_stream,
         archive_config=cfg.archive,
         archive=_archive_client_from_config(cfg),
+        spans_enabled=cfg.spans_enabled,
     )
 
 
@@ -2147,7 +2176,13 @@ def mcp_call_cmd(
 
 
 @session_cmd.command(name="graph")
-@click.argument("session_id")
+@click.argument("session_id", required=False)
+@click.option(
+    "--run",
+    "run_id",
+    default=None,
+    help="Show every session launched for this Factory run instead.",
+)
 @click.option(
     "--format",
     "output_format",
@@ -2157,18 +2192,52 @@ def mcp_call_cmd(
     help="Output format",
 )
 @click.option(
+    "--spans",
+    "show_spans",
+    is_flag=True,
+    help="Legacy span tree (needs [telemetry] spans_enabled = true).",
+)
+@click.option(
     "--max-spans",
     default=5000,
     show_default=True,
     type=click.IntRange(min=1),
-    help="Maximum spans to read for this session",
+    help="Maximum spans to read for this session (with --spans)",
 )
 @click.pass_context
 def session_graph_cmd(
-    ctx: click.Context, session_id: str, output_format: str, max_spans: int
+    ctx: click.Context,
+    session_id: Optional[str],
+    run_id: Optional[str],
+    output_format: str,
+    show_spans: bool,
+    max_spans: int,
 ) -> None:
-    """Reconstruct a parent/child span tree for SESSION_ID."""
+    """Show what is working on a piece of work and where it is stuck.
+
+    Builds the tree containing SESSION_ID from recorded launch metadata:
+    delegation parents, handoffs, and Factory runs. Nothing is inferred.
+    """
+    if (session_id is None) == (run_id is None):
+        raise click.UsageError("pass exactly one of SESSION_ID or --run RUN_ID")
     cfg = _resolve_config(ctx.obj["config_path"])
+    if not show_spans:
+        graph = delegation_graph_payload(
+            HarnessRegistry(cfg.duckdb_path), session_id=session_id, run_id=run_id
+        )
+        if graph is None:
+            target = f"run {run_id}" if run_id else f"session_id={session_id}"
+            raise click.ClickException(f"no harness session found for {target}")
+        if output_format == "json":
+            click.echo(json.dumps(graph, indent=2, sort_keys=True))
+        elif output_format == "dot":
+            click.echo(format_graph_dot(graph), nl=False)
+        else:
+            click.echo(format_graph_ascii(graph), nl=False)
+        return
+    if session_id is None:
+        raise click.UsageError("--spans needs SESSION_ID")
+    _require_spans(cfg)
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
     payload = session_graph_payload(
         cfg.duckdb_path, cfg.parquet_dir, session_id, max_spans=max_spans
@@ -2247,9 +2316,13 @@ def embeddings_drain_once_cmd(ctx: click.Context, limit: int, apply: bool) -> No
             session_pending = con.execute(
                 "SELECT count(*) FROM embed_jobs WHERE status='pending'"
             ).fetchone()[0]
-            span_pending = con.execute(
-                "SELECT count(*) FROM span_embed_jobs WHERE status='pending'"
-            ).fetchone()[0]
+            span_pending = (
+                con.execute(
+                    "SELECT count(*) FROM span_embed_jobs WHERE status='pending'"
+                ).fetchone()[0]
+                if cfg.spans_enabled
+                else "disabled"
+            )
         finally:
             con.close()
         click.echo(
@@ -2263,6 +2336,7 @@ def embeddings_drain_once_cmd(ctx: click.Context, limit: int, apply: bool) -> No
         backend_config=backend_cfg,
         embedding_config=embeddings_cfg,
         batch_size=limit,
+        spans_enabled=cfg.spans_enabled,
     )
     processed = worker.drain_batch(max_jobs=limit)
     click.echo(f"mode=apply processed={processed} limit={limit}")
@@ -2279,6 +2353,7 @@ def embeddings_prune_orphan_spans_cmd(
 ) -> None:
     """Prune errored span embed jobs whose span rows are absent."""
     cfg = _resolve_config(ctx.obj["config_path"])
+    _require_spans(cfg)
     result = _prune_orphan_span_embed_jobs(
         duckdb_path=cfg.duckdb_path, limit=limit, apply=apply
     )
@@ -2305,6 +2380,7 @@ def embeddings_enqueue_spans_cmd(
 ) -> None:
     """Enqueue missing span embedding jobs for existing spans."""
     cfg = _resolve_config(ctx.obj["config_path"])
+    _require_spans(cfg)
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
     result = enqueue_missing_span_embeds(
         duckdb_path=cfg.duckdb_path,
@@ -2340,6 +2416,7 @@ def embeddings_reset_stale_spans_cmd(
     stale running jobs, then rerun with --apply to requeue them.
     """
     cfg = _resolve_config(ctx.obj["config_path"])
+    _require_spans(cfg)
     result = reset_stale_span_embed_jobs(
         duckdb_path=cfg.duckdb_path,
         stale_after_hours=stale_after_hours,
@@ -2391,6 +2468,7 @@ def embeddings_reset_stale_sessions_cmd(
 def decisions_derive_cmd(ctx: click.Context) -> None:
     """Derive decisions from explicitly marked span attributes."""
     cfg = _resolve_config(ctx.obj["config_path"])
+    _require_spans(cfg)
     inserted = derive_decisions(
         duckdb_path=cfg.duckdb_path, parquet_dir=cfg.parquet_dir
     )
@@ -2640,7 +2718,8 @@ def status(ctx: click.Context) -> None:
         parquet_dir  : {cfg.parquet_dir}
         duckdb_path  : {cfg.duckdb_path}
         control_plane_duckdb_path : {control_plane_path(cfg.duckdb_path)}
-        otlp_grpc_port : {cfg.otlp_grpc_port}
+        spans_enabled  : {str(cfg.spans_enabled).lower()}
+        otlp_grpc_port : {cfg.otlp_grpc_port if cfg.spans_enabled else "disabled"}
         mcp_http_port  : {cfg.mcp_http_port}
         metrics_http_port : {cfg.metrics_http_port}
         agent_id     : {cfg.agent_id}
@@ -2656,7 +2735,10 @@ def status(ctx: click.Context) -> None:
                 except duckdb.Error as e:
                     n = f"error: {e}"
                 click.echo(f"  {t:20s} {n}")
-            for v in ("agent_events", "spans", "pr_events", "routing"):
+            views = ("agent_events", "spans", "pr_events", "routing")
+            if not cfg.spans_enabled:
+                views = tuple(v for v in views if v != "spans")
+            for v in views:
                 try:
                     n = con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]
                 except duckdb.Error as e:
@@ -3126,6 +3208,9 @@ def run(
     # background analytical pass (#331).
     analytics_gate = AnalyticalMaintenanceGate()
     advisory_worker: AdvisoryWorker | None = None
+    # Before any analyzer is built or fact read: decides whether advisory
+    # loaders may touch span Parquet at all (#473).
+    advisory_span_facts.configure(cfg.spans_enabled)
     try:
         advisory_analyzers = operational_analyzers()
         advisory_scheduler = AdvisoryScheduler(
@@ -3208,7 +3293,11 @@ def run(
         native_usage_rollup = None
 
     receiver: OTLPReceiver | None = None
-    if not no_otlp:
+    if not cfg.spans_enabled:
+        # Optional integration (#473): nothing core depends on spans, so the
+        # receiver only binds when [telemetry] spans_enabled = true.
+        log.info("OTLP receiver disabled ([telemetry] spans_enabled = false)")
+    elif not no_otlp:
         try:
             receiver = OTLPReceiver(
                 host=otlp_host,
@@ -3321,10 +3410,12 @@ def run(
                 api_token=auth.api_token if auth.enabled else None,
                 freshness_threshold_seconds=cfg.provider_freshness_threshold_seconds,
             )
+            metrics_collector.spans_enabled = cfg.spans_enabled
             metrics_collector.cockpit_service = CockpitService(
                 duckdb_path=cfg.duckdb_path,
                 provider_usage=provider_usage,
                 maintenance_gate=analytics_gate,
+                spans_enabled=cfg.spans_enabled,
             )
             # The first cockpit request after a restart pays to open DuckDB and
             # read the parquet views' metadata: measured at 15.6s cold against
@@ -3576,6 +3667,7 @@ def run(
                 embedding_config=embeddings_cfg,
                 session_job_stream=job_streams.get("embed_session"),
                 span_job_stream=job_streams.get("embed_span"),
+                spans_enabled=cfg.spans_enabled,
             )
             embeddings.start()
             if (
@@ -3748,11 +3840,15 @@ def doctor(ctx: click.Context) -> None:
             parquet_dir=cfg.parquet_dir,
             duckdb_path=db_path,
             incoming_dir=cfg.incoming_dir,
+            spans_enabled=cfg.spans_enabled,
         )
     click.echo("drover-server doctor")
     click.echo("===================")
     click.echo(f"  agent_events     : {report['agent_events_total']:>10d}")
-    click.echo(f"  spans            : {report['spans_total']:>10d}")
+    if report["spans_total"] is None:
+        click.echo(f"  spans            : {'disabled':>10s}")
+    else:
+        click.echo(f"  spans            : {report['spans_total']:>10d}")
     click.echo(f"  sessions         : {report['sessions_total']:>10d}")
     click.echo(f"  tasks            : {report['tasks_total']:>10d}")
     click.echo(f"  session_summaries: {report['summaries_total']:>10d}")
@@ -4174,6 +4270,7 @@ def _trace_tail_impl(
         raise click.UsageError("--interval must be >= 0")
 
     cfg = _resolve_config(ctx.obj["config_path"])
+    _require_spans(cfg)
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
 
     remaining = 1 if interval == 0 else count
@@ -4341,6 +4438,7 @@ def runtime_audit_cmd(
             source_duckdb_path=source_db,
             diagnostic_db_path=diagnostic_db,
             deep=deep,
+            spans_enabled=cfg.spans_enabled,
         )
     click.echo(format_runtime_audit(report))
 
@@ -4410,6 +4508,7 @@ def quality_cmd(
             hours=hours,
             required_agent_ids=required_agent_ids,
             deep=deep,
+            spans_enabled=cfg.spans_enabled,
         )
     if as_prometheus:
         click.echo(format_prometheus(snapshot), nl=False)
@@ -4458,6 +4557,7 @@ def observatory_cmd(
             duckdb_path=db_path,
             incoming_dir=incoming_dir or cfg.incoming_dir,
             deep=False,
+            spans_enabled=cfg.spans_enabled,
         )
         payload = pipeline_observatory_snapshot(
             duckdb_path=db_path,
@@ -4609,7 +4709,7 @@ def rollup(ctx: click.Context) -> None:
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
     con = open_duckdb_connection(cfg.duckdb_path)
     try:
-        n = rollup_tasks(con)
+        n = rollup_tasks(con, include_span_cost=cfg.spans_enabled)
     finally:
         con.close()
     click.echo(f"rolled up {n} task rows")

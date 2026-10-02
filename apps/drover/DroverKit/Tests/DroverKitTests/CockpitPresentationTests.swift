@@ -366,15 +366,29 @@ import Testing
 @Test func sourceCoveragePresentationNamesUnavailableUsageWithoutCallingItZero() throws {
     let coverage = try JSONDecoder().decode(Coverage.self, from: Data(#"""
     {"sources":{
-      "tokens":{"usage_percent":null,"span_percent":33.3,"status":"unavailable"},
-      "cache":{"usage_percent":null,"span_percent":0,"status":"unavailable"}
+      "tokens":{"usage_percent":null,"spans_percent":33.3,"status":"unavailable"},
+      "cache":{"usage_percent":null,"spans_percent":0,"status":"unavailable"}
     }}
     """#.utf8))
 
     let value = CoverageSourcesPresentation(coverage: coverage)
 
-    #expect(value.text == "Token sources: usage unavailable; spans 33.3% · Cache sources: usage unavailable; spans 0%")
-    #expect(value.accessibilityText == "Token sources: usage unavailable; spans 33.3%. Cache sources: usage unavailable; spans 0%.")
+    // Spans are named only where they contributed (drover#473).
+    #expect(value.text == "Token sources: usage unavailable; spans 33.3% · Cache sources: usage unavailable")
+    #expect(value.accessibilityText == "Token sources: usage unavailable; spans 33.3%. Cache sources: usage unavailable.")
+}
+
+@Test func sourceCoverageWithoutSpansNamesOnlyDroverUsage() throws {
+    let coverage = try JSONDecoder().decode(Coverage.self, from: Data(#"""
+    {"sources":{
+      "tokens":{"usage_percent":80,"spans_percent":0,"status":"ok"},
+      "cache":{"usage_percent":50,"spans_percent":0,"status":"ok"}
+    }}
+    """#.utf8))
+
+    let value = CoverageSourcesPresentation(coverage: coverage)
+
+    #expect(value.text == "Token sources: usage 80% · Cache sources: usage 50%")
 }
 
 // MARK: - Activity totals (#150)
@@ -420,6 +434,16 @@ private func totalsPresentation(_ activity: ActivitySummary) -> ActivityTotalsPr
     #expect(value.costIsUnreported)
     #expect(value.costText == "Not reported")
     #expect(value.costAccessibilityText == "API-billed cost not reported")
+    // With spans optional (drover#473) this is the normal state, so the
+    // metric and its coverage clause are hidden rather than shown empty.
+    #expect(!value.showsCost)
+    #expect(value.coverageText == "5.8% token coverage")
+}
+
+@Test func measuredCostIsStillShown() {
+    let value = totalsPresentation(totalsFixture())
+
+    #expect(value.showsCost)
 }
 
 @Test func costOfZeroThatWasActuallyMeasuredStaysAZero() {

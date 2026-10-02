@@ -41,9 +41,10 @@ Analytics expands provider-reported quota windows and usage distributions.
 - The **command plane** connects the iOS app to `drover-server` and per-host
   `drover-harnessd` daemons for session control, structured chat, approvals,
   handoff, and terminal streaming.
-- The **context plane** collects durable agent events and spans into local
-  Parquet and DuckDB storage, then derives summaries, project briefs, and
-  embeddings for recall.
+- The **context plane** collects durable agent events into local Parquet and
+  DuckDB storage, then derives summaries, project briefs, and embeddings for
+  recall. OpenTelemetry span ingestion is an optional integration, off by
+  default.
 - The reference hub runs a PostgreSQL control store, migrated from DuckDB on
   2026-09-21; its analytical lake and every host-local spool stay DuckDB.
 - A new central installation uses a **PostgreSQL control store** for fleet
@@ -212,10 +213,12 @@ path, verification, private Tailscale setup, and optional context ingestion.
 
 ## Context store
 
-Raw agent events and OpenTelemetry spans are durable facts. Drover stores them
-as partitioned Parquet, exposes normalized DuckDB views, and keeps mutable
-derived context such as summaries, briefs, embeddings, and job provenance in
-DuckDB. Derived records always retain links back to source sessions or spans.
+Raw agent events are durable facts. Drover stores them as partitioned Parquet,
+exposes normalized DuckDB views, and keeps mutable derived context such as
+summaries, briefs, embeddings, and job provenance in DuckDB. Derived records
+always retain links back to source sessions. Spans from an external OTLP
+producer are kept the same way when the
+[optional span integration](docs/optional-span-integration.md) is enabled.
 
 The model and its compatibility boundary are documented in
 [Context Store](docs/context-store.md). Historical telemetry may retain

@@ -320,6 +320,12 @@ def test_analytics_boundary_has_fixed_routes_and_strips_public_credentials() -> 
     }
     assert is_analytics_route("GET", "/insights", "limit=10") is True
     assert is_analytics_route("GET", "/insights/near/match", "") is False
+    # Project Activity reads the lakehouse, so it crosses the same boundary.
+    assert (
+        is_analytics_route("GET", "/projects/activity", "project=o/r&days=7&limit=5")
+        is True
+    )
+    assert is_analytics_route("GET", "/projects/activity", "since=x") is False
     with pytest.raises(AnalyticsBoundaryRequestInvalid):
         client.request("POST", "/metrics", "", b"{}")
 

@@ -91,10 +91,12 @@ backend = "postgres"
 dsn_env = "DROVER_CONTROL_DSN"
 
 [server]
-otlp_grpc_port = 4317
 mcp_http_port = 7077
 metrics_http_port = 7080
 ```
+
+Span ingestion over OTLP is an optional integration and is off by default; no
+core feature needs it. See [Optional span integration](optional-span-integration.md).
 
 The server enables bearer-token authentication by default. On first start it
 creates `~/.drover/api_token` with mode `0600` unless `DROVER_API_TOKEN` or an
@@ -231,8 +233,9 @@ host-firewall or Tailscale-policy restriction from the
 on a laptop that joins untrusted networks. Keep a single address there and
 accept that the hub is unreachable while that network is down.
 
-OTLP and MCP remain loopback-only unless you also set `--otlp-host` or
-`--mcp-host` explicitly.
+MCP remains loopback-only unless you also set `--mcp-host` explicitly. The
+optional OTLP receiver, when enabled, is loopback-only unless you set
+`--otlp-host`.
 
 ## Verify The Context Surface
 

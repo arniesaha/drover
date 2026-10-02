@@ -232,6 +232,46 @@ def _parse_cockpit_query(query: str):
     return AnalyticsFilters(**values)
 
 
+_PROJECT_ACTIVITY_QUERY_FIELDS = frozenset({"project", "days", "limit"})
+
+
+def _parse_project_activity_query(query: str) -> dict[str, Any]:
+    """``project`` (owner/name), ``days`` (1-30) and ``limit`` (1-200)."""
+    from drover.server.project_activity import MAX_DAYS, MAX_SESSIONS
+
+    params = parse_qs(query, keep_blank_values=True)
+    unknown = sorted(set(params) - _PROJECT_ACTIVITY_QUERY_FIELDS)
+    if unknown:
+        raise ValueError(f"unsupported query field: {unknown[0]}")
+    values: dict[str, Any] = {"project_key": None, "days": 7, "limit": 50}
+    for name, entries in params.items():
+        if len(entries) != 1:
+            raise ValueError(f"{name} must appear once")
+        value = entries[0].strip()
+        if not value or len(value) > 256:
+            raise ValueError(f"{name} must be 1-256 characters")
+        if name == "project":
+            values["project_key"] = value
+            continue
+        try:
+            number = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        upper = MAX_DAYS if name == "days" else MAX_SESSIONS
+        if not 1 <= number <= upper:
+            raise ValueError(f"{name} must be within [1, {upper}]")
+        values[name] = number
+    return values
+
+
+def _render_project_activity(collector: Any, query: str) -> tuple[int, str]:
+    try:
+        values = _parse_project_activity_query(query)
+    except ValueError as exc:
+        return 400, json.dumps({"error": str(exc)}) + "\n"
+    return collector.render_project_activity_json(**values)
+
+
 _INSIGHT_QUERY_FIELDS = frozenset(
     {
         "state",
@@ -963,6 +1003,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 status, body = self.collector.render_analytics_json(filters)
             self._send(status, "application/json", body)
             return
+        if path == "/projects/activity":
+            status, body = _render_project_activity(self.collector, parsed.query)
+            self._send(status, "application/json", body)
+            return
         if path == "/insights":
             try:
                 filters = _parse_insight_query(parsed.query)
@@ -1184,6 +1228,22 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 allow_gzip=True,
                 route_class="session_messages",
             )
+            return
+        if path.startswith("/harness/sessions/") and path.endswith("/graph"):
+            session_id = unquote(
+                path.removeprefix("/harness/sessions/").removesuffix("/graph")
+            ).strip("/")
+            status, body = self.collector.render_session_graph_json(
+                session_id=session_id
+            )
+            self._send(status, "application/json", body)
+            return
+        if path.startswith("/harness/runs/") and path.endswith("/graph"):
+            run_id = unquote(
+                path.removeprefix("/harness/runs/").removesuffix("/graph")
+            ).strip("/")
+            status, body = self.collector.render_session_graph_json(run_id=run_id)
+            self._send(status, "application/json", body)
             return
         if path.startswith("/harness/sessions/"):
             session_id = unquote(path.removeprefix("/harness/sessions/").strip("/"))
@@ -2487,6 +2547,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             "/insights/content-analysis/consent",
             "/insights/content-analysis/revoke",
             "/insights/content-excerpts",
+            "/projects/activity",
         }:
             return True
         return path.startswith("/insights/")
@@ -2787,6 +2848,9 @@ def analytics_boundary_dispatcher(
                     if path == "/cockpit/overview"
                     else collector.render_analytics_json(filters)
                 )
+                return response(status, "application/json", rendered)
+            if path == "/projects/activity":
+                status, rendered = _render_project_activity(collector, query)
                 return response(status, "application/json", rendered)
             if path == "/insights":
                 try:

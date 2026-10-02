@@ -37,9 +37,12 @@ Partitioned Parquet is the system of record for append-oriented telemetry:
 | `pr_events` | Pull-request lifecycle facts |
 | `routing` | Model or harness routing observations |
 
-Spans, and their cost and latency attributes, are populated only when an
-external OTLP producer is configured. Tokens and cache counts come from the
-harness event stream first (the `session_usage` rollup) and from spans second.
+Spans, and their cost and latency attributes, are populated only when the
+[optional span integration](optional-span-integration.md) is enabled; it is
+off by default and no core feature reads them. Tokens and cache counts come
+from the harness event stream (the `session_usage` rollup), with spans as a
+fallback only when the integration is on. Historical span Parquet stays on
+disk either way.
 
 DuckDB creates normalized views over those files: `agent_events`, `spans`,
 `spans_enriched`, `pr_events`, and `routing`. The `sessions`,
@@ -285,7 +288,7 @@ handoff, and quality checks. Operators can use `drover-server status`,
 | `drover_resume_context` | Context + linked summaries | Join contexts ↔ summaries |
 | `drover_recall` | Semantic search via embedding | Cosine similarity |
 | `drover_task_status` | Aggregated task stats | COUNT sessions |
-| `drover_project_activity` | Span-level activity by repo | SUM costs |
+| `drover_project_activity` | Recent sessions and open items by project | Session facts + summaries + `session_usage`, capped |
 | `drover_active_handoff` | Live handoff brief for mid-task | TTL cache lookup |
 | `drover_fleet_status` | All active sessions right now | Aggregates active |
 | `drover_data_quality` | Lakehouse health check | Run quality check |

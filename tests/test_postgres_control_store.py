@@ -404,7 +404,9 @@ def test_postgres_bootstrap_serializes_concurrent_starters(tmp_path: Path):
             rows = con.execute(
                 f'SELECT version FROM "{schema}".control_schema_migrations'
             ).fetchall()
-        assert rows == [(1,), (2,), (3,), (4,)]
+        from drover.server.postgres_schema import _MIGRATIONS
+
+        assert rows == [(version,) for version, _ in _MIGRATIONS]
     finally:
         for store in starters:
             store.close()

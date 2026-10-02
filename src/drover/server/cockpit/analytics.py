@@ -201,12 +201,17 @@ def activity_analytics(
     filters: AnalyticsFilters,
     *,
     cursor_codec: AnalyticsCursorCodec | None = None,
+    spans_enabled: bool = False,
 ) -> ActivityAnalytics:
     """Return observed metrics from one DuckDB MVCC snapshot.
 
     When the caller already owns a transaction, that transaction defines the
     snapshot and remains caller-owned. Otherwise this function begins and ends
     a read transaction, rolling it back on every failure path.
+
+    Span partitions are read only when the optional span integration is on
+    (#473). Off, sessions and tokens come from Drover's own events and
+    ``session_usage``; cost and latency carry zero coverage, never a guess.
     """
     owns_transaction = not _connection_has_active_transaction(con)
     if owns_transaction:
@@ -214,7 +219,7 @@ def activity_analytics(
 
     try:
         result = _activity_analytics_in_snapshot(
-            con, filters, cursor_codec=cursor_codec
+            con, filters, cursor_codec=cursor_codec, spans_enabled=spans_enabled
         )
         if owns_transaction:
             con.execute("COMMIT")
@@ -262,13 +267,18 @@ def _activity_analytics_in_snapshot(
     filters: AnalyticsFilters,
     *,
     cursor_codec: AnalyticsCursorCodec | None = None,
+    spans_enabled: bool = False,
 ) -> ActivityAnalytics:
     """Run every analytics statement inside the caller's current snapshot."""
     codec = cursor_codec or _DEFAULT_CURSOR_CODEC
     snapshot_at, cursor_snapshot = _cursor_snapshot_context(codec, filters)
     usage_available = _session_usage_available(con)
     with _materialized_session_facts(
-        con, filters, snapshot_at, usage_available=usage_available
+        con,
+        filters,
+        snapshot_at,
+        usage_available=usage_available,
+        spans_enabled=spans_enabled,
     ) as facts:
         return _activity_analytics_from_facts(
             con,
@@ -281,6 +291,29 @@ def _activity_analytics_in_snapshot(
         )
 
 
+def materialized_session_facts(
+    con: duckdb.DuckDBPyConnection,
+    filters: AnalyticsFilters,
+    snapshot_at: datetime,
+    *,
+    spans_enabled: bool = False,
+):
+    """The cockpit's per-session facts, for other read models (#473).
+
+    Yields the name of a connection-scoped temp table with one row per session
+    in the window: ``session_id``, ``started_at``, ``latest_activity_at``,
+    ``host_id``, ``harness``, ``model``, ``project_key`` and token columns.
+    Project Activity reads this so both surfaces count the same sessions.
+    """
+    return _materialized_session_facts(
+        con,
+        filters,
+        snapshot_at,
+        usage_available=_session_usage_available(con),
+        spans_enabled=spans_enabled,
+    )
+
+
 @contextmanager
 def _materialized_session_facts(
     con: duckdb.DuckDBPyConnection,
@@ -288,10 +321,15 @@ def _materialized_session_facts(
     snapshot_at: datetime,
     *,
     usage_available: bool = False,
+    spans_enabled: bool = False,
 ):
     """Yield one connection-scoped copy of the normalized request facts."""
     relation = f"analytics_session_facts_{secrets.token_hex(8)}"
-    span_dates = _span_partition_dates(con, filters, snapshot_at)
+    # No span dates binds the empty `_seed` partition, so a hub without the
+    # span integration answers from events and session_usage alone.
+    span_dates = (
+        _span_partition_dates(con, filters, snapshot_at) if spans_enabled else ()
+    )
     event_dates = _agent_event_partition_dates(con, filters, snapshot_at, span_dates)
     base_sql, params = _session_facts_sql(
         filters,

@@ -165,7 +165,9 @@ def _freshness_category(
             f"{oldest_event_agent}={oldest_latest_event_age:.1f}h old"
         )
 
-    if latest_span_age is None:
+    if _spans_disabled(audit):
+        pass
+    elif latest_span_age is None:
         statuses.append("warn")
         warnings.append("no recent spans found")
     elif latest_span_age > FRESH_SPAN_CRITICAL_HOURS:
@@ -195,10 +197,24 @@ def _freshness_category(
     )
 
 
+def _spans_disabled(audit: dict) -> bool:
+    """True when the runtime audit ran with the span integration off (#473).
+
+    Audits built before the flag carry no marker and keep their old meaning.
+    """
+    return audit.get("span_integration") == "disabled"
+
+
 def _completeness_category(audit: dict) -> dict:
     counts = audit.get("table_counts", {})
-    missing = [name for name in RUNTIME_KEY_RELATIONS if counts.get(name) is None]
-    empty_core = [name for name in ("agent_events", "spans") if counts.get(name) == 0]
+    span_relations = {"spans"} if _spans_disabled(audit) else set()
+    missing = [
+        name
+        for name in RUNTIME_KEY_RELATIONS
+        if counts.get(name) is None and name not in span_relations
+    ]
+    core = ("agent_events",) if _spans_disabled(audit) else ("agent_events", "spans")
+    empty_core = [name for name in core if counts.get(name) == 0]
     summarize_counts = audit.get("summarize_jobs", {}).get("status_counts", {})
     summarize_health = audit.get("summarize_jobs", {}).get("backend_health", {})
     errored_summaries = int(summarize_counts.get("errored", 0))
@@ -530,7 +546,9 @@ def _embedding_coverage_category(audit: dict) -> dict:
             warnings.append(f"{errored_embed} embed_jobs are errored")
 
     span_percent = span_coverage.get("coverage_percent")
-    if span_percent is not None and float(span_percent) < 100.0:
+    if _spans_disabled(audit):
+        pass
+    elif span_percent is not None and float(span_percent) < 100.0:
         statuses.append("warn")
         warnings.append(f"span embedding coverage is {span_percent:.1f}%")
     if int(span_coverage.get("stale_running_jobs", 0) or 0):
@@ -565,7 +583,7 @@ def _span_linkability_category(audit: dict) -> dict | None:
     if total:
         coverage_percent = round((matched / total) * 100.0, 1)
 
-    if not status or status == "missing":
+    if not status or status in {"missing", "disabled"}:
         return None
 
     warnings: list[str] = []
@@ -634,7 +652,7 @@ def _bundle_quality_category(audit: dict) -> dict:
 def _openclaw_agentweave_category(audit: dict) -> dict | None:
     health = audit.get("openclaw_agentweave_health") or {}
     status = health.get("status")
-    if not status or status == "missing":
+    if not status or status in {"missing", "disabled"}:
         return None
 
     native = health.get("native_events", {})
@@ -682,8 +700,13 @@ def quality_snapshot(
     required_agent_ids: Iterable[str] | None = None,
     deep: bool = True,
     role: str = "diagnostic",
+    spans_enabled: bool = False,
 ) -> dict:
     """Return a structured Drover data-quality snapshot.
+
+    With the optional span integration off (#473) span checks are skipped and
+    ``span_integration`` reads ``"disabled"``; an absent span feed is never
+    scored as missing, stale or empty.
 
     The snapshot is derived from ``runtime_audit`` so the CLI, automation, and
     Grafana metrics all use the same read-only lakehouse health signals.
@@ -700,6 +723,7 @@ def quality_snapshot(
         hours=hours,
         deep=deep,
         role=role,
+        spans_enabled=spans_enabled,
     )
     categories = {
         "freshness": _freshness_category(
@@ -737,6 +761,7 @@ def quality_snapshot(
         "incoming_dir": str(incoming_dir) if incoming_dir else None,
         "hours": hours,
         "diagnostic_depth": "deep" if deep else "standard",
+        "span_integration": "enabled" if spans_enabled else "disabled",
         "status": status,
         "score": score,
         "categories": categories,

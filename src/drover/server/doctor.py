@@ -1234,11 +1234,16 @@ def runtime_audit(
     diagnostic_db_path: Optional[Path] = None,
     deep: bool = True,
     role: str = "diagnostic",
+    spans_enabled: bool = False,
 ) -> dict:
     """Return a read-only operational health report for a Drover runtime DB.
 
     Missing tables/views are represented with ``None`` counts and empty
     sections. The function does not bootstrap schemas or mutate the database.
+
+    With the optional span integration off (the default, #473) no span
+    Parquet is read: span sections report ``status: "disabled"`` and raise no
+    warnings, so an absent span feed is never mistaken for a failure.
 
     ``role`` picks the DuckDB connection profile. It defaults to
     ``diagnostic`` (one thread) because this function is reachable from the
@@ -1260,6 +1265,7 @@ def runtime_audit(
         "incoming_dir": str(incoming_dir) if incoming_dir else None,
         "hours": hours,
         "diagnostic_depth": "deep" if deep else "standard",
+        "span_integration": "enabled" if spans_enabled else "disabled",
         "skipped_checks": [],
         "table_counts": {},
         "latest_events": {},
@@ -1374,7 +1380,14 @@ def runtime_audit(
                 report["table_counts"][name] = scan.total_rows
                 continue
             report["table_counts"][name] = _relation_count(con, name)
-        if _relation_exists(con, "spans"):
+        if not spans_enabled:
+            report["table_counts"]["spans"] = None
+            report["span_health"] = {**report["span_health"], "status": "disabled"}
+            report["openclaw_agentweave_health"] = {
+                **report["openclaw_agentweave_health"],
+                "status": "disabled",
+            }
+        elif _relation_exists(con, "spans"):
             report["span_health"] = _span_health_for_window(
                 con, days=recent_days, warnings=report["warnings"]
             )
@@ -1388,7 +1401,8 @@ def runtime_audit(
             report["table_counts"]["spans"] = None
 
         if (
-            report["table_counts"].get("agent_events") is not None
+            spans_enabled
+            and report["table_counts"].get("agent_events") is not None
             and report["table_counts"].get("spans") is not None
         ):
             report["openclaw_agentweave_health"] = (
@@ -1463,7 +1477,7 @@ def runtime_audit(
             "stale_running_jobs": 0,
             "stale_running_age_hours": 0,
         }
-        if report["table_counts"].get("span_embed_jobs") is not None:
+        if spans_enabled and report["table_counts"].get("span_embed_jobs") is not None:
             stale_span_jobs = _stale_running_span_embed_jobs(
                 con,
                 stale_after_hours=24,
@@ -1515,6 +1529,10 @@ def runtime_audit(
             "coverage_percent": coverage_percent,
             "coverage_note": coverage_note,
         }
+        if not spans_enabled:
+            # Historical rows stay counted for the record; nothing is judged.
+            report["span_embedding_coverage"]["status"] = "disabled"
+            report["span_embedding_coverage"]["coverage_percent"] = None
         report["embedding_status"] = _embedding_status(
             embed_counts=embed_counts,
             session_embeddings_count=report["session_embeddings_count"],
@@ -1616,10 +1634,29 @@ def format_runtime_audit(report: dict) -> str:
         "",
         "table counts:",
     ]
+    spans_off = report.get("span_integration") == "disabled"
     for name, count in report.get("table_counts", {}).items():
         value = "missing" if count is None else str(count)
+        if spans_off and name == "spans":
+            value = "disabled"
         lines.append(f"  {name:20s} {value}")
 
+    if spans_off:
+        lines.extend(
+            [
+                "",
+                "span integration: disabled ([telemetry] spans_enabled = false); "
+                "optional, not required by any core feature",
+            ]
+        )
+    else:
+        _append_span_sections(lines, report)
+
+    _append_core_sections(lines, report, spans_off=spans_off)
+    return "\n".join(lines)
+
+
+def _append_span_sections(lines: list[str], report: dict) -> None:
     span_health = report.get("span_health", {})
     lines.extend(
         [
@@ -1681,6 +1718,8 @@ def format_runtime_audit(report: dict) -> str:
             ]
         )
 
+
+def _append_core_sections(lines: list[str], report: dict, *, spans_off: bool) -> None:
     lines.extend(["", "latest event by agent:"])
     latest = report.get("latest_events", {})
     if latest:
@@ -1726,6 +1765,12 @@ def format_runtime_audit(report: dict) -> str:
             f"embedding status: {embedding_status.get('state', 'unknown')} — {embedding_status.get('message', '-')}",
         ]
     )
+    if not spans_off:
+        _append_span_embedding_lines(lines, report)
+    _append_consistency_sections(lines, report)
+
+
+def _append_span_embedding_lines(lines: list[str], report: dict) -> None:
     sej = report.get("span_embed_jobs", {})
     span_cov = report.get("span_embedding_coverage", {})
     stale_running = int(sej.get("stale_running_jobs") or 0)
@@ -1755,6 +1800,8 @@ def format_runtime_audit(report: dict) -> str:
     if span_cov.get("coverage_note"):
         lines.append(f"  note: {span_cov.get('coverage_note')}")
 
+
+def _append_consistency_sections(lines: list[str], report: dict) -> None:
     session_consistency = report.get("session_consistency", {})
     if session_consistency.get("status") == "missing":
         lines.extend(["", "session consistency: missing"])
@@ -1911,7 +1958,6 @@ def format_runtime_audit(report: dict) -> str:
     if warnings:
         lines.extend(["", "warnings:"])
         lines.extend(f"  ⚠ {w}" for w in warnings)
-    return "\n".join(lines)
 
 
 def audit_lakehouse(
@@ -1920,8 +1966,12 @@ def audit_lakehouse(
     duckdb_path: Path,
     incoming_dir: Optional[Path] = None,
     drift_threshold: float = 0.01,
+    spans_enabled: bool = False,
 ) -> dict:
-    """Return a dict report. Never raises — failures show up as warnings."""
+    """Return a dict report. Never raises — failures show up as warnings.
+
+    ``spans_total`` is ``None`` when the optional span integration is off.
+    """
     parquet_dir = Path(parquet_dir)
     duckdb_path = Path(duckdb_path)
     warnings: list[str] = []
@@ -1933,14 +1983,18 @@ def audit_lakehouse(
         agent_total = _safe_count(
             con, "SELECT count(*) FROM agent_events WHERE id IS NOT NULL"
         )
-        spans_total = _safe_count(
-            con,
-            """
+        spans_total = (
+            _safe_count(
+                con,
+                """
             SELECT count(*) FROM spans
             WHERE span_id IS NOT NULL
               AND date >= strftime(current_date - INTERVAL '32 days', '%Y-%m-%d')
               AND date <> '_seed'
             """,
+            )
+            if spans_enabled
+            else None
         )
         sessions_total = _safe_count(
             con,

@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from drover.config import ControlStoreConfig
+from drover.server.advisory import span_facts
 from drover.server.advisory.snapshot_codec import encode_snapshot
 from drover.server.advisory.worker import load_operational_snapshot
 from drover.server.control_store import configure_control_store
@@ -20,6 +21,7 @@ def run(payload: dict) -> dict:
     control_store = payload.get("control_store")
     if control_store is not None:
         configure_control_store(source, ControlStoreConfig(**control_store))
+    span_facts.configure(bool(payload.get("spans_enabled", False)))
     copy_duckdb_store_with_wal(source, snapshot)
     result = load_operational_snapshot(
         snapshot,

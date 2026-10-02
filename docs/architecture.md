@@ -37,8 +37,9 @@ target. See [Harness Adapter Architecture](harness-adapter-architecture.md) and
 
 The context plane turns local agent activity into durable, queryable memory:
 
-1. `drover-collect` and hooks emit agent events. Spans arrive only when an
-   external OTLP producer is configured.
+1. `drover-collect` and hooks emit agent events. Spans arrive only when the
+   [optional span integration](optional-span-integration.md) is enabled; no
+   core feature depends on them.
 2. Ingest normalizes identifiers, attributes repository context, deduplicates
    records, and writes partitioned Parquet facts.
 3. DuckDB views expose normalized events, spans, sessions, links, pull-request
@@ -72,8 +73,8 @@ the corresponding operator command.
 
 The analytics role exports pending central harness events into immutable Parquet
 batches, records them in a PostgreSQL manifest, then acknowledges them. DuckDB
-remains the home for analytical views, derived context, MCP and OTLP work, and
-the local-first default. A central API role reads PostgreSQL and has no direct lake fallback;
+remains the home for analytical views, derived context, MCP and optional OTLP
+work, and the local-first default. A central API role reads PostgreSQL and has no direct lake fallback;
 it uses a bounded authenticated loopback boundary for analytical routes and
 cold archived payload reads.
 
@@ -83,7 +84,7 @@ cold archived payload reads.
 | --- | --- | --- |
 | iOS app | iPhone or simulator | Presentation, local settings, token in Keychain |
 | `drover-server` API role | Central machine | Fleet API, pairing, relay, push, PostgreSQL control readiness |
-| `drover-server` analytics role | Central machine | Ingest, immutable export, archive resolution, derived workers, MCP, OTLP |
+| `drover-server` analytics role | Central machine | Ingest, immutable export, archive resolution, derived workers, MCP, optional OTLP |
 | `drover-server` all role | Central machine | Combined API and analytics startup, with the configured control backend |
 | `drover-harnessd` | Every harness host | Agent processes, adapters, PTY, terminal stream |
 | `drover-collect` | Source hosts | Local log parsing and source-side attribution |
@@ -96,7 +97,7 @@ cold archived payload reads.
 - Harness API: authenticated HTTP and WebSocket, normally port `7080`
 - Host daemon: private HTTP and WebSocket, normally port `7081`
 - MCP: streamable HTTP at `/mcp`, normally port `7077`
-- OTLP: gRPC ingest, normally port `4317`
+- OTLP (optional, off by default): gRPC ingest, normally port `4317`
 - Files: JSONL inputs under `~/.drover/incoming/`
 - API and analytics boundary: loopback-only HTTP, normally API port `7080` and
   worker port `7082`

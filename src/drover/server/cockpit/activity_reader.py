@@ -56,6 +56,7 @@ def run(payload: dict) -> dict:
                 cursor_codec=AnalyticsCursorCodec(
                     bytes.fromhex(payload["cursor_secret"])
                 ),
+                spans_enabled=bool(payload.get("spans_enabled", False)),
             )
         return {"ok": True, "result": asdict(result)}
     finally:

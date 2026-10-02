@@ -4675,6 +4675,39 @@ def test_a_handoff_from_a_different_source_still_creates_its_own_session(tmp_pat
         server.server_close()
 
 
+def test_delegated_children_of_one_parent_are_separate_sessions(tmp_path):
+    """`parent_session_id` records delegation without the handoff dedupe (#473).
+
+    An orchestrator starting two workers must get two sessions, each linked
+    to it, which `source_session_id` cannot express: a second launch with the
+    same source adopts the first.
+    """
+
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        base = {
+            "harness": "claude-code",
+            "mode": "structured",
+            "command": FAKE_STRUCTURED_CLI,
+            "cwd": str(tmp_path),
+            "parent_session_id": "orchestrator-1",
+        }
+        _, first = _json_request(f"{base_url}/sessions", payload=base)
+        _, second = _json_request(f"{base_url}/sessions", payload=base)
+
+        assert first["session_id"] != second["session_id"]
+        children = [
+            s
+            for s in state.registry.list_sessions()
+            if s.parent_session_id == "orchestrator-1"
+        ]
+        assert len(children) == 2
+    finally:
+        _close_structured_sessions(state)
+        server.shutdown()
+        server.server_close()
+
+
 def test_a_repeat_create_with_a_client_key_does_not_spawn_a_second_session(tmp_path):
     """The gate has to sit in front of the spawn, not behind it.
 

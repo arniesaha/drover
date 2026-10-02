@@ -46,10 +46,15 @@ _COVERAGE_RULES = (
 class TelemetryCoverageAnalyzer:
     analyzer_id = "deterministic.telemetry_coverage"
 
-    def __init__(self, *, minimum_percent: float = 80) -> None:
+    def __init__(
+        self, *, minimum_percent: float = 80, spans_enabled: bool = True
+    ) -> None:
         if not 0 < minimum_percent <= 100:
             raise ValueError("minimum_percent must be within (0, 100]")
         self.minimum_percent = minimum_percent
+        # With the optional span integration off (#473) a silent span feed is
+        # the expected state, not a finding; the other rules still apply.
+        self.spans_enabled = spans_enabled
 
     def analyze(self, snapshot: AnalysisSnapshot) -> list[FindingCandidate]:
         findings: list[FindingCandidate] = []
@@ -59,7 +64,7 @@ class TelemetryCoverageAnalyzer:
         if not active:
             return findings
 
-        if sum(a.sessions_with_spans for a in active) == 0:
+        if self.spans_enabled and sum(a.sessions_with_spans for a in active) == 0:
             latest = max(
                 (a.latest_span_at for a in active if a.latest_span_at),
                 default=None,

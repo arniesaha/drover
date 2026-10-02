@@ -226,6 +226,7 @@ _POSTGRES_ANALYTICS_SNAPSHOT_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("thinking_effort", "VARCHAR"),
         ("recap_reconcile_needed", "BOOLEAN"),
         ("client_session_id", "VARCHAR"),
+        ("parent_session_id", "VARCHAR"),
     ),
     "session_usage": (
         ("session_id", "VARCHAR"),

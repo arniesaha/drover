@@ -91,17 +91,17 @@ The three capability fields are required booleans. `runtime` and at least one
 `agent_id_patterns` glob are also required. Invalid configuration is surfaced
 as an adoption-category warning without stopping the server.
 
-## AgentWeave And OpenTelemetry
-
-Drover accepts OTLP spans and retains trace, span, session, model, token, cost,
-cache, delegation, and routing provenance when present. AgentWeave is one
-producer of those spans; Drover remains the durable local context and recall
-layer rather than a replacement tracing UI.
+## Optional: OpenTelemetry Spans
 
 Token and cache numbers come from the harness event stream, rolled up per
-session into the control-plane `session_usage` table. OTLP spans supply cost
-and latency, and fill in tokens only for sessions the harness stream did not
-report.
+session into the control-plane `session_usage` table. No core feature needs
+spans.
+
+Drover can optionally accept OTLP spans from an external producer (for
+example the AgentWeave proxy via Tempo and `drover-collect tempo-relay`). The
+integration is off by default; see
+[Optional span integration](optional-span-integration.md) for what it adds
+and how to enable it.
 
 Historical spans may contain `nexus.*` attributes. Drover reads those values
 for compatibility. New integrations should emit Drover naming and stable

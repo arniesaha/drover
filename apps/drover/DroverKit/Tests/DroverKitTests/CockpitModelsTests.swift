@@ -147,11 +147,13 @@ func backendContentConsentFixturesPreserveFleetPropagation(
 @Test func analyticsDecodesMetricSourceCoverageWithoutInventingUsage() throws {
     let coverage = try JSONDecoder().decode(Coverage.self, from: Data(#"""
     {"token_percent":33.3,"sources":{
-      "tokens":{"usage_percent":null,"span_percent":33.3,"status":"unavailable"},
-      "cache":{"usage_percent":0,"span_percent":0,"status":"ok"}
+      "tokens":{"usage_percent":null,"spans_percent":33.3,"status":"unavailable"},
+      "cache":{"usage_percent":0,"spans_percent":0,"status":"ok"}
     }}
     """#.utf8))
 
+    // `spans_percent` is the field the server emits (`MetricSources` in
+    // cockpit/analytics.py); the app used to read `span_percent`.
     #expect(coverage.sources?.tokens.usagePercent == nil)
     #expect(coverage.sources?.tokens.spansPercent == 33.3)
     #expect(coverage.sources?.tokens.status == .unavailable)

@@ -364,6 +364,10 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "thinking_effort": "VARCHAR",
             "recap_reconcile_needed": "BOOLEAN DEFAULT FALSE",
             "client_session_id": "VARCHAR",
+            # Optional delegation link supplied by an orchestrator at launch
+            # (#473). Distinct from source_session_id, which is a handoff and
+            # adopts an existing live session rather than starting a sibling.
+            "parent_session_id": "VARCHAR",
         },
     )
     # A caller-supplied idempotency key, so a create whose response was lost

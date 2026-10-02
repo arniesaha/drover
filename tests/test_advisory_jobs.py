@@ -19,6 +19,7 @@ import drover.server.advisory.service as advisory_service_module
 from drover.config import AdvisoryContentConfig, default_config, load_config
 from drover.schema import bootstrap
 from drover.server.__main__ import _create_content_analysis_worker
+from drover.server.advisory import span_facts
 from drover.server.advisory.analyzers import (
     AnalysisSnapshot,
     ProviderConnectionObservation,
@@ -66,6 +67,16 @@ from drover.server.providers.service import ProviderUsageService
 from drover.server.providers.types import ProviderAccountSnapshot
 
 NOW = datetime(2026, 8, 8, 18, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _span_integration_on():
+    """These fixtures pin how span facts combine with Drover's own facts, so
+    the module runs with the optional span integration on (#473). Tests of
+    the default turn it back off themselves."""
+    span_facts.configure(True)
+    yield
+    span_facts.configure(False)
 
 
 # Most fixtures here sit at NOW and hand it back as `analyzed_at`, which keeps
@@ -2583,6 +2594,42 @@ def test_runtime_telemetry_prefers_exact_session_usage_over_span_token_fallback(
     assert telemetry.token_observed_sessions == 2
     assert telemetry.prompt_tokens == 130
     assert telemetry.cache_read_tokens == 9
+
+    # Spans off (#473): the same store answers from session_usage alone.
+    span_facts.configure(False)
+    without_spans = load_operational_snapshot(
+        db_path,
+        "deterministic.telemetry_coverage",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+    routing = load_operational_snapshot(
+        db_path,
+        "deterministic.routing_mismatch",
+        "fleet",
+        "facts:v1",
+        analyzed_at=NOW,
+    )
+    telemetry = without_spans.telemetry[0]
+    assert telemetry.total_sessions == 2
+    assert telemetry.sessions_with_spans == 0
+    assert telemetry.token_observed_sessions == 1
+    assert telemetry.prompt_tokens == 100
+    assert telemetry.cache_read_tokens == 7
+    assert routing.routing == ()
+
+
+def test_operational_analyzers_drop_only_the_span_feed_rule_when_spans_are_off():
+    from drover.server.advisory.analyzers.telemetry import TelemetryCoverageAnalyzer
+
+    span_facts.configure(False)
+    coverage = next(
+        analyzer
+        for analyzer in operational_analyzers()
+        if isinstance(analyzer, TelemetryCoverageAnalyzer)
+    )
+    assert coverage.spans_enabled is False
 
 
 def test_runtime_cache_efficiency_uses_only_complete_quality_pairs(

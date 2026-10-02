@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -17,14 +18,18 @@ from drover.server.embeddings.client import (
     EmbeddingBackendConfig,
     OllamaEmbedder,
 )
+from drover.server.embeddings.worker import EmbedWorker as _EmbedWorker
 from drover.server.embeddings.worker import (
-    EmbedWorker,
     build_span_embedding_text,
     enqueue_embed,
     enqueue_missing_span_embeds,
     enqueue_span_embed,
 )
 from drover.server.jobs import JobStream
+
+# This module covers span jobs alongside session jobs, so workers here opt
+# into the optional span integration (#473); the default is tested below.
+EmbedWorker = functools.partial(_EmbedWorker, spans_enabled=True)
 from drover.server.summarizer.backends.types import BackendError
 from drover.server.wol import GpuRig
 
@@ -385,6 +390,26 @@ def test_worker_persists_span_embeddings(tmp_path: Path) -> None:
     assert "prompt:" in rows[0][2]
     assert rows[0][3:] == ("arniesaha", "nexus", "feat-span-embeddings")
     assert jobs == [("span-1", "done")]
+
+
+def test_default_worker_leaves_span_jobs_untouched(tmp_path: Path) -> None:
+    """Spans off (#473): historical span jobs are neither claimed nor failed."""
+    duckdb_path = _seed(tmp_path)
+    enqueue_span_embed(duckdb_path, "span-1")
+    embedder = _StubEmbedder()
+
+    processed = _EmbedWorker(duckdb_path=duckdb_path, embedder=embedder).drain_batch()
+
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        jobs = con.execute(
+            "SELECT span_id, status, attempts FROM span_embed_jobs"
+        ).fetchall()
+    finally:
+        con.close()
+    assert processed == 0
+    assert embedder.calls == 0
+    assert jobs == [("span-1", "pending", 0)]
 
 
 def test_enqueue_embed_already_done(tmp_path: Path) -> None:

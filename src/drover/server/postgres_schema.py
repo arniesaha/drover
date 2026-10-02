@@ -238,6 +238,15 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS apns_failed_fingerprint TEXT",
         ),
     ),
+    (
+        5,
+        (
+            # Optional delegation link recorded at launch, so the session
+            # graph never has to infer parentage from traces (#473).
+            "ALTER TABLE harness_sessions ADD COLUMN IF NOT EXISTS parent_session_id TEXT",
+            "CREATE INDEX IF NOT EXISTS harness_sessions_parent ON harness_sessions (parent_session_id) WHERE parent_session_id IS NOT NULL",
+        ),
+    ),
 )
 
 

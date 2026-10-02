@@ -63,7 +63,7 @@ _SPAN_SCHEMA = pa.schema(
 )
 
 
-def _make_config(tmp_path: Path) -> Path:
+def _make_config(tmp_path: Path, *, spans: bool = False) -> Path:
     cfg = tmp_path / "config.toml"
     cfg.write_text(textwrap.dedent(f"""\
         [paths]
@@ -79,6 +79,9 @@ def _make_config(tmp_path: Path) -> Path:
         [agent]
         agent_id     = "test"
         principal_id = "test"
+
+        [telemetry]
+        spans_enabled = {"true" if spans else "false"}
     """))
     return cfg
 
@@ -432,13 +435,20 @@ def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
     monkeypatch.setattr(server_main, "bootstrap", lambda **_kwargs: None)
     monkeypatch.setattr(server_main.signal, "signal", lambda *_args: None)
 
+    class RecordingOTLPReceiver:
+        def __init__(self, **_kwargs) -> None:
+            events.append(("otlp", "constructed"))
+
+    monkeypatch.setattr(server_main, "OTLPReceiver", RecordingOTLPReceiver)
+
+    # No --no-otlp: the default config alone must keep the optional span
+    # receiver from starting (#473).
     result = CliRunner().invoke(
         main,
         [
             "--config",
             str(_make_config(tmp_path)),
             "run",
-            "--no-otlp",
             "--no-mcp",
             "--no-metrics",
             "--no-embeddings",
@@ -447,6 +457,7 @@ def test_run_starts_and_stops_live_recap_worker_with_summarizer_backend(
     )
 
     assert result.exit_code == 0, result.output
+    assert ("otlp", "constructed") not in events
     assert ("live_recap", "constructed") in events
     assert ("live_recap", "start") in events
     assert ("live_recap", "stop") in events
@@ -621,6 +632,39 @@ def test_cli_status_shows_config_and_counts(tmp_path):
     assert "incoming_dir" in res.output
     assert "tasks" in res.output
     assert "session_summaries" in res.output
+    assert "spans_enabled  : false" in res.output
+    assert "otlp_grpc_port : disabled" in res.output
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["trace-tail"],
+        ["recent-traces"],
+        ["embeddings", "enqueue-spans"],
+        ["embeddings", "reset-stale-spans"],
+        ["embeddings", "prune-orphan-spans"],
+        ["decisions", "derive"],
+    ],
+)
+def test_cli_span_commands_name_the_flag_when_spans_are_off(tmp_path, command):
+    cfg = _make_config(tmp_path)
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
+
+    res = CliRunner().invoke(main, ["--config", str(cfg), *command])
+
+    assert res.exit_code != 0
+    assert "spans_enabled = true" in res.output
+
+
+def test_cli_doctor_reports_spans_disabled(tmp_path):
+    cfg = _make_config(tmp_path)
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
+
+    res = CliRunner().invoke(main, ["--config", str(cfg), "doctor"])
+
+    assert res.exit_code == 0, res.output
+    assert "spans            :   disabled" in res.output
 
 
 def test_cli_status_uses_read_only_connection_when_db_exists(tmp_path):
@@ -1936,7 +1980,7 @@ def test_cli_export_bundle_session_outputs_markdown(tmp_path):
 
 def test_cli_embeddings_enqueue_spans_dry_run_and_apply(tmp_path):
     runner = CliRunner()
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, spans=True)
     parquet_dir = tmp_path / "parquet"
     now = datetime.now(timezone.utc)
     _write_spans(
@@ -1993,7 +2037,7 @@ def test_cli_embeddings_enqueue_spans_dry_run_and_apply(tmp_path):
 
 def test_cli_embeddings_reset_stale_spans_dry_run_and_apply(tmp_path):
     runner = CliRunner()
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, spans=True)
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
     con = duckdb.connect(str(db))
@@ -2075,7 +2119,7 @@ def test_cli_embeddings_reset_stale_sessions_dry_run_and_apply(tmp_path):
 
 def test_cli_embeddings_prune_orphan_spans_dry_run_and_apply(tmp_path):
     runner = CliRunner()
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, spans=True)
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
     con = duckdb.connect(str(db))
@@ -2118,7 +2162,7 @@ def test_cli_embeddings_prune_orphan_spans_dry_run_and_apply(tmp_path):
 
 def test_cli_embeddings_drain_once_dry_run_reports_pending_counts(tmp_path):
     runner = CliRunner()
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, spans=True)
     db = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=db)
     con = duckdb.connect(str(db))
@@ -2242,7 +2286,7 @@ def test_cli_compact_runs_on_empty_lakehouse(tmp_path):
 
 def test_cli_trace_tail_shows_recent_spans_with_filters(tmp_path):
     runner = CliRunner()
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, spans=True)
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -2307,7 +2351,7 @@ def test_cli_trace_tail_shows_recent_spans_with_filters(tmp_path):
 
 def test_cli_recent_traces_alias_supports_json_output(tmp_path):
     runner = CliRunner()
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, spans=True)
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -2346,7 +2390,7 @@ def test_cli_recent_traces_alias_supports_json_output(tmp_path):
 
 def test_cli_trace_tail_agent_filter_accepts_raw_alias(tmp_path):
     runner = CliRunner()
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, spans=True)
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -2385,7 +2429,7 @@ def test_cli_trace_tail_agent_filter_accepts_raw_alias(tmp_path):
 
 def test_cli_trace_tail_skips_missing_recent_partitions(tmp_path):
     runner = CliRunner()
-    cfg = _make_config(tmp_path)
+    cfg = _make_config(tmp_path, spans=True)
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)

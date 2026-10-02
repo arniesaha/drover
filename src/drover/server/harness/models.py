@@ -140,6 +140,8 @@ class HarnessSession:
     thinking_effort: str | None = None
     awaiting: str | None = None
     last_activity: datetime | None = None
+    # Optional delegation link an orchestrator records at launch (#473).
+    parent_session_id: str | None = None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "HarnessSession":
@@ -168,6 +170,7 @@ class HarnessSession:
             thinking_effort=row.get("thinking_effort"),
             awaiting=row.get("awaiting"),
             last_activity=row.get("last_activity"),
+            parent_session_id=row.get("parent_session_id"),
         )
 
 

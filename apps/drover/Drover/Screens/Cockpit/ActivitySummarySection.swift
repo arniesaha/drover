@@ -49,12 +49,16 @@ struct ActivitySummarySection: View {
                         // the token coverage printed below. The wording, and
                         // the zero-versus-unmeasured rule behind it, live in
                         // DroverKit so the analytics screen cannot drift from
-                        // this card again. See #150.
-                        ActivityMetric(
-                            value: totals.costText,
-                            label: ActivityTotalsPresentation.costLabel,
-                            accessibilityText: totals.costAccessibilityText
-                        )
+                        // this card again. See #150. Hidden when no session
+                        // reported a cost, the default since spans became
+                        // optional (#473).
+                        if totals.showsCost {
+                            ActivityMetric(
+                                value: totals.costText,
+                                label: ActivityTotalsPresentation.costLabel,
+                                accessibilityText: totals.costAccessibilityText
+                            )
+                        }
                     }
                     Text(totals.coverageText)
                         .droverText(.subtitle)

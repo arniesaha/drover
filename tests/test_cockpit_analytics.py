@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import sys
 import threading
@@ -26,10 +27,15 @@ from drover.server.cockpit.analytics import (
     AnalyticsCursorCodec,
     AnalyticsFilters,
     AnalyticsSnapshotChangedError,
-    activity_analytics,
 )
+from drover.server.cockpit.analytics import activity_analytics as _activity_analytics
 from drover.server.cockpit.service import CockpitService
 from drover.server.db import attached_control_plane_snapshot
+
+# Most of this module pins how span facts combine with Drover's own facts, so
+# it opts into the optional span integration (#473). Tests of the default,
+# spans-off behaviour call ``_activity_analytics`` directly.
+activity_analytics = functools.partial(_activity_analytics, spans_enabled=True)
 
 
 def _analytics_connection(
@@ -1571,7 +1577,7 @@ def test_a_slow_activity_section_cannot_blank_the_whole_overview(monkeypatch):
         def close(self):
             pass
 
-    def _never_finishes(con, filters, *, cursor_codec=None):
+    def _never_finishes(con, filters, *, cursor_codec=None, spans_enabled=False):
         # Stops when the connection is interrupted, as DuckDB's own query does.
         interrupted.wait(10)
         raise RuntimeError("interrupted")
@@ -1667,7 +1673,7 @@ def test_an_abandoned_activity_query_blocks_the_next_attempt(monkeypatch):
         opened.append(1)
         return _Connection()
 
-    def _hangs(con, filters, *, cursor_codec=None):
+    def _hangs(con, filters, *, cursor_codec=None, spans_enabled=False):
         release.wait(10)
         return None
 
@@ -1719,7 +1725,7 @@ def test_activity_result_is_cached_so_many_clients_cost_one_query(
     calls = {"n": 0}
     real = service_module.activity_analytics
 
-    def _counting(con, filters, *, cursor_codec=None):
+    def _counting(con, filters, *, cursor_codec=None, spans_enabled=False):
         calls["n"] += 1
         return real(con, filters, cursor_codec=cursor_codec)
 
@@ -1755,7 +1761,7 @@ def test_a_query_that_blew_its_budget_is_not_retried_immediately(monkeypatch):
     interrupted = threading.Event()
     calls = {"n": 0}
 
-    def _never_finishes(con, filters, *, cursor_codec=None):
+    def _never_finishes(con, filters, *, cursor_codec=None, spans_enabled=False):
         calls["n"] += 1
         interrupted.wait(10)
         raise RuntimeError("interrupted")
@@ -1805,7 +1811,7 @@ def test_a_busy_slot_serves_the_last_good_activity_instead_of_nothing(
     calls = {"n": 0}
     real = service_module.activity_analytics
 
-    def _activity(con, filters, *, cursor_codec=None):
+    def _activity(con, filters, *, cursor_codec=None, spans_enabled=False):
         calls["n"] += 1
         if calls["n"] == 1:
             return real(con, filters, cursor_codec=cursor_codec)
@@ -2156,3 +2162,40 @@ def test_snapshot_fingerprint_changes_when_a_usage_row_lands_with_same_totals():
         con.close()
 
     assert first.snapshot_version != second.snapshot_version
+
+
+def test_default_analytics_never_read_span_facts(low_coverage_analytics_db):
+    """Spans off (#473): sessions and usage tokens only; no cost or latency."""
+    _insert_usage(low_coverage_analytics_db, session_id="beta-1", inp=40, out=10)
+
+    result = _activity_analytics(low_coverage_analytics_db, AnalyticsFilters(days=7))
+
+    assert result.totals.session_count == 3
+    # alpha-1's 100 tokens and $0.40 exist only on its span.
+    assert result.totals.total_tokens == 50
+    assert result.totals.cost_usd == 0
+    assert result.totals.total_latency_ms == 0
+    assert result.coverage.cost_percent == 0
+    assert result.coverage.latency_percent == 0
+    assert result.coverage.sources.tokens.spans_percent == 0
+
+
+def test_cockpit_service_forwards_the_span_setting_to_the_query(monkeypatch):
+    from drover.server.cockpit import service as service_module
+
+    seen: list[bool] = []
+
+    def _record(con, filters, *, cursor_codec=None, spans_enabled=False):
+        seen.append(spans_enabled)
+        raise RuntimeError("stop after recording")
+
+    monkeypatch.setattr(service_module, "activity_analytics", _record)
+    for enabled in (False, True):
+        CockpitService(
+            duckdb_path=None,
+            provider_usage=None,
+            connect=_analytics_connection,
+            spans_enabled=enabled,
+        ).analytics(AnalyticsFilters(days=7))
+
+    assert seen == [False, True]

@@ -211,12 +211,15 @@ struct AnalyticsView: View {
                         // This screen prints the figures in full, so it is the
                         // one place a 5%-coverage cost most looks like a total.
                         // Same wording and same unmeasured rule as the cockpit
-                        // card, from the same presentation. See #150.
-                        analyticsMetric(
-                            totals.costText,
-                            ActivityTotalsPresentation.costLabel,
-                            accessibilityText: totals.costAccessibilityText
-                        )
+                        // card, from the same presentation. See #150. Hidden
+                        // when nothing reported a cost (#473).
+                        if totals.showsCost {
+                            analyticsMetric(
+                                totals.costText,
+                                ActivityTotalsPresentation.costLabel,
+                                accessibilityText: totals.costAccessibilityText
+                            )
+                        }
                     }
                 }
 
