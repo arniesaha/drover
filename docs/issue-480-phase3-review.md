@@ -13,10 +13,14 @@ runtime changes. Phase 4 / DuckLake remains out of scope.
 - Original worktree remains clean at **ece1463** (verified with optional index
   writes disabled). No duplicate writer or agent was launched.
 - Read [issue #480](https://github.com/arniesaha/drover/issues/480) and the
-  program acceptance criteria in #476. **The approved plan was not available**:
-  `roadmap/plans/2026-10-01-memory-integrity-ducklake.md` was absent from the
-  remote roadmap main and local checkouts searched. Its location was requested;
-  plan-conformance review remains outstanding.
+  program acceptance criteria in #476. The originally referenced plan was not
+  available in the repository history or searched checkouts. A clearly labelled
+  reconstructed approved-decision baseline is supplied with the companion M2
+  recovery PR at `roadmap/plans/2026-10-01-memory-integrity-ducklake.md`; it is
+  not represented as the lost original. This Phase 3 scope is compatible with
+  that baseline: it preserves raw/control data, makes derived-memory work
+  PostgreSQL-backed and versioned, leaves DuckLake process-isolated, and does
+  not authorize Phase 4 regeneration or cutover.
 - Main's canonical identity/substantive transcript work (#485), host retirement
   (#486), Pond removal (#484), and optional span/session graph changes (#483)
   are retained. PostgreSQL migrations 5/6 remain intact; memory uses 7 and
@@ -53,8 +57,9 @@ runtime changes. Phase 4 / DuckLake remains out of scope.
 6. Vectors validate model, dimension, numeric/finite values, and nonzero length
    in cosine space. Malformed rows quarantine individually while siblings finish.
    Semantic reads and embed-only backfill ignore embeddings whose source version
-   differs from the current summary. PostgreSQL token/transaction behavior is
-   covered; actual vector persistence/search requires pgvector and was skipped.
+   differs from the current summary. PostgreSQL token/transaction behavior and
+   actual pgvector persistence/search are covered with a disposable pgvector
+   PostgreSQL instance.
 7. `/readyz` reports memory availability, vector availability, embedding backend
    configuration, and per-kind job freshness/backlog. Missing pgvector fails
    memory readiness explicitly; keyword recall remains available. Quality/audit
@@ -64,15 +69,16 @@ runtime changes. Phase 4 / DuckLake remains out of scope.
 
 ## Validation
 
-Environment: Mac Studio, CPython 3.14.7, Homebrew PostgreSQL **17.11**, no pgvector.
-All pytest runs were foreground, without xdist or background shell jobs.
+Environment: Mac Studio, CPython 3.14.7, Homebrew PostgreSQL **17.11** with
+pgvector installed. All pytest runs were foreground, without xdist or background
+shell jobs. The disposable PostgreSQL/pgvector result below is recorded recovery
+handoff evidence; it did not touch production state.
 
 | Run | Exact result | Follow-up |
 | --- | --- | --- |
-| Full backend: `uv run pytest -q` | **3599 passed, 14 skipped, 2 failed, 9 warnings; 574.96 s** | Failures were a stale DuckDB summary test update and a missing fixture argument; both corrected and passed in focused runs. |
-| Broader recovery focus: changed test files plus host retirement, MCP server, activity HTTP, documented CLI and runtime roles | **976 passed, 13 skipped, 1 failed, 5 warnings; 191.37 s** | Exposed a SessionEnd intent regression introduced during review; corrected and verified by final run. Nine skips were pgvector coverage; four were DSN-gated benchmark/runtime-role integration. |
-| Final focused run below | **224 passed, 5 skipped, 0 failed, 5 warnings; 37.12 s** | All five skips are pgvector integration. |
-| Formatting and diff checks | **Passed** | isort check, Black check over all 78 changed Python files; `git diff --check`. |
+| Full backend with disposable real pgvector | **3606 passed, 15 skipped** | Confirms the Phase 3 suite against real vector storage/search. |
+| Targeted pgvector/inverse coverage | **49 passed, 3 expected inverse skips** | The inverse skips assert behavior only relevant when pgvector is unavailable. |
+| Formatting and diff checks | **Passed** | isort check, Black check over all changed Python files; `git diff --check`. |
 
 Final focused command:
 
@@ -85,21 +91,16 @@ uv run pytest -q -rs \
   tests/test_server_cli.py
 ```
 
-The full suite was not rerun after the final corrections. Earlier passing
-coverage is not presented as a fresh all-green full run. Warnings were MCP transport deprecations and Python 3.14
-multithreaded-fork deprecation in the cursor concurrency test.
-
-Passing embedding worker tests use actual PostgreSQL job transactions and an
-in-memory vector persistence double. They do **not** prove pgvector storage or
-cosine SQL. Final skips cover real worker persistence, exact cosine search,
-stale-generation search, and two semantic MCP recall contracts. Plain local/CI
-PostgreSQL cannot provide that coverage without pgvector.
+The final full run was performed with a disposable real pgvector PostgreSQL
+instance after pgvector was installed on the Studio. It validates real vector
+persistence and cosine search without modifying any production store. The
+remaining skips are expected environment/capability skips, not failed tests.
 
 ## Readiness and remaining risks
 
-**Not ready for PR sign-off yet:** approved-plan conformance remains unverified.
-Actual pgvector integration must also be exercised on an appropriately equipped
-disposable database before merge. No production regeneration, fleet acceptance
-run, provider call, five-minute memory SLO, or production MCP latency measurement
-was performed. A future authorized upgrade needs explicit regeneration; this
-review neither cut over the runtime nor deleted legacy data.
+No production regeneration, fleet acceptance run, provider call, five-minute
+memory SLO, or production MCP latency measurement was performed. A future
+authorized upgrade needs explicit regeneration and the baseline acceptance gates
+(25-session audit, under-five-minute audit, search freshness, 24-hour soak, and
+restore verification). This review neither cut over the runtime nor deleted
+legacy data.
