@@ -241,6 +241,9 @@ struct HarnessControlsTests {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct CapabilityDrivenLaunchTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
+
     private func store() -> HarnessModelCatalogStore {
         HarnessModelCatalogStore(defaults: UserDefaults(suiteName: "cap-launch-\(UUID().uuidString)")!)
     }
@@ -304,7 +307,7 @@ struct CapabilityDrivenLaunchTests {
         model.promptAttachments = [TurnAttachment(mediaType: "image/jpeg", data: Data([1]))]
 
         nonisolated(unsafe) var body: [String: Any] = [:]
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
             return (201, Data(#"{"session_id": "lab-1", "mode": "structured"}"#.utf8))
         }
@@ -321,7 +324,7 @@ struct CapabilityDrivenLaunchTests {
         let model = try launchModel()
         model.hostID = "old-mini"
         model.harness = "codex"
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             Issue.record("a legacy host must not be asked to launch")
             return (500, Data())
         }
@@ -346,7 +349,7 @@ struct CapabilityDrivenLaunchTests {
         model.harness = "agy"
         #expect(model.canLaunch)
 
-        MockURLProtocol.handler = { _ in (200, after) }
+        mock.handler = { _ in (200, after) }
         await model.refreshSnapshot()
 
         #expect(model.hostID == "mac")
@@ -371,7 +374,7 @@ struct CapabilityDrivenLaunchTests {
         #expect(model.supportsInteractiveAuth && model.showsRunPreferences && model.canAttachImages)
         #expect(model.runPreferences.isCatalogAvailable)
 
-        MockURLProtocol.handler = { _ in (200, after) }
+        mock.handler = { _ in (200, after) }
         await model.refreshSnapshot()
 
         #expect(model.harness == "codex")
@@ -384,13 +387,16 @@ struct CapabilityDrivenLaunchTests {
 
 @Suite(.serialized)
 struct CapabilityDrivenChatTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
+
     private func fixtureData() throws -> Data {
         try Data(contentsOf: try #require(droverKitFixtureURL("harness-capabilities-mixed")))
     }
 
     @MainActor private func loadedChat(_ sessionID: String, harness: String) async throws -> ChatModel {
         let snapshot = try fixtureData()
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             request.url?.path == "/harness" ? (200, snapshot) : (404, Data(#"{"error": "none"}"#.utf8))
         }
         let model = ChatModel(
@@ -420,7 +426,7 @@ struct CapabilityDrivenChatTests {
 
     @Test @MainActor func interruptIsRefusedLocallyWhenNotAdvertised() async throws {
         let lab = try await loadedChat("s-lab", harness: "fixture-lab")
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             Issue.record("an unadvertised interrupt must not reach the hub")
             return (500, Data())
         }
@@ -445,14 +451,14 @@ struct CapabilityDrivenChatTests {
     }
 
     @Test @MainActor func withdrawnAttachmentsPreserveDraftAndNeverPost() async throws {
-        let model = ChatModel.fixture()
+        let model = ChatModel.fixture(client: client())
         model.composerText = "preserve this"
         let jpeg = TurnAttachment(mediaType: "image/jpeg", data: Data([1]))
         model.pendingAttachments = [jpeg]
         model.controls = HarnessControls(offer: HarnessOffer(
             name: "fixture", capabilities: HarnessCapabilities(launchModes: [.structured])
         ))
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             Issue.record("withdrawn attachments must not reach the hub")
             return (500, Data())
         }
@@ -464,9 +470,9 @@ struct CapabilityDrivenChatTests {
 
     @Test @MainActor func unresolvedAndLegacyTurnsAndHandoffsNeverPost() async throws {
         let legacy = try await loadedChat("s-legacy", harness: "codex")
-        let unresolved = ChatModel.fixture()
+        let unresolved = ChatModel.fixture(client: client())
         unresolved.controls = .unresolved
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             Issue.record("unadvertised turns and handoffs must not reach the hub")
             return (500, Data())
         }
@@ -482,14 +488,14 @@ struct CapabilityDrivenChatTests {
 
     @Test @MainActor func sessionListHandoffRejectsMissingAndWithdrawnTargets() async throws {
         let store = SessionStore(client: client())
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             Issue.record("an unresolved handoff must not reach the hub")
             return (500, Data())
         }
         #expect(await store.continueSession("s-claude") == nil)
-        MockURLProtocol.handler = { _ in (200, try! fixtureData()) }
+        mock.handler = { _ in (200, try! fixtureData()) }
         await store.refresh()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             Issue.record("an unadvertised handoff target must not reach the hub")
             return (500, Data())
         }
@@ -504,7 +510,7 @@ struct CapabilityDrivenChatTests {
             seq: 5, type: .approvalPrompt, payload: ["request_id": .string("r1")]
         )))
         #expect(codex.pendingApproval != nil)
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             Issue.record("an unadvertised approval must not be answered")
             return (500, Data())
         }

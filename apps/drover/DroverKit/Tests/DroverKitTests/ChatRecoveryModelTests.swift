@@ -5,12 +5,61 @@ import Testing
 extension MockNetworkTests {
 @Suite(.serialized)
 struct ChatRecoveryModelTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
+
+    @MainActor
+    private func recoveryModel(
+        binding: UUID,
+        recoveryStore: any ChatRecoveryPersisting
+    ) -> ChatModel {
+        let recoveryWriteGate = ChatRecoveryWriteGate()
+        let client = DroverClient(
+            config: ServerConfig(urlString: "http://recovery.test:7080")!,
+            token: "synthetic-token",
+            credentialBindingID: binding,
+            session: mock.session()
+        )
+        let model = ChatModel(
+            client: client,
+            sessionID: "recovery-session",
+            recoveryStore: recoveryStore,
+            recoveryWriteGate: recoveryWriteGate,
+            recoveryGeneration: recoveryWriteGate.generation
+        )
+        model.controls = .everythingAdvertised
+        return model
+    }
+
+    @MainActor
+    private func lifecycleRecoveryModel(
+        binding: UUID,
+        recoveryStore: any ChatRecoveryPersisting,
+        recoveryWriteGate: ChatRecoveryWriteGate
+    ) -> ChatModel {
+        let client = DroverClient(
+            config: ServerConfig(urlString: "http://recovery.test:7080")!,
+            token: "synthetic-token",
+            credentialBindingID: binding,
+            session: mock.session()
+        )
+        let model = ChatModel(
+            client: client,
+            sessionID: "recovery-session",
+            recoveryStore: recoveryStore,
+            recoveryWriteGate: recoveryWriteGate,
+            recoveryGeneration: recoveryWriteGate.generation
+        )
+        model.controls = .everythingAdvertised
+        return model
+    }
+
     @Test @MainActor func sendingCheckpointsOriginalIDBeforeThePost() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
-        MockURLProtocol.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
-        defer { MockURLProtocol.handler = nil }
+        mock.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "preserve me"
 
@@ -18,29 +67,29 @@ struct ChatRecoveryModelTests {
 
         let snapshot = try #require(await recovery.lastSavedSnapshot)
         let savedID = try #require(snapshot.pendingTurn?.clientTurnID.uuidString)
-        #expect(MockURLProtocol.sentClientTurnIDs == [savedID])
+        #expect(mock.sentClientTurnIDs == [savedID])
     }
 
     @Test @MainActor func storageFailureLeavesTheComposerUntouchedAndPreventsThePost() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
         await recovery.failNextSave()
-        MockURLProtocol.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
-        defer { MockURLProtocol.handler = nil }
+        mock.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "do not lose this"
 
         await model.sendTurn()
 
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
         #expect(model.composerText == "do not lose this")
         #expect(model.pendingTurn == nil)
         #expect(model.canSendTurn == false)
     }
 
     @Test @MainActor func inFlightSaveFailureParksAnOlderTurnAndRetriesTheCurrentSnapshotWithoutAPost() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailingBlockingRecoveryStore()
         let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0x91, 0x92]))
@@ -59,7 +108,7 @@ struct ChatRecoveryModelTests {
         await recovery.failSave()
         await sending.value
 
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
         #expect(model.composerText == "newer B")
         #expect(model.pendingAttachments == [newerImage])
         #expect(model.pendingTurn?.clientTurnID == originalID)
@@ -79,11 +128,11 @@ struct ChatRecoveryModelTests {
         #expect(saved.pendingTurn?.attachments.map(\.data) == [olderImage.data])
         #expect(model.recoveryStatusMessage == nil)
         #expect(model.canRetryRecoverySave == false)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func failedSaveCanDurablyCommitAnIntentionalClearWithoutPosting() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailingBlockingRecoveryStore()
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
@@ -102,11 +151,11 @@ struct ChatRecoveryModelTests {
 
         #expect(await recovery.removeCount == 1)
         #expect(model.recoveryStatusMessage == nil)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func retrySavingSchedulesAnEditMadeWhileTheRetryIsInFlight() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailThenBlockRetryRecoveryStore()
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
@@ -127,11 +176,11 @@ struct ChatRecoveryModelTests {
             try await recovery.load(for: recoveryKey(binding: binding))?.draftText == "newer draft"
         }
         #expect(model.recoveryStatusMessage == nil)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func retrySavingPreservesAnEditMadeWhileTheRetryIsInFlightAtImmediateDeparture() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailThenBlockRetryRecoveryStore()
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
@@ -151,11 +200,11 @@ struct ChatRecoveryModelTests {
         await recreated.restoreRecovery()
 
         #expect(recreated.composerText == "newer draft")
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func departingBeforeASuspendedRetryReturnsStillRecoversTheNewestEdit() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = SavedThenFailThenBlockRetryRecoveryStore()
         var model: ChatModel? = recoveryModel(binding: binding, recoveryStore: recovery)
@@ -181,11 +230,11 @@ struct ChatRecoveryModelTests {
         await recreated.restoreRecovery()
 
         #expect(recreated.composerText == "newer B")
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func departingBeforeASuspendedRetryReturnsDurablyCommitsAnIntentionalClear() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = SavedThenFailThenBlockRetryRecoveryStore()
         var model: ChatModel? = recoveryModel(binding: binding, recoveryStore: recovery)
@@ -211,11 +260,11 @@ struct ChatRecoveryModelTests {
         let recreated = recoveryModel(binding: binding, recoveryStore: recovery)
         await recreated.restoreRecovery()
         #expect(recreated.composerText.isEmpty)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func failedCopyPreservesANewerDraftAndBlocksSendUntilRetryMakesBothDurable() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 2)
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -232,8 +281,8 @@ struct ChatRecoveryModelTests {
             ),
             for: recoveryKey(binding: binding)
         )
-        MockURLProtocol.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
-        defer { MockURLProtocol.handler = nil }
+        mock.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         await model.restoreRecovery()
 
@@ -255,7 +304,7 @@ struct ChatRecoveryModelTests {
         #expect(model.pendingTurn?.attachments == [olderImage])
         #expect(model.composerText == "newer B")
         #expect(model.pendingAttachments == [newerImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
 
         await model.retryRecoverySave()
         await model.prepareForDeparture()
@@ -266,11 +315,11 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingTurn?.attachments == [olderImage])
         #expect(recreated.composerText == "newer B")
         #expect(recreated.pendingAttachments == [newerImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func failedDiscardPreservesANewerDraftAndBlocksSendUntilRetryMakesBothDurable() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 2)
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -287,8 +336,8 @@ struct ChatRecoveryModelTests {
             ),
             for: recoveryKey(binding: binding)
         )
-        MockURLProtocol.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
-        defer { MockURLProtocol.handler = nil }
+        mock.handler = { _ in (202, Data(#"{"turn_id": "accepted"}"#.utf8)) }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         await model.restoreRecovery()
 
@@ -306,7 +355,7 @@ struct ChatRecoveryModelTests {
         #expect(model.pendingTurn?.attachments == [olderImage])
         #expect(model.composerText == "newer B")
         #expect(model.pendingAttachments == [newerImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
 
         await model.retryRecoverySave()
         await model.prepareForDeparture()
@@ -317,11 +366,11 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingTurn?.attachments == [olderImage])
         #expect(recreated.composerText == "newer B")
         #expect(recreated.pendingAttachments == [newerImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func copyRefusesNewAttachmentAdmissionWhileItsFirstSaveIsBlocked() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 2)
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -349,13 +398,13 @@ struct ChatRecoveryModelTests {
 
         #expect(admitted == false)
         #expect(model.pendingAttachments == [olderImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
         await recovery.failSave()
         await copying.value
     }
 
     @Test @MainActor func discardRefusesNewAttachmentAdmissionWhileItsFirstSaveIsBlocked() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 2)
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -378,13 +427,13 @@ struct ChatRecoveryModelTests {
 
         #expect(admitted == false)
         #expect(model.pendingAttachments.isEmpty)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
         await recovery.failSave()
         await discarding.value
     }
 
     @Test @MainActor func exactAcknowledgmentDuringCopyNeverResurrectsItsManualDeliveryAfterPhaseTwoFailure() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = PhaseOneThenFailPhaseTwoRecoveryStore()
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -426,11 +475,11 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingTurn == nil)
         #expect(recreated.composerText == "newer B")
         #expect(recreated.pendingAttachments == [newerImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func exactAcknowledgmentDuringDiscardNeverResurrectsItsManualDeliveryAfterPhaseTwoFailure() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = PhaseOneThenFailPhaseTwoRecoveryStore()
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -472,11 +521,11 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingTurn == nil)
         #expect(recreated.composerText == "newer B")
         #expect(recreated.pendingAttachments == [newerImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func exactAcknowledgmentDuringCopyPhaseTwoNeverResurrectsItsManualDelivery() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = PhaseTwoFailingRecoveryStore()
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -517,11 +566,11 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingTurn == nil)
         #expect(recreated.composerText == "newer B")
         #expect(recreated.pendingAttachments == [newerImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func exactAcknowledgmentDuringDiscardPhaseTwoNeverResurrectsItsManualDelivery() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = PhaseTwoFailingRecoveryStore()
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -562,11 +611,11 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingTurn == nil)
         #expect(recreated.composerText == "newer B")
         #expect(recreated.pendingAttachments == [newerImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func unrelatedAcknowledgmentDuringCopyPhaseTwoDoesNotConfirmItsManualDelivery() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = PhaseTwoFailingRecoveryStore()
         let originalID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
@@ -590,7 +639,7 @@ struct ChatRecoveryModelTests {
         await copying.value
 
         #expect(model.pendingTurn?.clientTurnID == originalID.uuidString)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func failedRecoveryReadCannotRetrySavingOrReplaceTheUnreadRecord() async throws {
@@ -661,7 +710,7 @@ struct ChatRecoveryModelTests {
     }
 
     @Test @MainActor func deferredConflictRestoresAsDraftWithoutPosting() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
         try await recovery.save(
@@ -677,17 +726,17 @@ struct ChatRecoveryModelTests {
 
         #expect(model.composerText == "review this first")
         #expect(model.pendingTurn == nil)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func liveConflictIsDurableThenRestoresAsAReviewableDraft() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (409, Data(#"{"error": "turn already in flight"}"#.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "queue this safely"
 
@@ -702,22 +751,22 @@ struct ChatRecoveryModelTests {
 
         #expect(recreated.composerText == "queue this safely")
         #expect(recreated.pendingTurn == nil)
-        #expect(MockURLProtocol.sentClientTurnIDs.count == 1)
+        #expect(mock.sentClientTurnIDs.count == 1)
     }
 
     @Test @MainActor func delayedConflictKeepsTheNewerEditableCompositionForManualReview() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
         let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xA1, 0xA2]))
         let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xB1, 0xB2]))
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (409, Data(#"{"error": "turn already in flight"}"#.utf8))
         }
-        MockURLProtocol.responseDelay = { _ in 0.1 }
+        mock.responseDelay = { _ in 0.1 }
         defer {
-            MockURLProtocol.handler = nil
-            MockURLProtocol.responseDelay = nil
+            mock.handler = nil
+            mock.responseDelay = nil
         }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "older A"
@@ -726,7 +775,7 @@ struct ChatRecoveryModelTests {
         let sending = Task { @MainActor in
             await model.sendTurn()
         }
-        try await waitForRecoveryRecord { MockURLProtocol.sentClientTurnIDs.count == 1 }
+        try await waitForRecoveryRecord { mock.sentClientTurnIDs.count == 1 }
         let originalID = try #require(model.pendingTurn?.clientTurnID)
         model.composerText = "newer B"
         model.pendingAttachments = [newerImage]
@@ -742,26 +791,26 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingTurn?.text == "older A")
         #expect(recreated.pendingTurn?.attachments == [olderImage])
         #expect(recreated.pendingTurn?.deliveryState == .needsManualReview)
-        #expect(MockURLProtocol.sentClientTurnIDs == [originalID])
+        #expect(mock.sentClientTurnIDs == [originalID])
     }
 
     @Test @MainActor func deferredConflictParksItsOriginalIDWhenANewerDraftAppears() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
         let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xC1, 0xC2]))
         let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xD1, 0xD2]))
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (409, Data(#"{"error": "turn already in flight"}"#.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "older A"
         model.pendingAttachments = [olderImage]
 
         await model.sendTurn()
 
-        let originalID = try #require(MockURLProtocol.sentClientTurnIDs.first)
+        let originalID = try #require(mock.sentClientTurnIDs.first)
         #expect(model.queuedTurn == "older A")
         model.composerText = "newer B"
         model.pendingAttachments = [newerImage]
@@ -776,26 +825,26 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingTurn?.text == "older A")
         #expect(recreated.pendingTurn?.attachments == [olderImage])
         #expect(recreated.pendingTurn?.deliveryState == .needsManualReview)
-        #expect(MockURLProtocol.sentClientTurnIDs == [originalID])
+        #expect(mock.sentClientTurnIDs == [originalID])
     }
 
     @Test @MainActor func deferredConflictDurablyAdmitsAnAttachmentOnlyNewerDraft() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
         let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xC3, 0xC4]))
         let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xD3, 0xD4]))
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (409, Data(#"{"error": "turn already in flight"}"#.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "older A"
         model.pendingAttachments = [olderImage]
 
         await model.sendTurn()
 
-        let originalID = try #require(MockURLProtocol.sentClientTurnIDs.first)
+        let originalID = try #require(mock.sentClientTurnIDs.first)
         let admitted = await model.addAttachmentIfRecoverable(newerImage)
         let durable = try #require(await recovery.load(for: recoveryKey(binding: binding)))
 
@@ -815,19 +864,19 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingAttachments == [newerImage])
         #expect(recreated.pendingTurn?.clientTurnID == originalID)
         #expect(recreated.pendingTurn?.attachments == [olderImage])
-        #expect(MockURLProtocol.sentClientTurnIDs == [originalID])
+        #expect(mock.sentClientTurnIDs == [originalID])
     }
 
     @Test @MainActor func queuedSendSaveFailureParksTheQueuedIDAndPreservesTheNewerDraft() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 3)
         let olderImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xE3, 0xE4]))
         let newerImage = TurnAttachment(mediaType: "image/jpeg", data: Data([0xF3, 0xF4]))
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (409, Data(#"{"error": "turn already in flight"}"#.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "older A"
         model.pendingAttachments = [olderImage]
@@ -862,17 +911,17 @@ struct ChatRecoveryModelTests {
         #expect(recreated.pendingAttachments == [newerImage])
         #expect(recreated.pendingTurn?.clientTurnID == queuedID)
         #expect(recreated.pendingTurn?.attachments == [olderImage])
-        #expect(MockURLProtocol.sentClientTurnIDs.count == 1)
+        #expect(mock.sentClientTurnIDs.count == 1)
     }
 
     @Test @MainActor func deferredOnlyQueuedSaveFailureRetainsItsIDUntilANewerDraftAppears() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = FailingBlockingRecoveryStore(failingSaveNumber: 3)
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (409, Data(#"{"error": "turn already in flight"}"#.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "older A"
 
@@ -892,18 +941,18 @@ struct ChatRecoveryModelTests {
         #expect(model.pendingTurn?.clientTurnID == queuedID)
         #expect(model.pendingTurn?.deliveryState == .needsManualReview)
         #expect(model.composerText == "newer B")
-        #expect(MockURLProtocol.sentClientTurnIDs.count == 1)
+        #expect(mock.sentClientTurnIDs.count == 1)
     }
 
     @Test @MainActor func imageOnlyDeferredConflictSurvivesRecreationWithoutAnotherPost() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
         let image = TurnAttachment(mediaType: "image/jpeg", data: Data([0xE1, 0xE2]))
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (409, Data(#"{"error": "turn already in flight"}"#.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.pendingAttachments = [image]
 
@@ -916,17 +965,17 @@ struct ChatRecoveryModelTests {
         #expect(recreated.composerText.isEmpty)
         #expect(recreated.pendingAttachments == [image])
         #expect(recreated.pendingTurn == nil)
-        #expect(MockURLProtocol.sentClientTurnIDs.count == 1)
+        #expect(mock.sentClientTurnIDs.count == 1)
     }
 
     @Test @MainActor func ambiguousFailureRestoresTheOriginalIDForManualReviewWithoutAPost() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = InMemoryChatRecoveryStore()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (503, Data(#"{"error": "temporary failure"}"#.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.handler = nil }
         let model = recoveryModel(binding: binding, recoveryStore: recovery)
         model.composerText = "preserve this UUID"
 
@@ -942,11 +991,11 @@ struct ChatRecoveryModelTests {
 
         #expect(recreated.pendingTurn?.clientTurnID == originalID)
         #expect(recreated.pendingTurn?.deliveryState == .needsManualReview)
-        #expect(MockURLProtocol.sentClientTurnIDs == [originalID])
+        #expect(mock.sentClientTurnIDs == [originalID])
     }
 
     @Test @MainActor func restoredPendingCopyPreservesAnExistingEditableDraft() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let turnID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
         let recovery = InMemoryChatRecoveryStore()
@@ -965,11 +1014,11 @@ struct ChatRecoveryModelTests {
 
         #expect(model.composerText == "keep this draft")
         #expect(model.pendingTurn?.clientTurnID == turnID.uuidString)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func restoredPendingCopiesToAnEmptyDraftWithoutPosting() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let turnID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
         let recovery = InMemoryChatRecoveryStore()
@@ -987,7 +1036,7 @@ struct ChatRecoveryModelTests {
 
         #expect(model.composerText == "saved delivery")
         #expect(model.pendingTurn == nil)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
         try await waitForRecoveryRecord {
             let snapshot = try await recovery.load(for: recoveryKey(binding: binding))
             return snapshot?.draftText == "saved delivery" && snapshot?.pendingTurn == nil
@@ -1015,20 +1064,20 @@ struct ChatRecoveryModelTests {
     }
 
     @Test @MainActor func missingRecoveryDependencyPreventsAnUnprotectedPost() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let client = DroverClient(
             config: ServerConfig(urlString: "http://recovery.test:7080")!,
             token: "synthetic-token",
             credentialBindingID: binding,
-            session: MockURLProtocol.session()
+            session: mock.session()
         )
         let model = ChatModel(client: client, sessionID: "recovery-session")
         model.composerText = "cannot send unprotected"
 
         await model.sendTurn()
 
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
         #expect(model.composerText == "cannot send unprotected")
         #expect(model.canSendTurn == false)
     }
@@ -1077,7 +1126,7 @@ struct ChatRecoveryModelTests {
     }
 
     @Test @MainActor func invalidatedGenerationAfterPendingSavePreventsThePost() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let recovery = BlockingRecoveryStore()
         let gate = ChatRecoveryWriteGate()
@@ -1096,11 +1145,11 @@ struct ChatRecoveryModelTests {
         await recovery.releaseSave()
         await sending.value
 
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
     }
 
     @Test @MainActor func restoredUnknownTurnNeverPostsAndRequiresReview() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let turnID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
         let recovery = InMemoryChatRecoveryStore()
@@ -1117,21 +1166,21 @@ struct ChatRecoveryModelTests {
 
         #expect(model.pendingTurn?.deliveryState == .needsManualReview)
         model.checkPendingDelivery()
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
         model.stop()
     }
 
     @Test @MainActor func checkDeliveryRestartsAnActiveCatchUpWithoutPosting() async throws {
-        MockURLProtocol.resetRecordedRequests()
+        mock.resetRecordedRequests()
         nonisolated(unsafe) var historyRequests = 0
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             if request.url?.path == "/harness/sessions/recovery-session/messages" {
                 historyRequests += 1
                 return (200, Data(#"{"messages": [], "max_seq": 0, "has_older": false, "has_newer": false}"#.utf8))
             }
             return (404, Data())
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.handler = nil }
         let binding = UUID(uuidString: "00000000-0000-4000-8000-000000000041")!
         let turnID = UUID(uuidString: "00000000-0000-4000-8000-000000000042")!
         let recovery = InMemoryChatRecoveryStore()
@@ -1151,7 +1200,7 @@ struct ChatRecoveryModelTests {
 
         try await waitForRecoveryRecord { historyRequests >= 2 }
         #expect(model.pendingTurn?.deliveryState == .needsManualReview)
-        #expect(MockURLProtocol.sentClientTurnIDs.isEmpty)
+        #expect(mock.sentClientTurnIDs.isEmpty)
         model.stop()
     }
 
@@ -1596,59 +1645,12 @@ private actor UnreadableRecoveryStore: ChatRecoveryPersisting {
     func eraseAllAfterCredentialDeletion() async throws {}
 }
 
-@MainActor
-private func recoveryModel(
-    binding: UUID,
-    recoveryStore: any ChatRecoveryPersisting
-) -> ChatModel {
-    let recoveryWriteGate = ChatRecoveryWriteGate()
-    let client = DroverClient(
-        config: ServerConfig(urlString: "http://recovery.test:7080")!,
-        token: "synthetic-token",
-        credentialBindingID: binding,
-        session: MockURLProtocol.session()
-    )
-    let model = ChatModel(
-        client: client,
-        sessionID: "recovery-session",
-        recoveryStore: recoveryStore,
-        recoveryWriteGate: recoveryWriteGate,
-        recoveryGeneration: recoveryWriteGate.generation
-    )
-    // Recovery is about durability; let the host accept attachments.
-    model.controls = .everythingAdvertised
-    return model
-}
-
 private func recoveryKey(binding: UUID) -> ChatRecoveryKey {
     ChatRecoveryKey(
         serverURL: ServerConfig(urlString: "http://recovery.test:7080")!.baseURL,
         credentialBindingID: binding,
         sessionID: "recovery-session"
     )
-}
-
-@MainActor
-private func lifecycleRecoveryModel(
-    binding: UUID,
-    recoveryStore: any ChatRecoveryPersisting,
-    recoveryWriteGate: ChatRecoveryWriteGate
-) -> ChatModel {
-    let client = DroverClient(
-        config: ServerConfig(urlString: "http://recovery.test:7080")!,
-        token: "synthetic-token",
-        credentialBindingID: binding,
-        session: MockURLProtocol.session()
-    )
-    let model = ChatModel(
-        client: client,
-        sessionID: "recovery-session",
-        recoveryStore: recoveryStore,
-        recoveryWriteGate: recoveryWriteGate,
-        recoveryGeneration: recoveryWriteGate.generation
-    )
-    model.controls = .everythingAdvertised
-    return model
 }
 
 private func waitForRecoveryRecord(

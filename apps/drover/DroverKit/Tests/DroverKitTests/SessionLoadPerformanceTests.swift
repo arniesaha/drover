@@ -7,6 +7,9 @@ import Testing
 extension MockNetworkTests {
 @Suite(.serialized)
 struct SessionLoadPerformanceTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
+
     @Test @MainActor func productionShapedTranscriptMergesInBoundedPages() {
         let messages = productionShapedMessages(count: 3_316)
         let pages = messages.chunked(maxCount: 200)
@@ -31,11 +34,11 @@ struct SessionLoadPerformanceTests {
         let requests = MessagePageRequestLog()
         let connector = HoldingConnector()
 
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             transcript.respond(to: request, recordingIn: requests)
         }
         defer {
-            MockURLProtocol.handler = nil
+            mock.handler = nil
             connector.finish()
         }
 

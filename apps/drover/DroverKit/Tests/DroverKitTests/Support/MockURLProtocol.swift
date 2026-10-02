@@ -1,4 +1,5 @@
 import Foundation
+@testable import DroverKit
 
 /// A boolean one thread raises and another reads — the mock's own cancellation
 /// flag, and whatever a test needs to observe from a handler running off the
@@ -7,101 +8,180 @@ final class MockFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
 
+    init() {}
     func raise() { lock.lock(); value = true; lock.unlock() }
     var isRaised: Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
 
-/// Test double intercepting `URLSession` traffic so `DroverClient` tests never
-/// touch the network. Install a `handler` before each request and it decides
-/// the (status, body) pair returned for that request.
-final class MockURLProtocol: URLProtocol {
-    nonisolated(unsafe) static var responseHeaders: [String: String]?
-    nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (Int, Data))?
+/// An isolated mock network environment for a test or session.
+/// Routes requests by a per-session identifier header (`X-Mock-Session-ID`)
+/// so that concurrent tests and suites never share handlers or leak requests.
+final class MockNetwork: @unchecked Sendable {
+    let id: String
+    private let lock = NSLock()
 
-    /// A deliberately narrow request trace for recovery tests. It retains
-    /// correlation IDs only, never a prompt or attachment payload.
-    private static let sentClientTurnIDsLock = NSLock()
-    nonisolated(unsafe) private static var recordedClientTurnIDs: [String] = []
+    private var _handler: (@Sendable (URLRequest) -> (Int, Data))?
+    private var _responseHeaders: [String: String]?
+    private var _transportError: URLError?
+    private var _responseDelay: (@Sendable (URLRequest) -> TimeInterval?)?
+    private var _recordedClientTurnIDs: [String] = []
 
-    static var sentClientTurnIDs: [String] {
-        sentClientTurnIDsLock.withLock { recordedClientTurnIDs }
+    init(id: String = UUID().uuidString) {
+        self.id = id
+        MockURLProtocol.register(self)
     }
 
-    static func resetRecordedRequests() {
-        sentClientTurnIDsLock.withLock {
-            recordedClientTurnIDs.removeAll(keepingCapacity: true)
+    deinit {
+        MockURLProtocol.unregister(self)
+    }
+
+    var handler: (@Sendable (URLRequest) -> (Int, Data))? {
+        get { lock.withLock { _handler } }
+        set { lock.withLock { _handler = newValue } }
+    }
+
+    var responseHeaders: [String: String]? {
+        get { lock.withLock { _responseHeaders } }
+        set { lock.withLock { _responseHeaders = newValue } }
+    }
+
+    var transportError: URLError? {
+        get { lock.withLock { _transportError } }
+        set { lock.withLock { _transportError = newValue } }
+    }
+
+    var responseDelay: (@Sendable (URLRequest) -> TimeInterval?)? {
+        get { lock.withLock { _responseDelay } }
+        set { lock.withLock { _responseDelay = newValue } }
+    }
+
+    var sentClientTurnIDs: [String] {
+        lock.withLock { _recordedClientTurnIDs }
+    }
+
+    func resetRecordedRequests() {
+        lock.withLock {
+            _recordedClientTurnIDs.removeAll(keepingCapacity: true)
         }
     }
 
-    /// Fail the request at the transport layer instead of answering it, so
-    /// tests can exercise the `DroverError.transport` path (offline hub,
-    /// cancelled poll) that no (status, body) pair can represent. Takes
-    /// precedence over `handler`; clear it when the test is done.
-    nonisolated(unsafe) static var transportError: URLError?
-
-    /// Seconds to hold a given request's answer before delivering it, or nil
-    /// (the default) to answer inline on the loader thread.
-    ///
-    /// Sleeping inside `handler` instead does not work: `startLoading` runs on
-    /// a thread the session reuses, so a blocked handler blocks every *other*
-    /// request too, and two requests can never be in flight at once. A delayed
-    /// delivery returns the thread immediately and lets them overlap, which is
-    /// the only way to test a response arriving after a newer one superseded
-    /// it. Clear it when the test is done.
-    nonisolated(unsafe) static var responseDelay: (@Sendable (URLRequest) -> TimeInterval?)?
-
-    /// Set by `stopLoading` so a delayed delivery for a cancelled request
-    /// stays quiet rather than calling back into a finished task.
-    private let isStopped = MockFlag()
-
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        Self.recordClientTurnID(in: request)
-        if let transportError = Self.transportError {
-            client?.urlProtocol(self, didFailWithError: transportError)
-            return
-        }
-        guard let handler = Self.handler else { return }
-        guard let delay = Self.responseDelay?(request), delay > 0 else {
-            deliver(handler(request))
-            return
-        }
-        let pending = request
-        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, !self.isStopped.isRaised else { return }
-            self.deliver(handler(pending))
-        }
-    }
-
-    override func stopLoading() { isStopped.raise() }
-
-    private func deliver(_ answer: (Int, Data)) {
-        let (status, body) = answer
-        let response = HTTPURLResponse(url: request.url!, statusCode: status,
-                                       httpVersion: nil, headerFields: Self.responseHeaders)!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: body)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    static func session() -> URLSession {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.protocolClasses = [MockURLProtocol.self]
-        return URLSession(configuration: cfg)
-    }
-
-    private static func recordClientTurnID(in request: URLRequest) {
+    func recordClientTurnID(in request: URLRequest) {
         guard request.httpMethod == "POST",
               request.url?.path.hasSuffix("/turns") == true,
               let object = try? JSONSerialization.jsonObject(with: request.bodyStreamData())
                 as? [String: Any],
               let clientTurnID = object["client_turn_id"] as? String
         else { return }
-        sentClientTurnIDsLock.withLock {
-            recordedClientTurnIDs.append(clientTurnID)
+        lock.withLock {
+            _recordedClientTurnIDs.append(clientTurnID)
         }
+    }
+
+    func configuration() -> URLSessionConfiguration {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.protocolClasses = [MockURLProtocol.self]
+        cfg.httpAdditionalHeaders = [MockURLProtocol.sessionHeader: id]
+        return cfg
+    }
+
+    func session() -> URLSession {
+        URLSession(configuration: configuration())
+    }
+
+    func client(
+        config: ServerConfig = ServerConfig(urlString: "http://test.local:7080")!,
+        token: String = "test-token",
+        credentialBindingID: UUID = testRecoveryBindingID,
+        retryGate: HubRetryGate = HubRetryGate()
+    ) -> DroverClient {
+        DroverClient(
+            config: config,
+            token: token,
+            credentialBindingID: credentialBindingID,
+            session: session(),
+            retryGate: retryGate
+        )
+    }
+}
+
+/// Test double intercepting `URLSession` traffic so `DroverClient` tests never
+/// touch the network. Requests are scoped to a `MockNetwork` via the `X-Mock-Session-ID`
+/// header attached to the session configuration.
+final class MockURLProtocol: URLProtocol, @unchecked Sendable {
+    static let sessionHeader = "X-Mock-Session-ID"
+
+    private static let registryLock = NSLock()
+    nonisolated(unsafe) private static var registry: [String: MockNetwork] = [:]
+
+    static func register(_ mock: MockNetwork) {
+        registryLock.withLock { registry[mock.id] = mock }
+    }
+
+    static func unregister(_ mock: MockNetwork) {
+        registryLock.withLock { _ = registry.removeValue(forKey: mock.id) }
+    }
+
+    static func isRegistered(token: String) -> Bool {
+        registryLock.withLock { registry[token] != nil }
+    }
+
+    static func mock(for token: String) -> MockNetwork? {
+        registryLock.withLock { registry[token] }
+    }
+
+    static func session(for mock: MockNetwork) -> URLSession {
+        mock.session()
+    }
+
+    /// Set by `stopLoading` so a delayed delivery for a cancelled request
+    /// stays quiet rather than calling back into a finished task.
+    private let isStopped = MockFlag()
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        guard let token = request.value(forHTTPHeaderField: sessionHeader) else {
+            return false
+        }
+        return isRegistered(token: token)
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let token = request.value(forHTTPHeaderField: Self.sessionHeader),
+              let mock = Self.mock(for: token)
+        else {
+            client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
+            return
+        }
+
+        mock.recordClientTurnID(in: request)
+        if let transportError = mock.transportError {
+            client?.urlProtocol(self, didFailWithError: transportError)
+            return
+        }
+        guard let handler = mock.handler else { return }
+        guard let delay = mock.responseDelay?(request), delay > 0 else {
+            deliver(handler(request), headers: mock.responseHeaders)
+            return
+        }
+        let pending = request
+        let headers = mock.responseHeaders
+        let isStopped = self.isStopped
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !isStopped.isRaised else { return }
+            self.deliver(handler(pending), headers: headers)
+        }
+    }
+
+    override func stopLoading() { isStopped.raise() }
+
+    private func deliver(_ answer: (Int, Data), headers: [String: String]?) {
+        let (status, body) = answer
+        let response = HTTPURLResponse(url: request.url!, statusCode: status,
+                                       httpVersion: nil, headerFields: headers)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
     }
 }
 

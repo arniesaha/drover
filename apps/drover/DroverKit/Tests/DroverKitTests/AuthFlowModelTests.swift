@@ -5,9 +5,11 @@ import Testing
 extension MockNetworkTests {
 @Suite(.serialized)
 struct AuthFlowModelTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
 
     @Test @MainActor func startLoadsWaitingFlow() async throws {
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/start")
             #expect(request.httpMethod == "POST")
             #expect(request.bodyStreamData() == Data("{}".utf8))
@@ -24,7 +26,7 @@ struct AuthFlowModelTests {
     }
 
     @Test @MainActor func cancelUpdatesTerminalFlow() async throws {
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/flows/auth-flow-1/cancel")
             #expect(request.httpMethod == "POST")
             #expect(request.bodyStreamData() == Data("{}".utf8))
@@ -40,7 +42,7 @@ struct AuthFlowModelTests {
     }
 
     @Test @MainActor func submitCodePostsTheTypedTextAndAppliesTheSnapshot() async throws {
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             #expect(request.url?.path
                 == "/harness/hosts/mac-mini/auth/claude-code/flows/auth-flow-1/input")
             #expect(request.httpMethod == "POST")
@@ -61,7 +63,7 @@ struct AuthFlowModelTests {
 
     @Test @MainActor func submitCodeIgnoresBlankEntryWithoutCallingTheHost() async throws {
         let state = PollTestState()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             state.incrementRequests()
             return (200, Data(#"{"host_id":"mac-mini","harness":"claude-code","flow_id":"auth-flow-1","state":"waiting_for_user"}"#.utf8))
         }
@@ -80,7 +82,7 @@ struct AuthFlowModelTests {
         // is telling us the mode changed, so the model re-reads status
         // instead of leaving the user on a dead error string.
         let state = PollTestState()
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             if request.url?.path.hasSuffix("/start") == true {
                 state.incrementRequests()
                 return (409, Data(#"{"error":"agy can only be signed in from a terminal session","harness":"agy","sign_in":"terminal"}"#.utf8))
@@ -97,7 +99,7 @@ struct AuthFlowModelTests {
     }
 
     @Test @MainActor func statusMarksTerminalOnlyHarnessesBeforeAnyStart() async throws {
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (200, Data(#"{"host_id":"nas","harness":"agy","state":"unknown","sign_in":"terminal"}"#.utf8))
         }
         let model = AuthFlowModel(client: client(), hostID: "nas", harness: "agy")
@@ -109,7 +111,7 @@ struct AuthFlowModelTests {
 
     @Test @MainActor func pollingAppliesTerminalFlowThenStops() async throws {
         let state = PollTestState()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             state.incrementRequests()
             return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"authenticated"}"#.utf8))
         }
@@ -125,7 +127,7 @@ struct AuthFlowModelTests {
 
     @Test @MainActor func pollingPermanentRequestErrorStopsPolling() async throws {
         let state = PollTestState()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             state.incrementRequests()
             return (400, Data(#"{"error":"poll failed"}"#.utf8))
         }
@@ -141,7 +143,7 @@ struct AuthFlowModelTests {
 
     @Test @MainActor func pollingUnhandledClientErrorStopsPolling() async throws {
         let state = PollTestState()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             state.incrementRequests()
             return (422, Data(#"{"error":"poll rejected"}"#.utf8))
         }
@@ -158,7 +160,7 @@ struct AuthFlowModelTests {
 
     @Test @MainActor func pollingRetriesTransientErrorsAndRecovers() async throws {
         let state = PollTestState()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             if state.incrementRequests() < 3 {
                 return (500, Data(#"{"error":"poll failed"}"#.utf8))
             }
@@ -176,7 +178,7 @@ struct AuthFlowModelTests {
 
     @Test @MainActor func busyPollingWaitsAndRecovers() async throws {
         let state = PollTestState()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             state.incrementRequests()
             return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"authenticated"}"#.utf8))
         }
@@ -196,7 +198,7 @@ struct AuthFlowModelTests {
 
     @Test @MainActor func failedCancellationResumesPolling() async throws {
         let state = PollTestState()
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             state.incrementRequests()
             if request.url?.path.hasSuffix("/cancel") == true {
                 return (500, Data(#"{"error":"cancel failed"}"#.utf8))
@@ -216,7 +218,7 @@ struct AuthFlowModelTests {
     @Test @MainActor func stoppedPollingIgnoresAnInFlightPollResponse() async throws {
         let releasePoll = DispatchSemaphore(value: 0)
         let state = PollTestState()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             state.markStarted()
             _ = releasePoll.wait(timeout: .now() + 1)
             state.markReturned()
@@ -239,7 +241,7 @@ struct AuthFlowModelTests {
     @Test @MainActor func cancelledFlowIgnoresAnInFlightPollResponse() async throws {
         let releasePoll = DispatchSemaphore(value: 0)
         let state = PollTestState()
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             if request.url?.path.hasSuffix("/cancel") == true {
                 return (200, Data(#"{"host_id":"mac-mini","harness":"codex","flow_id":"auth-flow-1","state":"cancelled"}"#.utf8))
             }

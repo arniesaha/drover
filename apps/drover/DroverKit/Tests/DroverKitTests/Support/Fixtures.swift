@@ -5,12 +5,9 @@ import Testing
 // Shared fixtures/factories reused across DroverKit test files.
 // Real wire shapes captured from the deployed backend.
 
-/// Root suite for every test that installs `MockURLProtocol.handler`. The
-/// handler is a single global slot, and Swift Testing runs suites from
-/// different files concurrently — so a request issued by one suite can land
-/// in another suite's handler (a bodyless auth-poll GET arriving in a POST
-/// handler crashes its `try!` body parse). `.serialized` applies recursively,
-/// so nesting every handler-using suite here keeps them mutually exclusive.
+/// Root suite for test suites that exercise network mocks.
+/// Suites nested here historically used a process-global handler; network
+/// mocks are now scoped per-test via `MockNetwork` and routed by session tokens.
 @Suite(.serialized) enum MockNetworkTests {}
 
 #if !SWIFT_PACKAGE
@@ -218,14 +215,20 @@ private actor TestChatRecoveryStore: ChatRecoveryPersisting {
     }
 }
 
-/// Shared `DroverClient` factory wired to `MockURLProtocol` so Tasks 4-10 all
-/// build clients the same way instead of redefining this per-file.
-func client() -> DroverClient {
-    DroverClient(config: ServerConfig(urlString: "http://test.local:7080")!,
-                token: "test-token",
-                credentialBindingID: testRecoveryBindingID,
-                session: MockURLProtocol.session(),
-                retryGate: HubRetryGate())
+/// Shared `DroverClient` factory wired to an inert session by default, or to
+/// a `MockNetwork` when provided. Tests making network requests should pass
+/// their test's `MockNetwork` or use `mock.client()`.
+func client(_ mock: MockNetwork? = nil) -> DroverClient {
+    if let mock {
+        return mock.client()
+    }
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.protocolClasses = [MockURLProtocol.self]
+    return DroverClient(config: ServerConfig(urlString: "http://test.local:7080")!,
+                        token: "test-token",
+                        credentialBindingID: testRecoveryBindingID,
+                        session: URLSession(configuration: cfg),
+                        retryGate: HubRetryGate())
 }
 
 @MainActor
@@ -283,13 +286,14 @@ extension HarnessMessage {
 
 extension ChatModel {
     /// A `ChatModel` with no live stream — `ingest(_:)` drives it directly
-    /// in tests, no `MockURLProtocol.handler` needed unless the test also
-    /// calls a network action (`sendTurn`/`approve`/etc.).
+    /// in tests, no network needed unless the test also calls a network action
+    /// (`sendTurn`/`approve`/etc.). Pass `client: mock.client()` when network
+    /// interactions are tested.
     /// Its host advertises every session control, so tests of approval and
     /// turn mechanics are not also tests of capability gating.
-    static func fixture(messages: [HarnessMessage] = []) -> ChatModel {
+    static func fixture(client: DroverClient = client(), messages: [HarnessMessage] = []) -> ChatModel {
         let model = recoveryChatModel(
-            client: client(),
+            client: client,
             sessionID: "fixture-session",
             initialMessages: messages
         )
