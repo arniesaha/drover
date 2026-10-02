@@ -2,7 +2,7 @@
 
 **Status: runbook drafted; production execution is blocked.** The current branch
 contains pinned runtime/process primitives and offline rebuild/verify tooling.
-Serving routing, the fenced transactional exporter, maintenance,
+Serving routing/exporter lifecycle activation, maintenance,
 backup/restore and config epochs must be implemented and proven before these
 steps can be executed. Production cutover requires separate operator approval.
 

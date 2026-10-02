@@ -35,7 +35,15 @@ class MutationFence:
         try:
             if self.connection is None or self.connection.closed:
                 raise LakeError("lake_fence_lost")
-            self.connection.execute("SELECT 1")
+            held = self.connection.execute(
+                """SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory'
+                AND pid=pg_backend_pid() AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+                AND classid=%s AND objid=%s AND objsubid=1
+                AND mode='ExclusiveLock' AND granted)""",
+                [MUTATION_LOCK >> 32, MUTATION_LOCK & 0xFFFFFFFF],
+            ).fetchone()[0]
+            if not held:
+                raise LakeError("lake_fence_lost")
         except Exception:
             raise LakeError("lake_fence_lost") from None
 

@@ -194,6 +194,13 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
             "CREATE INDEX IF NOT EXISTS control_outbox_batches_visibility ON control_outbox_batches (state, published_at, batch_id)",
             """
+            CREATE TABLE IF NOT EXISTS lake_export_batches (
+              batch_id TEXT PRIMARY KEY REFERENCES control_outbox_batches(batch_id),
+              catalog_id TEXT NOT NULL, input_json TEXT NOT NULL, input_sha256 TEXT NOT NULL,
+              receipt_sha256 TEXT, acknowledged_at TIMESTAMPTZ
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS control_outbox_batch_events (
               batch_id TEXT NOT NULL, event_id TEXT NOT NULL,
               ordinal INTEGER NOT NULL, PRIMARY KEY (batch_id, event_id),

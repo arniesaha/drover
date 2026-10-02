@@ -29,18 +29,22 @@ engine/version/extension mismatch before catalog attachment.
 - Dedicated PostgreSQL mutation fence and reader/drained-maintenance fences.
   Connection loss fails the fence check; no reconnect or pooled lock ownership.
 
+The [control-outbox exporter](lake-exporter.md) now implements immutable
+transactional receipts, frozen PG inputs, isolated batch engines, dedicated
+ownership and catalog commit fencing with receipt-first recovery. It is not
+automatically started by the legacy backend.
+
 The reader/maintenance lock protocol is mandatory for every future serving read
 and lifecycle operation. An OS admission lock alone does not drain catalog
-transactions. A dedicated fence check alone does not fence a long-running export
-if its connection disappears during a lake commit: exporter supervision must
-cover that interval before release.
+transactions. The exporter additionally guards the catalog snapshot commit
+boundary and drains already-validated commits before transferring ownership.
 
 The configuration options follow [DuckLake configuration](https://ducklake.select/docs/stable/duckdb/usage/configuration).
 
 ## Remaining release work
 
-- Actual fenced exporter integration with PG outbox and canonical projection,
-  immutable transactional lake receipts and supervised lock-loss recovery.
+- Activate the implemented control-outbox exporter through backend lifecycle
+  routing at cutover.
 - Complete backend configuration/routing through MCP, cockpit, summarizer and
   PG task/fleet projections; legacy parity tests.
 - Daily fenced lifecycle operations and reader-safety tests.
