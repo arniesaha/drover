@@ -46,9 +46,8 @@ The configuration options follow [DuckLake configuration](https://ducklake.selec
 - Daily fenced lifecycle operations and reader-safety tests.
 - Immutable catalog/files backup generations, verified fresh restore, and
   replacement of the planned section in `docs/backup.md`.
-- Bound the full-backup rebuild RSS, complete catalog publication/verification
-  on the real backup, and rehearse the drafted cutover/rollback runbook.
-- Least-privilege catalog provisioning, installer pin verification, Linux proof,
+- Rehearse the drafted cutover/rollback runbook after the serving/export gates.
+- Installer credential provisioning/pin verification, Linux proof,
   fixed 25-session audit, 24-hour soak, and second-machine restore.
 
 ## Offline rebuild checkpoint
@@ -56,7 +55,8 @@ The configuration options follow [DuckLake configuration](https://ducklake.selec
 `drover-server lake rebuild` and `lake verify` are implemented without loading
 hub config. The explicit three-table schemas exclude spans. Dedupe preserves the
 repository ordering, with normalized payload SHA-256/file/ordinal tie-breaks,
-and retains every null-key row with lineage. Verification recomputes hashes
+and implements the decided null-key policy with backfill/archive/residual
+lineage. Original-key baseline accounting is retained independently. Verification recomputes hashes
 from contents and verifies baseline/evidence digests. The drafted runbook is
 `docs/operations/lake-cutover.md`; it explicitly blocks production execution.
 
@@ -79,15 +79,34 @@ hashes with newline separators, multiplicity retained):
 - Provider: `f7866d6ea00a14d14e95f415c18d9e9b2b8fc3cc35ce4e678434e717a86938ff`
 - Outbox: `75c20d41144afc238b4ea488b566b59260739976d0b3ef2dc809ea57e65c5139`
 
-**This is accounting evidence, not a successful bounded publication rehearsal.**
-A 512MB single-scan publication attempt failed during staging after 11.62 seconds
-(1,782,530,048 bytes peak RSS). Slicing execution through the same globally bound
-schema also failed at 512MB after 30.15 seconds (2,476,802,048 bytes peak RSS).
-The reduced budget and sliced staging are the current implementation; both
-failures occurred before catalog publication. Rebuild memory use is a release
-blocker. Do not raise serving ceilings to accommodate this tooling.
+The initial single-engine approach failed the memory gate and has been replaced.
+Each UTC day uses streamed 128-row input batches, fixed casts, narrow winner
+ranking and a fresh disposable engine. Provider/outbox staging uses at most 32
+files per process. Each engine uses 1GB, one thread and a spill directory under
+the chosen data root; the supervisor enforces a sampled aggregate 2.5 GiB ceiling.
+Cross-partition checks stream only keys/day. Verification recomputes content
+hashes per day, then globally sorts only the narrow hash stream.
+
+The decided policy retains all input through serving rows, archived metadata, or
+recorded dedupe losers. Content-bearing null keys use `dedup.make_dedup_key`;
+empty-content/null-role null keys enter `agent_events_legacy_metadata`; other
+empty-content null keys keep residual lineage. Day/session counts and exact
+winner/loser file/row/hash mappings are hashed evidence. The original 5,211,239
+canonical baseline includes null keys before this policy and is reported
+separately from the new serving count.
+
+Bounded publication rehearsal results will be recorded below once verification
+completes. An intermediate attempt published all partitions but stopped when a
+macOS subprocess RSS probe timed out. Native process sampling replaces that probe
+and handles the kernel's child-exit transition without tolerating an unmeasurable
+live process.
 
 Small fixture catalog publication and independent verification pass against
 initdb-created Postgres. Large local rehearsal is explicitly opt-in via
 `DROVER_PHASE4_REHEARSAL_TAR`/`DROVER_PHASE4_REHEARSAL_ROOT`, and refuses an
 external test DSN. All source data/evidence stays in scratch `/tmp` roots.
+
+The hub [RSS guard](hub-memory-budget.md) defaults to 4 GiB for its own process,
+with readiness/data-quality state and disposable child telemetry. Separate
+[reader/exporter/admin catalog groups](lake-catalog-roles.md) are provisioned and
+tested on scratch Postgres; installer login wiring remains outstanding.

@@ -3,31 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import shutil
 import tarfile
-import time
-from contextlib import nullcontext
 from pathlib import Path, PurePosixPath
 
-import duckdb
-import psycopg
-
-from .fence import drained_mutation
-from .runtime import (
-    LakeError,
-    LakeSpec,
-    attach_lake,
-    configure_catalog,
-    create_table,
-    lake_connection,
-    literal,
-    sha256_file,
-    verify_runtime,
-)
+from .runtime import LakeError, LakeSpec, literal
 
 # Schema is intentionally explicit, including VARCHAR event timestamps. Binding
-# all files once prevents mixed-era timestamps changing representation by batch.
+# Every incoming batch is cast to these types before any hash or deduplication.
 EVENT_SCHEMA = (
     dict.fromkeys(
         [
@@ -190,42 +173,65 @@ def hash_multiset(con, relation: str, *, expression: str = "_row_sha256") -> str
 
 
 def stage_relation(con, table: str, inventory: list[dict], extracted: Path):
+    """Stream fixed-schema record batches; never infer a batch's target types."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     schema = SCHEMAS[table]
+    ddl = ", ".join(f'"{c}" {t}' for c, t in schema.items())
+    con.execute(
+        f"CREATE TABLE raw_{table} ({ddl}, _import_file VARCHAR, _import_row BIGINT, _row_sha256 VARCHAR)"
+    )
     files = [str(extracted / item["path"]) for item in inventory]
+    # This audit-only binding checks the historical global representation in
+    # tests. Execution below always casts into the declared schema.
     con.execute(
-        f"CREATE TEMP VIEW input_{table} AS SELECT * FROM read_parquet("
-        f"{literal_list(files)}, union_by_name=true, hive_partitioning={'true' if table == 'agent_events' else 'false'}, "
-        "filename=true, file_row_number=true)"
+        f"CREATE TEMP VIEW input_{table} AS SELECT * FROM read_parquet({literal_list(files)}, union_by_name=true, hive_partitioning={'true' if table == 'agent_events' else 'false'})"
     )
-    observed = {r[0] for r in con.execute(f"DESCRIBE input_{table}").fetchall()}
-    unknown = observed - schema.keys() - {"filename", "file_row_number"}
-    if unknown:
-        raise LakeError("rebuild_unknown_schema_columns")
-    projection = ", ".join(
-        (
-            f'CAST("{c}" AS {t}) AS "{c}"'
-            if c in observed
-            else f'CAST(NULL AS {t}) AS "{c}"'
+    for item in inventory:
+        path = extracted / item["path"]
+        parquet = pq.ParquetFile(path)
+        observed = set(parquet.schema_arrow.names)
+        if observed - schema.keys():
+            raise LakeError("rebuild_unknown_schema_columns")
+        hive = dict(
+            part.split("=", 1) for part in Path(item["path"]).parts if "=" in part
         )
-        for c, t in schema.items()
-    )
-    # Relative archive path + physical file ordinal distinguishes identical null
-    # key rows without inventing canonical business identities.
-    con.execute(
-        f"CREATE TEMP VIEW normalized_{table} AS SELECT {projection}, "
-        f"substr(filename, {len(str(extracted)) + 2}) AS _import_file, "
-        f"file_row_number AS _import_row, filename AS _physical_file FROM input_{table}"
-    )
-    select = f"SELECT * EXCLUDE (_physical_file), {row_hash_expression(schema)} AS _row_sha256 FROM normalized_{table}"
-    con.execute(f"CREATE TABLE raw_{table} AS {select} LIMIT 0")
-    # Every slice uses the same globally bound relation and declared CASTs.
-    # Slice only execution, never type inference (mixed-era timestamps retain
-    # the globally unified VARCHAR representation).
-    for offset in range(0, len(files), 20):
-        selected = ", ".join(literal(f) for f in files[offset : offset + 20])
-        con.execute(
-            f"INSERT INTO raw_{table} {select} WHERE _physical_file IN ({selected})"
-        )
+        offset = 0
+        for batch in parquet.iter_batches(batch_size=128, use_threads=False):
+            incoming = pa.Table.from_batches([batch])
+            if table == "agent_events":
+                for column in ("date", "agent_id"):
+                    if column not in hive:
+                        raise LakeError("rebuild_missing_hive_identity")
+                    values = pa.array([hive[column]] * batch.num_rows, type=pa.string())
+                    if column in incoming.column_names:
+                        incoming = incoming.set_column(
+                            incoming.column_names.index(column), column, values
+                        )
+                    else:
+                        incoming = incoming.append_column(column, values)
+            incoming = incoming.append_column(
+                "_file_ordinal",
+                pa.array(range(offset, offset + batch.num_rows), type=pa.int64()),
+            )
+            offset += batch.num_rows
+            columns = set(incoming.column_names)
+            projection = ", ".join(
+                (
+                    f'CAST("{c}" AS {t}) AS "{c}"'
+                    if c in columns
+                    else f'CAST(NULL AS {t}) AS "{c}"'
+                )
+                for c, t in schema.items()
+            )
+            con.register("incoming_batch", incoming)
+            try:
+                con.execute(
+                    f"INSERT INTO raw_{table} SELECT *, {row_hash_expression(schema)} AS _row_sha256 FROM (SELECT {projection}, {literal(item['path'])} AS _import_file, _file_ordinal AS _import_row FROM incoming_batch)"
+                )
+            finally:
+                con.unregister("incoming_batch")
 
 
 def literal_list(values: list[str]) -> str:
@@ -266,141 +272,12 @@ def accounting(con, relation: str, *, expression: str = "_row_sha256") -> dict:
 
 
 def rebuild(source: Path, spec: LakeSpec, *, dry_run: bool = False) -> dict:
-    started = time.monotonic()
-    verify_runtime(spec)
-    root = spec.data_root.resolve()
-    if root.exists():
-        raise LakeError("rebuild_requires_new_data_root")
-    root.parent.mkdir(parents=True, exist_ok=True)
-    root.mkdir(mode=0o700)
-    evidence = root / "verification"
-    evidence.mkdir()
-    extracted = root / "frozen"
-    inventory = extract_frozen(source, extracted)
-    (evidence / "source-files.json").write_text(json.dumps(inventory, indent=2))
-    scratch = root / "staging.duckdb"
-    with duckdb.connect(
-        str(scratch),
-        config={
-            "memory_limit": "512MB",
-            "preserve_insertion_order": False,
-            "threads": 2,
-            "autoload_known_extensions": False,
-            "autoinstall_known_extensions": False,
-        },
-    ) as staging:
-        staging.execute("SET TimeZone = 'UTC'")
-        for table, files in inventory.items():
-            stage_relation(staging, table, files, extracted)
-        dedupe_events(staging)
-        raw = {t: accounting(staging, "raw_" + t) for t in SCHEMAS}
-        canonical = accounting(staging, "canonical_events")
-        nulls, keys = staging.execute(
-            "SELECT count(*) FILTER (WHERE dedup_key IS NULL), count(DISTINCT dedup_key) FROM canonical_events"
-        ).fetchone()
-        for grain in ("date", "session_id"):
-            staging.execute(
-                f"COPY (SELECT raw.{grain}, count(*) AS raw_rows, count(*) FILTER (WHERE w.winner_rank = 1) AS canonical_rows FROM raw_agent_events raw JOIN event_winners w USING (_import_file, _import_row) GROUP BY raw.{grain} ORDER BY raw.{grain}) TO {literal(str(evidence / (grain + '-counts.parquet')))} (FORMAT PARQUET, COMPRESSION ZSTD)"
-            )
-        staging.execute(
-            f"""COPY (
-            SELECT loser.dedup_key, loser._import_file AS loser_file, loser._import_row AS loser_row,
-                   loser._row_sha256 AS loser_sha256, winner._import_file AS winner_file,
-                   winner._import_row AS winner_row, winner._row_sha256 AS winner_sha256
-              FROM event_winners loser JOIN event_winners winner ON loser.dedup_key = winner.dedup_key
-             WHERE loser.winner_rank > 1 AND winner.winner_rank = 1
-             ORDER BY loser.dedup_key, loser_file, loser_row
-        ) TO {literal(str(evidence / 'winner-loser.parquet'))} (FORMAT PARQUET, COMPRESSION ZSTD)"""
-        )
-        if not dry_run:
-            # This is an explicit offline creation, not migration of an existing
-            # catalog. Never attach before checking that the database is empty.
-            with drained_mutation(spec.dsn()) as fence:
-                tables = fence.connection.execute(
-                    "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema')"
-                ).fetchone()[0]
-                if tables:
-                    raise LakeError("rebuild_requires_fresh_catalog")
-                attach_lake(staging, spec, read_only=False, create=True)
-                with nullcontext(staging) as lake:
-                    configure_catalog(lake)
-                    for table, schema in SCHEMAS.items():
-                        create_table(
-                            lake,
-                            table,
-                            schema
-                            | {
-                                "_import_file": "VARCHAR",
-                                "_import_row": "BIGINT",
-                                "_row_sha256": "VARCHAR",
-                            },
-                            day_partition=table == "agent_events",
-                        )
-                    lake.execute("BEGIN")
-                    try:
-                        for table in SCHEMAS:
-                            source_relation = (
-                                "canonical_events"
-                                if table == "agent_events"
-                                else "raw_" + table
-                            )
-                            lake.execute(
-                                f"INSERT INTO lake.{table} BY NAME SELECT * FROM staging.{source_relation}"
-                            )
-                        fence.check()
-                        lake.execute("COMMIT")
-                    except Exception:
-                        lake.execute("ROLLBACK")
-                        raise
-                    actual = {
-                        t: accounting(
-                            lake,
-                            "lake." + t,
-                            expression=row_hash_expression(SCHEMAS[t]),
-                        )
-                        for t in SCHEMAS
-                    }
-                    expected = {**raw, "agent_events": canonical}
-                    if actual != expected:
-                        raise LakeError("rebuild_verification_mismatch")
-        report = {
-            "format_version": 1,
-            "dry_run": dry_run,
-            "raw": raw,
-            "canonical_agent_events": canonical,
-            "losers": raw["agent_events"]["rows"] - canonical["rows"],
-            "null_key_rows_retained": nulls,
-            "distinct_nonnull_keys": keys,
-            "elapsed_seconds": time.monotonic() - started,
-        }
-        report["evidence_sha256"] = {
-            p.name: sha256_file(p) for p in sorted(evidence.iterdir()) if p.is_file()
-        }
-        (evidence / "report.json").write_text(json.dumps(report, indent=2))
-        return report
+    from .partition_rebuild import rebuild_partitioned
+
+    return rebuild_partitioned(source, spec, dry_run=dry_run)
 
 
 def verify(spec: LakeSpec) -> dict:
-    report_path = spec.data_root / "verification/report.json"
-    if not report_path.is_file():
-        raise LakeError("lake_verification_baseline_missing")
-    report = json.loads(report_path.read_text())
-    if report["dry_run"]:
-        raise LakeError("lake_dry_run_not_published")
-    expected = {**report["raw"], "agent_events": report["canonical_agent_events"]}
-    with lake_connection(spec) as con:
-        actual = {
-            t: accounting(con, "lake." + t, expression=row_hash_expression(SCHEMAS[t]))
-            for t in SCHEMAS
-        }
-        if actual != expected:
-            raise LakeError("lake_verification_mismatch")
-        counts = con.execute(
-            "SELECT count(*), count(DISTINCT dedup_key), count(*) FILTER (WHERE dedup_key IS NULL) FROM lake.agent_events"
-        ).fetchone()
-        if counts[0] != counts[1] + counts[2]:
-            raise LakeError("lake_duplicate_canonical_keys")
-    for name, digest in report["evidence_sha256"].items():
-        if Path(name).name != name or sha256_file(report_path.parent / name) != digest:
-            raise LakeError("lake_verification_evidence_mismatch")
-    return actual
+    from .partition_rebuild import verify_partitioned
+
+    return verify_partitioned(spec)

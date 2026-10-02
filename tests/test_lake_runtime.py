@@ -279,9 +279,12 @@ def test_rebuild_accounting_and_fresh_catalog_roundtrip(lake_spec, tmp_path):
     spec = replace(lake_spec, data_root=tmp_path / "rebuilt")
     report = rebuild(_fixture_tar(tmp_path), spec)
     assert report["raw"]["agent_events"]["rows"] == 5
-    assert report["canonical_agent_events"]["rows"] == 4
-    assert report["null_key_rows_retained"] == 2
-    assert report["losers"] == 1
+    assert report["canonical_agent_events"]["rows"] == 3
+    assert report["null_key_rows_retained"] == 0
+    assert report["losers"] == 2
+    assert report["original_key_losers"] == 1
+    assert report["baseline_canonical_agent_events"]["rows"] == 4
+    assert report["buckets"]["rebuild_backfill"] == 2
     actual = verify(spec)
     assert actual["agent_events"] == report["canonical_agent_events"]
     assert (
@@ -293,17 +296,17 @@ def test_rebuild_accounting_and_fresh_catalog_roundtrip(lake_spec, tmp_path):
     with lake_connection(spec) as con:
         assert (
             con.execute(
-                "SELECT count(DISTINCT (_import_file, _import_row)) FROM lake.agent_events WHERE dedup_key IS NULL"
+                "SELECT count(DISTINCT (_import_file, _import_row)) FROM lake.agent_events WHERE dedup_key_source = 'rebuild_backfill'"
             ).fetchone()[0]
-            == 2
+            == 1
         )
     import pyarrow.parquet as pq
 
     mapping = pq.read_table(
-        spec.data_root / "verification/winner-loser.parquet"
+        spec.data_root / "partitions/2026-10-01/losers.parquet"
     ).to_pylist()
-    assert len(mapping) == 1
-    assert mapping[0]["dedup_key"] == "a"
+    assert len(mapping) == 2
+    assert any(row["dedup_key"] == "a" for row in mapping)
     with pytest.raises(LakeError, match="requires_new_data_root"):
         rebuild(tmp_path / "frozen.tar", spec)
 
@@ -318,7 +321,7 @@ def test_rebuild_dry_run_never_contacts_postgres(lake_spec, tmp_path, monkeypatc
         dry_run=True,
     )
     assert report["dry_run"]
-    assert report["canonical_agent_events"]["rows"] == 4
+    assert report["canonical_agent_events"]["rows"] == 3
 
 
 def test_rebuild_rejects_unsafe_tar(tmp_path):
@@ -471,3 +474,129 @@ def test_admission_wait_has_same_deadline_and_never_starts_second_child(tmp_path
                 cwd=tmp_path,
             )
     assert not sentinel.exists()
+
+
+def test_decided_null_key_buckets(lake_spec, tmp_path):
+    import tarfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from drover.dedup import make_dedup_key
+    from drover.server.lake.rebuild import rebuild, verify
+
+    original = _fixture_tar(tmp_path)
+    path = (
+        tmp_path
+        / "source/parquet/agent_events/date=2026-10-01/agent_id=test/policy.parquet"
+    )
+    rows = [
+        {
+            "id": "metadata",
+            "session_id": "s",
+            "timestamp": "2026-10-01T03:00:00Z",
+            "dedup_key": None,
+            "content": "",
+            "role": None,
+        },
+        {
+            "id": "empty-role",
+            "session_id": "s",
+            "timestamp": "2026-10-01T03:00:00Z",
+            "dedup_key": None,
+            "content": "",
+            "role": "tool",
+        },
+        {
+            "id": "unicode",
+            "session_id": "s",
+            "timestamp": "2026-10-01T03:00:00Z",
+            "dedup_key": None,
+            "content": "🙂" * 205,
+            "role": "assistant",
+        },
+        {
+            "id": "keyed-status",
+            "session_id": "s",
+            "timestamp": "2026-10-01T03:00:00Z",
+            "dedup_key": "status",
+            "content": "",
+            "role": None,
+        },
+    ]
+    pq.write_table(pa.Table.from_pylist(rows), path)
+    original.unlink()
+    with tarfile.open(original, "w") as tar:
+        tar.add(tmp_path / "source/parquet", arcname="parquet")
+    spec = replace(lake_spec, data_root=tmp_path / "policy")
+    report = rebuild(original, spec)
+    assert report["buckets"] == {
+        "original": 4,
+        "rebuild_backfill": 3,
+        "legacy_metadata": 1,
+        "legacy_null": 1,
+    }
+    assert report["raw"]["agent_events"]["rows"] == 9
+    assert report["canonical_agent_events"]["rows"] == 6
+    assert report["legacy_metadata"]["rows"] == 1
+    assert report["losers"] == 2
+    assert (
+        9
+        == report["canonical_agent_events"]["rows"]
+        + report["legacy_metadata"]["rows"]
+        + report["losers"]
+    )
+    import duckdb
+
+    with duckdb.connect() as con:
+        counts = con.execute(
+            "SELECT sum(raw_rows),sum(serving_rows),sum(archive_rows),sum(loser_rows) FROM read_parquet(?)",
+            [str(spec.data_root / "partitions/2026-10-01/session-counts.parquet")],
+        ).fetchone()
+    assert counts == (9, 6, 1, 2)
+    expected = make_dedup_key("2026-10-01T03:00:00Z", "test", "s", None, "🙂" * 205)
+    assert query(
+        spec,
+        "SELECT dedup_key,dedup_key_source FROM lake.agent_events WHERE id='unicode'",
+    )["rows"] == [[expected, "rebuild_backfill"]]
+    assert query(spec, "SELECT id FROM lake.agent_events_legacy_metadata")["rows"] == [
+        ["metadata"]
+    ]
+    assert query(spec, "SELECT count(*) FROM lake.agent_events WHERE id='metadata'")[
+        "rows"
+    ] == [[0]]
+    assert verify(spec)["agent_events_legacy_metadata"]["rows"] == 1
+
+
+def test_cross_partition_keys_are_checked_before_publication(lake_spec, tmp_path):
+    import tarfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from drover.server.lake.rebuild import rebuild
+
+    archive = _fixture_tar(tmp_path)
+    path = (
+        tmp_path
+        / "source/parquet/agent_events/date=2026-10-02/agent_id=test/other.parquet"
+    )
+    path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"id": "bad-day", "timestamp": "2026-10-01T01:00:00Z", "dedup_key": "a"}]
+        ),
+        path,
+    )
+    archive.unlink()
+    with tarfile.open(archive, "w") as tar:
+        tar.add(tmp_path / "source/parquet", arcname="parquet")
+    with pytest.raises(LakeError, match="cross_partition_dedup_key"):
+        rebuild(archive, replace(lake_spec, data_root=tmp_path / "cross"))
+    with psycopg.connect(lake_spec.dsn(), autocommit=True) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')"
+            ).fetchone()[0]
+            == 0
+        )

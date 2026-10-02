@@ -2,7 +2,7 @@
 
 **Status: runbook drafted; production execution is blocked.** The current branch
 contains pinned runtime/process primitives and offline rebuild/verify tooling.
-Serving routing, the fenced transactional exporter, catalog roles, maintenance,
+Serving routing, the fenced transactional exporter, maintenance,
 backup/restore and config epochs must be implemented and proven before these
 steps can be executed. Production cutover requires separate operator approval.
 
@@ -36,13 +36,24 @@ drover-server lake verify --data-root /tmp/published-lake \
   --catalog-dsn-env SCRATCH_CATALOG_DSN
 ```
 
-Rebuild preserves the explicit 34-column historical event schema, including
+Rebuild preserves the explicit historical event schema, including
 VARCHAR timestamps, before adding file/row lineage and normalized SHA-256.
 Provider snapshots and outbox exports use explicit schemas and remain
-unpartitioned. Null-key event rows are all retained. Non-null keys use repository
+unpartitioned. Null keys with content are backfilled with the repository fingerprint
+and `dedup_key_source=rebuild_backfill`. Null keys with empty content and a null
+role enter `agent_events_legacy_metadata`, retained for verification and excluded
+from the serving events table. Remaining empty-content null-key rows keep
+`legacy_null` lineage. Non-null keys use repository
 attribution/timestamp/source-ID ordering, then normalized payload hash and stable
 file/ordinal tie-breaks. Verification recomputes payload hashes rather than
 trusting the stored per-row digests, and checks the evidence manifest.
+
+Each day is staged, deduplicated and published in a disposable process. Workers
+use a 1GB engine limit, one thread, and a spill directory on the new data volume.
+The supervisor samples aggregate coordinator/child RSS every 20ms and stops above
+2.5 GiB. Verification uses one day per process. A keys-only external sort checks
+original and backfilled identities across partitions before catalog creation; a
+cross-day duplicate fails explicitly instead of silently choosing two winners.
 
 Output: `verification/report.json`, source file SHA-256 inventory, raw/canonical
 counts per UTC day/session, and winner/loser file/ordinal/hash mappings. Retain
@@ -51,7 +62,9 @@ a backup generation, restore proof or cutover gate.
 
 The supplied October 1 tar actually contains 5,288,617 raw events, 5,350 above
 the spike baseline. The same 77,378 excess rows collapse to 5,211,239 canonical
-events; retain all 357,236 null-key rows. A baseline mismatch must be investigated
+events under original-key ordering. The 357,236 null-key rows are accounted for
+under the decided backfill/archive policy; the report separates original-key
+baseline counts from serving, archive and additional losers. A baseline mismatch must be investigated
 and recorded, never forced to match by deleting rows.
 
 ## Production gates
