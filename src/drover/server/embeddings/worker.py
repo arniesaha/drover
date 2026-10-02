@@ -24,6 +24,7 @@ from typing import Optional
 import duckdb
 
 from drover.server import ledger_shadow
+from drover.server.claim_quarantine import ClaimQuarantine
 from drover.server.db import open_duckdb_connection
 from drover.server.embeddings.client import (
     DEFAULT_EMBED_MODEL,
@@ -117,6 +118,8 @@ class EmbedWorker:
         self.session_job_stream = session_job_stream
         self.span_job_stream = span_job_stream
         self.worker_id = worker_id
+        self._session_quarantine = ClaimQuarantine("embed_jobs", "session_id", log)
+        self._span_quarantine = ClaimQuarantine("span_embed_jobs", "span_id", log)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -289,11 +292,12 @@ class EmbedWorker:
 
         con = open_duckdb_connection(self.duckdb_path)
         try:
+            exclusion, skipped = self._session_quarantine.exclusion("j.session_id")
             cur = con.execute(
-                """SELECT j.session_id, ss.summary_md
+                f"""SELECT j.session_id, ss.summary_md
                    FROM embed_jobs j
                    JOIN session_summaries ss USING (session_id)
-                   WHERE j.status='pending'
+                   WHERE j.status='pending' {exclusion}
                      AND (j.source_version IS NULL OR EXISTS (
                        SELECT 1 FROM summarize_jobs s
                         WHERE s.session_id=j.session_id
@@ -302,13 +306,14 @@ class EmbedWorker:
                      ))
                    ORDER BY j.enqueued_at ASC
                    LIMIT ?""",
-                [max_jobs],
+                [*skipped, max_jobs],
             )
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
             claimed_rows: list[dict] = []
             for r in rows:
-                claimed = con.execute(
+                claimed = self._session_quarantine.execute(
+                    con,
                     """UPDATE embed_jobs j SET status='running',
                        attempts = COALESCE(attempts,0)+1, updated_at=now()
                        WHERE j.session_id=? AND j.status='pending'
@@ -320,7 +325,8 @@ class EmbedWorker:
                          ))
                        RETURNING j.session_id""",
                     [r["session_id"]],
-                ).fetchone()
+                    r["session_id"],
+                )
                 if claimed is not None:
                     claimed_rows.append(r)
             rows = claimed_rows
@@ -345,13 +351,14 @@ class EmbedWorker:
 
         con = open_duckdb_connection(self.duckdb_path)
         try:
+            exclusion, skipped = self._span_quarantine.exclusion("span_id")
             pending = con.execute(
-                """SELECT span_id
+                f"""SELECT span_id
                    FROM span_embed_jobs
-                   WHERE status='pending'
+                   WHERE status='pending' {exclusion}
                    ORDER BY enqueued_at ASC
                    LIMIT ?""",
-                [max_jobs],
+                [*skipped, max_jobs],
             ).fetchall()
             span_ids = [row[0] for row in pending]
             if not span_ids:
@@ -373,33 +380,41 @@ class EmbedWorker:
             for span_id in span_ids:
                 r = rows_by_id.get(span_id)
                 if r is None:
-                    con.execute(
+                    claimed = self._span_quarantine.execute(
+                        con,
                         """UPDATE span_embed_jobs SET status='errored',
                            last_error='span row missing', updated_at=now()
                            WHERE span_id=?""",
                         [span_id],
+                        span_id,
                     )
                     continue
                 source_text = build_span_embedding_text(r)
                 if not source_text:
-                    con.execute(
+                    claimed = self._span_quarantine.execute(
+                        con,
                         """UPDATE span_embed_jobs SET status='errored',
                            last_error='no embeddable span text', updated_at=now()
                            WHERE span_id=?""",
                         [r["span_id"]],
+                        span_id,
                     )
                     continue
                 r["source_text"] = source_text
                 r["source_fields"] = [
                     f for f in SPAN_EMBED_TEXT_FIELDS if r.get(f) not in (None, "")
                 ]
-                out.append(r)
-                con.execute(
+                claimed = self._span_quarantine.execute(
+                    con,
                     """UPDATE span_embed_jobs SET status='running',
                        attempts = COALESCE(attempts,0)+1, updated_at=now()
                        WHERE span_id=?""",
                     [r["span_id"]],
+                    span_id,
                 )
+                if claimed is None:
+                    continue
+                out.append(r)
         finally:
             con.close()
         # Shadow durable-ledger lease per claimed span job (AGE-44).
@@ -433,6 +448,9 @@ class EmbedWorker:
                     self.session_job_stream.fail(delivery.id, "missing session_id")
                     continue
                 session_id = str(session_id)
+                if session_id in self._session_quarantine.skipped:
+                    self.session_job_stream.ack(delivery.id)
+                    continue
                 delivery_source_version = delivery.fields.get("source_version")
                 if delivery_source_version is not None:
                     delivery_source_version = str(delivery_source_version)
@@ -448,7 +466,8 @@ class EmbedWorker:
                     if job is None:
                         self.session_job_stream.ack(delivery.id)
                         continue
-                    claimed = con.execute(
+                    claimed = self._session_quarantine.execute(
+                        con,
                         """UPDATE embed_jobs e
                               SET status='running',
                                   attempts=COALESCE(attempts, 0)+1,
@@ -464,7 +483,8 @@ class EmbedWorker:
                               )
                             RETURNING e.session_id""",
                         [session_id, delivery_source_version],
-                    ).fetchone()
+                        session_id,
+                    )
                     if claimed is None:
                         self.session_job_stream.ack(delivery.id)
                         continue
@@ -473,12 +493,17 @@ class EmbedWorker:
                         [session_id],
                     ).fetchone()
                     if summary is None:
-                        con.execute(
+                        claimed = self._session_quarantine.execute(
+                            con,
                             """UPDATE embed_jobs SET status='errored',
                                       last_error='session summary missing', updated_at=now()
                                  WHERE session_id=?""",
                             [session_id],
+                            session_id,
                         )
+                        if claimed is None:
+                            self.session_job_stream.ack(delivery.id)
+                            continue
                         self.session_job_stream.fail(
                             delivery.id, "session summary missing"
                         )
@@ -504,14 +529,19 @@ class EmbedWorker:
                             [session_id],
                         )
                     else:
-                        con.execute(
+                        claimed = self._session_quarantine.execute(
+                            con,
                             """UPDATE embed_jobs SET status='errored',
                                attempts=COALESCE(attempts,0)+1,
                                last_error='session summary missing',
                                updated_at=now()
                                WHERE session_id=?""",
                             [session_id],
+                            session_id,
                         )
+                        if claimed is None:
+                            self.session_job_stream.ack(delivery.id)
+                            continue
                     self.session_job_stream.fail(delivery.id, "session summary missing")
                     continue
                 attempts = (job[1] if job else 0) or 0
@@ -523,12 +553,17 @@ class EmbedWorker:
                         [session_id],
                     )
                 else:
-                    con.execute(
+                    claimed = self._session_quarantine.execute(
+                        con,
                         """UPDATE embed_jobs SET status='running',
                            attempts=?, updated_at=now()
                            WHERE session_id=?""",
                         [attempts + 1, session_id],
+                        session_id,
                     )
+                    if claimed is None:
+                        self.session_job_stream.ack(delivery.id)
+                        continue
                 rows.append(
                     {
                         "session_id": session_id,
@@ -569,6 +604,9 @@ class EmbedWorker:
                     self.span_job_stream.fail(delivery.id, "missing span_id")
                     continue
                 span_id = str(span_id)
+                if span_id in self._span_quarantine.skipped:
+                    self.span_job_stream.ack(delivery.id)
+                    continue
                 job = con.execute(
                     "SELECT status, attempts FROM span_embed_jobs WHERE span_id=?",
                     [span_id],
@@ -610,12 +648,17 @@ class EmbedWorker:
                         [span_id],
                     )
                 else:
-                    con.execute(
+                    claimed = self._span_quarantine.execute(
+                        con,
                         """UPDATE span_embed_jobs SET status='running',
                            attempts=?, updated_at=now()
                            WHERE span_id=?""",
                         [attempts + 1, span_id],
+                        span_id,
                     )
+                    if claimed is None:
+                        self.span_job_stream.ack(delivery.id)
+                        continue
                 r["source_text"] = source_text
                 r["source_fields"] = [
                     f for f in SPAN_EMBED_TEXT_FIELDS if r.get(f) not in (None, "")
@@ -650,12 +693,14 @@ class EmbedWorker:
                 [span_id, message],
             )
         else:
-            con.execute(
+            self._span_quarantine.execute(
+                con,
                 """UPDATE span_embed_jobs SET status='errored',
                    attempts=COALESCE(attempts,0)+1,
                    last_error=?, updated_at=now()
                    WHERE span_id=?""",
                 [message, span_id],
+                span_id,
             )
 
     def _release_session_jobs(self, rows: list[dict]) -> None:

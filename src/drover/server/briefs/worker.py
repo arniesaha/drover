@@ -23,6 +23,7 @@ import duckdb
 from drover.event_identity import canonical_agent_events_cte
 from drover.server import ledger_shadow
 from drover.server.briefs.prompt import build_brief_prompt
+from drover.server.claim_quarantine import ClaimQuarantine
 from drover.server.db import open_duckdb_connection
 from drover.server.jobs import Delivery
 from drover.server.summarizer.backends import (
@@ -58,6 +59,7 @@ class BriefWorker:
         self.poll_interval_s = poll_interval_s
         self.job_stream = job_stream
         self.worker_id = worker_id
+        self._claim_quarantine = ClaimQuarantine("brief_jobs", "project_key", log)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -160,15 +162,19 @@ class BriefWorker:
     def _oldest_pending_project(self) -> Optional[str]:
         con = open_duckdb_connection(self.duckdb_path)
         try:
-            row = con.execute("""SELECT b.project_key FROM brief_jobs b
-                   WHERE b.status='pending'
+            exclusion, skipped = self._claim_quarantine.exclusion("b.project_key")
+            row = con.execute(
+                f"""SELECT b.project_key FROM brief_jobs b
+                   WHERE b.status='pending' {exclusion}
                      AND (b.source_version IS NULL OR EXISTS (
                        SELECT 1 FROM summarize_jobs s
                         WHERE s.session_id=b.source_session_id
                           AND s.source_version IS NOT DISTINCT FROM b.source_version
                           AND s.status='done'
                      ))
-                   ORDER BY enqueued_at ASC LIMIT 1""").fetchone()
+                   ORDER BY enqueued_at ASC LIMIT 1""",
+                skipped,
+            ).fetchone()
             return row[0] if row else None
         finally:
             con.close()
@@ -198,19 +204,24 @@ class BriefWorker:
     def _claim_duckdb_job(self) -> Optional[tuple[str, Optional[Delivery]]]:
         con = open_duckdb_connection(self.duckdb_path)
         try:
-            row = con.execute("""SELECT b.project_key, b.attempts FROM brief_jobs b
-                   WHERE b.status='pending'
+            exclusion, skipped = self._claim_quarantine.exclusion("b.project_key")
+            row = con.execute(
+                f"""SELECT b.project_key, b.attempts FROM brief_jobs b
+                   WHERE b.status='pending' {exclusion}
                      AND (b.source_version IS NULL OR EXISTS (
                        SELECT 1 FROM summarize_jobs s
                         WHERE s.session_id=b.source_session_id
                           AND s.source_version IS NOT DISTINCT FROM b.source_version
                           AND s.status='done'
                      ))
-                   ORDER BY enqueued_at ASC LIMIT 1""").fetchone()
+                   ORDER BY enqueued_at ASC LIMIT 1""",
+                skipped,
+            ).fetchone()
             if row is None:
                 return None
             project_key, attempts = row[0], row[1] or 0
-            claimed = con.execute(
+            claimed = self._claim_quarantine.execute(
+                con,
                 """UPDATE brief_jobs b
                    SET status='running', attempts=?, updated_at=now()
                    WHERE b.project_key=? AND b.status='pending'
@@ -222,7 +233,8 @@ class BriefWorker:
                      ))
                    RETURNING b.project_key""",
                 [attempts + 1, project_key],
-            ).fetchone()
+                project_key,
+            )
             if claimed is None:
                 return None
         finally:
@@ -241,6 +253,9 @@ class BriefWorker:
             self.job_stream.fail(delivery.id, "missing project_key")
             return None, delivery
         project_key = str(project_key)
+        if project_key in self._claim_quarantine.skipped:
+            self.job_stream.ack(delivery.id)
+            return None, None
         delivery_source_session_id = delivery.fields.get("source_session_id")
         delivery_source_version = delivery.fields.get("source_version")
         if delivery_source_session_id is not None:
@@ -259,7 +274,8 @@ class BriefWorker:
                 if row is None:
                     self.job_stream.ack(delivery.id)
                     return None, None
-                claimed = con.execute(
+                claimed = self._claim_quarantine.execute(
+                    con,
                     """UPDATE brief_jobs b
                           SET status='running',
                               attempts=COALESCE(attempts, 0)+1,
@@ -276,7 +292,8 @@ class BriefWorker:
                           )
                         RETURNING b.project_key""",
                     [project_key, delivery_source_session_id, delivery_source_version],
-                ).fetchone()
+                    project_key,
+                )
                 if claimed is None:
                     self.job_stream.ack(delivery.id)
                     return None, None
@@ -293,12 +310,17 @@ class BriefWorker:
             if status == "done":
                 self.job_stream.ack(delivery.id)
                 return None, None
-            con.execute(
+            claimed = self._claim_quarantine.execute(
+                con,
                 """UPDATE brief_jobs
                    SET status='running', attempts=?, updated_at=now()
                    WHERE project_key=?""",
                 [attempts + 1, project_key],
+                project_key,
             )
+            if claimed is None:
+                self.job_stream.ack(delivery.id)
+                return None, None
             return project_key, delivery
         finally:
             con.close()
