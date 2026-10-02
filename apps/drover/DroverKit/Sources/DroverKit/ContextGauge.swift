@@ -27,7 +27,7 @@ public struct ContextGauge: Sendable, Equatable {
 
     public init?(messages: [HarnessMessage], harness: String? = nil) {
         let normalizedHarness = harness?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalizedHarness == "codex" {
+        if normalizedHarness == "codex" {  // harness-name: selects the usage payload format to parse; display only
             guard let context = Self.latestCodexContext(messages) else { return nil }
             usedTokens = context.usedTokens
             window = context.window

@@ -161,7 +161,10 @@ swift test --package-path apps/drover/DroverKit --jobs 2
 
 The credential-free deterministic journey and its Accessibility XXXL companion
 exercise the app's real navigation against the synthetic `core-journey`
-fixture. They do not need a server URL, token, or network access:
+fixture. `CapabilityJourneyUITests` runs the same navigation against the
+`capability-journey` fleet. That fleet has a fixture adapter with an unusual
+capability mix, Codex without approvals and a legacy host with no matrix
+(#420). None of these tests need a server URL, token, or network access:
 
 ```bash
 DROVER_SIMULATOR_ID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ {print $2; exit}')"
@@ -170,6 +173,7 @@ xcodebuild -project apps/drover/Drover.xcodeproj -scheme DroverUITests \
   -destination "id=$DROVER_SIMULATOR_ID" \
   -only-testing:DroverUITests/DeterministicJourneyUITests \
   -only-testing:DroverUITests/AccessibilityJourneyUITests \
+  -only-testing:DroverUITests/CapabilityJourneyUITests \
   test
 ```
 

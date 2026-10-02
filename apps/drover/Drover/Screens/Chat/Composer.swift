@@ -9,7 +9,9 @@ struct Composer: View {
     @Binding var text: String
     @Binding var attachments: [TurnAttachment]
     let runPreferences: HarnessModelCatalogState
-    let harness: String
+    /// What the session's host advertises for its harness; drives the
+    /// preference chips, their lock and the attach button.
+    let controls: HarnessControls
     let isSending: Bool
     let canSend: Bool
     let canAddAttachments: Bool
@@ -27,7 +29,9 @@ struct Composer: View {
             text: $text,
             attachments: $attachments,
             runPreferences: runPreferences,
-            arePreferencesEditable: HarnessRunPreferences.canChangeInExistingSession(harness),
+            showsPreferences: controls.showsModelControls,
+            arePreferencesEditable: HarnessRunPreferences.canChangeInExistingSession(controls),
+            preferencesLockedReason: controls.preferencesLockedReason,
             placeholder: "Add feedback...",
             isSending: isSending,
             canSend: !isEmpty && canSend,
@@ -42,9 +46,10 @@ struct Composer: View {
                     .contentShape(Circle())
             }
             .accessibilityLabel("Attach image")
+            .accessibilityHint(controls.attachmentsUnavailableReason ?? "")
             .accessibilityIdentifier("composer-attach")
-            .disabled(!canAddAttachments)
-            .opacity(canAddAttachments ? 1 : 0.45)
+            .disabled(!canAddAttachments || !controls.acceptsImageAttachments)
+            .opacity(canAddAttachments && controls.acceptsImageAttachments ? 1 : 0.45)
         } onSend: {
             onSend()
         }

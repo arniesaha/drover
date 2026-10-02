@@ -4,6 +4,9 @@ import DroverKit
 #if DEBUG
 enum FixtureScenarioKind: String {
     case coreJourney = "core-journey"
+    /// The core journey's app root against a fleet with materially different
+    /// capability envelopes, including a legacy matrix-less host (#420).
+    case capabilityJourney = "capability-journey"
     case insightDetail = "insight-detail"
     case observability = "observability"
 }

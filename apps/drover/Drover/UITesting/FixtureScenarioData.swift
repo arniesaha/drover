@@ -92,6 +92,42 @@ enum FixtureScenarioData {
         ]
     }
 
+    // MARK: Capability envelopes (#420)
+
+    /// Codex's schema v1 row exactly as a current host publishes it.
+    private static var codexRow: [String: Any] { [
+        "name": "codex", "enabled": true, "description": "Codex CLI", "command": [String](),
+        "capabilities": [
+            "schema_version": 1, "harness_id": "codex", "launch_modes": ["structured"],
+            "approvals": false, "interrupt": true, "native_resume": true,
+            "model_catalog": true, "usage": false, "worktree": true,
+            "interactive_auth": true, "turn_preferences": true,
+            "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+        ] as [String: Any],
+    ] }
+
+    /// A fixture adapter with a deliberately unusual mix: approvals but no
+    /// interrupt, both launch modes, no model catalog or sign-in, and PNG-only
+    /// attachments (the app sends JPEG, so attaching is unavailable).
+    private static var labRow: [String: Any] { [
+        "name": capabilityLabHarness, "enabled": true,
+        "description": "Fixture adapter", "command": [String](),
+        "capabilities": [
+            "schema_version": 1, "harness_id": capabilityLabHarness,
+            "launch_modes": ["pty", "structured"],
+            "approvals": true, "interrupt": false, "native_resume": false,
+            "model_catalog": false, "usage": false, "worktree": false,
+            "interactive_auth": false, "turn_preferences": false,
+            "attachments": ["image/png"],
+        ] as [String: Any],
+    ] }
+
+    static let capabilityLabHarness = "fixture-lab"
+    static let legacyHostID = "fixture-legacy-host"
+    static let legacyHostName = "Legacy Mac"
+    static let labSessionID = "fixture-lab-session"
+    static let codexApprovalSessionID = "fixture-codex-approval"
+
     static func snapshotData() -> Data {
         jsonData([
             "hosts": [[
@@ -100,7 +136,7 @@ enum FixtureScenarioData {
                 "connection_kind": "direct",
                 "capabilities": [
                     "display_name": coreJourney.hostName,
-                    "harnesses": [["name": "codex", "enabled": true]],
+                    "harnesses": [codexRow],
                 ],
             ]],
             "sessions": coreJourney.sessions.map { session in
@@ -120,6 +156,52 @@ enum FixtureScenarioData {
                 "source": "fixture",
                 "host_id": coreJourney.hostID,
             ]],
+        ])
+    }
+
+    /// The capability journey's fleet: the fixture host advertises Codex and
+    /// the unusual fixture adapter; a second, pre-#418 host advertises no
+    /// matrix at all and must offer nothing to launch.
+    static func capabilitySnapshotData() -> Data {
+        func session(_ id: String, harness: String) -> [String: Any] {
+            [
+                "session_id": id,
+                "host_id": coreJourney.hostID,
+                "harness": harness,
+                "mode": "structured",
+                "status": "working",
+                "awaiting": "approval",
+                "cwd": "/fixture/project",
+                "preview": "Capability fixture: \(harness)",
+                "last_activity": "2026-09-04T00:00:00Z",
+            ]
+        }
+        return jsonData([
+            "hosts": [
+                [
+                    "host_id": coreJourney.hostID,
+                    "status": "online",
+                    "connection_kind": "direct",
+                    "capabilities": [
+                        "display_name": coreJourney.hostName,
+                        "harnesses": [codexRow, labRow],
+                    ],
+                ],
+                [
+                    "host_id": legacyHostID,
+                    "status": "online",
+                    "connection_kind": "direct",
+                    "capabilities": [
+                        "display_name": legacyHostName,
+                        "harnesses": ["shell", ["name": "codex", "enabled": true]] as [Any],
+                    ],
+                ],
+            ],
+            "sessions": [
+                session(labSessionID, harness: capabilityLabHarness),
+                session(codexApprovalSessionID, harness: "codex"),
+            ],
+            "cwd_suggestions": [],
         ])
     }
 
@@ -148,6 +230,22 @@ enum FixtureScenarioData {
             "text": "Fixture ready: \(sessionID)",
             "payload": [:],
         ]]
+        // Capability sessions wait on a tool approval, so the journey can
+        // see who may answer it from iOS.
+        if sessionID == labSessionID || sessionID == codexApprovalSessionID {
+            messages.append([
+                "event_id": "fixture-approval-\(sessionID)",
+                "seq": 2,
+                "type": "approval_prompt",
+                "role": "system",
+                "text": "approval needed: Bash",
+                "payload": [
+                    "request_id": "fixture-request",
+                    "tool": "Bash",
+                    "input": ["command": "ls"],
+                ] as [String: Any],
+            ])
+        }
         if let receiptTurnID {
             messages.append([
                 "event_id": "fixture-receipt-\(receiptTurnID)",
@@ -162,8 +260,8 @@ enum FixtureScenarioData {
         return jsonData([
             "messages": messages,
             "page_min_seq": 1,
-            "page_max_seq": receiptTurnID == nil ? 1 : 2,
-            "max_seq": receiptTurnID == nil ? 1 : 2,
+            "page_max_seq": messages.count,
+            "max_seq": messages.count,
             "has_older": false,
             "has_newer": false,
         ])

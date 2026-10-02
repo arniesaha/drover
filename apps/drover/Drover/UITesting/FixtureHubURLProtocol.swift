@@ -151,8 +151,14 @@ final class FixtureHubURLProtocol: URLProtocol {
         case ("GET", let path) where path == "/insights/\(FixtureScenarioData.insightFindingID)":
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.insightDetailData())
         case ("GET", "/harness"):
-            return FixtureHubResponse(status: 200, body: state.kind == .observability
-                ? ObservabilityFixtureData.homeSnapshot : FixtureScenarioData.snapshotData())
+            switch state.kind {
+            case .observability:
+                return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.homeSnapshot)
+            case .capabilityJourney:
+                return FixtureHubResponse(status: 200, body: FixtureScenarioData.capabilitySnapshotData())
+            case .coreJourney, .insightDetail:
+                return FixtureHubResponse(status: 200, body: FixtureScenarioData.snapshotData())
+            }
         case ("GET", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/model-catalog":
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.modelCatalogData())
         case ("POST", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/sessions":

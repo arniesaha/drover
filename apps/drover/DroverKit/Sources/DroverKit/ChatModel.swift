@@ -361,6 +361,9 @@ public final class ChatModel {
     private nonisolated(unsafe) var recapRefreshTask: Task<Void, Never>?
     private var recapRefreshGeneration = 0
     private var hasInitializedRunPreferences = false
+    /// The catalog availability run preferences were last selected with, so
+    /// a snapshot that withdraws or grants `model_catalog` re-selects them.
+    private var runPreferencesCatalogAvailable: Bool?
     private let recapPollInterval: Duration
     private let recapPollAttempts: Int
     /// How long an accepted turn may sit unechoed before the UI offers Retry.
@@ -750,7 +753,8 @@ public final class ChatModel {
     /// editable composition, which keeps the composer honest about what can
     /// survive a recreation.
     public func addAttachmentIfRecoverable(_ attachment: TurnAttachment) async -> Bool {
-        guard !isCommittingPendingDeliveryAction,
+        guard controls.capabilities.accepts(mediaType: attachment.mediaType),
+              !isCommittingPendingDeliveryAction,
               pendingAttachments.count < 4,
               recoveryStatusMessage == nil
         else { return false }
@@ -1446,14 +1450,14 @@ public final class ChatModel {
     }
 
     private var turnPreferences: (model: String?, thinking: String?) {
-        let harness = harnessPresentation.harness
-        guard HarnessRunPreferences.canChangeInExistingSession(harness) else {
+        guard HarnessRunPreferences.canChangeInExistingSession(controls) else {
             return (nil, nil)
         }
         return (runPreferences.modelOverride, runPreferences.thinkingEffortOverride)
     }
 
     public func approve(_ decision: String) async {
+        guard controls.showsApprovals else { return }
         guard !isAnswering else { return }
         guard let requestID = pendingApproval?.payload["request_id"]?.stringValue else { return }
         isAnswering = true
@@ -1484,10 +1488,19 @@ public final class ChatModel {
         }
     }
 
-    /// Enabled harnesses on this session's host, for the handoff target
-    /// picker. Loaded on demand by `loadSessionMetadata()`; empty until then
-    /// (the UI falls back to the plain same-harness handoff).
+    /// Harnesses on this session's host that launch in structured mode, for
+    /// the handoff target picker: the handoff seed becomes their first turn.
+    /// PTY-only targets are excluded because the seed would be typed into a
+    /// terminal and run as commands. Loaded on demand by
+    /// `loadSessionMetadata()`; empty until then (the UI falls back to the
+    /// plain same-harness handoff).
     public private(set) var handoffHarnesses: [String] = []
+
+    /// Session controls this session's host advertises for its harness.
+    /// `.unresolved` until the first snapshot read, which withholds every
+    /// control: nothing is offered before the host has said it supports it.
+    /// Settable from tests via `@testable import`.
+    public internal(set) var controls: HarnessControls = .unresolved
 
     /// Applies all snapshot-backed state for this open session. A missing
     /// generated recap may seed the display from preview only when the chat
@@ -1497,11 +1510,14 @@ public final class ChatModel {
         guard let metadata = await Self.fetchSessionMetadata(client: client, sessionID: sessionID)
         else { return }
         applySessionMetadata(metadata.snapshot, session: metadata.session)
-        if !hasInitializedRunPreferences {
+        let catalogAvailable = controls.showsModelControls
+        if !hasInitializedRunPreferences || runPreferencesCatalogAvailable != catalogAvailable {
             hasInitializedRunPreferences = true
+            runPreferencesCatalogAvailable = catalogAvailable
             runPreferences.select(
                 hostID: metadata.session.hostID,
                 harness: metadata.session.harness,
+                catalogAvailable: catalogAvailable,
                 seedModel: Self.nonEmpty(metadata.session.model),
                 seedThinkingEffort: Self.nonEmpty(metadata.session.thinkingEffort)
             )
@@ -1546,8 +1562,11 @@ public final class ChatModel {
             recap = preview
             recapSourceSeq = nil
         }
-        guard let host = snapshot.hosts.first(where: { $0.id == session.hostID }) else { return }
-        handoffHarnesses = host.harnesses
+        controls = HarnessControls(snapshot: snapshot, hostID: session.hostID, harness: session.harness)
+        let host = snapshot.hosts.first { $0.id == session.hostID }
+        handoffHarnesses = (host?.launchableOffers ?? [])
+            .filter { $0.launchMode == .structured }
+            .map(\.name)
     }
 
     private static func nonEmpty(_ value: String?) -> String? {
@@ -1563,6 +1582,10 @@ public final class ChatModel {
     }
 
     public func interrupt() async {
+        if let reason = controls.interruptUnavailableReason {
+            hint = reason
+            return
+        }
         do {
             try await client.interrupt(sessionID: sessionID)
             hint = nil

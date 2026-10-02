@@ -65,6 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolated Git worktree, and Claude factory sessions run with
   `--permission-mode dontAsk`, so tools that would need approval are denied
   instead of parking the session (#445).
+- iOS harness controls are capability-driven (#420). The launch sheet, sign-in,
+  model and effort pickers, approvals, interrupt, handoff targets, worktree note
+  and attachments read the host's schema v1 capability matrix instead of
+  harness-name lists. Controls a host does not advertise are hidden or
+  disabled with a spoken reason. Hosts without a matrix are listed but offer
+  nothing to launch, with an "update Drover on the host" explanation. A
+  DroverKit test fails if a quoted harness ID appears in iOS control code.
+- Capability schema v1 gains an additive `turn_preferences` flag: model and
+  effort overrides reach later turns of a running session. It is projected
+  from the adapter's existing turn-dispatch contract, so it is false for
+  Claude Code and true for Codex, agy and DeepSeek. Hosts that predate the flag
+  omit it, and clients read that as false (#420).
 
 ### Fixed
 

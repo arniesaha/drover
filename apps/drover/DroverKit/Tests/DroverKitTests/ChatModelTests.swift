@@ -117,7 +117,7 @@ private func sessionJSON(
     return Data("""
     {"hosts": [{"host_id": "host-1", "status": "online",
       "capabilities": {"display_name": "Host", "harnesses": [
-        {"name": "codex", "enabled": true}]}}],
+        \(v1Row("codex"))]}}],
      "sessions": [{"session_id": "s1", "host_id": "host-1", "harness": "codex",
        "mode": "structured", "status": "running", "awaiting": null\(recapField)\(sourceField)\(previewField)\(modelField)\(effortField)}],
      "cwd_suggestions": []}
@@ -318,7 +318,7 @@ struct ChatModelTests {
         recap: "Old", recapSourceSeq: 8,
         recapPollInterval: .zero, recapPollAttempts: 1
     )
-    model.runPreferences.select(hostID: "host-1", harness: "codex")
+    model.runPreferences.select(hostID: "host-1", harness: "codex", catalogAvailable: true)
     model.runPreferences.apply(catalog)
     model.runPreferences.selectedModel = "session-model"
     model.runPreferences.thinkingEffort = "low"
@@ -590,7 +590,8 @@ struct ChatModelTests {
     let model = recoveryChatModel(client: client(), sessionID: "harness-1")
     #expect(model.handoffHarnesses.isEmpty)
     await model.loadSessionMetadata()
-    #expect(model.handoffHarnesses == ["shell", "claude-code", "agy"])
+    // Structured launchers only: the PTY-only shell would run the seed.
+    #expect(model.handoffHarnesses == ["claude-code", "agy"])
 }
 
 @Test @MainActor func sessionMetadataSelectsActualPairAndOverridesStoredPreference() async throws {
@@ -615,7 +616,7 @@ struct ChatModelTests {
     let snapshot = Data("""
     {"hosts": [{"host_id": "mac-mini", "status": "online",
       "capabilities": {"display_name": "Mac Mini", "harnesses": [
-        {"name": "codex", "enabled": true}]}}],
+        \(v1Row("codex"))]}}],
      "sessions": [
       {"session_id": "harness-preferred", "host_id": "mac-mini", "harness": "codex",
        "mode": "structured", "status": "running", "awaiting": null,
@@ -881,7 +882,8 @@ struct ChatModelTests {
     let model = recoveryChatModel(
         client: client(), sessionID: "s1", harness: "codex", store: chatTestStore()
     )
-    model.runPreferences.select(hostID: "host-1", harness: "codex")
+    model.controls = HarnessControls(offer: v1Offer("codex"))
+    model.runPreferences.select(hostID: "host-1", harness: "codex", catalogAvailable: true)
     model.runPreferences.apply(fixtureCatalog(
         hostID: "host-1", scope: "scope-chat", model: "gpt-5.6-sol",
         supportedEfforts: ["xhigh"]
@@ -907,7 +909,8 @@ struct ChatModelTests {
     let model = recoveryChatModel(
         client: client(), sessionID: "s1", harness: "agy", store: chatTestStore()
     )
-    model.runPreferences.select(hostID: "host-1", harness: "agy")
+    model.controls = HarnessControls(offer: v1Offer("agy"))
+    model.runPreferences.select(hostID: "host-1", harness: "agy", catalogAvailable: true)
     model.runPreferences.apply(HarnessModelCatalog(
         schemaVersion: 1, hostID: "host-1", harness: "agy",
         accountScopeID: "scope-agy", harnessVersion: nil, discoveredAt: nil,
@@ -940,7 +943,8 @@ struct ChatModelTests {
         client: client(), sessionID: "s1", harness: "claude-code",
         store: chatTestStore()
     )
-    model.runPreferences.select(hostID: "host-1", harness: "claude-code")
+    model.controls = HarnessControls(offer: v1Offer("claude-code"))
+    model.runPreferences.select(hostID: "host-1", harness: "claude-code", catalogAvailable: true)
     model.runPreferences.apply(fixtureCatalog(
         hostID: "host-1", harness: "claude-code", scope: "scope-chat",
         model: "opus", supportedEfforts: ["high"]
@@ -953,7 +957,7 @@ struct ChatModelTests {
 
     #expect(sentModel == false)
     #expect(sentThinking == false)
-    #expect(HarnessRunPreferences.canChangeInExistingSession("claude-code") == false)
+    #expect(HarnessRunPreferences.canChangeInExistingSession(model.controls) == false)
 }
 
 @Test @MainActor func queuedTurnOmitsLockedClaudePreferences() async throws {
@@ -971,7 +975,8 @@ struct ChatModelTests {
         client: client(), sessionID: "s1", harness: "claude-code",
         store: chatTestStore()
     )
-    model.runPreferences.select(hostID: "host-1", harness: "claude-code")
+    model.controls = HarnessControls(offer: v1Offer("claude-code"))
+    model.runPreferences.select(hostID: "host-1", harness: "claude-code", catalogAvailable: true)
     model.runPreferences.apply(fixtureCatalog(
         hostID: "host-1", harness: "claude-code", scope: "scope-chat",
         model: "opus", supportedEfforts: ["high"]
@@ -1207,6 +1212,7 @@ struct ChatModelTests {
         return (200, Data())
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.controls = .everythingAdvertised
     await model.interrupt()
     await model.terminate()
     #expect(paths == ["/harness/sessions/s1/interrupt", "/harness/sessions/s1/terminate"])
@@ -1215,6 +1221,7 @@ struct ChatModelTests {
 @Test @MainActor func transportFailureGetsGenericRetryHint() async throws {
     MockURLProtocol.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.controls = .everythingAdvertised
     await model.interrupt()
     #expect(model.hint == "Could not interrupt — try again.")
 }
@@ -1229,6 +1236,7 @@ struct ChatModelTests {
         (504, Data(#"{"error": "harness host did not answer within 120s"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.controls = .everythingAdvertised
 
     await model.interrupt()
 
@@ -1588,6 +1596,7 @@ struct ChatModelTests {
 
     // A successful interrupt clears `hint`, and used to take the only Retry
     // affordance with it while the delivery stayed unresolved.
+    model.controls = .everythingAdvertised
     MockURLProtocol.transportError = nil
     MockURLProtocol.handler = { _ in (200, Data(#"{"status": "ok"}"#.utf8)) }
     await model.interrupt()

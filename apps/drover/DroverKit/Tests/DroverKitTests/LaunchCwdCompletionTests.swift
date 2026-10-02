@@ -10,10 +10,10 @@ private let cwdCompletionSnapshotJSON = Data("""
 {"hosts": [
   {"host_id": "work-laptop", "status": "online",
    "capabilities": {"display_name": "Work Laptop",
-                    "harnesses": [{"name": "claude-code", "enabled": true}]}},
+                    "harnesses": [\(v1Row("claude-code"))]}},
   {"host_id": "nas", "status": "online",
    "capabilities": {"display_name": "NAS",
-                    "harnesses": [{"name": "claude-code", "enabled": true}]}}],
+                    "harnesses": [\(v1Row("claude-code"))]}}],
  "sessions": [],
  "cwd_suggestions": [
   {"path": "/home/arnab/dev/drover", "source": "favorite"},

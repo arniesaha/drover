@@ -39,6 +39,7 @@ struct LaunchView: View {
                             .tag(host.id)
                     }
                 }
+                .accessibilityIdentifier("launch-host-picker")
 
                 if let warning = model.hostWarning {
                     Label(warning, systemImage: "exclamationmark.triangle.fill")
@@ -49,10 +50,35 @@ struct LaunchView: View {
             }
 
             Section("Harness") {
-                Picker("Harness", selection: $model.harness) {
-                    ForEach(model.availableHarnesses, id: \.self) { name in
-                        Text(name).tag(name)
+                if model.availableHarnesses.isEmpty {
+                    // Nothing on this host advertises a launch mode — most
+                    // often a host running a Drover that predates capability
+                    // envelopes. Say so instead of an empty picker.
+                    if let reason = model.harnessUnavailableReason {
+                        Label(reason, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(DroverColor.warn)
+                            .accessibilityIdentifier("launch-harness-unavailable")
                     }
+                } else {
+                    Picker("Harness", selection: $model.harness) {
+                        ForEach(model.availableHarnesses, id: \.self) { name in
+                            Text(name).tag(name)
+                        }
+                    }
+                    .accessibilityIdentifier("launch-harness-picker")
+                }
+
+                // Rows the host lists but this app can't launch, each with
+                // its reason, so a missing harness is never a mystery.
+                ForEach(model.unavailableHarnesses, id: \.name) { row in
+                    LabeledContent(row.name) {
+                        Text("Unavailable")
+                    }
+                    .foregroundStyle(.secondary)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityHint(row.reason)
+                    .accessibilityIdentifier("launch-unavailable-\(row.name)")
                 }
 
                 if model.supportsInteractiveAuth {
@@ -91,6 +117,13 @@ struct LaunchView: View {
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("cwd-suggestions-unreachable")
                 }
+
+                if model.controls.explainsWorktreeIsolation {
+                    Label(HarnessCapabilityCopy.worktreeIsolation, systemImage: "arrow.triangle.branch")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("launch-worktree-note")
+                }
             }
 
             if model.isStructured {
@@ -99,6 +132,7 @@ struct LaunchView: View {
                         text: $model.prompt,
                         attachments: $model.promptAttachments,
                         runPreferences: model.runPreferences,
+                        showsPreferences: model.showsRunPreferences,
                         placeholder: "Add instructions...",
                         showsSendButton: false,
                         attachmentAccessibilityIdentifier: "launch-attachment"
@@ -112,7 +146,10 @@ struct LaunchView: View {
                                 .contentShape(Circle())
                         }
                         .accessibilityLabel("Attach image")
+                        .accessibilityHint(model.controls.attachmentsUnavailableReason ?? "")
                         .accessibilityIdentifier("launch-attach")
+                        .disabled(!model.canAttachImages)
+                        .opacity(model.canAttachImages ? 1 : 0.45)
                     }
                     .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                     .listRowBackground(Color.clear)
@@ -184,8 +221,14 @@ struct LaunchView: View {
         // arrives from the server — `select()` reads the local cache alone, so
         // without this the model and effort pickers stay empty for any
         // uncached pair and a launch silently drops both overrides.
+        // A no-op unless the host advertises `model_catalog` for the pair.
         .task(id: "\(model.hostID)\u{1f}\(model.harness)") {
             await model.runPreferences.refresh()
+        }
+        // A harness switch can drop image support; never launch with
+        // attachments the new selection would not accept.
+        .onChange(of: model.canAttachImages) { _, canAttach in
+            if !canAttach { model.promptAttachments = [] }
         }
     }
 

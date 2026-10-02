@@ -31,12 +31,36 @@ func droverKitFixtureURL(_ name: String, withExtension extensionName: String = "
     #endif
 }
 
+/// The v1 matrices current hosts publish for the built-in harnesses, keyed
+/// by name. Test data only: `HarnessCapabilitiesTests` pins every entry to the
+/// server-generated golden `harness-capabilities-v1.json`, so these cannot
+/// drift from what a real host sends.
+let builtinV1Matrices: [String: String] = [
+    "shell": #"{"schema_version": 1, "harness_id": "shell", "launch_modes": ["pty"], "approvals": false, "interrupt": false, "native_resume": false, "model_catalog": false, "usage": false, "worktree": false, "interactive_auth": false, "turn_preferences": false, "attachments": []}"#,
+    "claude-code": #"{"schema_version": 1, "harness_id": "claude-code", "launch_modes": ["structured"], "approvals": true, "interrupt": true, "native_resume": true, "model_catalog": true, "usage": false, "worktree": false, "interactive_auth": true, "turn_preferences": false, "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"]}"#,
+    "codex": #"{"schema_version": 1, "harness_id": "codex", "launch_modes": ["structured"], "approvals": false, "interrupt": true, "native_resume": true, "model_catalog": true, "usage": false, "worktree": true, "interactive_auth": true, "turn_preferences": true, "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"]}"#,
+    "agy": #"{"schema_version": 1, "harness_id": "agy", "launch_modes": ["structured"], "approvals": false, "interrupt": true, "native_resume": true, "model_catalog": true, "usage": false, "worktree": true, "interactive_auth": true, "turn_preferences": true, "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"]}"#,
+    "deepseek-harness": #"{"schema_version": 1, "harness_id": "deepseek-harness", "launch_modes": ["structured"], "approvals": false, "interrupt": true, "native_resume": true, "model_catalog": true, "usage": false, "worktree": true, "interactive_auth": false, "turn_preferences": true, "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"]}"#,
+]
+
+/// One envelope row for a built-in harness, as a current host publishes it.
+func v1Row(_ name: String, enabled: Bool = true) -> String {
+    #"{"name": "\#(name)", "enabled": \#(enabled), "capabilities": \#(builtinV1Matrices[name]!)}"#
+}
+
+/// The same built-in rows decoded, for tests that build `HostSummary` directly.
+func v1Offer(_ name: String, enabled: Bool = true) -> HarnessOffer {
+    let data = Data(v1Row(name, enabled: enabled).utf8)
+    let row = try! JSONDecoder().decode(JSONValue.self, from: data)
+    return HarnessOffer(row: row)!
+}
+
 let snapshotJSON = Data("""
 {"hosts": [{"host_id": "mac-mini", "status": "online",
   "capabilities": {"display_name": "Mac Mini", "harnesses": [
-    {"name": "shell", "enabled": true},
-    {"name": "claude-code", "enabled": true},
-    {"name": "agy", "enabled": true}]}}],
+    \(v1Row("shell")),
+    \(v1Row("claude-code")),
+    \(v1Row("agy"))]}}],
  "sessions": [
   {"session_id": "harness-1", "host_id": "mac-mini", "harness": "agy",
    "mode": "structured", "status": "running", "awaiting": "approval",
@@ -60,17 +84,17 @@ let multiHostSnapshotJSON = Data("""
 {"hosts": [
   {"host_id": "mac-mini", "status": "online",
    "capabilities": {"display_name": "Mac Mini", "harnesses": [
-     {"name": "shell", "enabled": true},
-     {"name": "claude-code", "enabled": true},
-     {"name": "agy", "enabled": true}]}},
+     \(v1Row("shell")),
+     \(v1Row("claude-code")),
+     \(v1Row("agy"))]}},
   {"host_id": "nas", "status": "online",
    "capabilities": {"display_name": "NAS", "harnesses": [
-     {"name": "shell", "enabled": true},
-     {"name": "codex", "enabled": true}]}},
+     \(v1Row("shell")),
+     \(v1Row("codex"))]}},
   {"host_id": "studio", "status": "online",
    "capabilities": {"display_name": "Studio", "harnesses": [
-     {"name": "claude-code", "enabled": true},
-     {"name": "agy", "enabled": true}]}}],
+     \(v1Row("claude-code")),
+     \(v1Row("agy"))]}}],
  "sessions": [],
  "cwd_suggestions": []}
 """.utf8)
@@ -120,7 +144,8 @@ extension HostSummary {
             status: status,
             connectionKind: connectionKind,
             lastSeenAt: lastSeenAt,
-            harnesses: harnesses
+            harnesses: harnesses,
+            harnessOffers: harnesses.map { v1Offer($0) }
         )
     }
 }
@@ -133,15 +158,15 @@ let fleetSnapshotJSON = Data("""
   "hosts": [
     {"host_id": "mac-mini", "status": "online", "connection_kind": "direct",
      "capabilities": {"display_name": "Mac Mini",
-                      "harnesses": [{"name": "claude-code", "enabled": true}]}},
+                      "harnesses": [\(v1Row("claude-code"))]}},
     {"host_id": "nas", "status": "stale", "connection_kind": "direct",
      "last_seen_at": "2026-07-30 09:00:00+00:00", "stale_after_seconds": 45,
      "capabilities": {"display_name": "NAS",
-                      "harnesses": [{"name": "claude-code", "enabled": true}]}},
+                      "harnesses": [\(v1Row("claude-code"))]}},
     {"host_id": "work-laptop", "status": "offline", "connection_kind": "relay",
      "last_seen_at": "2026-07-30 08:30:00+00:00",
      "capabilities": {"display_name": "Work Laptop",
-                      "harnesses": [{"name": "claude-code", "enabled": true}]}}
+                      "harnesses": [\(v1Row("claude-code"))]}}
   ],
   "sessions": [
     {"session_id": "mac-running", "host_id": "mac-mini", "harness": "claude-code",
@@ -258,11 +283,28 @@ extension ChatModel {
     /// A `ChatModel` with no live stream — `ingest(_:)` drives it directly
     /// in tests, no `MockURLProtocol.handler` needed unless the test also
     /// calls a network action (`sendTurn`/`approve`/etc.).
+    /// Its host advertises every session control, so tests of approval and
+    /// turn mechanics are not also tests of capability gating.
     static func fixture(messages: [HarnessMessage] = []) -> ChatModel {
-        recoveryChatModel(
+        let model = recoveryChatModel(
             client: client(),
             sessionID: "fixture-session",
             initialMessages: messages
         )
+        model.controls = .everythingAdvertised
+        return model
     }
+}
+
+extension HarnessControls {
+    /// A host advertising every session control, for tests about something
+    /// else. Capability gating itself is covered in `HarnessCapabilitiesTests`.
+    static let everythingAdvertised = HarnessControls(offer: HarnessOffer(
+        name: "fixture",
+        capabilities: HarnessCapabilities(
+            launchModes: [.structured], approvals: true, interrupt: true,
+            nativeResume: true, modelCatalog: true, turnPreferences: true,
+            attachments: ["image/*"]
+        )
+    ))
 }

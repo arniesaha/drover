@@ -1608,13 +1608,16 @@ private func recoveryModel(
         credentialBindingID: binding,
         session: MockURLProtocol.session()
     )
-    return ChatModel(
+    let model = ChatModel(
         client: client,
         sessionID: "recovery-session",
         recoveryStore: recoveryStore,
         recoveryWriteGate: recoveryWriteGate,
         recoveryGeneration: recoveryWriteGate.generation
     )
+    // Recovery is about durability; let the host accept attachments.
+    model.controls = .everythingAdvertised
+    return model
 }
 
 private func recoveryKey(binding: UUID) -> ChatRecoveryKey {

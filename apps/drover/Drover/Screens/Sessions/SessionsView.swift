@@ -455,8 +455,8 @@ struct SessionsView: View {
                 Label("Continue session", systemImage: "arrow.triangle.branch")
             }
             // Cross-harness targets from the session's host (via the polled
-            // snapshot). "shell" is excluded — the handoff seed gets typed
-            // into the PTY, and a bare shell would execute it as commands.
+            // snapshot): structured launchers only — a PTY-only target would
+            // execute the typed-in handoff seed as commands.
             ForEach(crossHarnessTargets(for: session), id: \.self) { harness in
                 let presentation = HarnessPresentation(harness)
                 Button {
@@ -510,11 +510,14 @@ struct SessionsView: View {
         store.snapshot?.hosts.first { $0.id == session.hostID }?.title ?? session.hostDisplayName ?? session.hostID
     }
 
+    /// Harnesses the session's host advertises a structured launch for. The
+    /// handoff seed becomes their first turn; a PTY-only target would type it
+    /// into a terminal as commands, so those are left out.
     private func crossHarnessTargets(for session: SessionSummary) -> [String] {
-        let harnesses = store.snapshot?.hosts
+        let offers = store.snapshot?.hosts
             .first { $0.id == session.hostID }?
-            .harnesses ?? []
-        return harnesses.filter { $0 != "shell" }
+            .launchableOffers ?? []
+        return offers.filter { $0.launchMode == .structured }.map(\.name)
     }
 
     /// Server-side handoff: continues this session's context in a fresh one

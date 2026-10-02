@@ -139,12 +139,20 @@ regardless of direct or relay transport. The nested matrix is schema v1:
         "usage": false,
         "worktree": true,
         "attachments": ["image/gif", "image/jpeg", "image/png", "image/webp"],
-        "interactive_auth": true
+        "interactive_auth": true,
+        "turn_preferences": true
       }
     }
   ]
 }
 ```
+
+`turn_preferences` (additive in v1, #420) means model and reasoning-effort
+overrides reach later turns of a running session. It is projected from the
+adapter's immutable `turn_preferences_mutable` attribute, the same flag turn
+dispatch already enforces, and is only true when `model_catalog` is too. Claude
+Code fixes them at process start, so it publishes `false`. Hosts that predate
+the flag omit it, which reads as `false` under the missing-boolean rule below.
 
 `attachments` is an array of accepted MIME types, not a boolean. `usage` follows
 the executable adapter contract; a separate provider usage probe does not imply
@@ -305,6 +313,62 @@ page. `shell` remains a PTY terminal. The PTY Send button now ends input with
 `\r` for every harness. The Codex-only `\n` special case is gone, so an
 already-running Codex PTY session from before this change gets a terminal
 Enter.
+### iOS client decisions (#420)
+
+The iOS app implements the rules above in DroverKit `HarnessCapabilities`,
+`HarnessOffer` and `HarnessControls`. It answers #418's open client questions
+this way:
+
+- **Fail closed.** iOS offers a control only when the session's host advertises
+  it in a supported matrix. Until the first snapshot names the session's host,
+  chat controls are unresolved and withheld. That covers Allow/Deny, interrupt,
+  mid-session preferences and attachments. A harness missing from the snapshot
+  is treated the same way. The model also refuses unadvertised actions before
+  any request: `launch`, `interrupt`, `approve`, attachment admission and
+  turn-preference overrides.
+- **Missing or unsupported matrices.** A host with no envelope, or rows with no
+  matrix (string rows and matrix-less objects), is legacy metadata. Its
+  sessions stay listable and openable, and its enabled names stay in
+  `HostSummary.harnesses`. It offers nothing to launch, and the launch sheet
+  says: "This host runs an older Drover that doesn't advertise harness
+  capabilities. Update Drover on the host to launch or control sessions from
+  iOS." A newer `schema_version` reports its version and asks for an app
+  update. A `null` or malformed matrix, including a non-boolean flag, an
+  unknown attachment element or a `harness_id` mismatch, is invalid and is
+  never treated as legacy. Unknown additive fields and unknown launch-mode
+  strings are ignored.
+- **Preferred mode.** When a harness advertises both, iOS launches
+  `structured`. Only structured sessions carry a starting prompt, attachments,
+  approvals and run preferences. iOS uses `pty` only when it is the sole
+  advertised mode. The default harness is the host's first structured-capable
+  launchable row, so there is no longer a "prefer `claude-code`" rule.
+- **Handoff targets** are the host's launchable rows whose preferred mode is
+  structured. A PTY-only target would have the handoff seed typed into a
+  terminal and run as commands.
+- **Native resume.** iOS has no native-resume control today. "Continue
+  session" is Drover's server-built handoff, not native resume. The flag is
+  decoded and exposed as `HarnessControls.supportsNativeResume` for a future
+  control.
+- **Terminal Ctrl-C** writes 0x03 into the PTY. It is a terminal key, not the
+  adapter `interrupt` operation, and stays available for PTY sessions.
+- **Refreshes.** Launch-sheet controls are derived from the current snapshot
+  on every read. A refresh that withdraws the selected harness's launch mode
+  moves the selection to the host's next launchable harness. A refresh that
+  changes `model_catalog` re-selects run preferences, so an unadvertised
+  catalog is never fetched or sent. Chat re-resolves controls on each metadata
+  load.
+- **Retiring legacy compatibility.** The legacy path is already metadata-only
+  on iOS, so retiring it means removing string-row decoding and the upgrade
+  copy, not withdrawing any operation. That retirement belongs to rollout step
+  6 below, in the first iOS release after the hub refuses matrix-less host
+  registrations. Until then, iOS keeps listing legacy hosts and explaining
+  them.
+- **Display versus control.** `HarnessPresentation` still maps known IDs to
+  display names and icons, and unknown IDs fall back to the raw name. A few
+  non-control lines still parse provider wire formats or legacy rows by name.
+  Each is marked `// harness-name:`. `NoHarnessNameBranchingTests` fails on any
+  other quoted harness ID in iOS app or DroverKit sources, and on the retired
+  `structuredCapableHarnesses` and `interactiveAuthHarnesses` names.
 
 ## Compatibility and rollout
 
