@@ -88,3 +88,28 @@ def test_exit_transition_without_task_info_is_reaped(tmp_path, monkeypatch):
 
     monkeypatch.setattr(admin_process, "_rss", missing)
     assert admin_process.run_admin({}, tmp_path) == ({"verified": True}, 0)
+
+
+def test_live_child_with_failed_rss_monitor_fails_closed(tmp_path, monkeypatch):
+    child = SimpleNamespace(pid=123, returncode=None)
+    child.poll = lambda: child.returncode
+    reaped = []
+
+    def wait(timeout=None):
+        if child.returncode is None:
+            raise admin_process.subprocess.TimeoutExpired("child", timeout)
+        reaped.append(True)
+
+    child.wait = wait
+    monkeypatch.setattr(admin_process.subprocess, "Popen", lambda *a, **kw: child)
+    monkeypatch.setattr(
+        admin_process.os, "killpg", lambda *args: setattr(child, "returncode", -9)
+    )
+
+    def missing(pid):
+        raise LakeError("analytics_rss_monitor_unavailable")
+
+    monkeypatch.setattr(admin_process, "_rss", missing)
+    with pytest.raises(LakeError, match="analytics_rss_monitor_unavailable"):
+        admin_process.run_admin({}, tmp_path)
+    assert reaped

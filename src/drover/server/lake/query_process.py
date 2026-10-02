@@ -98,11 +98,11 @@ def run_disposable(
                         sample = _rss(child.pid)
                         guard.child_sample(sample)
                         peak = max(peak, sample)
-                    except LakeError:
+                    except LakeError as exc:
                         try:
                             child.wait(timeout=0.05)
                         except subprocess.TimeoutExpired:
-                            raise
+                            raise exc
                     if peak > limits.rss_bytes:
                         raise LakeError("analytics_rss_limit_exceeded")
                     time.sleep(0.01)

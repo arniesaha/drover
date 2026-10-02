@@ -36,13 +36,13 @@ def run_admin(request: dict, root: Path) -> tuple[dict, int]:
                 try:
                     sample = _rss(os.getpid()) + _rss(child.pid)
                     peak = max(peak, sample)
-                except LakeError:
+                except LakeError as exc:
                     # Darwin can stop exposing task info just before waitpid
                     # reports exit. Only tolerate a child that actually exits.
                     try:
                         child.wait(timeout=0.05)
                     except subprocess.TimeoutExpired:
-                        raise
+                        raise exc
                 if peak > RSS_CEILING:
                     raise LakeError("rebuild_rss_limit_exceeded")
                 if time.monotonic() - started > 1800:
