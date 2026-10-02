@@ -10,6 +10,7 @@ from typing import Any, Literal
 from drover.server.harness.capabilities import stored_capabilities
 from drover.server.harness.liveness import HostLiveness, host_liveness
 
+
 def _loads_object(value: str | None) -> dict[str, Any]:
     if not value:
         return {}

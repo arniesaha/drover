@@ -27,13 +27,13 @@ from drover.server.db import (
 )
 from drover.server.harness.capabilities import InvalidCapabilities
 from drover.server.harness.daemon import native_transcript_for_session
+from drover.server.harness.liveness import host_liveness
 from drover.server.harness.model_catalog import (
     MAX_CATALOG_WIRE_BYTES,
     CatalogEnvelope,
     catalog_wire_bytes,
 )
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
-from drover.server.harness.liveness import host_liveness
 from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.recap_prompt import drop_user_subject
 from drover.server.harness.registry import (
