@@ -9,9 +9,11 @@ import Testing
 extension MockNetworkTests {
 @Suite(.serialized)
 struct ClientTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
 
 @Test func selfRevocationSendsOnlyBearerAndAcceptsNoContent() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.httpMethod == "DELETE")
         #expect(request.url?.path == "/auth/device/credential")
         #expect(request.url?.query == nil)
@@ -23,19 +25,19 @@ struct ClientTests {
 }
 
 @Test func selfRevocationAcceptsAlreadyUnauthorized() async throws {
-    MockURLProtocol.handler = { _ in (401, Data()) }
+    mock.handler = { _ in (401, Data()) }
     try await client().revokeDeviceCredential()
 }
 
 @Test func selfRevocationSurfacesHubFailure() async {
-    MockURLProtocol.handler = { _ in (503, Data()) }
+    mock.handler = { _ in (503, Data()) }
     await #expect(throws: DroverError.httpStatus(503, "unexpected status 503")) {
         try await client().revokeDeviceCredential()
     }
 }
 
 @Test func snapshotSendsBearerAndDecodes() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
         #expect(request.url?.path == "/harness")
         return (200, snapshotJSON)
@@ -45,12 +47,12 @@ struct ClientTests {
 }
 
 @Test func unauthorizedMaps() async {
-    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8)) }
+    mock.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8)) }
     await #expect(throws: DroverError.unauthorized) { try await client().snapshot() }
 }
 
 @Test func turnConflictMaps() async {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/turns")
         return (409, Data(#"{"error": "approval pending; answer it first"}"#.utf8))
     }
@@ -60,7 +62,7 @@ struct ClientTests {
 }
 
 @Test func sendTurnWithoutImagesOmitsImagesKey() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(request.url?.path == "/harness/sessions/s1/turns")
@@ -74,7 +76,7 @@ struct ClientTests {
 
 @Test func sendTurnEncodesImagesAsBase64() async throws {
     let bytes = Data([0xFF, 0xD8, 0xFF])
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         let images = body["images"] as! [[String: Any]]
@@ -91,7 +93,7 @@ struct ClientTests {
 }
 
 @Test func createSessionPostsBodyAndReturnsID() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(request.url?.path == "/harness/hosts/mac-mini/sessions")
@@ -109,7 +111,7 @@ struct ClientTests {
 
 @Test func createSessionPostsImagesModelAndThinking() async throws {
     let bytes = Data([0x01, 0x02, 0x03])
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         let images = body["images"] as! [[String: Any]]
@@ -134,7 +136,7 @@ struct ClientTests {
 }
 
 @Test func permissionBadRequestMaps() async {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (400, Data(#"{"error": "codex exec has no approval channel; use sandbox flags"}"#.utf8))
     }
     await #expect(throws: DroverError.badRequest(
@@ -163,7 +165,7 @@ struct ClientTests {
 }
 
 @Test func messagesSendsAfterSeqQueryAndDecodes() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/messages")
         let query = request.url?.query ?? ""
         #expect(query.contains("after_seq=3"))
@@ -176,7 +178,7 @@ struct ClientTests {
 }
 
 @Test func messagePageBuildsNewestRequest() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.absoluteString.contains(
             "/harness/sessions/session%20one/messages?"
         ) == true)
@@ -192,7 +194,7 @@ struct ClientTests {
 }
 
 @Test func messagePageBuildsOlderRequest() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.query == "before_seq=42&limit=100")
         return (200, Data(#"{"messages": [], "max_seq": 42, "has_older": false, "has_newer": true}"#.utf8))
     }
@@ -202,7 +204,7 @@ struct ClientTests {
 }
 
 @Test func messagePageBuildsFixedBoundNewerRequest() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.query == "after_seq=7&through_seq=99&limit=500")
         return (200, Data(#"{"messages": [], "max_seq": 99, "has_older": true, "has_newer": false}"#.utf8))
     }
@@ -213,7 +215,7 @@ struct ClientTests {
 }
 
 @Test func sendTurnPostsBodyAndReturnsTurnID() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/turns")
         #expect(request.httpMethod == "POST")
         let body = try! JSONSerialization.jsonObject(
@@ -226,7 +228,7 @@ struct ClientTests {
 }
 
 @Test func sendTurnPostsModelAndThinkingWhenProvided() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(body["text"] as? String == "go")
@@ -244,7 +246,7 @@ struct ClientTests {
 }
 
 @Test func answerPermissionPostsBody() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/permission")
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
@@ -258,7 +260,7 @@ struct ClientTests {
 }
 
 @Test func interruptPostsToInterruptRoute() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/interrupt")
         #expect(request.httpMethod == "POST")
         return (200, Data())
@@ -267,7 +269,7 @@ struct ClientTests {
 }
 
 @Test func terminatePostsToTerminateRoute() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/terminate")
         #expect(request.httpMethod == "POST")
         return (200, Data())
@@ -276,7 +278,7 @@ struct ClientTests {
 }
 
 @Test func continueSessionPostsTargetsAndReturnsNewID() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(request.url?.path == "/harness/sessions/s1/continue")
@@ -293,7 +295,7 @@ struct ClientTests {
 }
 
 @Test func continueSessionDefaultsToEmptyBody() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(body.isEmpty)
@@ -305,7 +307,7 @@ struct ClientTests {
 }
 
 @Test func healthzSendsNoAuthHeaderAndReturnsTrue() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/healthz")
         // Unauthenticated per brief: header presence is not required, but if
         // DroverClient still attaches it that's harmless — assert only the
@@ -317,13 +319,13 @@ struct ClientTests {
 }
 
 @Test func healthzReturnsFalseOnFailureStatus() async throws {
-    MockURLProtocol.handler = { _ in (503, Data()) }
+    mock.handler = { _ in (503, Data()) }
     let ok = try await client().healthz()
     #expect(ok == false)
 }
 
 @Test func sessionIDIsPercentEncodedInPath() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         // A session id containing characters that need escaping in a URL path:
         // the raw URL string must carry the literal %20, not a space.
         let absolute = request.url?.absoluteString ?? ""
@@ -334,7 +336,7 @@ struct ClientTests {
 }
 
 @Test func decodingErrorMapsToDroverErrorDecoding() async {
-    MockURLProtocol.handler = { _ in (200, Data("not json".utf8)) }
+    mock.handler = { _ in (200, Data("not json".utf8)) }
     do {
         _ = try await client().snapshot()
         Issue.record("expected DroverError.decoding, but no error was thrown")
@@ -349,14 +351,14 @@ struct ClientTests {
 }
 
 @Test func badRequestFallsBackToRawBodyWhenNoErrorField() async {
-    MockURLProtocol.handler = { _ in (400, Data("plain text failure".utf8)) }
+    mock.handler = { _ in (400, Data("plain text failure".utf8)) }
     await #expect(throws: DroverError.badRequest("plain text failure")) {
         try await client().interrupt(sessionID: "s1")
     }
 }
 
 @Test func unavailableAuthResponsePreservesStructured404Error() async {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (404, Data(#"{"error": "auth is not supported for openclaw"}"#.utf8))
     }
     await #expect(throws: DroverError.unavailable("auth is not supported for openclaw")) {
@@ -365,7 +367,7 @@ struct ClientTests {
 }
 
 @Test func unavailableAuthResponseUsesDetailWhenErrorIsAbsent() async {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (404, Data(#"{"host_id":"mac-mini","harness":"openclaw","state":"unavailable","detail":"auth is not supported for openclaw"}"#.utf8))
     }
     await #expect(throws: DroverError.unavailable("auth is not supported for openclaw")) {
@@ -374,7 +376,7 @@ struct ClientTests {
 }
 
 @Test func createSessionOmitsNilCwdAndPromptFromBody() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(body["cwd"] == nil)
@@ -389,7 +391,7 @@ struct ClientTests {
 }
 
 @Test func authStatusRouteShape() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/status")
         #expect(request.httpMethod == "GET")
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
@@ -400,7 +402,7 @@ struct ClientTests {
 }
 
 @Test func startAuthFlowPostsAndDecodes() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/start")
         #expect(request.httpMethod == "POST")
         #expect(request.bodyStreamData() == Data("{}".utf8))
@@ -414,7 +416,7 @@ struct ClientTests {
 
 @Test func pollAndCancelAuthFlowRoutes() async throws {
     let seen = RequestLog()
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         seen.append("\(request.httpMethod ?? "") \(request.url?.path ?? "")")
         if request.url?.path.hasSuffix("/cancel") == true {
             #expect(request.bodyStreamData() == Data("{}".utf8))
@@ -432,7 +434,7 @@ struct ClientTests {
 
 @Test func authRoutesPercentEncodePathComponents() async throws {
     let seen = RequestLog()
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         seen.append("\(request.httpMethod ?? "") \(request.url?.absoluteString ?? "")")
         return (200, Data(#"{"host_id":"mac/mini","harness":"provider/test","flow_id":"flow%2F1","state":"waiting_for_user"}"#.utf8))
     }
@@ -448,7 +450,7 @@ struct ClientTests {
 }
 
 @Test func cockpitOverviewUsesAuthenticatedBoundedDaysQuery() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/cockpit/overview")
         #expect(request.url?.query == "days=7")
         #expect(request.timeoutInterval == 60)
@@ -460,7 +462,7 @@ struct ClientTests {
 }
 
 @Test func analyticsEncodesAllowlistedFiltersOnceInDeterministicOrder() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/analytics")
         #expect(request.url?.query == "days=30&host_id=mac%20mini&harness=codex&provider=openai&model=gpt-5.6-sol&project_key=arniesaha%2Fdrover")
         #expect(request.timeoutInterval == 60)
@@ -479,7 +481,7 @@ struct ClientTests {
 }
 
 @Test func analyticsEncodesIndependentDimensionCursorsAndBoundedLimit() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.query == "days=7&limit=50&project_cursor=project%2Bnext%3D&host_cursor=host%2Fnext")
         return (200, emptyAnalyticsJSON)
     }
@@ -490,7 +492,7 @@ struct ClientTests {
 }
 
 @Test func insightsCursorAndFiltersAreEncodedExactlyOnce() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/insights")
         #expect(request.url?.query == "state=open&severity=high&confidence=confirmed&analyzer_class=deterministic&host=mac-mini&harness=codex&target_type=hook&target_id=mac-mini%2Fcodex%2Fpre%20tool&cursor=rank%2Btime%2Fnext%3D&limit=25")
         #expect(request.timeoutInterval == 60)
@@ -524,8 +526,8 @@ struct ClientTests {
 // a typo in the real `.timedOut` branch there. This test drives a genuine
 // `URLError(.timedOut)` through the real client to close that gap.
 @Test func insightsTimeoutIsWrappedAsADroverErrorTimeout() async throws {
-    MockURLProtocol.transportError = URLError(.timedOut)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.timedOut)
+    defer { mock.transportError = nil }
 
     do {
         _ = try await client().insights(filters: InsightFilters())
@@ -544,8 +546,8 @@ struct ClientTests {
     store.updateCapability(from: try HarnessSnapshot.decode(from: Data(
         #"{"hosts":[],"sessions":[],"cockpit_api_version":1,"cockpit_sections":["insights"]}"#.utf8
     )))
-    MockURLProtocol.transportError = URLError(.timedOut)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.timedOut)
+    defer { mock.transportError = nil }
 
     await store.loadInsights()
 
@@ -554,7 +556,7 @@ struct ClientTests {
 
 @Test func insightLifecycleAndPrivacyRoutesUseExpectedBodies() async throws {
     let seen = RequestLog()
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = request.bodyStreamData()
         let encodedPath = request.url.flatMap {
             URLComponents(url: $0, resolvingAgainstBaseURL: false)?.percentEncodedPath
@@ -607,7 +609,7 @@ struct ClientTests {
 @Test func contentConsentPreservesHTTP207PartialPropagation() async throws {
     let fixtureURL = try #require(droverKitFixtureURL("content-consent-partial"))
     let fixture = try Data(contentsOf: fixtureURL)
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/insights/content-analysis/consent")
         return (207, fixture)
     }
@@ -624,7 +626,7 @@ struct ClientTests {
 @Test func failedRevokeResponseStillPreservesCentralDisabledTruth() async throws {
     let fixtureURL = try #require(droverKitFixtureURL("content-consent-failed"))
     let fixture = try Data(contentsOf: fixtureURL)
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/insights/content-analysis/revoke")
         return (503, fixture)
     }
@@ -639,7 +641,7 @@ struct ClientTests {
 @Test func contentStatusRetainsFailed503FleetTruthOnFreshNavigation() async throws {
     let fixtureURL = try #require(droverKitFixtureURL("content-consent-failed"))
     let fixture = try Data(contentsOf: fixtureURL)
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.httpMethod == "GET")
         #expect(request.url?.path == "/insights/content-analysis")
         return (503, fixture)
@@ -655,7 +657,7 @@ struct ClientTests {
 @Test func contentStatusSurfacesFailedDurableRepairWithoutHidingCentralIntent() async throws {
     let fixtureURL = try #require(droverKitFixtureURL("content-consent-repair-failed"))
     let fixture = try Data(contentsOf: fixtureURL)
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.httpMethod == "GET")
         #expect(request.url?.path == "/insights/content-analysis")
         return (503, fixture)

@@ -57,6 +57,9 @@ final class PairingViewTests: XCTestCase {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct AppPairingRequestTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
+
     @Test(arguments: [false, true])
     @MainActor
     func permittedPairingStillPostsCode(https: Bool) async throws {
@@ -71,7 +74,7 @@ struct AppPairingRequestTests {
         let model = PairingModel(serverURLString: origin)
         model.manualCode = "K7QP-2M4X"
         let requested = MockFlag()
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             requested.raise()
             #expect(request.url?.absoluteString == origin + "/auth/pair")
             #expect(request.httpMethod == "POST")
@@ -89,7 +92,7 @@ struct AppPairingRequestTests {
         )
         let response = try await environment.pair(
             payload: try #require(model.manualPayload()), deviceName: "Synthetic Phone",
-            session: MockURLProtocol.session()
+            session: mock.session()
         )
         #expect(requested.isRaised)
         #expect(response.credentialID == "synthetic-credential")

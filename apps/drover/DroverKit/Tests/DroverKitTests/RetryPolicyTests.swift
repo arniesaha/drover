@@ -65,18 +65,21 @@ struct RetryPolicyTests {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct RetryCallSiteTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
+
     @Test @MainActor func allReadsAndBackgroundWatcherRespectSharedCooldown() async throws {
         nonisolated(unsafe) var requests = 0
-        MockURLProtocol.responseHeaders = ["Retry-After": "120"]
-        defer { MockURLProtocol.responseHeaders = nil }
-        MockURLProtocol.handler = { _ in
+        mock.responseHeaders = ["Retry-After": "120"]
+        defer { mock.responseHeaders = nil }
+        mock.handler = { _ in
             requests += 1
             return (503, Data())
         }
         let gate = HubRetryGate()
         let config = ServerConfig(urlString: "http://retry.test")!
-        let first = DroverClient(config: config, token: "one", session: MockURLProtocol.session(), retryGate: gate)
-        let background = DroverClient(config: config, token: "two", session: MockURLProtocol.session(), retryGate: gate)
+        let first = DroverClient(config: config, token: "one", session: mock.session(), retryGate: gate)
+        let background = DroverClient(config: config, token: "two", session: mock.session(), retryGate: gate)
         do { _ = try await first.snapshot(); Issue.record("Expected busy") }
         catch DroverError.busy(let deadline) { #expect(deadline.timeIntervalSinceNow >= 119) }
         let controlReads: [() async throws -> Void] = [
@@ -118,9 +121,9 @@ struct RetryCallSiteTests {
 
     @Test func analyticalCooldownDoesNotStallSessionReads() async throws {
         nonisolated(unsafe) var paths: [String] = []
-        MockURLProtocol.responseHeaders = ["Retry-After": "120"]
-        defer { MockURLProtocol.responseHeaders = nil }
-        MockURLProtocol.handler = { request in
+        mock.responseHeaders = ["Retry-After": "120"]
+        defer { mock.responseHeaders = nil }
+        mock.handler = { request in
             let path = request.url?.path ?? ""
             paths.append(path)
             if path.hasPrefix("/cockpit") { return (503, Data()) }
@@ -129,7 +132,7 @@ struct RetryCallSiteTests {
         let gate = HubRetryGate()
         let config = ServerConfig(urlString: "http://retry.test")!
         let client = DroverClient(
-            config: config, token: "t", session: MockURLProtocol.session(), retryGate: gate
+            config: config, token: "t", session: mock.session(), retryGate: gate
         )
         do { _ = try await client.cockpitOverview(); Issue.record("Expected busy") }
         catch DroverError.busy { }
@@ -146,7 +149,7 @@ struct RetryCallSiteTests {
 
     @Test func socketBusyCooldownSurvivesManualSessionRestart() async throws {
         nonisolated(unsafe) var requests = 0
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             requests += 1
             return (200, Data(#"{"messages":[],"max_seq":0}"#.utf8))
         }
@@ -164,9 +167,9 @@ struct RetryCallSiteTests {
 
     @Test func sessionStreamEmitsBusyAndDoesNotReconnectEarly() async throws {
         nonisolated(unsafe) var requests = 0
-        MockURLProtocol.responseHeaders = ["Retry-After": "120"]
-        defer { MockURLProtocol.responseHeaders = nil }
-        MockURLProtocol.handler = { _ in requests += 1; return (503, Data()) }
+        mock.responseHeaders = ["Retry-After": "120"]
+        defer { mock.responseHeaders = nil }
+        mock.handler = { _ in requests += 1; return (503, Data()) }
         let stream = MessageStream(client: client(), sessionID: "s1", reconnectBaseDelay: .milliseconds(1))
         for await event in await stream.events() {
             if case .busy(let deadline) = event {

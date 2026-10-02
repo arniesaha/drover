@@ -24,9 +24,11 @@ private final class PollingRequestCounter: @unchecked Sendable {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct StoreTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
 
 @Test @MainActor func refreshBucketsSessions() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }  // Task 2 fixture
+    mock.handler = { _ in (200, snapshotJSON) }  // Task 2 fixture
     let store = SessionStore(client: client())
     await store.refresh()
     #expect(store.needsYou.map(\.id) == ["harness-1"])
@@ -144,10 +146,10 @@ struct StoreTests {
 }
 
 @Test @MainActor func refreshFailureKeepsSnapshotSetsError() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
     await store.refresh()
-    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8))
+    mock.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8))
     }
     await store.refresh()
     #expect(store.snapshot != nil)          // cached snapshot survives
@@ -158,8 +160,8 @@ struct StoreTests {
 @Test @MainActor func refreshErrorIsHumanReadableNotEnumReflection() async throws {
     // Regression: the banner used to render `"\(error)"`, so users saw the
     // literal Swift enum case — `transport("cancelled")` — as the message.
-    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cannotConnectToHost)
+    defer { mock.transportError = nil }
     let store = SessionStore(client: client())
     await store.refresh()
     let message = try #require(store.lastError)
@@ -195,7 +197,7 @@ private final class LockedCount: @unchecked Sendable {
     // that drive the fast-retry path. The hub logged 51 cancelled
     // /harness/hosts requests in one second this way (drover#331).
     let requests = LockedCount()
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         requests.increment()
         return (200, snapshotJSON)
     }
@@ -214,13 +216,13 @@ private final class LockedCount: @unchecked Sendable {
 @Test @MainActor func cancelledRefreshIsNotTreatedAsUnreachable() async throws {
     // A superseded poll or a dismissed screen cancels its own request. That
     // used to flash an unreachable banner over a perfectly healthy fleet.
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
     await store.refresh()
     #expect(store.isReachable)
 
-    MockURLProtocol.transportError = URLError(.cancelled)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cancelled)
+    defer { mock.transportError = nil }
     await store.refresh()
     #expect(store.isReachable)
     #expect(store.lastError == nil)
@@ -251,7 +253,7 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func continueSessionReturnsNewIDOnSuccess() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/harness" { return (200, snapshotJSON) }
         return (200, Data(#"{"session_id": "harness-9"}"#.utf8))
     }
@@ -264,7 +266,7 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func continueSessionSurfacesStructuredMode() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/harness" { return (200, snapshotJSON) }
         return (200, Data(#"{"session_id": "harness-9", "mode": "structured"}"#.utf8))
     }
@@ -276,7 +278,7 @@ private final class LockedCount: @unchecked Sendable {
 
 @Test @MainActor func continueSessionPostsTargetHarness() async throws {
     nonisolated(unsafe) var sentTarget: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/harness" { return (200, snapshotJSON) }
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         sentTarget = body["target_harness"] as? String
@@ -290,7 +292,7 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func continueSessionSurfacesServerExplanation() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/harness" { return (200, snapshotJSON) }
         return (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8))
     }
@@ -304,21 +306,21 @@ private final class LockedCount: @unchecked Sendable {
 @Test @MainActor func continueSessionConflictReplacesAStaleTailscaleTransportPresentation() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
     let tsClient = DroverClient(config: tsConfig, token: "test-token",
-                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
+                               session: mock.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/harness" { return (200, snapshotJSON) }
         return (200, snapshotJSON) }
     await store.refresh()
 
-    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    mock.transportError = URLError(.cannotConnectToHost)
     await store.refresh()
     #expect(store.lastRefreshFailure == .transport)
     #expect(store.isTailscaleTransportFailure)
 
-    MockURLProtocol.transportError = nil
-    MockURLProtocol.handler = { request in
+    mock.transportError = nil
+    mock.handler = { request in
         if request.url?.path == "/harness" { return (200, snapshotJSON) }
         return (409, Data(#"{"error": "host mac-mini is offline"}"#.utf8))
     }
@@ -339,7 +341,7 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func continueSessionNonServerFailureGetsGenericError() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/harness" { return (200, snapshotJSON) }
         return (200, Data("not json".utf8))
     }
@@ -351,7 +353,7 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func hasLoadedOnceFlipsOnFirstSuccessfulRefresh() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
     #expect(store.hasLoadedOnce == false)
     await store.refresh()
@@ -359,10 +361,10 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func hasLoadedOnceSurvivesLaterFailure() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
     await store.refresh()
-    MockURLProtocol.handler = { _ in (500, Data()) }
+    mock.handler = { _ in (500, Data()) }
     await store.refresh()
     #expect(store.hasLoadedOnce)
     #expect(store.isReachable == false)
@@ -376,13 +378,13 @@ private final class LockedCount: @unchecked Sendable {
 /// A failed refresh must not move the timestamp — a clock that ticks on
 /// failure is exactly the deception the cards were committing.
 @Test @MainActor func aFailedRefreshDoesNotMoveTheSnapshotsTimestamp() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
     await store.refresh()
     let landed = try #require(store.lastSuccessfulRefresh)
     #expect(store.freshness(now: landed.addingTimeInterval(1)).isStale == false)
 
-    MockURLProtocol.handler = { _ in (500, Data()) }
+    mock.handler = { _ in (500, Data()) }
     await store.refresh()
 
     #expect(store.snapshot != nil, "the cached snapshot must survive — that behaviour stays")
@@ -395,13 +397,13 @@ private final class LockedCount: @unchecked Sendable {
 /// A cancelled refresh is not a failure and not a success: it leaves the
 /// timestamp where it was, so the snapshot simply keeps ageing.
 @Test @MainActor func aCancelledRefreshLeavesTheTimestampAlone() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
     await store.refresh()
     let landed = try #require(store.lastSuccessfulRefresh)
 
-    MockURLProtocol.transportError = URLError(.cancelled)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cancelled)
+    defer { mock.transportError = nil }
     await store.refresh()
 
     #expect(store.lastSuccessfulRefresh == landed)
@@ -411,7 +413,7 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func fleetSnapshotProducesHostGroups() async throws {
-    MockURLProtocol.handler = { _ in (200, fleetSnapshotJSON) }
+    mock.handler = { _ in (200, fleetSnapshotJSON) }
     let store = SessionStore(client: client())
     await store.refresh()
     #expect(store.hostGroups.map(\.id) == ["mac-mini", "nas", "ghost-host", "work-laptop"])
@@ -425,11 +427,11 @@ private final class LockedCount: @unchecked Sendable {
     // called from both `.task` and the scenePhase change, so a foreground
     // event during the first load could leave the gate shut. A slow server
     // (see #91) widened that window from milliseconds to tens of seconds.
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         Thread.sleep(forTimeInterval: 0.15)  // a server that is not instant
         return (200, snapshotJSON)
     }
-    defer { MockURLProtocol.handler = nil }
+    defer { mock.handler = nil }
 
     let store = SessionStore(client: client())
     // Churn faster than a request can complete, as scene-phase changes do.
@@ -456,8 +458,8 @@ private final class LockedCount: @unchecked Sendable {
 /// the hub at all — which is exactly why the recurring report could not be
 /// diagnosed from the phone.
 @Test @MainActor func connectingDetailNamesTheCancellationsNobodyCanSee() async throws {
-    MockURLProtocol.transportError = URLError(.cancelled)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cancelled)
+    defer { mock.transportError = nil }
     let store = SessionStore(client: client())
 
     await store.refresh()
@@ -472,8 +474,8 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func connectingDetailReportsAnUnreachableHubDifferently() async throws {
-    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cannotConnectToHost)
+    defer { mock.transportError = nil }
     let store = SessionStore(client: client())
 
     await store.refresh()
@@ -484,16 +486,16 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func connectingDetailStaysQuietOnTheFirstAttemptAndAfterSuccess() async throws {
-    MockURLProtocol.transportError = URLError(.cancelled)
+    mock.transportError = URLError(.cancelled)
     let store = SessionStore(client: client())
 
     await store.refresh()
     // One blip is normal; the screen should not start explaining itself.
     #expect(store.connectingDetail == nil)
 
-    MockURLProtocol.transportError = nil
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
-    defer { MockURLProtocol.handler = nil }
+    mock.transportError = nil
+    mock.handler = { _ in (200, snapshotJSON) }
+    defer { mock.handler = nil }
     await store.refresh()
 
     #expect(store.hasLoadedOnce)
@@ -510,8 +512,8 @@ private final class LockedCount: @unchecked Sendable {
 /// failure, which at least offers Retry. A *run* of them has to become
 /// actionable, or the only cure is luck.
 @Test @MainActor func aFirstLoadLostToRepeatedCancellationBecomesRetriable() async throws {
-    MockURLProtocol.transportError = URLError(.cancelled)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cancelled)
+    defer { mock.transportError = nil }
     let store = SessionStore(client: client())
 
     await store.refresh()
@@ -533,13 +535,13 @@ private final class LockedCount: @unchecked Sendable {
 /// unreachable banner over a healthy fleet is the bug that put the early
 /// return in `refresh()` in the first place.
 @Test @MainActor func cancellationsNeverFlashUnreachableOverALoadedFleet() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let store = SessionStore(client: client())
     await store.refresh()
-    MockURLProtocol.handler = nil
+    mock.handler = nil
 
-    MockURLProtocol.transportError = URLError(.cancelled)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cancelled)
+    defer { mock.transportError = nil }
     for _ in 0..<5 { await store.refresh() }
 
     #expect(store.isReachable)
@@ -548,14 +550,14 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test @MainActor func aLandedSnapshotClearsTheGivenUpFirstLoad() async throws {
-    MockURLProtocol.transportError = URLError(.cancelled)
+    mock.transportError = URLError(.cancelled)
     let store = SessionStore(client: client())
     for _ in 0..<3 { await store.refresh() }
     #expect(store.lastError != nil)
 
-    MockURLProtocol.transportError = nil
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
-    defer { MockURLProtocol.handler = nil }
+    mock.transportError = nil
+    mock.handler = { _ in (200, snapshotJSON) }
+    defer { mock.handler = nil }
     await store.refresh()
 
     #expect(store.hasLoadedOnce)
@@ -572,8 +574,8 @@ private final class LockedCount: @unchecked Sendable {
 /// and this resolves in about a second; wait out the interval and the test
 /// times out on one attempt.
 @Test @MainActor func aCancelledFirstLoadRetriesWithoutWaitingOutTheInterval() async throws {
-    MockURLProtocol.transportError = URLError(.cancelled)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cancelled)
+    defer { mock.transportError = nil }
     let store = SessionStore(client: client())
 
     store.startPolling(every: 60)
@@ -593,8 +595,8 @@ private final class LockedCount: @unchecked Sendable {
 /// that it is four requests a second at a hub whose slowness (#95) is what
 /// widened the cancellation window in the first place.
 @Test @MainActor func theFastRetryStopsOnceTheScreenIsActionable() async throws {
-    MockURLProtocol.transportError = URLError(.cancelled)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cancelled)
+    defer { mock.transportError = nil }
     let store = SessionStore(client: client())
 
     store.startPolling(every: 60)
@@ -619,12 +621,12 @@ private final class LockedCount: @unchecked Sendable {
 /// does not.
 @Test @MainActor func startPollingDoesNotTearDownARunningLoop() async throws {
     let requests = PollingRequestCounter()
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         requests.increment()
         Thread.sleep(forTimeInterval: 0.3)  // a hub under load, not an instant one
         return (200, snapshotJSON)
     }
-    defer { MockURLProtocol.handler = nil }
+    defer { mock.handler = nil }
 
     let store = SessionStore(client: client())
     store.startPolling(every: 5)
@@ -666,14 +668,14 @@ private final class LockedCount: @unchecked Sendable {
 @Test @MainActor func refreshErrorOnTailscaleReflectsTailscaleContext() async throws {
     let tsConfig = ServerConfig(urlString: "http://100.64.0.1:7080")!
     let tsClient = DroverClient(config: tsConfig, token: "test-token",
-                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
+                               session: mock.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
     #expect(store.isTailscaleAddress)
     #expect(store.tailscaleHost == "100.64.0.1")
 
-    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cannotConnectToHost)
+    defer { mock.transportError = nil }
 
     await store.refresh()
 
@@ -683,8 +685,8 @@ private final class LockedCount: @unchecked Sendable {
     #expect(store.isTailscaleTransportFailure)
     #expect(!store.isReachable)
 
-    MockURLProtocol.transportError = nil
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.transportError = nil
+    mock.handler = { _ in (200, snapshotJSON) }
     await store.refresh()
 
     #expect(store.lastRefreshFailure == nil)
@@ -694,24 +696,24 @@ private final class LockedCount: @unchecked Sendable {
 @Test @MainActor func tailscaleNonTransportFailuresKeepTheirExactClassificationAndMessage() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
     let tsClient = DroverClient(config: tsConfig, token: "test-token",
-                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
+                               session: mock.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
-    MockURLProtocol.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8))
+    mock.handler = { _ in (401, Data(#"{"error": "authentication required"}"#.utf8))
     }
     await store.refresh()
     #expect(store.lastRefreshFailure == .authentication)
     #expect(store.lastError == "Token rejected — check Settings")
     #expect(!store.isTailscaleTransportFailure)
 
-    MockURLProtocol.handler = { _ in (200, Data("not json".utf8))
+    mock.handler = { _ in (200, Data("not json".utf8))
     }
     await store.refresh()
     #expect(store.lastRefreshFailure == .decoding)
     #expect(store.lastError == "Unexpected response from the hub")
     #expect(!store.isTailscaleTransportFailure)
 
-    MockURLProtocol.handler = { _ in (503, Data(#"{"error": "Hub is restarting"}"#.utf8))
+    mock.handler = { _ in (503, Data(#"{"error": "Hub is restarting"}"#.utf8))
     }
     await store.refresh()
     #expect(store.lastRefreshFailure == .http)
@@ -722,11 +724,11 @@ private final class LockedCount: @unchecked Sendable {
 @Test @MainActor func repeatedFirstLoadCancellationIsNotATailscaleTransportFailure() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
     let tsClient = DroverClient(config: tsConfig, token: "test-token",
-                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
+                               session: mock.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
-    MockURLProtocol.transportError = URLError(.cancelled)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cancelled)
+    defer { mock.transportError = nil }
     for _ in 0..<3 { await store.refresh() }
 
     #expect(store.lastRefreshFailure == .cancellation)
@@ -737,17 +739,17 @@ private final class LockedCount: @unchecked Sendable {
 @Test @MainActor func ignoredCancellationsKeepTheDisplayedFailureClassificationInSync() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
     let tsClient = DroverClient(config: tsConfig, token: "test-token",
-                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
+                               session: mock.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
-    defer { MockURLProtocol.transportError = nil }
-    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
+    defer { mock.transportError = nil }
+    mock.transportError = URLError(.cannotConnectToHost)
     await store.refresh()
     #expect(store.lastRefreshFailure == .transport)
     #expect(store.lastError == "Can't reach the hub over Tailscale")
     #expect(store.isTailscaleTransportFailure)
 
-    MockURLProtocol.transportError = URLError(.cancelled)
+    mock.transportError = URLError(.cancelled)
     await store.refresh()
     #expect(store.lastRefreshFailure == .transport)
     #expect(store.lastError == "Can't reach the hub over Tailscale")
@@ -767,11 +769,11 @@ private final class LockedCount: @unchecked Sendable {
 @Test @MainActor func connectingDetailReportsTailscaleUnreachableHub() async throws {
     let tsConfig = ServerConfig(urlString: "http://my-mac.ts.net:7080")!
     let tsClient = DroverClient(config: tsConfig, token: "test-token",
-                               session: MockURLProtocol.session(), retryGate: HubRetryGate())
+                               session: mock.session(), retryGate: HubRetryGate())
     let store = SessionStore(client: tsClient)
 
-    MockURLProtocol.transportError = URLError(.cannotConnectToHost)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.cannotConnectToHost)
+    defer { mock.transportError = nil }
 
     await store.refresh()
     await store.refresh()

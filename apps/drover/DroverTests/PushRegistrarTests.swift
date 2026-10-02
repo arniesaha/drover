@@ -52,6 +52,8 @@ private func waitForPushRegistrarCondition(
 extension MockNetworkTests {
 @Suite(.serialized)
 struct PushRegistrarTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
 
 @Test @MainActor func failedTokenUploadClearsStaleHubPushStateSoLocalAlertsResume() async throws {
     let defaults = UserDefaults.standard
@@ -65,11 +67,11 @@ struct PushRegistrarTests {
         defaults.removeObject(forKey: AttentionWatcher.seenKey)
         defaults.removeObject(forKey: AttentionWatcher.readKey)
         registrar.updateClient(nil)
-        MockURLProtocol.handler = nil
+        mock.handler = nil
     }
 
     let uploadAttempted = MockFlag()
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "PUT", request.url?.path == "/auth/device/apns" {
             uploadAttempted.raise()
             return (503, Data(#"{"error":"hub push is unavailable"}"#.utf8))
@@ -79,7 +81,7 @@ struct PushRegistrarTests {
     let client = DroverClient(
         config: ServerConfig(urlString: "http://drover.test")!,
         token: pushRegistrarFixtureCredential,
-        session: MockURLProtocol.session()
+        session: mock.session()
     )
 
     registrar.updateClient(client)
@@ -110,11 +112,11 @@ struct PushRegistrarTests {
     defer {
         PushRegistration.setActive(false, in: defaults)
         registrar.updateClient(nil)
-        MockURLProtocol.handler = nil
+        mock.handler = nil
     }
 
     let uploadAttempted = MockFlag()
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "PUT", request.url?.path == "/auth/device/apns" {
             uploadAttempted.raise()
             return (204, Data())
@@ -124,7 +126,7 @@ struct PushRegistrarTests {
     let client = DroverClient(
         config: ServerConfig(urlString: "http://new-hub.test")!,
         token: pushRegistrarFixtureCredential,
-        session: MockURLProtocol.session()
+        session: mock.session()
     )
 
     registrar.updateClient(client)
@@ -149,14 +151,14 @@ struct PushRegistrarTests {
         defaults.removeObject(forKey: AttentionWatcher.seenKey)
         defaults.removeObject(forKey: AttentionWatcher.readKey)
         registrar.updateClient(nil)
-        MockURLProtocol.handler = nil
+        mock.handler = nil
     }
 
     // The hub accepts the first upload, then Apple rejects the token (or the
     // hub's key) and every later upload gets #439's push-unavailable 503.
     let hubRejected = MockFlag()
     let uploads = MockCounter()
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "PUT", request.url?.path == "/auth/device/apns" {
             uploads.increment()
             if hubRejected.isRaised {
@@ -169,7 +171,7 @@ struct PushRegistrarTests {
     let client = DroverClient(
         config: ServerConfig(urlString: "http://drover.test")!,
         token: pushRegistrarFixtureCredential,
-        session: MockURLProtocol.session()
+        session: mock.session()
     )
     registrar.updateClient(client)
     registrar.accept(token: Data([0x09, 0x28, 0x03]))
@@ -204,15 +206,15 @@ struct PushRegistrarTests {
     defer {
         PushRegistration.setActive(false)
         registrar.updateClient(nil)
-        MockURLProtocol.handler = nil
+        mock.handler = nil
     }
     let uploads = MockCounter()
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "PUT" { uploads.increment() }
         return (204, Data())
     }
     let client = DroverClient(config: ServerConfig(urlString: "http://drover.test")!,
-                              token: pushRegistrarFixtureCredential, session: MockURLProtocol.session())
+                              token: pushRegistrarFixtureCredential, session: mock.session())
     registrar.updateClient(client)
     registrar.accept(token: Data([0x04]))
     #expect(await waitForPushRegistrarCondition { PushRegistration.isActive() })
@@ -244,17 +246,17 @@ func lateUploadFromPreviousHubCannotChangeCurrentHubState(oldStatus: Int) async 
     let oldUploadStarted = MockFlag()
     defer {
         registrar.updateClient(nil)
-        MockURLProtocol.handler = nil
-        MockURLProtocol.responseDelay = nil
+        mock.handler = nil
+        mock.responseDelay = nil
     }
-    MockURLProtocol.responseDelay = { request in
+    mock.responseDelay = { request in
         if request.url?.host == "old-hub.test" {
             oldUploadStarted.raise()
             return 0.2
         }
         return nil
     }
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.host == "old-hub.test" {
             oldResponseDelivered.raise()
             return (oldStatus, Data())
@@ -263,7 +265,7 @@ func lateUploadFromPreviousHubCannotChangeCurrentHubState(oldStatus: Int) async 
     }
     func client(_ host: String) -> DroverClient {
         DroverClient(config: ServerConfig(urlString: "http://\(host)")!,
-                     token: pushRegistrarFixtureCredential, session: MockURLProtocol.session())
+                     token: pushRegistrarFixtureCredential, session: mock.session())
     }
     registrar.updateClient(client("old-hub.test"))
     registrar.accept(token: Data([0x01]))
@@ -283,22 +285,22 @@ func lateUploadFromPreviousHubCannotChangeCurrentHubState(oldStatus: Int) async 
     let responseDelivered = MockFlag()
     defer {
         registrar.updateClient(nil)
-        MockURLProtocol.handler = nil
-        MockURLProtocol.responseDelay = nil
+        mock.handler = nil
+        mock.responseDelay = nil
     }
-    MockURLProtocol.responseDelay = { request in
+    mock.responseDelay = { request in
         if request.httpMethod == "PUT" {
             uploadStarted.raise()
             return 0.2
         }
         return nil
     }
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "PUT" { responseDelivered.raise() }
         return (204, Data())
     }
     let client = DroverClient(config: ServerConfig(urlString: "http://drover.test")!,
-                              token: pushRegistrarFixtureCredential, session: MockURLProtocol.session())
+                              token: pushRegistrarFixtureCredential, session: mock.session())
     registrar.updateClient(client)
     registrar.accept(token: Data([0x02]))
     let started = await waitForPushRegistrarCondition { uploadStarted.isRaised }

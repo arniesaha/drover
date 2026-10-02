@@ -49,9 +49,11 @@ private func testDefaults() -> UserDefaults {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct NotifierTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
 
 @Test func firstCheckNotifiesEachNeedsYouSessionAndSetsBadge() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotData([
+    mock.handler = { _ in (200, snapshotData([
         (id: "sess-approval", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
         (id: "sess-input", harness: "agy", status: "running", awaiting: "input", cwd: "/Users/arnab/other"),
         (id: "sess-working", harness: "shell", status: "running", awaiting: nil, cwd: "/tmp"),
@@ -78,7 +80,7 @@ struct NotifierTests {
     let snapshotBytes = snapshotData([
         (id: "sess-approval", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
     ])
-    MockURLProtocol.handler = { _ in (200, snapshotBytes) }
+    mock.handler = { _ in (200, snapshotBytes) }
 
     let spy = SpyNotifier()
     let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
@@ -95,17 +97,17 @@ struct NotifierTests {
     let spy = SpyNotifier()
     let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
 
-    MockURLProtocol.handler = { _ in (200, snapshotData([
+    mock.handler = { _ in (200, snapshotData([
         (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
     ])) }
     await watcher.check(client: client())
 
-    MockURLProtocol.handler = { _ in (200, snapshotData([
+    mock.handler = { _ in (200, snapshotData([
         (id: "sess-1", harness: "claude-code", status: "completed", awaiting: nil, cwd: "/Users/arnab/project"),
     ])) }
     await watcher.check(client: client())
 
-    MockURLProtocol.handler = { _ in (200, snapshotData([
+    mock.handler = { _ in (200, snapshotData([
         (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
     ])) }
     await watcher.check(client: client())
@@ -120,7 +122,7 @@ struct NotifierTests {
     // Foreground polling already holds a fresh snapshot — evaluate() must
     // diff/notify from it directly, no second network fetch. Handler would
     // fail the test loudly if a fetch happened.
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         Issue.record("evaluate() must not fetch")
         return (500, Data())
     }
@@ -144,12 +146,12 @@ struct NotifierTests {
     let defaults = testDefaults()
     let watcher = AttentionWatcher(notifier: spy, seenStore: defaults)
 
-    MockURLProtocol.handler = { _ in (200, snapshotData([
+    mock.handler = { _ in (200, snapshotData([
         (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
     ])) }
     await watcher.check(client: client())
 
-    MockURLProtocol.handler = { _ in (500, Data()) }
+    mock.handler = { _ in (500, Data()) }
     await watcher.check(client: client())
 
     let notifications = await spy.notifications

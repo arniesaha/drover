@@ -156,8 +156,11 @@ struct HarnessModelCatalogTests {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct HarnessModelCatalogClientTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
+
     @Test func requestEncodesPathQueryAndSendsBearer() async throws {
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             #expect(request.httpMethod == "GET")
             #expect(request.url?.absoluteString.contains(
                 "/harness/hosts/mac%20mini/model-catalog?"
@@ -176,7 +179,7 @@ struct HarnessModelCatalogClientTests {
     }
 
     @Test func forcedRefreshSendsOne() async throws {
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             #expect(request.url?.query == "harness=codex&refresh=1")
             return (200, modelCatalogJSON())
         }
@@ -187,7 +190,7 @@ struct HarnessModelCatalogClientTests {
     }
 
     @Test func requestUsesNormalDroverErrorMapping() async {
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             (401, Data(#"{"error":"authentication required"}"#.utf8))
         }
 

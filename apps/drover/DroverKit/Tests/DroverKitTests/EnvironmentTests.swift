@@ -2,20 +2,16 @@ import Foundation
 import Testing
 @testable import DroverKit
 
-// MARK: - validate (the server-checking logic behind AppEnvironment.configure)
-
-private func validate() async -> String? {
-    await ClientFactory.validate(config: ServerConfig(urlString: "http://test.local:7080")!,
-                                 token: "test-token",
-                                 session: MockURLProtocol.session())
-}
-
-/// `.serialized`: several tests here mutate the process-global
-/// `MockURLProtocol.handler` — see `ClientTests`' doc comment for why that
-/// requires serialization rather than Swift Testing's default parallelism.
 extension MockNetworkTests {
 @Suite(.serialized)
 struct EnvironmentTests {
+    let mock = MockNetwork()
+
+    private func validate() async -> String? {
+        await ClientFactory.validate(config: ServerConfig(urlString: "http://test.local:7080")!,
+                                     token: "test-token",
+                                     session: mock.session())
+    }
 
 @Test func factoryNilWhenUnconfigured() {
     let defaults = UserDefaults(suiteName: "drover-env-\(UUID().uuidString)")!
@@ -61,7 +57,7 @@ struct EnvironmentTests {
 }
 
 @Test func validateFailsWhenHealthzUnhealthy() async {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/healthz")
         return (500, Data())
     }
@@ -70,7 +66,7 @@ struct EnvironmentTests {
 }
 
 @Test func validateReportsRejectedToken() async {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/healthz" { return (200, Data()) }
         #expect(request.url?.path == "/harness")
         return (401, Data(#"{"error": "authentication required"}"#.utf8))
@@ -80,7 +76,7 @@ struct EnvironmentTests {
 }
 
 @Test func validateSucceedsWhenHealthzAndSnapshotGreen() async {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/healthz" { return (200, Data()) }
         #expect(request.url?.path == "/harness")
         return (200, snapshotJSON)

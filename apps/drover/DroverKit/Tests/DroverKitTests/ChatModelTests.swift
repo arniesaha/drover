@@ -36,14 +36,10 @@ private final class SnapshotClient: @unchecked Sendable {
     private let repeating: Data?
     private var requestCount = 0
 
-    let client = DroverClient(
-        config: ServerConfig(urlString: "http://test.local:7080")!,
-        token: "test-token",
-        credentialBindingID: testRecoveryBindingID,
-        session: MockURLProtocol.session()
-    )
+    let client: DroverClient
 
-    init(responses: [Data] = [], repeating: Data? = nil) {
+    init(mock: MockNetwork, responses: [Data] = [], repeating: Data? = nil) {
+        self.client = mock.client()
         self.responses = responses
         self.repeating = repeating
     }
@@ -91,15 +87,6 @@ private final class DelayedSnapshotResponse: @unchecked Sendable {
     }
 
     func finish() { release.signal() }
-}
-
-private func snapshotClient(responses: [Data] = [], repeating: Data? = nil) -> SnapshotClient {
-    let snapshotClient = SnapshotClient(responses: responses, repeating: repeating)
-    MockURLProtocol.handler = { request in
-        #expect(request.url?.path == "/harness")
-        return (200, snapshotClient.nextResponse())
-    }
-    return snapshotClient
 }
 
 private func sessionJSON(
@@ -182,6 +169,17 @@ private func eventually(_ condition: () -> Bool) async {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct ChatModelTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
+
+    private func snapshotClient(responses: [Data] = [], repeating: Data? = nil) -> SnapshotClient {
+        let sc = SnapshotClient(mock: mock, responses: responses, repeating: repeating)
+        mock.handler = { request in
+            #expect(request.url?.path == "/harness")
+            return (200, sc.nextResponse())
+        }
+        return sc
+    }
 
 @Test @MainActor func initialRecapBecomesHeaderTitle() {
     let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex",
@@ -231,7 +229,7 @@ struct ChatModelTests {
 
 @Test @MainActor func recapPollRetriesAfterFailedSnapshot() async {
     let requests = RequestCounter()
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness")
         requests.bump()
         if requests.value == 1 {
@@ -252,7 +250,7 @@ struct ChatModelTests {
 
 @Test @MainActor func recapPollWaitsForBusyHubWithoutSpendingAttempts() async throws {
     let requests = RequestCounter()
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         requests.bump()
         return (200, sessionJSON(recap: "Recovered", source: 12))
     }
@@ -271,7 +269,7 @@ struct ChatModelTests {
 @Test @MainActor func recapPollKeepsCurrentTextUntilTargetSourceArrives() async {
     let requests = RequestCounter()
     let target = DelayedSnapshotResponse(sessionJSON(recap: "Target", source: 12))
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness")
         requests.bump()
         if requests.value == 1 {
@@ -309,7 +307,7 @@ struct ChatModelTests {
         recap: "Target", source: 12,
         model: "session-model", thinkingEffort: "low"
     ))
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness")
         return (200, delayed.waitForRelease())
     }
@@ -373,8 +371,8 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func recapTransportFailureKeepsCurrentText() async throws {
-    MockURLProtocol.transportError = URLError(.notConnectedToInternet)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.notConnectedToInternet)
+    defer { mock.transportError = nil }
     let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex",
                           recap: "Current", recapSourceSeq: 8,
                           recapPollInterval: .zero, recapPollAttempts: 1)
@@ -402,7 +400,7 @@ struct ChatModelTests {
 
 @Test @MainActor func stopDoesNotApplyALateRecapSnapshot() async throws {
     let delayed = DelayedSnapshotResponse(sessionJSON(recap: "Late", source: 12))
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness")
         return (200, delayed.waitForRelease())
     }
@@ -434,7 +432,7 @@ struct ChatModelTests {
     // Note: the specific "turn already in flight" conflict queues instead
     // (see inFlightConflictQueuesTurnAndAutoSendsOnTurnComplete); every
     // other 409 still surfaces verbatim as a hint.
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (409, Data(#"{"error": "session is terminating"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
@@ -448,7 +446,7 @@ struct ChatModelTests {
     // Regression: nine taps during a cellular stall produced nine accepted
     // turns (seq 876, 878-885, all "Yes") because sendTurn had no guard.
     let counter = RequestCounter()
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         counter.bump()
         Thread.sleep(forTimeInterval: 0.3)   // hold the request in flight
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
@@ -469,7 +467,7 @@ struct ChatModelTests {
 @Test @MainActor func guardClearsSoTheNextSendStillWorks() async throws {
     let counter = RequestCounter()
     nonisolated(unsafe) var firstTurnID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         counter.bump()
         if firstTurnID == nil { firstTurnID = clientTurnID(in: request) }
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
@@ -489,8 +487,8 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func failedSendLeavesARetryablePendingDelivery() async throws {
-    MockURLProtocol.transportError = URLError(.notConnectedToInternet)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.notConnectedToInternet)
+    defer { mock.transportError = nil }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes"
     await model.sendTurn()
@@ -501,8 +499,8 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func transportFailureClearsTheDraftAndKeepsAPendingDelivery() async throws {
-    MockURLProtocol.transportError = URLError(.notConnectedToInternet)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.notConnectedToInternet)
+    defer { mock.transportError = nil }
     let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01]))
     let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes"
@@ -518,7 +516,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func definiteSendRejectionRestoresTheDraftAndAttachments() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (400, Data(#"{"error": "message is not accepted"}"#.utf8))
     }
     let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01]))
@@ -536,7 +534,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func handOffReturnsNewSessionID() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/continue")
         return (201, Data(#"{"session_id": "harness-continued"}"#.utf8))
     }
@@ -549,7 +547,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func handOffSurfacesStructuredModeForNavigation() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (201, Data(#"{"session_id": "harness-continued", "mode": "structured"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
@@ -560,7 +558,7 @@ struct ChatModelTests {
 
 @Test @MainActor func handOffWithTargetHarnessPostsTarget() async throws {
     nonisolated(unsafe) var sentTarget: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness/sessions/s1/continue")
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         sentTarget = body["target_harness"] as? String
@@ -580,7 +578,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func loadSessionMetadataUpdatesHarnessPresentation() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let model = recoveryChatModel(client: client(), sessionID: "harness-1", harness: "codex")
     #expect(model.harnessPresentation.name == "Codex")
     await model.loadSessionMetadata()
@@ -589,7 +587,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func loadSessionMetadataListsHostHarnesses() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let model = recoveryChatModel(client: client(), sessionID: "harness-1")
     #expect(model.handoffHarnesses.isEmpty)
     await model.loadSessionMetadata()
@@ -626,7 +624,7 @@ struct ChatModelTests {
        "model": "session-model", "thinking_effort": "high"}],
      "cwd_suggestions": []}
     """.utf8)
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         request.url?.path == "/harness" ? (200, snapshot) : (200, encodedCatalog(catalog))
     }
     let model = recoveryChatModel(
@@ -654,7 +652,7 @@ struct ChatModelTests {
         ),
         hostID: "host-1", harness: "codex"
     )
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         request.url?.path == "/harness"
             ? (200, sessionJSON(model: "   ", thinkingEffort: "  \t "))
             : (200, encodedCatalog(catalog))
@@ -676,7 +674,7 @@ struct ChatModelTests {
     )
     nonisolated(unsafe) var sentModel: String?
     nonisolated(unsafe) var sentEffort: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "GET", request.url?.path == "/harness" {
             return (200, sessionJSON(model: rawModel, thinkingEffort: rawEffort))
         }
@@ -715,7 +713,7 @@ struct ChatModelTests {
         supportedEfforts: ["high"]
     )
     let delayedCatalog = DelayedSnapshotResponse(encodedCatalog(freshCatalog))
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.path == "/harness" {
             return (200, sessionJSON(model: "session-model", thinkingEffort: "high"))
         }
@@ -737,14 +735,14 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func loadSessionMetadataUnknownSessionLeavesListEmpty() async throws {
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     let model = recoveryChatModel(client: client(), sessionID: "not-in-snapshot")
     await model.loadSessionMetadata()
     #expect(model.handoffHarnesses.isEmpty)
 }
 
 @Test @MainActor func handOffFailureBecomesHint() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (409, Data(#"{"error": "host offline"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
@@ -758,7 +756,7 @@ struct ChatModelTests {
 
 @Test @MainActor func inFlightConflictQueuesTurnAndAutoSendsOnTurnComplete() async throws {
     nonisolated(unsafe) var turnPosts: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "GET" { return (200, sessionJSON()) }
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         turnPosts.append(body["text"] as? String ?? "")
@@ -793,7 +791,7 @@ struct ChatModelTests {
 
 @Test @MainActor func historicalTurnCompletionDoesNotDispatchQueuedTurn() async throws {
     let counter = RequestCounter()
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         counter.bump()
         return (409, Data(#"{"error": "turn already in flight"}"#.utf8))
     }
@@ -818,7 +816,7 @@ struct ChatModelTests {
 @Test @MainActor func sendTurnPassesAttachmentsAndClearsThem() async throws {
     let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01, 0x02]))
     nonisolated(unsafe) var sentImages: [[String: Any]] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         sentImages = body["images"] as? [[String: Any]] ?? []
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
@@ -848,7 +846,7 @@ struct ChatModelTests {
         hostID: "host-1", scope: "scope-chat", model: "available-model"
     )
     nonisolated(unsafe) var preferenceKeys: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         switch (request.httpMethod, request.url?.path) {
         case ("GET", "/harness"):
             return (200, sessionJSON())
@@ -877,7 +875,7 @@ struct ChatModelTests {
 @Test @MainActor func codexSendsValidCatalogOverridesUnchanged() async throws {
     nonisolated(unsafe) var sentModel: String?
     nonisolated(unsafe) var sentThinking: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         sentModel = body["model"] as? String
         sentThinking = body["thinking_effort"] as? String
@@ -903,7 +901,7 @@ struct ChatModelTests {
 @Test @MainActor func agySendsModelWithoutSeparateEffortWhenMetadataHasNone() async throws {
     nonisolated(unsafe) var sentModel: String?
     nonisolated(unsafe) var sentThinking = false
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         sentModel = body["model"] as? String
@@ -937,7 +935,7 @@ struct ChatModelTests {
 @Test @MainActor func sendTurnOmitsLockedClaudePreferences() async throws {
     nonisolated(unsafe) var sentModel = false
     nonisolated(unsafe) var sentThinking = false
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         sentModel = body.keys.contains("model")
         sentThinking = body.keys.contains("thinking_effort")
@@ -966,7 +964,7 @@ struct ChatModelTests {
 
 @Test @MainActor func queuedTurnOmitsLockedClaudePreferences() async throws {
     nonisolated(unsafe) var preferenceKeys: [[String]] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "GET" { return (200, sessionJSON()) }
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         preferenceKeys.append(body.keys.filter { $0 == "model" || $0 == "thinking_effort" })
@@ -1006,7 +1004,7 @@ struct ChatModelTests {
 
 @Test @MainActor func imageOnlyTurnSends() async throws {
     nonisolated(unsafe) var sentTexts: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         sentTexts.append(body["text"] as? String ?? "missing")
         return (202, Data(#"{"turn_id": "t1"}"#.utf8))
@@ -1021,7 +1019,7 @@ struct ChatModelTests {
 @Test @MainActor func attachmentsSurviveConflictQueueing() async throws {
     let attachment = TurnAttachment(mediaType: "image/png", data: Data([0x0A, 0x0B]))
     nonisolated(unsafe) var turnPosts: [[String: Any]] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "GET" { return (200, sessionJSON()) }
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         turnPosts.append(body)
@@ -1053,7 +1051,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func otherConflictsStillSurfaceAsHintNotQueue() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (409, Data(#"{"error": "approval pending; answer it first"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
@@ -1067,7 +1065,7 @@ struct ChatModelTests {
 @Test @MainActor func unavailableRecoveryPreservesComposerForNewSession() async throws {
     let message = "Session cannot be resumed after the harness restart. Continue it in a new session."
     let attachment = TurnAttachment(mediaType: "image/png", data: Data([0x0C, 0x0D]))
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (409, Data(#"{"error": "\#(message)"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
@@ -1085,12 +1083,12 @@ struct ChatModelTests {
 
 @Test @MainActor func turnCompleteWithoutQueueDoesNotPostTurn() async throws {
     nonisolated(unsafe) var posts = 0
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "GET" { return (200, sessionJSON()) }
         posts += 1
         return (202, Data(#"{"turn_id": "t"}"#.utf8))
     }
-    let model = ChatModel.fixture()
+    let model = ChatModel.fixture(client: client())
     model.ingest(.message(.fixture(seq: 1, type: .status,
                                    payload: ["turn_complete": .bool(true)])))
     try await Task.sleep(for: .milliseconds(50))
@@ -1099,7 +1097,7 @@ struct ChatModelTests {
 
 @Test @MainActor func sentTurnStaysPendingUntilItsStreamEcho() async throws {
     nonisolated(unsafe) var turnID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         turnID = clientTurnID(in: request)
         return (202, Data(#"{"turn_id": "t9"}"#.utf8))
     }
@@ -1122,7 +1120,7 @@ struct ChatModelTests {
 
 @Test @MainActor func sentTurnIsConfirmedByTheHubsCanonicalTurnID() async throws {
     nonisolated(unsafe) var turnID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         turnID = clientTurnID(in: request)
         return (202, Data(#"{"turn_id": "t9"}"#.utf8))
     }
@@ -1183,13 +1181,13 @@ struct ChatModelTests {
 @Test @MainActor func approveSendsRequestIDAndDecision() async throws {
     nonisolated(unsafe) var sentDecision: String?
     nonisolated(unsafe) var sentRequestID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
         sentRequestID = body["request_id"] as? String
         sentDecision = body["decision"] as? String
         return (200, Data())
     }
-    let model = ChatModel.fixture(messages: [
+    let model = ChatModel.fixture(client: client(), messages: [
         .fixture(seq: 1, type: .approvalPrompt, payload: ["request_id": .string("r1")]),
     ])
     await model.approve("allow")
@@ -1199,10 +1197,10 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func approveBadRequestBecomesHint() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (400, Data(#"{"error": "codex exec has no approval channel"}"#.utf8))
     }
-    let model = ChatModel.fixture(messages: [
+    let model = ChatModel.fixture(client: client(), messages: [
         .fixture(seq: 1, type: .approvalPrompt, payload: ["request_id": .string("r1")]),
     ])
     await model.approve("allow")
@@ -1211,7 +1209,7 @@ struct ChatModelTests {
 
 @Test @MainActor func interruptAndTerminatePostToRoutes() async throws {
     nonisolated(unsafe) var paths: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         paths.append(request.url?.path ?? "")
         return (200, Data())
     }
@@ -1223,7 +1221,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func transportFailureGetsGenericRetryHint() async throws {
-    MockURLProtocol.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
+    mock.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.controls = .everythingAdvertised
     await model.interrupt()
@@ -1236,7 +1234,7 @@ struct ChatModelTests {
 // the app said "try again" for a session that may already exist. Retrying
 // that is how you end up with two.
 @Test @MainActor func aHostStillWorkingIsNotAnInvitationToRetry() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (504, Data(#"{"error": "harness host did not answer within 120s"}"#.utf8))
     }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
@@ -1254,7 +1252,7 @@ struct ChatModelTests {
 /// the second start()'s pump, and a finished pump must not leave
 /// `pumpTask` non-nil (which would wedge start()'s idempotency guard).
 @Test @MainActor func restartAfterStopStillStreamsMessages() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let afterSeq = URLComponents(
             url: request.url!, resolvingAgainstBaseURL: false
         )?.queryItems?.first(where: { $0.name == "after_seq" })?.value ?? "0"
@@ -1329,7 +1327,7 @@ struct ChatModelTests {
 /// has been read and tapped, the next scheduled attempt can be most of a
 /// minute away — a Retry that only cleared state would look broken.
 @Test @MainActor func retryReopensTheStreamRatherThanJustClearingTheMessage() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (200, Data(#"{"messages": [], "max_seq": 0}"#.utf8))
     }
     let connector = FakeConnector([
@@ -1354,7 +1352,7 @@ struct ChatModelTests {
 @Test @MainActor func retryClearsTheFailureAndStartsTheRestraintOver() async throws {
     // 500s forever behind a backoff long enough that the restarted pump
     // cannot land a failure of its own inside this test.
-    MockURLProtocol.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
+    mock.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
     let model = recoveryChatModel(client: client(), sessionID: "s1", streamFactory: { client, sessionID in
         MessageStream(client: client, sessionID: sessionID,
                       connector: FakeConnector([.frames([], thenError: false)]),
@@ -1372,7 +1370,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func olderHistoryIsLoadedOnlyAfterExplicitRequest() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         switch request.url?.query {
         case "limit=50":
             return (200, Data("""
@@ -1413,7 +1411,7 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func failedOlderHistoryLoadReportsNoPrepend() async throws {
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.url?.query == "limit=50" {
             return (200, Data("""
             {"messages": [\(chatWireMessage(seq: 4, text: "four")), \(chatWireMessage(seq: 5, text: "five"))],
@@ -1447,7 +1445,7 @@ struct ChatModelTests {
 /// it should set a token-rejected hint and stop reconnecting.
 @Test @MainActor func unauthorizedDuringCatchUpSetsHintAndStopsReconnecting() async throws {
     nonisolated(unsafe) var restCalls = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         restCalls += 1
         return (401, Data(#"{"error": "authentication required"}"#.utf8))
     }
@@ -1468,11 +1466,11 @@ struct ChatModelTests {
 
 @Test @MainActor func approveIgnoredWhileAnswerInFlight() async throws {
     nonisolated(unsafe) var calls = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         calls += 1
         return (200, Data())
     }
-    let model = ChatModel.fixture(messages: [
+    let model = ChatModel.fixture(client: client(), messages: [
         .fixture(seq: 1, type: .approvalPrompt, payload: ["request_id": .string("r1")]),
     ])
     // First approve sets isAnswering before its network suspension; the
@@ -1489,11 +1487,11 @@ struct ChatModelTests {
 
 @Test @MainActor func echoOfAnAmbiguouslyFailedSendClearsThePendingDelivery() async throws {
     nonisolated(unsafe) var turnID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         turnID = clientTurnID(in: request)
         return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
     }
-    defer { MockURLProtocol.handler = nil }
+    defer { mock.handler = nil }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
@@ -1518,8 +1516,8 @@ struct ChatModelTests {
 }
 
 @Test @MainActor func echoOfDifferentTextLeavesPendingDeliveryInPlace() async throws {
-    MockURLProtocol.transportError = URLError(.networkConnectionLost)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.networkConnectionLost)
+    defer { mock.transportError = nil }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
@@ -1535,8 +1533,8 @@ struct ChatModelTests {
     // The hub accepting the POST is not delivery. If the echo is dropped on
     // any hop, the composer must not stay gated on a turn nothing will
     // resolve; it degrades to a retryable state instead.
-    MockURLProtocol.handler = { _ in (202, Data(#"{"status": "accepted"}"#.utf8)) }
-    defer { MockURLProtocol.handler = nil }
+    mock.handler = { _ in (202, Data(#"{"status": "accepted"}"#.utf8)) }
+    defer { mock.handler = nil }
     let model = recoveryChatModel(
         client: client(),
         sessionID: "s1",
@@ -1558,11 +1556,11 @@ struct ChatModelTests {
 
 @Test @MainActor func aConfirmedTurnIsNeverMarkedUnconfirmedLater() async throws {
     nonisolated(unsafe) var turnID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         turnID = clientTurnID(in: request)
         return (202, Data(#"{"status": "accepted"}"#.utf8))
     }
-    defer { MockURLProtocol.handler = nil }
+    defer { mock.handler = nil }
     let model = recoveryChatModel(
         client: client(),
         sessionID: "s1",
@@ -1589,8 +1587,8 @@ struct ChatModelTests {
 @Test @MainActor func retryStaysOfferedAfterAnotherActionClearsTheHint() async throws {
     // approve/interrupt/terminate all clear `hint`. The retry affordance is
     // driven by the pending turn, so it has to survive them.
-    MockURLProtocol.transportError = URLError(.networkConnectionLost)
-    defer { MockURLProtocol.transportError = nil }
+    mock.transportError = URLError(.networkConnectionLost)
+    defer { mock.transportError = nil }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
@@ -1601,8 +1599,8 @@ struct ChatModelTests {
     // A successful interrupt clears `hint`, and used to take the only Retry
     // affordance with it while the delivery stayed unresolved.
     model.controls = .everythingAdvertised
-    MockURLProtocol.transportError = nil
-    MockURLProtocol.handler = { _ in (200, Data(#"{"status": "ok"}"#.utf8)) }
+    mock.transportError = nil
+    mock.handler = { _ in (200, Data(#"{"status": "ok"}"#.utf8)) }
     await model.interrupt()
 
     #expect(model.hint == nil)
@@ -1612,9 +1610,9 @@ struct ChatModelTests {
 
 @Test @MainActor func matchingTextFromAnotherClientDoesNotConfirmPendingDelivery() async throws {
     nonisolated(unsafe) var localTurnID: String?
-    MockURLProtocol.transportError = nil
-    defer { MockURLProtocol.handler = nil }
-    MockURLProtocol.handler = { request in
+    mock.transportError = nil
+    defer { mock.handler = nil }
+    mock.handler = { request in
         localTurnID = clientTurnID(in: request)
         return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
     }
@@ -1644,11 +1642,11 @@ struct ChatModelTests {
 
 @Test @MainActor func echoArrivingInReconnectHistoryClearsPendingDelivery() async throws {
     nonisolated(unsafe) var turnID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         turnID = clientTurnID(in: request)
         return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
     }
-    defer { MockURLProtocol.handler = nil }
+    defer { mock.handler = nil }
     let model = recoveryChatModel(client: client(), sessionID: "s1")
     model.composerText = "Yes looks good"
     await model.sendTurn()
@@ -1673,7 +1671,7 @@ struct ChatModelTests {
 @Test @MainActor func echoAfterAFailedQueuedDispatchClearsPendingDelivery() async throws {
     nonisolated(unsafe) var turnPosts = 0
     nonisolated(unsafe) var turnID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         if request.httpMethod == "GET" { return (200, sessionJSON()) }
         turnPosts += 1
         if turnPosts == 1 {
@@ -1708,7 +1706,7 @@ struct ChatModelTests {
 
 @Test @MainActor func retryingPendingDeliveryReusesTheClientTurnID() async throws {
     nonisolated(unsafe) var turnIDs: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         turnIDs.append(clientTurnID(in: request))
         if turnIDs.count == 1 {
             return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
@@ -1736,11 +1734,11 @@ struct ChatModelTests {
 
 @Test @MainActor func echoOfFailedSendPreservesAttachmentsAddedAfterTheSend() async throws {
     nonisolated(unsafe) var turnID: String?
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         turnID = clientTurnID(in: request)
         return (500, Data(#"{"error": "upstream timeout"}"#.utf8))
     }
-    defer { MockURLProtocol.handler = nil }
+    defer { mock.handler = nil }
     let landedAttachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x01]))
     let laterAttachment = TurnAttachment(mediaType: "image/png", data: Data([0x02]))
     let model = recoveryChatModel(client: client(), sessionID: "s1")

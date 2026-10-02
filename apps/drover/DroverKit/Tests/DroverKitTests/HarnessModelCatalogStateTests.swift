@@ -119,12 +119,14 @@ struct HarnessModelCatalogPersistenceTests {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct HarnessModelCatalogStateTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
     @Test @MainActor func cachedCatalogIsVisibleBeforeRefreshCompletes() async throws {
         let store = HarnessModelCatalogStore(defaults: catalogDefaults())
         store.save(catalog: fixtureCatalog(scope: "scope-a", model: "cached-model"))
         let state = HarnessModelCatalogState(client: client(), store: store)
         let gate = CatalogRequestGate()
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             gate.requestStarted()
             gate.waitForRelease()
             return (200, stateCatalogJSON(model: "fresh-model"))
@@ -416,8 +418,8 @@ struct HarnessModelCatalogStateTests {
         store.save(catalog: fixtureCatalog(scope: "scope-a", model: "cached-model"))
         let state = HarnessModelCatalogState(client: client(), store: store)
         state.select(hostID: "mac-mini", harness: "codex", catalogAvailable: true)
-        MockURLProtocol.transportError = URLError(.notConnectedToInternet)
-        defer { MockURLProtocol.transportError = nil }
+        mock.transportError = URLError(.notConnectedToInternet)
+        defer { mock.transportError = nil }
 
         await state.refresh()
 
@@ -428,7 +430,7 @@ struct HarnessModelCatalogStateTests {
     }
 
     @Test @MainActor func forcedStateRefreshSendsOne() async {
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             #expect(request.url?.query == "harness=codex&refresh=1")
             return (200, stateCatalogJSON())
         }

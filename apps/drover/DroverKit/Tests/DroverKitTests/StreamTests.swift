@@ -36,10 +36,12 @@ private func wireMessage(seq: Int, text: String) -> String {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct StreamTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
 
 @Test func historyThenLiveDedupedAndOrdered() async throws {
     // REST returns history seq 1-2; WS replays 2 (dup) then delivers 3.
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url!.query == "limit=50")
         return (200, Data("""
         {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two"))],
@@ -66,7 +68,7 @@ struct StreamTests {
 @Test func reconnectCatchesUpFromLastSeq() async throws {
     // First WS errors after seq 1; catch-up REST must be called with after_seq=1.
     nonisolated(unsafe) var restCalls: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         restCalls.append(request.url!.query ?? "")
         if restCalls.count == 1 {
             return (200, Data(#"{"messages": [], "max_seq": 0}"#.utf8))
@@ -103,7 +105,7 @@ struct StreamTests {
 }
 
 @Test func websocketStartsAfterRestCatchupSeq() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         return (200, Data("""
         {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two"))],
          "max_seq": 2}
@@ -131,7 +133,7 @@ struct StreamTests {
     // history gap — it emits .connection(false), backs off, retries the
     // catch-up, and only then comes up.
     nonisolated(unsafe) var restCalls = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         restCalls += 1
         if restCalls == 1 {
             return (500, Data(#"{"error": "boom"}"#.utf8))
@@ -168,7 +170,7 @@ struct StreamTests {
     // sentence, not URLSession's — the phone's radio being fine says nothing
     // about whether the fleet answered.
     nonisolated(unsafe) var restCalls = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         restCalls += 1
         if restCalls == 1 {
             return (500, Data(#"{"error": "boom"}"#.utf8))
@@ -192,7 +194,7 @@ struct StreamTests {
 /// screen over a transcript the user can already read.
 @Test func aDropAfterAttachingStillReportsItselfForTheColdOpenToIgnore() async throws {
     nonisolated(unsafe) var restCalls = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         restCalls += 1
         return (200, Data(#"{"messages": [], "max_seq": 0}"#.utf8))
     }
@@ -217,7 +219,7 @@ struct StreamTests {
     // token: the stream must emit .unauthorized exactly once and stop for
     // good, never re-issuing the REST call or falling through to WS.
     nonisolated(unsafe) var restCalls = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         restCalls += 1
         return (401, Data(#"{"error": "authentication required"}"#.utf8))
     }
@@ -235,7 +237,7 @@ struct StreamTests {
 
 @Test func coldCatchUpEmitsOnlyTheNewestPageBeforeLiveMessages() async throws {
     nonisolated(unsafe) var queries: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let query = request.url?.query ?? ""
         queries.append(query)
         switch queries.count {
@@ -301,7 +303,7 @@ struct StreamTests {
     // on "Reconnecting…" forever.
     nonisolated(unsafe) var queries: [String] = []
     nonisolated(unsafe) var olderAttempts = 0
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let query = request.url?.query ?? ""
         queries.append(query)
         if query == "limit=50" {
@@ -357,7 +359,7 @@ struct StreamTests {
     // not, so the window is thrown away and the snapshot re-established.
     nonisolated(unsafe) var queries: [String] = []
     nonisolated(unsafe) var olderAttempts = 0
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let query = request.url?.query ?? ""
         queries.append(query)
         if query == "limit=50" {
@@ -414,7 +416,7 @@ struct StreamTests {
     // session's history and surfaces no error. Once the gap has outlived its
     // retries, render what is there and mark the hole.
     nonisolated(unsafe) var attempts = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         attempts += 1
         return (200, Data("""
         {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 2, text: "two")),
@@ -469,7 +471,7 @@ struct StreamTests {
     // A gap the hub is merely late on must not leave a marker in the
     // transcript: the retries exist precisely so a transient hole heals.
     nonisolated(unsafe) var attempts = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         attempts += 1
         if attempts == 1 {
             return (200, Data("""
@@ -507,7 +509,7 @@ struct StreamTests {
     // cannot produce the missing event either, the session must keep
     // updating rather than freeze on the last thing it managed to render.
     nonisolated(unsafe) var attempts = 0
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         attempts += 1
         if attempts == 1 {
             return (200, Data(#"{"messages": [], "max_seq": 0, "has_older": false, "has_newer": false}"#.utf8))
@@ -547,7 +549,7 @@ struct StreamTests {
     // The cold window is unchanged at 200 messages, but no single request may
     // carry more than one page of it.
     nonisolated(unsafe) var queries: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         queries.append(request.url?.query ?? "")
         let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
             .queryItems ?? []
@@ -590,7 +592,7 @@ struct StreamTests {
 
 @Test func olderHistoryLoadsOnePageOnlyWhenRequested() async throws {
     nonisolated(unsafe) var queries: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let query = request.url?.query ?? ""
         queries.append(query)
         if query == "limit=50" {
@@ -628,7 +630,7 @@ struct StreamTests {
 
 @Test func coldCatchUpRejectsHistoryThatDoesNotReachSequenceOne() async throws {
     nonisolated(unsafe) var queries: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         queries.append(request.url?.query ?? "")
         return (200, Data("""
         {"messages": [\(wireMessage(seq: 2, text: "two")), \(wireMessage(seq: 3, text: "three"))],
@@ -653,7 +655,7 @@ struct StreamTests {
 @Test func failedOlderHistoryRequestKeepsItsCursorForRetry() async throws {
     nonisolated(unsafe) var queries: [String] = []
     nonisolated(unsafe) var olderAttempts = 0
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let query = request.url?.query ?? ""
         queries.append(query)
         if query == "limit=50" {
@@ -706,7 +708,7 @@ struct StreamTests {
 
 @Test func catchUpGapRetriesFromLastContiguousSequenceWithoutWebSocket() async throws {
     nonisolated(unsafe) var queries: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         queries.append(request.url?.query ?? "")
         return (200, Data("""
         {"messages": [\(wireMessage(seq: 1, text: "one")), \(wireMessage(seq: 3, text: "three"))],
@@ -730,7 +732,7 @@ struct StreamTests {
 
 @Test func malformedHistoryElementDoesNotAdvanceCursorOrAttachWebSocket() async throws {
     nonisolated(unsafe) var queries: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         queries.append(request.url?.query ?? "")
         return (200, Data("""
         {"messages": [
@@ -756,7 +758,7 @@ struct StreamTests {
 }
 
 @Test func stopCancelsTheAttachedWebSocketStream() async throws {
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (200, Data(#"{"messages": [], "max_seq": 0, "has_older": false, "has_newer": false}"#.utf8))
     }
     let connector = FakeConnector([.frames([], thenError: false)])
@@ -778,7 +780,7 @@ struct StreamTests {
 
 @Test func liveSequenceGapReconnectsWithoutAdvancingCursor() async throws {
     nonisolated(unsafe) var queries: [String] = []
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         queries.append(request.url?.query ?? "")
         return (200, Data(#"{"messages": [], "max_seq": 0, "has_older": false, "has_newer": false}"#.utf8))
     }

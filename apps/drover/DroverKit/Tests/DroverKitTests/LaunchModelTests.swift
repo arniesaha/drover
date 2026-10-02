@@ -15,6 +15,8 @@ private final class SnapshotRequestCounter: @unchecked Sendable {
 extension MockNetworkTests {
 @Suite(.serialized)
 struct LaunchModelTests {
+    let mock = MockNetwork()
+    private func client() -> DroverClient { mock.client() }
 
 private func testStore() -> HarnessModelCatalogStore {
     HarnessModelCatalogStore(
@@ -151,7 +153,7 @@ private func catalog(
     model.harness = "agy"
     model.prompt = "explain the repo layout"
 
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(request.url?.path == "/harness/hosts/mac-mini/sessions")
@@ -178,7 +180,7 @@ private func catalog(
     model.runPreferences.selectedModel = "gpt-5.6-terra"
     model.runPreferences.thinkingEffort = "high"
 
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         let images = body["images"] as! [[String: Any]]
@@ -199,7 +201,7 @@ private func catalog(
     model.harness = "agy"
     model.runPreferences.apply(catalog(harness: "agy"))
 
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(body.keys.contains("model") == false)
@@ -218,7 +220,7 @@ private func catalog(
     // the view never shows the prompt field when `isStructured` is false.
     model.prompt = "should never be sent"
 
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         let body = try! JSONSerialization.jsonObject(
             with: request.bodyStreamData()) as! [String: Any]
         #expect(body["harness"] as? String == "shell")
@@ -235,7 +237,7 @@ private func catalog(
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
 
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         (400, Data(#"{"error": "host offline"}"#.utf8))
     }
 
@@ -254,7 +256,7 @@ private func catalog(
     let model = LaunchModel(client: client(), snapshot: nil, store: testStore())
     #expect(model.hostID.isEmpty)
 
-    MockURLProtocol.handler = { request in
+    mock.handler = { request in
         #expect(request.url?.path == "/harness")
         return (200, snapshotJSON)
     }
@@ -278,7 +280,7 @@ private func catalog(
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
     model.hostID = "nas"
 
-    MockURLProtocol.handler = { _ in (200, multiHostSnapshotJSON) }
+    mock.handler = { _ in (200, multiHostSnapshotJSON) }
     await model.refreshSnapshot()
 
     #expect(model.hostID == "nas")
@@ -293,7 +295,7 @@ private func catalog(
     model.hostID = "studio"
 
     // `snapshotJSON` lists mac-mini only.
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     await model.refreshSnapshot()
 
     #expect(model.hostID == "mac-mini")
@@ -306,7 +308,7 @@ private func catalog(
 /// into a request storm with Launch pinned disabled.
 @Test @MainActor func anEmptySuggestionListNeverStormsTheServer() async throws {
     let counter = SnapshotRequestCounter()
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         counter.bump()
         return (200, multiHostSnapshotJSON)
     }
@@ -331,7 +333,7 @@ private func catalog(
 /// re-enabling Launch mid-fetch.
 @Test @MainActor func overlappingRefreshesShareOneRequest() async throws {
     let counter = SnapshotRequestCounter()
-    MockURLProtocol.handler = { _ in
+    mock.handler = { _ in
         counter.bump()
         return (200, snapshotJSON)
     }
@@ -350,7 +352,7 @@ private func catalog(
 /// nothing said. `launchError` never covered this — only `launch()` sets it.
 @Test @MainActor func aFailedFetchSaysWhyInsteadOfGoingQuiet() async throws {
     let model = LaunchModel(client: client(), snapshot: nil, store: testStore())
-    MockURLProtocol.handler = { _ in (401, Data()) }
+    mock.handler = { _ in (401, Data()) }
 
     await model.refreshSnapshot()
 
@@ -363,11 +365,11 @@ private func catalog(
 /// A retry that works clears the message it replaced.
 @Test @MainActor func aSucceedingRetryClearsTheError() async throws {
     let model = LaunchModel(client: client(), snapshot: nil, store: testStore())
-    MockURLProtocol.handler = { _ in (401, Data()) }
+    mock.handler = { _ in (401, Data()) }
     await model.refreshSnapshot()
     #expect(model.snapshotError != nil)
 
-    MockURLProtocol.handler = { _ in (200, snapshotJSON) }
+    mock.handler = { _ in (200, snapshotJSON) }
     await model.refreshSnapshot()
 
     #expect(model.snapshotError == nil)
@@ -449,7 +451,7 @@ private func catalog(
        "capabilities": {"display_name": "Studio", "harnesses": [\(v1Row("claude-code"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
-    MockURLProtocol.handler = { _ in (200, refreshedJSON) }
+    mock.handler = { _ in (200, refreshedJSON) }
     await model.refreshSnapshot()
 
     #expect(model.hostID == "mac-mini")
@@ -482,7 +484,7 @@ private func catalog(
        "capabilities": {"display_name": "Studio", "harnesses": [\(v1Row("codex"))]}}
     ], "sessions": [], "cwd_suggestions": []}
     """.utf8)
-    MockURLProtocol.handler = { _ in (200, offlineJSON) }
+    mock.handler = { _ in (200, offlineJSON) }
     await model.refreshSnapshot()
 
     #expect(model.hostID == "mac-mini")
@@ -492,7 +494,7 @@ private func catalog(
     #expect(model.hostWarning == "Host is offline. Wait for it to reconnect before launching.")
     #expect(model.canLaunch == false)
 
-    MockURLProtocol.handler = { _ in (200, initialJSON) }
+    mock.handler = { _ in (200, initialJSON) }
     await model.refreshSnapshot()
 
     #expect(model.hostID == "mac-mini")
