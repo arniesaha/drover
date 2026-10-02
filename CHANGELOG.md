@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   served at `GET /projects/activity` (#473).
 - The app hides the API-billed cost metric when no session reported a cost,
   and names spans as a measurement source only when they contributed (#473).
+- Phase 1 of the memory-integrity program (#478, program #476) removes Pond
+  recall, CLI, and backup integration. Legacy `[archive]` keys are ignored with
+  one deprecation warning per process. Recall bundles serve hub context and
+  include `sources: ["hub"]` while retaining their response envelope.
+- DuckLake and R2 catalog+files generation backups plus a Postgres dump are
+  planned for Phase 4 (#481); `docs/backup.md` records the unimplemented design.
 
 ### Added
 
@@ -578,23 +584,11 @@ the hub was rolled back to 0.4.15. See 0.4.17.
 - Three `/metrics` lines for the rollup: `drover_usage_rollup_sessions_total`,
   `drover_usage_rollup_malformed_payloads_total`, and
   `drover_usage_rollup_last_pass_seconds` (#309).
-- Four local-only, read-only archive inventory commands capture private
-  native and Pond identity manifests and compare candidate coverage. They
-  create only new owner-readable `0600` artifacts, refuse unsafe inputs and
-  existing outputs, emit aggregate-only stdout, and exit `2` when conservative
-  duplicate or readiness checks block progression. They do not sync, upload,
-  configure remote storage, certify content, mutate the archive, or authorize
-  deletion.
 - A bounded metadata-only eligibility assessment can produce a private,
   fingerprint-bound receipt for a canonical Claude source containing only
   title/name events. Coverage reports the source as
   `source_not_archive_eligible`; changed, duplicate, message-bearing, oversized,
   or noncanonical sources fail closed.
-- Manual, fail-closed Pond v0.16.3 backup and restore commands create verified,
-  immutable R2 generations while the local Pond store remains the only live
-  recall and sync target. The operator runbook covers private configuration,
-  dry-run and health gates, retained diagnostics, read-only restore drills, and
-  manual Cloudflare cost and lifecycle evidence.
 
 ### Changed
 
@@ -629,19 +623,6 @@ the hub was rolled back to 0.4.15. See 0.4.17.
 
 ### Added
 
-- Optional cross-session recall archive: Drover reads a local Pond
-  (pinned v0.16.3) HTTP endpoint, and the new `drover_recall_bundle` MCP
-  tool composes bounded, source-cited evidence from archived native
-  sessions alongside Drover's own summaries, briefs, and open loops.
-  Disabled by default; loopback-only; responses are streamed and
-  byte-capped before decoding, and bundles compose one at a time. An
-  archive outage or the disabled state degrades to Drover-only context
-  with a structured warning -- it never blocks startup or a live session.
-- `[archive]` configuration block with strict validation (loopback URL,
-  bounded timeouts, limits, and response caps).
-- CI job proving the archive client against the real checksum-verified
-  Pond binary, so an upstream contract drift breaks the build rather than
-  an operator's hub.
 
 ### Fixed
 

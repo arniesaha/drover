@@ -1,4 +1,4 @@
-"""Private, bounded manifest artifacts for Pond inventory operations."""
+"""Private, bounded manifest artifacts for native inventory operations."""
 
 import dataclasses
 import json
@@ -11,11 +11,8 @@ from drover.server.archive import inventory as inventory_module
 from drover.server.archive.inventory import (
     NativeInventory,
     NativeInventoryRecord,
-    PondInventory,
-    PondInventoryRecord,
     SourceEligibilityReceipt,
     load_native_inventory,
-    load_pond_inventory,
     load_source_eligibility_receipt,
     read_private_json,
     write_private_json,
@@ -34,24 +31,6 @@ def _native_inventory() -> NativeInventory:
                 updated_at="2026-08-28T11:00:00Z",
                 size_bytes=123,
                 source_copies=1,
-            ),
-        ),
-    )
-
-
-def _pond_inventory() -> PondInventory:
-    return PondInventory(
-        schema_version=1,
-        captured_at="2026-08-28T12:00:00Z",
-        pond_version="0.16.3",
-        records=(
-            PondInventoryRecord(
-                session_id="pond-1",
-                source_agent="codex-cli",
-                created_at="2026-08-28T10:00:00Z",
-                message_count=1,
-                first_message_at="2026-08-28T10:01:00Z",
-                last_message_at="2026-08-28T10:02:00Z",
             ),
         ),
     )
@@ -84,35 +63,6 @@ def test_native_inventory_round_trips_through_owner_only_file(tmp_path):
     assert load_native_inventory(path) == inventory
 
 
-def test_pond_inventory_round_trips_and_sorts_records(tmp_path):
-    path = tmp_path / "pond.json"
-    inventory = PondInventory(
-        schema_version=1,
-        captured_at="2026-08-28T12:00:00Z",
-        pond_version="0.16.3",
-        records=(
-            PondInventoryRecord(
-                "pond-2", "claude-code", "2026-08-28T10:00:00Z", 0, None, None
-            ),
-            _pond_inventory().records[0],
-        ),
-    )
-
-    write_private_json(path, inventory.to_wire())
-
-    assert load_pond_inventory(path) == PondInventory(
-        schema_version=1,
-        captured_at="2026-08-28T12:00:00Z",
-        pond_version="0.16.3",
-        records=(
-            PondInventoryRecord(
-                "pond-2", "claude-code", "2026-08-28T10:00:00Z", 0, None, None
-            ),
-            _pond_inventory().records[0],
-        ),
-    )
-
-
 def test_source_eligibility_receipt_round_trips_through_owner_only_file(tmp_path):
     path = tmp_path / "eligibility.json"
     receipt = _eligibility_receipt()
@@ -123,9 +73,7 @@ def test_source_eligibility_receipt_round_trips_through_owner_only_file(tmp_path
     assert load_source_eligibility_receipt(path) == receipt
 
 
-@pytest.mark.parametrize(
-    "factory", [_native_inventory, _pond_inventory, _eligibility_receipt]
-)
+@pytest.mark.parametrize("factory", [_native_inventory, _eligibility_receipt])
 def test_inventory_values_are_frozen_and_slotted(factory):
     inventory = factory()
 
@@ -154,26 +102,6 @@ def test_source_eligibility_loader_rejects_invalid_fixed_contract(
         load_source_eligibility_receipt(path)
 
     assert str(value) not in str(raised.value)
-
-
-@pytest.mark.parametrize(
-    ("kind", "loader", "payload"),
-    [
-        ("native", load_native_inventory, _native_inventory().to_wire()),
-        ("pond", load_pond_inventory, _pond_inventory().to_wire()),
-    ],
-)
-def test_typed_loaders_require_kind_to_match_manifest_type(
-    tmp_path, kind, loader, payload
-):
-    payload["kind"] = (
-        "pond_session_inventory" if kind == "native" else "native_source_inventory"
-    )
-    path = tmp_path / f"{kind}.json"
-    _write_input(path, payload)
-
-    with pytest.raises(ValueError, match="kind"):
-        loader(path)
 
 
 @pytest.mark.parametrize("name", ["existing.json", "symlink.json"])
@@ -409,103 +337,6 @@ def test_native_loader_rejects_duplicate_source_session_pair(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("remove", "add"),
-    [
-        ("pond_version", None),
-        (None, ("unexpected", True)),
-    ],
-)
-def test_pond_loader_requires_exact_root_fields(tmp_path, remove, add):
-    payload = _pond_inventory().to_wire()
-    if remove:
-        del payload[remove]
-    if add:
-        payload[add[0]] = add[1]
-    path = tmp_path / "pond.json"
-    _write_input(path, payload)
-
-    with pytest.raises(ValueError, match="root"):
-        load_pond_inventory(path)
-
-
-@pytest.mark.parametrize(
-    ("remove", "add"),
-    [
-        ("message_count", None),
-        (None, ("unexpected", True)),
-    ],
-)
-def test_pond_loader_requires_exact_record_fields(tmp_path, remove, add):
-    payload = _pond_inventory().to_wire()
-    if remove:
-        del payload["records"][0][remove]
-    if add:
-        payload["records"][0][add[0]] = add[1]
-    path = tmp_path / "pond.json"
-    _write_input(path, payload)
-
-    with pytest.raises(ValueError, match="record"):
-        load_pond_inventory(path)
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("pond_version", ""),
-        ("pond_version", 1),
-        ("session_id", ""),
-        ("source_agent", ""),
-        ("created_at", "not-a-timestamp"),
-        ("message_count", -1),
-    ],
-)
-def test_pond_loader_rejects_invalid_field_values(tmp_path, field, value):
-    payload = _pond_inventory().to_wire()
-    destination = payload if field == "pond_version" else payload["records"][0]
-    destination[field] = value
-    path = tmp_path / "pond.json"
-    _write_input(path, payload)
-
-    with pytest.raises(ValueError, match=field):
-        load_pond_inventory(path)
-
-
-@pytest.mark.parametrize(
-    ("message_count", "first_message_at", "last_message_at"),
-    [
-        (0, "2026-08-28T10:01:00Z", "2026-08-28T10:02:00Z"),
-        (0, None, "2026-08-28T10:02:00Z"),
-        (1, None, None),
-        (1, "not-a-timestamp", "2026-08-28T10:02:00Z"),
-    ],
-)
-def test_pond_loader_enforces_message_timestamp_pairing(
-    tmp_path, message_count, first_message_at, last_message_at
-):
-    payload = _pond_inventory().to_wire()
-    payload["records"][0].update(
-        message_count=message_count,
-        first_message_at=first_message_at,
-        last_message_at=last_message_at,
-    )
-    path = tmp_path / "pond.json"
-    _write_input(path, payload)
-
-    with pytest.raises(ValueError, match="message"):
-        load_pond_inventory(path)
-
-
-def test_pond_loader_rejects_duplicate_source_session_pair(tmp_path):
-    payload = _pond_inventory().to_wire()
-    payload["records"].append(payload["records"][0].copy())
-    path = tmp_path / "pond.json"
-    _write_input(path, payload)
-
-    with pytest.raises(ValueError, match="records"):
-        load_pond_inventory(path)
-
-
-@pytest.mark.parametrize(
     "inventory",
     [
         NativeInventory(
@@ -532,3 +363,18 @@ def test_pond_loader_rejects_duplicate_source_session_pair(tmp_path):
 def test_to_wire_rejects_invalid_typed_manifest(inventory):
     with pytest.raises(ValueError):
         inventory.to_wire()
+
+
+@pytest.mark.parametrize(
+    "loader,payload",
+    [
+        (load_native_inventory, _native_inventory().to_wire()),
+        (load_source_eligibility_receipt, _eligibility_receipt().to_wire()),
+    ],
+)
+def test_typed_loaders_require_kind_to_match_manifest_type(tmp_path, loader, payload):
+    payload["kind"] = "unknown_inventory"
+    path = tmp_path / "wrong-kind.json"
+    _write_input(path, payload)
+    with pytest.raises(ValueError, match="kind"):
+        loader(path)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import faulthandler
 import json
 import logging
-import math
 import os
 import shutil
 import signal
@@ -70,33 +69,12 @@ from drover.server.analytics_maintenance import (
     MaintenanceAdmission,
 )
 from drover.server.archive import (
-    BackupConfig,
-    PondArchiveClient,
     assess_metadata_only_source,
-    backup_preflight_summary,
-    backup_receipt_summary,
-    backup_run_summary,
-    build_coverage_report,
-    coverage_summary,
     discover_native_history_inventory,
-    export_pond_inventory,
-    load_backup_config,
-    load_backup_receipt,
-    load_native_inventory,
-    load_pond_inventory,
-    load_registry_candidates,
-    load_source_eligibility_receipt,
     native_inventory_summary,
-    pond_inventory_summary,
-    restore_backup,
-    restore_summary,
-    run_backup,
-    run_backup_preflight,
     source_eligibility_summary,
-    validate_restore_request,
     write_private_json,
 )
-from drover.server.archive.backup_runtime import RuntimeGuard
 from drover.server.briefs.worker import (
     BriefWorker,
     enqueue_brief,
@@ -210,34 +188,6 @@ _REDIS_JOB_STREAM_SUFFIXES = {
     "brief": "regenerate_project_brief",
     "embed_session": "embed_session",
     "embed_span": "embed_span",
-}
-
-_ARCHIVE_BACKUP_ERRORS = frozenset(
-    {
-        "archive backup config failed",
-        "archive backup preflight failed",
-        "archive backup local changed",
-        "archive backup storage unavailable",
-        "archive backup copy failed",
-        "archive backup verify failed",
-        "archive backup receipt failed",
-        "archive backup restore failed",
-        "archive backup resource limit",
-    }
-)
-_ARCHIVE_BACKUP_RUN_DRY_SUMMARY = {
-    "mode": "dry-run",
-    "preflight_ready": True,
-    "remote_contacted": False,
-    "schema_version": 1,
-}
-_ARCHIVE_BACKUP_RESTORE_DRY_SUMMARY = {
-    "destination_valid": True,
-    "mode": "dry-run",
-    "receipt_chain_valid": True,
-    "remote_contacted": False,
-    "schema_version": 1,
-    "store_started": False,
 }
 
 
@@ -429,18 +379,6 @@ api_token = ""
 [agent]
 agent_id     = "{default_agent_id}"
 principal_id = "unknown"
-
-[archive]
-# Optional local Pond recall. This remains disabled until explicitly configured
-# with a loopback-only HTTP URL.
-enabled = false
-base_url = ""
-timeout_seconds = 3.0
-search_limit = 5
-context_before = 2
-context_after = 2
-max_context_chars = 24000
-max_response_bytes = 1048576
 
 [provider]
 # Provider fetches run every five minutes. Retain provider-reported quota facts,
@@ -862,13 +800,6 @@ def _summarizer_backend_config(cfg: DroverConfig) -> SummarizerBackendConfig:
     )
 
 
-def _archive_client_from_config(cfg: DroverConfig) -> PondArchiveClient | None:
-    """Construct the optional local archive client without probing Pond."""
-    if not cfg.archive.enabled:
-        return None
-    return PondArchiveClient(cfg.archive)
-
-
 def _build_runtime_mcp_server(
     *,
     cfg: DroverConfig,
@@ -883,8 +814,6 @@ def _build_runtime_mcp_server(
         port=cfg.mcp_http_port,
         backend_config=backend_config,
         summarize_job_stream=summarize_job_stream,
-        archive_config=cfg.archive,
-        archive=_archive_client_from_config(cfg),
         spans_enabled=cfg.spans_enabled,
     )
 
@@ -1248,233 +1177,6 @@ def control_store_recovery_cmd(ctx: click.Context) -> None:
     )
 
 
-def _raise_archive_backup_error(error: Exception, fallback: str) -> None:
-    """Raise one identifier-free operator category for a backup failure."""
-    try:
-        category = str(error)
-    except Exception:
-        category = fallback
-    if category not in _ARCHIVE_BACKUP_ERRORS:
-        category = fallback
-    raise click.ClickException(category) from None
-
-
-def _raise_archive_backup_usage_error(error: click.UsageError, category: str) -> None:
-    """Replace private parser input with one fixed operator category."""
-    if isinstance(error, click.exceptions.NoArgsIsHelpError):
-        raise error
-    raise click.ClickException(category) from None
-
-
-class _ArchiveBackupCommand(click.Command):
-    """Click command boundary that never formats private parser input."""
-
-    def __init__(self, *args: object, error_category: str, **kwargs: object) -> None:
-        self._error_category = error_category
-        super().__init__(*args, **kwargs)
-
-    def make_context(
-        self,
-        info_name: str | None,
-        args: list[str],
-        parent: click.Context | None = None,
-        **extra: object,
-    ) -> click.Context:
-        try:
-            return super().make_context(info_name, args, parent=parent, **extra)
-        except click.UsageError as error:
-            _raise_archive_backup_usage_error(error, self._error_category)
-
-
-class _ArchiveBackupGroup(click.Group):
-    """Click group boundary that sanitizes its own command resolution."""
-
-    def __init__(self, *args: object, error_category: str, **kwargs: object) -> None:
-        self._error_category = error_category
-        super().__init__(*args, **kwargs)
-
-    def make_context(
-        self,
-        info_name: str | None,
-        args: list[str],
-        parent: click.Context | None = None,
-        **extra: object,
-    ) -> click.Context:
-        try:
-            return super().make_context(info_name, args, parent=parent, **extra)
-        except click.UsageError as error:
-            _raise_archive_backup_usage_error(error, self._error_category)
-
-    def resolve_command(
-        self, ctx: click.Context, args: list[str]
-    ) -> tuple[str | None, click.Command | None, list[str]]:
-        try:
-            return super().resolve_command(ctx, args)
-        except click.UsageError as error:
-            _raise_archive_backup_usage_error(error, self._error_category)
-
-
-def _run_backup_preflight_for_cli(
-    config: BackupConfig, drover_config: DroverConfig
-) -> dict[str, object]:
-    """Compose the fixed local-only preflight service for Click callbacks."""
-    workspace = Path(
-        tempfile.mkdtemp(
-            prefix=".drover-backup-preflight-",
-            dir=config.receipt_directory,
-        )
-    )
-    runtime = RuntimeGuard(drover_config)
-    runtime.capture_baseline()
-    result = run_backup_preflight(config, drover_config, workspace, runtime)
-    runtime.finish()
-    return backup_preflight_summary(result)
-
-
-@archive_cmd.group(
-    name="backup",
-    cls=_ArchiveBackupGroup,
-    error_category="archive backup config failed",
-)
-def archive_backup_cmd() -> None:
-    """Verify, back up, and restore private Pond generations."""
-
-
-@archive_backup_cmd.command(
-    name="preflight",
-    cls=_ArchiveBackupCommand,
-    error_category="archive backup preflight failed",
-)
-@click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
-@click.pass_context
-def archive_backup_preflight_cmd(ctx: click.Context, backup_config_path: str) -> None:
-    """Verify the local archive denominator without contacting R2."""
-    try:
-        config = load_backup_config(backup_config_path)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup config failed")
-    try:
-        drover_config = _resolve_config(ctx.obj["config_path"])
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup config failed")
-    try:
-        summary = _run_backup_preflight_for_cli(config, drover_config)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup preflight failed")
-    click.echo(json.dumps(summary, sort_keys=True))
-    if summary.get("ready") is not True:
-        ctx.exit(2)
-
-
-@archive_backup_cmd.command(
-    name="run",
-    cls=_ArchiveBackupCommand,
-    error_category="archive backup preflight failed",
-)
-@click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
-@click.option("--apply", is_flag=True)
-@click.pass_context
-def archive_backup_run_cmd(
-    ctx: click.Context, backup_config_path: str, apply: bool
-) -> None:
-    """Preflight locally, or apply one immutable backup generation."""
-    try:
-        config = load_backup_config(backup_config_path)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup config failed")
-    try:
-        drover_config = _resolve_config(ctx.obj["config_path"])
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup config failed")
-    if not apply:
-        try:
-            summary = _run_backup_preflight_for_cli(config, drover_config)
-        except Exception as error:
-            _raise_archive_backup_error(error, "archive backup preflight failed")
-        dry_summary = dict(_ARCHIVE_BACKUP_RUN_DRY_SUMMARY)
-        dry_summary["preflight_ready"] = summary.get("ready") is True
-        click.echo(json.dumps(dry_summary, sort_keys=True))
-        if dry_summary["preflight_ready"] is not True:
-            ctx.exit(2)
-        return
-    try:
-        receipt = run_backup(config, drover_config)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup preflight failed")
-    try:
-        summary = backup_run_summary(receipt)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup receipt failed")
-    click.echo(json.dumps(summary, sort_keys=True))
-
-
-@archive_backup_cmd.command(
-    name="restore",
-    cls=_ArchiveBackupCommand,
-    error_category="archive backup restore failed",
-)
-@click.option("--config", "backup_config_path", required=True, type=str, metavar="FILE")
-@click.option("--receipt", "receipt_path", required=True, type=str, metavar="FILE")
-@click.option(
-    "--destination", "destination_path", required=True, type=str, metavar="DIRECTORY"
-)
-@click.option("--apply", is_flag=True)
-@click.pass_context
-def archive_backup_restore_cmd(
-    ctx: click.Context,
-    backup_config_path: str,
-    receipt_path: str,
-    destination_path: str,
-    apply: bool,
-) -> None:
-    """Validate locally, or restore one receipt into a fresh stopped store."""
-    try:
-        config = load_backup_config(backup_config_path)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup config failed")
-    receipt = Path(receipt_path)
-    destination = Path(destination_path)
-    if not apply:
-        try:
-            validate_restore_request(config, receipt, destination)
-        except Exception as error:
-            _raise_archive_backup_error(error, "archive backup restore failed")
-        click.echo(json.dumps(_ARCHIVE_BACKUP_RESTORE_DRY_SUMMARY, sort_keys=True))
-        return
-    try:
-        drover_config = _resolve_config(ctx.obj["config_path"])
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup config failed")
-    try:
-        result = restore_backup(config, receipt, destination, drover_config)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup restore failed")
-    try:
-        summary = restore_summary(result)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup restore failed")
-    click.echo(json.dumps(summary, sort_keys=True))
-
-
-@archive_backup_cmd.command(
-    name="inspect-receipt",
-    cls=_ArchiveBackupCommand,
-    error_category="archive backup receipt failed",
-)
-@click.option("--receipt", "receipt_path", required=True, type=str, metavar="FILE")
-def archive_backup_inspect_receipt_cmd(receipt_path: str) -> None:
-    """Validate one private receipt and print only aggregate evidence."""
-    try:
-        receipt = load_backup_receipt(receipt_path)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup receipt failed")
-    try:
-        summary = backup_receipt_summary(receipt)
-    except Exception as error:
-        _raise_archive_backup_error(error, "archive backup receipt failed")
-    click.echo(json.dumps(summary, sort_keys=True))
-
-
 @archive_cmd.command(name="source-inventory")
 @click.option("--host-id", required=True, metavar="HOST")
 @click.option(
@@ -1521,156 +1223,6 @@ def archive_source_eligibility_cmd(
     except Exception:
         raise click.ClickException("archive source eligibility failed") from None
     click.echo(json.dumps(summary, sort_keys=True))
-
-
-@archive_cmd.command(name="pond-inventory")
-@click.option(
-    "--storage-path",
-    required=True,
-    type=click.Path(path_type=Path),
-    metavar="DIRECTORY",
-)
-@click.option(
-    "--output",
-    required=True,
-    type=click.Path(path_type=Path),
-    metavar="FILE",
-)
-@click.option(
-    "--pond-binary",
-    default=None,
-    type=click.Path(path_type=Path),
-    metavar="FILE",
-)
-@click.option(
-    "--timeout",
-    "timeout_seconds",
-    default="60",
-    show_default=True,
-    type=str,
-    metavar="SECONDS",
-)
-def archive_pond_inventory_cmd(
-    storage_path: Path,
-    output: Path,
-    pond_binary: Optional[Path],
-    timeout_seconds: str,
-) -> None:
-    """Export supported Pond root-session metadata."""
-    try:
-        parsed_timeout = float(timeout_seconds)
-    except (TypeError, ValueError, OverflowError):
-        raise click.ClickException("archive pond inventory invalid timeout") from None
-    if not math.isfinite(parsed_timeout) or not 5.0 <= parsed_timeout <= 600.0:
-        raise click.ClickException("archive pond inventory invalid timeout")
-    binary = pond_binary
-    if binary is None:
-        configured = os.environ.get("POND_BINARY", "").strip()
-        if configured:
-            binary = Path(configured)
-    if binary is None:
-        discovered = shutil.which("pond")
-        if discovered:
-            binary = Path(discovered)
-    if binary is None:
-        raise click.ClickException("archive pond inventory binary unavailable")
-    try:
-        inventory = export_pond_inventory(
-            binary,
-            output,
-            storage_path=storage_path,
-            timeout_seconds=parsed_timeout,
-        )
-        summary = pond_inventory_summary(inventory)
-    except Exception:
-        raise click.ClickException("archive pond inventory failed") from None
-    click.echo(json.dumps(summary, sort_keys=True))
-
-
-@archive_cmd.command(name="coverage")
-@click.option(
-    "--output",
-    required=True,
-    type=click.Path(path_type=Path),
-    metavar="FILE",
-)
-@click.option(
-    "--db",
-    "duckdb_path",
-    default=None,
-    type=click.Path(path_type=Path),
-    metavar="FILE",
-)
-@click.option(
-    "--source-inventory",
-    "source_inventory_paths",
-    required=True,
-    multiple=True,
-    type=click.Path(path_type=Path),
-    metavar="FILE",
-)
-@click.option(
-    "--pond-inventory",
-    "pond_inventory_path",
-    required=True,
-    type=click.Path(path_type=Path),
-    metavar="FILE",
-)
-@click.option(
-    "--prior-source-inventory",
-    "prior_source_inventory_paths",
-    multiple=True,
-    type=click.Path(path_type=Path),
-    metavar="FILE",
-)
-@click.option(
-    "--source-eligibility-receipt",
-    "source_eligibility_receipt_paths",
-    multiple=True,
-    type=click.Path(path_type=Path),
-    metavar="FILE",
-)
-@click.pass_context
-def archive_coverage_cmd(
-    ctx: click.Context,
-    output: Path,
-    duckdb_path: Optional[Path],
-    source_inventory_paths: tuple[Path, ...],
-    pond_inventory_path: Path,
-    prior_source_inventory_paths: tuple[Path, ...],
-    source_eligibility_receipt_paths: tuple[Path, ...],
-) -> None:
-    """Compare private source, registry, and Pond identity inventories."""
-    try:
-        current_sources = tuple(
-            load_native_inventory(path) for path in source_inventory_paths
-        )
-        prior_sources = tuple(
-            load_native_inventory(path) for path in prior_source_inventory_paths
-        )
-        eligibility_receipts = tuple(
-            load_source_eligibility_receipt(path)
-            for path in source_eligibility_receipt_paths
-        )
-        pond = load_pond_inventory(pond_inventory_path)
-        cfg = _resolve_config(ctx.obj["config_path"])
-        registry_path = control_plane_path(duckdb_path or cfg.duckdb_path)
-        with _diagnostic_db_path(registry_path) as snapshot_path:
-            registry = load_registry_candidates(snapshot_path)
-        report = build_coverage_report(
-            registry,
-            current_sources,
-            pond,
-            prior_sources=prior_sources,
-            eligibility_receipts=eligibility_receipts,
-        )
-        summary = coverage_summary(report)
-        write_private_json(output, report.to_wire())
-    except Exception:
-        raise click.ClickException("archive coverage failed") from None
-    click.echo(json.dumps(summary, sort_keys=True))
-    if not report.ready_for_next_writer:
-        ctx.exit(2)
 
 
 @main.command(name="pair")
