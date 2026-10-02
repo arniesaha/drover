@@ -37,7 +37,7 @@ Files touched samples at most 101 input events and reports truncation if the
 sample or resulting file list exceeds its limit. Fleet `count` is the pre-cap
 live-session count; the returned list can be smaller with `truncated: true`.
 
-Each MCP read has a 15-second caller deadline and returns `status: timeout` if
+Each MCP read has a 5-second caller deadline and returns `status: timeout` if
 exceeded. Four read calls can execute at once per server; further calls return
 `status: busy`. Timed-out execution retains its admission slot until it finishes.
 These are response-level deadlines, not cancellation of SQL or LLM work. Phase 4

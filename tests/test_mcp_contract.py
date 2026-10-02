@@ -183,3 +183,8 @@ def test_public_validation_errors_are_bounded_and_identified(tmp_path):
     assert result["store"] == "hub"
     assert result["data_watermark"]["timestamp"] is None
     assert result["truncated"] is True
+
+
+def test_default_deadline_is_five_seconds():
+    assert READ_CAPS["drover_search"].deadline_seconds == 5.0
+    assert all(caps.deadline_seconds == 5.0 for caps in READ_CAPS.values())

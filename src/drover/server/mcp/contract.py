@@ -21,7 +21,7 @@ class ReadCaps:
     rows: int = 100
     text_bytes: int = 4096
     response_bytes: int = 65536
-    deadline_seconds: float = 15.0
+    deadline_seconds: float = 5.0
 
 
 READ_CAPS = {
