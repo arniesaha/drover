@@ -36,14 +36,12 @@ class QueryLimits:
 
 
 def _rss(pid: int) -> int:
-    # ps is present on the supported macOS/Linux installers. Fail closed when
-    # measurement fails while the process is alive; no optional psutil import.
-    result = subprocess.run(
-        ["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, timeout=0.25
-    )
-    if result.returncode or not result.stdout.strip():
-        raise LakeError("analytics_rss_monitor_unavailable")
-    return int(result.stdout.strip()) * 1024
+    from drover.server.process_memory import process_rss
+
+    try:
+        return process_rss(pid)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise LakeError("analytics_rss_monitor_unavailable") from None
 
 
 def run_disposable(
@@ -101,7 +99,9 @@ def run_disposable(
                         guard.child_sample(sample)
                         peak = max(peak, sample)
                     except LakeError:
-                        if child.poll() is None:
+                        try:
+                            child.wait(timeout=0.05)
+                        except subprocess.TimeoutExpired:
                             raise
                     if peak > limits.rss_bytes:
                         raise LakeError("analytics_rss_limit_exceeded")
@@ -133,7 +133,12 @@ def run_disposable(
                 if child.poll() is None:
                     import signal
 
-                    os.killpg(child.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        child.wait(timeout=0.05)
                 child.wait()
                 guard.child_finished(child.pid)
 

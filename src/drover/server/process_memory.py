@@ -3,18 +3,43 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
 import logging
 import os
+import struct
 import subprocess
+import sys
 import threading
 import time
+from functools import lru_cache
 
 from drover.config import MemoryBudgetConfig
 
 log = logging.getLogger("drover.memory")
 
 
+@lru_cache(maxsize=1)
+def _darwin_pidinfo():
+    function = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    return function
+
+
 def process_rss(pid: int) -> int:
+    if sys.platform == "darwin":
+        # macOS SDK sys/proc_info.h: PROC_PIDTASKINFO=4; proc_taskinfo is
+        # six uint64_t values followed by twelve int32_t values. RSS is bytes.
+        buffer = ctypes.create_string_buffer(96)
+        if _darwin_pidinfo()(pid, 4, 0, buffer, len(buffer)) != len(buffer):
+            raise OSError(ctypes.get_errno(), "process RSS unavailable")
+        return struct.unpack_from("=Q", buffer, 8)[0]
     if os.path.exists(f"/proc/{pid}/statm"):
         with open(f"/proc/{pid}/statm") as stream:
             return int(stream.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")

@@ -107,3 +107,9 @@ def test_guard_samples_periodically_and_stops():
     finally:
         guard.stop()
     assert not guard._thread.is_alive()
+
+
+def test_native_process_rss_and_missing_pid():
+    assert process_memory.process_rss(os.getpid()) > 0
+    with pytest.raises((OSError, ValueError)):
+        process_memory.process_rss(2147483647)
