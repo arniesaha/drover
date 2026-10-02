@@ -153,17 +153,35 @@ public struct HarnessOffer: Sendable, Equatable, Hashable, Identifiable {
     /// carry no flag at all.
     public var enabled: Bool?
     public var advertisement: HarnessCapabilityAdvertisement
+    /// The adapter's label from the envelope (additive, #422). Nil from hosts
+    /// that predate it. Presentation only; `name` stays the identity.
+    public var displayName: String?
 
     public var id: String { name }
 
-    public init(name: String, enabled: Bool?, advertisement: HarnessCapabilityAdvertisement) {
+    /// What to show for this row: the host's label, else the raw name.
+    public var label: String { displayName ?? name }
+
+    public init(
+        name: String,
+        enabled: Bool?,
+        advertisement: HarnessCapabilityAdvertisement,
+        displayName: String? = nil
+    ) {
         self.name = name
         self.enabled = enabled
         self.advertisement = advertisement
+        self.displayName = displayName
     }
 
-    public init(name: String, enabled: Bool = true, capabilities: HarnessCapabilities) {
-        self.init(name: name, enabled: enabled, advertisement: .v1(capabilities))
+    public init(
+        name: String,
+        enabled: Bool = true,
+        capabilities: HarnessCapabilities,
+        displayName: String? = nil
+    ) {
+        self.init(name: name, enabled: enabled, advertisement: .v1(capabilities),
+                  displayName: displayName)
     }
 
     /// The advertised matrix, or nothing for anything but a supported v1 row.
@@ -208,8 +226,11 @@ public struct HarnessOffer: Sendable, Equatable, Hashable, Identifiable {
                   !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { return nil }
             let enabled = object["enabled"]?.boolValue ?? false
+            let label = object["display_name"]?.stringValue
             self.init(name: name, enabled: enabled,
-                      advertisement: Self.advertisement(object["capabilities"], name: name))
+                      advertisement: Self.advertisement(object["capabilities"], name: name),
+                      displayName: label?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                          ? label : nil)
         default:
             return nil
         }

@@ -909,7 +909,7 @@
       const host = hosts.find((item) => item.host_id === $("continue-host").value) || hosts[0];
       const targets = DroverCapabilities.launchTargets(host);
       $("continue-harness").innerHTML = targets.map((item) => (
-        `<option value="${esc(item.name)}">${esc(item.name)}</option>`
+        `<option value="${esc(item.name)}">${esc(item.displayName || item.name)}</option>`
       )).join("");
       if (sessionData?.session?.harness && targets.some((item) => item.name === sessionData.session.harness)) {
         $("continue-harness").value = sessionData.session.harness;

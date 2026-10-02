@@ -7,7 +7,9 @@ import Testing
 //   real `HarnessDaemonState`, so it is what current hosts publish;
 // - harness-capabilities-mixed.json: Claude Code, Codex, agy, DeepSeek, shell,
 //   two fixture adapters with unusual mixes, malformed and future rows, a
-//   legacy (matrix-less) host, a host with no envelope and a future-schema host.
+//   legacy (matrix-less) host, a host with no envelope and a future-schema host,
+//   and `lab-host`: the exact row harnessd publishes for the test-only
+//   `synthetic-lab` adapter (#422, pinned by tests/test_adapter_extensibility.py).
 
 private func mixedSnapshot() throws -> HarnessSnapshot {
     let url = try #require(droverKitFixtureURL("harness-capabilities-mixed"))
@@ -76,6 +78,43 @@ struct HarnessCapabilityDecodingTests {
             turnPreferences: false,
             attachments: ["image/png"]
         )))
+    }
+
+    /// drover#422: the row harnessd publishes for the test-only synthetic
+    /// adapter (pinned by tests/test_adapter_extensibility.py) drives every
+    /// control without the app knowing its ID.
+    @Test func syntheticAdapterRowDecodesFromItsPublishedEnvelope() throws {
+        let snapshot = try mixedSnapshot()
+        let offer = try #require(try host("lab-host", in: snapshot).offer(named: "synthetic-lab"))
+        #expect(offer.label == "Synthetic Lab")
+        #expect(offer.capabilities == HarnessCapabilities(
+            launchModes: [.pty, .structured],
+            approvals: true,
+            nativeResume: true,
+            attachments: ["image/png"]
+        ))
+        #expect(offer.launchMode == .structured)
+        let controls = HarnessControls(snapshot: snapshot, hostID: "lab-host", harness: "synthetic-lab")
+        #expect(controls.showsApprovals && !controls.canInterrupt)
+        #expect(controls.supportsNativeResume && !controls.showsModelControls)
+        #expect(!controls.explainsWorktreeIsolation && !controls.offersSignIn)
+        // PNG only, and the app produces JPEG attachments.
+        #expect(!controls.acceptsImageAttachments)
+        #expect(controls.interruptUnavailableReason == HarnessCapabilityCopy.interruptUnsupported)
+    }
+
+    @Test func displayNamesComeFromTheEnvelopeWithARawNameFallback() throws {
+        let golden = try host("test-host", in: goldenSnapshot())
+        #expect(golden.offer(named: "codex")?.label == "Codex CLI")
+        #expect(golden.offer(named: "shell")?.label == "Shell")
+        // Rows from hosts that predate the field, and legacy rows, show the ID.
+        let studio = try host("studio", in: mixedSnapshot())
+        #expect(studio.offer(named: "codex")?.displayName == nil)
+        #expect(studio.offer(named: "codex")?.label == "codex")
+        let old = try host("old-mini", in: mixedSnapshot())
+        #expect(old.offer(named: "codex beta")?.label == "codex beta")
+        let blank = HarnessOffer(row: .object(["name": .string("x"), "display_name": .string("  ")]))
+        #expect(blank?.label == "x")
     }
 
     @Test func missingOptionalFlagsAreFalseAndHarnessIDMayBeOmitted() throws {
@@ -317,6 +356,26 @@ struct CapabilityDrivenLaunchTests {
         #expect(body["prompt"] as? String == "go")
         // PNG-only harness: the app's JPEG is never sent.
         #expect((body["images"] as? [Any])?.isEmpty ?? true)
+        #expect(body["model"] == nil && body["thinking_effort"] == nil)
+    }
+
+    @Test @MainActor func aSyntheticAdapterLaunchesFromItsEnvelopeAlone() async throws {
+        let model = try launchModel()
+        model.hostID = "lab-host"
+        #expect(model.harness == "synthetic-lab")
+        #expect(model.harnessLabel(model.harness) == "Synthetic Lab")
+        #expect(model.isStructured && !model.showsRunPreferences)
+        #expect(!model.supportsInteractiveAuth && !model.canAttachImages)
+        model.prompt = "go"
+
+        nonisolated(unsafe) var body: [String: Any] = [:]
+        MockURLProtocol.handler = { request in
+            body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+            return (201, Data(#"{"session_id": "lab-2", "mode": "structured"}"#.utf8))
+        }
+        #expect(await model.launch() == "lab-2")
+        #expect(body["harness"] as? String == "synthetic-lab")
+        #expect(body["mode"] as? String == "structured")
         #expect(body["model"] == nil && body["thinking_effort"] == nil)
     }
 

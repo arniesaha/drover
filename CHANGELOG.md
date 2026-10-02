@@ -28,6 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are `DROVER_HOST_STALE_AFTER_SECONDS` (45) and
   `DROVER_HOST_OFFLINE_AFTER_SECONDS` (600); see `docs/multi-host.md` (#474).
 
+- A test-only adapter with an unusual capability mix now runs through the
+  registry, harnessd, the hub API, and the web and iOS fixtures without any
+  harness-specific branch (#422). The extension points this measured are in
+  `docs/design/adapter-extension-points.md`. Making it pass changed the
+  contract:
+  - harnessd starts a PTY session only for a harness that advertises `pty`.
+    Provider CLIs no longer start as raw terminals through the API.
+  - Native resume is the adapter's resume operation and runs as a structured
+    session. The per-harness resume flags in harnessd, and the bare "latest"
+    forms, are gone.
+  - The hub's Continue and restart recovery follow the target host's
+    capabilities instead of the hub's own adapter list. Continue onto a host
+    without a capability matrix is refused with an upgrade message.
+  - Interrupt, approvals, attachments outside the declared MIME types, model
+    or effort without a catalog, and unsupported native resume are refused
+    before any provider call.
+  - Harness rows carry an additive `display_name`, used by the web pickers and
+    the iOS launch sheet.
 - OpenClaw is observe-only end to end (#421). harnessd no longer carries an
   OpenClaw native-resume argument or maps a terminal command to `openclaw`;
   neither path was reachable without a preset. Collection, parsing,

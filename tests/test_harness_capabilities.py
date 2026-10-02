@@ -92,7 +92,14 @@ def test_every_offered_harness_emits_registry_contract_without_probes(
     public = host.capabilities()
     assert {row["name"] for row in public["harnesses"]} == set(DEFAULT_PRESETS)
     for row in public["harnesses"]:
-        assert {"name", "enabled", "description", "command", "capabilities"} == set(row)
+        assert {
+            "name",
+            "enabled",
+            "display_name",
+            "description",
+            "command",
+            "capabilities",
+        } == set(row)
         matrix = row["capabilities"]
         assert matrix["schema_version"] == 1
         assert matrix["harness_id"] == row["name"]
@@ -469,3 +476,58 @@ def test_handoff_to_an_unknown_adapter_uses_its_matrix(
         assert "initial_input" not in launches[0]
     else:
         assert not launches
+
+
+@pytest.mark.parametrize(
+    "harnesses,request_body,error",
+    [
+        # Matrix-less (pre-#418) rows are metadata only, even for a name the
+        # hub itself knows how to drive.
+        (
+            [{"name": "claude-code", "enabled": True}],
+            {"target_harness": "claude-code"},
+            "upgrade Drover",
+        ),
+        (["claude-code"], {"target_harness": "claude-code"}, "upgrade Drover"),
+        ([], {"target_harness": "claude-code"}, "upgrade Drover"),
+        (
+            [
+                {
+                    "name": "claude-code",
+                    "enabled": True,
+                    "capabilities": {
+                        "schema_version": 1,
+                        "launch_modes": ["structured"],
+                    },
+                }
+            ],
+            {"target_harness": "claude-code", "native_resume": {"session_id": "n"}},
+            "native resume",
+        ),
+    ],
+)
+def test_continue_never_routes_by_name_or_assumes_native_resume(
+    collector, monkeypatch, harnesses, request_body, error
+):
+    from types import SimpleNamespace
+
+    source = SimpleNamespace(
+        session_id="source",
+        host_id="test-host",
+        harness="claude-code",
+        cwd="/tmp",
+        repo_owner=None,
+        repo_name=None,
+        branch=None,
+    )
+    host = SimpleNamespace(capabilities={"harnesses": harnesses})
+    monkeypatch.setattr(collector, "_harness_session", lambda _: source)
+    monkeypatch.setattr(collector, "_harness_host", lambda _: host)
+    monkeypatch.setattr(
+        collector,
+        "proxy_create_harness_session",
+        lambda *_: pytest.fail("refused Continue must not reach the host"),
+    )
+    status, body = collector.continue_harness_session("source", request_body)
+    assert status == 400
+    assert error in json.loads(body)["error"]

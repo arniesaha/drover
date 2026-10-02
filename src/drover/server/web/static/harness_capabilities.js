@@ -35,9 +35,17 @@ const DroverCapabilities = (() => {
     return isObject(row) && typeof row.name === "string" ? row.name : "";
   }
 
+  // The host's label for a harness (additive row field, #422). Older hosts
+  // omit it; the raw name is then shown. Presentation only, never identity.
+  function rowDisplayName(row, name) {
+    const label = isObject(row) ? row.display_name : undefined;
+    return typeof label === "string" && label.trim() ? label : name;
+  }
+
   function closed(name, status, reason, extra = {}) {
     return {
       name,
+      displayName: name,
       status,
       reason,
       launchable: false,
@@ -60,20 +68,22 @@ const DroverCapabilities = (() => {
   function fromRow(row) {
     const name = rowName(row);
     if (!name) return null;
+    const displayName = rowDisplayName(row, name);
     if (typeof row === "string" || !Object.prototype.hasOwnProperty.call(row, "capabilities")) {
-      return closed(name, "legacy", REASONS.legacy, {legacy: true});
+      return closed(name, "legacy", REASONS.legacy, {legacy: true, displayName});
     }
     const matrix = row.capabilities;
     if (!isObject(matrix) || !Number.isInteger(matrix.schema_version) || matrix.schema_version < 1) {
-      return closed(name, "invalid", REASONS.invalid);
+      return closed(name, "invalid", REASONS.invalid, {displayName});
     }
     if (matrix.schema_version !== SCHEMA_VERSION) {
       return closed(name, "unsupported", REASONS.unsupported(matrix.schema_version), {
         schemaVersion: matrix.schema_version,
+        displayName,
       });
     }
     if (matrix.harness_id !== undefined && matrix.harness_id !== name) {
-      return closed(name, "invalid", REASONS.invalid);
+      return closed(name, "invalid", REASONS.invalid, {displayName});
     }
     const booleanFields = ["approvals", "interrupt", "native_resume", "model_catalog",
       "usage", "worktree", "interactive_auth", "turn_preferences"];
@@ -82,7 +92,7 @@ const DroverCapabilities = (() => {
         booleanFields.some((key) => matrix[key] !== undefined && typeof matrix[key] !== "boolean") ||
         (matrix.attachments !== undefined && (!Array.isArray(matrix.attachments) ||
           matrix.attachments.some((mime) => typeof mime !== "string" || !MIME.test(mime))))) {
-      return closed(name, "invalid", REASONS.invalid);
+      return closed(name, "invalid", REASONS.invalid, {displayName});
     }
     const advertised = matrix.launch_modes;
     const modes = CLIENT_MODES.filter((mode) => advertised.includes(mode));
@@ -95,6 +105,7 @@ const DroverCapabilities = (() => {
     const launchable = enabled && mode !== null;
     return {
       name,
+      displayName,
       status: launchable ? "ready" : (enabled ? "no-mode" : "disabled"),
       reason: launchable ? "" : (enabled ? REASONS.noMode : REASONS.disabled),
       launchable,

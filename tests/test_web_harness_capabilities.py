@@ -168,6 +168,52 @@ def test_unusual_fixture_adapter_fails_closed_on_what_it_does_not_understand():
 
 
 @needs_node
+def test_synthetic_adapter_renders_from_its_published_row():
+    """drover#422: the row harnessd publishes for a test-only adapter (see
+    tests/test_adapter_extensibility.py) drives every web control unaided."""
+    session = json.dumps({"harness": "synthetic-lab", "mode": "structured"})
+    lab = "C.harnessControls(host('lab-host'), 'synthetic-lab')"
+    out = _js(
+        {
+            "lab": lab,
+            "targets": "C.launchTargets(host('lab-host')).map((t) => [t.name, t.displayName, t.mode])",
+            "body": "C.launchBody(C.requireLaunch(host('lab-host'), 'synthetic-lab'), "
+            "{cwd: '/repo', rows: 40, cols: 120, model: 'm1', thinkingEffort: 'high'})",
+            "png": f"C.acceptsAttachment({lab}, 'image/png')",
+            "jpeg": f"C.acceptsAttachment({lab}, 'image/jpeg')",
+            "approve": f"attempt(() => C.requireSessionAction(host('lab-host'), {session}, 'approve'))",
+            "interrupt": f"attempt(() => C.requireSessionAction(host('lab-host'), {session}, 'interrupt'))",
+            "unlabelled": "C.harnessControls(host('mac-mini'), 'codex').displayName",
+            "legacy": "C.harnessControls(host('old-nas'), 'codex beta').displayName",
+        }
+    )
+    lab_controls = out["lab"]
+    assert lab_controls["displayName"] == "Synthetic Lab"
+    assert lab_controls["modes"] == ["structured", "pty"]
+    assert (
+        lab_controls["approvals"],
+        lab_controls["interrupt"],
+        lab_controls["nativeResume"],
+        lab_controls["modelCatalog"],
+        lab_controls["worktree"],
+        lab_controls["interactiveAuth"],
+    ) == (True, False, True, False, False, False)
+    assert out["targets"] == [["synthetic-lab", "Synthetic Lab", "structured"]]
+    # No catalog advertised: model and effort never reach the launch body.
+    assert out["body"] == {
+        "harness": "synthetic-lab",
+        "mode": "structured",
+        "cwd": "/repo",
+    }
+    assert (out["png"], out["jpeg"]) == (True, False)
+    assert out["approve"] == "ok"
+    assert out["interrupt"].startswith("error:")
+    # Hosts that predate display names fall back to the raw name.
+    assert out["unlabelled"] == "codex"
+    assert out["legacy"] == "codex beta"
+
+
+@needs_node
 def test_disabled_modeless_future_and_malformed_rows_offer_nothing():
     names = (
         "fixture-off",

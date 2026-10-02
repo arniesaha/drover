@@ -144,6 +144,12 @@ public final class LaunchModel {
         (selectedHost?.launchableOffers ?? []).map(\.name)
     }
 
+    /// The selected host's label for a harness ID, from its envelope; the raw
+    /// ID when the host predates envelope display names.
+    public func harnessLabel(_ name: String) -> String {
+        selectedHost?.offer(named: name)?.label ?? name
+    }
+
     /// Harnesses the selected host lists but this app cannot launch, each
     /// with the explanation the sheet shows (and VoiceOver reads).
     public var unavailableHarnesses: [(name: String, reason: String)] {
