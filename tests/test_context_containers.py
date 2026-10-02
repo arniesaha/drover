@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
 import pytest
+from memory_helpers import put_summary
 
 from drover.context_containers import normalize_context_type
 from drover.schema import bootstrap
@@ -17,21 +19,31 @@ from drover.server.mcp.tools import (
 )
 
 
-def _seed_context_db(tmp_path: Path) -> Path:
+def _seed_context_db(tmp_path: Path, *, with_summary: bool = False) -> Path:
+    """``with_summary`` writes the linked session summary to the PostgreSQL
+    memory store; the caller must request ``pg_control_path``."""
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    if with_summary:
+        put_summary(
+            duckdb_path,
+            "non-code-s1",
+            agent_id="hermes",
+            ended_at=datetime.now(timezone.utc),
+            summary_md=(
+                "Talked through a weekly planning conversation and captured "
+                "follow-up loops."
+            ),
+            last_user_prompt="Help me plan the week",
+            last_assistant="Captured priorities.",
+            next_steps_md="Confirm the childcare calendar.",
+            open_questions=("Which appointment moved?",),
+            status="complete",
+            generator_model="test",
+        )
     con = duckdb.connect(str(duckdb_path))
     try:
-        con.execute("""INSERT INTO session_summaries
-                (session_id, task_id, agent_id, ended_at, summary_md,
-                 files_touched, tools_used, last_user_prompt, last_assistant,
-                 next_steps_md, open_questions, status, generator_model, generated_at)
-                VALUES ('non-code-s1', NULL, 'hermes', now(),
-                        'Talked through a weekly planning conversation and captured follow-up loops.',
-                        [], MAP{}, 'Help me plan the week', 'Captured priorities.',
-                        'Confirm the childcare calendar.', ['Which appointment moved?'],
-                        'complete', 'test', now())""")
         con.execute("""INSERT INTO context_containers
                 (context_id, container_type, label, source_harness, confidence,
                  evidence, last_touched_at, next_action, open_loop, session_ids,
@@ -68,8 +80,10 @@ def test_bootstrap_creates_context_containers_table(tmp_path: Path) -> None:
     assert row == (1,)
 
 
-def test_non_code_context_is_queryable_and_resumable(tmp_path: Path) -> None:
-    duckdb_path = _seed_context_db(tmp_path)
+def test_non_code_context_is_queryable_and_resumable(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    duckdb_path = _seed_context_db(tmp_path, with_summary=True)
 
     recent = drover_recent_contexts(
         duckdb_path=duckdb_path, container_type="open_floor_conversation"

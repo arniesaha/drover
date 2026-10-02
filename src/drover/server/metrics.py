@@ -142,13 +142,12 @@ _RECOVERY_UNAVAILABLE = (
     "Continue it in a new session."
 )
 
-_SUMMARIZE_JOB_STATUSES = (
+_MEMORY_JOB_STATUSES = (
     "pending",
     "running",
     "retry_wait",
-    "done",
-    "errored",
     "dead_lettered",
+    "quarantined",
 )
 
 
@@ -427,37 +426,26 @@ def sequence_health_report(db_path: Path, *, apply: bool = False) -> dict[str, i
     }
 
 
+def _memory_job_stats(db_path: Path) -> dict[str, dict[str, Any]]:
+    """Per-kind ledger health, or {} when memory is not on PostgreSQL."""
+    if not is_postgres_control_store(db_path):
+        return {}
+    from drover.server.ledger import ledger_stats
+
+    with control_plane_connection(db_path) as con:
+        return ledger_stats(con)
+
+
 def _append_operational_health_metrics(
     lines: list[str], db_path: Path, snapshot: Mapping[str, Any]
 ) -> None:
-    summary = (
-        snapshot.get("categories", {}).get("summary_coverage", {}).get("details", {})
-    )
-    statuses = {status: 0 for status in _SUMMARIZE_JOB_STATUSES}
-    statuses["pending"] = int(summary.get("pending_summarize_jobs", 0) or 0)
-    statuses["errored"] = int(summary.get("errored_summarize_jobs", 0) or 0)
-    max_attempts = 0
-    oldest_retry_seconds = 0.0
+    del snapshot  # job health now comes from the ledger itself (#480)
     source = Path(db_path)
-    if source.exists():
-        con = open_duckdb_connection(source, read_only=True, role="diagnostic")
-        try:
-            rows = con.execute(
-                "SELECT status, count(*) FROM summarize_jobs "
-                "WHERE status IN (?, ?, ?, ?, ?, ?) GROUP BY status",
-                list(_SUMMARIZE_JOB_STATUSES),
-            ).fetchall()
-            statuses.update({str(status): int(count) for status, count in rows})
-            max_attempts, oldest_retry_seconds = con.execute("""
-                SELECT
-                    COALESCE(max(max_attempts), 0),
-                    COALESCE(max(epoch((now() AT TIME ZONE 'UTC')
-                        - COALESCE(updated_at, enqueued_at)))
-                        FILTER (WHERE status = 'retry_wait'), 0)
-                FROM summarize_jobs
-                """).fetchone()
-        finally:
-            con.close()
+    try:
+        jobs = _memory_job_stats(source)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("failed to render memory job metrics: %s", exc)
+        jobs = {}
 
     try:
         sequences = sequence_health_report(source)
@@ -482,25 +470,52 @@ def _append_operational_health_metrics(
                 "drover_harness_mixed_sequence_sessions",
                 sequences["mixed_sessions"],
             ),
-            "# HELP drover_summarize_jobs Summarization jobs by bounded status.",
-            "# TYPE drover_summarize_jobs gauge",
+            "# HELP drover_memory_jobs Derived-memory ledger jobs by kind and live/failed status.",
+            "# TYPE drover_memory_jobs gauge",
         ]
     )
-    for status in _SUMMARIZE_JOB_STATUSES:
-        lines.append(_metric("drover_summarize_jobs", statuses[status], status=status))
+    for kind, stats in sorted(jobs.items()):
+        for status in _MEMORY_JOB_STATUSES:
+            lines.append(
+                _metric(
+                    "drover_memory_jobs", int(stats[status]), kind=kind, status=status
+                )
+            )
+    for name, key, help_text in (
+        (
+            "drover_memory_job_oldest_pending_seconds",
+            "oldest_pending_age_seconds",
+            "Age of the oldest pending or retry-waiting job.",
+        ),
+        (
+            "drover_memory_job_oldest_lease_seconds",
+            "oldest_lease_age_seconds",
+            "Age of the oldest running lease.",
+        ),
+        (
+            "drover_memory_job_expired_leases",
+            "expired_leases",
+            "Running jobs whose lease has expired and awaits reclaim.",
+        ),
+    ):
+        lines.extend([f"# HELP {name} {help_text}", f"# TYPE {name} gauge"])
+        for kind, stats in sorted(jobs.items()):
+            lines.append(_metric(name, float(stats[key] or 0), kind=kind))
     lines.extend(
         [
-            "# HELP drover_summarize_max_attempts Maximum configured summarize-job attempt ceiling.",
-            "# TYPE drover_summarize_max_attempts gauge",
-            _metric("drover_summarize_max_attempts", int(max_attempts or 0)),
-            "# HELP drover_summarize_oldest_retry_seconds Age of the oldest waiting summarize retry.",
-            "# TYPE drover_summarize_oldest_retry_seconds gauge",
-            _metric(
-                "drover_summarize_oldest_retry_seconds",
-                max(float(oldest_retry_seconds or 0), 0.0),
-            ),
+            "# HELP drover_memory_job_last_success_timestamp Unix time of the newest succeeded job.",
+            "# TYPE drover_memory_job_last_success_timestamp gauge",
         ]
     )
+    for kind, stats in sorted(jobs.items()):
+        last = stats["last_success_at"]
+        lines.append(
+            _metric(
+                "drover_memory_job_last_success_timestamp",
+                datetime.fromisoformat(last).timestamp() if last else 0,
+                kind=kind,
+            )
+        )
 
 
 def _append_summarizer_metrics(lines: list[str], report: Mapping[str, Any]) -> None:
@@ -1152,6 +1167,10 @@ class MetricsCollector:
     # absent in legacy/all mode until retained history is configured there.
     archive_resolver: Any | None = None
     archive_resolver_factory: Callable[[], Any] | None = None
+    # How this process runs session embeddings, for /readyz's memory section:
+    # {"enabled": bool, "backend": str | None, "model": str | None}. A hub
+    # started with --no-embeddings says so instead of going quiet (#471).
+    embeddings_state: Mapping[str, Any] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _cached_text: str | None = field(default=None, init=False)
     _cached_json: str | None = field(default=None, init=False)
@@ -1198,6 +1217,7 @@ class MetricsCollector:
                 self._readiness = ReadinessProbe(
                     self.duckdb_path,
                     include_analytical=self.include_analytical_readiness,
+                    embeddings=self.embeddings_state,
                 )
             probe = self._readiness
         status, body = probe.check().as_response(include_detail=include_detail)
@@ -1379,7 +1399,11 @@ class MetricsCollector:
         try:
             with attached_control_plane_snapshot(con, self.duckdb_path):
                 payload = project_activity(
-                    con, project_key=project_key, days=days, max_sessions=limit
+                    con,
+                    memory_store_path=self.duckdb_path,
+                    project_key=project_key,
+                    days=days,
+                    max_sessions=limit,
                 )
         except ValueError as exc:
             return _json_response(400, {"error": str(exc)})
@@ -2977,6 +3001,17 @@ class MetricsCollector:
             return self._unavailable_quality_snapshot(), self._unavailable_observatory()
         return self._audit_quality, self._audit_observatory or {}
 
+    def _memory_kwargs(self) -> dict[str, Any]:
+        """Point audits of a snapshot copy at the live memory store (#480).
+
+        Derived memory lives in the PostgreSQL control store registered for
+        the live path; a private DuckDB copy has no registration of its own.
+        """
+        return {
+            "memory_store_path": Path(self.duckdb_path),
+            "embedding_model": (self.embeddings_state or {}).get("model"),
+        }
+
     def _build_audit_payload(self) -> tuple[dict, dict]:
         """Build quality + observatory from one private store snapshot."""
         source = Path(self.duckdb_path)
@@ -2986,6 +3021,7 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
                 spans_enabled=self.spans_enabled,
+                **self._memory_kwargs(),
             )
             return quality, {}
 
@@ -2998,6 +3034,7 @@ class MetricsCollector:
                 duckdb_path=snapshot,
                 incoming_dir=self.incoming_dir,
                 deep=False,
+                **self._memory_kwargs(),
                 role="snapshot",
                 spans_enabled=self.spans_enabled,
             )
@@ -3007,6 +3044,7 @@ class MetricsCollector:
                 max_artifacts=10,
                 max_projects=10,
                 role="snapshot",
+                memory_store_path=source,
             )
             return quality, observatory
 
@@ -3089,6 +3127,7 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
                 spans_enabled=self.spans_enabled,
+                **self._memory_kwargs(),
             )
         # Deliberately a COPY, unlike harness_snapshot's live read.
         #
@@ -3117,6 +3156,7 @@ class MetricsCollector:
                 duckdb_path=snapshot,
                 incoming_dir=self.incoming_dir,
                 deep=False,
+                **self._memory_kwargs(),
                 role="snapshot",
                 spans_enabled=self.spans_enabled,
             )
@@ -3141,6 +3181,7 @@ class MetricsCollector:
                     max_artifacts=10,
                     max_projects=10,
                     role="snapshot",
+                    memory_store_path=source,
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to render observatory drilldown: %s", exc)

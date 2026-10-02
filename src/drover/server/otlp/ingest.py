@@ -32,7 +32,6 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
 from drover.attribution import derive_repo_attribution
 from drover.event_identity import canonical_agent_events_cte
 from drover.parsers import parse_agentweave_trace
-from drover.server import ledger_shadow
 from drover.server.db import open_duckdb_connection
 from drover.server.otlp.proto_adapter import otlp_request_to_trace_dict
 from drover.server.parquet_io import atomic_write_table
@@ -98,7 +97,6 @@ class OTLPIngestStats:
     inserted: int = 0
     skipped_dupes: int = 0
     errors: int = 0
-    ledger_receipts: int = 0
 
 
 def _make_span_dedup_key(trace_id: str | None, span_id: str | None) -> str:
@@ -317,7 +315,6 @@ def ingest_otlp_request(
     parquet_dir: Path,
     duckdb_path: Path,
     raw_object_uri: str = "otlp://stream",
-    span_job_stream: object | None = None,
 ) -> OTLPIngestStats:
     """Ingest one OTLP trace export request. Returns OTLPIngestStats."""
     parquet_dir = Path(parquet_dir)
@@ -381,30 +378,9 @@ def ingest_otlp_request(
                     [partition_date, latest_activity_at],
                 )
             _upsert_tasks(con, new_rows)
-            for row in new_rows:
-                span_id = row.get("span_id")
-                if span_id:
-                    con.execute(
-                        """INSERT INTO span_embed_jobs (span_id, status, attempts)
-                           VALUES (?, 'pending', 0)
-                           ON CONFLICT (span_id) DO NOTHING""",
-                        [span_id],
-                    )
-                    if span_job_stream is not None:
-                        span_job_stream.add({"span_id": str(span_id)})
-                # Shadow-write a durable receipt per accepted span (AGE-44). The
-                # span dedup_key is the durable identity, so a re-arriving span is
-                # a ledger no-op. Best-effort; never blocks the parquet write.
-                result = ledger_shadow.record_receipt(
-                    con,
-                    source_kind="otlp_span",
-                    source_key=row["dedup_key"],
-                    subject_kind="span",
-                    subject_key=span_id,
-                    payload_hash=row["dedup_key"],
-                )
-                if result is not None and not result.is_duplicate:
-                    stats.ledger_receipts += 1
+            # Span embedding jobs are gone from the core path (#473), and so
+            # are the DuckDB ledger-shadow receipts (#480): ingest writes the
+            # spans partition and tasks, nothing else.
             stats.inserted = len(new_rows)
     finally:
         con.close()

@@ -16,10 +16,8 @@ import pytest
 
 
 @pytest.fixture
-def postgres_control_store(tmp_path: Path, monkeypatch):
-    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
-    if not dsn:
-        pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
+def postgres_control_store(tmp_path: Path, monkeypatch, postgres_dsn):
+    dsn = postgres_dsn
 
     from drover.config import ControlStoreConfig
     from drover.schema import bootstrap
@@ -49,11 +47,9 @@ def postgres_control_store(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture
-def postgres_single_connection_control_store(tmp_path: Path, monkeypatch):
+def postgres_single_connection_control_store(tmp_path: Path, monkeypatch, postgres_dsn):
     """A one-slot store proves archive RPCs cannot hold API connections."""
-    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
-    if not dsn:
-        pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
+    dsn = postgres_dsn
     from drover.config import ControlStoreConfig
     from drover.schema import bootstrap
     from drover.server.control_store import close_control_store, configure_control_store
@@ -108,6 +104,33 @@ def _seed_outbox_claim(control_path: Path, *, event_id: str):
         claim = claim_outbox_batch(con, owner="publisher", limit=10)
         assert claim is not None
         return claim
+
+
+def _finish_recap(con, session_id: str, source_seq: int) -> None:
+    """Record a finished live recap the way the worker does (#480).
+
+    The live ``recap_session`` ledger job (if any) succeeds and the live phase
+    of ``session_memory`` reaches ``source_seq``. Tests stand in for the model.
+    """
+    from drover.server.memory_store import MemoryRepository
+
+    con.execute(
+        """UPDATE pipeline_jobs
+              SET status = 'succeeded', finished_at = now(), updated_at = now()
+            WHERE job_kind = 'recap_session' AND subject_key = ?
+              AND status IN ('pending', 'retry_wait')""",
+        [session_id],
+    )
+    MemoryRepository.put_recap(con, session_id, "done", source_seq, None)
+
+
+def _live_recap_job(con, session_id: str):
+    return con.execute(
+        """SELECT source_version, status FROM pipeline_jobs
+            WHERE job_kind = 'recap_session' AND subject_key = ?
+              AND status IN ('pending', 'running', 'retry_wait')""",
+        [session_id],
+    ).fetchone()
 
 
 def test_postgres_event_write_commits_payload_preview_and_outbox_atomically(
@@ -192,7 +215,7 @@ def test_postgres_event_transaction_rolls_back_metadata_payload_preview_outbox_a
             "harness_event_payloads",
             "harness_session_previews",
             "control_outbox_events",
-            "live_recap_jobs",
+            "pipeline_jobs",
         ):
             assert con.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
 
@@ -341,7 +364,7 @@ def test_postgres_batch_and_structured_writers_roll_back_all_event_side_effects(
             "harness_event_payloads",
             "harness_session_previews",
             "control_outbox_events",
-            "live_recap_jobs",
+            "pipeline_jobs",
         ):
             assert con.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
 
@@ -979,18 +1002,22 @@ def test_retention_requires_export_usage_and_verified_archive_replay(
         "verification_failed": 0,
     }
     with control_plane_connection(control_path) as con:
-        assert con.execute(
-            "SELECT desired_source_seq, status FROM live_recap_jobs WHERE session_id = ?",
-            ["retention-session"],
-        ).fetchone() == (2, "pending")
-        con.execute("""
-            INSERT INTO live_session_recaps (session_id, recap_text, source_seq, generated_at)
-            VALUES ('retention-session', 'done', 2, now())
-            """)
+        assert _live_recap_job(con, "retention-session") == ("2", "pending")
+        # A recap that has not caught up to the newest sequence still protects.
         con.execute(
-            "UPDATE live_recap_jobs SET status = 'done' WHERE session_id = ?",
+            "UPDATE pipeline_jobs SET status = 'succeeded', finished_at = now() "
+            "WHERE job_kind = 'recap_session' AND subject_key = ?",
             ["retention-session"],
         )
+        from drover.server.memory_store import MemoryRepository
+
+        MemoryRepository.put_recap(con, "retention-session", "behind", 1, None)
+    assert (
+        prune_verified_payloads(control_path, resolver=None)["protected_dependency"]
+        == 2
+    )
+    with control_plane_connection(control_path) as con:
+        _finish_recap(con, "retention-session", 2)
 
     class CorruptResolver:
         def resolve(self, **_kwargs):
@@ -1137,14 +1164,7 @@ def test_retention_releases_the_only_postgres_slot_before_archive_resolution(
             ).batch_id,
         )
         rollup_pending_sessions(con)
-        con.execute("""
-            INSERT INTO live_session_recaps (session_id, recap_text, source_seq, generated_at)
-            VALUES ('retention-slot-session', 'done', 2, now())
-            """)
-        con.execute(
-            "UPDATE live_recap_jobs SET status = 'done' WHERE session_id = ?",
-            ["retention-slot-session"],
-        )
+        _finish_recap(con, "retention-slot-session", 2)
 
     payloads = {
         "retention-slot-event": '{"text":"worker RPC must not hold the sole slot"}',
@@ -1256,13 +1276,7 @@ def test_reopened_session_usage_retries_until_archived_payloads_are_verified(
             con, publish_outbox_batch(con, claim, parquet_dir=parquet_dir).batch_id
         )
         assert rollup_pending_sessions(con).rolled == 1
-        con.execute("""INSERT INTO live_session_recaps
-               (session_id, recap_text, source_seq, generated_at)
-               VALUES ('reopen-session', 'done', 2, now())""")
-        con.execute(
-            "UPDATE live_recap_jobs SET status = 'done' WHERE session_id = ?",
-            ["reopen-session"],
-        )
+        _finish_recap(con, "reopen-session", 2)
 
     def manifest_ids() -> set[str]:
         with control_plane_connection(control_path) as manifest_con:
@@ -1378,19 +1392,11 @@ def test_dependency_protected_events_do_not_starve_prunable_ones(
         rollup_pending_sessions(con)
         # Only the newer session's recap dependency completes. The older one
         # keeps a pending recap job, exactly like a pre-recap-era session.
-        con.execute("""
-            INSERT INTO live_session_recaps (session_id, recap_text, source_seq, generated_at)
-            VALUES ('fresh-session', 'done', 1, now())
-            """)
-        # A recap job is only enqueued by a completion event, so insert the
-        # row a completed session would have. stuck-session deliberately gets
-        # none, which is the real pre-recap-era shape: 6,710 payloads on the
-        # reference hub are blocked exactly this way.
-        con.execute("""
-            INSERT INTO live_recap_jobs
-              (session_id, desired_source_seq, status, attempts, enqueued_at, updated_at)
-            VALUES ('fresh-session', 1, 'done', 1, now(), now())
-            """)
+        # A recap is only generated after a completion event, so record the
+        # finished recap a completed session would have. stuck-session
+        # deliberately gets none, which is the real pre-recap-era shape:
+        # 6,710 payloads on the reference hub are blocked exactly this way.
+        _finish_recap(con, "fresh-session", 1)
 
     def manifest_ids() -> set[str]:
         with control_plane_connection(manifest_con_path) as manifest_con:

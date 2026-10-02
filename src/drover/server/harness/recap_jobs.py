@@ -1,111 +1,127 @@
-"""Durable queue operations for incremental live session recaps."""
+"""Live recaps as the live phase of session memory (#480).
+
+A live recap is one ``recap_session`` job in the PostgreSQL job ledger
+(``pipeline_jobs``) and, once generated, the live phase of the session's
+``session_memory`` row. There is no recap-specific queue table and no Redis
+delivery stream any more: the ledger is the one authoritative queue.
+
+The registry enqueues inside the transaction that appends the turn-completion
+event, on the same PostgreSQL control-plane connection, so the event and the
+recap intent commit (or roll back) together. On a DuckDB control plane --
+a local install without PostgreSQL -- derived memory, live recaps included,
+is unavailable: enqueue is a no-op and reads return nothing.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from pathlib import Path
+from typing import Iterable
 
-import duckdb
+from drover.server.control_outbox import is_postgres_connection
+from drover.server.ledger import (
+    LIVE_STATUSES,
+    RECAP_SESSION,
+    JobLedger,
+    memory_store_available,
+)
+from drover.server.memory_store import LiveRecap, MemoryRepository
+
+__all__ = ["LiveRecap", "enqueue_live_recap", "latest_live_recaps"]
+
+_ADVANCED = ("queued", "requeued")
 
 
-@dataclass(frozen=True)
-class LiveRecap:
-    """The latest durable recap projection for one live session."""
+def _live_job_seq(con: object, session_id: str) -> int | None:
+    """The source sequence of the session's live recap job, locked for this txn.
 
-    session_id: str
-    text: str
-    source_seq: int
-    generated_at: datetime
-    generator_model: str | None
+    ``FOR UPDATE`` serializes two completions racing for one session: the
+    second waits for the first to commit and then compares against its seq,
+    so the forward-only check below cannot be interleaved.
+    """
+    row = con.execute(  # type: ignore[attr-defined]
+        f"""SELECT source_version FROM pipeline_jobs
+             WHERE job_kind = ? AND subject_key = ?
+               AND status IN ({", ".join("?" for _ in LIVE_STATUSES)})
+             FOR UPDATE""",
+        [RECAP_SESSION, session_id, *LIVE_STATUSES],
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        # A live job whose version is not a sequence was not written here;
+        # treat it as older than anything so a real sequence replaces it.
+        return -1
+
+
+def _stored_recap_seq(con: object, session_id: str) -> int | None:
+    row = con.execute(  # type: ignore[attr-defined]
+        "SELECT recap_source_seq FROM session_memory WHERE session_id = ?",
+        [session_id],
+    ).fetchone()
+    return int(row[0]) if row is not None and row[0] is not None else None
 
 
 def enqueue_live_recap(
-    con: duckdb.DuckDBPyConnection, session_id: str, source_seq: int
+    con: object, session_id: str, source_seq: int, *, store_path: str | Path
 ) -> bool:
-    """Queue a newer recap generation without letting stale events reset it."""
-    row = con.execute(
-        """INSERT INTO live_recap_jobs
-          (session_id, desired_source_seq, status, attempts, last_error,
-           enqueued_at, updated_at, next_run_at, stream_publish_needed)
-        VALUES (?, ?, 'pending', 0, NULL, now(), now(), NULL, TRUE)
-        ON CONFLICT (session_id) DO UPDATE SET
-          desired_source_seq=excluded.desired_source_seq,
-          status='pending', attempts=0, last_error=NULL,
-          updated_at=now(), next_run_at=NULL, stream_publish_needed=TRUE
-        WHERE live_recap_jobs.desired_source_seq < excluded.desired_source_seq
-        RETURNING session_id""",
-        [session_id, source_seq],
-    ).fetchone()
-    return row is not None
+    """Queue a recap at ``source_seq`` in the caller's transaction, forward only.
 
+    ``con`` is the caller's open control-plane connection; on PostgreSQL the
+    ledger enqueue joins its transaction. Returns True when a job now targets
+    ``source_seq``.
 
-def publish_live_recap_generation(
-    con: duckdb.DuckDBPyConnection,
-    session_id: str,
-    source_seq: int,
-    stream: object | None,
-) -> bool:
-    """Publish one durable generation with at-least-once semantics."""
-    if stream is None:
+    The ledger retargets a waiting job to whatever version is enqueued, so
+    the forward-only rule lives here: a session whose live job, or whose
+    stored recap, already covers ``source_seq`` or later is left alone. An
+    out-of-order or replayed completion can therefore never move a session's
+    recap backwards.
+    """
+    if not is_postgres_connection(con) or not memory_store_available(store_path):
         return False
-    pending = con.execute(
-        """SELECT 1 FROM live_recap_jobs
-             WHERE session_id=?
-               AND desired_source_seq=?
-               AND stream_publish_needed""",
-        [session_id, source_seq],
-    ).fetchone()
-    if pending is None:
+    seq = int(source_seq)
+    # Serialize the sequence comparison as well as the subsequent enqueue.
+    JobLedger.lock_subject(con, RECAP_SESSION, session_id)
+    live_seq = _live_job_seq(con, session_id)
+    if live_seq is not None and live_seq >= seq:
         return False
-    stream.add({"session_id": session_id, "source_seq": source_seq})  # type: ignore[attr-defined]
-    con.execute(
-        """UPDATE live_recap_jobs SET stream_publish_needed=FALSE
-             WHERE session_id=?
-               AND desired_source_seq=?
-               AND stream_publish_needed""",
-        [session_id, source_seq],
+    stored_seq = _stored_recap_seq(con, session_id)
+    if stored_seq is not None and stored_seq >= seq:
+        return False
+    ledger = JobLedger(store_path)
+    outcome = ledger.enqueue(
+        RECAP_SESSION,
+        session_id,
+        source_version=str(seq),
+        payload={"source_seq": seq},
+        con=con,
     )
-    return True
-
-
-def flush_live_recap_publications(
-    con: duckdb.DuckDBPyConnection, stream: object | None, *, limit: int = 100
-) -> int:
-    """Retry stream publications left pending by a failed prior process."""
-    if stream is None:
-        return 0
-    rows = con.execute(
-        """SELECT session_id, desired_source_seq FROM live_recap_jobs
-             WHERE stream_publish_needed
-             ORDER BY enqueued_at ASC
-             LIMIT ?""",
-        [max(1, int(limit))],
-    ).fetchall()
-    return sum(
-        publish_live_recap_generation(con, session_id, source_seq, stream)
-        for session_id, source_seq in rows
-    )
+    if outcome == "already_queued":
+        # On a caller connection the ledger reports a lost insert race as
+        # "already_queued". The winner may hold an older sequence; now that
+        # its row is committed and visible, advance it once more.
+        live_seq = _live_job_seq(con, session_id)
+        if live_seq is not None and live_seq < seq:
+            outcome = ledger.enqueue(
+                RECAP_SESSION,
+                session_id,
+                source_version=str(seq),
+                payload={"source_seq": seq},
+                con=con,
+            )
+    return outcome in _ADVANCED
 
 
 def latest_live_recaps(
-    con: duckdb.DuckDBPyConnection, session_ids: list[str]
+    store_path: str | Path, session_ids: Iterable[str]
 ) -> dict[str, LiveRecap]:
-    """Return the latest persisted recap for each requested session."""
-    if not session_ids:
+    """The latest generated recap for each requested session.
+
+    Empty when memory is unavailable (DuckDB control plane): nothing that
+    renders a fleet may fail because live recaps are off.
+    """
+    ids = [str(s) for s in session_ids if s]
+    if not ids or not memory_store_available(store_path):
         return {}
-    placeholders = ", ".join("?" for _ in session_ids)
-    rows = con.execute(
-        "SELECT session_id, recap_text, source_seq, generated_at, generator_model "
-        f"FROM live_session_recaps WHERE session_id IN ({placeholders})",
-        session_ids,
-    ).fetchall()
-    return {
-        session_id: LiveRecap(
-            session_id=session_id,
-            text=recap_text,
-            source_seq=source_seq,
-            generated_at=generated_at,
-            generator_model=generator_model,
-        )
-        for session_id, recap_text, source_seq, generated_at, generator_model in rows
-    }
+    return MemoryRepository(store_path).live_recaps(ids)

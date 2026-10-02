@@ -9,6 +9,8 @@ from pathlib import Path
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
+from memory_helpers import put_summary
 
 from drover.schema import bootstrap
 from drover.server.dogfood_smoke import render_report, run_smoke
@@ -76,9 +78,15 @@ _SPAN_SCHEMA = pa.schema(
 )
 
 
+@pytest.fixture(autouse=True)
+def _memory_store(pg_control_path: Path) -> Path:
+    """Summaries live in the PostgreSQL memory store registered for this path."""
+    return pg_control_path
+
+
 def _seed_fixture(tmp_path: Path, *, include_active: bool = True) -> dict[str, object]:
     parquet_dir = tmp_path / "parquet"
-    duckdb_path = tmp_path / "nexus.duckdb"
+    duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
 
     now = datetime.now(timezone.utc)
@@ -176,30 +184,25 @@ def _seed_fixture(tmp_path: Path, *, include_active: bool = True) -> dict[str, o
                VALUES (?, ?, ?, ?, 'arnab', 'open', ?, ?, 2, 0.12)""",
             [task_id, repo_owner, repo_name, branch, now - timedelta(hours=3), now],
         )
-        con.execute(
-            """INSERT INTO session_summaries
-               (session_id, task_id, agent_id, ended_at, summary_md, files_touched,
-                tools_used, last_user_prompt, last_assistant, next_steps_md,
-                open_questions, status, generator_model, generated_at)
-               VALUES (?, ?, ?, ?, ?, ?, MAP{'Edit': 2}, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                "sess-A",
-                task_id,
-                "nas-claude",
-                now - timedelta(hours=2),
-                "Built fixture-backed MCP handoff checks for another agent.",
-                ["src/nexus/server/dogfood_smoke.py"],
-                "Implement MCP handoff fixture coverage.",
-                "Continuing from the NAS agent summary.",
-                "Run the smoke against live ~/.nexus/nexus.duckdb before OSS readiness.",
-                ["Should data quality be required before #82 merges?"],
-                "completed",
-                "test-model",
-                now - timedelta(hours=2),
-            ],
-        )
     finally:
         con.close()
+    put_summary(
+        duckdb_path,
+        "sess-A",
+        task_id=task_id,
+        agent_id="nas-claude",
+        ended_at=now - timedelta(hours=2),
+        summary_md="Built fixture-backed MCP handoff checks for another agent.",
+        files_touched=("src/nexus/server/dogfood_smoke.py",),
+        tools_used={"Edit": 2},
+        last_user_prompt="Implement MCP handoff fixture coverage.",
+        last_assistant="Continuing from the NAS agent summary.",
+        next_steps_md="Run the smoke against live ~/.nexus/nexus.duckdb before OSS readiness.",
+        open_questions=("Should data quality be required before #82 merges?",),
+        status="completed",
+        generator_model="test-model",
+        generated_at=now - timedelta(hours=2),
+    )
 
     return {
         "duckdb_path": duckdb_path,

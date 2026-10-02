@@ -12,9 +12,11 @@ import pytest
 from drover.schema import bootstrap
 from drover.server.db import control_plane_connection
 from drover.server.embeddings.client import EmbeddingBackendConfig, OllamaEmbedder
+from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
 from drover.server.mcp import tools
 from drover.server.memory_identity import apply_memory_links, read_memory_sessions
 from drover.server.memory_identity import refresh_memory_projection as project_memory
+from drover.server.memory_store import MemoryRepository
 from drover.server.summarizer.jobs import source_version_for_session
 from drover.server.summarizer.worker import SummarizerWorker
 
@@ -23,15 +25,16 @@ FIXTURE = json.loads(
 )
 
 
-def refresh_memory_projection(analytics, control):
+def refresh_memory_projection(analytics, control, path):
     apply_memory_links(
-        control, project_memory(analytics, read_memory_sessions(control))
+        control,
+        project_memory(analytics, read_memory_sessions(control), store_path=path),
     )
 
 
 @pytest.fixture
-def stores(tmp_path):
-    path = tmp_path / "db.duckdb"
+def stores(tmp_path, pg_control_path):
+    path = pg_control_path
     parquet = tmp_path / "parquet"
     bootstrap(parquet_dir=parquet, duckdb_path=path)
     return path, parquet
@@ -83,7 +86,7 @@ def test_control_stream_summarizes_every_harness_with_metadata_tail(stores, harn
         seed_control(control, harness)
         analytics = duckdb.connect(str(path))
         exported_events(analytics)
-        refresh_memory_projection(analytics, control)
+        refresh_memory_projection(analytics, control, path)
         version = source_version_for_session(analytics, "harness-fixture")
         assert analytics.execute(
             "SELECT count(*), min(source) FROM agent_events"
@@ -91,7 +94,7 @@ def test_control_stream_summarizes_every_harness_with_metadata_tail(stores, harn
         analytics.execute(
             "INSERT INTO harness_exported_events SELECT 'later', session_id, created_at + INTERVAL '1 day', 'status', 'status', normalized_source, payload_json FROM harness_exported_events LIMIT 1"
         )
-        refresh_memory_projection(analytics, control)
+        refresh_memory_projection(analytics, control, path)
         assert source_version_for_session(analytics, "harness-fixture") == version
         analytics.close()
     prompts = []
@@ -105,7 +108,7 @@ def test_control_stream_summarizes_every_harness_with_metadata_tail(stores, harn
     assert FIXTURE["final_output"] in prompts[0]
     with control_plane_connection(path) as control:
         analytics = duckdb.connect(str(path))
-        refresh_memory_projection(analytics, control)
+        refresh_memory_projection(analytics, control, path)
         assert (
             control.execute(
                 "SELECT summary_session_id FROM harness_sessions"
@@ -114,6 +117,12 @@ def test_control_stream_summarizes_every_harness_with_metadata_tail(stores, harn
         )
         analytics.close()
     for identifier in ["harness-fixture", "native-fixture"]:
+        assert (
+            tools.drover_session_close(duckdb_path=path, session_id=identifier)[
+                "session_id"
+            ]
+            == "harness-fixture"
+        )
         summary = tools.drover_session_summary(duckdb_path=path, session_id=identifier)
         assert summary["last_assistant"] == FIXTURE["final_output"]
         for ref in ["abc123def456789", "#479", "#468", "#469", "#470"]:
@@ -147,10 +156,10 @@ def test_control_stream_summarizes_every_harness_with_metadata_tail(stores, harn
             == 1
         )
         assert (
-            tools.drover_recall(
-                duckdb_path=path, session_id=identifier, query_embedding=[1.0]
-            )["status"]
-            == "unavailable"
+            tools.drover_recall(duckdb_path=path, session_id=identifier, query="#479")[
+                "mode"
+            ]
+            == "keyword"
         )
     spec = importlib.util.spec_from_file_location(
         "memory_acceptance", Path(__file__).parents[1] / "scripts/memory_acceptance.py"
@@ -158,7 +167,7 @@ def test_control_stream_summarizes_every_harness_with_metadata_tail(stores, harn
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     con = duckdb.connect(str(path), read_only=True)
-    report = module.audit_session(con, "harness-fixture")
+    report = module.audit_session(con, "harness-fixture", store_path=path)
     assert report["canonical_event_count"] == 41
     assert (
         report["mapping_present"]
@@ -178,19 +187,15 @@ def test_metadata_only_session_is_insufficient(stores):
         seed_control(control, native=None)
         con = duckdb.connect(str(path))
         exported_events(con, metadata_only=True)
-        refresh_memory_projection(con, control)
+        refresh_memory_projection(con, control, path)
         con.close()
     llm = Mock()
     SummarizerWorker(duckdb_path=path, _llm_call=llm, api_key="fixture").drain_once()
     llm.assert_not_called()
-    con = duckdb.connect(str(path))
-    assert (
-        con.execute("SELECT status FROM summarize_jobs").fetchone()[0]
-        == "insufficient_input"
-    )
-    assert con.execute("SELECT count(*) FROM session_summaries").fetchone()[0] == 0
-    assert con.execute("SELECT count(*) FROM embed_jobs").fetchone()[0] == 0
-    con.close()
+    job = JobLedger(path).latest(SUMMARIZE_SESSION, "harness-fixture")
+    assert job.status == "quarantined" and job.error_category == "no_events"
+    assert MemoryRepository(path).summary("harness-fixture") is None
+    assert JobLedger(path).stats()["embed_session"]["pending"] == 0
     assert (
         tools.drover_session_summary(duckdb_path=path, session_id="harness-fixture")[
             "status"
@@ -220,7 +225,7 @@ def test_mcp_unknown_and_unmapped(stores, tool, kwargs):
     with control_plane_connection(path) as control:
         seed_control(control, native=None)
         con = duckdb.connect(str(path))
-        refresh_memory_projection(con, control)
+        refresh_memory_projection(con, control, path)
         con.close()
     assert (
         tool(duckdb_path=path, session_id="harness-fixture", **kwargs)["status"]
@@ -295,7 +300,7 @@ def test_native_history_attaches_without_duplicate_memory_and_backfills(stores):
                 )
             ],
         )
-        refresh_memory_projection(con, control)
+        refresh_memory_projection(con, control, path)
         assert (
             control.execute(
                 "SELECT native_session_id FROM harness_sessions"
@@ -350,19 +355,20 @@ def test_projection_repairs_enqueue_and_control_link_after_failure(stores, monke
             Mock(side_effect=RuntimeError("fixture enqueue outage")),
         )
         with pytest.raises(RuntimeError):
-            refresh_memory_projection(con, control)
+            refresh_memory_projection(con, control, path)
         assert (
             con.execute("SELECT count(*) FROM memory_projection_pending").fetchone()[0]
             == 1
         )
         monkeypatch.setattr(jobs, "enqueue_summary_generation", original)
-        refresh_memory_projection(con, control)
+        refresh_memory_projection(con, control, path)
         assert (
             con.execute("SELECT count(*) FROM memory_projection_pending").fetchone()[0]
             == 0
         )
         assert (
-            con.execute("SELECT status FROM summarize_jobs").fetchone()[0] == "pending"
+            JobLedger(path).latest(SUMMARIZE_SESSION, "harness-fixture").status
+            == "pending"
         )
         assert (
             control.execute(
@@ -387,7 +393,7 @@ def test_forced_final_assistant_survives_later_tool_turns(stores):
                 "INSERT INTO harness_exported_events SELECT ?, session_id, created_at+INTERVAL '1 day', 'tool_result', 'tool_result', normalized_source, ? FROM harness_exported_events LIMIT 1",
                 [f"tool-{n}", json.dumps({"text": "test completed"})],
             )
-        refresh_memory_projection(con, control)
+        refresh_memory_projection(con, control, path)
         window = select_substantive_window(
             con, _session_agent_events_ctes(), "harness-fixture"
         )
@@ -456,7 +462,7 @@ def test_exporter_rebuilds_canonical_memory_from_acknowledged_manifest(
     exporter.run_once()
     con = duckdb.connect(str(path))
     assert con.execute("SELECT count(*) FROM control_memory_events").fetchone()[0] == 40
-    assert con.execute("SELECT count(*) FROM summarize_jobs").fetchone()[0] == 1
+    assert JobLedger(path).stats()[SUMMARIZE_SESSION]["pending"] == 1
     con.close()
 
 

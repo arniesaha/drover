@@ -131,13 +131,22 @@ def apply_memory_links(control: Any, links: list[dict]) -> None:
             )
 
 
-def refresh_memory_projection(analytics: Any, sessions: dict[str, dict]) -> list[dict]:
+def refresh_memory_projection(
+    analytics: Any, sessions: dict[str, dict], *, store_path=None
+) -> list[dict]:
     """Project published events without borrowing a control connection or lock."""
+    from drover.server.ledger import memory_store_available
+    from drover.server.memory_store import MemoryRepository
     from drover.server.summarizer.jobs import (
         enqueue_summary_generation,
         source_version_for_session,
     )
 
+    repo = (
+        MemoryRepository(store_path)
+        if store_path and memory_store_available(store_path)
+        else None
+    )
     ensure_memory_schema(analytics)
     links = []
     for sid, native in analytics.execute(
@@ -221,8 +230,10 @@ def refresh_memory_projection(analytics: Any, sessions: dict[str, dict]) -> list
     for (sid,) in analytics.execute(
         "SELECT session_id FROM memory_projection_pending"
     ).fetchall():
+        if repo is None:
+            continue  # Keep the durable intent until a memory store is available.
         enqueue_summary_generation(
-            analytics, sid, source_version_for_session(analytics, sid)
+            store_path, sid, source_version_for_session(analytics, sid)
         )
         analytics.execute(
             "DELETE FROM memory_projection_pending WHERE session_id=?", [sid]
@@ -230,23 +241,34 @@ def refresh_memory_projection(analytics: Any, sessions: dict[str, dict]) -> list
     # Summary publication is a separate idempotent control-plane link effect.
     # A crash after summary completion is repaired by the next export pass.
     for sid, session in sessions.items():
-        candidates = [sid, session.get("native_session_id")]
-        row = analytics.execute(
-            "SELECT session_id FROM session_summaries WHERE session_id IN (?, ?) ORDER BY (session_id=?) DESC LIMIT 1",
-            [*candidates, sid],
-        ).fetchone()
-        if row and session.get("summary_session_id") != row[0]:
-            links.append({"session_id": sid, "summary_session_id": row[0]})
+        if repo is None:
+            continue
+        # A harness artifact wins over its explicit native alias.
+        artifact = repo.summary(sid) or (
+            repo.summary(session["native_session_id"])
+            if session.get("native_session_id")
+            else None
+        )
+        if artifact and session.get("summary_session_id") != artifact.session_id:
+            links.append({"session_id": sid, "summary_session_id": artifact.session_id})
             analytics.execute(
                 "UPDATE memory_session_identity SET summary_session_id=? WHERE harness_session_id=?",
-                [row[0], sid],
+                [artifact.session_id, sid],
             )
 
     return links
 
 
-def resolve_session(con: Any, session_id: str) -> dict:
+def resolve_session(con: Any, session_id: str, *, store_path=None) -> dict:
     """Distinguish unknown identity, missing native link, and missing artifact."""
+    from drover.server.ledger import memory_store_available
+    from drover.server.memory_store import MemoryRepository
+
+    repo = (
+        MemoryRepository(store_path)
+        if store_path and memory_store_available(store_path)
+        else None
+    )
     rows = con.execute(
         """SELECT harness_session_id, native_session_id, summary_session_id
         FROM memory_session_identity WHERE ? IN (harness_session_id, native_session_id, summary_session_id)""",
@@ -263,9 +285,10 @@ def resolve_session(con: Any, session_id: str) -> dict:
         exists = con.execute(
             "SELECT 1 FROM control_memory_events WHERE session_id=? LIMIT 1", [harness]
         ).fetchone()
-        artifact = con.execute(
-            "SELECT 1 FROM session_summaries WHERE session_id=?", [summary or harness]
-        ).fetchone()
+        artifact = repo.summary(harness) if repo is not None else None
+        if artifact is None and repo is not None and native:
+            artifact = repo.summary(native)
+        summary = artifact.session_id if artifact else summary
         status = (
             "ok" if exists or artifact else ("unavailable" if native else "unmapped")
         )
@@ -283,9 +306,7 @@ def resolve_session(con: Any, session_id: str) -> dict:
         "SELECT 1 FROM agent_events WHERE session_id=? LIMIT 1", [session_id]
     ).fetchone()
     if not exists:
-        exists = con.execute(
-            "SELECT 1 FROM session_summaries WHERE session_id=?", [session_id]
-        ).fetchone()
+        exists = repo.summary(session_id) if repo is not None else None
     return {
         "status": "ok" if exists else "unknown",
         "session_id": session_id,

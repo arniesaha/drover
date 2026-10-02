@@ -18,7 +18,7 @@ today. This note decides what each view answers using Drover's own data.
 - `live_session_recaps` and session previews: a readable line per session.
 - `agent_event_day_summary`: per-day, per-session first/last event and repo,
   for native sessions as well as launched ones.
-- `session_summaries`: summary, next steps, open questions.
+- PostgreSQL `session_memory`: summary, next steps, open questions (Phase 3).
 - `session_usage`: per-session token totals from the harness stream.
 
 Not held: a delegation parent, a session title, or commit/PR refs (only the

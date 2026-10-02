@@ -571,7 +571,7 @@ def test_content_analysis_revoke_cancels_model_jobs_but_keeps_findings(
     )
     con = duckdb.connect(str(repository.duckdb_path))
     try:
-        from drover.server.ledger import Ledger
+        from drover.server.analytical_ledger import Ledger
 
         Ledger(con).lease_job(leased.job_id, worker_id="model-worker")
     finally:

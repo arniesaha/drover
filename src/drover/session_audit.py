@@ -1,9 +1,11 @@
 """Read-only session consistency audit helpers.
 
 The ``sessions`` relation is intended to be derived state: a DuckDB view over
-``agent_events`` with optional ``session_summaries`` fields. This module never
-repairs or backfills data; it only reports drift and flags legacy base-table
-states loudly so operators can take an explicit, backed-up remediation path.
+``agent_events``. Session summaries are derived memory in the PostgreSQL
+control store (#480), so summary coverage compares DuckDB's event session ids
+with the summarized ids read from there. This module never repairs or
+backfills data; it only reports drift and flags legacy base-table states
+loudly so operators can take an explicit, backed-up remediation path.
 """
 
 from __future__ import annotations
@@ -18,9 +20,14 @@ from drover.event_identity import AgentEventScan, canonical_agent_events_cte
 LEGACY_SESSIONS_REMEDIATION = (
     "Back up the DuckDB file before making changes. The sessions relation is a "
     "legacy base table, but Drover expects sessions to be a view derived from "
-    "agent_events/session_summaries. Rebuild it only from a reviewed maintenance "
+    "agent_events. Rebuild it only from a reviewed maintenance "
     "window (for example by running schema bootstrap after the backup) and "
     "re-run `drover-server audit-sessions --json` to confirm zero drift."
+)
+
+MEMORY_UNAVAILABLE_WARNING = (
+    "session summaries live in the PostgreSQL control store, which this hub "
+    "does not have; summary coverage was not audited"
 )
 
 _ZERO_DRIFT_FIELDS = (
@@ -29,6 +36,7 @@ _ZERO_DRIFT_FIELDS = (
     "event_count_mismatches",
     "summaries_without_events",
 )
+_SUMMARY_DRIFT_FIELDS = ("event_sessions_without_summary", "summaries_without_events")
 
 
 def _safe_scalar(
@@ -46,90 +54,68 @@ def _safe_scalar(
     return int(row[0]) if row and row[0] is not None else 0
 
 
-_SESSION_SET_SQL = """
-WITH event_sessions AS MATERIALIZED (
-  SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL
-), summary_sessions AS MATERIALIZED (
-  SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
-)
-SELECT
-  (SELECT count(*) FROM event_sessions) AS event_sessions,
-  (
-    SELECT count(*)
-    FROM event_sessions e
-    LEFT JOIN summary_sessions s USING (session_id)
-    WHERE s.session_id IS NULL
-  ) AS event_sessions_without_summary,
-  (
-    SELECT count(*)
-    FROM summary_sessions s
-    LEFT JOIN event_sessions e USING (session_id)
-    WHERE e.session_id IS NULL
-  ) AS summaries_without_events
-"""
-
-_EVENT_SESSIONS_SQL = (
-    "SELECT count(DISTINCT session_id) FROM {events} WHERE session_id IS NOT NULL"
+_EVENT_SESSION_IDS_SQL = (
+    "SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL"
 )
 
-_EVENT_SESSIONS_WITHOUT_SUMMARY_SQL = """
-SELECT count(*)
-FROM (SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL) e
-LEFT JOIN (
-  SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
-) ss USING (session_id)
-WHERE ss.session_id IS NULL
-"""
 
-_SUMMARIES_WITHOUT_EVENTS_SQL = """
-SELECT count(*)
-FROM (
-  SELECT DISTINCT session_id FROM session_summaries WHERE session_id IS NOT NULL
-) ss
-LEFT JOIN (
-  SELECT DISTINCT session_id FROM {events} WHERE session_id IS NOT NULL
-) e USING (session_id)
-WHERE e.session_id IS NULL
-"""
+def summarized_session_ids(
+    memory_store_path: Path | str | None, *, warnings: list[str]
+) -> set[str] | None:
+    """Every session with a final summary, or None when that is unknowable.
+
+    None means no PostgreSQL memory store (or an unreadable one); an empty set
+    means the store has no summaries yet.
+    """
+    from drover.server.ledger import memory_store_available
+
+    if memory_store_path is None or not memory_store_available(memory_store_path):
+        warnings.append(MEMORY_UNAVAILABLE_WARNING)
+        return None
+    try:
+        from drover.server.memory_store import CANONICAL_MEMORY, MemoryRepository
+
+        with MemoryRepository(memory_store_path).connection() as pg:
+            rows = pg.execute(
+                f"SELECT session_id FROM session_memory WHERE phase = 'final' AND {CANONICAL_MEMORY}"
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 - an audit reports, never raises
+        warnings.append(f"summarized session ids query failed: {exc}")
+        return None
+    return {str(row[0]) for row in rows if row[0] is not None}
 
 
 def _session_set_metrics(
-    con: duckdb.DuckDBPyConnection, *, warnings: list[str], events: str
+    con: duckdb.DuckDBPyConnection,
+    *,
+    warnings: list[str],
+    events: str,
+    summary_ids: set[str] | None,
 ) -> tuple[int | None, int | None, int | None]:
     """Return the three session-set metrics from a single ``events`` scan.
 
-    These metrics all derive from the same two DISTINCT session-id sets. Asking
-    for them separately meant three full scans of the ``agent_events`` parquet
-    tree per audit, which is a large share of the /metrics cost (see #78). The
-    per-metric fallback is kept so one unreadable relation still degrades to
-    partial results rather than losing all three.
+    The event side is one DISTINCT scan of ``events`` (asking per metric used
+    to mean three full scans of the parquet tree, a large share of the
+    /metrics cost, #78). The summary side comes from PostgreSQL, so the two
+    id sets are compared here rather than joined in SQL.
     """
     try:
-        row = con.execute(_SESSION_SET_SQL.format(events=events)).fetchone()
-    except duckdb.Error:
-        return (
-            _safe_scalar(
-                con,
-                _EVENT_SESSIONS_SQL.format(events=events),
-                warnings=warnings,
-                label="event_sessions",
-            ),
-            _safe_scalar(
-                con,
-                _EVENT_SESSIONS_WITHOUT_SUMMARY_SQL.format(events=events),
-                warnings=warnings,
-                label="event_sessions_without_summary",
-            ),
-            _safe_scalar(
-                con,
-                _SUMMARIES_WITHOUT_EVENTS_SQL.format(events=events),
-                warnings=warnings,
-                label="summaries_without_events",
-            ),
-        )
-    if row is None:
-        return (0, 0, 0)
-    return tuple(int(value) if value is not None else 0 for value in row[:3])  # type: ignore[return-value]
+        event_ids = {
+            str(row[0])
+            for row in con.execute(
+                _EVENT_SESSION_IDS_SQL.format(events=events)
+            ).fetchall()
+        }
+    except duckdb.Error as exc:
+        warnings.append(f"event_sessions query failed: {exc}")
+        return (None, None, None)
+    if summary_ids is None:
+        return (len(event_ids), None, None)
+    return (
+        len(event_ids),
+        len(event_ids - summary_ids),
+        len(summary_ids - event_ids),
+    )
 
 
 def _relation_type(con: duckdb.DuckDBPyConnection, name: str) -> str | None:
@@ -174,12 +160,18 @@ def audit_session_consistency(
     duckdb_path: Path | str | None = None,
     include_expensive_checks: bool = True,
     scan: AgentEventScan | None = None,
+    memory_store_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Return a read-only session/session-summary consistency report.
 
     The caller owns the DuckDB connection. All queries are ``SELECT`` metadata or
     count queries; this function intentionally performs no schema bootstrap,
     repair, backfill, DDL, or writes.
+
+    Summarized session ids are read from the PostgreSQL control store
+    registered for ``memory_store_path`` (default ``duckdb_path``). Without
+    one, the summary fields are None, ``summaries_available`` is False, and
+    they do not count towards drift.
 
     ``scan`` is the caller's shared whole-history pass over ``agent_events``
     (see ``drover.event_identity``). When it carries ``session_id`` the
@@ -205,12 +197,12 @@ def audit_session_consistency(
         "event_count_mismatches": None,
         "event_sessions_without_summary": None,
         "summaries_without_events": None,
+        "summaries_available": False,
         "warnings": warnings,
         "remediation": None,
     }
 
     agent_events_type = _relation_type(con, "agent_events")
-    summaries_type = _relation_type(con, "session_summaries")
     sessions_type = _relation_type(con, "sessions")
     report["sessions_relation_type"] = sessions_type
 
@@ -220,22 +212,23 @@ def audit_session_consistency(
             "agent_events relation is missing; cannot audit session consistency"
         )
         return report
-    if summaries_type is None:
-        report["status"] = "missing_session_summaries"
-        warnings.append(
-            "session_summaries relation is missing; cannot audit summary consistency"
-        )
-        return report
     if sessions_type is None:
         report["status"] = "missing_sessions"
         warnings.append("sessions relation is missing; expected a DuckDB VIEW")
         return report
 
+    summary_ids = summarized_session_ids(
+        memory_store_path if memory_store_path is not None else duckdb_path,
+        warnings=warnings,
+    )
+    report["summaries_available"] = summary_ids is not None
     (
         event_sessions,
         event_sessions_without_summary,
         summaries_without_events,
-    ) = _session_set_metrics(con, warnings=warnings, events=events)
+    ) = _session_set_metrics(
+        con, warnings=warnings, events=events, summary_ids=summary_ids
+    )
     report["event_sessions"] = event_sessions
     if include_expensive_checks:
         report["sessions_rows"] = _safe_scalar(
@@ -306,6 +299,9 @@ def audit_session_consistency(
         if include_expensive_checks
         else ("event_sessions_without_summary", "summaries_without_events")
     )
+    if summary_ids is None:
+        # No memory store is a known absence, not an unknown measurement.
+        drift_fields = tuple(f for f in drift_fields if f not in _SUMMARY_DRIFT_FIELDS)
     drift_values = [report.get(field) for field in drift_fields]
     has_unknown = any(value is None for value in drift_values)
     has_drift = any((value or 0) != 0 for value in drift_values if value is not None)
@@ -335,7 +331,11 @@ def audit_session_consistency(
 
 
 def audit_session_consistency_db(duckdb_path: Path | str) -> dict[str, Any]:
-    """Open ``duckdb_path`` read-only and return a session consistency report."""
+    """Open ``duckdb_path`` read-only and return a session consistency report.
+
+    Summary coverage reads the PostgreSQL control store registered for the
+    same path.
+    """
 
     path = Path(duckdb_path)
     if not path.exists():
@@ -351,6 +351,7 @@ def audit_session_consistency_db(duckdb_path: Path | str) -> dict[str, Any]:
             "event_count_mismatches": None,
             "event_sessions_without_summary": None,
             "summaries_without_events": None,
+            "summaries_available": False,
             "warnings": [f"DuckDB path does not exist: {path}"],
             "remediation": None,
         }

@@ -595,8 +595,15 @@ def test_split_roles_use_real_postgres_auth_when_lake_is_absent_and_worker_chang
         assert {session["session_id"] for session in snapshot["sessions"]} == {
             "synthetic-session"
         }
-        status, _ = _request_json(api_port, "GET", "/readyz", token=device_token)
-        assert status == 200
+        status, readiness = _request_json(
+            api_port, "GET", "/readyz", token=device_token
+        )
+        # The API/control plane remains usable without its analytical lake, but
+        # Phase 3 intentionally makes readiness fail closed when this ordinary
+        # CI PostgreSQL service has no pgvector memory store. Fleet endpoints
+        # below prove the independent control-plane contract.
+        assert status == 503
+        assert isinstance(readiness, dict)
 
         # No worker owns the boundary yet. Fleet serving remains available.
         status, _ = _request_json(api_port, "GET", "/metrics", token=device_token)

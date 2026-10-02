@@ -10,6 +10,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from memory_helpers import put_summary
 
 from drover.schema import bootstrap
 from drover.server.mcp import tools as mcp_tools
@@ -26,8 +27,11 @@ from drover.task_id import compute_task_id
 
 
 def _seed(tmp_path: Path) -> tuple[Path, Path]:
+    # The same path `pg_control_path` registers: tests that request that
+    # fixture read derived memory from PostgreSQL; the rest run with a DuckDB
+    # control store, where there is no derived memory at all.
     parquet_dir = tmp_path / "parquet"
-    duckdb_path = tmp_path / "nexus.duckdb"
+    duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
     return parquet_dir, duckdb_path
 
@@ -152,30 +156,25 @@ def _populate(parquet_dir: Path, duckdb_path: Path) -> dict:
                VALUES (?, ?, ?, ?, 'arnab', 'open', now(), now(), 2, 0.0)""",
             [tid, repo_owner, repo_name, branch],
         )
-        con.execute(
-            """INSERT INTO session_summaries (session_id, task_id, agent_id, ended_at, summary_md,
-                                              files_touched, tools_used, last_user_prompt,
-                                              last_assistant, next_steps_md, open_questions,
-                                              status, generator_model, generated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())""",
-            [
-                "sess-A",
-                tid,
-                "nas-claude",
-                two_hours_ago,
-                "Set up the foundation; ported parsers; landed Plan 1.",
-                ["src/foo.py"],
-                {"Edit": 1},
-                "kicked off the lakehouse rewrite",
-                "ok done",
-                "Wire OTLP receiver into nexus-server run.",
-                ["should we keep BigQuery for 30 days?"],
-                "completed",
-                "claude-haiku-4-5-20251001",
-            ],
-        )
     finally:
         con.close()
+    put_summary(
+        duckdb_path,
+        "sess-A",
+        task_id=tid,
+        agent_id="nas-claude",
+        project_key=f"{repo_owner}/{repo_name}",
+        ended_at=two_hours_ago + timedelta(minutes=1),
+        summary_md="Set up the foundation; ported parsers; landed Plan 1.",
+        files_touched=("src/foo.py",),
+        tools_used={"Edit": 1},
+        last_user_prompt="kicked off the lakehouse rewrite",
+        last_assistant="ok done",
+        next_steps_md="Wire OTLP receiver into nexus-server run.",
+        open_questions=("should we keep BigQuery for 30 days?",),
+        status="completed",
+        generator_model="claude-haiku-4-5-20251001",
+    )
 
     return {
         "task_id": tid,
@@ -185,7 +184,9 @@ def _populate(parquet_dir: Path, duckdb_path: Path) -> dict:
     }
 
 
-def test_handoff_returns_summary_and_active_sessions(tmp_path: Path) -> None:
+def test_handoff_returns_summary_and_active_sessions(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     ctx = _populate(parquet_dir, duckdb_path)
 
@@ -265,7 +266,9 @@ def test_handoff_quarantines_unknown_openclaw_active_session(tmp_path: Path) -> 
     assert "unknown_openclaw" not in active_ids
 
 
-def test_handoff_spans_branches_when_branch_omitted(tmp_path: Path) -> None:
+def test_handoff_spans_branches_when_branch_omitted(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     """#53: calling drover_handoff with (repo_owner, repo_name) and no branch
     must return summaries from every branch of that repo, not just the one
     whose task_id happens to match compute_task_id(None, owner, name, None)."""
@@ -282,22 +285,19 @@ def test_handoff_spans_branches_when_branch_omitted(tmp_path: Path) -> None:
                VALUES (?, ?, ?, 'feat/other', 'arnab', 'open', now(), now(), 1, 0.0)""",
             [other_tid, ctx["repo_owner"], ctx["repo_name"]],
         )
-        con.execute(
-            """INSERT INTO session_summaries
-               (session_id, task_id, agent_id, ended_at, summary_md,
-                files_touched, tools_used, last_user_prompt, last_assistant,
-                next_steps_md, open_questions, status, generator_model, generated_at)
-               VALUES (?, ?, 'macmini-claude', now(), ?, ?, MAP{}, '', '',
-                       'continue feature', [], 'completed', 'test', now())""",
-            [
-                "sess-C",
-                other_tid,
-                "Worked on feat/other; refactored handler.",
-                ["src/other.py"],
-            ],
-        )
     finally:
         con.close()
+    put_summary(
+        duckdb_path,
+        "sess-C",
+        task_id=other_tid,
+        agent_id="macmini-claude",
+        ended_at=datetime.now(timezone.utc),
+        summary_md="Worked on feat/other; refactored handler.",
+        files_touched=("src/other.py",),
+        next_steps_md="continue feature",
+        generator_model="test",
+    )
 
     # No-branch query → should see summaries from BOTH branches.
     out = drover_handoff(
@@ -324,7 +324,7 @@ def test_handoff_spans_branches_when_branch_omitted(tmp_path: Path) -> None:
     assert out_main["task_id"] == ctx["task_id"]
 
 
-def test_handoff_task_id_path_unchanged(tmp_path: Path) -> None:
+def test_handoff_task_id_path_unchanged(tmp_path: Path, pg_control_path: Path) -> None:
     """Direct task_id lookup should bypass the repo JOIN and behave as before."""
     parquet_dir, duckdb_path = _seed(tmp_path)
     ctx = _populate(parquet_dir, duckdb_path)
@@ -333,7 +333,9 @@ def test_handoff_task_id_path_unchanged(tmp_path: Path) -> None:
     assert any("Plan 1" in s["summary_md"] for s in out["summaries"])
 
 
-def test_session_replay_returns_recent_turns(tmp_path: Path) -> None:
+def test_session_replay_returns_recent_turns(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _populate(parquet_dir, duckdb_path)
 
@@ -469,15 +471,24 @@ def test_session_replay_can_include_empty_metadata_when_requested(
     assert [event["event_type"] for event in out["events"]] == ["ai-title"]
 
 
-def test_session_summary_returns_one_row(tmp_path: Path) -> None:
+def test_session_summary_returns_one_row(tmp_path: Path, pg_control_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _populate(parquet_dir, duckdb_path)
     out = drover_session_summary(duckdb_path=duckdb_path, session_id="sess-A")
     assert out is not None
     assert "Plan 1" in out["summary_md"]
+    # The legacy session_summaries row shape, plus the memory-store fields.
+    assert out["tools_used"] == {"Edit": 1}
+    assert out["files_touched"] == ["src/foo.py"]
+    assert out["open_questions"] == ["should we keep BigQuery for 30 days?"]
+    assert out["project_key"] == "arniesaha/nexus"
+    assert isinstance(out["ended_at"], str) and isinstance(out["generated_at"], str)
+    json.dumps(out)
 
 
-def test_session_summary_reports_unknown(tmp_path: Path) -> None:
+def test_session_summary_returns_none_for_unknown(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _populate(parquet_dir, duckdb_path)
     assert (
@@ -486,7 +497,66 @@ def test_session_summary_reports_unknown(tmp_path: Path) -> None:
     )
 
 
-def test_active_sessions_list(tmp_path: Path) -> None:
+def test_readers_degrade_without_postgres_memory_store(tmp_path: Path) -> None:
+    """A DuckDB control store has no derived memory: empty answers, no errors."""
+    parquet_dir, duckdb_path = _seed(tmp_path)
+    now = datetime.now(timezone.utc)
+    tid = compute_task_id(None, "arniesaha", "drover", "main")
+    _write_agent_events(
+        parquet_dir,
+        [
+            dict(
+                id="live-1",
+                session_id="sess-live",
+                agent_id="macmini-claude",
+                task_id=tid,
+                timestamp=now - timedelta(minutes=2),
+                event_type="user_message",
+                role="user",
+                content="still going",
+                repo_owner="arniesaha",
+                repo_name="drover",
+                branch="main",
+                principal_id="arnab",
+                dedup_key="live1",
+                raw_data="{}",
+            )
+        ],
+    )
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+
+    assert (
+        drover_session_summary(duckdb_path=duckdb_path, session_id="sess-live")[
+            "memory_unavailable"
+        ]
+        is True
+    )
+    handoff = drover_handoff(
+        duckdb_path=duckdb_path, repo_owner="arniesaha", repo_name="drover"
+    )
+    assert handoff["summaries"] == []
+    assert [s["session_id"] for s in handoff["active_sessions"]] == ["sess-live"]
+    assert (
+        mcp_tools.drover_recent_sessions(
+            duckdb_path=duckdb_path, project_key="arniesaha/drover"
+        )["sessions"]
+        == []
+    )
+    assert (
+        mcp_tools.drover_project_brief(
+            duckdb_path=duckdb_path, project_key="arniesaha/drover"
+        )
+        is None
+    )
+    recall = mcp_tools.drover_recall(
+        duckdb_path=duckdb_path, query_embedding=[0.1] * 768, query="still"
+    )
+    assert recall["results"] == []
+    assert recall["memory_unavailable"] is True
+    assert "PostgreSQL" in recall["reason"]
+
+
+def test_active_sessions_list(tmp_path: Path, pg_control_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     ctx = _populate(parquet_dir, duckdb_path)
     out = drover_active_sessions(duckdb_path=duckdb_path, task_id=ctx["task_id"])
@@ -557,7 +627,7 @@ def test_search_returns_one_row_per_canonical_logical_event(tmp_path: Path) -> N
     ]
 
 
-def test_search_finds_by_content(tmp_path: Path) -> None:
+def test_search_finds_by_content(tmp_path: Path, pg_control_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     _populate(parquet_dir, duckdb_path)
     out = drover_search(duckdb_path=duckdb_path, query="lakehouse rewrite", limit=10)
@@ -662,7 +732,9 @@ def test_search_defaults_to_recent_bounded_window_when_unscoped(
     assert "date >=" in searches[0]
 
 
-def test_files_touched_pulls_from_tool_use_blocks(tmp_path: Path) -> None:
+def test_files_touched_pulls_from_tool_use_blocks(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     ctx = _populate(parquet_dir, duckdb_path)
     out = drover_files_touched(duckdb_path=duckdb_path, task_id=ctx["task_id"])
@@ -670,13 +742,20 @@ def test_files_touched_pulls_from_tool_use_blocks(tmp_path: Path) -> None:
     assert "src/foo.py" in files
 
 
-def test_task_status_aggregates(tmp_path: Path) -> None:
+def test_task_status_aggregates(tmp_path: Path, pg_control_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     ctx = _populate(parquet_dir, duckdb_path)
     out = drover_task_status(duckdb_path=duckdb_path, task_id=ctx["task_id"])
     assert out["task_id"] == ctx["task_id"]
     assert out["session_count"] >= 2
     assert out["repo_owner"] == "arniesaha"
+    assert out["latest_summary"]["session_id"] == "sess-A"
+    assert set(out["latest_summary"]) == {
+        "session_id",
+        "agent_id",
+        "summary_md",
+        "ended_at",
+    }
 
 
 def test_handoff_empty_lakehouse_returns_well_formed(tmp_path: Path) -> None:
@@ -742,10 +821,10 @@ def _seed_summarised_mid_flight(
 ) -> tuple[Path, str]:
     """One session with events either side of its summary's ``ended_at``.
 
-    The summarizer writes ``ended_at`` from the newest event it saw, as a naive
-    local wall clock (``worker.py`` inserts the event timestamp straight into a
-    ``TIMESTAMP`` column). ``summary_offset`` moves that receipt relative to the
-    session's newest event: negative means the session kept working afterwards.
+    The summarizer writes ``ended_at`` from the newest event it saw; in the
+    PostgreSQL memory store that is a TIMESTAMPTZ. ``summary_offset`` moves
+    that receipt relative to the session's newest event: negative means the
+    session kept working afterwards.
     """
     parquet_dir, duckdb_path = _seed(tmp_path)
     now = datetime.now(timezone.utc)
@@ -785,28 +864,23 @@ def _seed_summarised_mid_flight(
                VALUES (?, ?, ?, ?, 'arnab', 'open', now(), now(), 1, 0.0)""",
             [tid, repo_owner, repo_name, branch],
         )
-        con.execute(
-            """INSERT INTO session_summaries (session_id, task_id, agent_id, ended_at,
-                                              summary_md, files_touched, tools_used,
-                                              last_user_prompt, last_assistant,
-                                              next_steps_md, open_questions, status,
-                                              generator_model, generated_at)
-               VALUES (?, ?, ?, ?, ?, [], MAP{}, '', '', '', [], 'completed', 'test',
-                       now())""",
-            [
-                "sess-live",
-                tid,
-                "macmini-claude",
-                (newest + summary_offset).astimezone().replace(tzinfo=None),
-                "summarised while the session was still running",
-            ],
-        )
     finally:
         con.close()
+    put_summary(
+        duckdb_path,
+        "sess-live",
+        task_id=tid,
+        agent_id="macmini-claude",
+        ended_at=newest + summary_offset,
+        summary_md="summarised while the session was still running",
+        generator_model="test",
+    )
     return duckdb_path, tid
 
 
-def test_active_sessions_keeps_a_session_summarised_mid_flight(tmp_path: Path) -> None:
+def test_active_sessions_keeps_a_session_summarised_mid_flight(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
     """A summary is not an ending: the summarizer fires on an idle gap.
 
     Before this, one mid-session summary removed a live session from every
@@ -820,12 +894,43 @@ def test_active_sessions_keeps_a_session_summarised_mid_flight(tmp_path: Path) -
 
 
 def test_active_sessions_drops_a_session_its_summary_already_covers(
-    tmp_path: Path,
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
     """The original intent survives: a finished session stays out."""
-    duckdb_path, _ = _seed_summarised_mid_flight(tmp_path, summary_offset=timedelta(0))
+    duckdb_path, tid = _seed_summarised_mid_flight(
+        tmp_path, summary_offset=timedelta(0)
+    )
     out = drover_active_sessions(duckdb_path=duckdb_path)
     assert out["active_sessions"] == []
+    # Every reader of active_sessions applies the same rule.
+    assert drover_handoff(duckdb_path=duckdb_path, task_id=tid)["active_sessions"] == []
+    assert mcp_tools.drover_fleet_status(duckdb_path=duckdb_path)["count"] == 0
+
+
+def test_active_sessions_compares_instants_across_time_zones(
+    tmp_path: Path, pg_control_path: Path
+) -> None:
+    """ended_at (PostgreSQL TIMESTAMPTZ) and last_event_at (DuckDB) are instants.
+
+    A summary stamped in another zone at the same instant still covers the
+    newest event; one a second earlier does not.
+    """
+    duckdb_path, _ = _seed_summarised_mid_flight(
+        tmp_path, summary_offset=-timedelta(seconds=1)
+    )
+    assert [
+        s["session_id"]
+        for s in drover_active_sessions(duckdb_path=duckdb_path)["active_sessions"]
+    ] == ["sess-live"]
+    summary = mcp_tools.MemoryRepository(duckdb_path).summary("sess-live")
+    covering = summary.ended_at + timedelta(seconds=1)
+    put_summary(
+        duckdb_path,
+        "sess-live",
+        task_id=summary.task_id,
+        ended_at=covering.astimezone(timezone(timedelta(hours=-7))),
+    )
+    assert drover_active_sessions(duckdb_path=duckdb_path)["active_sessions"] == []
 
 
 def _seed_active_fleet(tmp_path: Path, *, sessions: int) -> Path:
@@ -902,7 +1007,7 @@ def test_fleet_status_cost_does_not_grow_with_the_fleet(
 
 
 def test_recent_sessions_attributes_a_repo_without_rescanning_history(
-    tmp_path: Path,
+    tmp_path: Path, pg_control_path: Path
 ) -> None:
     """Repo attribution comes from the day-summary index, not a full scan.
 
@@ -919,18 +1024,24 @@ def test_recent_sessions_attributes_a_repo_without_rescanning_history(
                 summarised_ingested_at)
                VALUES ('2026-09-06', 'sess-unlinked', 'macmini-claude',
                        'arniesaha', 'drover', 12, now(), now(), false, now())""")
-        con.execute(
-            """INSERT INTO session_summaries (session_id, task_id, agent_id, ended_at,
-                                              summary_md, files_touched, tools_used,
-                                              last_user_prompt, last_assistant,
-                                              next_steps_md, open_questions, status,
-                                              generator_model, generated_at)
-               VALUES ('sess-unlinked', 'task-not-in-tasks-table', 'macmini-claude',
-                       now(), 'unlinked but attributable', [], MAP{}, '', '', '', [],
-                       'completed', 'test', now())"""
-        )
     finally:
         con.close()
+    # No project_key and no tasks row: only the day-summary index links it.
+    put_summary(
+        duckdb_path,
+        "sess-unlinked",
+        task_id="task-not-in-tasks-table",
+        agent_id="macmini-claude",
+        ended_at=datetime.now(timezone.utc),
+        summary_md="unlinked but attributable",
+        generator_model="test",
+    )
+    put_summary(
+        duckdb_path,
+        "sess-other-repo",
+        project_key="arniesaha/other",
+        ended_at=datetime.now(timezone.utc),
+    )
 
     out = mcp_tools.drover_recent_sessions(
         duckdb_path=duckdb_path, repo_owner="arniesaha", repo_name="drover"

@@ -258,8 +258,15 @@ def _enqueue_recap_if_completion(
     event_type: str,
     payload: dict[str, Any] | None,
     seq: int | None,
+    store_path: str | Path,
 ) -> bool:
-    """Queue a recap only for a completed turn from a structured session."""
+    """Queue a recap only for a completed turn from a structured session.
+
+    The enqueue joins ``con``'s open transaction, so on the PostgreSQL control
+    plane the completion event and its ``recap_session`` ledger job commit
+    together (#480). On a DuckDB control plane live recaps are unavailable
+    and this is a no-op.
+    """
     if (
         event_type != "status"
         or not payload
@@ -277,10 +284,12 @@ def _enqueue_recap_if_completion(
     mode, harness = session
     if not _supports_live_recaps(mode, harness):
         return False
-    return enqueue_live_recap(con, session_id, seq)
+    return enqueue_live_recap(con, session_id, seq, store_path=store_path)
 
 
-def _enqueue_latest_stored_completion(con: object, session_id: str) -> bool:
+def _enqueue_latest_stored_completion(
+    con: object, session_id: str, *, store_path: str | Path
+) -> bool:
     """Recover the newest completion that arrived before session metadata."""
     if is_postgres_connection(con):
         rows = con.execute(
@@ -311,6 +320,7 @@ def _enqueue_latest_stored_completion(con: object, session_id: str) -> bool:
             event_type="status",
             payload=payload,
             seq=seq,
+            store_path=store_path,
         )
     return False
 
@@ -698,7 +708,9 @@ class HarnessRegistry:
                 raise
             con.execute("BEGIN TRANSACTION")
             try:
-                _enqueue_latest_stored_completion(con, session_id)
+                _enqueue_latest_stored_completion(
+                    con, session_id, store_path=self.control_plane_path
+                )
                 con.execute(
                     "UPDATE harness_sessions SET recap_reconcile_needed = FALSE "
                     "WHERE session_id = ?",
@@ -845,7 +857,9 @@ class HarnessRegistry:
                 ).fetchall()
                 enqueued = 0
                 for (session_id,) in rows:
-                    enqueued += _enqueue_latest_stored_completion(con, str(session_id))
+                    enqueued += _enqueue_latest_stored_completion(
+                        con, str(session_id), store_path=self.control_plane_path
+                    )
                     con.execute(
                         "UPDATE harness_sessions "
                         "SET recap_reconcile_needed = FALSE "
@@ -1223,6 +1237,7 @@ class HarnessRegistry:
                         event_type=event_type,
                         payload=payload,
                         seq=seq,
+                        store_path=self.control_plane_path,
                     )
                 con.execute("COMMIT")
             except Exception:
@@ -1385,6 +1400,7 @@ class HarnessRegistry:
                         event_type=record["event_type"],
                         payload=record.get("payload"),
                         seq=seq,
+                        store_path=self.control_plane_path,
                     )
                 con.execute("COMMIT")
             except Exception:
@@ -1523,6 +1539,7 @@ class HarnessRegistry:
                         event_type=event_type,
                         payload=payload,
                         seq=seq,
+                        store_path=self.control_plane_path,
                     )
                     inserted_count += 1
                     inserted_by_session.setdefault(session_id, []).append(
@@ -2128,12 +2145,11 @@ class HarnessRegistry:
         }
 
     def latest_live_recaps(self, session_ids: list[str]) -> dict[str, LiveRecap]:
-        """Return the durable recap projection for the requested sessions."""
-        session_ids = [session_id for session_id in session_ids if session_id]
-        if not session_ids:
-            return {}
-        with self._connect() as con:
-            return latest_live_recaps(con, session_ids)
+        """Return the live phase of session memory for the requested sessions.
+
+        ``{}`` on a DuckDB control plane, where derived memory is unavailable.
+        """
+        return latest_live_recaps(self.control_plane_path, session_ids)
 
     @staticmethod
     def _session_event_preview(row: dict[str, Any]) -> str:

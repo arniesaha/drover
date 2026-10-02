@@ -84,6 +84,16 @@ that lock, which a probe reaching past it would be the first thing to
 undermine. Unpinned, the probe's real subject is the connect, and a connect
 cannot be done without the window. So: bounded, not lock-free.
 
+**Derived memory (#480).** On a PostgreSQL control store the probe also
+reports the memory store: whether pgvector is installed (session embeddings
+cannot exist without it, so its absence *fails* readiness rather than letting
+recall quietly degrade -- #471 was embeddings stopping for days with nothing
+red anywhere), whether an embedding backend is configured or deliberately
+disabled, and per-job-kind queue health from the one job ledger. Queue health
+is reported, never a reason for 503: a backlog is a reason to look, not a
+reason for a load balancer to eject the hub. The reads are a handful of
+partial-index lookups inside the same bounded control-plane window.
+
 **What this cannot see.** It proves the instance answers, not that every block
 in the store is readable: measured against DuckDB 1.5.2, a corrupt data block
 raises ``IOException`` on the scan that reads it *without* invalidating the
@@ -103,6 +113,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable, Mapping
 
 import duckdb
 
@@ -124,6 +135,8 @@ log = logging.getLogger("drover.readiness")
 #: reading a 503 knows which one to look at.
 STORE_ANALYTICAL = "analytical"
 STORE_CONTROL_PLANE = "control_plane"
+#: Derived memory (job ledger, summaries, embeddings) in the PostgreSQL store.
+STORE_MEMORY = "memory"
 
 #: Per-store outcomes. Only ``failed`` makes the hub unready; the rest are
 #: reported so a green ``/readyz`` still says what it actually proved.
@@ -235,6 +248,7 @@ class ReadinessReport:
 
     stores: tuple[StoreProbe, ...]
     checked_at: float
+    memory: Mapping[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -252,6 +266,11 @@ class ReadinessReport:
             "stores": [
                 store.as_dict(include_detail=include_detail) for store in self.stores
             ],
+            **(
+                {"memory": _public_memory(self.memory, include_detail)}
+                if self.memory is not None
+                else {}
+            ),
         }
 
     def as_response(self, *, include_detail: bool = True) -> tuple[int, str]:
@@ -281,8 +300,12 @@ class ReadinessProbe:
         control_plane_timeout: float = DEFAULT_CONTROL_PLANE_TIMEOUT_SECONDS,
         probe_stall_seconds: float = DEFAULT_PROBE_STALL_SECONDS,
         time_source=time.monotonic,
+        embeddings: Mapping[str, Any] | Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._duckdb_path = Path(duckdb_path)
+        #: How this process runs embeddings ({"enabled": bool, "backend": ...}),
+        #: so a disabled embedder is visible in readiness, not a silent flag.
+        self._embeddings = embeddings
         self._include_analytical = include_analytical
         self._cache_seconds = (
             _cache_seconds_default()
@@ -337,7 +360,14 @@ class ReadinessProbe:
                     if analytical is None
                     else (analytical, control_plane)
                 )
-                report = ReadinessReport(stores=stores, checked_at=time.time())
+                memory_probe, memory = (
+                    self._probe_memory(now) if control_plane.ok else (None, None)
+                )
+                if memory_probe is not None:
+                    stores = (*stores, memory_probe)
+                report = ReadinessReport(
+                    stores=stores, checked_at=time.time(), memory=memory
+                )
                 self._remember(report)
                 return report
             finally:
@@ -346,7 +376,16 @@ class ReadinessProbe:
                 self._probe_gate.release()
         control_plane = self._control_plane_while_probing(now)
         stores = (control_plane,) if analytical is None else (analytical, control_plane)
-        return ReadinessReport(stores=stores, checked_at=time.time())
+        with self._lock:
+            cached = self._cached
+        memory = None
+        if cached is not None:
+            stores = (
+                *stores,
+                *(s for s in cached.stores if s.store == STORE_MEMORY),
+            )
+            memory = cached.memory
+        return ReadinessReport(stores=stores, checked_at=time.time(), memory=memory)
 
     def _fresh_verdict(self) -> ReadinessReport | None:
         """The cached verdict, while it is both good and recent enough."""
@@ -536,6 +575,82 @@ class ReadinessProbe:
         self._clear_busy(STORE_CONTROL_PLANE)
         return StoreProbe(STORE_CONTROL_PLANE, STATE_OK, f"{PROBE_SQL} on the store")
 
+    def _embeddings_state(self) -> dict[str, Any]:
+        source = self._embeddings
+        try:
+            state = source() if callable(source) else source
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            return {"enabled": None, "detail": _detail(exc)}
+        if state is None:
+            return {"enabled": None, "detail": "not reported by this process"}
+        return dict(state)
+
+    def _probe_memory(self, now: float) -> tuple[StoreProbe | None, dict[str, Any]]:
+        """pgvector, embedding backend and per-kind job health (#480, #471).
+
+        A DuckDB-only hub has no memory store to probe: it gets the ``memory``
+        section saying so, but no store entry, because there is nothing that
+        could fail.
+        """
+        embeddings = self._embeddings_state()
+        if not is_postgres_control_store(self._duckdb_path):
+            detail = (
+                "derived memory requires control_store.backend = 'postgres'; "
+                "summaries, briefs, embeddings and recaps are not produced"
+            )
+            return None, {
+                "available": False,
+                "detail": detail,
+                "embeddings": embeddings,
+                "vector": {"ready": False, "detail": detail},
+                "jobs": {},
+            }
+        from drover.server.ledger import ledger_stats
+        from drover.server.memory_store import vector_status
+
+        try:
+            with control_plane_connection(
+                self._duckdb_path, timeout=self._control_plane_timeout
+            ) as con:
+                vector_ready, vector_detail = vector_status(con)
+                jobs = ledger_stats(con)
+        except ControlPlaneBusy as exc:
+            probe = self._classify(
+                STORE_MEMORY, _detail(exc), lock_conflict=True, now=now
+            )
+            return probe, {
+                "available": True,
+                "detail": probe.detail,
+                "embeddings": embeddings,
+                "jobs": {},
+            }
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            probe = self._failure(STORE_MEMORY, exc, now)
+            return probe, {
+                "available": True,
+                "detail": probe.detail,
+                "embeddings": embeddings,
+                "jobs": {},
+            }
+        self._clear_busy(STORE_MEMORY)
+        memory = {
+            "available": True,
+            "detail": "derived memory in the PostgreSQL control store",
+            "embeddings": embeddings,
+            "vector": {"ready": vector_ready, "detail": vector_detail},
+            "jobs": jobs,
+        }
+        if not vector_ready:
+            return StoreProbe(STORE_MEMORY, STATE_FAILED, vector_detail), memory
+        backlog = ", ".join(
+            f"{kind} pending={stats['pending'] + stats['retry_wait']}"
+            f" dead={stats['dead_lettered'] + stats['quarantined']}"
+            for kind, stats in jobs.items()
+        )
+        if embeddings.get("enabled") is False:
+            backlog += "; embeddings disabled on this hub"
+        return StoreProbe(STORE_MEMORY, STATE_OK, f"{vector_detail}; {backlog}"), memory
+
     def _clear_busy(self, store: str) -> None:
         """Forget a store's busy clock, because it just answered."""
         with self._busy_lock:
@@ -575,3 +690,21 @@ class ReadinessProbe:
             STATE_FAILED,
             f"the store has been held elsewhere for {held_for:.0f}s: {detail}",
         )
+
+
+def _public_memory(memory: Mapping[str, Any], include_detail: bool) -> dict[str, Any]:
+    """Queue counts are public; error text and backend detail are not."""
+    if include_detail:
+        return dict(memory)
+    jobs = {
+        kind: {k: v for k, v in stats.items() if k != "last_error"}
+        for kind, stats in (memory.get("jobs") or {}).items()
+    }
+    embeddings = memory.get("embeddings") or {}
+    vector = memory.get("vector") or {}
+    return {
+        "available": memory.get("available"),
+        "embeddings": {"enabled": embeddings.get("enabled")},
+        "vector": {"ready": vector.get("ready")},
+        "jobs": jobs,
+    }

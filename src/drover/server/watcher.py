@@ -26,11 +26,11 @@ from watchdog.observers import Observer
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import control_plane_connection, open_duckdb_connection
 from drover.server.ingest import ingest_file
+from drover.server.ledger import memory_store_available
 from drover.server.providers.service import compact_closed_snapshot_partitions
 from drover.server.redis_shadow import ShadowPublisher
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
-    publish_summary_generation,
     source_version_for_session,
 )
 
@@ -90,7 +90,6 @@ class _Handler(FileSystemEventHandler):
         max_lock_retries: int = 5,
         lock_retry_base_seconds: float = 1.0,
         shadow_publisher: ShadowPublisher | None = None,
-        summarize_job_stream: object | None = None,
     ):
         self._parquet_dir = parquet_dir
         self._duckdb_path = duckdb_path
@@ -98,7 +97,6 @@ class _Handler(FileSystemEventHandler):
         self._max_lock_retries = max(0, int(max_lock_retries))
         self._lock_retry_base_seconds = max(0.0, float(lock_retry_base_seconds))
         self._shadow_publisher = shadow_publisher
-        self._summarize_job_stream = summarize_job_stream
 
     def _maybe_ingest(self, path: Path) -> None:
         if not path.is_file():
@@ -153,14 +151,13 @@ class _Handler(FileSystemEventHandler):
             shadow_publisher=self._shadow_publisher,
         )
         log.info(
-            "ingested %s read=%d inserted=%d dupes=%d errors=%d shadow=%d receipts=%d",
+            "ingested %s read=%d inserted=%d dupes=%d errors=%d shadow=%d",
             path,
             stats.read,
             stats.inserted,
             stats.skipped_dupes,
             stats.errors,
             stats.shadow_published,
-            stats.ledger_receipts,
         )
         # Enqueue summarize jobs idempotently. Include session IDs present in
         # the source file so a retry after post-ingest DuckDB lock contention
@@ -168,29 +165,62 @@ class _Handler(FileSystemEventHandler):
         # already-inserted sessions.
         session_ids = set(stats.new_session_ids) | _session_ids_in_file(path)
         if session_ids:
-            con = open_duckdb_connection(self._duckdb_path)
-            try:
-                for sid in session_ids:
-                    source_version = source_version_for_session(con, str(sid))
-                    enqueue_summary_generation(con, str(sid), source_version)
-                    publish_summary_generation(
-                        con,
-                        str(sid),
-                        source_version,
-                        self._summarize_job_stream,
-                    )
-                log.info(
-                    "enqueued %d summarize_job(s) for %s",
-                    len(session_ids),
-                    path,
-                )
-            finally:
-                con.close()
-        # Move to .processed/ for audit only after ingest + job enqueue succeed.
+            self._enqueue_summaries(path, session_ids)
+        # Move to .processed/ for audit only after ingest + job enqueue ran.
         processed = path.parent / ".processed"
         processed.mkdir(exist_ok=True)
         target = processed / path.name
         shutil.move(str(path), str(target))
+
+    def _enqueue_summaries(self, path: Path, session_ids: set[str]) -> None:
+        """Open a summary generation in the job ledger for each touched session.
+
+        The events are committed by now, so a failed enqueue must not fail the
+        ingest (#308): re-parsing the file would only dedupe the same rows and
+        try the same enqueue again. Each failure is logged with its session and
+        skipped; the session's next batch mints a new source version and
+        enqueues it, and ``drover-server retry-summarize-jobs`` covers the rest.
+        A DuckDB failure computing the source version still propagates, so
+        lock contention keeps the whole-file retry above.
+
+        Without a PostgreSQL control store derived memory is unavailable and
+        there is nothing to enqueue, so the source versions are not computed.
+        """
+        if not memory_store_available(self._duckdb_path):
+            log.debug(
+                "derived memory unavailable (no PostgreSQL control store); "
+                "no summaries enqueued for %s",
+                path,
+            )
+            return
+        queued = 0
+        con = open_duckdb_connection(self._duckdb_path)
+        try:
+            for sid in sorted(str(s) for s in session_ids):
+                source_version = source_version_for_session(con, sid)
+                try:
+                    outcome = enqueue_summary_generation(
+                        self._duckdb_path, sid, source_version
+                    )
+                except Exception:  # noqa: BLE001 - the ingest is already committed
+                    log.warning(
+                        "summary enqueue failed for session %s after ingesting %s; "
+                        "its next batch will enqueue it",
+                        sid,
+                        path,
+                        exc_info=True,
+                    )
+                    continue
+                if outcome in ("queued", "requeued"):
+                    queued += 1
+        finally:
+            con.close()
+        log.info(
+            "enqueued %d summarize job(s) for %d session(s) in %s",
+            queued,
+            len(session_ids),
+            path,
+        )
 
     def on_created(self, event: FileSystemEvent) -> None:
         if event.is_directory:
@@ -209,21 +239,18 @@ def ingest_incoming_file_once(
     *,
     parquet_dir: Path,
     duckdb_path: Path,
-    summarize_job_stream: object | None = None,
     shadow_publisher: ShadowPublisher | None = None,
 ) -> None:
     """Ingest one incoming JSONL file through the same path as the watcher.
 
     This is a small operational escape hatch for stale incoming files: it keeps
-    the watcher semantics (dedupe, summarize-job enqueue, optional Redis stream
-    publish, and move to ``.processed``) without needing to start a long-lived
-    watcher process.
+    the watcher semantics (dedupe, summarize-job enqueue and move to
+    ``.processed``) without needing to start a long-lived watcher process.
     """
     handler = _Handler(
         parquet_dir,
         duckdb_path,
         shadow_publisher=shadow_publisher,
-        summarize_job_stream=summarize_job_stream,
     )
     handler._maybe_ingest(path)
 
@@ -498,7 +525,6 @@ class IncomingWatcher:
         parquet_dir: Path,
         duckdb_path: Path,
         shadow_publisher: ShadowPublisher | None = None,
-        summarize_job_stream: object | None = None,
         retention_days: int = 0,
         receipt_retention_days: int = 0,
         advisory_occurrence_retention_days: int = 0,
@@ -519,7 +545,6 @@ class IncomingWatcher:
             self._parquet_dir,
             self._duckdb_path,
             shadow_publisher=shadow_publisher,
-            summarize_job_stream=summarize_job_stream,
         )
 
     def start(self) -> None:

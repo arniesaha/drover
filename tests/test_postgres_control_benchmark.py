@@ -333,6 +333,47 @@ def test_usage_validator_accepts_sessions_already_current_in_postgres(
     )
 
 
+def test_synthetic_recap_receipts_satisfy_the_retention_recap_gate(pg_control_path):
+    """The benchmark's stand-in recaps use the #480 ledger and session_memory."""
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(pg_control_path)
+    registry.create_session(
+        host_id="benchmark-host-0",
+        harness="codex",
+        command="synthetic",
+        session_id="benchmark-recap",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id="benchmark-recap",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=2,
+    )
+    registry.append_event(
+        session_id="benchmark-recap",
+        event_type="assistant_output",
+        payload={"text": "after the completion"},
+        seq=3,
+    )
+
+    assert BENCHMARK._mark_terminal_recap_dependencies_done(pg_control_path) == 1
+
+    with control_plane_connection(pg_control_path) as con:
+        assert con.execute(
+            "SELECT source_version, status FROM pipeline_jobs "
+            "WHERE job_kind = 'recap_session' AND subject_key = ?",
+            ["benchmark-recap"],
+        ).fetchall() == [("3", "succeeded")]
+        assert con.execute(
+            "SELECT recap_source_seq FROM session_memory WHERE session_id = ?",
+            ["benchmark-recap"],
+        ).fetchone() == (3,)
+    assert BENCHMARK._mark_terminal_recap_dependencies_done(pg_control_path) == 0
+
+
 def test_completed_benchmark_sentinels_remain_in_default_archive_window(
     benchmark_postgres_control_store,
 ):

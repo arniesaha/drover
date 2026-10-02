@@ -1,255 +1,76 @@
-"""State-machine tests for source-versioned summarizer jobs."""
+"""Source versions and summary-generation enqueue on the PostgreSQL ledger (#480).
+
+The retry budget, backoff, supersession and streak cap themselves are the
+ledger's (tests/test_ledger.py); these cover what the summarizer layers on
+top: the source-version hash and the enqueue helper's contract.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
 
 from drover.schema import bootstrap
+from drover.server.db import control_plane_connection
+from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
-    finish_summary_failure,
     source_version_for_session,
 )
 
 
-def _bootstrapped(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, Path]:
-    duckdb_path = tmp_path / "jobs.duckdb"
+def _dead_letter(store_path: Path, session_id: str, version: str) -> None:
+    """Drive one generation through its whole budget to dead_lettered."""
+    ledger = JobLedger(store_path, jitter=lambda _low, _high: 0)
+    assert enqueue_summary_generation(store_path, session_id, version) in (
+        "queued",
+        "requeued",
+    )
+    while True:
+        with control_plane_connection(store_path) as con:
+            con.execute(
+                "UPDATE pipeline_jobs SET next_run_at = now() "
+                "WHERE subject_key = ? AND status = 'retry_wait'",
+                [session_id],
+            )
+        (job,) = ledger.claim(SUMMARIZE_SESSION, worker_id="test")
+        if ledger.fail(job, "backend failed") == "dead_lettered":
+            return
+
+
+def test_enqueue_opens_one_live_generation(pg_control_path: Path) -> None:
+    assert enqueue_summary_generation(pg_control_path, "s1", "v1") == "queued"
+    assert enqueue_summary_generation(pg_control_path, "s1", "v1") == "already_queued"
+    assert enqueue_summary_generation(pg_control_path, "s1", "v2") == "requeued"
+
+    job = JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "s1")
+    assert (job.source_version, job.status, job.failures) == ("v2", "pending", 0)
+
+
+def test_dead_lettered_version_earns_nothing_but_a_new_one_reruns(
+    pg_control_path: Path,
+) -> None:
+    _dead_letter(pg_control_path, "s1", "v1")
+
+    assert enqueue_summary_generation(pg_control_path, "s1", "v1") == "already_failed"
+    assert enqueue_summary_generation(pg_control_path, "s1", "v2") == "queued"
+
+
+def test_repeated_dead_letters_stop_opening_new_generations(
+    pg_control_path: Path,
+) -> None:
+    for version in ("v1", "v2", "v3"):
+        _dead_letter(pg_control_path, "s1", version)
+
+    assert enqueue_summary_generation(pg_control_path, "s1", "v4") == "suppressed"
+
+
+def test_enqueue_without_postgres_is_an_unavailable_no_op(tmp_path: Path) -> None:
+    duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
-    return duckdb.connect(str(duckdb_path)), duckdb_path
 
-
-def test_same_source_version_does_not_reset_attempt_budget(tmp_path: Path) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    try:
-        assert enqueue_summary_generation(con, "s1", "v1") is True
-        con.execute(
-            "UPDATE summarize_jobs SET status='dead_lettered', attempts=5 "
-            "WHERE session_id='s1'"
-        )
-
-        assert enqueue_summary_generation(con, "s1", "v1") is False
-        assert con.execute(
-            "SELECT status, attempts FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == ("dead_lettered", 5)
-    finally:
-        con.close()
-
-
-def test_new_source_version_opens_fresh_generation(tmp_path: Path) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    try:
-        assert enqueue_summary_generation(con, "s1", "v1") is True
-        con.execute(
-            "UPDATE summarize_jobs SET status='dead_lettered', attempts=5 "
-            "WHERE session_id='s1'"
-        )
-
-        assert enqueue_summary_generation(con, "s1", "v2") is True
-        assert con.execute(
-            "SELECT source_version,status,attempts FROM summarize_jobs "
-            "WHERE session_id='s1'"
-        ).fetchone() == ("v2", "pending", 0)
-    finally:
-        con.close()
-
-
-def test_legacy_null_source_version_is_backfilled_without_reset(tmp_path: Path) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    try:
-        con.execute(
-            "INSERT INTO summarize_jobs "
-            "(session_id, status, attempts, source_version) "
-            "VALUES ('s1', 'dead_lettered', 5, NULL)"
-        )
-
-        assert enqueue_summary_generation(con, "s1", "v1") is False
-        assert con.execute(
-            "SELECT source_version, status, attempts FROM summarize_jobs "
-            "WHERE session_id='s1'"
-        ).fetchone() == ("v1", "dead_lettered", 5)
-    finally:
-        con.close()
-
-
-def test_failure_waits_with_capped_exponential_backoff(tmp_path: Path) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
-    try:
-        assert enqueue_summary_generation(con, "s1", "v1") is True
-
-        outcome = finish_summary_failure(
-            con,
-            "s1",
-            "v1",
-            "backend failed",
-            now=now,
-            jitter=lambda low, high: high,
-        )
-
-        assert outcome == "retry_wait"
-        assert con.execute(
-            "SELECT status, attempts, next_run_at FROM summarize_jobs "
-            "WHERE session_id='s1'"
-        ).fetchone() == ("retry_wait", 1, datetime(2026, 8, 6, 12, 1, 12))
-    finally:
-        con.close()
-
-
-def test_fifth_failure_dead_letters_generation(tmp_path: Path) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
-    try:
-        assert enqueue_summary_generation(con, "s1", "v1") is True
-        con.execute(
-            "UPDATE summarize_jobs SET status='running', attempts=4 "
-            "WHERE session_id='s1'"
-        )
-
-        outcome = finish_summary_failure(
-            con,
-            "s1",
-            "v1",
-            "backend failed",
-            now=now,
-            jitter=lambda _low, _high: 0,
-        )
-
-        assert outcome == "dead_lettered"
-        assert con.execute(
-            "SELECT status, attempts, next_run_at, dead_lettered_at "
-            "FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == ("dead_lettered", 5, None, datetime(2026, 8, 6, 12, 0))
-    finally:
-        con.close()
-
-
-def _dead_letter_once(con: duckdb.DuckDBPyConnection, session_id: str, version: str):
-    """Drive one generation all the way to dead_lettered."""
-    assert enqueue_summary_generation(con, session_id, version) is True
-    con.execute(
-        "UPDATE summarize_jobs SET status='running', attempts=4 WHERE session_id=?",
-        [session_id],
-    )
-    return finish_summary_failure(
-        con,
-        session_id,
-        version,
-        "backend failed",
-        now=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
-        jitter=lambda _low, _high: 0,
-    )
-
-
-def test_dead_letter_counts_against_a_durable_streak(tmp_path: Path) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    try:
-        assert _dead_letter_once(con, "s1", "v1") == "dead_lettered"
-
-        assert con.execute(
-            "SELECT dead_letter_streak FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == (1,)
-    finally:
-        con.close()
-
-
-def test_new_source_version_reruns_but_keeps_the_failure_history(
-    tmp_path: Path,
-) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    try:
-        _dead_letter_once(con, "s1", "v1")
-
-        assert enqueue_summary_generation(con, "s1", "v2") is True
-
-        assert con.execute(
-            "SELECT status, attempts, dead_letter_streak, last_error "
-            "FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == ("pending", 0, 1, "backend failed")
-    finally:
-        con.close()
-
-
-def test_repeated_dead_letters_stop_opening_new_generations(tmp_path: Path) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    try:
-        for version in ("v1", "v2", "v3"):
-            assert _dead_letter_once(con, "s1", version) == "dead_lettered"
-
-        assert enqueue_summary_generation(con, "s1", "v4") is False
-        assert con.execute(
-            "SELECT source_version, status, dead_letter_streak "
-            "FROM summarize_jobs WHERE session_id='s1'"
-        ).fetchone() == ("v3", "dead_lettered", 3)
-    finally:
-        con.close()
-
-
-def test_stale_failure_cannot_spend_new_generation_budget(tmp_path: Path) -> None:
-    con, _ = _bootstrapped(tmp_path)
-    try:
-        assert enqueue_summary_generation(con, "s1", "v2") is True
-
-        outcome = finish_summary_failure(
-            con,
-            "s1",
-            "v1",
-            "obsolete failure",
-            now=datetime(2026, 8, 6, tzinfo=timezone.utc),
-            jitter=lambda _low, _high: 0,
-        )
-
-        assert outcome == "stale"
-        assert con.execute(
-            "SELECT status, attempts, last_error FROM summarize_jobs "
-            "WHERE session_id='s1'"
-        ).fetchone() == ("pending", 0, None)
-    finally:
-        con.close()
-
-
-def test_failure_completion_is_one_conditional_statement_at_supersession(
-    tmp_path: Path,
-) -> None:
-    con, duckdb_path = _bootstrapped(tmp_path)
-    try:
-        assert enqueue_summary_generation(con, "s1", "v1") is True
-
-        class SupersedingConnection:
-            calls = 0
-
-            def execute(self, sql: str, params=None):
-                self.calls += 1
-                assert sql.lstrip().startswith(
-                    "UPDATE summarize_jobs"
-                ), "failure completion must have no snapshot read before mutation"
-                other = duckdb.connect(str(duckdb_path))
-                try:
-                    assert enqueue_summary_generation(other, "s1", "v2") is True
-                finally:
-                    other.close()
-                return con.execute(sql, params)
-
-        interleaved = SupersedingConnection()
-        outcome = finish_summary_failure(
-            interleaved,
-            "s1",
-            "v1",
-            "obsolete failure",
-            now=datetime(2026, 8, 6, tzinfo=timezone.utc),
-            jitter=lambda _low, _high: 0,
-        )
-
-        assert outcome == "stale"
-        assert interleaved.calls == 1
-        assert con.execute(
-            "SELECT source_version, status, attempts FROM summarize_jobs "
-            "WHERE session_id='s1'"
-        ).fetchone() == ("v2", "pending", 0)
-    finally:
-        con.close()
+    assert enqueue_summary_generation(duckdb_path, "s1", "v1") == "unavailable"
 
 
 def test_source_version_hashes_stable_facts_not_content(tmp_path: Path) -> None:
@@ -276,50 +97,5 @@ def test_source_version_hashes_stable_facts_not_content(tmp_path: Path) -> None:
         assert before == after_content_change
         assert after_new_event != before
         assert len(before) == 64
-    finally:
-        con.close()
-
-
-def test_bootstrap_adds_retry_columns_to_existing_table(tmp_path: Path) -> None:
-    duckdb_path = tmp_path / "legacy.duckdb"
-    con = duckdb.connect(str(duckdb_path))
-    con.execute(
-        "CREATE TABLE summarize_jobs (session_id VARCHAR PRIMARY KEY, status VARCHAR, "
-        "attempts INTEGER DEFAULT 0, last_error VARCHAR, enqueued_at TIMESTAMP, "
-        "updated_at TIMESTAMP)"
-    )
-    con.execute("""CREATE TABLE brief_jobs (
-             project_key VARCHAR PRIMARY KEY, status VARCHAR, attempts INTEGER,
-             last_error VARCHAR, enqueued_at TIMESTAMP, updated_at TIMESTAMP)""")
-    con.execute("""CREATE TABLE embed_jobs (
-             session_id VARCHAR PRIMARY KEY, status VARCHAR, attempts INTEGER,
-             last_error VARCHAR, enqueued_at TIMESTAMP, updated_at TIMESTAMP)""")
-    con.close()
-
-    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
-
-    con = duckdb.connect(str(duckdb_path))
-    try:
-        columns = {
-            row[1]: row[4]
-            for row in con.execute("PRAGMA table_info('summarize_jobs')").fetchall()
-        }
-        assert columns["source_version"] is None
-        assert columns["max_attempts"] == "5"
-        assert columns["next_run_at"] is None
-        assert columns["dead_lettered_at"] is None
-        assert columns["stream_publish_needed"] is not None
-        assert columns["dead_letter_streak"] == "0"
-        brief_columns = {
-            row[1]: row[4]
-            for row in con.execute("PRAGMA table_info('brief_jobs')").fetchall()
-        }
-        embed_columns = {
-            row[1]: row[4]
-            for row in con.execute("PRAGMA table_info('embed_jobs')").fetchall()
-        }
-        assert brief_columns["source_session_id"] is None
-        assert brief_columns["source_version"] is None
-        assert embed_columns["source_version"] is None
     finally:
         con.close()

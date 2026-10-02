@@ -18,9 +18,10 @@ from drover.server.__main__ import main
 
 
 @pytest.fixture
-def postgres_control_store(tmp_path: Path, monkeypatch):
+def postgres_control_store(tmp_path: Path, monkeypatch, postgres_dsn):
     """One disposable PostgreSQL schema, registered for one central path."""
-    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
+    dsn = postgres_dsn
+    monkeypatch.setenv("DROVER_TEST_POSTGRES_DSN", dsn)
     if not dsn:
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
 
@@ -80,10 +81,11 @@ def test_postgres_control_store_rejects_an_invalid_pool_range(tmp_path: Path):
 
 
 def test_cli_default_config_initializes_a_disposable_postgres_store(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, postgres_dsn
 ):
     """Fresh CLI config generation reaches ready PostgreSQL without DuckDB fallback."""
-    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
+    dsn = postgres_dsn
+    monkeypatch.setenv("DROVER_TEST_POSTGRES_DSN", dsn)
     if not dsn:
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
 
@@ -338,7 +340,7 @@ def test_postgres_readiness_and_sequence_health_probe_the_registered_store(
     report = ReadinessProbe(control_path, cache_seconds=0.0).check()
     states = {store.store: store.state for store in report.stores}
 
-    assert report.ok
+    assert report.ok == report.memory["vector"]["ready"]
     assert states[STORE_CONTROL_PLANE] == STATE_OK
     assert sequence_health_report(control_path) == {
         "null_event_count": 1,
@@ -360,9 +362,12 @@ def test_postgres_bootstrap_creates_the_registered_schema(postgres_control_store
     assert row == (f"{config.schema}.harness_hosts",)
 
 
-def test_postgres_bootstrap_serializes_concurrent_starters(tmp_path: Path):
+def test_postgres_bootstrap_serializes_concurrent_starters(
+    tmp_path: Path, postgres_dsn, monkeypatch
+):
     """Two API/worker starters apply one ordered schema history."""
-    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
+    dsn = postgres_dsn
+    monkeypatch.setenv("DROVER_TEST_POSTGRES_DSN", dsn)
     if not dsn:
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
 
@@ -404,9 +409,10 @@ def test_postgres_bootstrap_serializes_concurrent_starters(tmp_path: Path):
             rows = con.execute(
                 f'SELECT version FROM "{schema}".control_schema_migrations'
             ).fetchall()
-        from drover.server.postgres_schema import _MIGRATIONS
-
-        assert rows == [(version,) for version, _ in _MIGRATIONS]
+        # 1..7 always; 8 (session_embeddings) only where pgvector is installed.
+        versions = {row[0] for row in rows}
+        assert set(range(1, 8)) <= versions <= set(range(1, 9))
+        assert len(rows) == len(versions)
     finally:
         for store in starters:
             store.close()
@@ -529,67 +535,39 @@ def test_postgres_client_session_id_concurrency_returns_the_insert_winner(
     assert sessions[0].session_id == sessions[1].session_id
 
 
-def test_postgres_recap_workers_claim_one_generation(postgres_control_store):
-    """Concurrent workers retain the queue's one-generation claim fence."""
-    control_path, _ = postgres_control_store
-    from drover.server.db import control_plane_connection
-    from drover.server.harness.recap_jobs import enqueue_live_recap
-    from drover.server.harness.recap_worker import LiveRecapWorker
-
-    with control_plane_connection(control_path) as con:
-        assert enqueue_live_recap(con, "pg-recap-claim", 7)
-
-    workers = [
-        LiveRecapWorker(duckdb_path=control_path),
-        LiveRecapWorker(duckdb_path=control_path),
-    ]
-    barrier = threading.Barrier(2)
-    claims: list[object] = []
-
-    def claim(worker: LiveRecapWorker) -> None:
-        barrier.wait(timeout=2)
-        result = worker._claim_due_job()
-        if result is not None:
-            claims.append(result)
-
-    threads = [threading.Thread(target=claim, args=(worker,)) for worker in workers]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
-
-    assert all(not thread.is_alive() for thread in threads)
-    assert len(claims) == 1
-    assert claims[0].session_id == "pg-recap-claim"
-    assert claims[0].attempts == 1
-
-
 def test_postgres_recap_completion_upserts_only_a_live_claim(postgres_control_store):
-    """The completion transaction remains fenced and portable on PostgreSQL."""
+    """The recap ledger job's lease fences the live-phase write (#480).
+
+    Concurrency and supersession are covered in ``test_live_recap_worker``.
+    """
     control_path, _ = postgres_control_store
     from drover.server.db import control_plane_connection
     from drover.server.harness.recap_jobs import enqueue_live_recap
     from drover.server.harness.recap_worker import LiveRecapWorker
+    from drover.server.ledger import RECAP_SESSION, JobLedger, transaction
 
     with control_plane_connection(control_path) as con:
-        assert enqueue_live_recap(con, "pg-recap-complete", 9)
+        with transaction(con):
+            assert enqueue_live_recap(
+                con, "pg-recap-complete", 9, store_path=control_path
+            )
 
+    ledger = JobLedger(control_path)
+    [job] = ledger.claim(RECAP_SESSION, worker_id="test")
     worker = LiveRecapWorker(duckdb_path=control_path)
-    claim = worker._claim_due_job()
-    assert claim is not None
-    assert worker._complete(claim, "PostgreSQL recap.", "test-model") is True
-    assert worker._complete(claim, "Stale recap.", "test-model") is False
+    assert worker._complete(ledger, job, "PostgreSQL recap.", "test-model", 9) is True
+    assert worker._complete(ledger, job, "Stale recap.", "test-model", 9) is False
 
     with control_plane_connection(control_path) as con:
         assert con.execute(
-            "SELECT recap_text, source_seq, generator_model FROM live_session_recaps "
+            "SELECT recap_text, recap_source_seq, recap_model FROM session_memory "
             "WHERE session_id = ?",
             ["pg-recap-complete"],
         ).fetchone() == ("PostgreSQL recap.", 9, "test-model")
         assert con.execute(
-            "SELECT status, attempts FROM live_recap_jobs WHERE session_id = ?",
-            ["pg-recap-complete"],
-        ).fetchone() == ("done", 1)
+            "SELECT status, claims FROM pipeline_jobs WHERE job_id = ?",
+            [job.job_id],
+        ).fetchone() == ("succeeded", 1)
 
 
 def test_postgres_advisory_observe_serializes_one_finding(postgres_control_store):
@@ -789,9 +767,10 @@ def test_server_config_registers_only_its_explicit_control_path(
         close_control_store(configured_path)
 
 
-def test_postgres_pool_and_statement_deadlines_are_bounded():
+def test_postgres_pool_and_statement_deadlines_are_bounded(postgres_dsn, monkeypatch):
     """A busy pool and a slow statement fail inside the configured deadlines."""
-    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
+    dsn = postgres_dsn
+    monkeypatch.setenv("DROVER_TEST_POSTGRES_DSN", dsn)
     if not dsn:
         pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
 

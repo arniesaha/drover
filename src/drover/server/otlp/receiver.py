@@ -28,12 +28,10 @@ class _Servicer(tsg.TraceServiceServicer):
         parquet_dir: Path,
         duckdb_path: Path,
         ingest_lock: threading.Lock,
-        span_job_stream: object | None = None,
     ) -> None:
         self.parquet_dir = parquet_dir
         self.duckdb_path = duckdb_path
         self._lock = ingest_lock
-        self._span_job_stream = span_job_stream
 
     def Export(self, request, context):  # noqa: N802 — gRPC method name
         try:
@@ -42,7 +40,6 @@ class _Servicer(tsg.TraceServiceServicer):
                     request,
                     parquet_dir=self.parquet_dir,
                     duckdb_path=self.duckdb_path,
-                    span_job_stream=self._span_job_stream,
                 )
             log.debug(
                 "OTLP Export: read=%d inserted=%d dupes=%d errors=%d",
@@ -67,7 +64,6 @@ class OTLPReceiver:
         parquet_dir: Path,
         duckdb_path: Path,
         max_workers: int = 4,
-        span_job_stream: object | None = None,
     ) -> None:
         self.host = host
         self._configured_port = port
@@ -75,7 +71,6 @@ class OTLPReceiver:
         self.parquet_dir = Path(parquet_dir)
         self.duckdb_path = Path(duckdb_path)
         self.max_workers = max_workers
-        self._span_job_stream = span_job_stream
         self._server: grpc.Server | None = None
         self._lock = threading.Lock()  # serialize DuckDB single-writer access
 
@@ -96,7 +91,6 @@ class OTLPReceiver:
             parquet_dir=self.parquet_dir,
             duckdb_path=self.duckdb_path,
             ingest_lock=self._lock,
-            span_job_stream=self._span_job_stream,
         )
         tsg.add_TraceServiceServicer_to_server(servicer, server)
         bound = server.add_insecure_port(f"{self.host}:{self._configured_port}")

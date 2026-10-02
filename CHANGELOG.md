@@ -46,6 +46,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   effort pickers, native resume and the worktree note appear only when
   advertised, and every action re-checks the latest envelope. Hosts without a
   matrix are listed with an upgrade note and cannot launch.
+- Derived memory moves to the PostgreSQL control store with one job ledger
+  (#480, closes #464). Session summaries, live recaps (now the live phase of
+  one `session_memory` row), project briefs and pgvector `vector(768)` session
+  embeddings live in PostgreSQL; summarize/embed/brief/recap jobs live in
+  `pipeline_jobs`, claimed with `FOR UPDATE SKIP LOCKED` under lease tokens,
+  with bounded retries, per-row quarantine and a reason on every terminal
+  failure. The DuckDB `summarize_jobs`/`embed_jobs`/`brief_jobs`/
+  `span_embed_jobs` queues, the DuckDB ledger shadow, the Redis memory streams
+  and span embeddings (#473) are gone. Derived rows are rebuilt, not migrated:
+  schema bootstrap preserves legacy data. Run
+  `drover-server memory requeue --since <date>` after upgrading;
+  `drover-server memory purge-legacy` previews optional cleanup. A DuckDB-only control store
+  records sessions but derives no memory.
+- `/readyz` reports a `memory` section: pgvector status (missing pgvector
+  fails readiness), whether embeddings are configured or disabled, and per job
+  kind the pending, running (oldest lease age), retrying, dead-lettered and
+  quarantined counts, oldest pending age and last success (#471). The
+  `ledger reconcile|replay` and `embeddings reset-stale-*|enqueue-spans|
+  prune-orphan-spans` commands are removed; expired leases are reclaimed
+  automatically.
 
 ### Added
 

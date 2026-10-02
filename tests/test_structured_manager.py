@@ -130,8 +130,10 @@ class _StubAdapter(HarnessAdapter):
         driver.interrupt()
 
 
-def _build_manager(monkeypatch, tmp_path, *, session_id: str = "sess-1"):
-    duckdb_path = tmp_path / "drover.duckdb"
+def _build_manager(
+    monkeypatch, tmp_path, *, session_id: str = "sess-1", duckdb_path=None
+):
+    duckdb_path = duckdb_path or tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
     registry = HarnessRegistry(duckdb_path)
     registry.create_session(
@@ -443,11 +445,11 @@ def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_
 
 
 def test_manager_wire_completion_enqueues_recap_at_emitted_sequence(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, pg_control_path
 ):
     """StructuredMessage.to_payload nests completion inside its wire payload."""
     _mgr, driver, registry, _on_messages, _finalized = _build_manager(
-        monkeypatch, tmp_path
+        monkeypatch, tmp_path, duckdb_path=pg_control_path
     )
 
     driver.emit(
@@ -462,11 +464,10 @@ def test_manager_wire_completion_enqueues_recap_at_emitted_sequence(
 
     event = registry.list_events("sess-1")[0]
     assert event.payload["payload"]["turn_complete"] is True
-    with duckdb.connect(str(registry.control_plane_path)) as con:
-        assert con.execute(
-            "SELECT desired_source_seq FROM live_recap_jobs WHERE session_id = ?",
-            ["sess-1"],
-        ).fetchone() == (event.seq,)
+    from drover.server.ledger import RECAP_SESSION, JobLedger
+
+    job = JobLedger(pg_control_path).latest(RECAP_SESSION, "sess-1")
+    assert job is not None and job.source_version == str(event.seq)
 
 
 def test_manager_does_not_duplicate_per_turn_driver_inflight_state(

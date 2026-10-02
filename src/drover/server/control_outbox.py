@@ -761,6 +761,21 @@ def outbox_status(con: object) -> dict[str, Any]:
     }
 
 
+#: The recap dependency (#480). A payload is not prunable while its session's
+#: recap could still need it: there is a live ``recap_session`` job in the
+#: ledger (pending, running or retry_wait -- the partial unique index allows at
+#: most one, so this join never fans out), or the live phase of
+#: ``session_memory`` is missing or has not reached the session's newest
+#: sequence. This is the old ``live_recap_jobs.status = 'done'`` /
+#: ``desired_source_seq`` / ``live_session_recaps.source_seq`` gate expressed
+#: on the tables that replaced them. Retention only runs on PostgreSQL, where
+#: both exist.
+_RECAP_JOINS = """LEFT JOIN pipeline_jobs recap_job
+            ON recap_job.job_kind = 'recap_session'
+           AND recap_job.subject_key = e.session_id
+           AND recap_job.status IN ('pending', 'running', 'retry_wait')
+          LEFT JOIN session_memory recap ON recap.session_id = e.session_id"""
+
 #: Mirrors ``_payload_prune_protection`` in SQL so a bounded candidate read
 #: returns rows that can actually prune. Kept beside that predicate on purpose:
 #: the two must change together.
@@ -772,9 +787,9 @@ _PRUNE_ELIGIBLE_SQL = """
           AND usage.source_event_count IS NOT NULL
           AND usage.source_event_count >= COALESCE(progress.event_count, 0)
           AND COALESCE(usage.source_seq, 0) >= COALESCE(progress.max_seq, 0)
-          AND recap_job.status = 'done'
-          AND COALESCE(recap_job.desired_source_seq, 0) >= COALESCE(progress.max_seq, 0)
-          AND COALESCE(recap.source_seq, 0) >= COALESCE(progress.max_seq, 0)
+          AND recap_job.job_id IS NULL
+          AND recap.recap_source_seq IS NOT NULL
+          AND COALESCE(recap.recap_source_seq, 0) >= COALESCE(progress.max_seq, 0)
 """
 
 
@@ -786,7 +801,7 @@ def _payload_protection_counts(con: object) -> dict[str, int]:
     would lose the signal that distinguishes "nothing left to prune" from
     "everything is waiting on recap".
     """
-    row = con.execute("""
+    row = con.execute(f"""
         WITH session_progress AS (
           SELECT session_id, count(*) AS event_count, COALESCE(max(seq), 0) AS max_seq
             FROM harness_events GROUP BY session_id
@@ -805,9 +820,9 @@ def _payload_protection_counts(con: object) -> dict[str, int]:
                 AND usage.source_event_count IS NOT NULL
                 AND usage.source_event_count >= COALESCE(progress.event_count, 0)
                 AND COALESCE(usage.source_seq, 0) >= COALESCE(progress.max_seq, 0)
-                AND recap_job.status = 'done'
-                AND COALESCE(recap_job.desired_source_seq, 0) >= COALESCE(progress.max_seq, 0)
-                AND COALESCE(recap.source_seq, 0) >= COALESCE(progress.max_seq, 0)
+                AND recap_job.job_id IS NULL
+                AND recap.recap_source_seq IS NOT NULL
+                AND COALESCE(recap.recap_source_seq, 0) >= COALESCE(progress.max_seq, 0)
               )
           ) AS dependency
           FROM harness_event_payloads p
@@ -818,8 +833,7 @@ def _payload_protection_counts(con: object) -> dict[str, int]:
           LEFT JOIN session_progress progress ON progress.session_id = e.session_id
           LEFT JOIN session_usage_sources usage
             ON usage.session_id = e.session_id AND usage.source = 'harness_events'
-          LEFT JOIN live_recap_jobs recap_job ON recap_job.session_id = e.session_id
-          LEFT JOIN live_session_recaps recap ON recap.session_id = e.session_id
+          {_RECAP_JOINS}
         """).fetchone()
     return {"active": int(row[0] or 0), "dependency": int(row[1] or 0)}
 
@@ -852,9 +866,8 @@ def _payload_prune_candidates(
                s.status, o.state AS outbox_state, o.batch_id, b.state AS batch_state,
                progress.event_count, progress.max_seq,
                usage.source_event_count, usage.source_seq,
-               recap_job.status AS recap_status,
-               recap_job.desired_source_seq AS recap_desired_source_seq,
-               recap.source_seq AS recap_source_seq
+               recap_job.status AS recap_job_status,
+               recap.recap_source_seq AS recap_source_seq
           FROM harness_event_payloads p
           JOIN harness_events e ON e.event_id = p.event_id
           LEFT JOIN harness_sessions s ON s.session_id = e.session_id
@@ -863,8 +876,7 @@ def _payload_prune_candidates(
           LEFT JOIN session_progress progress ON progress.session_id = e.session_id
           LEFT JOIN session_usage_sources usage
             ON usage.session_id = e.session_id AND usage.source = 'harness_events'
-          LEFT JOIN live_recap_jobs recap_job ON recap_job.session_id = e.session_id
-          LEFT JOIN live_session_recaps recap ON recap.session_id = e.session_id
+          {_RECAP_JOINS}
           {filter_sql}
          ORDER BY e.created_at, e.event_id
          LIMIT ?
@@ -886,8 +898,8 @@ def _payload_prune_protection(row: dict[str, Any]) -> str | None:
         or row.get("source_event_count") is None
         or int(row["source_event_count"]) < int(row.get("event_count") or 0)
         or int(row.get("source_seq") or 0) < int(row.get("max_seq") or 0)
-        or row.get("recap_status") != "done"
-        or int(row.get("recap_desired_source_seq") or 0) < int(row.get("max_seq") or 0)
+        or row.get("recap_job_status") is not None
+        or row.get("recap_source_seq") is None
         or int(row.get("recap_source_seq") or 0) < int(row.get("max_seq") or 0)
     ):
         return "dependency"
