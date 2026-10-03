@@ -1100,9 +1100,11 @@ def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> d
     from drover.server.harness.registry import HarnessRegistry
 
     registry = HarnessRegistry(duckdb_path)
+    # The registry default excludes retired hosts; retain that boundary for
+    # active work while deriving liveness for every host it returns.
     host_liveness = {
-        host.host_id: host.liveness().state
-        for host in registry.list_hosts(include_retired=True)
+        host.host_id: (host.liveness().state if hasattr(host, "liveness") else "online")
+        for host in registry.list_hosts()
     }
     sessions = []
     for session in registry.list_sessions(archived_limit=0):
