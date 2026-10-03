@@ -1,6 +1,8 @@
 """Inactive plugin's fake SDK registration with real authenticated Drover HTTP.
 
-No OpenClaw runtime, messaging, plugin installation or configuration is used.
+The fake uses the NAS 2026.9.6 V2 factory/guard shape; a separate Node test
+executes current NAS source registration. No Gateway, messaging, plugin
+installation or configuration is used.
 Tests require the standalone artifact's Node dependencies installed locally.
 """
 
@@ -32,7 +34,21 @@ TOKEN = "synthetic-plugin-only-test-token"
 def node():
     executable = shutil.which("node")
     if executable is None:
-        pytest.skip("Node >=22 unavailable for the standalone OpenClaw plugin proof")
+        pytest.skip(
+            "Compatible Node unavailable for the OpenClaw 2026.9.6 plugin proof"
+        )
+    version = (
+        subprocess.run(
+            [executable, "--version"], capture_output=True, text=True, check=True
+        )
+        .stdout.strip()
+        .removeprefix("v")
+    )
+    major, minor, *_ = [int(part) for part in version.split(".")]
+    if not (
+        (major == 24 and minor >= 16) or major > 26 or (major == 26 and minor >= 1)
+    ):
+        pytest.skip(f"Node {version} does not satisfy OpenClaw 2026.9.6 engine range")
     if not (PLUGIN / "node_modules/ajv/package.json").is_file():
         pytest.skip(
             "OpenClaw plugin dependencies missing; run npm ci --ignore-scripts in plugins/openclaw-continuity-owner"

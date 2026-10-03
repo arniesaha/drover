@@ -1,37 +1,67 @@
 # Drover continuity owner plugin (inactive by default)
 
 This standalone ESM package registers exactly `drover_continuity_owner` through
-normal `api.registerTool(factory, {name, optional: true})`. Its execute handler
-uses authenticated HTTP at the fixed `/harness/factory-observer/continuity`
+normal `api.registerTool({contextVersion: 2, create}, {name, optional: true})`.
+Its execute handler uses authenticated HTTP at the fixed `/harness/factory-observer/continuity`
 endpoint. It has no messaging client, executor, scheduler, implicit ack, or
 automatic retry. Installing/loading/activating it is an integration-owner task;
 none was performed by this implementation worker.
 
 ## SDK evidence and limits
 
-Inspected local source: `/Users/arnab/Developer/research/openclaw`, version
-**2026.3.13**, commit `421effcf905b0956895166316c3fbe62baf6a22f`.
-The requested `projects/openclaw` checkout was absent at the searched local
-roots. This source was read without modification.
+Current target source: **NAS OpenClaw 2026.9.6**, commit
+`88027bc85c0a4eebbea49a2a5522faec71ecdc14`, at
+`/home/Arnab/clawd/projects/openclaw`. This worker reads it through the existing
+SMB mount `/Volumes/personal_folder/clawd/projects/openclaw`
+(`Arnab@ARNABSNAS/personal_folder`). The checkout is read-only to this task.
+The prior Studio 2026.3.13 source proof targeted the wrong checkout and is
+superseded; it does not establish NAS compatibility.
 
-- `src/plugins/types.ts:63–89`: trusted tool context `sessionKey`, factory
-  returning a tool or null, and optional registration options.
-- `src/plugins/types.ts:366–380`: `pluginConfig` and `registerTool` API.
-- `src/plugins/registry.ts:194–218`: normal factory registration normalization.
-- `extensions/llm-task/index.ts`: default function registration example.
-- `docs/plugins/agent-tools.md`: raw JSON-schema parameters and optional tools
-  subject to normal tool availability/policy.
-- `docs/tools/plugin.md` and `src/plugins/install.ts`: manifest/package loading
-  and tarball installation. **CLI install changes configuration and enables an
-  entry**; do not treat install as inactive staging without authorization.
+Current-source evidence:
 
-The checkout lacks installed SDK dependencies/build output. Tests therefore use
-a small source-matched registration host, not a running Gateway. A downloaded
-OpenClaw app reports 2026.9.6; that runtime was not tested. The integration owner
-must verify the actual parent's SDK/version, schema normalization, discovery,
-existing policy, and execute/result behavior before activation. The child lacks
-`sessions_send`; the user confirms the parent has
-first-class `sessions_send`. This is not evidence of a core defect.
+- `package.json:1454–1456,1612–1614`: exported `openclaw/plugin-sdk/plugin-entry`
+  and `openclaw/plugin-sdk/tool-plugin` runtime/type subpaths.
+  `src/plugin-sdk/plugin-entry.ts` exports `definePluginEntry` and the tool/API
+  types. No SDK runtime import is needed for our supported plain definition object.
+- `src/plugins/plugin-definition.types.ts` and `src/plugins/module-export.ts`:
+  default definition object with synchronous `register(api)` is accepted. The
+  actual source resolver is executed in the focused contract test.
+- `src/plugins/plugin-api.types.ts:194,214–217` and `tool-types.ts`: host
+  `pluginConfig`, trusted `sessionKey`, normal optional registration, V2 factory
+  descriptor and required `assertInvocationCurrent` callback.
+- `src/plugins/registry-registrars-tools-hooks.ts:207–272`: registrations **must
+  declare `contracts.tools`**; V2 descriptors are normalized through `create`
+  and require host invocation authority. The old manifest lacked this declaration
+  and would be rejected. The test executes this actual source body and proves
+  rejection of the old manifest shape as well as registration of the repaired one.
+- `docs/plugins/manifest/capabilities.md`: `contracts.tools`, optional/side-effect
+  metadata and `activation.onStartup`; `src/plugins/manifest.ts:233,306,379`
+  parses these declarations. Manifest now declares the one owned tool, default
+  disabled, startup lazy, optional and side-effecting (never replay-safe).
+- `docs/plugins/tool-plugins.md:183–217`: V2 live authority must be checked after
+  awaits in the final synchronous request guard. We check immediately before
+  each GET/POST, including POST after scope preflight. Metadata discovery grants
+  no invocation authority. Drover lease/epoch and scope checks still apply.
+- `docs/plugins/sdk-entrypoints/package-entries.md`: source/runtime entries pair
+  positionally. Both entries explicitly select the shipped `index.js` ESM artifact.
+- `docs/plugins/manage-plugins.md:236–237` documents
+  `openclaw plugins install npm-pack:<path.tgz>`;
+  `src/plugins/install-source-plan.ts:122–132` resolves that supported archive
+  form. Installation/configuration/reload are administrator actions and require
+  explicit user authorization; installation is not read-only staging.
+- `package.json:2370–2372` and `docs/plugins/tool-plugins.md`: supported Node range
+  `>=24.16.0 <25 || >=26.1.0`, now mirrored by the package engine declaration.
+
+`test/nas-source.test.js` requires `DROVER_TEST_OPENCLAW_NAS_SOURCE` and rejects
+versions other than 2026.9.6. It imports the actual pure source entry resolver
+and contract helpers and executes the actual registrar body with fake surrounding
+registry bookkeeping. It does not load the whole Gateway or SDK lifecycle.
+The remaining tool tests use a minimal V2 fake matching that tested registrar.
+Current NAS source has dependencies/build output; this proof deliberately loads
+only these bounded source helpers, without plugin installation or host activation.
+Live tool discovery, schema normalization, host lifetime/continuation behavior,
+normal authenticated transport in the Gateway and parent messaging remain untested.
+The parent has first-class `sessions_send`; child catalog absence is not a core defect.
 
 ## Trusted configuration
 
@@ -95,19 +125,21 @@ From this package directory:
 
 ```sh
 npm ci --ignore-scripts --no-audit --no-fund
-DROVER_TEST_OPENCLAW_SOURCE=/Users/arnab/Developer/research/openclaw npm test
+DROVER_TEST_OPENCLAW_NAS_SOURCE=/Volumes/personal_folder/clawd/projects/openclaw npm test
 npm pack --ignore-scripts
 ```
 
-The SDK source-shape test explicitly skips when that checkout is unavailable.
-The Python tests skip Node execution when Node/dependencies are missing. They
+The current-source test fails explicitly if the NAS path/environment is missing or
+points at another version; it cannot silently substitute the old Studio source.
+The Python tests skip Node execution when compatible Node/dependencies are missing. They
 exercise real authenticated Drover HTTP with synthetic credentials, a durable
 local store and reconstructed store, but a fake SDK host. They prove read-only
 parent/owner polling, explicit owner lease/consume/ack, post-reconstruction no
 duplicate delivery, and 401 refusal. Protocol tests prove CI green → `review_ci`,
 CI red → `correct_ci`, blocked deployment and lost-delivery recovery. Node tests
-also cover normal registration shape, session isolation, strict requests,
-transport refusal/redirect/cancellation, scope preflight and no automatic ack.
+also cover current source load/registration, session isolation, strict requests,
+transport refusal/redirect/cancellation, scope preflight, live authority revoked
+during preflight preventing POST, and no automatic ack.
 Neither these tests nor the package establish live OpenClaw delivery or new
 PostgreSQL proof. Prior PG evidence/gaps are recorded in the Drover ledger.
 
@@ -118,8 +150,8 @@ Owner for integration/release:
 The worker does not perform any step below against a live runtime.
 
 1. Review the commit and packed artifact; verify the parent's supported SDK.
-   With explicit authorization for installation/configuration/loading, the normal
-   local SDK command is `openclaw plugins install ./drover-openclaw-continuity-owner-0.1.0.tgz`.
+   Only with explicit user authorization for installation/configuration/loading, the current-source-supported
+   owner command is `openclaw plugins install npm-pack:/<approved-artifact-directory>/drover-openclaw-continuity-owner-0.1.0.tgz`.
    That command changes configuration. Coordinate inactive staging and approved
    activation through the host's supported procedures; retain the package's
    `config.enabled: false` until the canary is approved. Any necessary host reload

@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { join } from "node:path";
 import { test } from "node:test";
-import register, { TOOL_NAME } from "../index.js";
+import { register, TOOL_NAME } from "../index.js";
 import { fakeApi } from "./fake-sdk.js";
 
 const OWNER = "agent:coder:subagent:mock-owner";
@@ -55,32 +53,16 @@ function tool(config, sessionKey = OWNER) {
   const { api, registrations } = fakeApi(config);
   register(api);
   assert.equal(registrations.length, 1);
-  return registrations[0].factory({ sessionKey });
+  return registrations[0].factory({ sessionKey, assertInvocationCurrent() {} });
 }
 const call = (operation, fields = {}) => ({ version: 1, request: { operation, ...fields } });
-
-test("actual local SDK source confirms the fake registration/context shape", (t) => {
-  const root = process.env.DROVER_TEST_OPENCLAW_SOURCE;
-  if (!root) return t.skip("DROVER_TEST_OPENCLAW_SOURCE not set; local SDK source contract unavailable");
-  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-  const types = readFileSync(join(root, "src/plugins/types.ts"), "utf8");
-  const registry = readFileSync(join(root, "src/plugins/registry.ts"), "utf8");
-  assert.equal(pkg.version, "2026.3.13");
-  assert.match(types, /sessionKey\?: string/);
-  assert.match(types, /pluginConfig\?: Record<string, unknown>/);
-  assert.match(types, /tool: AnyAgentTool \| OpenClawPluginToolFactory/);
-  assert.match(types, /optional\?: boolean/);
-  assert.match(registry, /typeof tool === "function" \? tool/);
-  assert.match(registry, /optional = opts\?\.optional === true/);
-  t.diagnostic(`Read-only SDK contract: OpenClaw ${pkg.version}; no Gateway/SDK runtime loaded`);
-});
 
 test("registers exactly one optional normal tool; default inactive and unknown contexts get none", () => {
   const { api, registrations } = fakeApi();
   register(api);
   assert.equal(registrations.length, 1);
-  assert.equal(registrations[0].factory({ sessionKey: OWNER }), null);
-  assert.equal(registrations[0].factory({}), null);
+  assert.equal(registrations[0].factory({ sessionKey: OWNER, assertInvocationCurrent() {} }), null);
+  assert.equal(registrations[0].factory({ assertInvocationCurrent() {} }), null);
 });
 
 test("only the configured owner and canary sessions receive the one tool", async (t) => {
@@ -90,7 +72,7 @@ test("only the configured owner and canary sessions receive the one tool", async
   assert.equal(tool(f.config, "agent:unbound:session"), null);
   const { api, registrations } = fakeApi(f.config);
   register(api);
-  assert.equal(registrations[0].factory({}), null);
+  assert.equal(registrations[0].factory({ assertInvocationCurrent() {} }), null);
 });
 
 test("parent and owner polls retain pending state; never POST or auto-ack", async (t) => {
@@ -176,6 +158,26 @@ test("scope mismatch is detected during GET before a POST", async (t) => {
   await assert.rejects(tool({ ...f.config, mode: "owner" }).execute("ack", call("acknowledge", {
     owner_epoch: 1, event_id: EVENT, checkpoint: "Wrong scope" })), /trusted run\/scope/);
   assert.deepEqual(f.calls.map((req) => req.method), ["GET"]);
+});
+
+test("live V2 host authority is required and checked again after scope preflight", async (t) => {
+  let current = true;
+  let checks = 0;
+  const f = await fixture(t, (_request, res) => {
+    current = false; // Authority revoked while GET was awaited.
+    res.end(JSON.stringify({ continuity: projection() }));
+  });
+  const { api, registrations } = fakeApi({ ...f.config, mode: "owner" });
+  register(api);
+  assert.throws(() => registrations[0].factory({ sessionKey: OWNER }), /host invocation authority/);
+  const target = registrations[0].factory({ sessionKey: OWNER, assertInvocationCurrent() {
+    checks++;
+    if (!current) throw new Error("Host authority retired");
+  } });
+  await assert.rejects(target.execute("consume", call("consume", { owner_epoch: 1 })), /Host authority retired/);
+  assert.equal(checks, 2);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].method, "GET");
 });
 
 test("explicit consume has trusted binding and leaves action until a separate ack", async (t) => {

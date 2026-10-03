@@ -63,7 +63,7 @@ function reply(raw, config) {
   return result;
 }
 
-async function request(config, method, data, signal) {
+async function request(config, method, data, signal, assertCurrent) {
   const token = process.env[config.tokenEnvName];
   requireValue(typeof token === "string" && token.length > 0 && token.length <= 8192 && !/\s/.test(token), "Configured Drover credential environment variable is missing or malformed");
   const url = new URL(ENDPOINT, config.droverOrigin);
@@ -78,6 +78,8 @@ async function request(config, method, data, signal) {
   const timeout = AbortSignal.timeout(config.timeoutMs);
   const boundedSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   let response;
+  // 2026.9.6 V2 host authority must be checked after awaits, immediately before effects.
+  assertCurrent();
   try {
     response = await fetch(url, { method, headers, body, signal: boundedSignal, redirect: "error", cache: "no-store" });
   } catch {
@@ -108,12 +110,12 @@ async function request(config, method, data, signal) {
   }
 }
 
-async function invoke(config, readOnly, payload, signal) {
+async function invoke(config, readOnly, payload, signal, assertCurrent) {
   requireValue(validateRequest(payload), "Invalid owner tool request schema");
   safeIntegers(payload);
   const args = payload.request;
   requireValue(!readOnly || args.operation === "poll", "Read-only canary permits poll only");
-  const get = (limit) => request(config, "GET", { run_id: config.runId, limit }, signal);
+  const get = (limit) => request(config, "GET", { run_id: config.runId, limit }, signal, assertCurrent);
   let raw;
   if (args.operation === "poll") raw = await get(args.limit ?? 20);
   else {
@@ -124,7 +126,7 @@ async function invoke(config, readOnly, payload, signal) {
     if (body.owner_epoch === null) delete body.owner_epoch;
     if (args.operation === "report") body.source = "openclaw";
     else body.owner_id = config.ownerSessionKey;
-    raw = await request(config, "POST", body, signal);
+    raw = await request(config, "POST", body, signal, assertCurrent);
   }
   const result = reply(raw, config);
   const status = result.continuity;
@@ -141,15 +143,16 @@ async function invoke(config, readOnly, payload, signal) {
   return result;
 }
 
-// SDK: OpenClawPluginApi.registerTool(factory, {name, optional}); factory(ctx)
-// returns AnyAgentTool or null. Context.sessionKey is trusted host input.
-export default function register(api) {
+// SDK 2026.9.6: V2 descriptor uses trusted sessionKey and live invocation guard.
+export function register(api) {
   const config = configuration(api.pluginConfig ?? {});
-  api.registerTool((context) => {
+  api.registerTool({ contextVersion: 2, create(context) {
     if (config.enabled !== true || !context?.sessionKey) return null;
     const owner = context.sessionKey === config.ownerSessionKey;
     const canary = context.sessionKey === config.canarySessionKey;
     if (!owner && !canary) return null;
+    requireValue(typeof context.assertInvocationCurrent === "function", "Host invocation authority is required");
+    const assertCurrent = context.assertInvocationCurrent;
     const readOnly = config.mode === "poll_only" || !owner;
     return {
       name: TOOL_NAME,
@@ -159,9 +162,13 @@ export default function register(api) {
         : "Explicit Drover continuity calls for the bound owner. Advisory actions only; no executor, merge, deployment or messaging. Ack only after idempotent reconciliation.",
       parameters: structuredClone(requestSchema),
       async execute(_toolCallId, payload, signal) {
-        const details = await invoke(config, readOnly, payload, signal);
+        const details = await invoke(config, readOnly, payload, signal, assertCurrent);
         return { content: [{ type: "text", text: JSON.stringify(details) }], details };
       },
     };
-  }, { name: TOOL_NAME, optional: true });
+  } }, { name: TOOL_NAME, optional: true });
 }
+
+// Current SDK accepts a default definition object; no runtime SDK import is needed.
+export default { id: manifest.id, name: manifest.name, version: manifest.version,
+  description: manifest.description, register };

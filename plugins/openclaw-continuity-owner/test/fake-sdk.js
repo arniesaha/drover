@@ -1,15 +1,23 @@
-// Exact minimal shape from OpenClaw 2026.3.13 src/plugins/types.ts:63-89,
-// 366-380 and src/plugins/registry.ts:194-218. This does NOT load a Gateway.
+// Minimal 2026.9.6 V2 registrar fake. NAS-source.test.js executes actual source
+// resolver/registrar code separately. This fake does not load a Gateway.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
 
 export function fakeApi(pluginConfig = {}) {
   const registrations = [];
   const api = {
     pluginConfig,
-    registerTool(factory, options) {
-      assert.equal(typeof factory, "function");
+    registerTool(descriptor, options) {
+      assert.deepEqual(manifest.contracts.tools, ["drover_continuity_owner"]);
+      assert.equal(descriptor.contextVersion, 2);
+      assert.equal(typeof descriptor.create, "function");
       assert.deepEqual(options, { name: "drover_continuity_owner", optional: true });
-      registrations.push({ factory, options });
+      const factory = (context) => {
+        if (!context.assertInvocationCurrent) throw new Error("Version 2 tool factories require host invocation authority");
+        return descriptor.create(context);
+      };
+      registrations.push({ factory, options, descriptor });
     },
   };
   return { api, registrations };

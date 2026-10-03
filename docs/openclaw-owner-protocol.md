@@ -10,7 +10,8 @@ continuity ledger. TaskFlow/Factory retains lifecycle authority.
 The standalone [inactive OpenClaw plugin](../plugins/openclaw-continuity-owner/README.md)
 now implements normal `api.registerTool` registration, trusted host session/config
 binding, and authenticated Drover HTTP. It is not installed or activated. Tests
-use a source-matched SDK host and real synthetic authenticated Drover HTTP;
+execute the current NAS 2026.9.6 source entry resolver/registrar with fake registry
+bookkeeping and real synthetic authenticated Drover HTTP;
 live Gateway discovery, parent messaging, and activation remain unverified.
 The linked README records SDK/version evidence, packaging and exact parent canary
 steps. No credential, configuration, policy, or service change was made.
@@ -64,7 +65,8 @@ a committed endpoint call; the owner must poll to resolve the outcome.
 `OwnerToolReply` contains `version: 1`, the typed `continuity` projection,
 optional `event_id` for reports, and optional `delivery` for consume. An OpenClaw
 execute handler may render its JSON as a normal tool result. The package tests SDK-shaped
-result wrapping and registration against a source-matched host, not a running
+result wrapping, actual NAS source entry resolution and registration with fake
+registry bookkeeping, not a running
 Gateway. Live discovery and authorization remain untested.
 
 ## Explicit delivery, reconciliation, and ack
@@ -108,12 +110,15 @@ Observed in worker `harness-f5032b0f-837b-4769-8fcd-f39fb48d6281` on 2026-10-03:
   has that first-class tool. Child catalog absence is not a core defect.
 - The prior missing Drover registration/execute transport is implemented in the
   inactive standalone package. No messaging call or RPC/shell substitution was used.
-- Local SDK source inspected: OpenClaw 2026.3.13,
-  `421effcf905b0956895166316c3fbe62baf6a22f`, at
-  `/Users/arnab/Developer/research/openclaw`. The requested `projects/openclaw`
-  checkout was absent. Source locations and runtime limits are in the package README.
-- A source-matched fake registration host plus real authenticated Drover HTTP is
-  tested. Actual parent runtime version, registration diagnostics, authorized
+- Corrected target evidence: NAS OpenClaw 2026.9.6,
+  `88027bc85c0a4eebbea49a2a5522faec71ecdc14`, at
+  `/home/Arnab/clawd/projects/openclaw`, read through the existing
+  `/Volumes/personal_folder/clawd/projects/openclaw` mount. Prior Studio 2026.3.13
+  proof targeted the wrong checkout and is superseded. Current SDK requires
+  manifest `contracts.tools`; repaired registration also uses the V2 live host
+  invocation guard. Source locations/runtime limits are in the package README.
+- Actual NAS source resolver/registrar with fake registry bookkeeping plus real
+  synthetic authenticated Drover HTTP is tested. Actual parent runtime version, registration diagnostics, authorized
   discovery, tool results and normal messaging traces remain the integration gate.
 
 The earlier issue candidate described missing adapter wiring, now supplied as

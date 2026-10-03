@@ -7,17 +7,93 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "enabled": { "type": "boolean", "default": false },
-      "mode": { "type": "string", "enum": ["poll_only", "owner"], "default": "poll_only" },
-      "droverOrigin": { "type": "string", "format": "uri" },
-      "tokenEnvName": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" },
-      "runId": { "type": "string", "minLength": 1, "maxLength": 191, "pattern": "\\S" },
-      "ownerSessionKey": { "type": "string", "minLength": 1, "maxLength": 191, "pattern": "^agent:[^\\s]+$" },
-      "canarySessionKey": { "type": "string", "minLength": 1, "maxLength": 191, "pattern": "^agent:[^\\s]+$" },
-      "authorityScope": { "type": "string", "enum": ["implementation", "integration", "deployment"] },
-      "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 5000 }
+      "enabled": {
+        "type": "boolean",
+        "default": false
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "poll_only",
+          "owner"
+        ],
+        "default": "poll_only"
+      },
+      "droverOrigin": {
+        "type": "string",
+        "format": "uri"
+      },
+      "tokenEnvName": {
+        "type": "string",
+        "pattern": "^[A-Z_][A-Z0-9_]*$"
+      },
+      "runId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 191,
+        "pattern": "\\S"
+      },
+      "ownerSessionKey": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 191,
+        "pattern": "^agent:[^\\s]+$"
+      },
+      "canarySessionKey": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 191,
+        "pattern": "^agent:[^\\s]+$"
+      },
+      "authorityScope": {
+        "type": "string",
+        "enum": [
+          "implementation",
+          "integration",
+          "deployment"
+        ]
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10000,
+        "default": 5000
+      }
     },
-    "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
-    "then": { "required": ["droverOrigin", "tokenEnvName", "runId", "ownerSessionKey", "authorityScope"] }
+    "if": {
+      "properties": {
+        "enabled": {
+          "const": true
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    },
+    "then": {
+      "required": [
+        "droverOrigin",
+        "tokenEnvName",
+        "runId",
+        "ownerSessionKey",
+        "authorityScope"
+      ]
+    }
+  },
+  "contracts": {
+    "tools": [
+      "drover_continuity_owner"
+    ]
+  },
+  "enabledByDefault": false,
+  "activation": {
+    "onStartup": false
+  },
+  "toolMetadata": {
+    "drover_continuity_owner": {
+      "optional": true,
+      "replaySafe": false,
+      "sideEffecting": true
+    }
   }
 }
