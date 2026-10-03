@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import duckdb
 
+from drover.server.continuity_schema import CONTINUITY_TABLES
 from drover.server.control_outbox import payload_sha256
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
@@ -29,7 +30,6 @@ from drover.server.db import (
     CONTROL_PLANE_TABLES,
     control_plane_connection,
 )
-from drover.server.harness.continuity_schema import CONTINUITY_TABLES
 
 _EXTRA_TABLES = ("control_server_identity", "control_credentials")
 _ALL_TABLES = CONTROL_PLANE_TABLES + _EXTRA_TABLES

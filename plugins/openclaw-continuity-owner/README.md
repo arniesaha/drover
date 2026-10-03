@@ -11,9 +11,9 @@ none was performed by this implementation worker.
 
 Current target source: **NAS OpenClaw 2026.9.6**, commit
 `88027bc85c0a4eebbea49a2a5522faec71ecdc14`, at
-`/home/Arnab/clawd/projects/openclaw`. This worker reads it through the existing
-SMB mount `/Volumes/personal_folder/clawd/projects/openclaw`
-(`Arnab@ARNABSNAS/personal_folder`). The checkout is read-only to this task.
+`~/clawd/projects/openclaw`. This worker reads it through the existing
+SMB mount `${OPENCLAW_NAS_SOURCE}`
+(host-specific mount details omitted). The checkout is read-only to this task.
 The prior Studio 2026.3.13 source proof targeted the wrong checkout and is
 superseded; it does not establish NAS compatibility.
 
@@ -125,7 +125,7 @@ From this package directory:
 
 ```sh
 npm ci --ignore-scripts --no-audit --no-fund
-DROVER_TEST_OPENCLAW_NAS_SOURCE=/Volumes/personal_folder/clawd/projects/openclaw npm test
+DROVER_TEST_OPENCLAW_NAS_SOURCE="$OPENCLAW_NAS_SOURCE" npm test
 npm pack --ignore-scripts
 ```
 
@@ -143,7 +143,7 @@ during preflight preventing POST, and no automatic ack.
 Neither these tests nor the package establish live OpenClaw delivery or new
 PostgreSQL proof. Prior PG evidence/gaps are recorded in the Drover ledger.
 
-## Parent canary procedure — requires integration review and authorization
+## Parent canary procedure - requires integration review and authorization
 
 Owner for integration/release:
 `agent:coder:subagent:1998228b-5eb6-4b11-87a5-339a54576178`.

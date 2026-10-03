@@ -1,4 +1,4 @@
-# OpenClaw owner-tool protocol — #497 follow-through
+# OpenClaw owner-tool protocol - #497 follow-through
 
 `drover.server.harness.openclaw_owner` defines the minimal version-1 owner
 interface over `/harness/factory-observer/continuity`. It exports a JSON-schema
@@ -112,8 +112,8 @@ Observed in worker `harness-f5032b0f-837b-4769-8fcd-f39fb48d6281` on 2026-10-03:
   inactive standalone package. No messaging call or RPC/shell substitution was used.
 - Corrected target evidence: NAS OpenClaw 2026.9.6,
   `88027bc85c0a4eebbea49a2a5522faec71ecdc14`, at
-  `/home/Arnab/clawd/projects/openclaw`, read through the existing
-  `/Volumes/personal_folder/clawd/projects/openclaw` mount. Prior Studio 2026.3.13
+  `~/clawd/projects/openclaw`, read through the existing
+  `${OPENCLAW_NAS_SOURCE}` mount. Prior Studio 2026.3.13
   proof targeted the wrong checkout and is superseded. Current SDK requires
   manifest `contracts.tools`; repaired registration also uses the V2 live host
   invocation guard. Source locations/runtime limits are in the package README.

@@ -7,6 +7,7 @@ import { fakeApi } from "./fake-sdk.js";
 const OWNER = "agent:coder:subagent:mock-owner";
 const PARENT = "agent:main:mock-parent";
 const EVENT = "a".repeat(64);
+const MODEL_CREDENTIAL = "fixture-model-input";
 const action = {
   action_id: "observer-action-" + EVENT, event_id: EVENT, type: "review_worker_result",
   authority_scope: "implementation", authorized: true,
@@ -107,7 +108,7 @@ test("poll_only and a canary parent cannot mutate even when owner mode exists", 
 test("model cannot choose URL, credentials, run, owner, scope, messaging or executor", async (t) => {
   const f = await fixture(t);
   const target = tool({ ...f.config, mode: "owner" });
-  for (const fields of [{ url: "https://attacker.invalid" }, { token: "model-token" },
+  for (const fields of [{ url: "https://attacker.invalid" }, { token: MODEL_CREDENTIAL },
     { run_id: "run_OTHER" }, { owner_id: "impostor" }, { authority_scope: "deployment" },
     { command: "anything" }, { approve: true }]) {
     await assert.rejects(target.execute("bad", call("poll", fields)), /request schema/);
@@ -127,7 +128,7 @@ test("trusted configuration rejects unsafe origins, unknown keys and token argum
     assert.throws(() => tool({ ...config, droverOrigin: origin }), /origin|configuration/);
   }
   assert.throws(() => tool({ ...config, canarySessionKey: OWNER }), /distinct/);
-  assert.throws(() => tool({ ...config, token: "secret" }), /configuration/);
+  assert.throws(() => tool({ ...config, token: MODEL_CREDENTIAL }), /configuration/);
   assert.throws(() => tool({ ...config, tokenEnvName: "bad variable" }), /configuration/);
 });
 

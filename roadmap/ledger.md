@@ -25,7 +25,7 @@ under-five-minute audit, search freshness, 24-hour soak, and restore verificatio
 
 Worker: `harness-f5032b0f-837b-4769-8fcd-f39fb48d6281`; Codex session:
 `01a100a1-3981-7f62-abd1-09ff28c3a4eb`. Worktree:
-`/Users/arnab/.drover/worktrees/harness-f5032b0f-837b-4769-8fcd-f39fb48d6281`.
+`~/.drover/worktrees/harness-f5032b0f-837b-4769-8fcd-f39fb48d6281`.
 Follow-through base: `2b38b5120bd07304c533e8d4a4f02bc8b25eee3c`.
 Worker ownership and implementation/commit-only authority are unchanged.
 
@@ -68,7 +68,7 @@ Exact foreground commands from the worktree root and package directory respectiv
 
 ```sh
 .venv/bin/python -m pytest tests/test_openclaw_owner_plugin.py tests/test_openclaw_owner_protocol.py tests/test_factory_observer_continuity.py -q -rs
-DROVER_TEST_OPENCLAW_SOURCE=/Users/arnab/Developer/research/openclaw npm test
+DROVER_TEST_OPENCLAW_SOURCE="$OPENCLAW_STUDIO_SOURCE" npm test
 ```
 
 `plugins/openclaw-continuity-owner/README.md` specifies inactive packaging,
@@ -88,7 +88,7 @@ was the wrong target; it is not NAS compatibility evidence.
 
 | Area | Corrected/verified fact | Remaining boundary |
 | --- | --- | --- |
-| Current source | NAS `/home/Arnab/clawd/projects/openclaw`, read through existing SMB mount `/Volumes/personal_folder/clawd/projects/openclaw`: package 2026.9.6, HEAD `88027bc85c0a4eebbea49a2a5522faec71ecdc14`. SDK docs/source inspected first. | No OpenClaw source/config/policy/credential modification, install, activation or Gateway restart performed. |
+| Current source | NAS `~/clawd/projects/openclaw`, read through existing SMB mount `${OPENCLAW_NAS_SOURCE}`: package 2026.9.6, HEAD `88027bc85c0a4eebbea49a2a5522faec71ecdc14`. SDK docs/source inspected first. | No OpenClaw source/config/policy/credential modification, install, activation or Gateway restart performed. |
 | Concrete repair | Current registrar rejects absent manifest contracts.tools; now declares exactly drover_continuity_owner. Default definition object, V2 factory with required live host invocation guard before each HTTP request (including POST after awaited scope preflight), explicit shipped runtime entry, current Node engines, optional/non-replay-safe side-effect metadata and inactive/startup-lazy defaults. | Trusted run/owner/scope/transport bindings, strict protocol schemas, approval scopes, explicit ack, report-only watchers and no executor/messaging remain. No owner permission expansion. |
 | Current-source proof | Test imports actual NAS source entry resolver/contract helpers and executes current registrar body with fake surrounding registry bookkeeping. Old manifest is rejected; repaired V2 tool registers; missing/retired host authority refuses calls. Revocation during GET preflight prevents POST. | Source/contract proof, not a live Gateway registry/lifecycle/discovery or messaging test. No new PG proof; prior PG facts/gaps unchanged. Hermes untested. |
 | Supported owner installation | Current docs manage-plugins.md and install-source-plan.ts prove npm-pack archive form; README specifies exact owner command/path placeholder. | Explicit user authorization required before installation/config/activation/reload; not executed by worker. Parent sessions_send remains available first-class boundary and was not invoked. |
@@ -99,7 +99,7 @@ Final foreground commands/results (zero skips):
 # Worktree root: 36 passed in 8.08s
 .venv/bin/python -m pytest tests/test_openclaw_owner_plugin.py tests/test_openclaw_owner_protocol.py tests/test_factory_observer_continuity.py -q -rs
 # plugins/openclaw-continuity-owner: 16 passed, 1300.021875ms
-DROVER_TEST_OPENCLAW_NAS_SOURCE=/Volumes/personal_folder/clawd/projects/openclaw npm test
+DROVER_TEST_OPENCLAW_NAS_SOURCE="$OPENCLAW_NAS_SOURCE" npm test
 ```
 
 Schema parity, Black, isort and diff checks passed. Local `npm pack --ignore-scripts

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from drover.server.harness.continuity_schema import CONTINUITY_DDL
+from drover.server.continuity_schema import CONTINUITY_DDL
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import duckdb
 
-from drover.server.harness.continuity_schema import CONTINUITY_DDL
+from drover.server.continuity_schema import CONTINUITY_DDL
 from drover.server.harness.identity import harness_event_identity
 
 HARNESS_TABLES = (
