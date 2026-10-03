@@ -319,6 +319,28 @@ prove PITR, TLS, power-loss durability, capacity, or a production cutover.
 
 ## Workload validation before cutover
 
+The unconditional `pgvector-memory-integration` CI job tests actual vector writes,
+cosine similarity reads and stale-generation exclusion.
+It uses `pgvector/pgvector:0.8.6-pg17-bookworm` pinned to the multi-platform
+digest `sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f`.
+`--require-pgvector` requires an explicit test DSN, asserts that
+`CREATE EXTENSION IF NOT EXISTS vector` succeeds and fails on any skipped test.
+The separate `postgres-integration` job keeps plain PostgreSQL coverage, including
+the missing-extension contracts and the required ledger/memory-integrity
+regressions with their non-vector fixtures, without `--require-pgvector`.
+
+Reproduce the vector gate from a source checkout with Docker and uv installed:
+
+```sh
+bash scripts/test_pgvector_memory.sh
+```
+
+This creates a uniquely named container with an ephemeral loopback port, overrides
+any inherited test DSN, runs the locked dependencies and foreground tests, and
+removes only that container and its anonymous volume on exit. No live stores or
+production credentials are needed. Repository branch-protection settings must
+require the `pgvector-memory-integration` check to prevent merging a failed gate.
+
 Point `DROVER_TEST_POSTGRES_DSN` at a **disposable PostgreSQL instance**, then
 run the synthetic workload from a source checkout:
 

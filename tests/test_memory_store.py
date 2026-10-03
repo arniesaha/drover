@@ -141,9 +141,8 @@ def test_missing_pgvector_is_explicit(pg_control_path, postgres_dsn):
     assert store.count() == {"embedded": 0, "other_model": 0}
 
 
-def test_exact_cosine_search_with_pgvector(pg_control_path, postgres_dsn):
-    if not pgvector_available(postgres_dsn):
-        pytest.skip("pgvector is not installed on this PostgreSQL server")
+@pytest.mark.pgvector
+def test_exact_cosine_search_with_pgvector(pgvector, pg_control_path):
     store = EmbeddingStore(pg_control_path, model="nomic-embed-text")
     with control_plane_connection(pg_control_path) as con:
         assert vector_status(con)[0]
@@ -162,13 +161,18 @@ def test_exact_cosine_search_with_pgvector(pg_control_path, postgres_dsn):
     hits = store.search([0.9, 0.1] + [0.0] * 766, limit=2)
     assert [h.session_id for h in hits] == ["near", "far"]
     assert hits[0].similarity > hits[1].similarity
+    assert hits[0].similarity == pytest.approx(0.9 / (0.9**2 + 0.1**2) ** 0.5)
+    assert hits[1].similarity == pytest.approx(0.1 / (0.9**2 + 0.1**2) ** 0.5)
+    assert [
+        h.session_id
+        for h in store.search([0.9, 0.1] + [0.0] * 766, session_ids=["far"])
+    ] == ["far"]
     assert store.count() == {"embedded": 2, "other_model": 0}
     assert store.embedded_session_ids(["near", "x"]) == {"near"}
 
 
-def test_semantic_search_excludes_stale_generation(pg_control_path, postgres_dsn):
-    if not pgvector_available(postgres_dsn):
-        pytest.skip("pgvector is not installed on this PostgreSQL server")
+@pytest.mark.pgvector
+def test_semantic_search_excludes_stale_generation(pgvector, pg_control_path):
     repo = MemoryRepository(pg_control_path)
     store = EmbeddingStore(pg_control_path, model="m")
     with repo.connection() as con:
