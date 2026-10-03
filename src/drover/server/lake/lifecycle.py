@@ -60,6 +60,11 @@ class ExporterLifecycle:
                     ):
                         raise LakeError("lake_retirement_config_mismatch")
                     activate_retirement(self.config.duckdb_path)
+                from .task_projection import refresh_if_provisioned
+
+                refresh_if_provisioned(
+                    self.config.duckdb_path, lake_fence=getattr(exporter, "fence", None)
+                )
                 self._running = True
                 self._ready.set()
                 while not self._stop.is_set() and not shutdown.is_set():
@@ -74,9 +79,23 @@ class ExporterLifecycle:
                                 raise LakeError("lake_retirement_config_mismatch")
                             if allowed:
                                 raise LakeError("lake_retirement_lost")
-                            exporter.run_once()
+                            result = exporter.run_once()
+                            if result and (
+                                result.get("exported") or result.get("acknowledged")
+                            ):
+                                refresh_if_provisioned(
+                                    self.config.duckdb_path,
+                                    lake_fence=getattr(exporter, "fence", None),
+                                )
                     else:
-                        exporter.run_once()
+                        result = exporter.run_once()
+                        if result and (
+                            result.get("exported") or result.get("acknowledged")
+                        ):
+                            refresh_if_provisioned(
+                                self.config.duckdb_path,
+                                lake_fence=getattr(exporter, "fence", None),
+                            )
                     self._stop.wait(0.25)
         except Exception as exc:
             self._error = (

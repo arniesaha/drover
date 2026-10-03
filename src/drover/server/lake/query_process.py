@@ -236,6 +236,12 @@ def _worker(request: dict) -> dict:
             con.execute(
                 "CREATE TEMP VIEW control_memory_events AS SELECT * FROM agent_events WHERE source='control'"
             )
+        if (request.get("serving") or {}).get("task_projection"):
+            from .task_projection import build_in_child
+
+            return build_in_child(
+                con, build=request["serving"]["task_projection"] == "build"
+            )
         if (request.get("serving") or {}).get("operation"):
             from .read_models import run_model
 

@@ -1477,14 +1477,26 @@ def drover_task_status(
     from drover.server.lake.serving import selected_config
 
     if selected_config(duckdb_path).backend == "ducklake":
-        # No complete, versioned PG task projection exists yet. A verified
-        # event catalog alone cannot authorize stale task aggregates.
-        return {
-            "status": "unavailable",
-            "backend": "ducklake",
-            "reason": "analytics_task_projection_unavailable",
-            "task_id": task_id,
-        }
+        from drover.server.lake.task_projection import task_status
+
+        out = task_status(duckdb_path, task_id=task_id, session_id=session_id)
+        if out["status"] == "unknown":
+            return out
+        import psycopg
+
+        from drover.server.lake.runtime import LakeError
+
+        try:
+            repo = _memory(duckdb_path)
+            summaries = (
+                repo.recent_summaries(task_id=out["task_id"], limit=1) if repo else []
+            )
+        except psycopg.Error:
+            raise LakeError("analytics_task_summary_unavailable") from None
+        out["latest_summary"] = (
+            _summary_row(summaries[0], _TASK_SUMMARY_KEYS) if summaries else None
+        )
+        return out
     if session_id:
         resolution = _resolve(duckdb_path, session_id)
         if resolution["status"] != "ok":

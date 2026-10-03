@@ -109,10 +109,11 @@ requeue, and post-ingest scheduling use the selector. A lake error defers
 post-ingest summary scheduling without changing source ingestion; legacy lock
 errors retain their existing retry behavior.
 
-Selected lake task status returns `analytics_task_projection_unavailable`.
-A verified event catalog does not certify the old task table. Complete,
-versioned PG task projections remain a prerequisite; there is no full-history
-scan or legacy aggregate fallback for task status.
+Selected lake task status now reads completed PostgreSQL task generations.
+The legacy task table is never consulted by selected lake requests. Missing,
+stale, corrupt or incomplete generations return explicit unavailable rather
+than a full-history scan or aggregate fallback. See the task-generation
+procedure below.
 
 `retire_legacy_writers = false` is independently defaulted. Only explicit
 DuckLake opt-in can request retirement. Activation verifies the selected lake
@@ -139,7 +140,7 @@ publication/usage freshness before production cutover.
 
 This is partial serving coverage, not full backend replacement.
 Repository-scoped context/recall bundles, legacy fleet/active-session adapters,
-complete versioned PG task-status projections, native publication/usage freshness,
+native publication/usage freshness,
 and the remaining legacy derived/advisory writer audit still need proof. Daily
 fenced maintenance, immutable paired backups and fresh restore,
 exporter-watermark/rollback rehearsal, platform pin/credential installation,
@@ -177,3 +178,70 @@ no remaining critical or important issues in this implemented scope.
 All lake/PG integration used fixture roots and private throwaway PostgreSQL,
 with `DROVER_TEST_POSTGRES_DSN` removed. No production configuration, data root,
 catalog, hub, restart, migration, cutover or backup deletion was involved.
+
+
+## PostgreSQL task generations
+
+`lake.task_projection.provision_task_projections(path)` is an explicit staging
+provisioning operation against an existing PG control store and selected,
+verified DuckLake catalog. It creates only three PG projection relations and
+one lookup index; no event data is migrated. It is never invoked automatically
+by server startup or serving requests. Production provisioning/cutover remains
+an operator-approved operation, not something performed in this session.
+
+`refresh_task_projections(path)` certifies all canonical task facts and session
+associations in one disposable child, using the existing two-thread/2GB engine,
+2 GiB RSS ceiling, five-second deadline, 1,000 combined task/session-row cap and
+1 MiB output cap. Limit breaches fail explicitly; these caps are not bypassed
+for larger catalogs. The build excludes archived metadata and legacy spans and
+uses the same normalized canonical event view and PG identity mapping as other
+selected reads. It derives distinct session/agent counts, first/last event times
+and deterministic repository/branch/principal attribution. Session-to-task
+association chooses the latest event with deterministic ID/task tie-breaking.
+
+A dedicated PG advisory fence serializes projection builders. The catalog
+mutation fence prevents an export from crossing a build; an exporter refresh
+reuses and checks its existing dedicated owner fence. Publication checks the
+catalog and identity bindings again, verifies both fences, and writes all PG
+rows plus a manifest/receipt in one transaction, receipt last. Deferred foreign
+keys prevent rows without their receipt from surviving. Failed publication
+rolls back all new rows. Generations are retained; none are deleted or replaced.
+
+The receipt binds configuration epoch, pinned verification proof/root, catalog
+snapshot and the complete identity-map hash. Task status verifies catalog
+coverage in disposable metadata queries before and after its PG read, then
+checks generation counts, every PG task payload SHA-256 and the complete session
+map in a repeatable-read transaction. PG projection text is byte-bounded before
+fetching. Task status reads no historical events and never refreshes itself.
+Ambiguous identity aliases are unavailable. Unknown task IDs in a complete
+certified generation remain `status=unknown`. Latest task summaries come from
+the existing authoritative PG memory repository; a PG summary-read error returns
+`analytics_task_summary_unavailable`, without legacy fallback.
+
+Available task facts report `status=observed`, `status_source=canonical_events`.
+This is canonical task membership, not inferred fleet liveness; live/closed
+state is not invented from old event timestamps. `total_cost_usd=null` with
+`cost_coverage=unavailable` makes the absence of a canonical cost source explicit.
+No legacy span costs or native usage/fleet adapters were added. Canonical counts,
+attribution, timestamp instants and summary fields have focused legacy parity
+coverage; legacy mutable status/cost metadata is deliberately not imported.
+
+When these tables have been explicitly provisioned, the opt-in lake exporter
+refreshes before its first claim and after acknowledged/exported batches,
+including batches with zero new winning events. A refresh failure stops that
+lifecycle and releases its fence; the already committed export/ack remains
+durable, while stale task generations are unavailable. A new authorized
+lifecycle refresh repairs them on startup. Absent tables preserve existing
+exporter behavior with task status unavailable. Legacy-default selection still
+uses the unchanged legacy task read path and creates no projection tables.
+
+
+Task-projection validation checkpoint: final foreground **10 passed in 119.46
+seconds**, including the final UUID/byte-bound and summary-error checks. The
+preceding scoped task/selector/activity/lifecycle/MCP run passed **67 tests in
+316.26 seconds**. These counts overlap. Black, isort and `git diff --check`
+passed. Integration used only private PG fixtures and fixture lakes with
+`DROVER_TEST_POSTGRES_DSN` removed. No live schema, config, store, service,
+cutover, backup deletion or migration was touched. Catalogs exceeding the
+initial projection caps remain explicitly unavailable; bounded batching for
+larger generations is an additional cutover capacity gate.
