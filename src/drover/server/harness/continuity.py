@@ -189,6 +189,12 @@ class FactoryObserverContinuity:
         _integer(lease_seconds, "lease_seconds", 1, MAX_LEASE_SECONDS)
         with self._transaction(run_id) as (con, run):
             now = self.clock()
+            # A delayed renewal is a compare-and-swap even after expiry. It
+            # must not silently reacquire after a newer owner epoch expired.
+            if owner_epoch is not None and (
+                type(owner_epoch) is not int or owner_epoch != run["owner_epoch"]
+            ):
+                raise ContinuityConflict("owner epoch changed; read recovery status")
             live = run["lease_until"] is not None and run["lease_until"] > now
             if live:
                 self._fence(run, owner_id, owner_epoch, now)

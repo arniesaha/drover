@@ -198,6 +198,11 @@ increments the epoch, even for the same owner name. Consume and acknowledge
 reject absent, expired, or stale owners. DuckDB's existing control-plane lock
 serializes transactions; PostgreSQL locks the run row with `FOR UPDATE`.
 An expired owner never causes automatic release, a worker launch, or a restart.
+Whenever a lease call supplies `owner_epoch`, that epoch is compared against
+the locked row even after expiry. A delayed old renewal cannot reacquire after
+a newer epoch expires. Omitting the epoch is an explicit acquisition/reclamation;
+it still conflicts with any live lease. An owner should poll after losing a
+lease response rather than guessing the new epoch.
 
 Consume commits the next action and delivery record together **before** replying.
 Only one action may be outstanding; acknowledgment atomically records the new
@@ -237,11 +242,40 @@ the version-1 projection, consume with its epoch, reconcile using `action_id`,
 and acknowledge with the updated checkpoint. These HTTP and recovery contracts
 are covered by focused Python tests; a live OpenClaw producer/owner loop has
 not been integrated or exercised in this implementation.
+The follow-through adds a [validated owner-tool protocol](openclaw-owner-protocol.md)
+with a mock normal-tool harness; it does not register a live OpenClaw plugin.
 
 A Hermes adapter should map its stable report IDs and ordered subject streams
 into the same envelope, then implement the same lease, idempotent action, and
 ack protocol. Adapter transport and owner wake mechanisms stay outside the
 ledger; no Hermes-specific scheduler or Factory controls belong here. Hermes
 has **not** been tested. Live PostgreSQL concurrency, owner transport wiring,
-approval handoff, integration publication/review, and terminal release remain
-integration/release verification boundaries.
+approval handoff, integration publication/review, and terminal release were
+the first-slice verification boundaries. PostgreSQL concurrency is now covered
+on the actual PostgreSQL test facility as described below; the other boundaries
+remain external.
+
+## PostgreSQL follow-through proof
+
+`tests/test_factory_observer_continuity_postgres.py` uses the repository's
+`pg_control_path` / `postgres_dsn` fixtures, never DuckDB as a PG substitute and
+never `DROVER_CONTROL_DSN`. The focused run on 2026-10-03 used a disposable
+PostgreSQL **17.11 (Homebrew), aarch64 macOS** cluster from local
+`/opt/homebrew/opt/postgresql@17/bin`, with isolated per-test schemas. No supplied
+test DSN was set. Five actual PG tests passed with no skips.
+
+The tests establish two distinct `pg_backend_pid()` connections; race two
+owners for acquisition; race the current owner and an intruder for renewal;
+verify compare-and-swap epoch mismatch leaves the lease unchanged; race expired
+re-admission; reject stale owner acks before/after reclaim; race duplicate source
+retries before/after ack; and recover the same action, retry budget, checkpoint,
+and dedupe fence after closing and reconstructing the connection pool/store.
+The PostgreSQL server is not restarted to simulate client recovery.
+
+The driver dependencies explicitly skip with their missing package names.
+The existing facility skips with `no DROVER_TEST_POSTGRES_DSN and no local initdb`
+when there is no authorized test target, or reports the disposable-cluster start
+failure. Run with `-rs` to retain those reasons. A skipped run proves no PG
+semantics. Live hub load, process/network partitions, database/server crash
+recovery, other PostgreSQL versions, and production release remain unverified;
+there is no claim of exactly-once delivery.
