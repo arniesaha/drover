@@ -427,6 +427,14 @@ func hostPresenceDerivation(status: String, expected: HostPresence) {
     #expect(host.presence == expected)
 }
 
+@Test func hostSummaryPrefersTheServerDerivedLivenessField() throws {
+    let json = Data(#"{"host_id": "work-laptop", "status": "online", "liveness": "stale", "connection_kind": "relay"}"#.utf8)
+    let host = try JSONDecoder().decode(HostSummary.self, from: json)
+    #expect(host.presence == .stale)
+    let legacy = Data(#"{"host_id": "nas", "status": "stale"}"#.utf8)
+    #expect(try JSONDecoder().decode(HostSummary.self, from: legacy).presence == .stale)
+}
+
 /// Regression: a single malformed harness entry must not discard every
 /// other entry for the host — decoding is per-element lenient (mirrors
 /// `LenientElement`'s contract, already relied on elsewhere in this file),

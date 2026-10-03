@@ -342,6 +342,30 @@ restart ends the process. The list is empty by default and only applies to
 `in_place`. A symlink flip does not touch a running venv, so on those hosts a
 sibling keeps running its own files until it restarts for its own reasons.
 
+## Host liveness
+
+A host is `online`, `stale`, `offline` or `retired`, derived from heartbeat age
+in one place (`drover.server.harness.liveness`) for direct and relay hosts
+alike. The stored status is only what the host last claimed, so nothing reads
+it. The hub sends the result as `liveness` (and as `status`, for older
+clients) on `/harness/hosts`, with `heartbeat_age_seconds`,
+`stale_after_seconds` and `offline_after_seconds`; the web console, iOS app,
+launch pickers, provider capacity refresh, content-consent fan-out and the MCP
+`drover_fleet_status` (`host_liveness` per session) all use it rather than
+re-deriving it.
+
+| State | Heartbeat silence | Effect |
+| --- | --- | --- |
+| `online` | up to 45 s | probed and launchable |
+| `stale` | 45 s to 10 min | shown flagged; not probed for provider capacity |
+| `offline` | over 10 min, or a relay spoke the hub sees as unresponsive | not launchable; quota reads host-offline |
+| `retired` | n/a | hidden from fleet views, history kept |
+
+Tune with `DROVER_HOST_STALE_AFTER_SECONDS` (default 45) and
+`DROVER_HOST_OFFLINE_AFTER_SECONDS` (default 600) in the hub's environment;
+offline is never shorter than stale. A host that has never heartbeat is judged
+by its stored status.
+
 ## Retiring a host
 
 After uninstalling Drover from a machine, run `drover-server hosts list`, then

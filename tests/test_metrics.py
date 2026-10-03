@@ -1566,7 +1566,7 @@ def test_metrics_collector_keeps_fresh_naive_harness_hosts_online(tmp_path):
 
     assert payload["hosts"][0]["host_id"] == "nas"
     assert payload["hosts"][0]["status"] == "online"
-    assert "stale_after_seconds" not in payload["hosts"][0]
+    assert payload["hosts"][0]["liveness"] == "online"
 
 
 def test_metrics_collector_harness_cwd_suggestions_are_recent_then_favorites(tmp_path):

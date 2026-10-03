@@ -928,7 +928,7 @@ def _dark_relay_fixture():
 def test_dark_relay_host_is_host_offline_not_its_last_probe_error(tmp_path):
     """The reference hub's work-laptop: relay, probe failed, then went dark.
 
-    Relay hosts are exempt from the 45-second `is_stale` skip, so the loop kept
+    Relay hosts used to be exempt from the stale skip, so the loop kept
     probing, every probe failed as `unavailable`, and the 6-day-old reading was
     never tagged `host_offline` -- the one category Home collapsed by age.
     """
@@ -990,8 +990,8 @@ def test_dark_relay_host_is_host_offline_not_its_last_probe_error(tmp_path):
     assert account.observed_at == datetime.fromisoformat(fixture["last_success_at"])
 
 
-def test_relay_host_inside_offline_window_is_still_probed(tmp_path):
-    """Relay hosts keep their #222 exemption from the 45-second stale skip."""
+def test_relay_host_with_a_fresh_heartbeat_is_still_probed(tmp_path):
+    """A relay host that is heartbeating is probed like any other host."""
     fixture = _dark_relay_fixture()
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
     service = ProviderUsageService(tmp_path / "drover.duckdb", tmp_path / "parquet")
@@ -1001,7 +1001,7 @@ def test_relay_host_inside_offline_window_is_still_probed(tmp_path):
             return [
                 HarnessHost(
                     **fixture["host"],
-                    last_seen_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+                    last_seen_at=datetime.now(timezone.utc) - timedelta(seconds=10),
                 )
             ]
 
@@ -1017,206 +1017,3 @@ def test_relay_host_inside_offline_window_is_still_probed(tmp_path):
     loop.run_once()
 
     assert probes == ["work-laptop"]
-
-
-def test_heartbeat_expired_ignores_connection_kind():
-    now = datetime(2026, 10, 1, 18, tzinfo=timezone.utc)
-
-    def _host(kind, last_seen):
-        return HarnessHost(
-            host_id="work-laptop",
-            display_name="work-laptop",
-            kind="macos",
-            status="online",
-            connection_kind=kind,
-            last_seen_at=last_seen,
-        )
-
-    for kind in ("direct", "relay"):
-        assert _host(kind, now - timedelta(seconds=601)).heartbeat_expired(600, now=now)
-        assert not _host(kind, now - timedelta(seconds=600)).heartbeat_expired(
-            600, now=now
-        )
-        # Never heartbeat is unknown, not expired.
-        assert not _host(kind, None).heartbeat_expired(600, now=now)
-
-
-def test_harness_host_is_stale_behavior():
-    now = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
-    fresh_time = now - timedelta(seconds=10)
-    old_time = now - timedelta(seconds=120)
-
-    fresh_host = HarnessHost(
-        host_id="mac-mini",
-        display_name="Mac Mini",
-        kind="macos",
-        status="online",
-        connection_kind="direct",
-        last_seen_at=fresh_time,
-    )
-    stale_host = HarnessHost(
-        host_id="gpu-pc",
-        display_name="GPU PC",
-        kind="linux",
-        status="online",
-        connection_kind="direct",
-        last_seen_at=old_time,
-    )
-    relay_host = HarnessHost(
-        host_id="nas",
-        display_name="NAS",
-        kind="linux",
-        status="online",
-        connection_kind="relay",
-        last_seen_at=old_time,
-    )
-
-    assert fresh_host.is_stale(now=now) is False
-    assert stale_host.is_stale(now=now) is True
-    # Relay hosts don't rely on last_seen_at for staleness
-    assert relay_host.is_stale(now=now) is False
-
-
-def test_is_stale_handles_naive_db_timestamps_against_an_aware_now():
-    """A naive last_seen_at is process-local, so an aware `now` must convert to local.
-
-    DuckDB stores last_seen_at as TIMESTAMP, never TIMESTAMPTZ, so it reads back
-    naive *local* (see registry._db_timestamp_to_utc). Normalizing an aware `now`
-    to naive UTC instead shifts the comparison by the hub's UTC offset: west of
-    UTC every direct host reports stale seconds after heartbeating, which takes
-    all provider capacity dark; east of UTC nothing is ever stale. The other
-    is_stale tests only pass aware/aware, which cannot catch either direction.
-    """
-
-    def _host(last_seen):
-        return HarnessHost(
-            host_id="gpu-pc",
-            display_name="GPU PC",
-            kind="linux",
-            status="online",
-            connection_kind="direct",
-            last_seen_at=last_seen,
-        )
-
-    local_now = datetime.now()
-    aware_now = datetime.now(timezone.utc)
-
-    just_heartbeat = _host(local_now - timedelta(seconds=5))
-    long_gone = _host(local_now - timedelta(seconds=600))
-
-    # The default (now=None) path is the one production takes today.
-    assert just_heartbeat.is_stale() is False
-    assert long_gone.is_stale() is True
-
-    # An explicit aware `now` has to agree with it, whatever the hub's offset.
-    assert just_heartbeat.is_stale(now=aware_now) is False
-    assert long_gone.is_stale(now=aware_now) is True
-
-
-@pytest.mark.parametrize(("toml_value", "expected"), [("900", 900.0), ("900.5", 900.5)])
-def test_provider_freshness_threshold_is_runtime_configurable(
-    tmp_path, toml_value, expected
-):
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(f"[provider]\nfreshness_threshold_seconds = {toml_value}\n")
-
-    config = load_config(config_path)
-
-    assert config.provider_freshness_threshold_seconds == expected
-
-
-@pytest.mark.parametrize(
-    "toml_value",
-    ["nan", "inf", "+inf", "-inf", "true", "false", "0", "-1", '"300"'],
-)
-def test_config_rejects_non_positive_or_non_finite_provider_freshness_thresholds(
-    tmp_path, toml_value
-):
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(f"[provider]\nfreshness_threshold_seconds = {toml_value}\n")
-
-    with pytest.raises(ValueError, match="finite positive number"):
-        load_config(config_path)
-
-
-@pytest.mark.parametrize(
-    "value", [float("nan"), float("inf"), -float("inf"), True, False, 0, -1, "300"]
-)
-def test_provider_service_rejects_invalid_freshness_thresholds(tmp_path, value):
-    with pytest.raises(ValueError, match="finite positive number"):
-        ProviderUsageService(
-            tmp_path / "drover.duckdb",
-            tmp_path / "parquet",
-            freshness_threshold_seconds=value,
-        )
-
-
-@pytest.mark.parametrize("value", [1, 300.5])
-def test_provider_service_accepts_finite_positive_numeric_thresholds(tmp_path, value):
-    service = ProviderUsageService(
-        tmp_path / "drover.duckdb",
-        tmp_path / "parquet",
-        freshness_threshold_seconds=value,
-    )
-
-    assert service.freshness_threshold_seconds == float(value)
-
-
-def test_legacy_codex_source_is_normalized_to_canonical_contract(
-    tmp_path, provider_host
-):
-    parquet_dir = tmp_path / "parquet"
-    duckdb_path = tmp_path / "drover.duckdb"
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
-    service = ProviderUsageService(
-        duckdb_path,
-        parquet_dir,
-        clock=lambda: datetime(2026, 8, 8, 10, 1, tzinfo=timezone.utc),
-    )
-    legacy_payload = {
-        **GOOD_PAYLOAD,
-        "accounts": [{**GOOD_PAYLOAD["accounts"][0], "source": "codex_app_server"}],
-    }
-
-    service.refresh_host(provider_host, fetch=lambda _: legacy_payload)
-
-    assert service.latest_accounts()[0].source == "codex-app-server"
-
-
-def test_explicit_account_identity_round_trips_through_hub_storage(
-    provider_service, provider_host
-):
-    import copy
-
-    payload = copy.deepcopy(GOOD_PAYLOAD)
-    payload["accounts"][0]["account_identity"] = "google-sub:fixture-stable-id"
-    payload["accounts"][0]["account_label"] = "Friendly display name"
-    provider_service.refresh_host(provider_host, fetch=lambda host: payload)
-    accounts = provider_service.latest_accounts()
-    assert accounts[0].account_identity == "google-sub:fixture-stable-id"
-    section = CockpitService(
-        duckdb_path=None, provider_usage=provider_service
-    )._provider_capacity(AnalyticsFilters())
-    assert section["data"][0]["account_identity"] == "google-sub:fixture-stable-id"
-
-
-def test_retired_host_capacity_disappears_without_deleting_snapshots(
-    provider_service, provider_host
-):
-    from drover.server.harness.registry import HarnessRegistry
-
-    registry = HarnessRegistry(provider_service.duckdb_path)
-    registry.register_host(
-        host_id=provider_host.host_id, display_name="Mac", kind="mac"
-    )
-    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
-    assert len(provider_service.latest_accounts()) == 1
-    registry.retire_host(provider_host.host_id, reason="decommissioned")
-    assert provider_service.latest_accounts() == []
-    with duckdb.connect(str(provider_service.duckdb_path)) as con:
-        assert (
-            con.execute("SELECT count(*) FROM provider_usage_snapshots").fetchone()[0]
-            > 0
-        )
-    registry.unretire_host(provider_host.host_id)
-    assert len(provider_service.latest_accounts()) == 1

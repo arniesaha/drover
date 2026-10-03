@@ -27,13 +27,13 @@ from drover.server.db import (
 )
 from drover.server.harness.capabilities import InvalidCapabilities
 from drover.server.harness.daemon import native_transcript_for_session
+from drover.server.harness.liveness import host_liveness
 from drover.server.harness.model_catalog import (
     MAX_CATALOG_WIRE_BYTES,
     CatalogEnvelope,
     catalog_wire_bytes,
 )
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
-from drover.server.harness.models import HARNESS_STALE_AFTER_SECONDS
 from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.recap_prompt import drop_user_subject
 from drover.server.harness.registry import (
@@ -946,32 +946,27 @@ def _harness_host_dict(
     host: Any, relay_manager: "RelayManager | None" = None
 ) -> dict[str, Any]:
     item = dict(host.__dict__)
+    # A relay spoke can attach and then send nothing, and because it
+    # reconnects the moment the silence watchdog drops it, attachment reads
+    # true almost continuously for a host that has been mute for an hour. Ask
+    # whether it is talking back; the heartbeat age does the rest.
+    responsive = None
     if item.get("connection_kind") == "relay":
-        # A relay host has no daemon-reported heartbeat to trust -- the hub's
-        # own socket is ground truth, so it always wins over whatever status
-        # happens to be stored in the row (never leak a stale "online" once
-        # the socket has dropped, and vice versa).
-        #
-        # Attachment is not the test, though. A spoke can attach and then send
-        # nothing, and because it reconnects the moment the silence watchdog
-        # drops it, `is_live` reads true almost continuously for a host that
-        # has been mute for an hour. Ask whether it is talking back instead.
         responsive = (
             relay_manager.is_responsive(host.host_id) if relay_manager else False
         )
-        item["status"] = "online" if responsive else "offline"
-        return _wire_datetimes(
-            item, ("last_seen_at", "created_at", "updated_at", "retired_at")
-        )
-    last_seen_at = getattr(host, "last_seen_at", None)
-    if last_seen_at is not None:
-        if last_seen_at.tzinfo is None:
-            age_s = (datetime.now() - last_seen_at).total_seconds()
-        else:
-            age_s = (datetime.now(timezone.utc) - last_seen_at).total_seconds()
-        if age_s > HARNESS_STALE_AFTER_SECONDS and item.get("status") == "online":
-            item["status"] = "stale"
-            item["stale_after_seconds"] = HARNESS_STALE_AFTER_SECONDS
+    live = host_liveness(host, relay_responsive=responsive)
+    # ``status`` stays the field existing clients read, but it is the derived
+    # state, never the stored claim; ``liveness`` is the explicit contract.
+    item["status"] = live.state
+    item["liveness"] = live.state
+    item["heartbeat_age_seconds"] = (
+        None
+        if live.heartbeat_age_seconds is None
+        else round(live.heartbeat_age_seconds, 1)
+    )
+    item["stale_after_seconds"] = live.stale_after_seconds
+    item["offline_after_seconds"] = live.offline_after_seconds
     return _wire_datetimes(
         item, ("last_seen_at", "created_at", "updated_at", "retired_at")
     )
@@ -1783,7 +1778,7 @@ class MetricsCollector:
         consent = {"enabled": enabled, "epoch": epoch}
         results: list[dict[str, str]] = []
         for host in hosts:
-            if str(getattr(host, "status", "offline")) != "online":
+            if not host_liveness(host).usable:
                 results.append({"host_id": host.host_id, "state": "disconnected"})
                 continue
             results.append(self._push_content_consent(host, consent))

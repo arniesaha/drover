@@ -8,14 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 from drover.server.harness.capabilities import stored_capabilities
-
-#: How long a direct host may go without a heartbeat before it counts as stale.
-#:
-#: One definition, two readers: the provider refresh loop uses it to skip
-#: probing hosts that are not answering, and the fleet payload uses it to mark
-#: a host stale for display. They have to agree -- tuning one alone would leave
-#: the hub still dialling a host the app already shows as stale, or the reverse.
-HARNESS_STALE_AFTER_SECONDS = 45
+from drover.server.harness.liveness import HostLiveness, host_liveness
 
 
 def _loads_object(value: str | None) -> dict[str, Any]:
@@ -71,51 +64,13 @@ class HarnessHost:
             updated_at=row.get("updated_at"),
         )
 
-    def is_stale(
-        self,
-        *,
-        stale_after_seconds: float = HARNESS_STALE_AFTER_SECONDS,
-        now: datetime | None = None,
-    ) -> bool:
-        """True when a direct host has not reported a heartbeat within the stale window.
+    def liveness(self, **kwargs: Any) -> HostLiveness:
+        """online / stale / offline / retired from heartbeat age.
 
-        ``last_seen_at`` normally arrives straight off a DuckDB ``TIMESTAMP``
-        column, and a naive value out of one of those is process-*local* wall
-        time, never UTC -- the same convention spelled out on
-        ``registry._db_timestamp_to_utc``. So an aware ``now`` has to be
-        converted to local before it can be compared against it; converting to
-        naive UTC instead shifts the comparison by the process's UTC offset and
-        reports a host that heartbeat seconds ago as stale.
+        The single derivation every reader uses; see
+        :mod:`drover.server.harness.liveness`.
         """
-        if self.connection_kind == "relay":
-            return False
-        return self.heartbeat_expired(stale_after_seconds, now=now)
-
-    def heartbeat_expired(
-        self, after_seconds: float, *, now: datetime | None = None
-    ) -> bool:
-        """True when the last heartbeat is older than ``after_seconds``.
-
-        Unlike :meth:`is_stale` this holds for relay hosts too. Their liveness
-        for routing is the relay socket, but they register through the same
-        HTTP heartbeat, so a ``last_seen_at`` days old means the host is dark
-        whichever way requests reach it. A host that never heartbeat is
-        unknown, not expired.
-        """
-        if self.last_seen_at is None:
-            return False
-        if now is None:
-            now = (
-                datetime.now(timezone.utc)
-                if self.last_seen_at.tzinfo is not None
-                else datetime.now()
-            )
-        elif self.last_seen_at.tzinfo is not None and now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-        elif self.last_seen_at.tzinfo is None and now.tzinfo is not None:
-            now = now.astimezone().replace(tzinfo=None)
-        age = (now - self.last_seen_at).total_seconds()
-        return age > after_seconds
+        return host_liveness(self, **kwargs)
 
 
 @dataclass(frozen=True)

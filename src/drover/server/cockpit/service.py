@@ -46,12 +46,6 @@ COCKPIT_SECTIONS = (
     "insights",
 )
 PROVIDER_REFRESH_INTERVAL_SECONDS = 300.0
-# Two refresh intervals of heartbeat silence (forty missed 15-second beats)
-# marks a host offline for provider capacity whatever its connection kind.
-# Relay hosts are exempt from the 45-second `is_stale` skip, so without this a
-# relay host that went dark kept failing probes as `unavailable` forever and
-# its days-old quota never read as host-offline.
-PROVIDER_HOST_OFFLINE_AFTER_SECONDS = 2 * PROVIDER_REFRESH_INTERVAL_SECONDS
 # The bounded query is usually about four seconds against the production
 # lakehouse, but a cold concurrent read has exceeded eight seconds and older
 # live measurements put the complete cold overview at 12.4 seconds. Cockpit
@@ -620,20 +614,18 @@ class ProviderRefreshLoop:
             host_id = str(getattr(host, "host_id", "") or "").strip()
             if not host_id:
                 continue
-            status = str(getattr(host, "status", "online") or "").lower()
             # The registry always yields HarnessHost, so call it directly: a
-            # getattr probe defaulting to "not stale" would let a rename
-            # silently turn the whole skip off with every test still green.
-            if (
-                status != "online"
-                or host.is_stale()
-                or host.heartbeat_expired(PROVIDER_HOST_OFFLINE_AFTER_SECONDS)
-            ):
+            # getattr probe would let a rename silently turn the skip off with
+            # every test still green. Only an online host is probed; stale
+            # ones are skipped too, since the hub would just dial a host that
+            # has stopped answering.
+            liveness = host.liveness().state
+            if liveness != "online":
                 try:
                     self.provider_usage.mark_host_unavailable(
                         host_id,
                         error_category=(
-                            "host_retired" if status == "retired" else "host_offline"
+                            "host_retired" if liveness == "retired" else "host_offline"
                         ),
                     )
                 except Exception as exc:  # noqa: BLE001 - status overlay is isolated

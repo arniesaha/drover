@@ -1125,11 +1125,9 @@ def drover_fleet_status(
         from drover.server.harness.registry import HarnessRegistry
 
         registry = HarnessRegistry(duckdb_path)
-        retired = {
-            host.host_id
-            for host in registry.list_hosts(include_retired=True)
-            if host.retired_at is not None
-        }
+        all_hosts = registry.list_hosts(include_retired=True)
+        liveness = {host.host_id: host.liveness().state for host in all_hosts}
+        retired = {host.host_id for host in all_hosts if host.retired_at is not None}
         retired_sessions = set()
         for host_id in retired:
             for session in registry.list_sessions(host_id=host_id):
@@ -1183,6 +1181,9 @@ def drover_fleet_status(
         for s in sessions:
             content = snippets.get(s["session_id"])
             s["latest_user_message"] = (content or "")[:300] if content else None
+            # Derived from heartbeat age, so an agent never trusts a session
+            # on a host that went dark; None when the agent is not a host.
+            s["host_liveness"] = liveness.get(s["agent_id"])
     finally:
         con.close()
     return {"active_sessions": sessions, "count": len(sessions)}
