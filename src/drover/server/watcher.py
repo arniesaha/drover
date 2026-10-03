@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -573,7 +574,18 @@ class IncomingWatcher:
         started = time.monotonic()
         attempted = 0
         try:
-            for jsonl in sorted(self._incoming.rglob("*.jsonl")):
+            # Prune audit directories before descending. Filtering rglob's
+            # results still enumerated every archived file before the first
+            # pending batch, on the foreground pre-bind startup path.
+            pending = []
+            for directory, subdirs, filenames in os.walk(self._incoming):
+                subdirs[:] = [name for name in subdirs if name != ".processed"]
+                pending.extend(
+                    Path(directory) / name
+                    for name in filenames
+                    if name.endswith(".jsonl")
+                )
+            for jsonl in sorted(pending):
                 if self._stopping.is_set():
                     return
                 if ".processed" in jsonl.parts:  # the audit archive, not backlog
