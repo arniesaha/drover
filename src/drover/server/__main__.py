@@ -20,6 +20,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
+# This opt-in timer must precede third-party and server-wide imports.
+from drover.server.startup_diagnostics import arm_startup_diagnostics
+
+_startup_diagnostics = arm_startup_diagnostics()
+
+# isort: split
 import click
 import duckdb
 from mcp.server.fastmcp import FastMCP
@@ -857,6 +863,8 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
     )
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
+    if _startup_diagnostics is not None:
+        ctx.call_on_close(_startup_diagnostics.close)
 
 
 @main.command(name="setup-check")
@@ -2434,6 +2442,34 @@ def _analytics_worker_health(
     return {"state": "degraded" if health.get("last_error") else "ok", "outbox": outbox}
 
 
+@contextmanager
+def _startup_phase(name: str):
+    """Emit phase names and elapsed time without exception/query payloads."""
+    started = time.monotonic()
+    identity = (
+        f"pid={os.getpid()} runtime={sys.executable!r} version={drover.__version__}"
+    )
+    log.info("startup phase %s starting (%s)", name, identity)
+    try:
+        yield
+    except Exception as exc:
+        log.error(
+            "startup phase %s failed after %.3fs (%s; %s)",
+            name,
+            time.monotonic() - started,
+            type(exc).__name__,
+            identity,
+        )
+        raise
+    else:
+        log.info(
+            "startup phase %s completed in %.3fs (%s)",
+            name,
+            time.monotonic() - started,
+            identity,
+        )
+
+
 @main.command()
 @click.option(
     "--role",
@@ -2491,7 +2527,8 @@ def run(
 ) -> None:
     """Run the selected all, API, or analytics role in the foreground."""
     _register_stack_dump()
-    cfg = _resolve_config(ctx.obj["config_path"])
+    with _startup_phase("resolve_startup_config"):
+        cfg = _resolve_config(ctx.obj["config_path"])
     runtime_config_path = (
         Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     )
@@ -2550,19 +2587,23 @@ def run(
     # external SSD that blocked all-role startup for >10 minutes before MCP or
     # OTLP could bind. The analytical views are finalized after the network
     # surfaces are listening.
-    pin_analytical_connection(cfg.duckdb_path)
-    bootstrap(
-        parquet_dir=cfg.parquet_dir,
-        duckdb_path=cfg.duckdb_path,
-        bind_parquet_views=False,
-    )
+    with _startup_phase("pin_analytical_connection"):
+        pin_analytical_connection(cfg.duckdb_path)
+    with _startup_phase("bootstrap_catalog_and_control_store"):
+        bootstrap(
+            parquet_dir=cfg.parquet_dir,
+            duckdb_path=cfg.duckdb_path,
+            bind_parquet_views=False,
+        )
     central_consent: CentralContentConsent | None = None
     if cfg.control_store.backend == "postgres":
-        require_control_store_ready(cfg.duckdb_path)
-        central_consent = CentralContentConsent(
-            cfg.duckdb_path, legacy_config_path=runtime_config_path
-        )
-        central_consent.initialize(cfg.advisory_content)
+        with _startup_phase("require_control_store_ready"):
+            require_control_store_ready(cfg.duckdb_path)
+        with _startup_phase("initialize_central_consent"):
+            central_consent = CentralContentConsent(
+                cfg.duckdb_path, legacy_config_path=runtime_config_path
+            )
+            central_consent.initialize(cfg.advisory_content)
     host_bridge = (
         HostDataBridgeClient(
             cfg.analytics_boundary,
@@ -2571,7 +2612,8 @@ def run(
         if selected_role == "analytics"
         else None
     )
-    worker_archive_resolver = _worker_archive_payload_resolver(cfg)
+    with _startup_phase("build_worker_archive_resolver"):
+        worker_archive_resolver = _worker_archive_payload_resolver(cfg)
     # After bootstrap, which is what creates and migrates the control-plane
     # store, and before any worker starts, so the one moment the control plane
     # touches a connect lock is a moment when nothing is scanning. Pins the
@@ -2579,13 +2621,15 @@ def run(
     # DuckDB's file lock against a co-resident harnessd, which shares that
     # store -- and db.py logs which way it went. The lock split and the
     # separate database in control_plane_connection apply regardless (#95).
-    pin_control_plane_connection(cfg.duckdb_path)
+    with _startup_phase("pin_control_plane_connection"):
+        pin_control_plane_connection(cfg.duckdb_path)
     # Snapshot copies are only cleaned up when a process exits gracefully, and a
     # hub that is killed or restarted by launchd does not. They accumulated
     # across every restart until the volume ran out (#171), so startup is where
     # the previous process's leavings get collected. Anything recent belongs to
     # a co-resident process still using it and is left alone.
-    sweep_orphaned_snapshot_scratch(cfg.duckdb_path)
+    with _startup_phase("sweep_orphaned_snapshot_scratch"):
+        sweep_orphaned_snapshot_scratch(cfg.duckdb_path)
 
     # An explicit --metrics-host wins; otherwise the bind comes from
     # [server] metrics_host in config.toml. Keeping it in config matters
@@ -2608,7 +2652,8 @@ def run(
         receipt_retention_days=cfg.receipt_retention_days,
         advisory_occurrence_retention_days=cfg.advisory_occurrence_retention_days,
     )
-    watcher.start()
+    with _startup_phase("watcher_start_and_backlog"):
+        watcher.start()
 
     # PostgreSQL events become analytical input only through the durable
     # manifest relation.  This starts after bootstrap and before derived jobs,
@@ -2622,7 +2667,8 @@ def run(
                 analytical_path=cfg.duckdb_path,
                 parquet_dir=cfg.parquet_dir,
             )
-            outbox_exporter.start(shutdown_event=stop)
+            with _startup_phase("start_control_outbox_exporter"):
+                outbox_exporter.start(shutdown_event=stop)
             log.info("control outbox exporter ready")
         except Exception:  # noqa: BLE001 - control remains available, export lags
             log.exception("control outbox exporter failed to start")
@@ -2654,12 +2700,13 @@ def run(
                 cfg.duckdb_path, analyzer_id, target_id, source_version
             ),
         )
-        advisory_worker.start(
-            analyzers=advisory_analyzers,
-            scheduler=advisory_scheduler,
-            shutdown_event=stop,
-            poll_interval_seconds=cfg.advisory_poll_interval_seconds,
-        )
+        with _startup_phase("start_advisory_worker"):
+            advisory_worker.start(
+                analyzers=advisory_analyzers,
+                scheduler=advisory_scheduler,
+                shutdown_event=stop,
+                poll_interval_seconds=cfg.advisory_poll_interval_seconds,
+            )
         log.info(
             "advisory worker ready (full_review_interval=%.0fs)",
             cfg.advisory_full_review_interval_seconds,
@@ -2692,7 +2739,8 @@ def run(
             duckdb_path=cfg.duckdb_path,
             archive_resolver=worker_archive_resolver,
         )
-        usage_rollup.start()
+        with _startup_phase("start_usage_rollup"):
+            usage_rollup.start()
         log.info(
             "usage rollup worker ready (interval=%.0fs)", usage_rollup.poll_interval_s
         )
@@ -2705,7 +2753,8 @@ def run(
         native_usage_rollup = NativeUsageRollupWorker(
             duckdb_path=cfg.duckdb_path, maintenance_gate=analytics_gate
         )
-        native_usage_rollup.start()
+        with _startup_phase("start_native_usage_rollup"):
+            native_usage_rollup.start()
         log.info(
             "native usage rollup worker ready (interval=%.0fs)",
             native_usage_rollup.poll_interval_s,
@@ -2784,72 +2833,76 @@ def run(
     metrics_server = None
     metrics_collector: MetricsCollector | None = None
     provider_refresh: ProviderRefreshLoop | None = None
-    embeddings_state = _embeddings_state(cfg, enabled=not no_embeddings)
+    with _startup_phase("embeddings_configuration"):
+        embeddings_state = _embeddings_state(cfg, enabled=not no_embeddings)
     config_path = (
         Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     )
     if not no_metrics and cfg.metrics_http_port > 0:
         try:
-            auth = load_auth(cfg)
+            with _startup_phase("load_metrics_auth"):
+                auth = load_auth(cfg)
             # Register the push sender before the HTTP surface starts taking
             # harness events, so the first awaiting transition after boot is
             # already deliverable.
-            _configure_push(cfg, auth)
-            metrics_collector = MetricsCollector(
-                duckdb_path=cfg.duckdb_path,
-                incoming_dir=cfg.incoming_dir,
-                summarizer_report=summarize_backend_auth(
-                    backend_policy=cfg.summarizer_backend_policy,
-                    api_model=cfg.summarizer_api_model,
-                    harness_model=cfg.summarizer_harness_model,
-                    local_model=cfg.summarizer_local_model,
-                    local_ollama_url=cfg.summarizer_local_ollama_url or None,
-                    gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
-                    gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
-                ),
-                embeddings_state=embeddings_state,
-                api_token=auth.api_token if auth.enabled else "",
-                favorite_cwds=cfg.harness_favorite_cwds,
-                advisory_service=InsightsService(
-                    cfg.duckdb_path,
-                    config_path=config_path,
-                    central_consent=central_consent,
-                    isolated_snapshots=True,
-                ),
-                content_consent_propagator=(
-                    (
-                        lambda enabled, epoch: host_bridge.propagate_content_consent(
-                            enabled=enabled, epoch=epoch
+            with _startup_phase("configure_metrics_push"):
+                _configure_push(cfg, auth)
+            with _startup_phase("construct_metrics_services"):
+                metrics_collector = MetricsCollector(
+                    duckdb_path=cfg.duckdb_path,
+                    incoming_dir=cfg.incoming_dir,
+                    summarizer_report=summarize_backend_auth(
+                        backend_policy=cfg.summarizer_backend_policy,
+                        api_model=cfg.summarizer_api_model,
+                        harness_model=cfg.summarizer_harness_model,
+                        local_model=cfg.summarizer_local_model,
+                        local_ollama_url=cfg.summarizer_local_ollama_url or None,
+                        gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
+                        gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
+                    ),
+                    embeddings_state=embeddings_state,
+                    api_token=auth.api_token if auth.enabled else "",
+                    favorite_cwds=cfg.harness_favorite_cwds,
+                    advisory_service=InsightsService(
+                        cfg.duckdb_path,
+                        config_path=config_path,
+                        central_consent=central_consent,
+                        isolated_snapshots=True,
+                    ),
+                    content_consent_propagator=(
+                        (
+                            lambda enabled, epoch: host_bridge.propagate_content_consent(
+                                enabled=enabled, epoch=epoch
+                            )
                         )
-                    )
-                    if host_bridge is not None
-                    else None
-                ),
-                archive_resolver=worker_archive_resolver,
-            )
-            provider_usage = ProviderUsageService(
-                duckdb_path=cfg.duckdb_path,
-                parquet_dir=cfg.parquet_dir,
-                api_token=auth.api_token if auth.enabled else None,
-                freshness_threshold_seconds=cfg.provider_freshness_threshold_seconds,
-            )
-            metrics_collector.spans_enabled = cfg.spans_enabled
-            metrics_collector.cockpit_service = CockpitService(
-                duckdb_path=cfg.duckdb_path,
-                provider_usage=provider_usage,
-                maintenance_gate=analytics_gate,
-                spans_enabled=cfg.spans_enabled,
-            )
-            # The first cockpit request after a restart pays to open DuckDB and
-            # read the parquet views' metadata: measured at 15.6s cold against
-            # 3.9-5.3s warm, and the iOS client abandons the whole response at
-            # 15s. Whoever asks first should not be the one paying that, so the
-            # server pays it itself, off the request path.
-            _warm_cockpit(metrics_collector.cockpit_service)
-            # Pairing codes live only in this process's memory, which is why
-            # `drover-server pair` reaches the hub over loopback rather than
-            # minting in-process. A restart invalidates outstanding codes.
-            pairing = PairingCodes()
+                        if host_bridge is not None
+                        else None
+                    ),
+                    archive_resolver=worker_archive_resolver,
+                )
+                provider_usage = ProviderUsageService(
+                    duckdb_path=cfg.duckdb_path,
+                    parquet_dir=cfg.parquet_dir,
+                    api_token=auth.api_token if auth.enabled else None,
+                    freshness_threshold_seconds=cfg.provider_freshness_threshold_seconds,
+                )
+                metrics_collector.spans_enabled = cfg.spans_enabled
+                metrics_collector.cockpit_service = CockpitService(
+                    duckdb_path=cfg.duckdb_path,
+                    provider_usage=provider_usage,
+                    maintenance_gate=analytics_gate,
+                    spans_enabled=cfg.spans_enabled,
+                )
+                # The first cockpit request after a restart pays to open DuckDB and
+                # read the parquet views' metadata: measured at 15.6s cold against
+                # 3.9-5.3s warm, and the iOS client abandons the whole response at
+                # 15s. Whoever asks first should not be the one paying that, so the
+                # server pays it itself, off the request path.
+                _warm_cockpit(metrics_collector.cockpit_service)
+                # Pairing codes live only in this process's memory, which is why
+                # `drover-server pair` reaches the hub over loopback rather than
+                # minting in-process. A restart invalidates outstanding codes.
+                pairing = PairingCodes()
 
             # The hub decides what the fleet converges on and publishes it on
             # the heartbeat every harnessd already sends. Attached to the
@@ -2862,32 +2915,37 @@ def run(
                 metrics_collector.update_planner = planner
                 _start_update_checker(planner, cfg, stop)
 
-            if selected_role == "analytics":
-                worker_url = urlsplit(cfg.analytics_boundary.worker_url)
-                metrics_server = start_analytics_boundary_server(
-                    host=worker_url.hostname or "127.0.0.1",
-                    port=worker_url.port or 7082,
-                    token=os.environ[cfg.analytics_boundary.api_to_worker_token_env],
-                    config=cfg.analytics_boundary,
-                    dispatch=analytics_boundary_dispatcher(metrics_collector),
-                    archive_payload_resolver=(
-                        worker_archive_resolver.resolve
-                        if worker_archive_resolver is not None
-                        else None
-                    ),
-                    health_provider=lambda: _analytics_worker_health(outbox_exporter),
-                )
-            else:
-                # Retries a missing bind address and rebinds if it vanishes
-                # while serving, so a VPN going down no longer leaves the hub
-                # running with no listener until someone restarts it (#457).
-                metrics_server = start_resilient_metrics_server(
-                    host=metrics_host,
-                    port=cfg.metrics_http_port,
-                    collector=metrics_collector,
-                    auth=auth,
-                    pairing=pairing,
-                )
+            with _startup_phase("start_http_listener"):
+                if selected_role == "analytics":
+                    worker_url = urlsplit(cfg.analytics_boundary.worker_url)
+                    metrics_server = start_analytics_boundary_server(
+                        host=worker_url.hostname or "127.0.0.1",
+                        port=worker_url.port or 7082,
+                        token=os.environ[
+                            cfg.analytics_boundary.api_to_worker_token_env
+                        ],
+                        config=cfg.analytics_boundary,
+                        dispatch=analytics_boundary_dispatcher(metrics_collector),
+                        archive_payload_resolver=(
+                            worker_archive_resolver.resolve
+                            if worker_archive_resolver is not None
+                            else None
+                        ),
+                        health_provider=lambda: _analytics_worker_health(
+                            outbox_exporter
+                        ),
+                    )
+                else:
+                    # Retries a missing bind address and rebinds if it vanishes
+                    # while serving, so a VPN going down no longer leaves the hub
+                    # running with no listener until someone restarts it (#457).
+                    metrics_server = start_resilient_metrics_server(
+                        host=metrics_host,
+                        port=cfg.metrics_http_port,
+                        collector=metrics_collector,
+                        auth=auth,
+                        pairing=pairing,
+                    )
             _warm_metrics(metrics_collector)
             provider_refresh = ProviderRefreshLoop(
                 provider_usage=provider_usage,
