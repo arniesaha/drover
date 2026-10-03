@@ -13,7 +13,7 @@ from .runtime import LakeError
 from .serving import _SELECTION_LOCK, lake_spec, open_history, selected_config
 
 PROJECTION_LOCK = 0x4452565441534B01
-MAX_ROWS = 1000
+PAGE_ROWS = 500
 MAX_BYTES = 1024 * 1024
 
 
@@ -45,7 +45,7 @@ def projection_fence(path):
             con.execute("SELECT pg_advisory_unlock(?)", [PROJECTION_LOCK])
 
 
-def _capture(path, *, build=False):
+def _capture(path, *, build=False, kind=None, after=None):
     config = selected_config(path)
     if config.backend != "ducklake":
         raise LakeError("lake_backend_not_selected")
@@ -58,6 +58,8 @@ def _capture(path, *, build=False):
                 "verification_sha256": config.verification_sha256,
                 "identities": identities,
                 "task_projection": "build" if build else "token",
+                "projection_kind": kind,
+                "projection_after": after,
             },
         )
     return {
@@ -126,35 +128,62 @@ def refresh_task_projections(path, *, lake_fence=None):
         projection_fence(path) as con,
         _lake_fence(path, lake_fence) as fence,
     ):
-        binding, result = _capture(path, build=True)
-        tasks, sessions = result["tasks"], result["sessions"]
-        if len(tasks) + len(sessions) > MAX_ROWS:
-            raise LakeError("analytics_row_limit_exceeded")
+        binding, _ = _capture(path)
         generation = str(uuid4())
-        manifest = {
-            "tasks": {row["task_id"]: _hash(row) for row in tasks},
-            "sessions": dict(sessions),
-        }
-        if len(manifest["tasks"]) != len(tasks) or len(manifest["sessions"]) != len(
-            sessions
-        ):
-            raise LakeError("analytics_task_projection_duplicate")
-        # Detect export/identity/epoch changes during computation; the generation
-        # remains snapshot-bound even if a later export races the PG commit.
-        if _capture(path)[0] != binding:
-            raise LakeError("analytics_task_projection_changed")
+        manifest = {"version": 2}
+        counts = {}
         con.execute("BEGIN")
         try:
-            for row in tasks:
-                con.execute(
-                    "INSERT INTO lake_task_rows VALUES (?,?,?)",
-                    [generation, row["task_id"], _encoded(row)],
-                )
-            for sid, task in sessions:
-                con.execute(
-                    "INSERT INTO lake_task_sessions VALUES (?,?,?)",
-                    [generation, sid, task],
-                )
+            for kind in ("tasks", "sessions"):
+                after = None
+                digest = hashlib.sha256()
+                count = 0
+                while True:
+                    page_binding, result = _capture(
+                        path, build=True, kind=kind, after=after
+                    )
+                    if page_binding != binding:
+                        raise LakeError("analytics_task_projection_changed")
+                    page = result[kind]
+                    pg_bytes = sum(
+                        (
+                            len(row["task_id"].encode()) + len(_encoded(row).encode())
+                            if kind == "tasks"
+                            else sum(len(value.encode()) for value in row)
+                        )
+                        for row in page
+                    )
+                    if (
+                        len(page) > PAGE_ROWS
+                        or len(_encoded(page).encode()) > MAX_BYTES
+                        or pg_bytes > MAX_BYTES
+                    ):
+                        raise LakeError("analytics_task_projection_page_limit")
+                    for row in page:
+                        key = row["task_id"] if kind == "tasks" else row[0]
+                        if after is not None and key <= after:
+                            raise LakeError("analytics_task_projection_duplicate")
+                        after = key
+                        if kind == "tasks":
+                            con.execute(
+                                "INSERT INTO lake_task_rows VALUES (?,?,?)",
+                                [generation, key, _encoded(row)],
+                            )
+                            leaf = [key, _hash(row)]
+                        else:
+                            con.execute(
+                                "INSERT INTO lake_task_sessions VALUES (?,?,?)",
+                                [generation, *row],
+                            )
+                            leaf = list(row)
+                        digest.update((_encoded(leaf) + "\n").encode())
+                        count += 1
+                    if len(page) < PAGE_ROWS:
+                        break
+                counts[kind] = count
+                manifest[kind] = digest.hexdigest()
+            if _capture(path)[0] != binding:
+                raise LakeError("analytics_task_projection_changed")
             _before_receipt(con)
             fence.check()
             held = con.execute(
@@ -171,8 +200,8 @@ def refresh_task_projections(path, *, lake_fence=None):
                     generation,
                     _encoded(binding),
                     _encoded(manifest),
-                    len(tasks),
-                    len(sessions),
+                    counts["tasks"],
+                    counts["sessions"],
                 ],
             )
             con.execute("COMMIT")
@@ -192,50 +221,67 @@ def task_status(path, *, task_id=None, session_id=None):
                 )
                 try:
                     receipt = con.execute(
-                        "SELECT generation,manifest,task_count,session_count FROM lake_task_generations WHERE binding=? AND octet_length(manifest)<=1048576 ORDER BY receipt_seq DESC LIMIT 1",
+                        "SELECT generation,CASE WHEN octet_length(manifest)<=1048576 THEN manifest END,task_count,session_count FROM lake_task_generations WHERE binding=? ORDER BY receipt_seq DESC LIMIT 1",
                         [_encoded(binding)],
                     ).fetchone()
                     if not receipt:
                         raise LakeError("analytics_task_projection_unavailable")
                     generation, encoded, task_count, session_count = receipt
-                    if (
-                        len(encoded.encode()) > MAX_BYTES
-                        or task_count + session_count > MAX_ROWS
-                    ):
+                    if encoded is None or len(encoded.encode()) > MAX_BYTES:
                         raise LakeError("analytics_task_projection_incomplete")
                     manifest = json.loads(encoded)
-                    counts = con.execute(
-                        "SELECT (SELECT count(*) FROM lake_task_rows WHERE generation=?),(SELECT count(*) FROM lake_task_sessions WHERE generation=?)",
-                        [generation, generation],
-                    ).fetchone()
-                    if (
-                        tuple(counts) != (task_count, session_count)
-                        or len(manifest["tasks"]) != task_count
-                        or len(manifest["sessions"]) != session_count
+                    if manifest.get("version") != 2:
+                        raise LakeError("analytics_task_projection_incomplete")
+                    # Stream and certify the entire generation within one PG
+                    # repeatable-read snapshot; never load a global key map.
+                    for kind, expected_count in (
+                        ("tasks", task_count),
+                        ("sessions", session_count),
                     ):
-                        raise LakeError("analytics_task_projection_incomplete")
-                    # Certify every PG row, not just the requested leaf. No event
-                    # history is read. Bound byte size before fetching any text.
-                    sizes = con.execute(
-                        "SELECT (SELECT coalesce(sum(octet_length(payload)+octet_length(task_id)),0) FROM lake_task_rows WHERE generation=?)+(SELECT coalesce(sum(octet_length(session_id)+octet_length(task_id)),0) FROM lake_task_sessions WHERE generation=?)",
-                        [generation, generation],
-                    ).fetchone()[0]
-                    if sizes > MAX_BYTES:
-                        raise LakeError("analytics_task_projection_incomplete")
-                    hashes = dict(
-                        con.execute(
-                            "SELECT task_id,encode(sha256(convert_to(payload,'UTF8')),'hex') FROM lake_task_rows WHERE generation=? LIMIT 1001",
-                            [generation],
-                        ).fetchall()
-                    )
-                    mappings = dict(
-                        con.execute(
-                            "SELECT session_id,task_id FROM lake_task_sessions WHERE generation=? LIMIT 1001",
-                            [generation],
-                        ).fetchall()
-                    )
-                    if hashes != manifest["tasks"] or mappings != manifest["sessions"]:
-                        raise LakeError("analytics_task_projection_incomplete")
+                        digest = hashlib.sha256()
+                        count = 0
+                        after = None
+                        table = (
+                            "lake_task_rows"
+                            if kind == "tasks"
+                            else "lake_task_sessions"
+                        )
+                        key = "task_id" if kind == "tasks" else "session_id"
+                        value = "payload" if kind == "tasks" else "task_id"
+                        while True:
+                            predicate = f'FROM {table} WHERE generation=? AND (CAST(? AS TEXT) IS NULL OR {key} COLLATE "C">?) ORDER BY {key} COLLATE "C" LIMIT {PAGE_ROWS}'
+                            sizes = con.execute(
+                                f"SELECT coalesce(sum(octet_length(k)+octet_length(v)),0) FROM (SELECT {key} k,{value} v "
+                                + predicate
+                                + ") bounded",
+                                [generation, after, after],
+                            ).fetchone()[0]
+                            if sizes > MAX_BYTES:
+                                raise LakeError("analytics_task_projection_incomplete")
+                            expression = (
+                                "encode(sha256(convert_to(payload,'UTF8')),'hex')"
+                                if kind == "tasks"
+                                else "task_id"
+                            )
+                            page = con.execute(
+                                f"SELECT {key},{expression} " + predicate,
+                                [generation, after, after],
+                            ).fetchall()
+                            for leaf in page:
+                                if after is not None and leaf[0] <= after:
+                                    raise LakeError(
+                                        "analytics_task_projection_incomplete"
+                                    )
+                                after = leaf[0]
+                                digest.update((_encoded(list(leaf)) + "\n").encode())
+                                count += 1
+                            if len(page) < PAGE_ROWS:
+                                break
+                        if (
+                            count != expected_count
+                            or digest.hexdigest() != manifest[kind]
+                        ):
+                            raise LakeError("analytics_task_projection_incomplete")
                     if session_id:
                         sid = session_id
                         # Identity aliases belong to the certified identity snapshot.
@@ -253,10 +299,6 @@ def task_status(path, *, task_id=None, session_id=None):
                             "SELECT task_id FROM lake_task_sessions WHERE generation=? AND session_id=?",
                             [generation, sid],
                         ).fetchone()
-                        if mapping and manifest["sessions"].get(sid) != mapping[0]:
-                            raise LakeError("analytics_task_projection_incomplete")
-                        if not mapping and sid in manifest["sessions"]:
-                            raise LakeError("analytics_task_projection_incomplete")
                         task_id = mapping[0] if mapping else None
                     row = con.execute(
                         "SELECT payload FROM lake_task_rows WHERE generation=? AND task_id=?",
@@ -266,11 +308,7 @@ def task_status(path, *, task_id=None, session_id=None):
                         if len(row[0].encode()) > MAX_BYTES:
                             raise LakeError("analytics_task_projection_incomplete")
                         payload = json.loads(row[0])
-                        if _hash(payload) != manifest["tasks"].get(task_id):
-                            raise LakeError("analytics_task_projection_incomplete")
                     else:
-                        if task_id in manifest["tasks"]:
-                            raise LakeError("analytics_task_projection_incomplete")
                         payload = {"status": "unknown", "task_id": task_id}
                     con.execute("COMMIT")
                 except BaseException:
@@ -301,39 +339,47 @@ def refresh_if_provisioned(path, *, lake_fence=None):
         refresh_task_projections(path, lake_fence=lake_fence)
 
 
-def build_in_child(con, *, build):
+def build_in_child(con, *, build, kind=None, after=None):
     snapshot = con.execute("SELECT max(snapshot_id) FROM lake.snapshots()").fetchone()[
         0
     ]
     result = {"snapshot": snapshot, "rows": []}
     if not build:
         return result
-    cursor = con.execute(
-        """SELECT task_id,
+    if kind not in ("tasks", "sessions"):
+        raise LakeError("analytics_task_projection_page_invalid")
+    tasks = []
+    if kind == "tasks":
+        cursor = con.execute(
+            """SELECT task_id,
       arg_max(repo_owner,struct_pack(ts:=timestamp,id:=id,repo:=repo_owner,name:=repo_name,branch:=branch,principal:=principal_id)) AS repo_owner,
       arg_max(repo_name,struct_pack(ts:=timestamp,id:=id,repo:=repo_owner,name:=repo_name,branch:=branch,principal:=principal_id)) AS repo_name,
       arg_max(branch,struct_pack(ts:=timestamp,id:=id,repo:=repo_owner,name:=repo_name,branch:=branch,principal:=principal_id)) AS branch,
       arg_max(principal_id,struct_pack(ts:=timestamp,id:=id,repo:=repo_owner,name:=repo_name,branch:=branch,principal:=principal_id)) AS principal_id,
       min(timestamp) AS created_at,max(timestamp) AS last_activity_at,
       count(DISTINCT session_id) AS session_count,count(DISTINCT agent_id) AS agent_count
-      FROM agent_events WHERE task_id IS NOT NULL GROUP BY task_id ORDER BY task_id LIMIT 1001"""
-    )
-    names = [field[0] for field in cursor.description]
-    tasks = [dict(zip(names, row)) for row in cursor.fetchall()]
-    for task in tasks:
-        for key in ("created_at", "last_activity_at"):
-            if task[key] is not None:
-                task[key] = task[key].isoformat()
-        task.update(
-            status="observed",
-            total_cost_usd=None,
-            status_source="canonical_events",
-            cost_coverage="unavailable",
+      FROM agent_events WHERE task_id IS NOT NULL AND (? IS NULL OR task_id>?) GROUP BY task_id ORDER BY task_id LIMIT ?""",
+            [after, after, PAGE_ROWS],
         )
-    sessions = con.execute("""SELECT session_id,task_id FROM agent_events
-      WHERE task_id IS NOT NULL AND session_id IS NOT NULL
+        names = [field[0] for field in cursor.description]
+        tasks = [dict(zip(names, row)) for row in cursor.fetchall()]
+        for task in tasks:
+            for key in ("created_at", "last_activity_at"):
+                if task[key] is not None:
+                    task[key] = task[key].isoformat()
+            task.update(
+                status="observed",
+                total_cost_usd=None,
+                status_source="canonical_events",
+                cost_coverage="unavailable",
+            )
+    sessions = []
+    if kind == "sessions":
+        sessions = con.execute(
+            """SELECT session_id,task_id FROM agent_events
+      WHERE task_id IS NOT NULL AND session_id IS NOT NULL AND (? IS NULL OR session_id>?)
       QUALIFY row_number() OVER(PARTITION BY session_id ORDER BY timestamp DESC NULLS LAST,id DESC NULLS LAST,task_id DESC)=1
-      ORDER BY session_id LIMIT 1001""").fetchall()
-    if len(tasks) + len(sessions) > MAX_ROWS:
-        raise LakeError("analytics_row_limit_exceeded")
+      ORDER BY session_id LIMIT ?""",
+            [after, after, PAGE_ROWS],
+        ).fetchall()
     return {**result, "tasks": tasks, "sessions": sessions}

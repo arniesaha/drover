@@ -490,3 +490,157 @@ def test_task_summary_pg_error_is_explicit_unavailable(task_lake, monkeypatch):
     result = tools.drover_task_status(duckdb_path=path, task_id="task-s")
     assert result["status"] == "unavailable"
     assert result["reason"] == "analytics_task_summary_unavailable"
+
+
+def test_paged_publication_above_combined_limit_and_atomic_failure(
+    task_lake, monkeypatch
+):
+    from drover.server.db import control_plane_connection
+    from drover.server.lake import task_projection as projection
+
+    _, path, config = task_lake
+    configure_analytics(path, config)
+    projection.provision_task_projections(path)
+    original_capture = projection._capture
+    rows = [dict(task_id=f"task-{i:05}", status="observed") for i in range(1001)]
+    sessions = [(f"session-{i:05}", row["task_id"]) for i, row in enumerate(rows)]
+    calls = []
+
+    def capture(path, *, build=False, kind=None, after=None):
+        binding, result = original_capture(path)
+        if build:
+            calls.append((kind, after))
+            # Compatible with the old unpaged call so RED exercises its cap.
+            values = rows if kind == "tasks" else sessions
+            if kind is None:
+                return binding, {**result, "tasks": rows, "sessions": sessions}
+            page = [
+                r
+                for r in values
+                if after is None or (r["task_id"] if kind == "tasks" else r[0]) > after
+            ][: projection.PAGE_ROWS]
+            return binding, {**result, kind: page}
+        return binding, result
+
+    monkeypatch.setattr(projection, "_capture", capture)
+    generation = projection.refresh_task_projections(path)
+    assert (
+        projection.task_status(path, session_id="session-01000")["task_id"]
+        == "task-01000"
+    )
+    assert len(calls) >= 6
+    with control_plane_connection(path) as con:
+        assert con.execute(
+            "SELECT task_count,session_count FROM lake_task_generations WHERE generation=?",
+            [generation],
+        ).fetchone() == (1001, 1001)
+    monkeypatch.setattr(
+        projection,
+        "_before_receipt",
+        lambda con: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError, match="crash"):
+        projection.refresh_task_projections(path)
+
+    def changed_capture(path, **options):
+        binding, result = capture(path, **options)
+        if options.get("after") is not None:
+            binding = {**binding, "identities": "changed-between-pages"}
+        return binding, result
+
+    monkeypatch.setattr(projection, "_capture", changed_capture)
+    with pytest.raises(LakeError, match="analytics_task_projection_changed"):
+        projection.refresh_task_projections(path)
+    monkeypatch.setattr(projection, "_capture", capture)
+    with control_plane_connection(path) as con:
+        assert (
+            con.execute("SELECT count(*) FROM lake_task_generations").fetchone()[0] == 1
+        )
+        assert con.execute("SELECT count(*) FROM lake_task_rows").fetchone()[0] == 1001
+        con.execute("DELETE FROM lake_task_sessions WHERE session_id='session-01000'")
+    with pytest.raises(LakeError, match="analytics_task_projection_incomplete"):
+        projection.task_status(path, task_id="task-00000")
+
+
+def test_native_child_keyset_pages_are_complete_and_deterministic():
+    import duckdb
+
+    from drover.server.lake.task_projection import PAGE_ROWS, build_in_child
+
+    with duckdb.connect() as con:
+        con.execute("CREATE SCHEMA lake")
+        con.execute("CREATE MACRO lake.snapshots() AS TABLE SELECT 1 snapshot_id")
+        con.execute("""CREATE TABLE agent_events AS SELECT
+            printf('%05d',i) task_id, printf('%05d',i) session_id,
+            i id, 'a' agent_id, 'o' repo_owner, 'r' repo_name,
+            'main' branch, 'p' principal_id, TIMESTAMPTZ '2026-10-01' AS timestamp
+            FROM range(1201) t(i)""")
+        con.execute(
+            "INSERT INTO agent_events SELECT '', '', id, agent_id, repo_owner, repo_name, branch, principal_id, timestamp FROM agent_events LIMIT 1"
+        )
+        for kind in ("tasks", "sessions"):
+            after = None
+            keys = []
+            while True:
+                result = build_in_child(con, build=True, kind=kind, after=after)
+                page = result[kind]
+                assert len(page) <= PAGE_ROWS
+                keys.extend(
+                    row["task_id"] if kind == "tasks" else row[0] for row in page
+                )
+                if len(page) < PAGE_ROWS:
+                    break
+                after = keys[-1]
+            assert keys == [""] + [f"{i:05d}" for i in range(1201)]
+
+
+def test_publication_accounts_for_pg_page_bytes_before_receipt(task_lake, monkeypatch):
+    from drover.server.db import control_plane_connection
+    from drover.server.lake import task_projection as projection
+
+    _, path, config = task_lake
+    configure_analytics(path, config)
+    projection.provision_task_projections(path)
+    capture = projection._capture
+    binding, result = capture(path)
+    rows = [dict(task_id=f"{i:05}" + "x" * 800, status="observed") for i in range(500)]
+
+    def pages(path, *, build=False, kind=None, after=None):
+        if not build:
+            return binding, result
+        page = (
+            [r for r in rows if after is None or r["task_id"] > after]
+            if kind == "tasks"
+            else []
+        )
+        return binding, {**result, kind: page[: projection.PAGE_ROWS]}
+
+    monkeypatch.setattr(projection, "_capture", pages)
+    projection.refresh_task_projections(path)
+    assert (
+        projection.task_status(path, task_id=rows[-1]["task_id"])["status"]
+        == "observed"
+    )
+    # Fits the child JSON limit, but exceeds the reader's key + payload bound.
+    for row in rows:
+        row["task_id"] += "x" * 300
+        row["padding"] = "x" * 500
+    with pytest.raises(LakeError, match="analytics_task_projection_page_limit"):
+        projection.refresh_task_projections(path)
+    with control_plane_connection(path) as con:
+        assert (
+            con.execute("SELECT count(*) FROM lake_task_generations").fetchone()[0] == 1
+        )
+
+    # A malformed newest receipt must never be filtered away in favor of an
+    # older valid generation bound to the same snapshot.
+    from uuid import uuid4
+
+    for manifest in ("x" * (1024 * 1024 + 1), '{"tasks":{},"sessions":{}}'):
+        with control_plane_connection(path) as con:
+            con.execute(
+                "INSERT INTO lake_task_generations(generation,binding,manifest,task_count,session_count) SELECT ?,binding,?,task_count,session_count FROM lake_task_generations ORDER BY receipt_seq DESC LIMIT 1",
+                [str(uuid4()), manifest],
+            )
+        with pytest.raises(LakeError, match="analytics_task_projection_incomplete"):
+            projection.task_status(path, task_id=rows[0]["task_id"])

@@ -240,7 +240,10 @@ def _worker(request: dict) -> dict:
             from .task_projection import build_in_child
 
             return build_in_child(
-                con, build=request["serving"]["task_projection"] == "build"
+                con,
+                build=request["serving"]["task_projection"] == "build",
+                kind=request["serving"].get("projection_kind"),
+                after=request["serving"].get("projection_after"),
             )
         if (request.get("serving") or {}).get("operation"):
             from .read_models import run_model

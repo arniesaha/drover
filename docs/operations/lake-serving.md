@@ -190,9 +190,13 @@ by server startup or serving requests. Production provisioning/cutover remains
 an operator-approved operation, not something performed in this session.
 
 `refresh_task_projections(path)` certifies all canonical task facts and session
-associations in one disposable child, using the existing two-thread/2GB engine,
-2 GiB RSS ceiling, five-second deadline, 1,000 combined task/session-row cap and
-1 MiB output cap. Limit breaches fail explicitly; these caps are not bypassed
+associations in bounded disposable children, using the existing two-thread/2GB
+engine,
+2 GiB RSS ceiling, five-second deadline and 1 MiB output cap per child.
+Task and session projections use separate deterministic keyset pages of at most
+500 rows, so there is no combined generation row cap. Each page is checked
+against the same snapshot/epoch/proof/identity binding. Limit breaches fail
+explicitly; caps are not bypassed
 for larger catalogs. The build excludes archived metadata and legacy spans and
 uses the same normalized canonical event view and PG identity mapping as other
 selected reads. It derives distinct session/agent counts, first/last event times
@@ -202,16 +206,19 @@ association chooses the latest event with deterministic ID/task tie-breaking.
 A dedicated PG advisory fence serializes projection builders. The catalog
 mutation fence prevents an export from crossing a build; an exporter refresh
 reuses and checks its existing dedicated owner fence. Publication checks the
-catalog and identity bindings again, verifies both fences, and writes all PG
-rows plus a manifest/receipt in one transaction, receipt last. Deferred foreign
-keys prevent rows without their receipt from surviving. Failed publication
+catalog and identity bindings again, verifies both fences, and writes bounded
+PG row batches plus a version-2 digest receipt in one transaction, receipt last.
+The receipt records separate task/session counts and SHA-256 digests of ordered
+key/payload-hash or session/task pairs. No whole-generation key map is retained.
+Deferred foreign keys prevent rows without their receipt from surviving. Failed publication
 rolls back all new rows. Generations are retained; none are deleted or replaced.
 
 The receipt binds configuration epoch, pinned verification proof/root, catalog
 snapshot and the complete identity-map hash. Task status verifies catalog
 coverage in disposable metadata queries before and after its PG read, then
 checks generation counts, every PG task payload SHA-256 and the complete session
-map in a repeatable-read transaction. PG projection text is byte-bounded before
+mapping in ordered, bounded pages within a repeatable-read transaction.
+PG projection text is byte-bounded before
 fetching. Task status reads no historical events and never refreshes itself.
 Ambiguous identity aliases are unavailable. Unknown task IDs in a complete
 certified generation remain `status=unknown`. Latest task summaries come from
@@ -242,6 +249,31 @@ preceding scoped task/selector/activity/lifecycle/MCP run passed **67 tests in
 316.26 seconds**. These counts overlap. Black, isort and `git diff --check`
 passed. Integration used only private PG fixtures and fixture lakes with
 `DROVER_TEST_POSTGRES_DSN` removed. No live schema, config, store, service,
-cutover, backup deletion or migration was touched. Catalogs exceeding the
-initial projection caps remain explicitly unavailable; bounded batching for
-larger generations is an additional cutover capacity gate.
+cutover, backup deletion or migration was touched. The initial combined
+projection cap is now replaced by bounded pages; production-scale latency/soak
+remains a cutover gate.
+
+
+### Native freshness metadata
+
+Selected lake cockpit results extend the established `metadata` block with
+`native_publication` and `native_usage`. Both report `freshness=unavailable`:
+verification of a frozen catalog does not establish ongoing native publication
+or rollup coverage. Usage includes diagnostic PostgreSQL `observed_at` (latest
+rollup clock) and `source_activity_at`; even a recent legacy rollup does not
+certify lake coverage (`reason=lake_coverage_unverified`). Publication reports
+`reason=native_publication_not_proven`. Existing event-observation freshness
+retains its meaning. This adds metadata only, with no native writers or
+context/fleet adapters. Version-1 task receipts require an explicitly authorized
+refresh before they can serve; they are never silently accepted or migrated.
+
+Paged-projection validation (2026-10-02): foreground scoped task, activity and
+selector tests passed **45 tests in 378.79 seconds** using only disposable PG
+and fixture lakes. Coverage includes publication of 1,001 tasks plus 1,001
+session mappings, SQL keyset enumeration of 1,202 keys (including an empty key),
+terminal empty pages, near-limit page bytes, atomic rollback, changing identity
+bindings between pages, and malformed newest receipts without older-generation
+fallback. Black, isort and whitespace checks passed. No production state was
+changed. Real native publication/usage coverage, context/fleet adapters,
+production-scale lifecycle latency/soak and the remaining cutover gates above
+still require separate work.

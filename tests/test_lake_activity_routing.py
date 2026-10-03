@@ -479,3 +479,21 @@ def test_lake_activity_cursor_error_preserves_reload_contract(tmp_path, monkeypa
         # Validation runs before any store/credential access.
         monkeypatch.undo()
         read_models.read_model(path, "project_activity", project_key="invalid")
+
+
+def test_native_freshness_metadata_does_not_certify_legacy_rollup(verified_lake):
+    from drover.server.db import control_plane_connection
+    from drover.server.lake.read_models import read_model
+
+    _, path, config = verified_lake
+    configure_analytics(path, config)
+    with control_plane_connection(path) as con:
+        con.execute(
+            "INSERT INTO native_usage_partition_watermarks(partition_date,source_activity_at,rolled_at) VALUES ('2026-10-01','2026-10-01','2026-10-02')"
+        )
+    result = read_model(path, "cockpit", filters={"days": 30}, cursor_secret="00" * 32)
+    metadata = result["metadata"]
+    assert metadata["native_publication"]["freshness"] == "unavailable"
+    assert metadata["native_usage"]["freshness"] == "unavailable"
+    assert metadata["native_usage"]["observed_at"].startswith("2026-10-02")
+    assert metadata["native_usage"]["reason"] == "lake_coverage_unverified"

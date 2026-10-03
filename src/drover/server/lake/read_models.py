@@ -65,14 +65,33 @@ def _control_snapshot(con, request):
                         f'INSERT INTO {table} VALUES ({",".join("?" for _ in columns)})',
                         rows,
                     )
+            # Legacy PG rollup clocks are diagnostic only: they do not prove
+            # coverage of this verified lake's native snapshot.
+            source_at, rolled_at = pg.execute(
+                "SELECT max(source_activity_at),max(rolled_at) FROM native_usage_partition_watermarks"
+            ).fetchone()
+            freshness = {
+                "native_publication": {
+                    "freshness": "unavailable",
+                    "observed_at": None,
+                    "reason": "native_publication_not_proven",
+                },
+                "native_usage": {
+                    "freshness": "unavailable",
+                    "observed_at": rolled_at,
+                    "source_activity_at": source_at,
+                    "reason": "lake_coverage_unverified",
+                },
+            }
             pg.execute("COMMIT")
+            return freshness
         except BaseException:
             pg.execute("ROLLBACK")
             raise
 
 
 def run_model(con, request, limits):
-    _control_snapshot(con, request)
+    native_freshness = _control_snapshot(con, request)
     # These are ephemeral query relations, never catalog tables or cached files.
     con.execute(
         "CREATE TEMP VIEW agent_event_partitions AS SELECT DISTINCT date FROM agent_events"
@@ -110,6 +129,7 @@ def run_model(con, request, limits):
             spans_enabled=False,
         )
         payload = asdict(result)
+        payload["metadata"].update(native_freshness)
     elif operation == "project_activity":
         from drover.server.project_activity import project_activity
 
