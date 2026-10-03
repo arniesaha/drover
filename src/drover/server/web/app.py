@@ -1161,6 +1161,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 self.collector.render_harness_json(include_hosts=False),
             )
             return
+        if path == "/harness/factory-observer/continuity":
+            self._factory_observer_continuity(parsed.query)
+            return
         if path == "/harness/relay":
             self._accept_relay_websocket()
             return
@@ -1370,6 +1373,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/harness/events":
             self._ingest_harness_events()
+            return
+        if path == "/harness/factory-observer/continuity":
+            self._factory_observer_continuity()
             return
         if path.startswith("/harness/hosts/") and path.rsplit("/", 1)[-1] in {
             "retire",
@@ -1968,6 +1974,49 @@ class _MetricsHandler(BaseHTTPRequestHandler):
 
     def _harness_registry(self) -> HarnessRegistry:
         return HarnessRegistry(self.collector.duckdb_path)
+
+    def _factory_observer_continuity(self, query: str | None = None) -> None:
+        from drover.server.db import ControlPlaneBusy
+        from drover.server.harness.continuity import (
+            ContinuityConflict,
+            FactoryObserverContinuity,
+            continuity_request,
+        )
+
+        store = FactoryObserverContinuity(self.collector.duckdb_path)
+        try:
+            if query is not None:
+                params = parse_qs(query, keep_blank_values=True)
+                if (
+                    set(params) - {"run_id", "limit"}
+                    or "run_id" not in params
+                    or any(len(values) != 1 for values in params.values())
+                ):
+                    raise ValueError("run_id and optional limit are required")
+                result = {
+                    "continuity": store.status(
+                        params["run_id"][0], limit=int(params.get("limit", ["20"])[0])
+                    )
+                }
+            else:
+                length = int(self.headers.get("Content-Length") or "0")
+                if not 0 < length <= 16384:
+                    self.close_connection = True
+                    raise ValueError("continuity body must be 1..16384 bytes")
+                body = self._read_json()
+                if body is None:
+                    raise ValueError("request body must be a JSON object")
+                result = continuity_request(store, body)
+            status = 200
+        except ContinuityConflict as exc:
+            status, result = 409, {"error": str(exc)}
+        except KeyError:
+            status, result = 404, {"error": "continuity run or event not found"}
+        except (ValueError, TypeError) as exc:
+            status, result = 400, {"error": str(exc)}
+        except ControlPlaneBusy:
+            status, result = 503, {"error": "continuity store busy"}
+        self._send(status, "application/json", json.dumps(result) + "\n")
 
     def _send_session_history(self, path: str, query: str) -> None:
         """``GET /sessions/history[/facets]`` from the PostgreSQL control plane."""

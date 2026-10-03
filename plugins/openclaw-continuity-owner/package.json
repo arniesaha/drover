@@ -1,0 +1,31 @@
+{
+  "name": "@drover/openclaw-continuity-owner",
+  "version": "0.1.0",
+  "description": "Inactive-by-default, explicitly invoked Drover continuity owner tool",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=24.16.0 <25 || >=26.1.0"
+  },
+  "files": [
+    "index.js",
+    "schemas",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "ajv": "8.18.0",
+    "ajv-formats": "3.0.1"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "runtimeExtensions": [
+      "./index.js"
+    ]
+  }
+}

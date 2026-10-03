@@ -1,0 +1,406 @@
+{
+  "$defs": {
+    "ContinuityProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "authority": {
+          "const": "taskflow",
+          "title": "Authority",
+          "type": "string"
+        },
+        "authority_scope": {
+          "enum": [
+            "implementation",
+            "integration",
+            "deployment"
+          ],
+          "title": "Authority Scope",
+          "type": "string"
+        },
+        "checkpoint": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Checkpoint",
+          "type": "string"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/InboxEntry"
+          },
+          "maxItems": 50,
+          "title": "Events",
+          "type": "array"
+        },
+        "expected_revision": {
+          "minimum": 0,
+          "title": "Expected Revision",
+          "type": "integer"
+        },
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "inbox_counts": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "pending",
+              "delivered",
+              "acknowledged",
+              "exhausted"
+            ]
+          },
+          "title": "Inbox Counts",
+          "type": "object"
+        },
+        "next_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OwnerAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "objective": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Objective",
+          "type": "string"
+        },
+        "owner": {
+          "$ref": "#/$defs/OwnerLease"
+        },
+        "owner_wake": {
+          "title": "Owner Wake",
+          "type": "boolean"
+        },
+        "recovery": {
+          "enum": [
+            "claim_owner",
+            "reclaim_expired_owner",
+            "approval_required",
+            "manual_attention",
+            "continue_owner"
+          ],
+          "title": "Recovery",
+          "type": "string"
+        },
+        "run_id": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "scope_limit": {
+          "enum": [
+            "commit_only",
+            "publish_review",
+            "explicit_approval_required"
+          ],
+          "title": "Scope Limit",
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "terminal_release": {
+          "const": false,
+          "title": "Terminal Release",
+          "type": "boolean"
+        },
+        "version": {
+          "const": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "worker_state": {
+          "enum": [
+            "unknown",
+            "awaiting_input",
+            "brief_completed"
+          ],
+          "title": "Worker State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "run_id",
+        "session_id",
+        "expected_revision",
+        "authority",
+        "objective",
+        "checkpoint",
+        "authority_scope",
+        "scope_limit",
+        "owner",
+        "worker_state",
+        "terminal_release",
+        "next_action",
+        "recovery",
+        "owner_wake",
+        "inbox_counts",
+        "events",
+        "has_more"
+      ],
+      "title": "ContinuityProjection",
+      "type": "object"
+    },
+    "InboxEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "attempts": {
+          "maximum": 3,
+          "minimum": 0,
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "event_id": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Event Id",
+          "type": "string"
+        },
+        "next_delivery_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Delivery At"
+        },
+        "report": {
+          "$ref": "#/$defs/InboxReport"
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "delivered",
+            "exhausted"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "state",
+        "attempts",
+        "next_delivery_at",
+        "report"
+      ],
+      "title": "InboxEntry",
+      "type": "object"
+    },
+    "InboxReport": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "worker_awaiting_input",
+            "worker_brief_completed",
+            "ci_red",
+            "ci_green"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "source": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Source",
+          "type": "string"
+        },
+        "source_event_id": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Source Event Id",
+          "type": "string"
+        },
+        "subject": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Subject",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "source_event_id",
+        "subject",
+        "sequence",
+        "kind",
+        "summary"
+      ],
+      "title": "InboxReport",
+      "type": "object"
+    },
+    "OwnerAction": {
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "title": "Action Id",
+          "type": "string"
+        },
+        "authority_scope": {
+          "enum": [
+            "implementation",
+            "integration",
+            "deployment"
+          ],
+          "title": "Authority Scope",
+          "type": "string"
+        },
+        "authorized": {
+          "title": "Authorized",
+          "type": "boolean"
+        },
+        "event_id": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Event Id",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "request_input",
+            "review_worker_result",
+            "correct_ci",
+            "review_ci",
+            "review_late_report",
+            "request_explicit_approval"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action_id",
+        "event_id",
+        "type",
+        "authority_scope",
+        "authorized"
+      ],
+      "title": "OwnerAction",
+      "type": "object"
+    },
+    "OwnerLease": {
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "minimum": 0,
+          "title": "Epoch",
+          "type": "integer"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Id"
+        },
+        "lease_until": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Lease Until"
+        },
+        "live": {
+          "title": "Live",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "epoch",
+        "lease_until",
+        "live"
+      ],
+      "title": "OwnerLease",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "continuity": {
+      "$ref": "#/$defs/ContinuityProjection"
+    },
+    "delivery": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OwnerAction"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "event_id": {
+      "anyOf": [
+        {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Event Id"
+    },
+    "version": {
+      "const": 1,
+      "default": 1,
+      "title": "Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "continuity"
+  ],
+  "title": "OwnerToolReply",
+  "type": "object"
+}

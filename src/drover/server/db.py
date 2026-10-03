@@ -151,6 +151,8 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
 #: memory in the PostgreSQL ``session_memory``/``pipeline_jobs`` tables now
 #: (#480), rebuilt rather than migrated, so they are neither copied nor pruned.
 CONTROL_PLANE_TABLES = (
+    "factory_observer_runs",
+    "factory_observer_inbox",
     "harness_hosts",
     "harness_sessions",
     "harness_events",
@@ -164,6 +166,8 @@ CONTROL_PLANE_TABLES = (
 
 #: Primary keys, used by the migration to copy without duplicating.
 CONTROL_PLANE_PRIMARY_KEYS = {
+    "factory_observer_runs": "run_id",
+    "factory_observer_inbox": "event_id",
     "harness_hosts": "host_id",
     "harness_sessions": "session_id",
     "harness_events": "event_id",

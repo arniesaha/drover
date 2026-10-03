@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import duckdb
 
+from drover.server.continuity_schema import CONTINUITY_TABLES
 from drover.server.control_outbox import payload_sha256
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
@@ -52,6 +53,14 @@ _NAIVE_UTC_TIMESTAMP_COLUMNS = frozenset(
 # `live_recap_jobs`/`live_session_recaps` are not imported: live recaps are
 # derived memory (#480), rebuilt in the ledger and `session_memory`.
 _REQUIRED_SOURCE_COLUMNS: dict[str, frozenset[str]] = {
+    "factory_observer_runs": frozenset(
+        "run_id session_id expected_revision objective checkpoint authority_scope "
+        "owner_id owner_epoch lease_until worker_state next_action_json updated_at".split()
+    ),
+    "factory_observer_inbox": frozenset(
+        "event_id run_id source subject sequence payload_json state action_json "
+        "attempts next_delivery_at acknowledged_at received_at".split()
+    ),
     "harness_hosts": frozenset(
         {"host_id", "display_name", "kind", "status", "capabilities_json"}
     ),
@@ -356,13 +365,23 @@ def _source_table_rows(
             "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
         ).fetchall()
     }
-    missing = [table for table in CONTROL_PLANE_TABLES if table not in tables]
+    continuity_tables = tables.intersection(CONTINUITY_TABLES)
+    if continuity_tables and continuity_tables != set(CONTINUITY_TABLES):
+        raise ValueError("snapshot must supply both continuity tables or neither")
+    missing = [
+        table
+        for table in CONTROL_PLANE_TABLES
+        if table not in tables and table not in CONTINUITY_TABLES
+    ]
     if missing:
         raise ValueError(
             "legacy snapshot is missing central table(s): " + ", ".join(missing)
         )
     for table in CONTROL_PLANE_TABLES:
         if table == "harness_events" and not include_events:
+            continue
+        if table not in tables:
+            output[table] = []  # Pre-#497 snapshots have no observer continuity.
             continue
         result = snapshot.execute(f"SELECT * FROM {table}")
         columns = [item[0] for item in result.description]
@@ -380,6 +399,14 @@ def _source_columns(snapshot: Path | Any, table: str) -> list[str]:
     if isinstance(snapshot, Path):
         with duckdb.connect(str(snapshot), read_only=True) as source:
             return _source_columns(source, table)
+    if (
+        table in CONTINUITY_TABLES
+        and snapshot.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = ?", [table]
+        ).fetchone()
+        is None
+    ):
+        return []
     result = snapshot.execute(f"SELECT * FROM {table} LIMIT 0")
     return [item[0] for item in result.description]
 
@@ -519,8 +546,15 @@ def _validate_source_inventory(
     credential_rows: dict[str, list[dict[str, Any]]],
 ) -> None:
     """Fence every supplied source column before writing any target row."""
+    continuity_columns = [
+        _source_columns(source_snapshot, table) for table in CONTINUITY_TABLES
+    ]
+    if any(continuity_columns) and not all(continuity_columns):
+        raise ValueError("snapshot must supply both continuity tables or neither")
     for table in CONTROL_PLANE_TABLES:
         source_columns = set(_source_columns(source_snapshot, table))
+        if table in CONTINUITY_TABLES and not source_columns:
+            continue
         missing = sorted(_REQUIRED_SOURCE_COLUMNS[table] - source_columns)
         if missing:
             raise ValueError(

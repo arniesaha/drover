@@ -208,6 +208,8 @@ def test_fenced_import_preserves_legacy_identity_timezone_and_event_order(
     )
     assert report["state"] == "ready"
     assert set(report["details"]["tables"]) == {
+        "factory_observer_runs",
+        "factory_observer_inbox",
         "harness_hosts",
         "harness_sessions",
         "harness_events",
