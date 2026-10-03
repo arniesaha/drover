@@ -133,14 +133,16 @@ a failure stops it and releases its dedicated PG fence.
 This is a process-local drain, not permission for a running old binary to write
 across cutover. Operator fencing of all old writer processes remains mandatory.
 Raw/source collectors and ingestion are not retired by this gate. Retiring the
-native usage rollup requires a separately proven replacement for native event
-publication/usage freshness before production cutover.
+native usage rollup requires operational proof of native event publication and
+periodic usage certification before production cutover.
 
 ## Remaining cutover gates
 
 This is partial serving coverage, not full backend replacement.
-Authoritative context publication and proven native publication/usage coverage,
-plus the remaining legacy derived/advisory writer audit still need proof.
+Authoritative source producer integration and periodic context/native certification
+in production, plus the remaining legacy derived/advisory writer audit, still
+need operational proof. The bounded staging certification below proves the
+serving contract against independent fixture inputs.
 Fleet routing now uses PostgreSQL registry liveness behind verified selection;
 it does not claim coverage of native-only collector sessions. Daily
 fenced maintenance, immutable paired backups and fresh restore,
@@ -257,8 +259,9 @@ remains a cutover gate.
 
 ### Native freshness metadata
 
-Selected lake cockpit results extend the established `metadata` block with
-`native_publication` and `native_usage`. Both report `freshness=unavailable`:
+At the paged-projection checkpoint, selected lake cockpit results extended the
+established `metadata` block with `native_publication` and `native_usage`. Without
+the explicit certification described below, both report `freshness=unavailable`:
 verification of a frozen catalog does not establish ongoing native publication
 or rollup coverage. Usage includes diagnostic PostgreSQL `observed_at` (latest
 rollup clock) and `source_activity_at`; even a recent legacy rollup does not
@@ -283,11 +286,11 @@ still require separate work.
 ## Verified context/fleet adapters
 
 Context container tools (recent, brief, open loops, resume) and repository-scoped
-recall bundles now pass through verified selection. The frozen lake and PG
-schema have no authoritative `context_containers` publication. Selected lake
-responses therefore report `analytics_context_projection_unavailable`, with
-verified binding metadata, rather than returning an empty set or reading a
-legacy container. Context publication remains a release gate. Legacy selection
+recall bundles pass through verified selection. Without explicitly provisioned
+and certified authoritative contexts, selected lake responses report
+`analytics_context_projection_unavailable`, with verified binding metadata,
+rather than returning an empty set or reading a legacy container. The staging
+source and receipt protocol below now enables these reads. Legacy selection
 retains the existing context data and linked-summary behavior.
 
 Selected fleet status uses PostgreSQL registry `running`/`awaiting` sessions,
@@ -317,3 +320,96 @@ seconds**. Final identity-tag/proof-loss assertions passed **2 focused tests in
 and fixture lakes with the ambient test DSN removed. Black, isort and whitespace
 checks passed. No live configuration, stores, services or operational cutover
 state were changed.
+
+
+## Authoritative coverage certification (staging API)
+
+`drover.server.lake.coverage` exposes explicit producer/operator APIs;
+serving never provisions tables, copies legacy contexts, publishes a source,
+or renews a receipt. These APIs require an already selected, verified lake and
+PostgreSQL control store. They are not public MCP mutation endpoints.
+
+1. Explicitly call `provision_coverage(path)` on disposable infrastructure to
+   create the control-store source revision and generation receipt tables.
+2. A trusted producer supplies a **complete**, independently obtained revision
+   with `publish_source(path, kind, payload, publisher=..., watermark=...,
+   observed_at=...)`. `kind="contexts"` takes the full authoritative context
+   list. `kind="native"` takes an inventory containing `version=1`, `rows`,
+   and `sha256`. Watermarks are publisher-local labels, not global cursors.
+   Observation timestamps must include a timezone.
+3. `certify(path, kind)` validates the revision and publishes an immutable
+   completion receipt last in a PostgreSQL transaction. It holds the projection
+   advisory fence and catalog mutation fence, rechecks both ownership and the
+   snapshot/epoch/verification/data-root/identity binding, and rejects changed
+   source heads. Failed certification leaves no usable generation.
+
+The native inventory must come from the producer's independent canonical
+inputs, after the repository's winner ordering and null-key/archive policy.
+`native_inventory(con, relation)` defines its version-1 digest: explicitly cast
+all `EVENT_SCHEMA` fields, normalize timestamps to UTC, SHA-256 each typed row,
+sort those leaf hashes, and SHA-256 their newline-delimited sequence. Include
+all canonical native rows, including identity-linked mirrors, and exclude
+control/outbox rows and archived legacy metadata. Do not hash the serving lake
+to declare its own expected inventory. Certification compares that independent
+count and digest with the retained lake's native inventory in an admitted
+query child. A mismatch cannot yield a receipt or retain a fresh older result.
+
+Usage certification derives nullable typed token counters from the canonical
+identity-normalized lake view. Identity-linked native mirrors are suppressed;
+negative counters or missing session identity on usage rows reject the proof.
+Per-session counts reconcile to the number of eligible usage events. Unknown
+counters remain null. The certificate scope is
+`publication_scope=canonical_native_agent_events` and
+`usage_basis=typed_canonical_native_events`; it does not certify provider quota
+snapshots, billed costs, or an upstream inventory the trusted producer omitted.
+Legacy PostgreSQL native rollups are never substituted for certified usage;
+PostgreSQL control-event usage remains authoritative.
+
+Serving reads sources and receipts together in a repeatable-read snapshot and
+accepts only the newest receipt for the newest source revision. Its binding must
+match the selected lake snapshot, config epoch, verification proof, data root,
+and PostgreSQL identity hash. Both source observation and receipt certification
+must be no more than 300 seconds old and cannot be in the future. Missing,
+stale, malformed, oversized, or incomplete proof is explicitly unavailable;
+there is no older-generation or legacy fallback. Source/receipt head tokens and
+bindings are checked again after computation, including composite context and
+linked-summary reads.
+
+The established metadata exposes `generation`, `coverage_binding`, `publisher`,
+`source_revision`, `watermark`, `observed_at`, `certified_at`, and
+`freshness_basis=registered_source_revision`. Certified native metadata also
+reports covered events, usage events and usage sessions. Fresh means coverage
+of that registered authoritative revision under that exact binding; a recent
+legacy rollup clock is only diagnostic. Successful selected recall bundles
+carry the metadata too. Context briefs retain their existing row shape;
+recent/open-loop results carry context metadata, and a certified empty source
+can correctly return an empty list or a missing brief.
+
+Full context revisions and native usage generations are bounded to 1,000 rows
+and 1 MiB; response byte limits apply to composite resume/bundle payloads too.
+Limits reject rather than truncate proof. Native certification runs inside the
+existing disposable query admission, 2 GiB RSS, 2 GB DuckDB memory, two-thread,
+five-second and output limits. No production-scale throughput claim follows
+from these small fixtures.
+
+Production producer authority/credentials, independent complete inventory
+collection, periodic renewal and publication transport remain integration and
+operator gates. This slice does not activate a producer, modify configuration,
+retire additional writers, or perform capacity/soak, maintenance, backup/restore,
+cutover or rollback. Legacy remains the default backend.
+
+
+Certification validation (2026-10-03): foreground scoped coverage, context/fleet,
+activity, selector, legacy context, recall-bundle and MCP regressions passed
+**88 tests in 439.37 seconds**. After adding successful-bundle provenance, the
+affected coverage/selector/recall-bundle scope passed **34 tests in 289.91
+seconds**. Final stricter source-shape and exact native usage boundary checks
+passed with the full coverage module: **13 tests in 128.87 seconds**. These
+runs overlap; they are not additive test counts. All integration used disposable
+PostgreSQL and fixture lakes with `DROVER_TEST_POSTGRES_DSN` removed. Tests cover
+context and typed-usage parity, independent inventory mismatch, source-head
+renewal during a read, epoch/identity invalidation, stale/future clocks,
+corrupt newest receipts, receipt rollback/fence loss, source/receipt/composite
+byte caps and the 1,000/1,001 usage-row boundary. Black, isort and whitespace
+checks passed. No live configuration, stores, services or operational state
+were changed.

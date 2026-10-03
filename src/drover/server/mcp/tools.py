@@ -994,13 +994,16 @@ _CONTEXT_CONTAINER_COLUMNS = """
 """
 
 
-def _selected_context(path, *, limit):
+def _selected_context(path, *, limit, **options):
     from drover.server.lake.serving import selected_config
 
     if selected_config(path).backend == "ducklake":
         from drover.server.lake.read_models import read_model
 
-        return read_model(path, "contexts", limit=limit)
+        result = read_model(path, "contexts", limit=limit, **options)
+        if options.get("mode") == "brief" and result.get("status") != "unavailable":
+            return result["context"]
+        return result
     return None
 
 
@@ -1026,7 +1029,12 @@ def drover_recent_contexts(
         where.append("source_harness = ?")
         params.append(source_harness)
     sql_where = f"WHERE {' AND '.join(where)}" if where else ""
-    selected = _selected_context(duckdb_path, limit=limit)
+    selected = _selected_context(
+        duckdb_path,
+        limit=limit,
+        container_type=container_type,
+        source_harness=source_harness,
+    )
     if selected is not None:
         return selected
     con = _connect(duckdb_path)
@@ -1058,9 +1066,12 @@ def drover_context_brief(
         raise ValueError("context_brief: need context_id or label")
     predicate = "context_id = ?" if context_id else "label = ?"
     value = context_id or label
-    selected = _selected_context(duckdb_path, limit=1)
-    if selected is not None:
-        return selected
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        return _selected_context(
+            duckdb_path, limit=1, mode="brief", context_id=context_id, label=label
+        )
     con = _connect(duckdb_path)
     try:
         rows = _row_to_dict(
@@ -1103,7 +1114,13 @@ def drover_open_loops(
             raise ValueError("open_loops: project_key must be one <owner>/<name> pair")
         where.extend(["repo_owner = ?", "repo_name = ?"])
         params.extend([owner, name])
-    selected = _selected_context(duckdb_path, limit=limit)
+    selected = _selected_context(
+        duckdb_path,
+        limit=limit,
+        mode="loops",
+        container_type=container_type,
+        project_key=project_key,
+    )
     if selected is not None:
         return selected
     con = _connect(duckdb_path)
@@ -1132,16 +1149,34 @@ def drover_resume_context(
     max_summaries: int = 5,
 ) -> Optional[dict]:
     """Return a resumable context container plus linked session summaries."""
+    from drover.server.lake.coverage import read_fence
+
+    with read_fence(duckdb_path):
+        return _resume_context(
+            duckdb_path=duckdb_path,
+            context_id=context_id,
+            label=label,
+            max_summaries=max_summaries,
+        )
+
+
+def _resume_context(*, duckdb_path, context_id, label, max_summaries):
+    from drover.server.lake.runtime import LakeError
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake" and (
+        type(max_summaries) is not int or not 1 <= max_summaries <= 1000
+    ):
+        raise LakeError("analytics_row_limit_exceeded")
     if not (context_id or label):
         raise ValueError("context_brief: need context_id or label")
-    selected = _selected_context(duckdb_path, limit=max_summaries)
-    if selected is not None:
-        return selected
     container = drover_context_brief(
         duckdb_path=duckdb_path, context_id=context_id, label=label
     )
     if not container:
         return None
+    if container.get("status") == "unavailable":
+        return container
     session_ids = container.get("session_ids") or []
     summaries: list[dict] = []
     repo = _memory(duckdb_path) if session_ids else None
@@ -1150,7 +1185,15 @@ def drover_resume_context(
             _summary_row(s, _RESUME_SUMMARY_KEYS)
             for s in repo.recent_summaries(session_ids=session_ids, limit=max_summaries)
         ]
-    return {"context": container, "session_summaries": summaries}
+    result = {"context": container, "session_summaries": summaries}
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        from drover.server.lake.coverage import bounded
+
+        bounded(summaries)
+        bounded(result)
+    return result
 
 
 # --- drover_project_activity --------------------------------------------------

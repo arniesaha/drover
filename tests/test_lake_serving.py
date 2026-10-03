@@ -521,6 +521,9 @@ def test_recall_bundle_unscoped_history_parity_and_repository_gate(
                 .astimezone(timezone.utc)
                 .isoformat()
             )
+    metadata = actual.pop("metadata")
+    assert metadata["binding"]["epoch"] == config.epoch
+    assert metadata["native_publication"]["freshness"] == "unavailable"
     assert actual == expected
     # Earlier day includes all three winners regardless of host timezone.
     actual = service.recall_bundle("remember", since="2026-09-30")

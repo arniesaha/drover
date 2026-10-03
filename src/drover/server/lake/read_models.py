@@ -34,6 +34,9 @@ def _read_model(path, operation, **options):
         limit = options.get("limit", 1000)
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise LakeError("analytics_row_limit_exceeded")
+    from .coverage import heads
+
+    source_heads = heads(path)
     binding, _ = _capture(path)
     # PG identity snapshot is bounded by the existing cursor path.
     with open_history(path) as history:
@@ -52,7 +55,11 @@ def _read_model(path, operation, **options):
                 "control_store": asdict(control),
             },
         )
-    if result["binding"] != binding or _capture(path)[0] != binding:
+    if (
+        result["binding"] != binding
+        or _capture(path)[0] != binding
+        or heads(path) != source_heads
+    ):
         raise LakeError("analytics_read_model_changed")
     return result["payload"]
 
@@ -107,15 +114,61 @@ def _control_snapshot(con, request):
                     "reason": "lake_coverage_unverified",
                 },
             }
+            from .coverage import certified
+
+            contexts = None
+            context_metadata = None
+            context_error = None
+            if request["operation"] == "contexts":
+                try:
+                    contexts, context_metadata = certified(
+                        pg, request["binding"], "contexts"
+                    )
+                except LakeError as exc:
+                    context_error = exc.code
+            # Never expose legacy native rollups as certified usage. Control
+            # event usage remains PG-authoritative; certified native facts are
+            # computed from the identity-normalized lake view instead.
+            con.execute("DELETE FROM session_usage WHERE source='native_agent_events'")
+            try:
+                native, proof = certified(pg, request["binding"], "native")
+                freshness = {name: dict(proof) for name in freshness}
+                for row in native["usage"]:
+                    con.execute(
+                        """INSERT INTO session_usage
+                        (session_id,input_tokens,output_tokens,cache_read_tokens,
+                         cache_write_tokens,reasoning_tokens,turn_count,exact,source,
+                         source_event_count,observed_at)
+                        SELECT ?,?,?,?,?,?,?,TRUE,'native_agent_events',?,?
+                        WHERE NOT EXISTS(SELECT 1 FROM session_usage WHERE session_id=?)""",
+                        [
+                            row["session_id"],
+                            row["input_tokens"],
+                            row["output_tokens"],
+                            row["cache_read_tokens"],
+                            row["cache_write_tokens"],
+                            row["reasoning_tokens"],
+                            row["turn_count"],
+                            row["source_event_count"],
+                            proof["observed_at"],
+                            row["session_id"],
+                        ],
+                    )
+            except LakeError as exc:
+                for value in freshness.values():
+                    if exc.code != "lake_coverage_unverified":
+                        value["reason"] = exc.code
             pg.execute("COMMIT")
-            return freshness
+            return freshness, contexts, context_metadata, context_error
         except BaseException:
             pg.execute("ROLLBACK")
             raise
 
 
 def run_model(con, request, limits):
-    native_freshness = _control_snapshot(con, request)
+    native_freshness, contexts, context_metadata, context_error = _control_snapshot(
+        con, request
+    )
     # These are ephemeral query relations, never catalog tables or cached files.
     con.execute(
         "CREATE TEMP VIEW agent_event_partitions AS SELECT DISTINCT date FROM agent_events"
@@ -146,14 +199,22 @@ def run_model(con, request, limits):
         ).fetchone()[0],
     }
     for value in native_freshness.values():
-        value.update(generation=None, coverage_binding=binding)
+        value.setdefault("generation", None)
+        value["coverage_binding"] = binding
     if operation == "contexts":
-        payload = {
-            "status": "unavailable",
-            "analytics_backend": "ducklake",
-            "analytics_epoch": binding["epoch"],
-            "reason": "analytics_context_projection_unavailable",
-        }
+        if context_error:
+            payload = {
+                "status": "unavailable",
+                "analytics_backend": "ducklake",
+                "analytics_epoch": binding["epoch"],
+                "reason": context_error,
+            }
+        else:
+            from .coverage import context_result
+
+            payload = context_result(contexts["contexts"], options)
+    elif operation == "coverage":
+        payload = {}
     elif operation == "fleet":
         cursor = con.execute(
             """SELECT s.session_id,s.host_id AS agent_id,
@@ -207,8 +268,10 @@ def run_model(con, request, limits):
     else:
         raise LakeError("analytics_read_model_unknown")
 
-    if operation in ("fleet", "contexts"):
+    if operation in ("fleet", "contexts", "coverage"):
         payload["metadata"] = dict(native_freshness)
+        if operation == "contexts" and context_metadata is not None:
+            payload["metadata"]["contexts"] = context_metadata
     if "metadata" in payload:
         payload["metadata"]["binding"] = binding
 
