@@ -50,3 +50,32 @@ deployment, and terminal release remain external. No second worker, push, PR,
 merge, deployment, existing-service restart, cron/config/policy/credential
 change, or OpenClaw RPC/shell messaging was performed. External orchestrator
 artifacts were not updated.
+
+## 2026-10-03 — #497 inactive product plugin follow-through
+
+Same worker/worktree and ownership as above; base
+`6d150b8a46dfc18046ed1e5958fcd48952898b8a`. No second worker.
+
+| Area | Verified fact | Remaining boundary |
+| --- | --- | --- |
+| Product adapter | Standalone `plugins/openclaw-continuity-owner` package registers exactly the optional `drover_continuity_owner` tool via normal SDK factory registration. Trusted host config/context binds owner/run/scope and fixed authenticated Drover HTTP; strict exported protocol schemas. Default inactive, poll-only canary, explicit ack, no messaging/executor. Local npm pack succeeded with six product files. | Not installed, loaded, activated or published. Runtime discovery/schema normalization and parent messaging require integration-owner verification/authorization. |
+| SDK evidence | Read-only local OpenClaw 2026.3.13 source, commit `421effcf905b0956895166316c3fbe62baf6a22f`, `/Users/arnab/Developer/research/openclaw`; source-matched registration contract test passes. Requested projects checkout absent at searched roots. | Checkout has no installed SDK dependencies/build; host is a fake, not a Gateway runtime. Downloaded app version 2026.9.6 is not a compatibility proof. |
+| Transport/canary proof | Real synthetic authenticated Drover HTTP, durable local store and reconstructed store: parent/owner read-only poll retains pending event, explicit lease/consume/ack then no duplicate delivery, unauthorized HTTP refused. Node tests cover scope/identity/config rejection, approval blocking, lost consume reply, redirect/cancellation and no autoack. | No live canary, sessions_send or runtime restart was performed. No new PG proof in this slice; prior actual PG evidence and remaining gaps above still apply. Hermes remains untested. |
+| Core evidence correction | User confirms parent has first-class sessions_send despite child catalog absence. Earlier adapter-wiring gap now has inactive product code. | No core defect asserted/issue filed. Actual parent diagnostics/normal invocation traces needed if runtime fails. |
+| Foreground validation | Python: 36 passed in 7.72s, no skips. Node: 15 passed, zero skips, 200.793583ms. Schema parity, Black, isort and diff checks passed. | SDK host mocked; authenticated HTTP/store actual; live OpenClaw runtime unverified. |
+
+Exact foreground commands from the worktree root and package directory respectively:
+
+```sh
+.venv/bin/python -m pytest tests/test_openclaw_owner_plugin.py tests/test_openclaw_owner_protocol.py tests/test_factory_observer_continuity.py -q -rs
+DROVER_TEST_OPENCLAW_SOURCE=/Users/arnab/Developer/research/openclaw npm test
+```
+
+`plugins/openclaw-continuity-owner/README.md` specifies inactive packaging,
+activation authorization, trusted schema and parent normal-tool/sessions_send
+canary steps. Integration/release remains with
+`agent:coder:subagent:1998228b-5eb6-4b11-87a5-339a54576178`.
+Implementation remains commit-only; integration review/publish and deployment
+explicit approval remain external. No push/PR/merge/deploy/restart, host config,
+cron, policy or credential change, live messaging, OpenClaw modification or
+external ledger update was performed. Watchers remain report-only.

@@ -1,0 +1,218 @@
+{
+  "$defs": {
+    "Acknowledge": {
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Checkpoint",
+          "type": "string"
+        },
+        "event_id": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Event Id",
+          "type": "string"
+        },
+        "operation": {
+          "const": "acknowledge",
+          "title": "Operation",
+          "type": "string"
+        },
+        "owner_epoch": {
+          "minimum": 1,
+          "title": "Owner Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operation",
+        "owner_epoch",
+        "event_id",
+        "checkpoint"
+      ],
+      "title": "Acknowledge",
+      "type": "object"
+    },
+    "Consume": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "consume",
+          "title": "Operation",
+          "type": "string"
+        },
+        "owner_epoch": {
+          "minimum": 1,
+          "title": "Owner Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operation",
+        "owner_epoch"
+      ],
+      "title": "Consume",
+      "type": "object"
+    },
+    "Lease": {
+      "additionalProperties": false,
+      "properties": {
+        "lease_seconds": {
+          "default": 60,
+          "maximum": 300,
+          "minimum": 1,
+          "title": "Lease Seconds",
+          "type": "integer"
+        },
+        "operation": {
+          "const": "lease",
+          "title": "Operation",
+          "type": "string"
+        },
+        "owner_epoch": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Owner Epoch"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "title": "Lease",
+      "type": "object"
+    },
+    "Poll": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 20,
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "operation": {
+          "const": "poll",
+          "title": "Operation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "title": "Poll",
+      "type": "object"
+    },
+    "Report": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "worker_awaiting_input",
+            "worker_brief_completed",
+            "ci_red",
+            "ci_green"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "operation": {
+          "const": "report",
+          "title": "Operation",
+          "type": "string"
+        },
+        "sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "source_event_id": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Source Event Id",
+          "type": "string"
+        },
+        "subject": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Subject",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation",
+        "source_event_id",
+        "subject",
+        "sequence",
+        "kind",
+        "summary"
+      ],
+      "title": "Report",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "discriminator": {
+        "mapping": {
+          "acknowledge": "#/$defs/Acknowledge",
+          "consume": "#/$defs/Consume",
+          "lease": "#/$defs/Lease",
+          "poll": "#/$defs/Poll",
+          "report": "#/$defs/Report"
+        },
+        "propertyName": "operation"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Poll"
+        },
+        {
+          "$ref": "#/$defs/Lease"
+        },
+        {
+          "$ref": "#/$defs/Report"
+        },
+        {
+          "$ref": "#/$defs/Consume"
+        },
+        {
+          "$ref": "#/$defs/Acknowledge"
+        }
+      ],
+      "title": "Request"
+    },
+    "version": {
+      "const": 1,
+      "title": "Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "request"
+  ],
+  "title": "OwnerToolCall",
+  "type": "object"
+}

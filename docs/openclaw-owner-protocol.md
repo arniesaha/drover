@@ -7,11 +7,13 @@ types, and `OpenClawOwnerAdapter.invoke`. It has no action executor, scheduler,
 messaging transport, automatic retries, implicit acknowledgments, or local
 continuity ledger. TaskFlow/Factory retains lifecycle authority.
 
-This is a **contract and mock integration proof**, not a deployed OpenClaw
-plugin. The descriptor alone does not make a tool available to a parent.
-An actual plugin execute handler and normally authenticated Drover transport
-must be supplied through supported OpenClaw integration, under existing scopes.
-No registration, credential, configuration, policy, or service change was made.
+The standalone [inactive OpenClaw plugin](../plugins/openclaw-continuity-owner/README.md)
+now implements normal `api.registerTool` registration, trusted host session/config
+binding, and authenticated Drover HTTP. It is not installed or activated. Tests
+use a source-matched SDK host and real synthetic authenticated Drover HTTP;
+live Gateway discovery, parent messaging, and activation remain unverified.
+The linked README records SDK/version evidence, packaging and exact parent canary
+steps. No credential, configuration, policy, or service change was made.
 
 ## Trusted binding and normal invocation
 
@@ -27,8 +29,8 @@ Before a mutation, a bounded GET checks the run's immutable scope against the
 trusted binding. A wrong scope is refused before any POST, including ack.
 
 [OpenClaw's supported plugin API](https://docs.openclaw.ai/plugins/sdk-overview/tools-and-commands)
-provides `api.registerTool(...)` for agent-visible tools. A runtime integration
-must bind this descriptor/schema and an execute handler using that path. A
+provides `api.registerTool(...)` for agent-visible tools. The inactive package
+binds this schema and execute handler using that path. A
 parent can then explicitly invoke the normally available tool, or use authorized
 [normal session messaging](https://docs.openclaw.ai/concepts/session-tool) to ask
 the bound owner to invoke it. Message receipt is data, not a Drover acknowledgment.
@@ -61,9 +63,9 @@ a committed endpoint call; the owner must poll to resolve the outcome.
 
 `OwnerToolReply` contains `version: 1`, the typed `continuity` projection,
 optional `event_id` for reports, and optional `delivery` for consume. An OpenClaw
-execute handler may render its JSON as a normal tool result. Its runtime-specific
-result wrapping, tool discovery, authorization, and registration are not tested
-by the mock harness.
+execute handler may render its JSON as a normal tool result. The package tests SDK-shaped
+result wrapping and registration against a source-matched host, not a running
+Gateway. Live discovery and authorization remain untested.
 
 ## Explicit delivery, reconciliation, and ack
 
@@ -102,28 +104,26 @@ parent-message delivery. PostgreSQL proof is in its separate test module.
 
 Observed in worker `harness-f5032b0f-837b-4769-8fcd-f39fb48d6281` on 2026-10-03:
 
-- The exposed tool catalog contained no callable OpenClaw messaging/session tool.
-  No runtime messaging call was attempted, and no shell/RPC substitution was used.
-- Drover had OpenClaw collection/provenance support, but no registration or execute
-  handler for this owner tool. Searches of `src`, `scripts`, and `docs` found no
-  `registerTool`/`sessions_send` owner integration before this slice.
-- Official OpenClaw documentation describes normal tool registration and session
-  messaging. Thus missing wiring in this session is **not proof of a core defect**.
-  The running parent's OpenClaw version, tool catalog/policy, and plugin-loading
-  diagnostics were not available or inspected.
+- The child catalog has no callable `sessions_send`; the user confirms the parent
+  has that first-class tool. Child catalog absence is not a core defect.
+- The prior missing Drover registration/execute transport is implemented in the
+  inactive standalone package. No messaging call or RPC/shell substitution was used.
+- Local SDK source inspected: OpenClaw 2026.3.13,
+  `421effcf905b0956895166316c3fbe62baf6a22f`, at
+  `/Users/arnab/Developer/research/openclaw`. The requested `projects/openclaw`
+  checkout was absent. Source locations and runtime limits are in the package README.
+- A source-matched fake registration host plus real authenticated Drover HTTP is
+  tested. Actual parent runtime version, registration diagnostics, authorized
+  discovery, tool results and normal messaging traces remain the integration gate.
 
-Issue candidate: **Expose the Drover continuity owner contract through the normal
-OpenClaw parent/owner tool surface and verify durable delivery/ack recovery.**
-Attach this protocol and the mock/PG proofs. Before classifying a core defect,
-capture the actual runtime version, registration diagnostics, authorized parent
-tool discovery/result, and failed normal invocation. Acceptance should prove the
-same completion/CI/failure cases through a real normally registered tool, without
-direct RPC/shell messaging, permission bypass, or implicit ack. Parent messaging
-must preserve its normal authorization and inter-session provenance. No issue
-was filed and no runtime workaround was installed.
+The earlier issue candidate described missing adapter wiring, now supplied as
+inactive product code; no core issue is asserted or filed. A real runtime failure
+must capture the above diagnostics before core classification. Parent messaging
+retains normal authorization/provenance; message receipt never acknowledges the
+Drover event. No runtime workaround was installed.
 
 Integration/release stays with
 `agent:coder:subagent:1998228b-5eb6-4b11-87a5-339a54576178`.
 This worker remains implementation/commit-only. Watchers stay report-only.
-Hermes, approval handoff, publication/review, and terminal release are untested
-external integration boundaries.
+Hermes, live approval handoff, publication/review and terminal release remain
+untested external integration boundaries.
