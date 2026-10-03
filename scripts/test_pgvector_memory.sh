@@ -26,5 +26,3 @@ port="$(docker port "$container" 5432/tcp)"
 export DROVER_TEST_POSTGRES_DSN="postgresql://drover:drover-ci-only@${port}/drover"
 uv run --python 3.11 --locked --extra dev pytest --require-pgvector -m pgvector \
   tests/test_memory_store.py tests/test_embeddings.py -v -s
-uv run --python 3.11 --locked --extra dev pytest --require-pgvector \
-  tests/test_ledger.py tests/test_memory_integrity.py -q

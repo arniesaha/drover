@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -16,7 +17,7 @@ from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
 from drover.server.mcp import tools
 from drover.server.memory_identity import apply_memory_links, read_memory_sessions
 from drover.server.memory_identity import refresh_memory_projection as project_memory
-from drover.server.memory_store import MemoryRepository
+from drover.server.memory_store import EMBEDDING_DIM, MemoryRepository
 from drover.server.summarizer.jobs import source_version_for_session
 from drover.server.summarizer.worker import SummarizerWorker
 
@@ -178,7 +179,12 @@ def test_control_stream_summarizes_every_harness_with_metadata_tail(stores, harn
     remote_report = tools.drover_memory_acceptance(
         duckdb_path=path, harness_ids=["harness-fixture"]
     )["sessions"][0]
-    assert remote_report == report
+    assert remote_report == {
+        **report,
+        "store": "hub",
+        "host": socket.gethostname(),
+        "data_watermark": {"timestamp": None, "basis": "unknown"},
+    }
 
 
 def test_metadata_only_session_is_insufficient(stores):
@@ -213,7 +219,7 @@ def test_metadata_only_session_is_insufficient(stores):
         (tools.drover_search, {"query": "memory"}),
         (tools.drover_files_touched, {}),
         (tools.drover_task_status, {}),
-        (tools.drover_recall, {"query_embedding": [1.0]}),
+        (tools.drover_recall, {"query_embedding": [1.0] * EMBEDDING_DIM}),
         (tools.drover_active_handoff, {}),
     ],
 )
