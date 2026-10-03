@@ -1100,10 +1100,15 @@ def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> d
     from drover.server.harness.registry import HarnessRegistry
 
     registry = HarnessRegistry(duckdb_path)
-    hosts = {host.host_id for host in registry.list_hosts()}
+    host_liveness = {
+        host.host_id: host.liveness().state
+        for host in registry.list_hosts(include_retired=True)
+    }
     sessions = []
     for session in registry.list_sessions(archived_limit=0):
-        if session.host_id not in hosts:
+        liveness = host_liveness.get(session.host_id)
+        # Retired hosts retain history but are never active fleet work.
+        if liveness is None or liveness == "retired":
             continue
         tid = compute_task_id(
             None, session.repo_owner, session.repo_name, session.branch
@@ -1111,7 +1116,11 @@ def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> d
         if task_id and tid != task_id:
             continue
         row = _coerce(asdict(session))
-        row.update(agent_id=session.host_id, task_id=tid)
+        row.update(
+            agent_id=session.host_id,
+            task_id=tid,
+            host_liveness=liveness,
+        )
         sessions.append(row)
     return {
         "active_sessions": sessions,
