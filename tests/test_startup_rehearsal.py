@@ -10,6 +10,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -43,11 +44,21 @@ class BeforeBind(BaseException):
 def phase_deadline(name, seconds=10):
     # faulthandler includes stacks, never Python locals or fixture payloads.
     print("private phase starting " + name, flush=True)
-    faulthandler.dump_traceback_later(seconds, exit=True)
+    # Click 8.5 captures sys.stderr in a BytesIO-backed stream without fileno.
+    # Keep a real descriptor for the hang guard; never drop the guard to pass CI.
+    faulthandler.dump_traceback_later(seconds, exit=True, file=sys.__stderr__)
     try:
         yield
     finally:
         faulthandler.cancel_dump_traceback_later()
+
+
+def test_phase_deadline_survives_non_fd_stderr(monkeypatch):
+    import io
+
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    with phase_deadline("captured_stderr"):
+        pass
 
 
 def test_phase_deadline_dumps_stacks_and_exits():
@@ -275,7 +286,7 @@ def test_all_role_reaches_bind_inside_fence(
     bind = Mock(side_effect=BeforeBind())
     monkeypatch.setattr(server_main, "start_resilient_metrics_server", bind)
     # Bounded foreground rehearsal. A hang dumps all stacks, then exits.
-    faulthandler.dump_traceback_later(20, exit=True)
+    faulthandler.dump_traceback_later(20, exit=True, file=sys.__stderr__)
     try:
         with pytest.raises(BeforeBind):
             CliRunner().invoke(
