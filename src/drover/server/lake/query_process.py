@@ -236,6 +236,10 @@ def _worker(request: dict) -> dict:
             con.execute(
                 "CREATE TEMP VIEW control_memory_events AS SELECT * FROM agent_events WHERE source='control'"
             )
+        if (request.get("serving") or {}).get("operation"):
+            from .read_models import run_model
+
+            return run_model(con, request["serving"], limits)
         cursor = con.execute(request["sql"], request["params"])
         rows = []
         size = 0
@@ -258,6 +262,14 @@ if __name__ == "__main__":
         reply = _worker(json.loads(Path(sys.argv[1]).read_text()))
     except LakeError as exc:
         reply = {"error": exc.code}
-    except Exception:
-        reply = {"error": "analytics_unavailable"}
+    except Exception as exc:
+        from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
+
+        reply = {
+            "error": (
+                "snapshot_changed"
+                if isinstance(exc, AnalyticsSnapshotChangedError)
+                else "analytics_unavailable"
+            )
+        }
     print(json.dumps(reply, default=str))

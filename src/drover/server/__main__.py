@@ -593,6 +593,7 @@ def _backfill_day_summaries(
 ) -> None:
     """Retry deferred summaries promptly; refresh completed passes every 15m."""
     from drover.schema import backfill_agent_event_day_summary
+    from drover.server.lake.writer_gate import legacy_derived_write
 
     admission = MaintenanceAdmission(analytics_gate)
     while not stop.is_set():
@@ -600,7 +601,10 @@ def _backfill_day_summaries(
         try:
             with admission.admit() as admitted:
                 if admitted:
-                    summarised = backfill_agent_event_day_summary(duckdb_path)
+                    with legacy_derived_write(duckdb_path) as allowed:
+                        if not allowed:
+                            return
+                        summarised = backfill_agent_event_day_summary(duckdb_path)
                     if summarised:
                         log.info("summarised %d event partition(s)", summarised)
                 else:
@@ -2609,14 +2613,23 @@ def run(
     # external SSD that blocked all-role startup for >10 minutes before MCP or
     # OTLP could bind. The analytical views are finalized after the network
     # surfaces are listening.
-    with _startup_phase("pin_analytical_connection"):
-        pin_analytical_connection(cfg.duckdb_path)
-    with _startup_phase("bootstrap_catalog_and_control_store"):
-        bootstrap(
-            parquet_dir=cfg.parquet_dir,
-            duckdb_path=cfg.duckdb_path,
-            bind_parquet_views=False,
-        )
+    from drover.server.lake.writer_gate import activate_retirement
+
+    if cfg.analytics.retire_legacy_writers:
+        # Existing PG and a fully verified catalog are prerequisites; startup
+        # does not rebuild or migrate either store.
+        with _startup_phase("activate_legacy_writer_retirement"):
+            require_control_store_ready(cfg.duckdb_path)
+            activate_retirement(cfg.duckdb_path)
+    else:
+        with _startup_phase("pin_analytical_connection"):
+            pin_analytical_connection(cfg.duckdb_path)
+        with _startup_phase("bootstrap_catalog_and_control_store"):
+            bootstrap(
+                parquet_dir=cfg.parquet_dir,
+                duckdb_path=cfg.duckdb_path,
+                bind_parquet_views=False,
+            )
     central_consent: CentralContentConsent | None = None
     if cfg.control_store.backend == "postgres":
         with _startup_phase("require_control_store_ready"):
@@ -2842,7 +2855,12 @@ def run(
 
     def _finish_analytical_bootstrap() -> None:
         try:
-            bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+            from drover.server.lake.writer_gate import legacy_derived_write
+
+            with legacy_derived_write(cfg.duckdb_path) as allowed:
+                if not allowed:
+                    return
+                bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
             log.info("analytical Parquet views ready")
         except Exception:  # noqa: BLE001
             log.exception("analytical Parquet view bootstrap failed")

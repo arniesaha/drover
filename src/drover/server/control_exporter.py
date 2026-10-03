@@ -121,6 +121,14 @@ class ControlOutboxExporter:
             self._shutdown.wait(self.poll_seconds)
 
     def run_once(self, *, now: datetime | None = None) -> dict[str, Any]:
+        from drover.server.lake.writer_gate import legacy_derived_write
+
+        with legacy_derived_write(self.control_path) as allowed:
+            if not allowed:
+                return self._empty_result()
+            return self._run_once_legacy(now=now)
+
+    def _run_once_legacy(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Publish at most one flush-sized batch and always resume SQL receipts."""
         if not is_postgres_control_store(self.control_path):
             result = self._empty_result()

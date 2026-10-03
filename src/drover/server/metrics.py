@@ -1385,8 +1385,28 @@ class MetricsCollector:
             attached_control_plane_snapshot,
             require_analytical_store,
         )
+        from drover.server.lake.serving import selected_config
         from drover.server.project_activity import project_activity
 
+        if selected_config(self.duckdb_path).backend == "ducklake":
+            from drover.server.lake.read_models import read_model
+            from drover.server.lake.runtime import LakeError
+
+            try:
+                payload = read_model(
+                    self.duckdb_path,
+                    "project_activity",
+                    project_key=project_key,
+                    days=days,
+                    max_sessions=limit,
+                )
+                return _json_response(200, payload)
+            except ValueError as exc:
+                return _json_response(400, {"error": str(exc)})
+            except LakeError as exc:
+                return _json_response(
+                    503, {"status": "unavailable", "reason": exc.code}
+                )
         require_analytical_store(self.duckdb_path)
         con = open_duckdb_connection(
             self.duckdb_path, read_only=True, role="diagnostic"

@@ -6,8 +6,9 @@ The catalog proof is checked in the SAME disposable child as each SELECT.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
+from threading import RLock
 
 from drover.config import AnalyticsConfig
 
@@ -15,10 +16,12 @@ from .query_process import query
 from .runtime import LakeError, LakeSpec
 
 _CONFIGS: dict[Path, AnalyticsConfig] = {}
+_SELECTION_LOCK = RLock()
 
 
 def configure_analytics(path: Path, config: AnalyticsConfig) -> None:
-    _CONFIGS[Path(path).resolve()] = config
+    with _SELECTION_LOCK:
+        _CONFIGS[Path(path).resolve()] = config
 
 
 def selected_config(path: Path) -> AnalyticsConfig:
@@ -47,7 +50,10 @@ class HistoryConnection:
         result = query(
             lake_spec(self.config),
             sql,
-            params,
+            [
+                value.isoformat() if isinstance(value, (date, datetime)) else value
+                for value in (params or [])
+            ],
             serving={
                 "verification_sha256": self.config.verification_sha256,
                 "identities": self.identities,

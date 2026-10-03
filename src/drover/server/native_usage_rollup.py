@@ -224,6 +224,12 @@ def _rebuild_partition(
     return len(totals)
 
 
+from drover.server.lake.writer_gate import fence_derived_writer
+
+
+@fence_derived_writer(
+    "duckdb_path", lambda: NativeUsageRollupReport(partitions=0, sessions=0)
+)
 def rollup_pending_native_usage(
     duckdb_path: Path, *, limit: int = DEFAULT_PARTITION_LIMIT
 ) -> NativeUsageRollupReport:

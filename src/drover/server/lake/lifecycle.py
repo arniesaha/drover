@@ -5,7 +5,7 @@ import threading
 
 from .exporter import LakeOutboxExporter
 from .runtime import LakeError
-from .serving import HistoryConnection, lake_spec
+from .serving import HistoryConnection, lake_spec, selected_config
 from .serving_proof import catalog_identity
 
 log = logging.getLogger(__name__)
@@ -51,10 +51,32 @@ class ExporterLifecycle:
                     raise LakeError("lake_export_catalog_mismatch")
                 with HistoryConnection(self.config.analytics) as history:
                     history.execute("SELECT 1")
+                if self.config.analytics.retire_legacy_writers:
+                    from .writer_gate import activate_retirement
+
+                    if (
+                        selected_config(self.config.duckdb_path)
+                        != self.config.analytics
+                    ):
+                        raise LakeError("lake_retirement_config_mismatch")
+                    activate_retirement(self.config.duckdb_path)
                 self._running = True
                 self._ready.set()
                 while not self._stop.is_set() and not shutdown.is_set():
-                    exporter.run_once()
+                    if self.config.analytics.retire_legacy_writers:
+                        from .writer_gate import legacy_derived_write
+
+                        with legacy_derived_write(self.config.duckdb_path) as allowed:
+                            if (
+                                selected_config(self.config.duckdb_path)
+                                != self.config.analytics
+                            ):
+                                raise LakeError("lake_retirement_config_mismatch")
+                            if allowed:
+                                raise LakeError("lake_retirement_lost")
+                            exporter.run_once()
+                    else:
+                        exporter.run_once()
                     self._stop.wait(0.25)
         except Exception as exc:
             self._error = (

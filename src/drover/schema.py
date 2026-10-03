@@ -1023,6 +1023,10 @@ def refresh_agent_event_day_summary(
     return rebuilt
 
 
+from drover.server.lake.writer_gate import fence_derived_writer
+
+
+@fence_derived_writer("duckdb_path", lambda: 0)
 def backfill_agent_event_day_summary(
     duckdb_path: str | Path, *, max_days: int = 45
 ) -> int:
@@ -2142,6 +2146,7 @@ def migrate_control_plane_tables(
     return copied
 
 
+@fence_derived_writer("duckdb_path", lambda: None)
 def bootstrap(
     *, parquet_dir: Path, duckdb_path: Path, bind_parquet_views: bool = True
 ) -> None:

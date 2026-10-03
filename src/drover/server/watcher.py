@@ -195,10 +195,25 @@ class _Handler(FileSystemEventHandler):
             )
             return
         queued = 0
-        con = open_duckdb_connection(self._duckdb_path)
+        from drover.server.lake.runtime import LakeError
+        from drover.server.lake.serving import open_history
+
+        try:
+            con = open_history(self._duckdb_path)
+        except LakeError:
+            log.warning(
+                "canonical source unavailable after committed ingest; enqueue deferred"
+            )
+            return
         try:
             for sid in sorted(str(s) for s in session_ids):
-                source_version = source_version_for_session(con, sid)
+                try:
+                    source_version = source_version_for_session(con, sid)
+                except LakeError:
+                    log.warning(
+                        "canonical source unavailable after committed ingest; enqueue deferred"
+                    )
+                    continue
                 try:
                     outcome = enqueue_summary_generation(
                         self._duckdb_path, sid, source_version

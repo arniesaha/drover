@@ -803,6 +803,7 @@ def drover_files_touched(
 # --- drover_task_status -------------------------------------------------------
 
 
+@_canonical_read
 def drover_session_close(
     *,
     duckdb_path: Path,
@@ -817,13 +818,13 @@ def drover_session_close(
     ``already_failed``, ``suppressed`` (dead-letter streak cap) or
     ``unavailable`` (no PostgreSQL control store).
     """
-    resolution = _resolve(duckdb_path, session_id)
+    resolution = _resolve(duckdb_path, session_id, history=True)
     # A native SessionEnd hook can arrive before collector ingestion. Keep
     # accepting that intent, while known harness identities must map explicitly.
     if resolution["status"] in ("unmapped", "unavailable"):
         return resolution
     session_id = resolution["session_id"]
-    con = open_duckdb_connection(duckdb_path)
+    con = _history_connect(duckdb_path)
     try:
         source_version = source_version_for_session(con, session_id)
     finally:
@@ -839,6 +840,7 @@ def drover_session_close(
 # --- drover_project_brief -----------------------------------------------------
 
 
+@_canonical_read
 def drover_project_brief(
     *,
     duckdb_path: Path,
@@ -867,7 +869,7 @@ def drover_project_brief(
     if brief is None:
         return None
     row = _summary_row(brief, _BRIEF_KEYS)
-    con = _connect(duckdb_path)
+    con = _history_connect(duckdb_path)
     try:
         # Newest activity the brief could have missed: summaries of the repo's
         # sessions (ended or regenerated) and the tasks' own activity marker.
@@ -878,11 +880,19 @@ def drover_project_brief(
             candidates.extend(
                 [_as_utc(summary.ended_at), _as_utc(summary.generated_at)]
             )
-        task_latest = con.execute(
-            """SELECT MAX(TRY_CAST(last_activity_at AS TIMESTAMP))
-                 FROM tasks WHERE repo_owner = ? AND repo_name = ?""",
-            [owner, name],
-        ).fetchone()
+        from drover.server.lake.serving import selected_config
+
+        if selected_config(duckdb_path).backend == "ducklake":
+            task_latest = con.execute(
+                "SELECT max(timestamp) FROM agent_events WHERE repo_owner=? AND repo_name=?",
+                [owner, name],
+            ).fetchone()
+        else:
+            task_latest = con.execute(
+                """SELECT MAX(TRY_CAST(last_activity_at AS TIMESTAMP))
+                     FROM tasks WHERE repo_owner = ? AND repo_name = ?""",
+                [owner, name],
+            ).fetchone()
         candidates.append(_as_utc(task_latest[0]) if task_latest else None)
     finally:
         con.close()
@@ -922,6 +932,7 @@ def drover_project_brief(
 # --- drover_recent_sessions ---------------------------------------------------
 
 
+@_canonical_read
 def drover_recent_sessions(
     *,
     duckdb_path: Path,
@@ -947,7 +958,7 @@ def drover_recent_sessions(
     repo = _memory(duckdb_path)
     sessions: list[dict] = []
     if repo is not None:
-        con = _connect(duckdb_path)
+        con = _history_connect(duckdb_path)
         try:
             # session_memory.project_key first, then the task link, then the
             # day-summary index so unlinked summaries still surface.
@@ -1130,6 +1141,7 @@ def _activity_days(since: Optional[str], days: Optional[int], now: datetime) -> 
     return max(1, min(PROJECT_ACTIVITY_MAX_DAYS, int(days or 7)))
 
 
+@_canonical_read
 def drover_project_activity(
     *,
     duckdb_path: Path,
@@ -1149,6 +1161,19 @@ def drover_project_activity(
     """
     now = datetime.now(timezone.utc)
     window_days = _activity_days(since, days, now)
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        from drover.server.lake.read_models import read_model
+
+        return read_model(
+            duckdb_path,
+            "project_activity",
+            project_key=project_key,
+            days=window_days,
+            now=now.isoformat(),
+            max_sessions=int(limit),
+        )
     con = _connect(duckdb_path)
     try:
         with attached_control_plane_snapshot(con, duckdb_path):
@@ -1442,12 +1467,24 @@ def drover_active_handoff(
         return _missing(resolution)
 
 
+@_canonical_read
 def drover_task_status(
     *,
     duckdb_path: Path,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> dict:
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        # No complete, versioned PG task projection exists yet. A verified
+        # event catalog alone cannot authorize stale task aggregates.
+        return {
+            "status": "unavailable",
+            "backend": "ducklake",
+            "reason": "analytics_task_projection_unavailable",
+            "task_id": task_id,
+        }
     if session_id:
         resolution = _resolve(duckdb_path, session_id)
         if resolution["status"] != "ok":

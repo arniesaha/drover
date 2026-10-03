@@ -328,6 +328,7 @@ class AnalyticsConfig:
 
     backend: str = "legacy"
     exporter_enabled: bool = False
+    retire_legacy_writers: bool = False
     catalog_dsn_env: str = ""
     exporter_dsn_env: str = ""
     data_root: str = ""
@@ -343,6 +344,10 @@ class AnalyticsConfig:
             raise ValueError("analytics.exporter_enabled must be boolean")
         if self.exporter_enabled and self.backend != "ducklake":
             raise ValueError("lake export requires analytics.backend=ducklake")
+        if type(self.retire_legacy_writers) is not bool:
+            raise ValueError("analytics.retire_legacy_writers must be boolean")
+        if self.retire_legacy_writers and self.backend != "ducklake":
+            raise ValueError("writer retirement requires analytics.backend=ducklake")
         if self.backend == "ducklake":
             for name in (
                 "catalog_dsn_env",

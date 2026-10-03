@@ -94,18 +94,59 @@ and never activates the legacy exporter. Explicit shutdown waits for the bounded
 batch to finish and release its connection. Retry requires a new explicit
 lifecycle instance.
 
+## Activity routing and opt-in derived-writer retirement
+
+Cockpit activity/day aggregation and HTTP/MCP project activity now execute the
+shared activity algorithms in the verified disposable child. They read only
+canonical lake events and a bounded repeatable-read snapshot of PG serving
+projections; no cached legacy day summaries or span tables are attached. The
+PG snapshot is capped at 10,000 rows per relation. Final model output shares
+query row/byte/RSS/deadline limits. Cockpit checks selection before its legacy
+cache and never returns stale legacy results when lake authorization fails.
+Repository recent summaries and project-brief freshness also use selected
+canonical history. Source-version reads for explicit session-close jobs,
+requeue, and post-ingest scheduling use the selector. A lake error defers
+post-ingest summary scheduling without changing source ingestion; legacy lock
+errors retain their existing retry behavior.
+
+Selected lake task status returns `analytics_task_projection_unavailable`.
+A verified event catalog does not certify the old task table. Complete,
+versioned PG task projections remain a prerequisite; there is no full-history
+scan or legacy aggregate fallback for task status.
+
+`retire_legacy_writers = false` is independently defaulted. Only explicit
+DuckLake opt-in can request retirement. Activation verifies the selected lake
+and drains process-local in-flight derived writers under a lock. Retirement
+is latched to the entire selected configuration. A change requires explicit
+verified renewal; verification failure or an attempted switch back to legacy
+never automatically re-enables writers in that process. Each retired writer
+entry rechecks authorization before returning without a write. The gate
+covers legacy exporter passes, canonical memory projection refresh, native
+usage rollup, day-summary backfill and analytical bootstrap entrypoints.
+Startup with retirement requested requires existing PG and successful lake
+verification before skipping legacy analytical bootstrap and its pinned
+connection. The enabled lake exporter checks explicit/registered configuration
+agreement at activation and rechecks retirement authorization before each pass;
+a failure stops it and releases its dedicated PG fence.
+
+This is a process-local drain, not permission for a running old binary to write
+across cutover. Operator fencing of all old writer processes remains mandatory.
+Raw/source collectors and ingestion are not retired by this gate. Retiring the
+native usage rollup requires a separately proven replacement for native event
+publication/usage freshness before production cutover.
+
 ## Remaining cutover gates
 
 This is partial serving coverage, not full backend replacement.
-Repository-scoped recall bundles, cockpit/day aggregation, remaining activity
-paths, PG task-status projections, source-version job scheduling and removal of
-legacy analytical bootstrap/writers still need routing and parity proof. Daily
+Repository-scoped context/recall bundles, legacy fleet/active-session adapters,
+complete versioned PG task-status projections, native publication/usage freshness,
+and the remaining legacy derived/advisory writer audit still need proof. Daily
 fenced maintenance, immutable paired backups and fresh restore,
 exporter-watermark/rollback rehearsal, platform pin/credential installation,
 audit/soak and second-machine restore remain gates. Operator approval for
 production cutover remains separate.
 
-## Disposable validation checkpoint
+## Prior disposable validation checkpoint
 
 Foreground scoped validation: **174 passed, 2 skipped in 196.64 seconds**.
 This includes **18 serving/selection/lifecycle tests** plus exporter, runtime,
@@ -118,3 +159,21 @@ is installed. No live data, configuration, services or catalogs were accessed.
 Black, isort and `git diff --check` passed. Independent read-only review found
 verification fence-loss and repository-normalization issues; both were fixed
 and re-reviewed without remaining critical or important findings.
+
+
+## Activity/writer-gate validation checkpoint
+
+Final foreground routing/serving validation: **31 passed in 213.06 seconds**,
+including **13 focused activity/writer-gate cases**. These cover shared-repository
+canonical activity parity, legacy selection, invalid/unverified lake rejection,
+HTTP unavailable responses, no cached legacy retry, selected job source reads,
+actual retired writer entrypoints, in-flight drain, failed verification, epoch
+renewal, old-exporter shutdown and cursor reload errors. The preceding scoped
+regression runs passed **220 tests in 227.69 seconds** and **258 tests with one
+optional vector scenario skipped in 288.10 seconds**. Counts overlap; they are
+not additive. Black, isort and `git diff --check` passed. Read-only review found
+no remaining critical or important issues in this implemented scope.
+
+All lake/PG integration used fixture roots and private throwaway PostgreSQL,
+with `DROVER_TEST_POSTGRES_DSN` removed. No production configuration, data root,
+catalog, hub, restart, migration, cutover or backup deletion was involved.
