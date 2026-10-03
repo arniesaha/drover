@@ -1,7 +1,7 @@
 # Continuity activation: bounded private prebind investigation
 
-Session: harness-ad8c3b34-ea5c-4802-84d8-04d1c58560b9. Base e07f9a2;
-parent instrumentation 5d32b6fb98344b192258876b208c0947a9c49381 preserved.
+Baseline e07f9a2; the accepted archive-pruning and parent instrumentation
+checkpoints remain in branch history. Operational identifiers stay outside Git.
 No live connections, deployment, service actions, configuration changes or push.
 
 ## Causal status
@@ -12,7 +12,7 @@ entire .processed archive before filtering it. A regression fails on the parent
 commit when scandir enters .processed; it passes after pruning those directories
 with os.walk. Pending paths retain global sorted order, file symlinks work,
 directory symlinks are not followed, and one failed file does not stop the pass.
-This defect predates e07f9a2. Its contribution to PID 20843's 90-second activation
+This defect predates e07f9a2. Its contribution to the failed candidate's 90-second activation
 failure is **a hypothesis**, not proof that continuity caused or fixed the stall.
 
 **Separate reproduced mechanism, policy unchanged:** default ingestion lock
@@ -87,30 +87,61 @@ analytical pin off below resolution, enabled 0.0056–0.0088 seconds;
 central consent 0.0007–0.0008 seconds; auth 0.0003–0.0008 seconds;
 service construction 0.0002–0.0003 seconds. HTTP binding was intercepted.
 
-## Foreground validation
+## Initial foreground validation
 
 112 passed in 21.93 seconds: test_startup_rehearsal.py, test_watcher.py,
 test_server_cli.py, schema deferred-view binding contract and the preserved
 PostgreSQL bounded-migration-lock/recovery contract. A separate focused run of
 the 13 rehearsal tests passed in 1.86 seconds and printed the timelines above.
-Runtime dependencies came from Studio's existing e07f9a2 Python 3.14 environment;
+Runtime dependencies came from the existing candidate Python 3.14 environment;
 pytest/formatters ran in an isolated uv tool environment. No global installation.
 
-## Next input, in priority order
+## Updated canonical evidence and decision
 
-1. Existing PID 20843 activation stderr/log excerpt: last completed startup
-   message, watcher backlog count/duration and any DuckDB lock-retry records.
-   Parent can redact paths; no payloads, query text or credential DSNs needed.
-2. Metadata-only incoming topology at activation: pending JSONL count outside
-   .processed, archive directory/file counts, and volume identity. Together with
-   retry logs this separates archive traversal from the 31-second-per-file waits.
-3. Snapshot scratch directory counts/ages and stat type/size/volume metadata for
-   analytical DuckDB/WAL and the adjacent consent file. Recursive scratch deletion,
-   DuckDB recovery/checkpoint and direct consent-file reads remain unbounded I/O.
-4. If evidence points to pin/bootstrap rather than watcher: a parent-provided,
-   verified private logical analytical copy plus minimal synthetic parquet with
-   equivalent schema/topology, excluding transcripts and credentials. Existing
-   file/WAL size and volume/permission context are necessary; another empty lakehouse
-   cannot reproduce that input. No live read-only connection is authorized here.
+Parent-provided, read-only metadata for the actual configured external volume:
+pruned incoming scan: six directories, zero pending files, five nested processed
+roots, 0.022 seconds. Archive scan: five directories, 387 files, 0.003 seconds.
+These counts do not support archive traversal or pending-file retries as the
+canonical cause. Historical topology is unavailable; the 93-second synthetic
+mechanism is not activation evidence and does not justify changing retry policy.
+The retained activation log proves artifact/PID attribution and 90 unsuccessful
+socket probes, but contains no application phase trace or stack.
 
-No rollout retry is requested. Canonical continuity remains unverified.
+The parent separately restored the PostgreSQL backup with strict pgvector 0.8.6
+and 289 sessions; fresh-analytical bootstrap took 11.760 seconds. That includes
+initialization work excluded by this worker's empty, already-initialized PG pool
+fixtures. The strict restored database is not available to these local tests;
+this worker has not replayed it. Small local fixtures cannot reproduce actual
+analytical file/WAL recovery, checkpoint cost, volume permissions, service-launch
+context, or the original network connection path. Cold PG pool configuration
+runs several session setup statements before its statement timeout is installed;
+pool admission has a bound, but native connection/setup work needs stack evidence.
+No causal repair to that path is justified by the evidence available.
+
+Independent review of archive pruning: ordering and file-symlink semantics are
+preserved, directory links are not followed, failures leave pending files intact,
+and retention/observer/worker ordering is unchanged. Review of migration locking:
+transaction-local lock_timeout is stricter than statement_timeout; the advisory
+lock still serializes schema history, failed migrations roll back and successful
+ones are skipped on replay. New checks verify lock_timeout resets after both
+rollback and commit and statement_timeout remains unchanged. Driver exceptions
+in the bootstrap logger are now reduced to their type to avoid row/query leakage.
+
+The next decision is approval of one bounded diagnostic start under the parent's
+integration ownership, after the artifact/backup/drain and credential fences in
+[the profiling proposal](continuity-startup-profiling-proposal.md) pass. It is a
+new diagnostic operation, not a blind rollout retry. No activation has been
+executed or requested by a tool. Canonical startup and continuity remain unmet.
+
+## Follow-up review validation
+
+32 affected tests passed in 5.42 seconds after the additional diagnostic/logging
+changes: new startup-diagnostic contracts, fenced prebind variants, SIGUSR1
+contracts, bounded migration lock/rollback and concurrent schema starters.
+No full-suite or NAS test run was performed. The initial 112-test proof is
+preserved; the affected prebind variants were repeated because their phase and
+command-cleanup code changed. Default-off diagnostics start no thread and perform
+no I/O. A child-process test proves sampling begins before a deliberately blocked
+heavy server import; another proves a stack sample does not terminate startup.
+Scoped and tracked-tree public release audits reported zero findings. Public
+reports contain no private paths or operational session/process identifiers.

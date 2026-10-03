@@ -473,17 +473,29 @@ def test_postgres_migration_ddl_lock_is_bounded_and_recovers(postgres_dsn, monke
                 store.bootstrap()
             assert time.monotonic() - started < 0.5
             assert store._pool is not None
+            with store.connection() as connection:
+                assert connection.execute("SHOW lock_timeout").fetchone() == ("0",)
+                assert connection.execute("SHOW statement_timeout").fetchone() == (
+                    "50ms",
+                )
             with psycopg.connect(dsn) as check:
                 check.execute(
                     sql.SQL("SET search_path TO {}").format(sql.Identifier(schema))
                 )
-                assert check.execute(
-                    "SELECT 1 FROM control_schema_migrations WHERE version = 99"
-                ).fetchone() is None
+                assert (
+                    check.execute(
+                        "SELECT 1 FROM control_schema_migrations WHERE version = 99"
+                    ).fetchone()
+                    is None
+                )
             blocker.rollback()
         store.bootstrap()
+        with store.connection() as connection:
+            assert connection.execute("SHOW lock_timeout").fetchone() == ("0",)
         with psycopg.connect(dsn) as check:
-            check.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+            check.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema))
+            )
             assert check.execute(
                 "SELECT 1 FROM control_schema_migrations WHERE version = 99"
             ).fetchone() == (1,)
@@ -491,7 +503,11 @@ def test_postgres_migration_ddl_lock_is_bounded_and_recovers(postgres_dsn, monke
         monkeypatch.setattr(postgres_schema, "_MIGRATIONS", original)
         store.close()
         with psycopg.connect(dsn, autocommit=True) as cleanup:
-            cleanup.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
+            cleanup.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema)
+                )
+            )
 
 
 def test_postgres_registry_round_trip_preserves_duplicate_event_replay(

@@ -612,7 +612,9 @@ def bootstrap_postgres_control_store(store: Any) -> None:
             # work and bound it slightly below the existing per-control-store statement deadline.
             # This is local to this transaction: it cannot relax or change
             # any other worker's PostgreSQL settings.
-            lock_timeout_ms = str(max(1, int(store.config.statement_timeout_seconds * 800)))
+            lock_timeout_ms = str(
+                max(1, int(store.config.statement_timeout_seconds * 800))
+            )
             con.execute("SELECT set_config('lock_timeout', ?, true)", [lock_timeout_ms])
             # API and worker can cold-start at the same time. The lock covers
             # schema creation as well as the version recheck, so catalog DDL
@@ -653,7 +655,12 @@ def bootstrap_postgres_control_store(store: Any) -> None:
                 )
             _apply_vector_migration(con, raw)
             con.execute("COMMIT")
-        except Exception:
-            log.exception("control-schema bootstrap failed before commit (schema=%s)", schema)
+        except Exception as exc:
+            # Driver exceptions can contain SQL and row details. Keep startup
+            # diagnostics useful without disclosing query or dataset payloads.
+            log.error(
+                "control-schema bootstrap failed before commit (%s)",
+                type(exc).__name__,
+            )
             con.execute("ROLLBACK")
             raise

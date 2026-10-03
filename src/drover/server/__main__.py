@@ -20,6 +20,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
+# This opt-in timer must precede third-party and server-wide imports.
+from drover.server.startup_diagnostics import arm_startup_diagnostics
+
+_startup_diagnostics = arm_startup_diagnostics()
+
+# isort: split
 import click
 import duckdb
 from mcp.server.fastmcp import FastMCP
@@ -857,6 +863,8 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
     )
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
+    if _startup_diagnostics is not None:
+        ctx.call_on_close(_startup_diagnostics.close)
 
 
 @main.command(name="setup-check")
@@ -2438,20 +2446,27 @@ def _analytics_worker_health(
 def _startup_phase(name: str):
     """Emit phase names and elapsed time without exception/query payloads."""
     started = time.monotonic()
-    log.info("startup phase %s starting", name)
+    identity = (
+        f"pid={os.getpid()} runtime={sys.executable!r} version={drover.__version__}"
+    )
+    log.info("startup phase %s starting (%s)", name, identity)
     try:
         yield
     except Exception as exc:
         log.error(
-            "startup phase %s failed after %.3fs (%s)",
+            "startup phase %s failed after %.3fs (%s; %s)",
             name,
             time.monotonic() - started,
             type(exc).__name__,
+            identity,
         )
         raise
     else:
         log.info(
-            "startup phase %s completed in %.3fs", name, time.monotonic() - started
+            "startup phase %s completed in %.3fs (%s)",
+            name,
+            time.monotonic() - started,
+            identity,
         )
 
 
@@ -2900,32 +2915,37 @@ def run(
                 metrics_collector.update_planner = planner
                 _start_update_checker(planner, cfg, stop)
 
-            if selected_role == "analytics":
-                worker_url = urlsplit(cfg.analytics_boundary.worker_url)
-                metrics_server = start_analytics_boundary_server(
-                    host=worker_url.hostname or "127.0.0.1",
-                    port=worker_url.port or 7082,
-                    token=os.environ[cfg.analytics_boundary.api_to_worker_token_env],
-                    config=cfg.analytics_boundary,
-                    dispatch=analytics_boundary_dispatcher(metrics_collector),
-                    archive_payload_resolver=(
-                        worker_archive_resolver.resolve
-                        if worker_archive_resolver is not None
-                        else None
-                    ),
-                    health_provider=lambda: _analytics_worker_health(outbox_exporter),
-                )
-            else:
-                # Retries a missing bind address and rebinds if it vanishes
-                # while serving, so a VPN going down no longer leaves the hub
-                # running with no listener until someone restarts it (#457).
-                metrics_server = start_resilient_metrics_server(
-                    host=metrics_host,
-                    port=cfg.metrics_http_port,
-                    collector=metrics_collector,
-                    auth=auth,
-                    pairing=pairing,
-                )
+            with _startup_phase("start_http_listener"):
+                if selected_role == "analytics":
+                    worker_url = urlsplit(cfg.analytics_boundary.worker_url)
+                    metrics_server = start_analytics_boundary_server(
+                        host=worker_url.hostname or "127.0.0.1",
+                        port=worker_url.port or 7082,
+                        token=os.environ[
+                            cfg.analytics_boundary.api_to_worker_token_env
+                        ],
+                        config=cfg.analytics_boundary,
+                        dispatch=analytics_boundary_dispatcher(metrics_collector),
+                        archive_payload_resolver=(
+                            worker_archive_resolver.resolve
+                            if worker_archive_resolver is not None
+                            else None
+                        ),
+                        health_provider=lambda: _analytics_worker_health(
+                            outbox_exporter
+                        ),
+                    )
+                else:
+                    # Retries a missing bind address and rebinds if it vanishes
+                    # while serving, so a VPN going down no longer leaves the hub
+                    # running with no listener until someone restarts it (#457).
+                    metrics_server = start_resilient_metrics_server(
+                        host=metrics_host,
+                        port=cfg.metrics_http_port,
+                        collector=metrics_collector,
+                        auth=auth,
+                        pairing=pairing,
+                    )
             _warm_metrics(metrics_collector)
             provider_refresh = ProviderRefreshLoop(
                 provider_usage=provider_usage,
