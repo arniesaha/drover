@@ -90,8 +90,14 @@ final class AccessibilityJourneyUITests: XCTestCase {
         // still calls it hittable but a center tap targets the next row.
         let fleet = app.scrollViews["fleet-list"]
         XCTAssertTrue(fleet.exists, "the fleet list should remain scrollable at XXXL")
-        for _ in 0..<3 where !fleet.frame.contains(session.frame) {
-            fleet.swipeUp()
+        // Short, held drags toward the row rather than swipes: a swipe carries
+        // momentum, and once anything sits below the session (History, the
+        // finished section, analytics) it flings the row past the top.
+        for _ in 0..<8 where !fleet.frame.contains(session.frame) {
+            let rowIsBelow = session.frame.maxY > fleet.frame.maxY
+            let start = fleet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: rowIsBelow ? 0.65 : 0.35))
+            let end = fleet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
         }
         XCTAssertTrue(fleet.frame.contains(session.frame), "the session should fit inside the fleet viewport")
         XCTAssertTrue(session.isHittable, "the fleet session should remain reachable at XXXL")
