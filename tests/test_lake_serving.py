@@ -527,7 +527,7 @@ def test_recall_bundle_unscoped_history_parity_and_repository_gate(
     assert len(actual["drover_context"]["keyword_matches"]) == 3
     assert (
         service.recall_bundle("remember", repo="o/r")["reason"]
-        == "analytics_recall_context_not_ported"
+        == "analytics_context_projection_unavailable"
     )
 
 

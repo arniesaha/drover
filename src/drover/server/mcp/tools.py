@@ -994,6 +994,17 @@ _CONTEXT_CONTAINER_COLUMNS = """
 """
 
 
+def _selected_context(path, *, limit):
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(path).backend == "ducklake":
+        from drover.server.lake.read_models import read_model
+
+        return read_model(path, "contexts", limit=limit)
+    return None
+
+
+@_canonical_read
 def drover_recent_contexts(
     *,
     duckdb_path: Path,
@@ -1015,6 +1026,9 @@ def drover_recent_contexts(
         where.append("source_harness = ?")
         params.append(source_harness)
     sql_where = f"WHERE {' AND '.join(where)}" if where else ""
+    selected = _selected_context(duckdb_path, limit=limit)
+    if selected is not None:
+        return selected
     con = _connect(duckdb_path)
     try:
         rows = _row_to_dict(
@@ -1032,6 +1046,7 @@ def drover_recent_contexts(
     return {"contexts": rows, "limit": int(limit)}
 
 
+@_canonical_read
 def drover_context_brief(
     *,
     duckdb_path: Path,
@@ -1043,6 +1058,9 @@ def drover_context_brief(
         raise ValueError("context_brief: need context_id or label")
     predicate = "context_id = ?" if context_id else "label = ?"
     value = context_id or label
+    selected = _selected_context(duckdb_path, limit=1)
+    if selected is not None:
+        return selected
     con = _connect(duckdb_path)
     try:
         rows = _row_to_dict(
@@ -1060,6 +1078,7 @@ def drover_context_brief(
     return rows[0] if rows else None
 
 
+@_canonical_read
 def drover_open_loops(
     *,
     duckdb_path: Path,
@@ -1084,6 +1103,9 @@ def drover_open_loops(
             raise ValueError("open_loops: project_key must be one <owner>/<name> pair")
         where.extend(["repo_owner = ?", "repo_name = ?"])
         params.extend([owner, name])
+    selected = _selected_context(duckdb_path, limit=limit)
+    if selected is not None:
+        return selected
     con = _connect(duckdb_path)
     try:
         rows = _row_to_dict(
@@ -1101,6 +1123,7 @@ def drover_open_loops(
     return {"open_loops": rows, "limit": int(limit)}
 
 
+@_canonical_read
 def drover_resume_context(
     *,
     duckdb_path: Path,
@@ -1109,6 +1132,11 @@ def drover_resume_context(
     max_summaries: int = 5,
 ) -> Optional[dict]:
     """Return a resumable context container plus linked session summaries."""
+    if not (context_id or label):
+        raise ValueError("context_brief: need context_id or label")
+    selected = _selected_context(duckdb_path, limit=max_summaries)
+    if selected is not None:
+        return selected
     container = drover_context_brief(
         duckdb_path=duckdb_path, context_id=context_id, label=label
     )
@@ -1192,13 +1220,13 @@ def drover_project_activity(
 # --- drover_fleet_status ------------------------------------------------------
 
 
+@_canonical_read
 def drover_fleet_status(
     *,
     duckdb_path: Path,
 ) -> dict:
     """Return live harness sessions from authoritative control-plane state."""
     return _control_active_sessions(duckdb_path)
-
 
 def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> dict:
     from dataclasses import asdict

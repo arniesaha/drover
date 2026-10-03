@@ -70,9 +70,11 @@ class RecallBundleService:
         config = selected_config(self._duckdb_path)
         try:
             if config.backend == "ducklake" and _is_exact_repository(repo):
-                # This context still includes unported legacy tables. Never mix
-                # them into a selected lake result while their routing is gated.
-                raise LakeError("analytics_recall_context_not_ported")
+                from drover.server.lake.read_models import read_model
+
+                # Missing authoritative context publication is explicit and
+                # bound to the verified selection, never an empty legacy mix.
+                return read_model(self._duckdb_path, "contexts", limit=effective_limit)
             return with_freshness(self._build_projected_bundle(**build_arguments))
         except LakeError as exc:
             return {

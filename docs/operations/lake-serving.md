@@ -139,9 +139,10 @@ publication/usage freshness before production cutover.
 ## Remaining cutover gates
 
 This is partial serving coverage, not full backend replacement.
-Repository-scoped context/recall bundles, legacy fleet/active-session adapters,
-native publication/usage freshness,
-and the remaining legacy derived/advisory writer audit still need proof. Daily
+Authoritative context publication and proven native publication/usage coverage,
+plus the remaining legacy derived/advisory writer audit still need proof.
+Fleet routing now uses PostgreSQL registry liveness behind verified selection;
+it does not claim coverage of native-only collector sessions. Daily
 fenced maintenance, immutable paired backups and fresh restore,
 exporter-watermark/rollback rehearsal, platform pin/credential installation,
 audit/soak and second-machine restore remain gates. Operator approval for
@@ -277,3 +278,42 @@ fallback. Black, isort and whitespace checks passed. No production state was
 changed. Real native publication/usage coverage, context/fleet adapters,
 production-scale lifecycle latency/soak and the remaining cutover gates above
 still require separate work.
+
+
+## Verified context/fleet adapters
+
+Context container tools (recent, brief, open loops, resume) and repository-scoped
+recall bundles now pass through verified selection. The frozen lake and PG
+schema have no authoritative `context_containers` publication. Selected lake
+responses therefore report `analytics_context_projection_unavailable`, with
+verified binding metadata, rather than returning an empty set or reading a
+legacy container. Context publication remains a release gate. Legacy selection
+retains the existing context data and linked-summary behavior.
+
+Selected fleet status uses PostgreSQL registry `running`/`awaiting` sessions,
+excluding ended sessions and retired hosts. It reports
+`status_source=postgres_registry`; historical event activity never creates a
+live session. Shared repo/agent/time fields have fixture parity where registry
+and legacy observations agree. Unproven task membership, event counts and user
+snippets are null, with `event_coverage=unavailable`. The response is bounded to
+1,000 sessions and the existing disposable child byte/RSS/deadline limits; a
+breach returns unavailable, never a partial fleet or legacy fallback.
+
+Read-model results certify the selected snapshot, epoch, verification proof,
+data root and PG identity hash before and after computation. The PG copy and
+freshness diagnostics share a repeatable-read snapshot and must match that
+identity hash. A binding change rejects the result. Metadata adds `binding`;
+native publication/usage add `coverage_binding` and `generation=null` to make
+missing coverage receipts explicit. Recent or stale legacy usage clocks are
+never promoted to `fresh`; their diagnostic timestamps do not establish a lake
+publication/usage generation. Verification loss is unavailable and cannot
+reuse a cached fresh result. No context/native publisher, configuration change,
+production state operation or capacity/maintenance/cutover work is included.
+
+Adapter validation (2026-10-03): foreground scoped adapter, activity, selector,
+legacy context, recall-bundle and MCP regressions passed **81 tests in 334.84
+seconds**. Final identity-tag/proof-loss assertions passed **2 focused tests in
+32.10 seconds** (overlapping that scope). All integration used disposable PG
+and fixture lakes with the ambient test DSN removed. Black, isort and whitespace
+checks passed. No live configuration, stores, services or operational cutover
+state were changed.
