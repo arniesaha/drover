@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+from time import monotonic
 from typing import Any
 
 from drover.server.continuity_schema import CONTINUITY_DDL
+
+log = logging.getLogger(__name__)
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -604,6 +608,12 @@ def bootstrap_postgres_control_store(store: Any) -> None:
         raw = con._connection
         con.execute("BEGIN")
         try:
+            # Distinguish a migration DDL lock wait from ordinary statement
+            # work and bound it slightly below the existing per-control-store statement deadline.
+            # This is local to this transaction: it cannot relax or change
+            # any other worker's PostgreSQL settings.
+            lock_timeout_ms = str(max(1, int(store.config.statement_timeout_seconds * 800)))
+            con.execute("SELECT set_config('lock_timeout', ?, true)", [lock_timeout_ms])
             # API and worker can cold-start at the same time. The lock covers
             # schema creation as well as the version recheck, so catalog DDL
             # is never concurrent and a waiter sees the winner's migration.
@@ -628,14 +638,22 @@ def bootstrap_postgres_control_store(store: Any) -> None:
                 ).fetchone()
                 if applied is not None:
                     continue
+                log.info("control-schema migration %s starting", version)
+                started = monotonic()
                 for statement in statements:
                     con.execute(statement)
                 con.execute(
                     "INSERT INTO control_schema_migrations (version) VALUES (?)",
                     [version],
                 )
+                log.info(
+                    "control-schema migration %s completed in %.3fs",
+                    version,
+                    monotonic() - started,
+                )
             _apply_vector_migration(con, raw)
             con.execute("COMMIT")
         except Exception:
+            log.exception("control-schema bootstrap failed before commit (schema=%s)", schema)
             con.execute("ROLLBACK")
             raise

@@ -2434,6 +2434,20 @@ def _analytics_worker_health(
     return {"state": "degraded" if health.get("last_error") else "ok", "outbox": outbox}
 
 
+@contextmanager
+def _startup_phase(name: str):
+    """Emit bounded, credential-free evidence for a pre-bind startup stall."""
+    started = time.monotonic()
+    log.info("startup phase %s starting", name)
+    try:
+        yield
+    except Exception:
+        log.exception("startup phase %s failed after %.3fs", name, time.monotonic() - started)
+        raise
+    else:
+        log.info("startup phase %s completed in %.3fs", name, time.monotonic() - started)
+
+
 @main.command()
 @click.option(
     "--role",
@@ -2550,19 +2564,23 @@ def run(
     # external SSD that blocked all-role startup for >10 minutes before MCP or
     # OTLP could bind. The analytical views are finalized after the network
     # surfaces are listening.
-    pin_analytical_connection(cfg.duckdb_path)
-    bootstrap(
-        parquet_dir=cfg.parquet_dir,
-        duckdb_path=cfg.duckdb_path,
-        bind_parquet_views=False,
-    )
+    with _startup_phase("pin_analytical_connection"):
+        pin_analytical_connection(cfg.duckdb_path)
+    with _startup_phase("bootstrap_catalog_and_control_store"):
+        bootstrap(
+            parquet_dir=cfg.parquet_dir,
+            duckdb_path=cfg.duckdb_path,
+            bind_parquet_views=False,
+        )
     central_consent: CentralContentConsent | None = None
     if cfg.control_store.backend == "postgres":
-        require_control_store_ready(cfg.duckdb_path)
-        central_consent = CentralContentConsent(
-            cfg.duckdb_path, legacy_config_path=runtime_config_path
-        )
-        central_consent.initialize(cfg.advisory_content)
+        with _startup_phase("require_control_store_ready"):
+            require_control_store_ready(cfg.duckdb_path)
+        with _startup_phase("initialize_central_consent"):
+            central_consent = CentralContentConsent(
+                cfg.duckdb_path, legacy_config_path=runtime_config_path
+            )
+            central_consent.initialize(cfg.advisory_content)
     host_bridge = (
         HostDataBridgeClient(
             cfg.analytics_boundary,
@@ -2571,7 +2589,8 @@ def run(
         if selected_role == "analytics"
         else None
     )
-    worker_archive_resolver = _worker_archive_payload_resolver(cfg)
+    with _startup_phase("build_worker_archive_resolver"):
+        worker_archive_resolver = _worker_archive_payload_resolver(cfg)
     # After bootstrap, which is what creates and migrates the control-plane
     # store, and before any worker starts, so the one moment the control plane
     # touches a connect lock is a moment when nothing is scanning. Pins the
@@ -2579,13 +2598,15 @@ def run(
     # DuckDB's file lock against a co-resident harnessd, which shares that
     # store -- and db.py logs which way it went. The lock split and the
     # separate database in control_plane_connection apply regardless (#95).
-    pin_control_plane_connection(cfg.duckdb_path)
+    with _startup_phase("pin_control_plane_connection"):
+        pin_control_plane_connection(cfg.duckdb_path)
     # Snapshot copies are only cleaned up when a process exits gracefully, and a
     # hub that is killed or restarted by launchd does not. They accumulated
     # across every restart until the volume ran out (#171), so startup is where
     # the previous process's leavings get collected. Anything recent belongs to
     # a co-resident process still using it and is left alone.
-    sweep_orphaned_snapshot_scratch(cfg.duckdb_path)
+    with _startup_phase("sweep_orphaned_snapshot_scratch"):
+        sweep_orphaned_snapshot_scratch(cfg.duckdb_path)
 
     # An explicit --metrics-host wins; otherwise the bind comes from
     # [server] metrics_host in config.toml. Keeping it in config matters

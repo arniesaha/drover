@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -424,6 +425,73 @@ def test_postgres_bootstrap_serializes_concurrent_starters(
 
         with psycopg.connect(dsn, autocommit=True) as con:
             con.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_postgres_migration_ddl_lock_is_bounded_and_recovers(postgres_dsn, monkeypatch):
+    """A conflicting DDL lock rolls back without recording a partial version."""
+    dsn = postgres_dsn
+    monkeypatch.setenv("DROVER_TEST_POSTGRES_DSN", dsn)
+    if not dsn:
+        pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.errors import LockNotAvailable
+
+    from drover.config import ControlStoreConfig
+    from drover.server import postgres_schema
+    from drover.server.postgres_control_store import PostgresControlStore
+
+    schema = f"drover_test_{uuid4().hex}"
+    config = ControlStoreConfig(
+        backend="postgres",
+        dsn_env="DROVER_TEST_POSTGRES_DSN",
+        pool_min_size=1,
+        pool_max_size=1,
+        acquire_timeout_seconds=1.0,
+        statement_timeout_seconds=0.05,
+        schema=schema,
+    )
+    store = PostgresControlStore(config)
+    original = postgres_schema._MIGRATIONS
+    try:
+        store.bootstrap()
+        # A small synthetic migration uses the same CREATE INDEX lock class as
+        # migration 9 without mutating production or requiring a long fixture.
+        monkeypatch.setattr(
+            postgres_schema,
+            "_MIGRATIONS",
+            ((99, ("CREATE INDEX bounded_lock_probe ON harness_sessions (host_id)",)),),
+        )
+        with psycopg.connect(dsn, autocommit=False) as blocker:
+            blocker.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema))
+            )
+            blocker.execute("LOCK TABLE harness_sessions IN ACCESS EXCLUSIVE MODE")
+            started = time.monotonic()
+            with pytest.raises(LockNotAvailable, match="lock timeout"):
+                store.bootstrap()
+            assert time.monotonic() - started < 0.5
+            assert store._pool is not None
+            with psycopg.connect(dsn) as check:
+                check.execute(
+                    sql.SQL("SET search_path TO {}").format(sql.Identifier(schema))
+                )
+                assert check.execute(
+                    "SELECT 1 FROM control_schema_migrations WHERE version = 99"
+                ).fetchone() is None
+            blocker.rollback()
+        store.bootstrap()
+        with psycopg.connect(dsn) as check:
+            check.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+            assert check.execute(
+                "SELECT 1 FROM control_schema_migrations WHERE version = 99"
+            ).fetchone() == (1,)
+    finally:
+        monkeypatch.setattr(postgres_schema, "_MIGRATIONS", original)
+        store.close()
+        with psycopg.connect(dsn, autocommit=True) as cleanup:
+            cleanup.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
 
 
 def test_postgres_registry_round_trip_preserves_duplicate_event_replay(
