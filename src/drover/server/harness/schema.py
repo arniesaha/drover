@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import duckdb
 
+from drover.server.harness.continuity_schema import CONTINUITY_DDL
 from drover.server.harness.identity import harness_event_identity
 
 HARNESS_TABLES = (
@@ -331,6 +332,8 @@ def migrate_duplicate_harness_events(
 
 def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     """Create Drover harness control-plane tables. Idempotent."""
+    for statement in CONTINUITY_DDL:
+        con.execute(statement)
     con.execute(_HARNESS_HOSTS_DDL)
     _ensure_harness_columns(
         con,

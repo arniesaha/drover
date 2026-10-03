@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from drover.server.harness.continuity_schema import CONTINUITY_DDL
+
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         1,
@@ -507,6 +509,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "SELECT drover_refresh_session_search(session_id) FROM harness_sessions",
         ),
     ),
+    (10, CONTINUITY_DDL),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
