@@ -53,6 +53,9 @@ def test_hub_bundle_preserves_envelope_and_scoped_context(service):
         "drover_context",
         "limits",
         "sources",
+        "store",
+        "host",
+        "data_watermark",
     ]
     assert bundle["sources"] == ["hub"]
     assert bundle["query"]["text"] == "recall question"

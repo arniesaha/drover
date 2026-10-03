@@ -32,6 +32,7 @@ from drover.server.ledger import (
     MemoryStoreUnavailable,
     memory_store_available,
 )
+from drover.server.mcp.contract import READ_CAPS, bounded_read
 from drover.server.memory_store import (
     EmbeddingStore,
     MemoryRepository,
@@ -49,11 +50,6 @@ from drover.server.summarizer.jobs import (
 from drover.task_id import compute_task_id
 
 log = logging.getLogger("drover.mcp.tools")
-
-#: Partition bound for the fleet-status message snippet. A session reported as
-#: active had an event in the last 30 minutes; its newest *user* message can be
-#: older than that when a long run is under way, but not older than this.
-_FLEET_SNIPPET_DAYS = 7
 
 #: Ingest placeholders that are never a real session; summaries keyed on them
 #: are noise in every handoff.
@@ -250,7 +246,10 @@ def _memory(duckdb_path: Path) -> MemoryRepository | None:
 def _summary_row(memory_row: Any, keys: Sequence[str]) -> dict:
     """A SessionSummary/ProjectBrief in a tool's legacy row shape."""
     full = memory_row.as_dict()
-    return {key: _coerce(full.get(key)) for key in keys}
+    return {
+        **{key: _coerce(full.get(key)) for key in keys},
+        "generated_at": _coerce(full.get("generated_at")),
+    }
 
 
 def _newest_first(summaries: Iterable[SessionSummary]) -> list[SessionSummary]:
@@ -545,27 +544,7 @@ def drover_active_sessions(
     duckdb_path: Path,
     task_id: Optional[str] = None,
 ) -> dict:
-    con = _connect(duckdb_path)
-    try:
-        if task_id:
-            cur = con.execute(
-                """SELECT session_id, agent_id, task_id, started_at, last_event_at,
-                          event_count, repo_owner, repo_name, branch
-                   FROM active_sessions WHERE task_id = ?
-                   ORDER BY last_event_at DESC""",
-                [task_id],
-            )
-        else:
-            cur = con.execute(
-                """SELECT session_id, agent_id, task_id, started_at, last_event_at,
-                          event_count, repo_owner, repo_name, branch
-                   FROM active_sessions
-                   ORDER BY last_event_at DESC"""
-            )
-        active = _row_to_dict(cur)
-    finally:
-        con.close()
-    return {"active_sessions": _drop_closed_active_sessions(duckdb_path, active)}
+    return _control_active_sessions(duckdb_path, task_id=task_id)
 
 
 # --- drover_search ------------------------------------------------------------
@@ -662,7 +641,7 @@ def drover_search(
       SELECT id, session_id, agent_id, timestamp, event_type, content, source
       FROM canonical_agent_events
       ORDER BY timestamp DESC
-      LIMIT {int(limit)}
+      LIMIT {int(limit) + 1}
     """
     con = _connect(duckdb_path)
     try:
@@ -682,7 +661,8 @@ def drover_search(
         "scoped": scoped,
         "since": since,
         "default_since_days": int(default_since_days) if not scoped else None,
-        "results": results,
+        "results": results[:limit],
+        "truncated": len(results) > limit,
     }
 
 
@@ -695,6 +675,7 @@ def drover_files_touched(
     task_id: Optional[str] = None,
     since: Optional[str] = None,
     session_id: Optional[str] = None,
+    limit: int = 100,
 ) -> dict:
     """Return distinct file paths touched by Edit/Write/Bash tool_use blocks.
 
@@ -715,6 +696,7 @@ def drover_files_touched(
       SELECT DISTINCT event_type, raw_data
       FROM canonical_agent_events
       WHERE {" AND ".join(where)} AND raw_data IS NOT NULL AND raw_data <> '{{}}'
+      LIMIT {int(limit) + 1}
     """
     con = _connect(duckdb_path)
     try:
@@ -727,7 +709,13 @@ def drover_files_touched(
     files = compute_files_touched(
         {"event_type": kind, "raw_data": raw} for kind, raw in rows
     )
-    return {**(resolution or {}), "status": "ok", "task_id": task_id, "files": files}
+    return {
+        **(resolution or {}),
+        "status": "ok",
+        "task_id": task_id,
+        "files": files[:limit],
+        "truncated": len(rows) > limit or len(files) > limit,
+    }
 
 
 # --- drover_task_status -------------------------------------------------------
@@ -1101,92 +1089,50 @@ def drover_fleet_status(
     *,
     duckdb_path: Path,
 ) -> dict:
-    """Return a snapshot of every currently-active session with repo context.
+    """Return live harness sessions from authoritative control-plane state."""
+    return _control_active_sessions(duckdb_path)
 
-    "Active" means: an agent_event within the last 30 minutes and no session
-    summary that already covers the newest event (open session). Combines
-    active_sessions with tasks for repo info.
-    """
-    con = _connect(duckdb_path)
-    try:
-        sessions = _row_to_dict(con.execute("""SELECT
-                 a.session_id,
-                 a.agent_id,
-                 a.task_id,
-                 COALESCE(a.repo_owner, t.repo_owner) AS repo_owner,
-                 COALESCE(a.repo_name,  t.repo_name)  AS repo_name,
-                 COALESCE(a.branch,     t.branch)     AS branch,
-                 a.started_at,
-                 a.last_event_at,
-                 a.event_count
-               FROM active_sessions a
-               LEFT JOIN tasks t ON a.task_id = t.task_id
-               ORDER BY a.last_event_at DESC"""))
-        from drover.server.harness.registry import HarnessRegistry
 
-        registry = HarnessRegistry(duckdb_path)
-        all_hosts = registry.list_hosts(include_retired=True)
-        liveness = {host.host_id: host.liveness().state for host in all_hosts}
-        retired = {host.host_id for host in all_hosts if host.retired_at is not None}
-        retired_sessions = set()
-        for host_id in retired:
-            for session in registry.list_sessions(host_id=host_id):
-                retired_sessions.update(
-                    value
-                    for value in (
-                        session.session_id,
-                        session.native_session_id,
-                        session.summary_session_id,
-                    )
-                    if value
-                )
-        sessions = [
-            session
-            for session in sessions
-            if session["agent_id"] not in retired
-            and session["session_id"] not in retired_sessions
-        ]
-        sessions = _drop_closed_active_sessions(duckdb_path, sessions)
-        # One bounded pass for every snippet. The previous loop ran a
-        # whole-history canonical scan *per session*, so the cost of the tool
-        # grew with the size of the fleet it was reporting on and a busy hub
-        # never finished it (drover#369).
-        snippets: dict[str, str | None] = {}
-        session_ids = [s["session_id"] for s in sessions]
-        if session_ids:
-            placeholders = ", ".join("?" for _ in session_ids)
-            rows = con.execute(
-                f"""WITH recent_agent_events AS (
-                      SELECT * FROM agent_events
-                      WHERE date >= strftime(
-                              now() - INTERVAL {_FLEET_SNIPPET_DAYS} DAY, '%Y-%m-%d'
-                            )
-                        AND session_id IN ({placeholders})
-                        AND role = 'user'
-                        AND content IS NOT NULL
-                    ),
-                    {canonical_agent_events_cte(source="recent_agent_events")}
-                    SELECT session_id, content FROM (
-                      SELECT session_id, content,
-                             row_number() OVER (
-                               PARTITION BY session_id
-                               ORDER BY TRY_CAST(timestamp AS TIMESTAMPTZ) DESC
-                             ) AS rank
-                        FROM canonical_agent_events
-                    )
-                    WHERE rank = 1""",
-                session_ids,
-            ).fetchall()
-            snippets = {str(row[0]): row[1] for row in rows}
-        for s in sessions:
-            content = snippets.get(s["session_id"])
-            s["latest_user_message"] = (content or "")[:300] if content else None
-            # Derived from heartbeat age, so an agent never trusts a session
-            # on a host that went dark; None when the agent is not a host.
-            s["host_liveness"] = liveness.get(s["agent_id"])
-    finally:
-        con.close()
-    return {"active_sessions": sessions, "count": len(sessions)}
+def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> dict:
+    from dataclasses import asdict
+
+    from drover.server.control_store import is_postgres_control_store
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(duckdb_path)
+    # The registry default excludes retired hosts; retain that boundary for
+    # active work while deriving liveness for every host it returns.
+    host_liveness = {
+        host.host_id: (host.liveness().state if hasattr(host, "liveness") else "online")
+        for host in registry.list_hosts()
+    }
+    sessions = []
+    for session in registry.list_sessions(archived_limit=0):
+        liveness = host_liveness.get(session.host_id)
+        # Retired hosts retain history but are never active fleet work.
+        if liveness is None or liveness == "retired":
+            continue
+        tid = compute_task_id(
+            None, session.repo_owner, session.repo_name, session.branch
+        )
+        if task_id and tid != task_id:
+            continue
+        row = _coerce(asdict(session))
+        row.update(
+            agent_id=session.host_id,
+            task_id=tid,
+            host_liveness=liveness,
+        )
+        sessions.append(row)
+    return {
+        "active_sessions": sessions,
+        "count": len(sessions),
+        "state_source": "control_plane.harness_sessions+harness_hosts",
+        "control_store": (
+            "postgres" if is_postgres_control_store(duckdb_path) else "duckdb"
+        ),
+        "authoritative": True,
+    }
 
 
 # --- drover_data_quality ------------------------------------------------------
@@ -1251,6 +1197,7 @@ def _recall_row(
         "span_id": None,
         "agent_id": summary.agent_id if summary else None,
         "ended_at": _coerce(summary.ended_at) if summary else None,
+        "generated_at": _coerce(summary.generated_at) if summary else None,
         "summary_md": summary.summary_md if summary else None,
         "next_steps_md": summary.next_steps_md if summary else None,
         "open_questions": list(summary.open_questions) if summary else [],
@@ -1270,6 +1217,7 @@ def drover_recall(
     session_id: Optional[str] = None,
     query: Optional[str] = None,
     embedding_model: Optional[str] = None,
+    query_embedding_model: Optional[str] = None,
 ) -> dict:
     """Return session summaries ranked by cosine similarity to ``query_embedding``.
 
@@ -1287,6 +1235,20 @@ def drover_recall(
     Filters by ``(repo_owner, repo_name)`` if both are provided. Span
     embeddings have been removed from the core memory path (#480).
     """
+    if query_embedding is not None:
+        from drover.server.memory_store import EMBEDDING_DIM, EmbeddingMismatch
+
+        if len(query_embedding) != EMBEDDING_DIM:
+            raise EmbeddingMismatch(
+                f"embedding has {len(query_embedding)} dimensions; expected {EMBEDDING_DIM}"
+            )
+        if (
+            query_embedding_model is not None
+            and query_embedding_model != embedding_model
+        ):
+            raise EmbeddingMismatch(
+                f"query model {query_embedding_model!r} does not match hub model {embedding_model!r}"
+            )
     resolution = _resolve(duckdb_path, session_id) if session_id else None
     if resolution and resolution["status"] != "ok":
         return resolution
@@ -1458,6 +1420,12 @@ def drover_task_status(
     )
     out["latest_summary"] = latest_summary[0] if latest_summary else None
     return out
+
+
+# Apply the same response caps to direct users and the MCP transport.
+for _tool_name in READ_CAPS:
+    if _tool_name in globals():
+        globals()[_tool_name] = bounded_read(globals()[_tool_name])
 
 
 # Transition aliases (nexus_* → drover_*), kept for one release so existing

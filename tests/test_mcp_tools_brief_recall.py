@@ -330,6 +330,10 @@ def test_recent_sessions_prefers_session_memory_project_key(
         "open_questions",
         "files_touched",
         "generator_model",
+        "generated_at",
+        "store",
+        "host",
+        "data_watermark",
     }
 
 
@@ -504,7 +508,7 @@ def test_project_activity_caps_and_validates_inputs(tmp_path: Path) -> None:
 
     assert out["window"]["days"] == 30
     assert len(_sessions(out)) == 2
-    assert out["truncated"]["sessions"] is True
+    assert out["truncation_details"]["sessions"] is True
     assert out["projects"][0]["session_count"] == 4
     with pytest.raises(ValueError, match="owner"):
         drover_project_activity(duckdb_path=duckdb_path, project_key="not-a-pair")

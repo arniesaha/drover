@@ -559,6 +559,7 @@ def test_readers_degrade_without_postgres_memory_store(tmp_path: Path) -> None:
 def test_active_sessions_list(tmp_path: Path, pg_control_path: Path) -> None:
     parquet_dir, duckdb_path = _seed(tmp_path)
     ctx = _populate(parquet_dir, duckdb_path)
+    _register_live(duckdb_path, "sess-B", repo_name="nexus")
     out = drover_active_sessions(duckdb_path=duckdb_path, task_id=ctx["task_id"])
     assert any(s["session_id"] == "sess-B" for s in out["active_sessions"])
 
@@ -755,6 +756,10 @@ def test_task_status_aggregates(tmp_path: Path, pg_control_path: Path) -> None:
         "agent_id",
         "summary_md",
         "ended_at",
+        "generated_at",
+        "store",
+        "host",
+        "data_watermark",
     }
 
 
@@ -889,7 +894,7 @@ def test_active_sessions_keeps_a_session_summarised_mid_flight(
     duckdb_path, _ = _seed_summarised_mid_flight(
         tmp_path, summary_offset=-timedelta(minutes=4)
     )
-    out = drover_active_sessions(duckdb_path=duckdb_path)
+    out = drover_handoff(duckdb_path=duckdb_path, task_id=_)
     assert [s["session_id"] for s in out["active_sessions"]] == ["sess-live"]
 
 
@@ -920,7 +925,7 @@ def test_active_sessions_compares_instants_across_time_zones(
     )
     assert [
         s["session_id"]
-        for s in drover_active_sessions(duckdb_path=duckdb_path)["active_sessions"]
+        for s in drover_handoff(duckdb_path=duckdb_path, task_id=_)["active_sessions"]
     ] == ["sess-live"]
     summary = mcp_tools.MemoryRepository(duckdb_path).summary("sess-live")
     covering = summary.ended_at + timedelta(seconds=1)
@@ -930,7 +935,24 @@ def test_active_sessions_compares_instants_across_time_zones(
         task_id=summary.task_id,
         ended_at=covering.astimezone(timezone(timedelta(hours=-7))),
     )
-    assert drover_active_sessions(duckdb_path=duckdb_path)["active_sessions"] == []
+    assert drover_handoff(duckdb_path=duckdb_path, task_id=_)["active_sessions"] == []
+
+
+def _register_live(path, session_id, host_id="macmini-claude", repo_name="drover"):
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(path)
+    registry.register_host(host_id=host_id, display_name=host_id, kind="mac")
+    registry.create_session(
+        session_id=session_id,
+        host_id=host_id,
+        harness="claude",
+        command="claude",
+        status="running",
+        repo_owner="arniesaha",
+        repo_name=repo_name,
+        branch="main",
+    )
 
 
 def _seed_active_fleet(tmp_path: Path, *, sessions: int) -> Path:
@@ -939,6 +961,7 @@ def _seed_active_fleet(tmp_path: Path, *, sessions: int) -> Path:
     now = datetime.now(timezone.utc)
     rows = []
     for index in range(sessions):
+        _register_live(duckdb_path, f"sess-{index}", host_id=f"host-{index}")
         for offset, role, content in (
             (12, "user", f"first ask {index}"),
             (3, "user", f"latest ask {index}"),
@@ -998,12 +1021,7 @@ def test_fleet_status_cost_does_not_grow_with_the_fleet(
     out = mcp_tools.drover_fleet_status(duckdb_path=duckdb_path)
 
     assert out["count"] == 3
-    assert {s["latest_user_message"] for s in out["active_sessions"]} == {
-        "latest ask 0",
-        "latest ask 1",
-        "latest ask 2",
-    }
-    assert len(statements) <= 2, f"{len(statements)} statements for 3 sessions"
+    assert len(statements) == 0, "fleet must not query analytical events"
 
 
 def test_recent_sessions_attributes_a_repo_without_rescanning_history(
@@ -1172,19 +1190,10 @@ def test_fleet_status_excludes_retired_host_sessions(tmp_path):
 
     path = _seed_active_fleet(tmp_path, sessions=3)
     registry = HarnessRegistry(path)
-    registry.register_host(host_id="gone", display_name="Gone", kind="mac")
-    active = mcp_tools.drover_fleet_status(duckdb_path=path)["active_sessions"]
-    registry.create_session(
-        host_id="gone",
-        harness="claude",
-        command="claude",
-        status="completed",
-        native_session_id=active[0]["session_id"],
-    )
-    registry.retire_host("gone", reason="uninstalled")
+    registry.retire_host("host-0", reason="uninstalled", force=True)
     result = mcp_tools.drover_fleet_status(duckdb_path=path)
     assert result["count"] == 2
-    assert active[0]["session_id"] not in {
+    assert "sess-0" not in {
         session["session_id"] for session in result["active_sessions"]
     }
 

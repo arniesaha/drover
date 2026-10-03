@@ -13,6 +13,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from drover.server.mcp import tools as t
+from drover.server.mcp.contract import ReadAdmission
 from drover.server.recall_bundle import RecallBundleService
 from drover.server.summarizer.backends import SummarizerBackendConfig
 
@@ -42,16 +43,24 @@ def build_mcp_server(
     mcp = FastMCP(name, host=host, port=port)
     db = Path(duckdb_path)
     bcfg = backend_config
+    admission = ReadAdmission()
+
+    def read_tool():
+        def register(fn):
+            return mcp.tool()(admission.wrap(fn))
+
+        return register
+
     recall_service = RecallBundleService(
         duckdb_path=db,
     )
 
-    @mcp.tool()
+    @read_tool()
     def drover_memory_acceptance(harness_ids: list[str]) -> dict:
         """Read-only memory evidence report for up to 25 harness IDs."""
         return t.drover_memory_acceptance(duckdb_path=db, harness_ids=harness_ids)
 
-    @mcp.tool()
+    @read_tool()
     def drover_handoff(
         repo_owner: Optional[str] = None,
         repo_name: Optional[str] = None,
@@ -73,7 +82,7 @@ def build_mcp_server(
             max_summaries=max_summaries,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_session_replay(
         session_id: str, last_n_turns: int = 30, include_empty: bool = False
     ) -> dict:
@@ -89,18 +98,17 @@ def build_mcp_server(
             include_empty=include_empty,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_session_summary(session_id: str) -> dict:
         """Return the session_summaries row for one session, or null if no summary exists."""
         return t.drover_session_summary(duckdb_path=db, session_id=session_id)
 
-    @mcp.tool()
+    @read_tool()
     def drover_active_sessions(task_id: Optional[str] = None) -> dict:
-        """List currently-active sessions: an event within the last 30 min and no
-        summary that already covers the newest event."""
+        """List live harness sessions from authoritative control-plane state."""
         return t.drover_active_sessions(duckdb_path=db, task_id=task_id)
 
-    @mcp.tool()
+    @read_tool()
     def drover_search(
         query: str,
         task_id: Optional[str] = None,
@@ -128,7 +136,7 @@ def build_mcp_server(
             default_since_days=default_since_days,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_recall_bundle(
         query: str,
         repo: Optional[str] = None,
@@ -149,15 +157,20 @@ def build_mcp_server(
             max_context_chars=max_context_chars,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_files_touched(
+        limit: int = 100,
         task_id: Optional[str] = None,
         since: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> dict:
         """Return file paths from normalized tool inputs for a task or harness/native ``session_id``."""
         return t.drover_files_touched(
-            duckdb_path=db, task_id=task_id, since=since, session_id=session_id
+            duckdb_path=db,
+            task_id=task_id,
+            since=since,
+            session_id=session_id,
+            limit=limit,
         )
 
     @mcp.tool()
@@ -169,7 +182,7 @@ def build_mcp_server(
         unavailable (no PostgreSQL memory store)."""
         return t.drover_session_close(duckdb_path=db, session_id=session_id)
 
-    @mcp.tool()
+    @read_tool()
     def drover_project_brief(
         repo_owner: Optional[str] = None,
         repo_name: Optional[str] = None,
@@ -186,7 +199,7 @@ def build_mcp_server(
             project_key=project_key,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_recent_sessions(
         repo_owner: Optional[str] = None,
         repo_name: Optional[str] = None,
@@ -205,7 +218,7 @@ def build_mcp_server(
             limit=limit,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_recent_contexts(
         container_type: Optional[str] = None,
         source_harness: Optional[str] = None,
@@ -221,7 +234,7 @@ def build_mcp_server(
             limit=limit,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_context_brief(
         context_id: Optional[str] = None,
         label: Optional[str] = None,
@@ -232,7 +245,7 @@ def build_mcp_server(
             duckdb_path=db, context_id=context_id, label=label
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_open_loops(
         container_type: Optional[str] = None,
         limit: int = 20,
@@ -250,7 +263,7 @@ def build_mcp_server(
             project_key=project_key,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_resume_context(
         context_id: Optional[str] = None,
         label: Optional[str] = None,
@@ -265,8 +278,9 @@ def build_mcp_server(
             max_summaries=max_summaries,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_recall(
+        query_embedding_model: Optional[str] = None,
         query_embedding: Optional[list[float]] = None,
         limit: int = 5,
         repo_owner: Optional[str] = None,
@@ -290,9 +304,10 @@ def build_mcp_server(
             repo_name=repo_name,
             query=query,
             embedding_model=embedding_model,
+            query_embedding_model=query_embedding_model,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_task_status(
         task_id: Optional[str] = None, session_id: Optional[str] = None
     ) -> dict:
@@ -303,7 +318,7 @@ def build_mcp_server(
             duckdb_path=db, task_id=task_id, session_id=session_id
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_project_activity(
         project_key: Optional[str] = None,
         since: Optional[str] = None,
@@ -326,7 +341,7 @@ def build_mcp_server(
             limit=limit,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_active_handoff(session_id: str, max_age_seconds: float = 60) -> dict:
         """Rolling handoff brief for an OPEN session.
 
@@ -344,15 +359,12 @@ def build_mcp_server(
             max_age_seconds=max_age_seconds,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_fleet_status() -> dict:
-        """Snapshot of all currently-active sessions (event in last 30 min, no
-        summary covering the newest event) with their repo, agent, and latest
-        user message. Use this
-        to answer 'what is every agent doing right now?'"""
+        """Live fleet from authoritative control-plane harness sessions and hosts."""
         return t.drover_fleet_status(duckdb_path=db)
 
-    @mcp.tool()
+    @read_tool()
     def drover_data_quality(
         incoming_dir: Optional[str] = None,
         hours: int = 24,
@@ -374,7 +386,7 @@ def build_mcp_server(
             spans_enabled=spans_enabled,
         )
 
-    @mcp.tool()
+    @read_tool()
     def drover_pipeline_observatory(
         incoming_dir: Optional[str] = None,
         max_artifacts: int = 10,
