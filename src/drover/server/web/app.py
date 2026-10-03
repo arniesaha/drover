@@ -111,6 +111,7 @@ MIRROR_DRAIN_MAX = 256
 MIRROR_DRAIN_SECONDS = 2.0
 _MESSAGE_PAGE_DEFAULT = 200
 _MESSAGE_PAGE_MAX = 500
+_HISTORY_PATH = "/sessions/history"
 _GZIP_MIN_BYTES = 1024
 
 
@@ -827,6 +828,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     host_data_bridge_token: str = ""
     analytical_slots: threading.BoundedSemaphore
     fleet_slots: threading.BoundedSemaphore
+    history_slots: threading.BoundedSemaphore
     metrics_slots: threading.BoundedSemaphore
     mutation_slots: threading.BoundedSemaphore
 
@@ -864,7 +866,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 "mutation": self.mutation_slots,
             }[lane]
             if analytical
-            else self.fleet_slots if path in {"/harness", "/harness/hosts"} else None
+            else (
+                self.fleet_slots
+                if path in {"/harness", "/harness/hosts"}
+                else self.history_slots if path.startswith(_HISTORY_PATH) else None
+            )
         )
         # Authenticate before exposing saturation. ThreadingHTTPServer already
         # gives control requests their own threads. Only heavy requests wait
@@ -877,7 +883,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 503,
                 "application/json",
                 json.dumps(
-                    {"error": "analytics busy" if analytical else "fleet listing busy"}
+                    {
+                        "error": (
+                            "analytics busy"
+                            if analytical
+                            else (
+                                "history busy"
+                                if path.startswith(_HISTORY_PATH)
+                                else "fleet listing busy"
+                            )
+                        )
+                    }
                 )
                 + "\n",
                 extra_headers={"Retry-After": "1"},
@@ -964,6 +980,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/ui/harness":
             self._send(200, "text/html; charset=utf-8", load_page("harness.html"))
+            return
+        if path == "/ui/history":
+            self._send(200, "text/html; charset=utf-8", load_page("history.html"))
+            return
+        if path in {_HISTORY_PATH, f"{_HISTORY_PATH}/facets"}:
+            self._send_session_history(path, parsed.query)
             return
         if path.startswith("/ui/harness/sessions/"):
             session_id = unquote(path.removeprefix("/ui/harness/sessions/").strip("/"))
@@ -1947,6 +1969,47 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def _harness_registry(self) -> HarnessRegistry:
         return HarnessRegistry(self.collector.duckdb_path)
 
+    def _send_session_history(self, path: str, query: str) -> None:
+        """``GET /sessions/history[/facets]`` from the PostgreSQL control plane."""
+        from drover.server.db import ControlPlaneBusy
+        from drover.server.session_history import (
+            HistoryUnavailable,
+            fetch_history_facets,
+            fetch_history_page,
+            parse_history_query,
+        )
+
+        try:
+            if path.endswith("/facets"):
+                body = fetch_history_facets(self.collector.duckdb_path)
+            else:
+                params = parse_qs(query, keep_blank_values=False)
+                body = fetch_history_page(
+                    self.collector.duckdb_path, parse_history_query(params)
+                )
+        except ValueError as exc:
+            self._send(400, "application/json", json.dumps({"error": str(exc)}) + "\n")
+            return
+        except HistoryUnavailable as exc:
+            # Permanent for this hub's configuration, so not 503: a client
+            # would read that as "busy, retry" and back off the whole hub.
+            self._send(501, "application/json", json.dumps({"error": str(exc)}) + "\n")
+            return
+        except ControlPlaneBusy:
+            self._send(
+                503,
+                "application/json",
+                '{"error": "history busy"}\n',
+                extra_headers={"Retry-After": "1"},
+            )
+            return
+        self._send(
+            200,
+            "application/json",
+            json.dumps(body, separators=(",", ":")) + "\n",
+            route_class="session_history",
+        )
+
     def _archive_resolver_for_request(self) -> Any | None:
         factory = getattr(self.collector, "archive_resolver_factory", None)
         if callable(factory):
@@ -2714,7 +2777,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         for header, value in (extra_headers or {}).items():
             self.send_header(header, value)
-        if self.path.startswith(("/ui/harness", "/harness")):
+        if self.path.startswith(
+            ("/ui/harness", "/harness", "/ui/history", "/sessions")
+        ):
             self.send_header("Cache-Control", "no-store, max-age=0")
             self.send_header("Pragma", "no-cache")
             self.send_header("Expires", "0")
@@ -2766,6 +2831,7 @@ def _metrics_handler(
                 ANALYTICS_MUTATION_CONCURRENCY
             ),
             "fleet_slots": _request_slots("DROVER_FLEET_HTTP_CONCURRENCY", 4),
+            "history_slots": _request_slots("DROVER_HISTORY_HTTP_CONCURRENCY", 4),
         },
     )
 

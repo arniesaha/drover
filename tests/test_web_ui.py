@@ -11,6 +11,7 @@ from drover.server.web.ui import load_page
         ("observatory.html", "<!doctype html>"),
         ("harness.html", "<!doctype html>"),
         ("harness_terminal.html", "xterm"),
+        ("history.html", "Session History"),
         ("login.html", "<form"),
     ],
 )

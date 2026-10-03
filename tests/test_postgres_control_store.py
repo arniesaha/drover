@@ -409,9 +409,13 @@ def test_postgres_bootstrap_serializes_concurrent_starters(
             rows = con.execute(
                 f'SELECT version FROM "{schema}".control_schema_migrations'
             ).fetchall()
-        # 1..7 always; 8 (session_embeddings) only where pgvector is installed.
+        from drover.server.postgres_schema import _MIGRATIONS, VECTOR_MIGRATION
+
+        # Every ordered migration always; session_embeddings only where
+        # pgvector is installed.
+        required = {version for version, _ in _MIGRATIONS}
         versions = {row[0] for row in rows}
-        assert set(range(1, 8)) <= versions <= set(range(1, 9))
+        assert required <= versions <= required | {VECTOR_MIGRATION}
         assert len(rows) == len(versions)
     finally:
         for store in starters:
