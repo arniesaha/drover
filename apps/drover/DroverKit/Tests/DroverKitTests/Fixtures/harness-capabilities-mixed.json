@@ -201,6 +201,37 @@
       }
     },
     {
+      "host_id": "lab-host",
+      "status": "online",
+      "connection_kind": "direct",
+      "capabilities": {
+        "host_id": "lab-host",
+        "harnesses": [
+          {
+            "name": "synthetic-lab",
+            "enabled": true,
+            "display_name": "Synthetic Lab",
+            "description": "Synthetic adapter (tests only)",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "synthetic-lab",
+              "launch_modes": ["pty", "structured"],
+              "approvals": true,
+              "interrupt": false,
+              "native_resume": true,
+              "model_catalog": false,
+              "usage": false,
+              "worktree": false,
+              "interactive_auth": false,
+              "turn_preferences": false,
+              "attachments": ["image/png"]
+            }
+          }
+        ]
+      }
+    },
+    {
       "host_id": "old-mini",
       "status": "online",
       "connection_kind": "direct",
@@ -239,7 +270,8 @@
     {"session_id": "s-claude", "host_id": "studio", "harness": "claude-code", "mode": "structured", "status": "working"},
     {"session_id": "s-codex", "host_id": "studio", "harness": "codex", "mode": "structured", "status": "working"},
     {"session_id": "s-lab", "host_id": "studio", "harness": "fixture-lab", "mode": "structured", "status": "working"},
-    {"session_id": "s-legacy", "host_id": "old-mini", "harness": "codex", "mode": "structured", "status": "working"},
+    {"session_id": "s-synth", "host_id": "lab-host", "harness": "synthetic-lab", "mode": "structured", "status": "working", "cwd": "/repo"},
+    {"session_id": "s-legacy","host_id": "old-mini", "harness": "codex", "mode": "structured", "status": "working"},
     {"session_id": "s-gone", "host_id": "studio", "harness": "removed-harness", "mode": "structured", "status": "working"}
   ],
   "cwd_suggestions": []

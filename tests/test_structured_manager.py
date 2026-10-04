@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 
 import duckdb
 import pytest
@@ -28,6 +29,7 @@ from drover.server.harness.adapters import (
     HarnessAdapterRegistry,
     HarnessCapabilities,
     LaunchRequest,
+    UnsupportedHarnessOperation,
 )
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.structured.driver import StructuredMessage
@@ -92,7 +94,10 @@ class _StubAdapter(HarnessAdapter):
     id = "stub"
     display_name = "Stub"
     capabilities = HarnessCapabilities(
-        launch_modes=frozenset({"structured"}), approvals=True, interrupt=True
+        launch_modes=frozenset({"structured"}),
+        approvals=True,
+        interrupt=True,
+        attachments=frozenset({"image/png"}),
     )
 
     def __init__(self, build=None):
@@ -115,6 +120,18 @@ class _StubAdapter(HarnessAdapter):
     ):
         driver.send_turn(
             text, turn_id, images=images, model=model, thinking_effort=thinking_effort
+        )
+
+    def send_attachments(
+        self, driver, text, turn_id, attachments, *, model=None, thinking_effort=None
+    ):
+        self.send_turn(
+            driver,
+            text,
+            turn_id,
+            images=attachments,
+            model=model,
+            thinking_effort=thinking_effort,
         )
 
     def close(self, driver):
@@ -413,6 +430,40 @@ def test_send_turn_forwards_images_and_records_attachments(monkeypatch, tmp_path
     ]
 
 
+def test_undeclared_attachments_and_resume_never_reach_the_driver(tmp_path):
+    """drover#422: the manager refuses what the adapter does not declare."""
+
+    class _Plain(_StubAdapter):
+        id = "plain"
+        capabilities = HarnessCapabilities(launch_modes=frozenset({"structured"}))
+        answer_permission = HarnessAdapter.answer_permission
+        interrupt = HarnessAdapter.interrupt
+        send_attachments = HarnessAdapter.send_attachments
+
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "d.duckdb")
+    registry = HarnessRegistry(tmp_path / "d.duckdb")
+    adapter = _Plain()
+    mgr = StructuredSessionManager(HarnessAdapterRegistry([adapter]))
+    start = dict(
+        harness="plain",
+        cwd=str(tmp_path),
+        command=None,
+        registry=registry,
+        on_message=lambda *_: None,
+        finalize=lambda *_: None,
+    )
+    with pytest.raises(UnsupportedHarnessOperation, match="native_resume"):
+        mgr.start("resumed", native_session_id="native-1", **start)
+    assert adapter.driver is None and not mgr.has("resumed")
+
+    mgr.start("plain-1", **start)
+    images = [{"path": "/tmp/a.png", "media_type": "image/png", "data_b64": "QUJD"}]
+    with pytest.raises(UnsupportedHarnessOperation, match="attachments"):
+        mgr.send_turn("plain-1", "see attached", images=images)
+    assert adapter.driver.sent_turns == []
+    assert [e.event_type for e in registry.list_events("plain-1")] == []
+
+
 def test_manager_rejects_overlapping_turns_until_turn_complete(monkeypatch, tmp_path):
     mgr, driver, registry, _on_messages, _finalized = _build_manager(
         monkeypatch, tmp_path
@@ -604,12 +655,7 @@ def test_start_passes_native_session_id_to_driver_factory(monkeypatch, tmp_path)
 
     class _ResumeAdapter(_StubAdapter):
         id = "stub-resume"
-        capabilities = HarnessCapabilities(
-            launch_modes=frozenset({"structured"}),
-            approvals=True,
-            interrupt=True,
-            native_resume=True,
-        )
+        capabilities = replace(_StubAdapter.capabilities, native_resume=True)
 
         def resume(self, request, emit):
             captured["native_session_id"] = request.native_session_id

@@ -38,7 +38,6 @@ from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
     HarnessPreset,
-    build_launch_command,
     create_harness_server,
     discover_native_history_metadata,
     discover_native_resume_sessions,
@@ -2231,78 +2230,61 @@ def test_resolve_harness_presets_enables_versioned_claude_cli(monkeypatch, tmp_p
     assert f"available at {newer}" in presets["claude-code"].description
 
 
-def test_build_launch_command_adds_provider_native_resume_args():
-    claude = HarnessPreset(
-        name="claude-code",
-        command=("/bin/zsh", "-lc", "exec /Users/arnabmac/.local/bin/claude"),
-        enabled=True,
-        description="Claude Code",
-    )
-    codex = HarnessPreset(
-        name="codex",
-        command=("/bin/zsh", "-lc", "exec /opt/homebrew/bin/codex"),
-        enabled=True,
-        description="Codex",
-    )
-    agy = HarnessPreset(
-        name="agy",
-        command=("/bin/zsh", "-lc", "exec /opt/homebrew/bin/agy"),
-        enabled=True,
-        description="Antigravity",
-    )
+def test_native_resume_launches_through_the_structured_adapter(tmp_path):
+    """Native resume is the adapter's `resume` operation (drover#422).
 
-    assert build_launch_command(
-        claude,
-        harness="claude-code",
-        native_resume={"session_id": "claude-session-1"},
-    ) == [
-        "/bin/zsh",
-        "-lc",
-        "exec /Users/arnabmac/.local/bin/claude --resume claude-session-1",
-    ]
-    assert build_launch_command(
-        claude,
-        harness="claude-code",
-        native_resume={"latest": True},
-    ) == ["/bin/zsh", "-lc", "exec /Users/arnabmac/.local/bin/claude --continue"]
-    assert build_launch_command(
-        codex,
-        harness="codex",
-        native_resume={"latest": True},
-    ) == ["/bin/zsh", "-lc", "exec /opt/homebrew/bin/codex resume --last"]
-    assert build_launch_command(
-        codex,
-        harness="codex",
-        native_resume={"session_id": "codex-session-1"},
-    ) == ["/bin/zsh", "-lc", "exec /opt/homebrew/bin/codex resume codex-session-1"]
-    assert build_launch_command(
-        agy,
-        harness="agy",
-        native_resume={"session_id": "agy-conversation-1"},
-    ) == [
-        "/bin/zsh",
-        "-lc",
-        "exec /opt/homebrew/bin/agy --conversation agy-conversation-1",
-    ]
-    # agy has no "latest" form: `--continue` resumes the newest conversation
-    # in the current directory, which is a different promise from the one
-    # claude/codex make here, so it is deliberately not wired up.
-    assert build_launch_command(
-        agy,
-        harness="agy",
-        native_resume={"latest": True},
-    ) == ["/bin/zsh", "-lc", "exec /opt/homebrew/bin/agy"]
+    The daemon no longer appends provider resume flags to a terminal command:
+    the structured launch hands the native session ID to the adapter, which
+    owns the flag (covered per adapter in test_builtin_harness_adapters).
+    """
+    server, state, base_url = _start_test_server(tmp_path)
+    starts = []
 
+    class _Structured:
+        def start(self, session_id, **kwargs):
+            starts.append(kwargs)
 
-def test_build_launch_command_preserves_plain_command_without_resume():
-    preset = HarnessPreset(
-        name="shell",
-        command=("/bin/sh",),
-        enabled=True,
-        description="Shell",
-    )
+        def has(self, session_id):
+            return False
 
-    assert build_launch_command(preset, harness="shell") == ["/bin/sh"]
+    state.structured = _Structured()
+    try:
+        status, created = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "command": ["fake-claude"],
+                "cwd": str(tmp_path),
+                "native_resume": {"session_id": "claude-native-1", "label": "work"},
+            },
+        )
+        assert status == 201
+        assert starts[0]["native_session_id"] == "claude-native-1"
+        row = state.registry.get_session(created["session_id"])
+        assert (row.native_session_id, row.native_resume_label) == (
+            "claude-native-1",
+            "work",
+        )
+        for refused in ({"latest": True}, {"mode": "continue"}):
+            with pytest.raises(urllib.error.HTTPError) as rejection:
+                _json_request(
+                    f"{base_url}/sessions",
+                    payload={
+                        "harness": "claude-code",
+                        "mode": "structured",
+                        "command": ["fake-claude"],
+                        "cwd": str(tmp_path),
+                        "native_resume": refused,
+                    },
+                )
+            assert rejection.value.code == 400
+            assert "session_id" in json.loads(rejection.value.read())["error"]
+        assert len(starts) == 1
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
 
 
 def test_discovers_claude_native_resume_sessions(tmp_path):
@@ -2893,19 +2875,16 @@ def test_harnessd_session_listing_cap_matches_the_hub_fleet_render():
 
 def test_harnessd_reconciles_exited_sessions_out_of_live_inventory(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
+    # A terminal that exits immediately. Only a harness advertising `pty` may
+    # start one, so this replaces the daemon's own shell command.
     state.presets = {
         **state.presets,
-        "quick": HarnessPreset(
-            name="quick",
-            command=("/bin/sh", "-lc", "true"),
-            enabled=True,
-            description="exits immediately",
-        ),
+        "shell": replace(state.presets["shell"], command=("/bin/sh", "-lc", "true")),
     }
     try:
         _, created = _json_request(
             f"{base_url}/sessions",
-            payload={"harness": "quick", "cwd": str(tmp_path)},
+            payload={"harness": "shell", "cwd": str(tmp_path)},
         )
         deadline = time.time() + 3
         inventory = {"sessions": [{"session_id": created["session_id"]}]}
@@ -3551,27 +3530,34 @@ def test_harnessd_rejects_disabled_harness(tmp_path):
         server.server_close()
 
 
-def test_harnessd_launches_enabled_cli_preset(tmp_path):
+def test_enabled_preset_is_not_terminal_launchable_without_advertised_pty(tmp_path):
+    """An enabled preset is not a terminal target by itself (drover#422).
+
+    Codex's adapter advertises only `structured`, and an unregistered preset
+    advertises nothing, so neither may start as a raw PTY even when its
+    executable resolved on this host.
+    """
     server, state, base_url = _start_test_server(tmp_path)
+    shim = ("/bin/sh", "-lc", "printf CLI_OK; sleep 1")
     state.presets = {
         **state.presets,
-        "codex": HarnessPreset(
-            name="codex",
-            command=("/bin/sh", "-lc", "printf CODEX_OK; sleep 1"),
-            enabled=True,
-            description="Codex test shim",
-        ),
+        "codex": HarnessPreset("codex", shim, True, "Codex test shim"),
+        "unregistered": HarnessPreset("unregistered", shim, True, "No adapter"),
     }
     try:
-        status, payload = _json_request(
-            f"{base_url}/sessions",
-            payload={"harness": "codex", "cwd": str(tmp_path)},
-        )
-
-        assert status == 201
-        assert payload["status"] == "running"
-        assert payload["harness"] == "codex"
-        assert state.registry.get_session(payload["session_id"]).harness == "codex"
+        for harness, error in (
+            ("codex", "codex does not support pty launch"),
+            ("unregistered", "unregistered does not support pty launch"),
+        ):
+            with pytest.raises(urllib.error.HTTPError) as refused:
+                _json_request(
+                    f"{base_url}/sessions",
+                    payload={"harness": harness, "cwd": str(tmp_path)},
+                )
+            assert refused.value.code == 400
+            assert json.loads(refused.value.read())["error"] == error
+        assert state.pty.list_sessions() == []
+        assert state.registry.list_sessions() == []
     finally:
         state.pty.close_all()
         server.shutdown()
@@ -4039,7 +4025,11 @@ def test_turn_with_unsupported_media_type_is_rejected(tmp_path):
         except urllib.error.HTTPError as exc:
             assert exc.code == 400
             payload = json.loads(exc.read().decode("utf-8"))
-            assert "unsupported media_type" in payload["error"]
+            # Refused against the adapter's declared MIME types (drover#422),
+            # before anything is written.
+            assert "does not accept attachment type 'application/pdf'" in (
+                payload["error"]
+            )
         else:
             raise AssertionError("unsupported media type should be rejected")
     finally:
@@ -4602,6 +4592,53 @@ def test_every_offered_preset_can_actually_be_driven():
     assert (
         offered <= drivable
     ), f"presets with no structured driver: {sorted(offered - drivable)}"
+
+
+def test_observe_only_sources_are_never_drive_targets(tmp_path):
+    """OpenClaw and Hermes are collected, never driven (drover#421).
+
+    Their collect Sources and parsers keep ingesting fixtures, while the
+    drive side has no adapter, preset, advertised row, launch path in either
+    mode, or native-resume argument for them.
+    """
+    from pathlib import Path
+
+    from drover.collect.sources import HermesSource, OpenClawSource
+    from drover.parsers import parse_openclaw_sessions
+
+    fixtures = Path(__file__).parent / "fixtures"
+    events = parse_openclaw_sessions(str(fixtures / "openclaw_session_contract.jsonl"))
+    assert {event.raw_data["harness"] for event in events} == {"openclaw"}
+    assert OpenClawSource(root=tmp_path).id == "openclaw"
+    assert HermesSource(tmp_path).id == "hermes"
+
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        for observed in ("openclaw", "hermes"):
+            assert observed not in DEFAULT_PRESETS
+            assert observed not in state.adapters.ids()
+            assert observed not in {
+                row["name"] for row in state.capabilities()["harnesses"]
+            }
+            for mode in ("structured", "pty"):
+                with pytest.raises(urllib.error.HTTPError) as refused:
+                    _json_request(
+                        f"{base_url}/sessions",
+                        payload={
+                            "harness": observed,
+                            "mode": mode,
+                            "cwd": str(tmp_path),
+                            "native_resume": {"session_id": "native-1"},
+                        },
+                    )
+                assert refused.value.code == 400
+        assert state.registry.list_sessions() == []
+        assert state.pty.list_sessions() == []
+        assert state.structured.session_ids() == []
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
 
 
 def test_a_repeated_handoff_create_returns_the_session_it_already_made(tmp_path):

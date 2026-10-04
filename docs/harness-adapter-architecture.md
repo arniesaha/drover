@@ -22,8 +22,11 @@ but the integration contract is spread across several places:
 Those tables describe related properties without one source of truth. Adding a
 harness therefore requires coordinated special cases, and clients can offer a
 control that a selected harness cannot execute. OpenClaw previously appeared as
-a launch target without a drive implementation; it is now correctly
-observe-only, with a regression test preventing that specific failure.
+a launch target without a drive implementation. It is now observe-only end to
+end (#421): no preset, adapter, envelope row, launch path or native-resume
+argument exists for it or for Hermes, and
+`test_observe_only_sources_are_never_drive_targets` keeps it that way while
+their collection, parsing, attribution, metrics and recall stay unchanged.
 
 ## Goals
 
@@ -153,6 +156,11 @@ adapter's immutable `turn_preferences_mutable` attribute, the same flag turn
 dispatch already enforces, and is only true when `model_catalog` is too. Claude
 Code fixes them at process start, so it publishes `false`. Hosts that predate
 the flag omit it, which reads as `false` under the missing-boolean rule below.
+
+Rows also carry an additive `display_name` (#422): the adapter's
+`display_name`, or `Shell` for the daemon's terminal. It is presentation
+metadata of at most 256 characters, never identity. Clients fall back to
+`name` when a host predates it.
 
 `attachments` is an array of accepted MIME types, not a boolean. `usage` follows
 the executable adapter contract; a separate provider usage probe does not imply
@@ -350,10 +358,11 @@ this way:
 - **Handoff targets** are the host's launchable rows whose preferred mode is
   structured. A PTY-only target would have the handoff seed typed into a
   terminal and run as commands.
-- **Native resume.** iOS has no native-resume control today. "Continue
-  session" is Drover's server-built handoff, not native resume. The flag is
-  decoded and exposed as `HarnessControls.supportsNativeResume` for a future
-  control.
+- **Native resume.** "Continue session" is Drover's server-built handoff.
+  Since #422 the chat menu also offers "Resume a native session", only when
+  the session's host advertises structured launch and `native_resume` for its
+  harness; candidates come from the host adapter's `native_sessions`
+  extension, and the resume runs as the adapter's `resume` operation.
 - **Terminal Ctrl-C** writes 0x03 into the PTY. It is a terminal key, not the
   adapter `interrupt` operation, and stays available for PTY sessions.
 - **Refreshes.** Launch-sheet controls are derived from the current snapshot
@@ -368,8 +377,11 @@ this way:
   6 below, in the first iOS release after the hub refuses matrix-less host
   registrations. Until then, iOS keeps listing legacy hosts and explaining
   them.
-- **Display versus control.** `HarnessPresentation` still maps known IDs to
-  display names and icons, and unknown IDs fall back to the raw name. A few
+- **Display versus control.** The launch sheet labels harnesses with the
+  envelope's `display_name` (#422), falling back to the raw ID.
+  `HarnessPresentation` still maps known IDs to display names and icons for
+  session rows, which do not carry the envelope, and unknown IDs fall back to
+  the raw name. A few
   non-control lines still parse provider wire formats or legacy rows by name.
   Each is marked `// harness-name:`. `NoHarnessNameBranchingTests` fails on any
   other quoted harness ID in iOS app or DroverKit sources, and on the retired
@@ -381,6 +393,27 @@ clients read its absence as false, keeping launch preferences while withholding
 mid-session overrides. Older clients ignore the new field. Matrix-less hosts
 remain visible but cannot launch or send structured operations; existing PTY
 terminal input remains the bounded legacy path.
+
+### Host enforcement and the extensibility gate (#422)
+
+harnessd enforces the same contract it publishes. A PTY launch requires `pty`
+in the harness's published contract. An enabled preset is not
+terminal-launchable on its own, and only the daemon's shell has a matrix row
+without an adapter. Native resume is the adapter's `resume` operation for
+structured launches, and its `build_command` input for PTY adapters. harnessd
+keeps no per-harness resume flags. Interrupt, approvals, attachments (by
+declared MIME type), model catalog and native resume are refused with
+`"<id> does not support <operation>"` before any row, file or provider call
+exists.
+
+Central Continue routes only from the target host's v1 row. It prefers
+`structured`, needs `native_resume` for a native resume, and refuses a
+matrix-less target with an upgrade message. Restart recovery is the host
+adapter's decision. A test-only adapter with a capability mix unlike any
+built-in passes through registry, envelope, hub, web and iOS fixtures without
+an ID-specific branch. See
+[design/adapter-extension-points.md](design/adapter-extension-points.md) for
+the measured extension points and the contract changes it required.
 
 ## Compatibility and rollout
 
@@ -394,7 +427,7 @@ terminal input remains the bounded legacy path.
    and new servers.
 6. Remove the legacy client fallback only after the supported upgrade window.
 7. Remove remaining dead OpenClaw drive/resume glue while preserving collection,
-   parsing, metrics, and historical compatibility.
+   parsing, metrics, and historical compatibility. Done in #421.
 
 Each migration step must be independently releasable. A mixed-version fleet
 must continue to list and launch the capabilities an older host can prove.
@@ -407,7 +440,8 @@ The implementation is complete when:
 - every declared capability has a contract test proving the operation works or
   is rejected deterministically;
 - adding a fixture adapter requires registry configuration and tests, not edits
-  to the manager, daemon routing, web UI, or iOS harness-name lists;
+  to the manager, daemon routing, web UI, or iOS harness-name lists
+  (`tests/test_adapter_extensibility.py`, #422);
 - all four existing structured harness lifecycle suites pass unchanged;
 - web and iOS fixtures cover different capability combinations;
 - old host capability payloads retain a bounded compatibility path;

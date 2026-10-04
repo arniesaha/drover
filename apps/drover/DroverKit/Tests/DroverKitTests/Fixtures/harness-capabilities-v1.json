@@ -13,6 +13,7 @@
           {
             "name": "shell",
             "enabled": true,
+            "display_name": "Shell",
             "description": "Interactive POSIX shell",
             "command": [],
             "capabilities": {
@@ -35,6 +36,7 @@
           {
             "name": "claude-code",
             "enabled": false,
+            "display_name": "Claude Code CLI",
             "description": "Claude Code CLI",
             "command": [],
             "capabilities": {
@@ -62,6 +64,7 @@
           {
             "name": "codex",
             "enabled": false,
+            "display_name": "Codex CLI",
             "description": "Codex CLI",
             "command": [],
             "capabilities": {
@@ -89,6 +92,7 @@
           {
             "name": "agy",
             "enabled": false,
+            "display_name": "Antigravity CLI (agy)",
             "description": "Antigravity CLI (agy)",
             "command": [],
             "capabilities": {
@@ -116,6 +120,7 @@
           {
             "name": "deepseek-harness",
             "enabled": false,
+            "display_name": "DeepSeek Harness (local Web RPC)",
             "description": "DeepSeek Harness (local Web RPC)",
             "command": [],
             "capabilities": {
