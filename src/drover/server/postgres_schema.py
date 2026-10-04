@@ -521,6 +521,23 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         ),
     ),
     (10, CONTINUITY_DDL),
+    (
+        11,
+        (
+            # #503 added lake_export_batches to migration 2 in place, so stores
+            # that had already applied 2 never got it and the DuckLake exporter
+            # failed with UndefinedTable. Same DDL as migration 2; a no-op on
+            # fresh stores. Released migrations are immutable (see
+            # tests/test_postgres_schema_migrations.py): add a new version.
+            """
+            CREATE TABLE IF NOT EXISTS lake_export_batches (
+              batch_id TEXT PRIMARY KEY REFERENCES control_outbox_batches(batch_id),
+              catalog_id TEXT NOT NULL, input_json TEXT NOT NULL, input_sha256 TEXT NOT NULL,
+              receipt_sha256 TEXT, acknowledged_at TIMESTAMPTZ
+            )
+            """,
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
