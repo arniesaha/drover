@@ -31,7 +31,9 @@ def _spec(spec):
     }
 
 
-def rebuild_partitioned(source: Path, spec: LakeSpec, *, dry_run=False):
+def rebuild_partitioned(
+    source: Path, spec: LakeSpec, *, dry_run=False, rss_ceiling=None
+):
     started = time.monotonic()
     verify_runtime(spec)
     root = spec.data_root.resolve()
@@ -47,15 +49,16 @@ def rebuild_partitioned(source: Path, spec: LakeSpec, *, dry_run=False):
 
     def run(operation, output, **fields):
         nonlocal peak
-        result, rss = run_admin(
-            {
-                "operation": operation,
-                "output": str(output),
-                "spill": str(root / "spill"),
-                **fields,
-            },
-            root,
-        )
+        request = {
+            "operation": operation,
+            "output": str(output),
+            "spill": str(root / "spill"),
+            **fields,
+        }
+        if rss_ceiling is not None:
+            result, rss = run_admin(request, root, rss_ceiling=rss_ceiling)
+        else:
+            result, rss = run_admin(request, root)
         peak = max(peak, rss)
         return result
 
@@ -181,10 +184,15 @@ def rebuild_partitioned(source: Path, spec: LakeSpec, *, dry_run=False):
         "spill_directory": str(root / "spill"),
         "elapsed_seconds": time.monotonic() - started,
         "peak_rss_bytes": peak,
+        "rss_ceiling_bytes": (
+            rss_ceiling if rss_ceiling is not None else 5 * 1024**3 // 2
+        ),
         "rss_measurement": "20ms samples: coordinator plus active disposable worker",
     }
     if not dry_run:
-        verified, verify_peak = _verify_jobs(spec, report, root / "verify-work")
+        verified, verify_peak = _verify_jobs(
+            spec, report, root / "verify-work", rss_ceiling=rss_ceiling
+        )
         peak = max(peak, verify_peak)
         report["verification"] = verified
         report["peak_rss_bytes"] = peak
@@ -202,13 +210,13 @@ def rebuild_partitioned(source: Path, spec: LakeSpec, *, dry_run=False):
     return report
 
 
-def _verify_jobs(spec, report, work):
+def _verify_jobs(spec, report, work, *, rss_ceiling=None):
     # Retained-file cleanup must not run between the individual day reads.
     with reader_fence(spec.dsn()):
-        return _verify_days(spec, report, work)
+        return _verify_days(spec, report, work, rss_ceiling=rss_ceiling)
 
 
-def _verify_days(spec, report, work):
+def _verify_days(spec, report, work, *, rss_ceiling=None):
     peak = 0
     results = {}
     from .query_process import query
@@ -237,18 +245,24 @@ def _verify_days(spec, report, work):
             }
             if day is not None:
                 request["day"] = day
-            result, rss = run_admin(request, spec.data_root)
+            if rss_ceiling is not None:
+                result, rss = run_admin(
+                    request, spec.data_root, rss_ceiling=rss_ceiling
+                )
+            else:
+                result, rss = run_admin(request, spec.data_root)
             peak = max(peak, rss)
             jobs.append(str(out / "hashes.parquet"))
-        result, rss = run_admin(
-            {
-                "operation": "verify_aggregate",
-                "output": str(work / table / "aggregate"),
-                "spill": str(spec.data_root / "spill"),
-                "files": jobs,
-            },
-            spec.data_root,
-        )
+        request = {
+            "operation": "verify_aggregate",
+            "output": str(work / table / "aggregate"),
+            "spill": str(spec.data_root / "spill"),
+            "files": jobs,
+        }
+        if rss_ceiling is not None:
+            result, rss = run_admin(request, spec.data_root, rss_ceiling=rss_ceiling)
+        else:
+            result, rss = run_admin(request, spec.data_root)
         peak = max(peak, rss)
         results[table] = result
     expected = {

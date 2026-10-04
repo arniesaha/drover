@@ -63,7 +63,12 @@ trusting the stored per-row digests, and checks the evidence manifest.
 Each day is staged, deduplicated and published in a disposable process. Workers
 use a 1GB engine limit, one thread, and a spill directory on the new data volume.
 The supervisor samples aggregate coordinator/child RSS every 20ms and stops above
-2.5 GiB. Verification uses one day per process. A keys-only external sort checks
+2.5 GiB by default. For an offline `lake rebuild` only, operators may set
+`DROVER_LAKE_REBUILD_RSS_CEILING_BYTES` to a whole-byte value from 512 MiB through
+12 GiB; it does not change standalone `lake verify` or server limits. The rebuild
+report records both `rss_ceiling_bytes` and peak RSS. On a supervisor or worker
+failure, the retained root also contains `admin-supervision-failure.json` with the
+cap, peak, last coordinator/child sample, and failure attribution. Verification uses one day per process. A keys-only external sort checks
 original and backfilled identities across partitions before catalog creation; a
 cross-day duplicate fails explicitly instead of silently choosing two winners.
 

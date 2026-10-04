@@ -399,6 +399,7 @@ def test_rebuild_cli_does_not_resolve_live_config(lake_spec, tmp_path, monkeypat
     monkeypatch.delenv(lake_spec.catalog_dsn_env)
     monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(lake_spec.extension_dir))
     monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", lake_spec.engine_sha256)
+    monkeypatch.setenv("DROVER_LAKE_REBUILD_RSS_CEILING_BYTES", str(3 * 1024**3))
     result = CliRunner().invoke(
         cli.main,
         [
@@ -416,7 +417,9 @@ def test_rebuild_cli_does_not_resolve_live_config(lake_spec, tmp_path, monkeypat
         ],
     )
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["dry_run"]
+    report = json.loads(result.output)
+    assert report["dry_run"]
+    assert report["rss_ceiling_bytes"] == 3 * 1024**3
 
 
 def test_rebuild_slices_keep_one_global_timestamp_binding(tmp_path):

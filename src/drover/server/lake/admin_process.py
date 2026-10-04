@@ -16,13 +16,24 @@ from .runtime import LakeError
 RSS_CEILING = 5 * 1024**3 // 2
 
 
-def run_admin(request: dict, root: Path) -> tuple[dict, int]:
+def run_admin(
+    request: dict, root: Path, *, rss_ceiling: int = RSS_CEILING
+) -> tuple[dict, int]:
+    """Run one disposable worker under a caller-selected aggregate RSS cap.
+
+    Only the offline rebuild command supplies a non-default cap.  Keeping the
+    override at this process boundary prevents it from changing the server or
+    standalone verification safety budgets.
+    """
     job = root / "admin-request.json"
     reply = root / "admin-reply.json"
     job.write_text(json.dumps({**request, "reply": str(reply)}))
     job.chmod(0o600)
     reply.unlink(missing_ok=True)
     peak = 0
+    coordinator_rss = 0
+    child_rss = 0
+    failure = None
     started = time.monotonic()
     with (root / "admin-error.log").open("wb") as errors:
         child = subprocess.Popen(
@@ -34,7 +45,9 @@ def run_admin(request: dict, root: Path) -> tuple[dict, int]:
         try:
             while child.poll() is None:
                 try:
-                    sample = _rss(os.getpid()) + _rss(child.pid)
+                    coordinator_rss = _rss(os.getpid())
+                    child_rss = _rss(child.pid)
+                    sample = coordinator_rss + child_rss
                     peak = max(peak, sample)
                 except LakeError as exc:
                     # Darwin can stop exposing task info just before waitpid
@@ -43,17 +56,42 @@ def run_admin(request: dict, root: Path) -> tuple[dict, int]:
                         child.wait(timeout=0.05)
                     except subprocess.TimeoutExpired:
                         raise exc
-                if peak > RSS_CEILING:
+                if peak > rss_ceiling:
+                    failure = "supervisor_aggregate_rss_limit"
                     raise LakeError("rebuild_rss_limit_exceeded")
                 if time.monotonic() - started > 1800:
+                    failure = "supervisor_partition_deadline"
                     raise LakeError("rebuild_partition_deadline_exceeded")
                 time.sleep(0.02)
             if child.returncode or not reply.is_file():
+                failure = "child_process"
                 raise LakeError("rebuild_partition_process_failed")
             result = json.loads(reply.read_text())
             if result.get("error"):
+                failure = "child_worker"
                 raise LakeError(result["error"])
             return result, peak
+        except LakeError as exc:
+            # A failed rebuild retains its data root for inspection.  Record
+            # the cap and the last split sample there rather than relying on
+            # stderr, which is deliberately scoped to the disposable child.
+            (root / "admin-supervision-failure.json").write_text(
+                json.dumps(
+                    {
+                        "operation": request.get("operation"),
+                        "error": exc.code,
+                        "failure_attribution": failure or "supervisor",
+                        "rss_ceiling_bytes": rss_ceiling,
+                        "peak_rss_bytes": peak,
+                        "last_rss_sample_bytes": {
+                            "coordinator": coordinator_rss,
+                            "child": child_rss,
+                        },
+                    },
+                    indent=2,
+                )
+            )
+            raise
         finally:
             if child.poll() is None:
                 try:
