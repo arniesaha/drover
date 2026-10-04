@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-10-04
+
+### Fixed
+
+- Control-schema migration 11 creates `lake_export_batches` on stores that applied
+  migration 2 before it was edited in place, so the DuckLake exporter no longer fails
+  with UndefinedTable. Released migrations are now hash-pinned in tests (#517).
+- DuckLake reads: the summarizer pages canonical events with a bounded keyset instead of
+  failing `analytics_row_limit_exceeded`, and cockpit activity scopes its PostgreSQL
+  snapshot with bound parameters and logs the real lake error code (#518).
+- `lake rebuild` preflights catalog permissions and surfaces the sanitized attach cause
+  instead of `analytics_unavailable` (#515).
+
+### Added
+
+- `drover-server lake provision-exporter` explicit admin step, and exporter startup
+  failures now log the real cause (#516).
+
 ## [0.5.4] - 2026-10-04
 
 ### Fixed
