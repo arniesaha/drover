@@ -11,12 +11,30 @@ modify legacy files.
 
 1. Stop the hub and all workers.
 2. Create and retain a tar backup of the legacy root.
-3. Rebuild a new DuckLake data root and fresh catalog from that tar, including exporter provisioning.
-4. Verify rebuild counts, hashes, and serving proof.
-5. Set `analytics.backend = "ducklake"` and its catalog DSN environment reference.
-6. Start the hub and workers.
-7. Check `/healthz`, summaries, recall, and the event count against verification.
-8. To roll back, set `analytics.backend = "legacy"` and restart.
+3. Rebuild a new DuckLake data root and fresh catalog from that tar (`lake rebuild`).
+4. Provision the exporter with the catalog **admin** DSN (`lake provision-exporter`).
+5. Grant the catalog roles (see `provision_catalog_roles`).
+6. Verify rebuild counts, hashes, and serving proof (`lake verify`).
+7. Set `analytics.backend = "ducklake"` and its catalog DSN environment reference.
+8. Start the hub and workers.
+9. Check `/healthz`, summaries, recall, and the event count against verification.
+10. To roll back, set `analytics.backend = "legacy"` and restart.
+
+The order is explicit: **rebuild → provision-exporter → role grants → verify**.
+Provisioning changes the catalog snapshot and invalidates the serving proof, so
+it must run before `verify`; verifying first and provisioning afterwards leaves
+the hub refusing to start. `provision-exporter` is never run at startup:
+
+```sh
+drover-server lake provision-exporter --data-root /path/to/new-lake \
+  --catalog-dsn-env CATALOG_ADMIN_DSN --exporter-role drover_lake_exporter
+```
+
+It needs the same `DROVER_LAKE_EXTENSION_DIR` and `DROVER_LAKE_ENGINE_SHA256` as
+rebuild/verify and prints a short JSON result. Failures carry a stable code plus
+a credential-stripped cause (`lake_export_tables_missing`,
+`lake_export_already_provisioned`, `lake_export_provision_failed`). If the hub
+logs `lake_export_not_provisioned`, this step was skipped.
 
 This is a rebuild, with an analytical outage allowed, for one operator. No shadow
 exporter or zero-downtime mechanism is required. Keep durable PostgreSQL ingress
