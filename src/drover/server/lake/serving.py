@@ -21,6 +21,9 @@ _SELECTION_LOCK = RLock()
 
 def configure_analytics(path: Path, config: AnalyticsConfig) -> None:
     with _SELECTION_LOCK:
+        from .writer_gate import selection_changed
+
+        selection_changed(path, config)
         _CONFIGS[Path(path).resolve()] = config
 
 

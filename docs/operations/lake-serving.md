@@ -117,10 +117,13 @@ procedure below.
 
 `retire_legacy_writers = false` is independently defaulted. Only explicit
 DuckLake opt-in can request retirement. Activation verifies the selected lake
-and drains process-local in-flight derived writers under a lock. Retirement
-is latched to the entire selected configuration. A change requires explicit
-verified renewal; verification failure or an attempted switch back to legacy
-never automatically re-enables writers in that process. Each retired writer
+and drains in-flight derived writers in all participating local processes. The
+local selection lock is retained for thread draining and nested calls; an
+exclusive OS `flock` spans the entire derived call, including its legacy reads.
+Retirement is durably latched to the entire selected configuration. A change
+requires explicit verified renewal; verification failure or an attempted switch
+back to legacy never automatically re-enables writers in any participating
+process. Each retired writer
 entry rechecks authorization before returning without a write. The gate
 covers legacy exporter passes, canonical memory projection refresh, native
 usage rollup, day-summary backfill and analytical bootstrap entrypoints.
@@ -130,8 +133,10 @@ connection. The enabled lake exporter checks explicit/registered configuration
 agreement at activation and rechecks retirement authorization before each pass;
 a failure stops it and releases its dedicated PG fence.
 
-This is a process-local drain, not permission for a running old binary to write
-across cutover. Operator fencing of all old writer processes remains mandatory.
+This fence requires cooperating binaries and one shared, resolved store-path
+namespace on a host with working `flock` and `fsync`. A running old binary or a
+direct writer bypassing these entrypoints cannot be fenced by this code.
+Operator fencing of all old/unconverted writer processes remains mandatory.
 Raw/source collectors and ingestion are not retired by this gate. Retiring the
 native usage rollup requires operational proof of native event publication and
 periodic usage certification before production cutover.
@@ -413,3 +418,77 @@ corrupt newest receipts, receipt rollback/fence loss, source/receipt/composite
 byte caps and the 1,000/1,001 usage-row boundary. Black, isort and whitespace
 checks passed. No live configuration, stores, services or operational state
 were changed.
+
+
+## Durable legacy-derived writer fence
+
+Every gated writer and retirement activation uses the stable inode at
+`<resolved-store-path>.legacy-derived-gate`. Gate entry creates its parent when
+needed for legacy bootstrap, without creating the store itself. Empty state
+means no activation has been requested, so legacy-default writes proceed.
+All processes lock the inode exclusively for the complete derived write; calls
+nested in the same process reuse the held descriptor. The inode is never
+renamed, replaced, or unlinked by the runtime.
+
+Activation drains competing writes, writes and fsyncs a `pending` latch **before**
+checking the selected lake, then writes/fsyncs `active` only after successful
+verification and unchanged selection. The record contains a version and a
+SHA-256 token of the full analytics configuration, including backend, epoch,
+verification digest and catalog/root selection. A failed activation leaves a
+closed pending latch. Process exit releases the OS lock but retains retirement.
+Writes happen before truncation, so a partial update leaves a nonempty closed
+record rather than an empty legacy authorization; invalid or oversized records
+fail closed and are never silently repaired.
+
+`configure_analytics` invalidates an existing activation under the same fence
+before publishing a changed local selection. Other processes with the previous
+configuration also see the pending latch and cannot reuse the old activation.
+Changing back to the old configuration does not restore it. Explicit verified
+`activate_retirement` renewal is required. An active entry with matching config
+rechecks verification before returning the existing retired no-op result;
+unconfigured/stale workers receive a renewal error instead of entering a write.
+There is no automatic unretirement, rollback, latch deletion or recovery reset.
+Do not remove or replace the sidecar during operation.
+
+Audited callers:
+
+| Caller | Gated namespace and scope |
+| --- | --- |
+| `schema.bootstrap` | `duckdb_path`; entire directory/catalog/control setup |
+| `schema.backfill_agent_event_day_summary` | `duckdb_path`; all day reads/writes |
+| `memory_identity.refresh_memory_projection` | Explicit `store_path`; whole projection and job derivation |
+| `native_usage_rollup.rollup_pending_native_usage` | `duckdb_path`; source reads, totals and control-store transaction |
+| `ControlOutboxExporter.run_once` | Both control and analytical paths, resolved/deduplicated and acquired in sorted order; full export pass, including nested projection |
+| Server bootstrap/day-summary wrappers and lake lifecycle authorization | Existing outer gates remain reentrant with the decorated calls |
+
+Runtime projection calls provide the explicit control/store path. The optional
+`store_path=None` standalone projection API has no namespace and retains its
+existing ungated behavior; it is not retirement authorization for a named store.
+Raw/source ingestion is unchanged. This audit does not retire additional direct,
+advisory, curated-state or source writers.
+
+The cross-process tests exec a fresh interpreter with an independent selection
+registry and PostgreSQL pool. Legacy bootstrap actually writes private DuckDB
+and Parquet files. A child pauses after opening its real legacy connection,
+inside the decorated call; parent activation cannot complete until that child
+finishes. The already-running legacy-config child and a newly exec'd default
+child then fail to enter derived writes. A matching selected child receives
+verified retired results from bootstrap, day summaries, memory projection and
+usage rollup. Epoch/selection changes invalidate even a still-running child's
+prior activation; missing, corrupt or subsequently lost fixture verification
+and partial latch records stay closed. All stores and catalog namespaces are
+throwaway fixtures; no live configuration, producer namespace or service is
+involved.
+
+Writer-fence validation (2026-10-03): foreground
+`tests/test_lake_writer_gate.py tests/test_lake_activity_routing.py` passed
+**21 tests in 138.85 seconds**. Foreground selector/exporter/native-rollup
+regressions passed **24 tests in 163.03 seconds**, with the two legacy exporter
+DSN-only tests initially skipped. Those two were rerun against a cluster created
+and destroyed by `tests/conftest.py::postgres_dsn.__wrapped__`, supplying only
+that owned cluster's DSN to `pytest.main(['-q', '-x',
+ 'tests/test_control_exporter.py'])`: **2 passed in 0.83 seconds**. The initial
+commands removed the ambient `DROVER_TEST_POSTGRES_DSN` and used pinned extension
+artifacts from `/tmp/drover-phase4-artifacts/osx_arm64`. Black, isort and whitespace
+checks passed. No production configuration, stores, services, actual producer
+namespace, credentials or operational lifecycle were changed.

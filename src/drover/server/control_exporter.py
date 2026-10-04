@@ -121,11 +121,18 @@ class ControlOutboxExporter:
             self._shutdown.wait(self.poll_seconds)
 
     def run_once(self, *, now: datetime | None = None) -> dict[str, Any]:
+        from contextlib import ExitStack
+
         from drover.server.lake.writer_gate import legacy_derived_write
 
-        with legacy_derived_write(self.control_path) as allowed:
-            if not allowed:
-                return self._empty_result()
+        # The public constructor permits separate control/analytical paths.
+        # Fence both write namespaces in stable order, retaining reentrancy for
+        # refresh_memory_projection's nested control-path gate.
+        paths = sorted({self.control_path.resolve(), self.analytical_path.resolve()})
+        with ExitStack() as fences:
+            for path in paths:
+                if not fences.enter_context(legacy_derived_write(path)):
+                    return self._empty_result()
             return self._run_once_legacy(now=now)
 
     def _run_once_legacy(self, *, now: datetime | None = None) -> dict[str, Any]:
