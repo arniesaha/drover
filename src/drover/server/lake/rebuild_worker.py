@@ -322,6 +322,9 @@ if __name__ == "__main__":
         result = work(request)
     except LakeError as exc:
         result = {"error": exc.code}
+        if exc.detail:
+            result["detail"] = exc.detail
+            print(f"{exc.code}: {exc.detail}", file=sys.stderr, flush=True)
     except duckdb.OutOfMemoryException:
         result = {"error": "rebuild_engine_memory_limit_exceeded"}
     Path(request["reply"]).write_text(json.dumps(result))

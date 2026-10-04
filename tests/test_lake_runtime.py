@@ -603,3 +603,152 @@ def test_cross_partition_keys_are_checked_before_publication(lake_spec, tmp_path
             ).fetchone()[0]
             == 0
         )
+
+
+def test_sanitize_detail_is_bounded_and_credential_free():
+    from drover.server.lake.runtime import sanitize_detail
+
+    dsn = "host=db.internal user=svc password=s3cr3t-pw dbname=lake"
+    exc = RuntimeError(
+        "connection to server failed: host=db.internal password=s3cr3t-pw "
+        "postgresql://svc:s3cr3t-pw@db.internal/lake\nsecond line " + "x" * 500
+    )
+    detail = sanitize_detail(exc, dsn)
+    assert detail.startswith("RuntimeError: connection to server failed")
+    assert "s3cr3t-pw" not in detail
+    assert "db.internal" not in detail
+    assert "second line" not in detail
+    assert len(sanitize_detail(RuntimeError("y" * 1000))) == 300
+
+
+def test_attach_failure_keeps_code_and_carries_clean_detail(monkeypatch, tmp_path):
+    from drover.server.lake import runtime
+
+    monkeypatch.setattr(runtime, "verify_runtime", lambda spec: {})
+    monkeypatch.setenv("SCRATCH_DSN", "host=h user=u password=hunter22 dbname=lake")
+
+    class Con:
+        def execute(self, statement):
+            if statement.startswith("ATTACH"):
+                raise RuntimeError(
+                    "permission denied for schema public (password=hunter22)"
+                )
+
+    spec = LakeSpec("SCRATCH_DSN", tmp_path, tmp_path, "0")
+    with pytest.raises(LakeError) as caught:
+        runtime.attach_lake(Con(), spec, read_only=False)
+    assert caught.value.code == "analytics_unavailable"
+    assert str(caught.value) == "analytics_unavailable"
+    assert "permission denied for schema public" in caught.value.detail
+    assert "hunter22" not in caught.value.detail
+
+
+def test_cli_prints_detail_and_writes_admin_error_log(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from drover.server.lake import cli as lake_cli
+    from drover.server.lake.runtime import LakeError as Err
+
+    root = tmp_path / "root"
+    root.mkdir()
+
+    def boom(spec):
+        raise Err("analytics_unavailable", "Error: permission denied for schema public")
+
+    monkeypatch.setattr(lake_cli, "verify", boom)
+    monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(tmp_path))
+    monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", "0")
+    result = CliRunner().invoke(
+        lake_cli.lake_cmd,
+        ["verify", "--data-root", str(root), "--catalog-dsn-env", "X"],
+    )
+    assert result.exit_code != 0
+    assert "analytics_unavailable: Error: permission denied" in result.output
+    assert (
+        "permission denied for schema public" in (root / "admin-error.log").read_text()
+    )
+
+
+@pytest.fixture
+def scratch_catalog(postgres_dsn):
+    """A throwaway database in the private test server plus a CREATE-less role."""
+    name = "drover_preflight_" + uuid4().hex[:12]
+    role = "drover_nocreate_" + uuid4().hex[:12]
+    with psycopg.connect(postgres_dsn, autocommit=True) as con:
+        con.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+        con.execute(
+            sql.SQL("CREATE ROLE {} LOGIN PASSWORD 'pw-nocreate'").format(
+                sql.Identifier(role)
+            )
+        )
+    with psycopg.connect(
+        make_conninfo(postgres_dsn, dbname=name), autocommit=True
+    ) as con:
+        con.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+    try:
+        yield make_conninfo(postgres_dsn, dbname=name), role
+    finally:
+        with psycopg.connect(postgres_dsn, autocommit=True) as con:
+            con.execute(
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name))
+            )
+            con.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+def test_catalog_preflight_denies_missing_create_and_allows_owner(
+    scratch_catalog, tmp_path, monkeypatch
+):
+    from drover.server.lake.runtime import catalog_permission_preflight
+
+    dsn, role = scratch_catalog
+    spec = LakeSpec("SCRATCH_CATALOG", tmp_path / "root", tmp_path, "0")
+    monkeypatch.setenv("SCRATCH_CATALOG", dsn)
+    catalog_permission_preflight(spec)
+    monkeypatch.setenv(
+        "SCRATCH_CATALOG", make_conninfo(dsn, user=role, password="pw-nocreate")
+    )
+    with pytest.raises(LakeError) as caught:
+        catalog_permission_preflight(spec)
+    assert caught.value.code == "lake_catalog_permission_denied"
+    assert "CREATE" in caught.value.detail
+    assert "pw-nocreate" not in caught.value.detail
+
+
+def test_rebuild_runs_preflight_before_any_partition_work(
+    scratch_catalog, tmp_path, monkeypatch
+):
+    from drover.server.lake import partition_rebuild
+
+    dsn, role = scratch_catalog
+    monkeypatch.setenv(
+        "SCRATCH_CATALOG", make_conninfo(dsn, user=role, password="pw-nocreate")
+    )
+    monkeypatch.setattr(partition_rebuild, "verify_runtime", lambda spec: {})
+    monkeypatch.setattr(
+        partition_rebuild,
+        "extract_frozen",
+        lambda *a, **k: pytest.fail("preflight must run before extraction"),
+    )
+    spec = LakeSpec("SCRATCH_CATALOG", tmp_path / "pre", tmp_path, "0")
+    with pytest.raises(LakeError) as caught:
+        partition_rebuild.rebuild_partitioned(tmp_path / "unused.tar", spec)
+    assert caught.value.code == "lake_catalog_permission_denied"
+    assert not spec.data_root.exists()
+
+
+def test_preflight_skipped_for_dry_run(lake_spec, tmp_path, monkeypatch):
+    from drover.server.lake import partition_rebuild
+    from drover.server.lake.rebuild import rebuild
+
+    monkeypatch.setattr(
+        partition_rebuild,
+        "catalog_permission_preflight",
+        lambda spec: pytest.fail("dry run must not contact PostgreSQL"),
+    )
+    monkeypatch.delenv(lake_spec.catalog_dsn_env)
+    report = rebuild(
+        _fixture_tar(tmp_path),
+        replace(lake_spec, data_root=tmp_path / "dry"),
+        dry_run=True,
+    )
+    assert report["dry_run"]
