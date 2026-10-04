@@ -338,17 +338,36 @@ class SummarizerWorker:
                 raise RuntimeError(
                     f"no events for session {session_id}: no substantive turns"
                 )
-            # Derive artifacts from the whole normalized tool stream, not the
-            # bounded text prompt (edits often precede the final 30 turns).
-            cur = con.execute(
-                f"""WITH {_session_agent_events_ctes()}
-                SELECT event_type, raw_data FROM canonical_agent_events
-                WHERE raw_data IS NOT NULL""",
-                [session_id],
-            )
-            tool_events = [
-                dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()
-            ]
+            tool_events = []
+            last_timestamp = None
+            last_id = None
+            overall_limit = 25000
+            for _ in range(overall_limit // 1000):
+                if last_timestamp is None:
+                    cur = con.execute(
+                        f"""WITH {_session_agent_events_ctes()}
+                        SELECT event_type, raw_data, timestamp, id FROM canonical_agent_events
+                        WHERE raw_data IS NOT NULL
+                        ORDER BY timestamp, id LIMIT 1000""",
+                        [session_id],
+                    )
+                else:
+                    cur = con.execute(
+                        f"""WITH {_session_agent_events_ctes()}
+                        SELECT event_type, raw_data, timestamp, id FROM canonical_agent_events
+                        WHERE raw_data IS NOT NULL AND (timestamp > ? OR (timestamp = ? AND id > ?))
+                        ORDER BY timestamp, id LIMIT 1000""",
+                        [session_id, last_timestamp, last_timestamp, last_id],
+                    )
+
+                cols = [d[0] for d in cur.description]
+                chunk = [dict(zip(cols, r)) for r in cur.fetchall()]
+                if not chunk:
+                    break
+
+                tool_events.extend(chunk)
+                last_timestamp = chunk[-1]["timestamp"]
+                last_id = chunk[-1]["id"]
         finally:
             con.close()
 

@@ -652,3 +652,83 @@ def test_raw_json_repository_attribution_parity(verified_lake, monkeypatch):
                     )
         assert actual == result
         assert actual["results"]
+
+
+def test_summarize_session_paginates_canonical_events(verified_lake):
+    from drover.server.lake.runtime import lake_connection
+    from drover.server.lake.serving import configure_analytics
+    from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
+    from drover.server.summarizer.worker import SummarizerWorker
+
+    spec, path, config = verified_lake
+    configure_analytics(path, config)
+
+    with lake_connection(spec, read_only=False) as con:
+        # Insert 1005 tool_call events for session 's'
+        # The limit is 1000 so this should trigger analytics_row_limit_exceeded if not paginated.
+        con.execute("""INSERT INTO lake.agent_events BY NAME
+               SELECT 'many-' || i AS id, 's' AS session_id, 'test' AS agent_id, 
+                      '2026-10-01'::DATE AS date,
+                      '2026-10-01 12:00:00Z'::TIMESTAMPTZ + (i * INTERVAL '1 millisecond') AS timestamp,
+                      'tool_call' AS event_type, 'assistant' AS role, NULL AS content,
+                      'k-many-' || i AS dedup_key,
+                      'outbox' AS dedup_key_source,
+                      '{"tool_name": "test_tool", "input": {}}' AS raw_data
+               FROM range(1005) AS t(i)
+            """)
+
+    # We need to test worker._summarize_session.
+    # It requires a leased job.
+    ledger = JobLedger(path)
+    ledger.enqueue(SUMMARIZE_SESSION, "s")
+    claimed = ledger.claim(SUMMARIZE_SESSION, limit=1)
+    assert claimed
+    job = claimed[0]
+
+    class FakeBackend:
+        model = "fake"
+
+        def summarize(self, prompt):
+            return {
+                "summary_md": "paginated ok",
+                "next_steps_md": "",
+                "open_questions": [],
+                "last_user_prompt": "",
+                "last_assistant": "",
+            }
+
+    worker = SummarizerWorker(duckdb_path=path)
+    # This should succeed without raising LakeError("analytics_row_limit_exceeded")
+    result = worker._summarize_session(ledger, job, backend=FakeBackend())
+    assert result is True
+
+
+def test_cockpit_activity_scopes_pg_snapshot(verified_lake):
+    from drover.server.cockpit.analytics import AnalyticsFilters
+    from drover.server.cockpit.service import CockpitService
+    from drover.server.lake.runtime import lake_connection
+    from drover.server.lake.serving import configure_analytics
+
+    spec, path, config = verified_lake
+    configure_analytics(path, config)
+
+    from drover.server.db import control_plane_connection
+
+    with control_plane_connection(path) as pg:
+        # Insert 10005 rows into harness_sessions and session_usage
+        # Old rows, so they don't get included in the 7 day window
+        pg.execute(
+            """INSERT INTO harness_sessions (session_id, host_id, harness, started_at, last_activity)
+               SELECT 'old-' || i, 'h', 'c', '2020-01-01'::DATE, '2020-01-01'::DATE
+               FROM range(10005) AS t(i)"""
+        )
+        # 1 new row that is within the 7 day window
+        pg.execute(
+            """INSERT INTO harness_sessions (session_id, host_id, harness, started_at, last_activity)
+               VALUES ('new-1', 'h', 'c', current_timestamp, current_timestamp)"""
+        )
+
+    service = CockpitService(path)
+    result = service.overview(AnalyticsFilters(days=7))
+    assert result["activity"]["status"] == "ok"
+    assert result["activity"]["reason"] is None

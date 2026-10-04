@@ -75,10 +75,40 @@ def _control_snapshot(con, request):
     with control_plane_connection(path) as pg:
         pg.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         try:
+            op = request.get("operation")
+            opts = request.get("options", {})
             for table, columns in _POSTGRES_ANALYTICS_SNAPSHOT_TABLES.items():
+                where = ""
+                if op in ("cockpit", "project_activity") and table in (
+                    "harness_sessions",
+                    "session_usage",
+                ):
+                    if op == "cockpit":
+                        filters = opts.get("filters", {})
+                        days = filters.get("days", 7)
+                        project = filters.get("project")
+                    else:
+                        days = opts.get("days", 7)
+                        project = opts.get("project_key")
+
+                    cutoff = f"(current_timestamp - interval '{int(days) + 2} days')"
+                    harness_where = (
+                        f"(coalesce(last_activity, updated_at, started_at) >= {cutoff})"
+                    )
+                    if project:
+                        owner, name = project.split("/")
+                        harness_where += (
+                            f" AND repo_owner = '{owner}' AND repo_name = '{name}'"
+                        )
+
+                    if table == "harness_sessions":
+                        where = f"WHERE {harness_where}"
+                    else:
+                        where = f"WHERE session_id IN (SELECT session_id FROM harness_sessions WHERE {harness_where})"
+
                 names = ",".join('"' + name + '"' for name, _ in columns)
                 rows = pg.execute(
-                    f'SELECT {names} FROM "{table}" LIMIT 10001'
+                    f'SELECT {names} FROM "{table}" {where} LIMIT 10001'
                 ).fetchall()
                 if len(rows) > 10000:
                     raise LakeError("analytics_control_row_limit_exceeded")
