@@ -363,7 +363,13 @@ class SummarizerWorker:
                         SELECT event_type, raw_data, timestamp, id, coalesce(dedup_key, '') AS _dedup_key, hash(raw_data) AS _raw_hash FROM canonical_agent_events
                         WHERE raw_data IS NOT NULL AND (timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data)) > (?, ?, ?, ?)
                         ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT 1000""",
-                        [session_id, last_timestamp, last_id or '', last_dedup_key or '', last_raw_hash],
+                        [
+                            session_id,
+                            last_timestamp,
+                            last_id or "",
+                            last_dedup_key or "",
+                            last_raw_hash,
+                        ],
                     )
 
                 cols = [d[0] for d in cur.description]
@@ -377,7 +383,11 @@ class SummarizerWorker:
                 last_dedup_key = chunk[-1]["_dedup_key"]
                 last_raw_hash = chunk[-1]["_raw_hash"]
             else:
-                log.warning("Truncated session %s to %d raw events for summarization", session_id, MAX_RAW_EVENTS_PER_SESSION)
+                log.warning(
+                    "Truncated session %s to %d raw events for summarization",
+                    session_id,
+                    MAX_RAW_EVENTS_PER_SESSION,
+                )
         finally:
             con.close()
 

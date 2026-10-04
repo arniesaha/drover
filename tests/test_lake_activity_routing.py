@@ -480,6 +480,7 @@ def test_lake_activity_cursor_error_preserves_reload_contract(tmp_path, monkeypa
 
     def changed(*args, **kwargs):
         from drover.server.lake.runtime import LakeError
+
         raise LakeError("snapshot_changed")
 
     monkeypatch.setattr(read_models, "read_model", changed)
@@ -487,6 +488,7 @@ def test_lake_activity_cursor_error_preserves_reload_contract(tmp_path, monkeypa
     with pytest.raises(AnalyticsSnapshotChangedError):
         service._activity(AnalyticsFilters())
     from drover.server.lake.runtime import LakeError
+
     with pytest.raises(LakeError) as exc_info:
         # Validation runs before any store/credential access.
         monkeypatch.undo()
