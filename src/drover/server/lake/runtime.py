@@ -61,7 +61,10 @@ class LakeSpec:
         dsn = os.environ.get(self.catalog_dsn_env, "")
         if not dsn:
             raise LakeError("lake_catalog_dsn_missing")
-        info = psycopg.conninfo.conninfo_to_dict(dsn)
+        try:
+            info = psycopg.conninfo.conninfo_to_dict(dsn)
+        except Exception:
+            raise LakeError("lake_catalog_dsn_invalid") from None
         if not info.get("dbname") or info["dbname"] in {
             "postgres",
             "template0",

@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from drover.server.harness.structured.driver import EmitFn, StructuredMessage
+from drover.server.harness.structured.git_changes import capture_head, changed_paths
 
 _STDERR_TAIL_LINES = 20
 
@@ -178,6 +179,8 @@ class CodexDriver:
         self._turn_model: str | None = None
         self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         self._closed = False
+        self._git_base: str | None = None
+        self._git_turn_id: str | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -254,6 +257,8 @@ class CodexDriver:
                 raise RuntimeError("driver is closed")
             self._stderr_tail.clear()
             self._turn_model = model
+            self._git_base = capture_head(self.cwd)
+            self._git_turn_id = turn_id
             try:
                 process = subprocess.Popen(
                     self._argv_for(text, model=model, thinking_effort=thinking_effort),
@@ -326,6 +331,10 @@ class CodexDriver:
     ) -> None:
         try:
             returncode = self._pump_turn(process, model=model)
+            # Failed/interrupted turns may never send turn.completed, but
+            # their shell edits still belong in the durable memory stream.
+            for message in self._file_evidence():
+                self.emit(message)
         finally:
             with self._turn_lock:
                 self._turn_process = None
@@ -351,6 +360,28 @@ class CodexDriver:
                 turn_id=turn_id,
             )
         )
+
+    def _file_evidence(self) -> list[StructuredMessage]:
+        base = self._git_base
+        self._git_base = None
+        if not base or not self.cwd:
+            return []
+        paths = changed_paths(self.cwd, base)
+        if not paths:
+            return []
+        return [
+            StructuredMessage(
+                type="tool_result",
+                role="tool",
+                text="Git file changes recorded at turn boundary",
+                payload={
+                    "source": "git_diff",
+                    "base_sha": base,
+                    "changes": [{"path": path} for path in paths],
+                },
+                turn_id=self._git_turn_id,
+            )
+        ]
 
     def _pump_turn(self, process: subprocess.Popen[str], *, model: str | None) -> int:
         stderr_thread = threading.Thread(
@@ -431,7 +462,8 @@ class CodexDriver:
                     context_window = None
                 if context_window is not None:
                     payload["model_context_window"] = context_window
-            return [
+            # Record before the completion marker can trigger summarization.
+            return self._file_evidence() + [
                 StructuredMessage(
                     type="status",
                     role="system",

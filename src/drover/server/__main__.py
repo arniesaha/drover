@@ -476,8 +476,9 @@ def _resolve_config(
     # is deliberately absent from harnessd, which keeps its host-local DuckDB
     # store even when a hub has PostgreSQL credentials in its environment.
     configure_control_store(cfg.duckdb_path, cfg.control_store)
-    from drover.server.lake.serving import configure_analytics
+    from drover.server.lake.serving import configure_analytics, validate_startup_config
 
+    validate_startup_config(cfg.analytics)
     configure_analytics(cfg.duckdb_path, cfg.analytics)
     return cfg
 
@@ -2635,6 +2636,14 @@ def run(
                 cfg.duckdb_path, legacy_config_path=runtime_config_path
             )
             central_consent.initialize(cfg.advisory_content)
+    if cfg.analytics.backend == "ducklake":
+        # Validate the selected serving catalog before any watcher or worker
+        # can start. A bad cutover config is a startup failure, never a read
+        # fallback to the legacy analytical store.
+        with _startup_phase("validate_ducklake_serving"):
+            from drover.server.lake.serving import check_selected
+
+            check_selected(cfg.duckdb_path)
     host_bridge = (
         HostDataBridgeClient(
             cfg.analytics_boundary,
@@ -2702,9 +2711,11 @@ def run(
                 else:
                     outbox_exporter.start(shutdown_event=stop)
                     log.info("control outbox exporter ready")
-        except Exception:  # noqa: BLE001 - control remains available, export lags
+        except Exception:  # noqa: BLE001 - legacy export remains best effort
             log.exception("control outbox exporter failed to start")
             outbox_exporter = None
+            if cfg.analytics.backend == "ducklake":
+                raise
 
     # One gate per process, shared by the foreground cockpit build and every
     # background analytical pass (#331).

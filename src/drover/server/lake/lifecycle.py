@@ -126,6 +126,7 @@ def selected_exporter(config):
             analytical_path=config.duckdb_path,
             parquet_dir=config.parquet_dir,
         )
-    if not config.analytics.exporter_enabled:
-        return None
+    # Restart-selected DuckLake is a complete read/write selection. A separate
+    # opt-in bit used to leave a hub serving the lake while silently not
+    # exporting new control events; do not permit that split brain.
     return ExporterLifecycle(config)

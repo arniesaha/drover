@@ -1,5 +1,12 @@
 # Recovery ledger
 
+## 2026-10-03 — #508 restart-selected DuckLake switch
+
+| Area | Evidence / boundary |
+| --- | --- |
+| Scope | Startup config selects legacy (unchanged) or DuckLake reads plus exporter; DuckLake config/runtime/serving/exporter failures stop startup without legacy fallback. |
+| Safety | No production data, config, service, deployment, or Studio hub was accessed or changed. Rollback remains config-to-legacy plus restart; legacy files are not mutated. |
+
 ## 2026-10-01 — verified recovery state
 
 | Area | State | Evidence / boundary |
