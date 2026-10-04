@@ -27,6 +27,10 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from drover.server.control_outbox import (
+    event_payload_expression,
+    event_payload_join,
+)
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import control_plane_connection
 from drover.server.ledger import EMBED_SESSION, SUMMARIZE_SESSION, JobLedger
@@ -128,7 +132,8 @@ def canonical_sessions(
             if not selected:
                 return []
             cur = con.execute(
-                """SELECT e.* FROM harness_events e
+                f"""SELECT e.*, {event_payload_expression(con)} AS payload_json
+                   FROM harness_events e {event_payload_join(con)}
                    WHERE e.session_id = ANY(?)
                      AND e.created_at <= ?
                      AND EXISTS (SELECT 1 FROM harness_events recent

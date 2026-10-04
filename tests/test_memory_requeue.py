@@ -395,3 +395,65 @@ def test_pg_version_for_tool_and_blank_events(pg_control_path, kind, payload):
                 list(row.values()),
             )
         assert session.source_version == source_version_for_session(con, "real")
+
+
+def test_substantive_only_reads_payload_from_side_table(pg_control_path):
+    sep30 = datetime(2026, 9, 30, 12, tzinfo=timezone.utc)
+    with control_plane_connection(pg_control_path) as con:
+        con.execute(
+            """INSERT INTO harness_sessions
+            (session_id, host_id, harness, command, status, native_session_id, summary_session_id)
+            VALUES ('substantive-session', 'host', 'codex', 'codex', 'ended', 'native-sub', 'summary-sub'),
+                   ('status-session', 'host', 'codex', 'codex', 'ended', 'native-stat', 'summary-stat')"""
+        )
+        events = [
+            (
+                "sub-0",
+                "substantive-session",
+                "user_input",
+                {"text": "fix the bug"},
+            ),
+            (
+                "sub-1",
+                "substantive-session",
+                "assistant_output",
+                {"text": "fixed the bug"},
+            ),
+            (
+                "stat-0",
+                "status-session",
+                "status",
+                {"status": "running"},
+            ),
+        ]
+        for event_id, sid, kind, payload in events:
+            con.execute(
+                """INSERT INTO harness_events
+                (event_id, session_id, event_type, normalized_type, payload_json, created_at, content_preview)
+                VALUES (?, ?, ?, ?, NULL, ?, 'preview')""",
+                [event_id, sid, kind, kind, sep30],
+            )
+            con.execute(
+                """INSERT INTO harness_event_payloads
+                (event_id, payload_json)
+                VALUES (?, ?)""",
+                [event_id, json.dumps(payload)],
+            )
+
+    sessions = {
+        s.session_id: s
+        for s in canonical_sessions(pg_control_path, since=date(2026, 9, 1))
+    }
+    assert sessions["substantive-session"].user_messages == 1
+    assert sessions["substantive-session"].assistant_messages == 1
+
+    report = requeue_memory(
+        pg_control_path,
+        since=date(2026, 9, 1),
+        substantive_only=True,
+        dry_run=True,
+        sleep=lambda s: None,
+    )
+    assert report.sessions_scanned == 2
+    assert report.skipped_not_substantive == 1
+    assert report.summarize == {"would_enqueue": 1}
