@@ -7,7 +7,9 @@ import Testing
 //   real `HarnessDaemonState`, so it is what current hosts publish;
 // - harness-capabilities-mixed.json: Claude Code, Codex, agy, DeepSeek, shell,
 //   two fixture adapters with unusual mixes, malformed and future rows, a
-//   legacy (matrix-less) host, a host with no envelope and a future-schema host.
+//   legacy (matrix-less) host, a host with no envelope and a future-schema host,
+//   and `lab-host`: the exact row harnessd publishes for the test-only
+//   `synthetic-lab` adapter (#422, pinned by tests/test_adapter_extensibility.py).
 
 private func mixedSnapshot() throws -> HarnessSnapshot {
     let url = try #require(droverKitFixtureURL("harness-capabilities-mixed"))
@@ -76,6 +78,43 @@ struct HarnessCapabilityDecodingTests {
             turnPreferences: false,
             attachments: ["image/png"]
         )))
+    }
+
+    /// drover#422: the row harnessd publishes for the test-only synthetic
+    /// adapter (pinned by tests/test_adapter_extensibility.py) drives every
+    /// control without the app knowing its ID.
+    @Test func syntheticAdapterRowDecodesFromItsPublishedEnvelope() throws {
+        let snapshot = try mixedSnapshot()
+        let offer = try #require(try host("lab-host", in: snapshot).offer(named: "synthetic-lab"))
+        #expect(offer.label == "Synthetic Lab")
+        #expect(offer.capabilities == HarnessCapabilities(
+            launchModes: [.pty, .structured],
+            approvals: true,
+            nativeResume: true,
+            attachments: ["image/png"]
+        ))
+        #expect(offer.launchMode == .structured)
+        let controls = HarnessControls(snapshot: snapshot, hostID: "lab-host", harness: "synthetic-lab")
+        #expect(controls.showsApprovals && !controls.canInterrupt)
+        #expect(controls.supportsNativeResume && !controls.showsModelControls)
+        #expect(!controls.explainsWorktreeIsolation && !controls.offersSignIn)
+        // PNG only, and the app produces JPEG attachments.
+        #expect(!controls.acceptsImageAttachments)
+        #expect(controls.interruptUnavailableReason == HarnessCapabilityCopy.interruptUnsupported)
+    }
+
+    @Test func displayNamesComeFromTheEnvelopeWithARawNameFallback() throws {
+        let golden = try host("test-host", in: goldenSnapshot())
+        #expect(golden.offer(named: "codex")?.label == "Codex CLI")
+        #expect(golden.offer(named: "shell")?.label == "Shell")
+        // Rows from hosts that predate the field, and legacy rows, show the ID.
+        let studio = try host("studio", in: mixedSnapshot())
+        #expect(studio.offer(named: "codex")?.displayName == nil)
+        #expect(studio.offer(named: "codex")?.label == "codex")
+        let old = try host("old-mini", in: mixedSnapshot())
+        #expect(old.offer(named: "codex beta")?.label == "codex beta")
+        let blank = HarnessOffer(row: .object(["name": .string("x"), "display_name": .string("  ")]))
+        #expect(blank?.label == "x")
     }
 
     @Test func missingOptionalFlagsAreFalseAndHarnessIDMayBeOmitted() throws {
@@ -320,6 +359,26 @@ struct CapabilityDrivenLaunchTests {
         #expect(body["model"] == nil && body["thinking_effort"] == nil)
     }
 
+    @Test @MainActor func aSyntheticAdapterLaunchesFromItsEnvelopeAlone() async throws {
+        let model = try launchModel()
+        model.hostID = "lab-host"
+        #expect(model.harness == "synthetic-lab")
+        #expect(model.harnessLabel(model.harness) == "Synthetic Lab")
+        #expect(model.isStructured && !model.showsRunPreferences)
+        #expect(!model.supportsInteractiveAuth && !model.canAttachImages)
+        model.prompt = "go"
+
+        nonisolated(unsafe) var body: [String: Any] = [:]
+        mock.handler = { request in
+            body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+            return (201, Data(#"{"session_id": "lab-2", "mode": "structured"}"#.utf8))
+        }
+        #expect(await model.launch() == "lab-2")
+        #expect(body["harness"] as? String == "synthetic-lab")
+        #expect(body["mode"] as? String == "structured")
+        #expect(body["model"] == nil && body["thinking_effort"] == nil)
+    }
+
     @Test @MainActor func launchRefusesWithoutAnAdvertisedMode() async throws {
         let model = try launchModel()
         model.hostID = "old-mini"
@@ -439,6 +498,76 @@ struct CapabilityDrivenChatTests {
         let jpeg = TurnAttachment(mediaType: "image/jpeg", data: Data([1]))
         #expect(await lab.addAttachmentIfRecoverable(jpeg) == false)
         #expect(lab.pendingAttachments.isEmpty)
+    }
+
+    /// drover#422: native resume follows the host's advertised capability for
+    /// the session's harness, whatever that harness is called.
+    @Test @MainActor func nativeResumeEligibilityFollowsTheAdvertisedCapability() async throws {
+        #expect(try await loadedChat("s-synth", harness: "synthetic-lab").canResumeNatively)
+        #expect(try await loadedChat("s-claude", harness: "claude-code").canResumeNatively)
+        // fixture-lab's matrix says native_resume: false; legacy says nothing.
+        let lab = try await loadedChat("s-lab", harness: "fixture-lab")
+        let legacy = try await loadedChat("s-legacy", harness: "codex")
+        #expect(!lab.canResumeNatively)
+        #expect(!legacy.canResumeNatively)
+    }
+
+    @Test @MainActor func nativeResumeListsAndSendsTheAdaptersCandidate() async throws {
+        let synth = try await loadedChat("s-synth", harness: "synthetic-lab")
+        let listing = Data("""
+        {"host_id": "lab-host", "sessions": [
+          {"session_id": "lab-native-7", "label": "Lab work · lab-nati", "cwd": null,
+           "harness": "synthetic-lab",
+           "native_resume": {"session_id": "lab-native-7", "label": "Lab work"}},
+          {"session_id": "no-resume-object", "harness": "synthetic-lab"},
+          {"session_id": "x", "harness": "other", "native_resume": {"session_id": "x"}}
+        ]}
+        """.utf8)
+        nonisolated(unsafe) var listQuery: [URLQueryItem] = []
+        nonisolated(unsafe) var body: [String: Any] = [:]
+        mock.handler = { request in
+            if request.url?.path == "/harness/hosts/lab-host/native-sessions" {
+                listQuery = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                    .queryItems ?? []
+                return (200, listing)
+            }
+            body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+            return (201, Data(#"{"session_id": "resumed-1", "mode": "structured"}"#.utf8))
+        }
+        await synth.loadNativeResumeCandidates()
+        #expect(synth.nativeResumeCandidates == [
+            NativeResumeCandidate(harness: "synthetic-lab", nativeSessionID: "lab-native-7",
+                                  label: "Lab work"),
+        ])
+        #expect(listQuery.first { $0.name == "harness" }?.value == "synthetic-lab")
+        #expect(listQuery.first { $0.name == "cwd" }?.value == "/repo")
+
+        let continued = await synth.resumeNatively(try #require(synth.nativeResumeCandidates.first))
+        #expect(continued == ContinuedSession(sessionID: "resumed-1", isStructured: true))
+        #expect(body["target_harness"] as? String == "synthetic-lab")
+        #expect((body["native_resume"] as? [String: String])?["session_id"] == "lab-native-7")
+    }
+
+    @Test @MainActor func unadvertisedNativeResumeNeverReachesTheHub() async throws {
+        let lab = try await loadedChat("s-lab", harness: "fixture-lab")
+        let legacy = try await loadedChat("s-legacy", harness: "codex")
+        let synth = try await loadedChat("s-synth", harness: "synthetic-lab")
+        mock.handler = { _ in
+            Issue.record("unadvertised native resume must not reach the hub")
+            return (500, Data())
+        }
+        for model in [lab, legacy] {
+            await model.loadNativeResumeCandidates()
+            #expect(model.nativeResumeCandidates.isEmpty)
+            let candidate = NativeResumeCandidate(
+                harness: model.harnessPresentation.harness, nativeSessionID: "n", label: "n")
+            #expect(await model.resumeNatively(candidate) == nil)
+            #expect(model.hint == HarnessCapabilityCopy.nativeResumeUnsupported)
+        }
+        // Advertised, but the candidate belongs to another harness.
+        let foreign = NativeResumeCandidate(harness: "claude-code", nativeSessionID: "n", label: "n")
+        #expect(await synth.resumeNatively(foreign) == nil)
+        #expect(synth.hint == HarnessCapabilityCopy.nativeResumeUnsupported)
     }
 
     @Test @MainActor func legacyHostSessionsStayListableButWithholdControls() async throws {

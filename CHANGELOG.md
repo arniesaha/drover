@@ -27,6 +27,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go dark now read stale, then offline, instead of staying online. Thresholds
   are `DROVER_HOST_STALE_AFTER_SECONDS` (45) and
   `DROVER_HOST_OFFLINE_AFTER_SECONDS` (600); see `docs/multi-host.md` (#474).
+
+- A test-only adapter with an unusual capability mix now runs through the
+  registry, harnessd, the hub API, and the web and iOS fixtures without any
+  harness-specific branch (#422). The extension points this measured are in
+  `docs/design/adapter-extension-points.md`. Making it pass changed the
+  contract:
+  - harnessd starts a PTY session only for a harness that advertises `pty`.
+    Provider CLIs no longer start as raw terminals through the API.
+  - Native resume is the adapter's resume operation and runs as a structured
+    session. The per-harness resume flags in harnessd, and the bare "latest"
+    forms, are gone.
+  - The hub's Continue and restart recovery follow the target host's
+    capabilities instead of the hub's own adapter list. Continue onto a host
+    without a capability matrix is refused with an upgrade message.
+  - Interrupt, approvals, attachments outside the declared MIME types, model
+    or effort without a catalog, and unsupported native resume are refused
+    before any provider call.
+  - Harness rows carry an additive `display_name`, used by the web pickers and
+    the iOS launch sheet.
+- OpenClaw is observe-only end to end (#421). harnessd no longer carries an
+  OpenClaw native-resume argument or maps a terminal command to `openclaw`;
+  neither path was reachable without a preset. Collection, parsing,
+  attribution, metrics, recall and historical rows are unchanged, and a
+  regression test keeps OpenClaw and Hermes out of presets, the adapter
+  registry, the capability envelope and both launch modes.
 - Span ingestion is an optional integration, off by default (#473). The OTLP
   receiver only starts with `[telemetry] spans_enabled = true`; with it off no
   span Parquet is read, no span embedding jobs are enqueued or claimed,

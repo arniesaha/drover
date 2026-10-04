@@ -168,6 +168,93 @@ def test_unusual_fixture_adapter_fails_closed_on_what_it_does_not_understand():
 
 
 @needs_node
+def test_synthetic_adapter_renders_from_its_published_row():
+    """drover#422: the row harnessd publishes for a test-only adapter (see
+    tests/test_adapter_extensibility.py) drives every web control unaided."""
+    session = json.dumps({"harness": "synthetic-lab", "mode": "structured"})
+    lab = "C.harnessControls(host('lab-host'), 'synthetic-lab')"
+    out = _js(
+        {
+            "lab": lab,
+            "targets": "C.launchTargets(host('lab-host')).map((t) => [t.name, t.displayName, t.mode])",
+            "body": "C.launchBody(C.requireLaunch(host('lab-host'), 'synthetic-lab'), "
+            "{cwd: '/repo', rows: 40, cols: 120, model: 'm1', thinkingEffort: 'high'})",
+            "png": f"C.acceptsAttachment({lab}, 'image/png')",
+            "jpeg": f"C.acceptsAttachment({lab}, 'image/jpeg')",
+            "approve": f"attempt(() => C.requireSessionAction(host('lab-host'), {session}, 'approve'))",
+            "interrupt": f"attempt(() => C.requireSessionAction(host('lab-host'), {session}, 'interrupt'))",
+            "unlabelled": "C.harnessControls(host('mac-mini'), 'codex').displayName",
+            "legacy": "C.harnessControls(host('old-nas'), 'codex beta').displayName",
+        }
+    )
+    lab_controls = out["lab"]
+    assert lab_controls["displayName"] == "Synthetic Lab"
+    assert lab_controls["modes"] == ["structured", "pty"]
+    assert (
+        lab_controls["approvals"],
+        lab_controls["interrupt"],
+        lab_controls["nativeResume"],
+        lab_controls["modelCatalog"],
+        lab_controls["worktree"],
+        lab_controls["interactiveAuth"],
+    ) == (True, False, True, False, False, False)
+    assert out["targets"] == [["synthetic-lab", "Synthetic Lab", "structured"]]
+    # No catalog advertised: model and effort never reach the launch body.
+    assert out["body"] == {
+        "harness": "synthetic-lab",
+        "mode": "structured",
+        "cwd": "/repo",
+    }
+    assert (out["png"], out["jpeg"]) == (True, False)
+    assert out["approve"] == "ok"
+    assert out["interrupt"].startswith("error:")
+    # Hosts that predate display names fall back to the raw name.
+    assert out["unlabelled"] == "codex"
+    assert out["legacy"] == "codex beta"
+
+
+@needs_node
+def test_native_resume_lookup_and_body_follow_the_advertised_capability():
+    """drover#422: native resume for any harness that advertises it, and only
+    for those -- including the synthetic adapter and legacy-shaped hosts."""
+    lab = "C.harnessControls(host('lab-host'), 'synthetic-lab')"
+    candidate = json.dumps(
+        {
+            "session_id": "lab-native-7",
+            "harness": "synthetic-lab",
+            "native_resume": {"session_id": "lab-native-7", "label": "Lab work"},
+        }
+    )
+    foreign = json.dumps({"harness": "other", "native_resume": {"session_id": "x"}})
+    out = _js(
+        {
+            "lab_query": f"C.nativeResumeQuery({lab}, {{cwd: '/repo'}})",
+            "lab_body": f"C.nativeResumeBody({lab}, {candidate})",
+            "foreign_body": f"C.nativeResumeBody({lab}, {foreign})",
+            "empty_body": f"C.nativeResumeBody({lab}, {{native_resume: {{}}}})",
+            "provider_query": "C.nativeResumeQuery(C.harnessControls(host('mac-mini'), 'codex'))",
+            "shell_query": "C.nativeResumeQuery(C.harnessControls(host('mac-mini'), 'shell'))",
+            "echo_body": "C.nativeResumeBody(C.harnessControls(host('fixture-box'), "
+            f"'fixture-echo'), {candidate})",
+            "legacy_query": "C.nativeResumeQuery(C.harnessControls(host('old-nas'), 'claude-code'))",
+        }
+    )
+    assert out["lab_query"] == {
+        "harness": "synthetic-lab",
+        "limit": "12",
+        "cwd": "/repo",
+    }
+    assert out["lab_body"] == {"session_id": "lab-native-7", "label": "Lab work"}
+    assert out["foreign_body"] is None
+    assert out["empty_body"] is None
+    assert out["provider_query"] == {"harness": "codex", "limit": "12"}
+    # Not advertised: no lookup, and a stale candidate is never sent.
+    assert out["shell_query"] is None
+    assert out["echo_body"] is None
+    assert out["legacy_query"] is None
+
+
+@needs_node
 def test_disabled_modeless_future_and_malformed_rows_offer_nothing():
     names = (
         "fixture-off",
@@ -413,7 +500,8 @@ def test_pages_route_every_action_through_a_capability_guard():
         "DroverCapabilities.requireLaunch(hostById(targetHost), targetHarness)"
         in session
     )
-    assert "!continueTarget().nativeResume" in session
+    assert "DroverCapabilities.nativeResumeQuery(target," in session
+    assert "DroverCapabilities.nativeResumeBody(continueTarget()," in session
 
 
 @needs_node

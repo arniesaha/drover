@@ -240,6 +240,11 @@ struct ChatView: View {
         // Separate task so the delay races the connect rather than waiting
         // behind it: `loadSessionMetadata` above suspends, and a timer sharing
         // that task would not tick until it returned.
+        // Native resume candidates load only once the host has advertised
+        // native resume for this harness, and reload if that changes.
+        .task(id: model.canResumeNatively) {
+            await model.loadNativeResumeCandidates()
+        }
         .task {
             try? await Task.sleep(for: .seconds(ColdOpenTracker.appearAfter))
             guard !Task.isCancelled else { return }
@@ -588,6 +593,25 @@ struct ChatView: View {
                     Label("Continue in a new session", systemImage: "arrow.triangle.branch")
                 }
                 .disabled(!model.handoffHarnesses.contains(model.harnessPresentation.harness))
+                // Native sessions this harness's adapter found on the host.
+                // Shown only when the host advertises native resume for it.
+                if model.canResumeNatively && !model.nativeResumeCandidates.isEmpty {
+                    Menu {
+                        ForEach(model.nativeResumeCandidates) { candidate in
+                            Button {
+                                Task { await resumeNatively(candidate) }
+                            } label: {
+                                Label(candidate.label, systemImage: "arrow.uturn.backward")
+                                if let cwd = candidate.cwd {
+                                    Text(cwd)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Resume a native session", systemImage: "arrow.uturn.backward.circle")
+                    }
+                    .accessibilityIdentifier("chat-native-resume")
+                }
                 // Per-harness targets from the session's host: only those it
                 // advertises a structured launch for. A PTY-only target would
                 // have the seed typed into a terminal and run as commands.
@@ -622,6 +646,14 @@ struct ChatView: View {
 
     private var crossHarnessTargets: [String] {
         model.handoffHarnesses
+    }
+
+    private func resumeNatively(_ candidate: NativeResumeCandidate) async {
+        if let continued = await model.resumeNatively(candidate) {
+            handoffSession = HandoffSession(id: continued.sessionID,
+                                            isStructured: continued.isStructured,
+                                            harness: candidate.harness)
+        }
     }
 
     private func handOff(to targetHarness: String?) async {

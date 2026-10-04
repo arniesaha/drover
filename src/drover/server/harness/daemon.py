@@ -40,8 +40,10 @@ from drover.config import (
 )
 from drover.native_history_identity import native_source_fingerprint
 from drover.server.harness.adapters import (
+    HarnessAdapter,
     HarnessAdapterRegistry,
     HarnessCapabilities,
+    LaunchRequest,
     UnsupportedHarnessOperation,
 )
 from drover.server.harness.auth import (
@@ -188,6 +190,40 @@ def save_turn_attachments(
     return saved
 
 
+def _accepts_media_type(accepted: frozenset[str], media_type: str) -> bool:
+    family = media_type.split("/", 1)[0]
+    return media_type in accepted or f"{family}/*" in accepted
+
+
+def _unsupported_request(
+    adapter: HarnessAdapter,
+    *,
+    native_resume: bool = False,
+    preferences: bool = False,
+    images: Any = None,
+) -> str | None:
+    """Why a structured request needs an operation its adapter does not declare.
+
+    Checked before anything is written or started, so an undeclared operation
+    fails the same way for every adapter instead of reaching provider code.
+    """
+    capabilities = adapter.capabilities
+    if native_resume and not capabilities.native_resume:
+        return f"{adapter.id} does not support native_resume"
+    if preferences and not capabilities.model_catalog:
+        return f"{adapter.id} does not support model_catalog"
+    if images:
+        if not capabilities.attachments:
+            return f"{adapter.id} does not support attachments"
+        for image in images if isinstance(images, list) else []:
+            media_type = (
+                str(image.get("media_type") or "") if isinstance(image, dict) else ""
+            )
+            if not _accepts_media_type(capabilities.attachments, media_type):
+                return f"{adapter.id} does not accept attachment type {media_type!r}"
+    return None
+
+
 def append_attachment_lines(text: str, saved: list[dict[str, str]]) -> str:
     for item in saved:
         line = f"[Attached image: {item['path']}]"
@@ -261,6 +297,8 @@ class HarnessPreset:
         }
 
 
+SHELL_DISPLAY_NAME = "Shell"
+
 DEFAULT_PRESETS = {
     "shell": HarnessPreset(
         name="shell",
@@ -294,12 +332,11 @@ DEFAULT_PRESETS = {
         enabled=False,
         description="Antigravity CLI (agy)",
     ),
-    # Retired as a session target: openclaw never had a structured driver, so
-    # offering it here only produced "harness has no structured driver:
-    # openclaw" at launch. It is still an *observed* agent -- the collect
-    # source, parser and metrics stay -- it is simply not driven from Drover.
-    # `test_every_offered_preset_can_actually_be_driven` keeps a driverless
-    # preset from being added back.
+    # OpenClaw and Hermes are observe-only: collect Sources, parsers,
+    # attribution, metrics and recall ingest their history, but neither has a
+    # drive adapter, so neither is a preset, a launch target or a resume
+    # target. `test_every_offered_preset_can_actually_be_driven` and
+    # `test_observe_only_sources_are_never_drive_targets` keep it that way.
     "deepseek-harness": HarnessPreset(
         name="deepseek-harness",
         command=("dsh",),
@@ -349,22 +386,6 @@ def resolve_harness_presets(
     return resolved
 
 
-def build_launch_command(
-    preset: HarnessPreset,
-    *,
-    harness: str,
-    native_resume: Any = None,
-) -> list[str]:
-    args = _native_resume_args(harness, native_resume)
-    command = list(preset.command)
-    if not args:
-        return command
-    if len(command) >= 3 and command[1] == "-lc" and command[2].startswith("exec "):
-        command[2] = command[2] + " " + " ".join(shlex.quote(arg) for arg in args)
-        return command
-    return [*command, *args]
-
-
 def apply_structured_preferences(
     command: list[str],
     *,
@@ -376,37 +397,6 @@ def apply_structured_preferences(
     return BUILTIN_ADAPTERS.resolve(harness).apply_preferences(
         command, model, thinking_effort
     )
-
-
-def _native_resume_args(harness: str, native_resume: Any) -> list[str]:
-    if not isinstance(native_resume, dict):
-        return []
-    session_id = str(native_resume.get("session_id") or "").strip()
-    latest = bool(native_resume.get("latest"))
-    mode = str(native_resume.get("mode") or "").strip()
-    if harness == "claude-code":
-        if session_id:
-            return ["--resume", session_id]
-        if latest or mode in {"continue", "latest"}:
-            return ["--continue"]
-    if harness == "codex":
-        if session_id:
-            return ["resume", session_id]
-        if latest or mode == "latest":
-            return ["resume", "--last"]
-        if mode == "resume":
-            return ["resume"]
-    if harness == "agy":
-        # agy resumes by conversation ID only -- there is no bare "latest"
-        # form, and `--continue` picks the most recent conversation in the
-        # *current* directory, which is not the same promise the other
-        # harnesses make here.
-        if session_id:
-            return ["--conversation", session_id]
-    if harness == "openclaw":
-        if session_id:
-            return ["resume", session_id]
-    return []
 
 
 def _native_session_id(native_resume: Any) -> str | None:
@@ -457,20 +447,33 @@ def discover_native_resume_sessions(
     harness: str | None = None,
     cwd: str | None = None,
     limit: int = 20,
+    adapters: HarnessAdapterRegistry | None = None,
 ) -> list[dict[str, Any]]:
-    """Return safe, metadata-only native resume candidates from local CLIs."""
+    """Return safe, metadata-only native resume candidates from local CLIs.
+
+    Only adapters that declare ``native_resume`` are asked, through their
+    ``native_sessions`` extension; nothing here knows a harness ID. Adapters
+    without discovery (agy, DeepSeek today) contribute no candidates, which
+    leaves their resume operation itself unaffected.
+    """
     root = home or Path.home()
-    # agy is absent on purpose: it keeps conversations in its own store under
-    # ``~/.gemini/antigravity-cli/conversations`` in a format nothing here
-    # reads yet. Drover's own per-session ``--conversation`` continuation is
-    # unaffected -- this list only feeds the "resume a session the CLI
-    # started outside Drover" picker.
-    requested = {harness} if harness else {"claude-code", "codex"}
+    registry = adapters if adapters is not None else BUILTIN_ADAPTERS
+    requested = [harness] if harness else list(registry.ids())
     candidates: list[dict[str, Any]] = []
-    if "claude-code" in requested:
-        candidates.extend(_discover_claude_sessions(root))
-    if "codex" in requested:
-        candidates.extend(_discover_codex_sessions(root))
+    for harness_id in requested:
+        try:
+            adapter = registry.resolve(harness_id, operation="native_resume")
+        except (KeyError, UnsupportedHarnessOperation):
+            continue
+        for item in adapter.native_sessions(home=root, cwd=cwd):
+            native = item.get("native_resume") if isinstance(item, dict) else None
+            if not (
+                isinstance(item.get("session_id"), str)
+                and isinstance(native, dict)
+                and isinstance(native.get("session_id"), str)
+            ):
+                continue
+            candidates.append({**item, "harness": harness_id})
     if cwd:
         wanted = str(Path(cwd).expanduser())
         exact = [item for item in candidates if item.get("cwd") == wanted]
@@ -494,41 +497,73 @@ def native_transcript_for_session(
     native_session_id: str | None = None,
     home: Path | None = None,
     limit: int = 80,
+    adapters: HarnessAdapterRegistry | None = None,
 ) -> dict[str, Any]:
-    """Return provider-native transcript messages for a Harness session."""
-    if harness == "claude-code":
-        root = home or Path.home()
-        path = _claude_transcript_path(
-            root,
+    """Return provider-native transcript messages for a Harness session.
+
+    The adapter's ``native_transcript`` extension reads its own history;
+    an unregistered harness, or one without the extension, is unsupported.
+    """
+    registry = adapters if adapters is not None else BUILTIN_ADAPTERS
+    try:
+        adapter = registry.resolve(harness or "")
+    except KeyError:
+        adapter = None
+    transcript = (
+        adapter.native_transcript(
+            home=home or Path.home(),
             cwd=cwd,
             native_session_id=native_session_id,
+            limit=limit,
         )
-        if path is None:
-            return {
-                "source": "claude jsonl",
-                "messages": [],
-                "reason": "no Claude JSONL transcript found for this workspace",
-            }
-        return _read_claude_transcript(path, limit=limit)
-    if harness == "codex":
-        root = home or Path.home()
-        path = _codex_transcript_path(
-            root,
-            cwd=cwd,
-            native_session_id=native_session_id,
-        )
-        if path is None:
-            return {
-                "source": "codex jsonl",
-                "messages": [],
-                "reason": "no Codex JSONL transcript found for this workspace",
-            }
-        return _read_codex_transcript(path, limit=limit)
+        if adapter is not None
+        else None
+    )
+    if transcript is not None:
+        return transcript
     return {
         "source": None,
         "messages": [],
         "reason": f"native transcript is not supported for harness: {harness}",
     }
+
+
+def claude_native_transcript(
+    home: Path, *, cwd: str | None, native_session_id: str | None, limit: int
+) -> dict[str, Any]:
+    """ClaudeCodeAdapter.native_transcript: Claude's JSONL project history."""
+    path = _claude_transcript_path(home, cwd=cwd, native_session_id=native_session_id)
+    if path is None:
+        return {
+            "source": "claude jsonl",
+            "messages": [],
+            "reason": "no Claude JSONL transcript found for this workspace",
+        }
+    return _read_claude_transcript(path, limit=limit)
+
+
+def codex_native_transcript(
+    home: Path, *, cwd: str | None, native_session_id: str | None, limit: int
+) -> dict[str, Any]:
+    """CodexAdapter.native_transcript: Codex's JSONL session history."""
+    path = _codex_transcript_path(home, cwd=cwd, native_session_id=native_session_id)
+    if path is None:
+        return {
+            "source": "codex jsonl",
+            "messages": [],
+            "reason": "no Codex JSONL transcript found for this workspace",
+        }
+    return _read_codex_transcript(path, limit=limit)
+
+
+def claude_native_sessions(home: Path) -> list[dict[str, Any]]:
+    """ClaudeCodeAdapter.native_sessions: Claude's JSONL project history."""
+    return _discover_claude_sessions(home)
+
+
+def codex_native_sessions(home: Path) -> list[dict[str, Any]]:
+    """CodexAdapter.native_sessions: Codex's JSONL session history."""
+    return _discover_codex_sessions(home)
 
 
 def _candidate_path(
@@ -1366,28 +1401,47 @@ class HarnessDaemonState:
         with self.recovery_locks_guard:
             return self.recovery_locks.setdefault(session_id, threading.Lock())
 
+    def drive_adapter(self, name: str) -> HarnessAdapter | None:
+        """The registered adapter for a preset, or None (shell, or unregistered)."""
+        try:
+            return self.adapters.resolve(name)
+        except KeyError:
+            return None
+
+    def harness_contract(self, name: str) -> HarnessCapabilities:
+        """What this host publishes, and therefore executes, for one preset.
+
+        Launch gates read this, not the preset table, so a request can never
+        reach a mode or operation the envelope did not advertise.
+        """
+        if name == "shell":
+            # The daemon owns the generic terminal, outside the provider
+            # adapter registry. It makes no structured-operation claims.
+            return HarnessCapabilities(frozenset({"pty"}))
+        adapter = self.drive_adapter(name)
+        if adapter is None:
+            return HarnessCapabilities(frozenset())
+        return adapter.capabilities
+
     def capabilities(self) -> dict[str, Any]:
         harnesses = []
         for preset in self.presets.values():
-            if preset.name == "shell":
-                # The daemon owns the generic terminal, outside the provider
-                # adapter registry. It makes no structured-operation claims.
-                capabilities = HarnessCapabilities(frozenset({"pty"}))
-                turn_preferences = False
-            else:
-                try:
-                    adapter = self.adapters.resolve(preset.name)
-                    capabilities = adapter.capabilities
-                    turn_preferences = adapter.turn_preferences_mutable
-                except KeyError:
-                    capabilities = HarnessCapabilities(frozenset())
-                    turn_preferences = False
+            adapter = self.drive_adapter(preset.name)
             row = preset.as_json()
             # Commands may contain environment assignments, auth or prompt
             # arguments. Keep the legacy field, never publish the invocation.
             row["command"] = []
+            row["display_name"] = (
+                adapter.display_name
+                if adapter is not None
+                else SHELL_DISPLAY_NAME if preset.name == "shell" else preset.name
+            )
             row["capabilities"] = capability_matrix(
-                preset.name, capabilities, turn_preferences=turn_preferences
+                preset.name,
+                self.harness_contract(preset.name),
+                turn_preferences=bool(
+                    adapter is not None and adapter.turn_preferences_mutable
+                ),
             )
             harnesses.append(row)
         return validate_capabilities(
@@ -2115,6 +2169,29 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
+        # A terminal is a launch mode like any other: an enabled preset is not
+        # terminal-launchable unless this host advertises `pty` for it.
+        contract = self.server.state.harness_contract(harness)
+        if "pty" not in contract.launch_modes:
+            self._write_json(
+                {"error": f"{harness} does not support pty launch"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        native_resume = body.get("native_resume")
+        native_session_id = _native_session_id(native_resume)
+        if native_resume and not contract.native_resume:
+            self._write_json(
+                {"error": f"{harness} does not support native_resume"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if native_resume and native_session_id is None:
+            self._write_json(
+                {"error": "native_resume requires a session_id"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
 
         cwd = body.get("cwd")
         if cwd is not None and not Path(str(cwd)).expanduser().is_dir():
@@ -2124,11 +2201,22 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        command = body.get("command") or build_launch_command(
-            preset,
-            harness=harness,
-            native_resume=body.get("native_resume"),
-        )
+        command = body.get("command")
+        if not command:
+            adapter = self.server.state.drive_adapter(harness)
+            # Without an adapter this is the daemon's own terminal (shell),
+            # which the contract above already limited to a plain command.
+            command = (
+                list(preset.command)
+                if adapter is None
+                else adapter.build_command(
+                    LaunchRequest(
+                        cwd=str(cwd) if cwd is not None else None,
+                        command=preset.command,
+                        native_session_id=native_session_id,
+                    )
+                )
+            )
         session_id = f"harness-{uuid4()}"
         registry_created = False
         try:
@@ -2143,8 +2231,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 cwd=str(cwd) if cwd is not None else None,
                 status="starting",
                 started_at=datetime.now(timezone.utc),
-                native_session_id=_native_session_id(body.get("native_resume")),
-                native_resume_label=_native_resume_label(body.get("native_resume")),
+                native_session_id=native_session_id,
+                native_resume_label=_native_resume_label(native_resume),
                 source_session_id=_optional_text(body.get("source_session_id")),
                 handoff_mode=_optional_text(body.get("handoff_mode")),
                 client_session_id=client_session_id,
@@ -2323,6 +2411,24 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
+        # Every optional operation the request asks for is checked against the
+        # adapter's declaration here, before a worktree, registry row or
+        # provider process exists.
+        native_resume = body.get("native_resume")
+        native_session_id = _native_session_id(native_resume)
+        refusal = _unsupported_request(
+            adapter,
+            native_resume=bool(native_resume),
+            preferences=(
+                body.get("model") is not None or body.get("thinking_effort") is not None
+            ),
+            images=body.get("images"),
+        )
+        if refusal is None and native_resume and native_session_id is None:
+            refusal = "native_resume requires a session_id"
+        if refusal is not None:
+            self._write_json({"error": refusal}, status=HTTPStatus.BAD_REQUEST)
+            return
         cwd = body.get("cwd")
         worktrees_dir = self.server.state.worktrees_dir
         from drover.server.staging_credentials import is_staging, staging_session_paths
@@ -2489,6 +2595,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 started_at=datetime.now(timezone.utc),
                 source_session_id=_optional_text(body.get("source_session_id")),
                 handoff_mode=_optional_text(body.get("handoff_mode")),
+                native_session_id=native_session_id,
+                native_resume_label=_native_resume_label(native_resume),
                 mode="structured",
                 permission_mode=permission_mode,
                 model=model,
@@ -2542,6 +2650,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 registry=self.server.state.registry,
                 on_message=self.server.state.push_event,
                 finalize=self._finalize_structured_session,
+                native_session_id=native_session_id,
             )
         except Exception as exc:
             if registry_created:
@@ -2662,6 +2771,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if not adapter.turn_preferences_mutable:
             model = None
             thinking_effort = None
+        refusal = _unsupported_request(
+            adapter,
+            preferences=model is not None or thinking_effort is not None,
+            images=images,
+        )
+        if refusal is not None:
+            self._write_json({"error": refusal}, status=HTTPStatus.BAD_REQUEST)
+            return
         if model is not None or thinking_effort is not None:
             try:
                 self._model_catalog_service().validate(
@@ -2842,6 +2959,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
         note = _optional_text(body.get("note"))
+        if (
+            refusal := self._unsupported_operation(session_id, "approvals")
+        ) is not None:
+            self._write_json({"error": refusal}, status=HTTPStatus.BAD_REQUEST)
+            return
         try:
             self.server.state.structured.answer_permission(
                 session_id, request_id, decision, note
@@ -2864,6 +2986,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.NOT_FOUND,
             )
             return
+        if (
+            refusal := self._unsupported_operation(session_id, "interrupt")
+        ) is not None:
+            self._write_json({"error": refusal}, status=HTTPStatus.BAD_REQUEST)
+            return
         try:
             self.server.state.structured.interrupt(session_id)
         except KeyError:
@@ -2873,6 +3000,19 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
         self._write_json({"ok": True})
+
+    def _unsupported_operation(self, session_id: str, operation: str) -> str | None:
+        """Refuse an undeclared session operation before it reaches the driver."""
+        harness = self.server.state.structured.harness_for(session_id)
+        if harness is None:
+            return None  # closed meanwhile; the manager reports it as unknown
+        try:
+            self.server.state.adapters.resolve(harness, operation=operation)
+        except KeyError:
+            return f"harness has no structured driver: {harness}"
+        except UnsupportedHarnessOperation as exc:
+            return str(exc)
+        return None
 
     def _finalize_structured_session(self, session_id: str, returncode: int) -> None:
         if session_id in self.server.state.terminated_session_ids:
@@ -3051,6 +3191,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             harness=harness,
             cwd=cwd,
             limit=limit,
+            adapters=self.server.state.adapters,
         )
         self._write_json(
             {
@@ -3078,12 +3219,21 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         native_session_id = _optional_text(
             (params.get("native_session_id") or [None])[0]
         )
-        harness = _harness_name_for_command(session.command)
+        # The registry row names the harness the session was launched as.
+        # Only a terminal predating that row falls back to command sniffing,
+        # a read-only legacy path that never selects a launch or resume.
+        registry_session = self._safe_get_session(session_id)
+        harness = (
+            registry_session.harness
+            if registry_session is not None and registry_session.harness
+            else _harness_name_for_command(session.command)
+        )
         payload = native_transcript_for_session(
             harness=harness,
             cwd=str(session.cwd) if session.cwd else None,
             native_session_id=native_session_id,
             limit=limit,
+            adapters=self.server.state.adapters,
         )
         provider_session_id = payload.get("session_id")
         payload.update(
@@ -4379,6 +4529,8 @@ def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
 
 
 def _harness_name_for_command(command: tuple[str, ...]) -> str:
+    # Legacy, read-only: labels a terminal with no registry row for the
+    # transcript viewer. Never used to choose a launch mode or resume.
     command_text = " ".join(str(part) for part in command)
     if "claude" in command_text:
         return "claude-code"
@@ -4386,8 +4538,6 @@ def _harness_name_for_command(command: tuple[str, ...]) -> str:
         return "codex"
     if "agy" in command_text or "antigravity" in command_text:
         return "agy"
-    if "openclaw" in command_text:
-        return "openclaw"
     return "shell"
 
 

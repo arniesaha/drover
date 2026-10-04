@@ -208,6 +208,39 @@
       }
     },
     {
+      "host_id": "lab-host",
+      "display_name": "Lab Host",
+      "kind": "linux",
+      "status": "online",
+      "local_url": "http://127.0.0.1:7085",
+      "capabilities": {
+        "host_id": "lab-host",
+        "harnesses": [
+          {
+            "name": "synthetic-lab",
+            "enabled": true,
+            "display_name": "Synthetic Lab",
+            "description": "Synthetic adapter (tests only)",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "synthetic-lab",
+              "launch_modes": ["pty", "structured"],
+              "approvals": true,
+              "interrupt": false,
+              "native_resume": true,
+              "model_catalog": false,
+              "usage": false,
+              "worktree": false,
+              "interactive_auth": false,
+              "turn_preferences": false,
+              "attachments": ["image/png"]
+            }
+          }
+        ]
+      }
+    },
+    {
       "host_id": "old-nas",
       "display_name": "Old NAS",
       "kind": "linux",
