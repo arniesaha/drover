@@ -1504,6 +1504,56 @@ public final class ChatModel {
         }
     }
 
+    /// True when this session's host advertises a structured launch with
+    /// `native_resume` for its harness (#422). Derived from the snapshot on
+    /// each metadata load; false until then, withholding the control.
+    public internal(set) var canResumeNatively = false
+
+    /// Native sessions this session's harness can resume, as its host
+    /// adapter discovered them. Empty unless `canResumeNatively`.
+    public internal(set) var nativeResumeCandidates: [NativeResumeCandidate] = []
+
+    private var sessionHostID: String?
+    private var sessionCwd: String?
+
+    /// Asks the host for resume candidates, only for an advertised harness.
+    public func loadNativeResumeCandidates() async {
+        let harness = harnessPresentation.harness
+        guard canResumeNatively, let hostID = sessionHostID else {
+            nativeResumeCandidates = []
+            return
+        }
+        do {
+            let found = try await client.nativeResumeCandidates(
+                hostID: hostID, harness: harness, cwd: sessionCwd)
+            // A refresh may have withdrawn the capability meanwhile.
+            guard canResumeNatively, harnessPresentation.harness == harness else { return }
+            nativeResumeCandidates = found
+        } catch {
+            nativeResumeCandidates = []
+        }
+    }
+
+    /// Continues this session by resuming `candidate` natively. Refused
+    /// without a request unless the host still advertises native resume for
+    /// this harness and the candidate belongs to it.
+    public func resumeNatively(_ candidate: NativeResumeCandidate) async -> ContinuedSession? {
+        let harness = harnessPresentation.harness
+        guard canResumeNatively, candidate.harness == harness else {
+            hint = HarnessCapabilityCopy.nativeResumeUnsupported
+            return nil
+        }
+        do {
+            let continued = try await client.continueSession(
+                sessionID: sessionID, targetHarness: harness, nativeResume: candidate)
+            hint = nil
+            return continued
+        } catch {
+            applyHint(for: error, action: "resume")
+            return nil
+        }
+    }
+
     /// Harnesses on this session's host that launch in structured mode, for
     /// the handoff target picker: the handoff seed becomes their first turn.
     /// PTY-only targets are excluded because the seed would be typed into a
@@ -1584,6 +1634,11 @@ public final class ChatModel {
         handoffHarnesses = (host?.launchableOffers ?? [])
             .filter { $0.launchMode == .structured }
             .map(\.name)
+        sessionHostID = session.hostID
+        sessionCwd = session.cwd
+        let own = host?.offer(named: session.harness)
+        canResumeNatively = own?.launchMode == .structured && own?.capabilities.nativeResume == true
+        if !canResumeNatively { nativeResumeCandidates = [] }
     }
 
     private static func nonEmpty(_ value: String?) -> String? {

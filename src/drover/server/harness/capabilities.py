@@ -163,6 +163,7 @@ def validate_capabilities(value: Any, host_id: str) -> dict[str, Any]:
 
     Unknown keys are dropped, never persisted or proxied. Legacy string rows
     are metadata only. Actual commands are private, including on old hosts.
+    A row's optional ``display_name`` is presentation metadata, never identity.
     """
     if value is None:
         return {}
@@ -198,6 +199,13 @@ def validate_capabilities(value: Any, host_id: str) -> dict[str, Any]:
             if type(enabled) is not bool:
                 raise InvalidCapabilities("harness enabled must be a boolean")
             public_row = {"name": name, "enabled": enabled}
+            if "display_name" in row:
+                # Additive (#422): the adapter's label, so clients need no
+                # harness-ID-to-name table. Absent on older hosts.
+                display_name = _text(row["display_name"], 256)
+                if not display_name.strip():
+                    raise InvalidCapabilities("invalid harness display name")
+                public_row["display_name"] = display_name
             if "description" in row:
                 public_row["description"] = _text(row["description"], 1024)
             if "command" in row:

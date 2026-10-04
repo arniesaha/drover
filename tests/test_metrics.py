@@ -2926,6 +2926,15 @@ def test_metrics_http_server_proxies_native_transcript(tmp_path):
     )
 
 
+def _v1_row(name: str, *modes: str, **flags: bool) -> dict:
+    """A host-published harness row; Continue routes only from these."""
+    return {
+        "name": name,
+        "enabled": True,
+        "capabilities": {"schema_version": 1, "launch_modes": list(modes), **flags},
+    }
+
+
 def test_metrics_http_server_continues_session_with_nexus_handoff(tmp_path):
     _FakeHarnessHandler.requests = []
     harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)
@@ -2945,8 +2954,8 @@ def test_metrics_http_server_continues_session_with_nexus_handoff(tmp_path):
         local_url=f"http://127.0.0.1:{harness_port}",
         capabilities={
             "harnesses": [
-                {"name": "claude-code", "enabled": True},
-                {"name": "codex", "enabled": True},
+                _v1_row("claude-code", "structured", native_resume=True),
+                _v1_row("codex", "structured", native_resume=True),
             ]
         },
     )
@@ -3038,8 +3047,8 @@ def test_metrics_http_server_continue_to_shell_target_keeps_pty_seed(tmp_path):
         local_url=f"http://127.0.0.1:{harness_port}",
         capabilities={
             "harnesses": [
-                {"name": "claude-code", "enabled": True},
-                {"name": "shell", "enabled": True},
+                _v1_row("claude-code", "structured", native_resume=True),
+                _v1_row("shell", "pty"),
             ]
         },
     )
@@ -3079,13 +3088,12 @@ def test_metrics_http_server_continue_to_shell_target_keeps_pty_seed(tmp_path):
         harness_server.server_close()
 
     assert payload["session_id"] == "harness-proxied"
-    assert "mode" not in payload
     launch = _FakeHarnessHandler.requests[0]["body"]
     assert launch["harness"] == "shell"
     assert launch["handoff_mode"] == "nexus_handoff"
-    # Shell has no structured driver: the handoff still goes through the PTY
+    # Shell advertises only `pty`: the handoff still goes through the PTY
     # typed-seed path.
-    assert "mode" not in launch
+    assert launch["mode"] == "pty"
     assert "prompt" not in launch
     assert launch["rows"] == 32
     assert launch["cols"] == 100
@@ -3109,7 +3117,9 @@ def test_metrics_http_server_continues_session_with_native_resume(tmp_path):
         display_name="Mac Mini",
         kind="macos",
         local_url=f"http://127.0.0.1:{harness_port}",
-        capabilities={"harnesses": [{"name": "claude-code", "enabled": True}]},
+        capabilities={
+            "harnesses": [_v1_row("claude-code", "structured", native_resume=True)]
+        },
     )
     source = registry.create_session(
         session_id="harness-source",
@@ -3159,9 +3169,9 @@ def test_metrics_http_server_continues_session_with_native_resume(tmp_path):
     assert launch["handoff_mode"] == "native_resume"
     assert launch["native_resume"]["session_id"] == "claude-native-1"
     assert "initial_input" not in launch
-    # Native resume stays on the PTY path: the harness CLI replays its own
-    # native session, so no structured first-turn prompt is involved.
-    assert "mode" not in launch
+    # Native resume is the structured adapter's resume operation: the CLI
+    # reopens its own native session, so no handoff prompt is involved.
+    assert launch["mode"] == "structured"
     assert "prompt" not in launch
     created = HarnessRegistry(duckdb_path).get_session("harness-proxied")
     assert created is not None

@@ -6,6 +6,7 @@ validated drive registry. Native wire parsing stays in each existing driver.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from drover.server.harness.adapters import (
@@ -152,6 +153,26 @@ class ClaudeCodeAdapter(_StructuredAdapter):
     ) -> None:
         driver.answer_permission(request_id, decision, note)
 
+    def native_sessions(self, *, home: Path, cwd: str | None) -> list[dict]:
+        # Deferred: the history readers live in daemon, which imports this.
+        from drover.server.harness.daemon import claude_native_sessions
+
+        return claude_native_sessions(home)
+
+    def native_transcript(
+        self,
+        *,
+        home: Path,
+        cwd: str | None,
+        native_session_id: str | None,
+        limit: int,
+    ) -> dict | None:
+        from drover.server.harness.daemon import claude_native_transcript
+
+        return claude_native_transcript(
+            home, cwd=cwd, native_session_id=native_session_id, limit=limit
+        )
+
     def auth_adapter(self, *, shell: str | None = None) -> object | None:
         if is_staging():
             try:
@@ -202,6 +223,25 @@ class CodexAdapter(_WorktreeAdapter, _StructuredAdapter):
         command = list(request.command) if request.command else self.default_command()
         return codex.CodexDriver(
             command, request.cwd, emit, native_session_id=request.native_session_id
+        )
+
+    def native_sessions(self, *, home: Path, cwd: str | None) -> list[dict]:
+        from drover.server.harness.daemon import codex_native_sessions
+
+        return codex_native_sessions(home)
+
+    def native_transcript(
+        self,
+        *,
+        home: Path,
+        cwd: str | None,
+        native_session_id: str | None,
+        limit: int,
+    ) -> dict | None:
+        from drover.server.harness.daemon import codex_native_transcript
+
+        return codex_native_transcript(
+            home, cwd=cwd, native_session_id=native_session_id, limit=limit
         )
 
     def auth_adapter(self, *, shell: str | None = None) -> object | None:

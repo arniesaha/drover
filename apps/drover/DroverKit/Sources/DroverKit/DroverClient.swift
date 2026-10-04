@@ -367,6 +367,20 @@ public actor DroverClient {
         return try decode(PathExistsResponse.self, from: data).exists
     }
 
+    /// Native sessions `harness` can resume on `hostID`, found by its adapter.
+    /// Callers ask only for harnesses that advertise `native_resume`.
+    public func nativeResumeCandidates(hostID: String, harness: String,
+                                       cwd: String? = nil,
+                                       limit: Int = 12) async throws -> [NativeResumeCandidate] {
+        let basePath = "/harness/hosts/\(encodePathComponent(hostID))/native-sessions"
+        let url = try queryURL(path: basePath, items: [
+            ("harness", harness), ("cwd", cwd), ("limit", "\(limit)"),
+        ])
+        let data = try await request(url: url, method: "GET", body: nil)
+        return try decode(NativeResumeCandidateList.self, from: data).sessions
+            .filter { $0.harness == harness }
+    }
+
     public func startAuthFlow(hostID: String, harness: String) async throws -> HarnessAuthFlow {
         let path = "/harness/hosts/\(encodePathComponent(hostID))/auth/\(encodePathComponent(harness))/start"
         let data = try await request(path: path, method: "POST", body: Data("{}".utf8))
@@ -528,10 +542,12 @@ public actor DroverClient {
     /// the source session's own. The returned `isStructured` tells the caller
     /// which screen to open (chat vs terminal).
     public func continueSession(sessionID: String, targetHostID: String? = nil,
-                                targetHarness: String? = nil) async throws -> ContinuedSession {
+                                targetHarness: String? = nil,
+                                nativeResume: NativeResumeCandidate? = nil) async throws -> ContinuedSession {
         var payload: [String: Any] = [:]
         if let targetHostID { payload["target_host_id"] = targetHostID }
         if let targetHarness { payload["target_harness"] = targetHarness }
+        if let nativeResume { payload["native_resume"] = nativeResume.wirePayload }
         let body = try JSONSerialization.data(withJSONObject: payload)
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/continue"
         let data = try await request(path: path, method: "POST", body: body)

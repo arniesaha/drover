@@ -24,6 +24,7 @@ from drover.server.harness.adapters import (
     HarnessAdapter,
     HarnessAdapterRegistry,
     LaunchRequest,
+    UnsupportedHarnessOperation,
 )
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
@@ -163,6 +164,9 @@ class StructuredSessionManager:
             adapter = self.adapters.resolve(harness, operation="structured")
         except (KeyError, ValueError):
             raise ValueError(f"harness has no structured driver: {harness}")
+        if native_session_id:
+            # Raises UnsupportedHarnessOperation before any driver exists.
+            self.adapters.resolve(harness, operation="native_resume")
         entry = _Entry(None, harness, adapter)
         entry.seq = registry.max_event_seq(session_id)
         # The process-local map prevents duplicate dispatches while a daemon is
@@ -439,6 +443,10 @@ class StructuredSessionManager:
             raise PermissionError("approval pending; answer it first")
         if self.is_draining():
             raise RuntimeError(_DRAINING_ERROR)
+        if images and not entry.adapter.capabilities.attachments:
+            raise UnsupportedHarnessOperation(
+                f"{entry.harness} does not support attachments"
+            )
         guard_persistent_turn = bool(
             getattr(entry.adapter, "persistent_turn_guard", False)
         )
@@ -452,7 +460,7 @@ class StructuredSessionManager:
         # flight" / "driver is closed") when a turn cannot be accepted, and
         # we must not record a user_input event for a turn that was never sent.
         try:
-            if images and entry.adapter.capabilities.attachments:
+            if images:
                 entry.adapter.send_attachments(
                     entry.driver,
                     text,

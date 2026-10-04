@@ -12,6 +12,13 @@ from time import sleep as time_sleep
 import pytest
 
 from drover.schema import bootstrap
+from drover.server.harness.adapters import (
+    AdapterHealth,
+    HarnessAdapter,
+    HarnessAdapterRegistry,
+    HarnessCapabilities,
+    LaunchRequest,
+)
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
@@ -22,6 +29,7 @@ from drover.server.harness.daemon import (
 from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 from drover.server.harness.websocket import (
     WebSocketClosed,
     client_handshake,
@@ -61,7 +69,32 @@ def _json_request(url: str, *, payload: dict | None = None):
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
-def _start_test_server(tmp_path, presets=None):
+class _PtyAdapter(HarnessAdapter):
+    """A terminal-only adapter: a preset needs one to be PTY-launchable."""
+
+    capabilities = HarnessCapabilities(launch_modes=frozenset({"pty"}))
+
+    def __init__(self, harness_id: str) -> None:
+        self.id = harness_id
+        self.display_name = harness_id
+
+    def default_command(self) -> list[str]:
+        return ["/bin/sh"]
+
+    def build_command(self, request: LaunchRequest) -> list[str]:
+        return list(request.command or self.default_command())
+
+    def send_turn(self, driver, text, turn_id, **kwargs) -> None:
+        raise AssertionError("PTY adapters take no structured turns")
+
+    def close(self, driver) -> None:
+        pass
+
+    def health(self) -> AdapterHealth:
+        return AdapterHealth(available=True)
+
+
+def _start_test_server(tmp_path, presets=None, pty_adapters=()):
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
@@ -74,6 +107,12 @@ def _start_test_server(tmp_path, presets=None):
         pty=PtySessionManager(),
         presets=presets or DEFAULT_PRESETS,
         local_url="http://127.0.0.1:0",
+        adapters=HarnessAdapterRegistry(
+            [
+                *(BUILTIN_ADAPTERS.resolve(name) for name in BUILTIN_ADAPTERS.ids()),
+                *(_PtyAdapter(name) for name in pty_adapters),
+            ]
+        ),
     )
     register_daemon_host(state)
     server = create_harness_server(listen_host="127.0.0.1", listen_port=0, state=state)
@@ -656,7 +695,9 @@ def test_handoff_seed_waits_for_startup_gate_to_be_answered(tmp_path, gate_promp
         startup_gate_markers=DEFAULT_PRESETS["claude-code"].startup_gate_markers,
         startup_gate_answer="1\n",
     )
-    server, state, base_url = _start_test_server(tmp_path, presets=presets)
+    server, state, base_url = _start_test_server(
+        tmp_path, presets=presets, pty_adapters=("gated",)
+    )
     try:
         _, created = _json_request(
             f"{base_url}/sessions",

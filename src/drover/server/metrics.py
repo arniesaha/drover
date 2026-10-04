@@ -45,7 +45,6 @@ from drover.server.harness.schema import (
     audit_legacy_harness_event_sequences,
     migrate_legacy_harness_event_sequences,
 )
-from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 from drover.server.jobs import RedisJobStream
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -128,15 +127,6 @@ FS_COMPLETE_TIMEOUT_S = 3.0
 _MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 
-# A nexus handoff to a registered structured adapter launches mode="structured" and
-# delivers the handoff text as the first turn -- strictly more reliable than
-# typing it into a cold PTY (no startup-gate race).
-_STRUCTURED_HANDOFF_HARNESSES = frozenset(BUILTIN_ADAPTERS.ids())
-_RECOVERABLE_STRUCTURED_HARNESSES = frozenset(
-    harness_id
-    for harness_id in BUILTIN_ADAPTERS.ids()
-    if BUILTIN_ADAPTERS.resolve(harness_id).recover_after_restart
-)
 _RECOVERY_UNAVAILABLE = (
     "Session cannot be resumed after the harness restart. "
     "Continue it in a new session."
@@ -1895,10 +1885,9 @@ class MetricsCollector:
             and _error_text(body) == f"unknown structured session: {session_id}"
         ):
             native_session_id = self._native_session_id_for_recovery(session_id)
-            if (
-                session.harness not in _RECOVERABLE_STRUCTURED_HARNESSES
-                or native_session_id is None
-            ):
+            # Whether the harness can recover is the host adapter's decision
+            # (native_resume + recover_after_restart); it answers 409 if not.
+            if native_session_id is None:
                 return _json_response(409, {"error": _RECOVERY_UNAVAILABLE})
             recovery_status, _recovery_body = self._harness_request(
                 host,
@@ -2265,9 +2254,9 @@ class MetricsCollector:
         target_harness = str(payload.get("target_harness") or source.harness)
         native_resume = payload.get("native_resume")
         handoff_mode = "native_resume" if native_resume else "nexus_handoff"
-        # Current hosts choose their handoff mode from the same envelope as
-        # clients. Keep the old routing only for matrix-less hosts during the
-        # mixed-version window; unknown adapter IDs must not become PTY seeds.
+        # The target host's advertised matrix is the only routing input: no
+        # hub-side adapter list, and no name-based guess for a matrix-less
+        # (pre-#418) host, which is metadata only and cannot be continued onto.
         target_host = self._harness_host(target_host_id)
         target_row = next(
             (
@@ -2279,26 +2268,39 @@ class MetricsCollector:
             ),
             None,
         )
-        structured_target = target_harness in _STRUCTURED_HANDOFF_HARNESSES
-        if target_row is not None and "capabilities" in target_row:
-            matrix = target_row["capabilities"]
-            modes = matrix.get("launch_modes", []) if isinstance(matrix, dict) else []
-            if (
-                not isinstance(matrix, dict)
-                or matrix.get("schema_version") != 1
-                or target_row.get("enabled") is not True
-                or not modes
-            ):
-                return _json_response(
-                    400, {"error": "target harness is not launchable"}
-                )
-            structured_target = "structured" in modes
-        if not native_resume and structured_target:
-            # Nexus handoff to a structured-capable harness: launch a
-            # structured session and deliver the handoff text as the first
-            # turn ("prompt"). The daemon sends it once the driver is up, so
-            # there is no typed-seed race against the CLI's cold start (and
-            # no rows/cols/initial_input -- those are PTY concepts).
+        if target_row is None or "capabilities" not in target_row:
+            return _json_response(
+                400,
+                {
+                    "error": "target host does not advertise capabilities for this "
+                    "harness; upgrade Drover on that host to continue onto it"
+                },
+            )
+        matrix = target_row["capabilities"]
+        modes = matrix.get("launch_modes", []) if isinstance(matrix, dict) else []
+        if (
+            not isinstance(matrix, dict)
+            or matrix.get("schema_version") != 1
+            or target_row.get("enabled") is not True
+            or not modes
+        ):
+            return _json_response(400, {"error": "target harness is not launchable"})
+        if native_resume and matrix.get("native_resume") is not True:
+            return _json_response(
+                400, {"error": "target harness does not support native resume"}
+            )
+        handoff_prompt = (
+            None
+            if native_resume and target_harness == source.harness
+            else self._build_handoff_prompt(source, target_harness=target_harness)
+        )
+        if "structured" in modes:
+            # Structured wins when both modes are advertised, as in the clients.
+            # A handoff seed becomes the first turn ("prompt"), delivered once
+            # the driver is up, so there is no typed-seed race against the
+            # CLI's cold start (and no rows/cols/initial_input -- those are PTY
+            # concepts). Native resume reopens the provider session through
+            # the adapter's own resume operation.
             structured_payload: dict[str, Any] = {
                 "mode": "structured",
                 "harness": target_harness,
@@ -2307,14 +2309,17 @@ class MetricsCollector:
                 "repo_name": source.repo_name,
                 "branch": source.branch,
                 "source_session_id": source.session_id,
-                "handoff_mode": "nexus_handoff",
-                "prompt": self._build_handoff_prompt(
-                    source,
-                    target_harness=target_harness,
+                "handoff_mode": (
+                    "nexus_handoff" if handoff_prompt is not None else handoff_mode
                 ),
             }
+            if native_resume:
+                structured_payload["native_resume"] = native_resume
+            if handoff_prompt is not None:
+                structured_payload["prompt"] = handoff_prompt
             return self.proxy_create_harness_session(target_host_id, structured_payload)
         launch_payload: dict[str, Any] = {
+            "mode": "pty",
             "harness": target_harness,
             "cwd": source.cwd,
             "repo_owner": source.repo_owner,
@@ -2326,11 +2331,8 @@ class MetricsCollector:
             "rows": payload.get("rows") or 32,
             "cols": payload.get("cols") or 100,
         }
-        if not native_resume or target_harness != source.harness:
-            launch_payload["initial_input"] = self._build_handoff_prompt(
-                source,
-                target_harness=target_harness,
-            )
+        if handoff_prompt is not None:
+            launch_payload["initial_input"] = handoff_prompt
             launch_payload["handoff_mode"] = "nexus_handoff"
         return self.proxy_create_harness_session(target_host_id, launch_payload)
 

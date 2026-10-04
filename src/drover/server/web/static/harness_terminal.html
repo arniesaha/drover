@@ -909,7 +909,7 @@
       const host = hosts.find((item) => item.host_id === $("continue-host").value) || hosts[0];
       const targets = DroverCapabilities.launchTargets(host);
       $("continue-harness").innerHTML = targets.map((item) => (
-        `<option value="${esc(item.name)}">${esc(item.name)}</option>`
+        `<option value="${esc(item.name)}">${esc(item.displayName || item.name)}</option>`
       )).join("");
       if (sessionData?.session?.harness && targets.some((item) => item.name === sessionData.session.harness)) {
         $("continue-harness").value = sessionData.session.harness;
@@ -935,15 +935,14 @@
       $("continue-native").innerHTML = '<option value="">Drover handoff only</option>';
       if (!hostId || !harness) return;
       const target = continueTarget();
-      $("continue-native").disabled = !target.nativeResume;
-      if (!target.nativeResume) {
-        $("continue-status").textContent = `${harness} does not advertise native resume; Drover handoff will be used.`;
+      const lookup = DroverCapabilities.nativeResumeQuery(target, {cwd: sessionData?.session?.cwd || ""});
+      $("continue-native").disabled = !lookup;
+      if (!lookup) {
+        $("continue-status").textContent = `${target.displayName || harness} does not advertise native resume; Drover handoff will be used.`;
         return;
       }
       $("continue-status").textContent = "Loading native resume candidates...";
-      const cwd = sessionData?.session?.cwd || "";
-      const query = new URLSearchParams({harness, limit: "12"});
-      if (cwd) query.set("cwd", cwd);
+      const query = new URLSearchParams(lookup);
       try {
         const res = await fetch(`/harness/hosts/${encodeURIComponent(hostId)}/native-sessions?${query}`, {cache: "no-store"});
         const payload = await res.json();
@@ -967,9 +966,8 @@
 
     function selectedNativeResume() {
       const value = $("continue-native").value;
-      if (value === "" || !continueTarget().nativeResume) return null;
-      const candidate = nativeCandidates[Number(value)];
-      return candidate?.native_resume || null;
+      if (value === "") return null;
+      return DroverCapabilities.nativeResumeBody(continueTarget(), nativeCandidates[Number(value)]);
     }
 
     async function load() {

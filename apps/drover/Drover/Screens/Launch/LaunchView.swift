@@ -63,7 +63,7 @@ struct LaunchView: View {
                 } else {
                     Picker("Harness", selection: $model.harness) {
                         ForEach(model.availableHarnesses, id: \.self) { name in
-                            Text(name).tag(name)
+                            Text(model.harnessLabel(name)).tag(name)
                         }
                     }
                     .accessibilityIdentifier("launch-harness-picker")
@@ -72,7 +72,7 @@ struct LaunchView: View {
                 // Rows the host lists but this app can't launch, each with
                 // its reason, so a missing harness is never a mystery.
                 ForEach(model.unavailableHarnesses, id: \.name) { row in
-                    LabeledContent(row.name) {
+                    LabeledContent(model.harnessLabel(row.name)) {
                         Text("Unavailable")
                     }
                     .foregroundStyle(.secondary)
@@ -85,7 +85,7 @@ struct LaunchView: View {
                     Button {
                         showAuth = true
                     } label: {
-                        Label("Sign in to \(model.harness)", systemImage: "person.badge.key")
+                        Label("Sign in to \(model.harnessLabel(model.harness))", systemImage: "person.badge.key")
                     }
                     .disabled(model.hostID.isEmpty)
                 }

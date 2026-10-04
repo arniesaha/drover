@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from drover.server.harness.structured.driver import EmitFn
@@ -149,6 +150,31 @@ class HarnessAdapter(ABC):
     def auth_adapter(self, *, shell: str | None = None) -> object | None:
         raise UnsupportedHarnessOperation("interactive auth is unsupported")
 
+    # Optional provider-local extensions. Native session discovery and
+    # transcripts read each CLI's own on-disk history, so they live with the
+    # adapter instead of in a central harness-ID table. Neither is a
+    # capability: an adapter that resumes but cannot discover simply offers
+    # no candidates, and the resume operation itself is unaffected.
+
+    def native_sessions(self, *, home: Path, cwd: str | None) -> list[dict]:
+        """Resume candidates found outside Drover. Requires native_resume.
+
+        Each item needs a ``session_id`` and a ``native_resume`` object; the
+        daemon owns filtering, ordering, bounds and the ``harness`` field.
+        """
+        return []
+
+    def native_transcript(
+        self,
+        *,
+        home: Path,
+        cwd: str | None,
+        native_session_id: str | None,
+        limit: int,
+    ) -> dict | None:
+        """Provider-native transcript for a session, or None if unsupported."""
+        return None
+
 
 _OPTIONAL_METHODS = {
     "approvals": "answer_permission",
@@ -219,6 +245,13 @@ class HarnessAdapterRegistry:
                 raise InvalidHarnessAdapter(
                     f"{harness_id}: {method} implementation contradicts {name} capability"
                 )
+        discovers = getattr(type(adapter), "native_sessions", None) is not getattr(
+            HarnessAdapter, "native_sessions"
+        )
+        if discovers and not capabilities.native_resume:
+            raise InvalidHarnessAdapter(
+                f"{harness_id}: native_sessions requires native_resume"
+            )
         for mode, method in _LAUNCH_METHODS.items():
             hook = getattr(type(adapter), method, None)
             if not callable(hook):

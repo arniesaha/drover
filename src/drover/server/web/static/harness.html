@@ -311,7 +311,7 @@
     }
 
     function targetLabel(target) {
-      return `${target.name} · ${MODE_LABEL[target.mode] || target.mode}`;
+      return `${target.displayName || target.name} · ${MODE_LABEL[target.mode] || target.mode}`;
     }
 
     function buildWorkspaces() {
@@ -561,7 +561,7 @@ ${s.path}`;
           </div>
           <div class="row" style="margin-top:12px">
             ${ready.map((item) => `<span class="pill">${esc(targetLabel(item))}</span>`).join("")}
-            ${unavailable.map((item) => `<span class="pill disabled" title="${esc(item.reason)}">${esc(item.name)}</span>`).join("")}
+            ${unavailable.map((item) => `<span class="pill disabled" title="${esc(item.reason)}">${esc(item.displayName || item.name)}</span>`).join("")}
           </div>
           ${summary.partlyLegacy ? `<div class="reason">Upgrade Drover on this host to launch from the web. Its existing sessions stay listed.</div>` : ""}
           ${summary.unsupported ? `<div class="reason">This host advertises a capability schema newer than v${DroverCapabilities.SCHEMA_VERSION}; upgrade the Drover hub to use it.</div>` : ""}
