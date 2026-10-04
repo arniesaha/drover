@@ -1,10 +1,22 @@
 # DuckLake cutover and rollback
 
-**Status: runbook drafted; production execution is blocked.** The current branch
-contains pinned runtime/process primitives and offline rebuild/verify tooling.
-Serving routing/exporter lifecycle activation, maintenance,
-backup/restore and config epochs must be implemented and proven before these
-steps can be executed. Production cutover requires separate operator approval.
+**Status: restart-selected routing is implemented; production execution still
+requires separate operator approval.** `analytics.backend = "legacy"` remains
+the default. `analytics.backend = "ducklake"` selects verified DuckLake reads
+and its exporter at process startup. Invalid DuckLake configuration fails startup
+without falling back. Roll back by restoring `legacy` and restarting; do not
+modify legacy files.
+
+## Restart cutover checklist
+
+1. Stop the hub and all workers.
+2. Create and retain a tar backup of the legacy root.
+3. Rebuild a new DuckLake data root and fresh catalog from that tar, including exporter provisioning.
+4. Verify rebuild counts, hashes, and serving proof.
+5. Set `analytics.backend = "ducklake"` and its catalog DSN environment reference.
+6. Start the hub and workers.
+7. Check `/healthz`, summaries, recall, and the event count against verification.
+8. To roll back, set `analytics.backend = "legacy"` and restart.
 
 This is a rebuild, with an analytical outage allowed, for one operator. No shadow
 exporter or zero-downtime mechanism is required. Keep durable PostgreSQL ingress
@@ -80,43 +92,10 @@ Before scheduling the separately approved cutover, require all of the following:
 - Explicit accounting for cutover-deferred incoming files, duplicate parse
   variants, and unarchived payloads. Export acknowledgement is not archive coverage.
 
-## Fence → watermark → epoch → one exporter
+## Deferred safeguards
 
-1. Disable retention/pruning. Fence exporters, derived workers and maintenance.
-   Drain in-flight lake reads/transactions and PG job leases. Acquire the catalog
-   mutation fence and exclusive reader/lifecycle fence. Never fence by merely
-   closing a pooled connection.
-2. Freeze input and take the final committed export watermark **H**, preserving
-   source offsets, batch membership, immutable lake receipt/hash coverage and
-   configuration epoch together. Verify that all events accepted through H are
-   accounted for. Events accepted after H stay in the durable PG outbox.
-3. Rebuild the new catalog/data root; verify counts, hashes, winners/losers and
-   null lineage against the final frozen source. Rebuild derived PG memory from
-   canonical events; keep the authoritative control state. Capture the paired
-   immutable backup generation and verify it independently before publishing
-   the final receipt.
-4. Atomically select `analytics.backend = "ducklake"` and advance the read/state
-   configuration epoch, identifying the new catalog/root and watermark H.
-   This configuration flip is **not implemented at this checkpoint**. Do not
-   use it on the current branch or assume an unknown option changes serving.
-5. Release the lifecycle fence and resume **one** authoritative exporter/worker
-   set. Confirm exclusive exporter ownership, receipt-first recovery and
-   acknowledgement only after lake commit. Drain post-H ingress. Verify fleet
-   and liveness from PG, summary freshness, and capped recall identity/watermark.
-6. Keep the old immutable data/catalog and legacy read implementation for at
-   least seven days and two verified backups. Leave payload pruning disabled
-   until archive coverage, deferred-file accounting and operator sign-off pass.
-
-## Rollback
-
-Fence and drain the new exporter/workers/readers before changing epochs. Preserve
-the new catalog/files, receipts and derived-state deltas as failure evidence.
-Switch the read epoch back to the retained legacy implementation. Replay durable
-post-H ingress into the legacy path and verify counts/hashes before resuming
-workers. Preserve PG control state and accepted events; regenerate derived memory
-from canonical events or apply its versioned deltas. Swapping in an old mutable
-DuckDB file cannot recover PG jobs/summaries accepted after H.
-
-Verify both events accepted during the fence and events accepted after the first
-resume in the rollback rehearsal. Do not resume retention until two verified
-paired generations and complete per-event archive coverage are established.
+Persisted configuration epochs, CAS publication, live handover, replay protocol,
+and zero-downtime rollback are explicitly out of scope for this restart-only
+mechanism and are tracked in #509. Do not infer any of them from the startup
+switch. Retain the old catalog/data and the legacy implementation until the
+separate operational gates and rollback rehearsal are approved.

@@ -161,6 +161,28 @@ def verified_lake(lake_spec, postgres_control_store, tmp_path):
     return spec, path, config
 
 
+def test_tar_rebuild_restart_selection_reads_and_starts_exporter(verified_lake):
+    """The rebuilt tar fixture is sufficient for a restart-selected lake hub."""
+    import threading
+
+    from drover.server.lake.exporter import provision_exporter
+    from drover.server.lake.lifecycle import selected_exporter
+    from drover.server.lake.serving import check_selected
+
+    spec, path, config = verified_lake
+    provision_exporter(spec)
+    configure_analytics(path, config)
+    check_selected(path)
+    exporter = selected_exporter(
+        replace(default_config(), duckdb_path=path, analytics=config)
+    )
+    try:
+        exporter.start(shutdown_event=threading.Event())
+        assert exporter.health()["enabled"]
+    finally:
+        exporter.stop()
+
+
 def test_canonical_read_parity_and_no_legacy_open(verified_lake, monkeypatch):
     from memory_helpers import put_summary
 
@@ -252,7 +274,7 @@ def test_catalog_change_and_proof_tamper_fail_closed(verified_lake):
             con.execute("SELECT 1")
 
 
-def test_export_lifecycle_disabled_by_default_and_fails_closed(
+def test_export_lifecycle_selected_by_ducklake_and_fails_closed(
     verified_lake, monkeypatch
 ):
     import threading
@@ -263,7 +285,7 @@ def test_export_lifecycle_disabled_by_default_and_fails_closed(
 
     spec, path, config = verified_lake
     cfg = replace(default_config(), duckdb_path=path, analytics=config)
-    assert selected_exporter(cfg) is None
+    assert selected_exporter(cfg).__class__.__name__ == "ExporterLifecycle"
     provision_exporter(spec)
     # Provisioning changes the snapshot; requires an explicit new verification.
     monkeypatch.setenv("DROVER_TEST_EXPORT_DSN", spec.dsn())
