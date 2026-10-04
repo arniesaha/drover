@@ -1,9 +1,41 @@
 # Backup design
 
-**Implementation: Phase 4 (#481), planned and not implemented.** This design
+**Implementation: isolated rehearsal tooling is available; production execution remains blocked.** This design
 belongs to the memory-integrity program (#476). Pond has been removed from
 Drover in Phase 1 (#478); its former backup and restore commands are unavailable.
 DuckLake replaces it in Phase 4.
+
+## Isolated backup rehearsal
+
+`lake backup` accepts only a copied data root carrying a literal
+`.drover-isolated-staging-copy` marker containing `DROVER_ISOLATED_STAGING_COPY`.
+It never reads hub configuration or a catalog DSN. Supply a separately-created,
+non-empty catalog snapshot (for example an operator-produced `pg_dump` from the
+isolated catalog) and a fresh backup root. The command verifies parquet row
+counts against `verification/report.json`, hashes every copied artifact, and only
+then writes the immutable receipt. A generation ID can never be reused.
+
+```sh
+# Every path below is a newly created rehearsal path, never a live root.
+drover-server lake backup \
+  --staging-root /tmp/studio-data-copy \
+  --catalog-snapshot /tmp/studio-catalog-copy.dump \
+  --backup-root /tmp/lake-backups \
+  --generation-id rehearsal-20261003
+
+drover-server lake restore \
+  --generation /tmp/lake-backups/rehearsal-20261003 \
+  --data-root /tmp/restored-lake \
+  --catalog-destination /tmp/restored-catalog.dump
+```
+
+Restore validates the receipt-chain entry, exact artifact membership, sizes and
+SHA-256 values before writing. It requires both data-root and catalog-destination
+to be new, separate paths and recounts parquet rows after restoration. Missing
+markers, reports, snapshots, tampered artifacts, existing destinations and row
+count mismatches fail closed. This tool is a copy-only restore drill; importing
+the restored catalog snapshot into an isolated database is an operator step and
+is not a cutover mechanism.
 
 ## Backup boundary
 
