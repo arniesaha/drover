@@ -116,3 +116,13 @@ canary/authorization steps and exact current-source citations are in
 `agent:coder:subagent:1998228b-5eb6-4b11-87a5-339a54576178`.
 External orchestrator artifacts are untouched; commit-only, no second worker,
 push/PR/merge/deploy or shell/RPC messaging.
+
+## 2026-10-04 — v0.5.3 release evidence
+
+| Area | Verified evidence |
+| --- | --- |
+| Release scope | `v0.5.3` targets merge commit `c48b574aa13e30a3fac71f944b9ffd4179845515` (PR #511), based on `origin/main`; it includes `cf70cdd` (#510) and `48654bf` (#507). |
+| CI / candidate | PR #511 checks passed: iOS 9s; pgvector 31s; PostgreSQL 1m33s; build-and-test 7m47s. Local release metadata tests: 34 passed; release-readiness gate passed; wheel build produced `drover-0.5.3-py3-none-any.whl`. |
+| Publication | GitHub Release `v0.5.3`: https://github.com/arniesaha/drover/releases/tag/v0.5.3. Release workflow https://github.com/arniesaha/drover/actions/runs/37212492076 passed: artifact publication plus clean-machine `install.sh` verification. |
+| Artifacts | Published wheel, `requirements.lock.txt`, and `SHA256SUMS.txt`; downloaded manifest verification passed for both wheel and lockfile. |
+| Boundary | No Studio or production configuration/service/deployment was accessed or changed. |
