@@ -667,7 +667,7 @@ def test_summarize_session_paginates_canonical_events(verified_lake):
         # Insert 1005 tool_call events for session 's'
         # The limit is 1000 so this should trigger analytics_row_limit_exceeded if not paginated.
         con.execute("""INSERT INTO lake.agent_events BY NAME
-               SELECT 'many-' || i AS id, 's' AS session_id, 'test' AS agent_id, 
+               SELECT 'many-' || i AS id, 's' AS session_id, 'test' AS agent_id,
                       '2026-10-01'::DATE AS date,
                       '2026-10-01 12:00:00Z'::TIMESTAMPTZ + (i * INTERVAL '1 millisecond') AS timestamp,
                       'tool_call' AS event_type, 'assistant' AS role, NULL AS content,
