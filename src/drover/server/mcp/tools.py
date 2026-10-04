@@ -1271,6 +1271,7 @@ def drover_fleet_status(
     """Return live harness sessions from authoritative control-plane state."""
     return _control_active_sessions(duckdb_path)
 
+
 def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> dict:
     from dataclasses import asdict
 

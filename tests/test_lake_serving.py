@@ -361,12 +361,19 @@ def test_query_failure_is_explicit_unavailable_without_legacy_retry(
         (tools.drover_search, dict(query="remember")),
         (tools.drover_recall, dict(query="remember")),
     ]:
-        assert function(duckdb_path=path, **kwargs) == {
+        result = function(duckdb_path=path, **kwargs)
+        assert {
+            key: result[key]
+            for key in ("status", "analytics_backend", "analytics_epoch", "reason")
+        } == {
             "status": "unavailable",
             "analytics_backend": "ducklake",
             "analytics_epoch": "test-epoch",
             "reason": "analytics_deadline_exceeded",
         }
+        assert result["store"] == "hub"
+        assert result["data_watermark"] == {"timestamp": None, "basis": "unknown"}
+        assert result["truncated"] is False
 
 
 def test_verify_refuses_extra_unaccounted_partition(verified_lake):
