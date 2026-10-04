@@ -126,6 +126,13 @@ def selection_changed(path, config):
     A durable invalidation prevents even another process with the old config
     from reusing activation. No selection change clears the retirement latch.
     """
+    # Default/legacy selection has no retirement state to invalidate. In
+    # particular, an API role must be able to register its control-store path
+    # when the colocated analytical path is deliberately absent or protected.
+    # Activation creates the latch itself; once present, every later selection
+    # change is still durably invalidated below.
+    if not _fence_path(path).exists():
+        return
     with _durable_gate(path) as handle:
         state = _read(handle)
         if state is not None and state["token"] != _token(config):

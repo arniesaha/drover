@@ -140,6 +140,15 @@ def test_exec_legacy_default_bootstrap_really_writes(tmp_path):
     assert list((tmp_path / "legacy-parquet").rglob("*.parquet"))
 
 
+def test_default_selection_does_not_create_a_retirement_sidecar(tmp_path):
+    from drover.config import AnalyticsConfig
+    from drover.server.lake.serving import configure_analytics
+
+    path = tmp_path / "protected" / "analytics.duckdb"
+    configure_analytics(path, AnalyticsConfig())
+    assert not path.parent.exists()
+
+
 def test_retirement_drains_real_decorated_process_then_blocks_other_writers(
     verified_lake,
 ):

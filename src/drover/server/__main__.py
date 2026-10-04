@@ -2355,10 +2355,6 @@ def _run_api_role(
     metrics_host: str,
 ) -> None:
     """Run the public/control role without opening any analytical resource."""
-
-    from drover.server.process_memory import configure_memory_guard
-
-    configure_memory_guard(cfg.memory)
     bootstrap_control_plane_store(cfg.duckdb_path)
     require_control_store_ready(cfg.duckdb_path)
     consent = CentralContentConsent(cfg.duckdb_path, legacy_config_path=config_path)
