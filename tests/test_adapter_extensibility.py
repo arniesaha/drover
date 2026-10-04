@@ -15,6 +15,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,11 @@ from harness_fixture_adapter import (
 )
 
 from drover.schema import bootstrap
-from drover.server.harness.adapters import HarnessAdapterRegistry
+from drover.server.harness.adapters import (
+    HarnessAdapter,
+    HarnessAdapterRegistry,
+    InvalidHarnessAdapter,
+)
 from drover.server.harness.auth import AuthFlowManager
 from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
@@ -337,6 +342,83 @@ def test_pty_launch_needs_an_advertised_pty_mode(fleet, tmp_path):
     )
     assert status == 400
     assert refused["error"] == "shell does not support native_resume"
+
+
+def test_native_resume_candidates_come_from_the_adapter_extension(fleet):
+    _state, adapter, hub_url = fleet
+    status, listing = _request(
+        f"{hub_url}/harness/hosts/studio/native-sessions?harness={FIXTURE_ID}"
+    )
+    assert status == 200
+    assert listing["sessions"] == [
+        {
+            "session_id": "lab-native-7",
+            "label": "Lab work · lab-nati",
+            "cwd": None,
+            "native_resume": {"session_id": "lab-native-7", "label": "Lab work"},
+            "harness": FIXTURE_ID,
+        }
+    ]
+    # Shell does not advertise native_resume, so nothing is discovered for it.
+    status, listing = _request(
+        f"{hub_url}/harness/hosts/studio/native-sessions?harness=shell"
+    )
+    assert (status, listing["sessions"]) == (200, [])
+    # Malformed adapter output is dropped rather than published.
+    adapter.native_candidates.append({"session_id": "no-resume-object"})
+    status, listing = _request(
+        f"{hub_url}/harness/hosts/studio/native-sessions?harness={FIXTURE_ID}"
+    )
+    assert [item["session_id"] for item in listing["sessions"]] == ["lab-native-7"]
+
+
+class NoResumeLab(FixtureLabAdapter):
+    """The same fixture without native_resume (and so without discovery)."""
+
+    capabilities = replace(FixtureLabAdapter.capabilities, native_resume=False)
+    resume = HarnessAdapter.resume
+    native_sessions = HarnessAdapter.native_sessions
+
+
+def test_unadvertised_native_resume_refuses_before_the_driver(tmp_path):
+    adapter = NoResumeLab()
+    state = _state(tmp_path, adapter)
+    row = next(r for r in state.capabilities()["harnesses"] if r["name"] == FIXTURE_ID)
+    assert row["capabilities"]["native_resume"] is False
+    host = create_harness_server(listen_host="127.0.0.1", listen_port=0, state=state)
+    threading.Thread(target=host.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % host.server_address[1]
+    try:
+        for mode in ("structured", "pty"):
+            status, refused = _request(
+                f"{base}/sessions",
+                {
+                    "harness": FIXTURE_ID,
+                    "mode": mode,
+                    "cwd": str(tmp_path),
+                    "native_resume": {"session_id": "lab-native-7"},
+                },
+            )
+            assert status == 400, mode
+            assert refused["error"] == f"{FIXTURE_ID} does not support native_resume"
+        status, listing = _request(f"{base}/native-sessions?harness={FIXTURE_ID}")
+        assert (status, listing["sessions"]) == (200, [])
+        assert adapter.executions == []
+        assert state.registry.list_sessions() == []
+        assert state.pty.list_sessions() == []
+    finally:
+        state.pty.close_all()
+        host.shutdown()
+        host.server_close()
+
+
+def test_discovery_extension_requires_the_native_resume_capability():
+    class DiscoversWithoutResume(NoResumeLab):
+        def native_sessions(self, *, home, cwd):
+            return []
+
+    with pytest.raises(InvalidHarnessAdapter, match="native_sessions"):
+        HarnessAdapterRegistry([DiscoversWithoutResume()])
 
 
 def test_continue_uses_the_target_matrix_for_handoff_and_native_resume(fleet, tmp_path):

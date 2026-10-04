@@ -167,6 +167,26 @@ const DroverCapabilities = (() => {
     return body;
   }
 
+  // Native resume (#422): candidates are looked up only for a target that
+  // advertises native_resume, and a candidate is sent only if it belongs to
+  // that target and names a native session. Discovery itself is the host
+  // adapter's business; nothing here knows which harnesses can discover.
+  function nativeResumeQuery(controls, {cwd, limit = 12} = {}) {
+    if (!controls?.nativeResume) return null;
+    const query = {harness: controls.name, limit: String(limit)};
+    if (cwd) query.cwd = cwd;
+    return query;
+  }
+
+  function nativeResumeBody(controls, candidate) {
+    if (!controls?.nativeResume || !isObject(candidate)) return null;
+    if (candidate.harness !== undefined && candidate.harness !== controls.name) return null;
+    const native = candidate.native_resume;
+    return isObject(native) && typeof native.session_id === "string" && native.session_id
+      ? native
+      : null;
+  }
+
   function acceptsAttachment(controls, mime) {
     const type = String(mime || "").toLowerCase();
     return (controls?.attachments || []).some((allowed) =>
@@ -243,6 +263,8 @@ const DroverCapabilities = (() => {
     preferredLaunchTarget,
     requireLaunch,
     launchBody,
+    nativeResumeQuery,
+    nativeResumeBody,
     acceptsAttachment,
     sessionControls,
     requireSessionAction,

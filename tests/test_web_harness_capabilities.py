@@ -214,6 +214,47 @@ def test_synthetic_adapter_renders_from_its_published_row():
 
 
 @needs_node
+def test_native_resume_lookup_and_body_follow_the_advertised_capability():
+    """drover#422: native resume for any harness that advertises it, and only
+    for those -- including the synthetic adapter and legacy-shaped hosts."""
+    lab = "C.harnessControls(host('lab-host'), 'synthetic-lab')"
+    candidate = json.dumps(
+        {
+            "session_id": "lab-native-7",
+            "harness": "synthetic-lab",
+            "native_resume": {"session_id": "lab-native-7", "label": "Lab work"},
+        }
+    )
+    foreign = json.dumps({"harness": "other", "native_resume": {"session_id": "x"}})
+    out = _js(
+        {
+            "lab_query": f"C.nativeResumeQuery({lab}, {{cwd: '/repo'}})",
+            "lab_body": f"C.nativeResumeBody({lab}, {candidate})",
+            "foreign_body": f"C.nativeResumeBody({lab}, {foreign})",
+            "empty_body": f"C.nativeResumeBody({lab}, {{native_resume: {{}}}})",
+            "provider_query": "C.nativeResumeQuery(C.harnessControls(host('mac-mini'), 'codex'))",
+            "shell_query": "C.nativeResumeQuery(C.harnessControls(host('mac-mini'), 'shell'))",
+            "echo_body": "C.nativeResumeBody(C.harnessControls(host('fixture-box'), "
+            f"'fixture-echo'), {candidate})",
+            "legacy_query": "C.nativeResumeQuery(C.harnessControls(host('old-nas'), 'claude-code'))",
+        }
+    )
+    assert out["lab_query"] == {
+        "harness": "synthetic-lab",
+        "limit": "12",
+        "cwd": "/repo",
+    }
+    assert out["lab_body"] == {"session_id": "lab-native-7", "label": "Lab work"}
+    assert out["foreign_body"] is None
+    assert out["empty_body"] is None
+    assert out["provider_query"] == {"harness": "codex", "limit": "12"}
+    # Not advertised: no lookup, and a stale candidate is never sent.
+    assert out["shell_query"] is None
+    assert out["echo_body"] is None
+    assert out["legacy_query"] is None
+
+
+@needs_node
 def test_disabled_modeless_future_and_malformed_rows_offer_nothing():
     names = (
         "fixture-off",
@@ -459,7 +500,8 @@ def test_pages_route_every_action_through_a_capability_guard():
         "DroverCapabilities.requireLaunch(hostById(targetHost), targetHarness)"
         in session
     )
-    assert "!continueTarget().nativeResume" in session
+    assert "DroverCapabilities.nativeResumeQuery(target," in session
+    assert "DroverCapabilities.nativeResumeBody(continueTarget()," in session
 
 
 @needs_node

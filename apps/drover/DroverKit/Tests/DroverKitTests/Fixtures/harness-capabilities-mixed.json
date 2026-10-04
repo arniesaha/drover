@@ -270,7 +270,8 @@
     {"session_id": "s-claude", "host_id": "studio", "harness": "claude-code", "mode": "structured", "status": "working"},
     {"session_id": "s-codex", "host_id": "studio", "harness": "codex", "mode": "structured", "status": "working"},
     {"session_id": "s-lab", "host_id": "studio", "harness": "fixture-lab", "mode": "structured", "status": "working"},
-    {"session_id": "s-legacy", "host_id": "old-mini", "harness": "codex", "mode": "structured", "status": "working"},
+    {"session_id": "s-synth", "host_id": "lab-host", "harness": "synthetic-lab", "mode": "structured", "status": "working", "cwd": "/repo"},
+    {"session_id": "s-legacy","host_id": "old-mini", "harness": "codex", "mode": "structured", "status": "working"},
     {"session_id": "s-gone", "host_id": "studio", "harness": "removed-harness", "mode": "structured", "status": "working"}
   ],
   "cwd_suggestions": []

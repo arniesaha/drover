@@ -447,20 +447,33 @@ def discover_native_resume_sessions(
     harness: str | None = None,
     cwd: str | None = None,
     limit: int = 20,
+    adapters: HarnessAdapterRegistry | None = None,
 ) -> list[dict[str, Any]]:
-    """Return safe, metadata-only native resume candidates from local CLIs."""
+    """Return safe, metadata-only native resume candidates from local CLIs.
+
+    Only adapters that declare ``native_resume`` are asked, through their
+    ``native_sessions`` extension; nothing here knows a harness ID. Adapters
+    without discovery (agy, DeepSeek today) contribute no candidates, which
+    leaves their resume operation itself unaffected.
+    """
     root = home or Path.home()
-    # agy is absent on purpose: it keeps conversations in its own store under
-    # ``~/.gemini/antigravity-cli/conversations`` in a format nothing here
-    # reads yet. Drover's own per-session ``--conversation`` continuation is
-    # unaffected -- this list only feeds the "resume a session the CLI
-    # started outside Drover" picker.
-    requested = {harness} if harness else {"claude-code", "codex"}
+    registry = adapters if adapters is not None else BUILTIN_ADAPTERS
+    requested = [harness] if harness else list(registry.ids())
     candidates: list[dict[str, Any]] = []
-    if "claude-code" in requested:
-        candidates.extend(_discover_claude_sessions(root))
-    if "codex" in requested:
-        candidates.extend(_discover_codex_sessions(root))
+    for harness_id in requested:
+        try:
+            adapter = registry.resolve(harness_id, operation="native_resume")
+        except (KeyError, UnsupportedHarnessOperation):
+            continue
+        for item in adapter.native_sessions(home=root, cwd=cwd):
+            native = item.get("native_resume") if isinstance(item, dict) else None
+            if not (
+                isinstance(item.get("session_id"), str)
+                and isinstance(native, dict)
+                and isinstance(native.get("session_id"), str)
+            ):
+                continue
+            candidates.append({**item, "harness": harness_id})
     if cwd:
         wanted = str(Path(cwd).expanduser())
         exact = [item for item in candidates if item.get("cwd") == wanted]
@@ -484,41 +497,73 @@ def native_transcript_for_session(
     native_session_id: str | None = None,
     home: Path | None = None,
     limit: int = 80,
+    adapters: HarnessAdapterRegistry | None = None,
 ) -> dict[str, Any]:
-    """Return provider-native transcript messages for a Harness session."""
-    if harness == "claude-code":
-        root = home or Path.home()
-        path = _claude_transcript_path(
-            root,
+    """Return provider-native transcript messages for a Harness session.
+
+    The adapter's ``native_transcript`` extension reads its own history;
+    an unregistered harness, or one without the extension, is unsupported.
+    """
+    registry = adapters if adapters is not None else BUILTIN_ADAPTERS
+    try:
+        adapter = registry.resolve(harness or "")
+    except KeyError:
+        adapter = None
+    transcript = (
+        adapter.native_transcript(
+            home=home or Path.home(),
             cwd=cwd,
             native_session_id=native_session_id,
+            limit=limit,
         )
-        if path is None:
-            return {
-                "source": "claude jsonl",
-                "messages": [],
-                "reason": "no Claude JSONL transcript found for this workspace",
-            }
-        return _read_claude_transcript(path, limit=limit)
-    if harness == "codex":
-        root = home or Path.home()
-        path = _codex_transcript_path(
-            root,
-            cwd=cwd,
-            native_session_id=native_session_id,
-        )
-        if path is None:
-            return {
-                "source": "codex jsonl",
-                "messages": [],
-                "reason": "no Codex JSONL transcript found for this workspace",
-            }
-        return _read_codex_transcript(path, limit=limit)
+        if adapter is not None
+        else None
+    )
+    if transcript is not None:
+        return transcript
     return {
         "source": None,
         "messages": [],
         "reason": f"native transcript is not supported for harness: {harness}",
     }
+
+
+def claude_native_transcript(
+    home: Path, *, cwd: str | None, native_session_id: str | None, limit: int
+) -> dict[str, Any]:
+    """ClaudeCodeAdapter.native_transcript: Claude's JSONL project history."""
+    path = _claude_transcript_path(home, cwd=cwd, native_session_id=native_session_id)
+    if path is None:
+        return {
+            "source": "claude jsonl",
+            "messages": [],
+            "reason": "no Claude JSONL transcript found for this workspace",
+        }
+    return _read_claude_transcript(path, limit=limit)
+
+
+def codex_native_transcript(
+    home: Path, *, cwd: str | None, native_session_id: str | None, limit: int
+) -> dict[str, Any]:
+    """CodexAdapter.native_transcript: Codex's JSONL session history."""
+    path = _codex_transcript_path(home, cwd=cwd, native_session_id=native_session_id)
+    if path is None:
+        return {
+            "source": "codex jsonl",
+            "messages": [],
+            "reason": "no Codex JSONL transcript found for this workspace",
+        }
+    return _read_codex_transcript(path, limit=limit)
+
+
+def claude_native_sessions(home: Path) -> list[dict[str, Any]]:
+    """ClaudeCodeAdapter.native_sessions: Claude's JSONL project history."""
+    return _discover_claude_sessions(home)
+
+
+def codex_native_sessions(home: Path) -> list[dict[str, Any]]:
+    """CodexAdapter.native_sessions: Codex's JSONL session history."""
+    return _discover_codex_sessions(home)
 
 
 def _candidate_path(
@@ -3146,6 +3191,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             harness=harness,
             cwd=cwd,
             limit=limit,
+            adapters=self.server.state.adapters,
         )
         self._write_json(
             {
@@ -3173,12 +3219,21 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         native_session_id = _optional_text(
             (params.get("native_session_id") or [None])[0]
         )
-        harness = _harness_name_for_command(session.command)
+        # The registry row names the harness the session was launched as.
+        # Only a terminal predating that row falls back to command sniffing,
+        # a read-only legacy path that never selects a launch or resume.
+        registry_session = self._safe_get_session(session_id)
+        harness = (
+            registry_session.harness
+            if registry_session is not None and registry_session.harness
+            else _harness_name_for_command(session.command)
+        )
         payload = native_transcript_for_session(
             harness=harness,
             cwd=str(session.cwd) if session.cwd else None,
             native_session_id=native_session_id,
             limit=limit,
+            adapters=self.server.state.adapters,
         )
         provider_session_id = payload.get("session_id")
         payload.update(
@@ -4474,6 +4529,8 @@ def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
 
 
 def _harness_name_for_command(command: tuple[str, ...]) -> str:
+    # Legacy, read-only: labels a terminal with no registry row for the
+    # transcript viewer. Never used to choose a launch mode or resume.
     command_text = " ".join(str(part) for part in command)
     if "claude" in command_text:
         return "claude-code"

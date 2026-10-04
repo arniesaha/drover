@@ -18,6 +18,7 @@ unsupported operation was refused before it reached the provider.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from drover.server.harness.adapters import (
@@ -67,6 +68,20 @@ class FixtureLabAdapter(HarnessAdapter):
     def __init__(self) -> None:
         self.drivers: list[FixtureLabDriver] = []
         self.executions: list[tuple[Any, ...]] = []
+        # Served through the native_sessions extension. In memory on purpose:
+        # the fixture has no provider history on disk to parse.
+        self.native_candidates: list[dict[str, Any]] = [
+            {
+                "session_id": "lab-native-7",
+                "label": "Lab work · lab-nati",
+                "cwd": None,
+                "updated_at_ts": 7,
+                "native_resume": {"session_id": "lab-native-7", "label": "Lab work"},
+            }
+        ]
+
+    def native_sessions(self, *, home: Path, cwd: str | None) -> list[dict]:
+        return [dict(item) for item in self.native_candidates]
 
     def default_command(self) -> list[str]:
         return [FIXTURE_ID, "--stdio"]

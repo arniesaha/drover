@@ -268,6 +268,8 @@ public enum HarnessCapabilityCopy {
         "This session's host or harness isn't in the current fleet snapshot."
     public static let checking = "Checking what this harness supports…"
     public static let interruptUnsupported = "This harness doesn't support interrupt."
+    public static let nativeResumeUnsupported =
+        "This harness doesn't advertise native resume on its host."
     public static let approvalsUnsupported =
         "This harness doesn't advertise approvals, so this request can't be answered from iOS. Answer it on the host."
     public static let attachmentsUnsupported = "This harness doesn't accept image attachments."

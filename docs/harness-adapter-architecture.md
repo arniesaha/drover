@@ -358,11 +358,11 @@ this way:
 - **Handoff targets** are the host's launchable rows whose preferred mode is
   structured. A PTY-only target would have the handoff seed typed into a
   terminal and run as commands.
-- **Native resume.** iOS has no native-resume control today. "Continue
-  session" is Drover's server-built handoff, not native resume. The flag is
-  decoded and exposed as `HarnessControls.supportsNativeResume` for a future
-  control. Since #422 the operation behind it is the adapter's `resume`, so
-  adding that control needs no server change.
+- **Native resume.** "Continue session" is Drover's server-built handoff.
+  Since #422 the chat menu also offers "Resume a native session", only when
+  the session's host advertises structured launch and `native_resume` for its
+  harness; candidates come from the host adapter's `native_sessions`
+  extension, and the resume runs as the adapter's `resume` operation.
 - **Terminal Ctrl-C** writes 0x03 into the PTY. It is a terminal key, not the
   adapter `interrupt` operation, and stays available for PTY sessions.
 - **Refreshes.** Launch-sheet controls are derived from the current snapshot

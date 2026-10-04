@@ -56,9 +56,33 @@ and on the four built-ins:
 | 4 | `harness/daemon.py` `DEFAULT_PRESETS` | The host availability row: the executable to resolve on `PATH` and a description. | Always |
 | 5 | `harness/model_catalog/<harness>.py` | The catalog adapter returned by `model_catalog_adapter`. | If `model_catalog` |
 | 6 | `tests/` | Contract tests for every declared capability. | Always |
+| 7 | The adapter's `native_sessions` / `native_transcript` | Provider-local resume candidates and transcript, read from the CLI's own history. | Optional; `native_sessions` requires `native_resume` |
 
-The test fixture needs only 2, 4 and 6: it brings an in-process driver, and its
-"registry entry" is the registry the test builds.
+The test fixture needs only 2, 4, 6 and 7: it brings an in-process driver, its
+"registry entry" is the registry the test builds, and its `native_sessions`
+serves in-memory candidates (no history parser is invented for it).
+
+### Native resume
+
+Native resume is one capability with one optional extension:
+
+- **Eligibility** is the advertised `native_resume` flag, nothing else. The web
+  Continue page (`nativeResumeQuery` / `nativeResumeBody` in
+  `harness_capabilities.js`) and the iOS chat menu (`ChatModel.canResumeNatively`)
+  look up candidates, and send one, only for a harness whose host advertises it,
+  and only a candidate belonging to that harness.
+- **Discovery** is `HarnessAdapter.native_sessions`. harnessd asks every adapter
+  that declares `native_resume` (or the requested one) and publishes
+  `{..., harness}` rows, dropping items without a native session ID. Registering
+  `native_sessions` without `native_resume` is rejected. Claude Code and Codex
+  implement it with their existing JSONL readers; agy and DeepSeek do not, so
+  they list no candidates while their resume operation still works.
+- **Transcripts** are `HarnessAdapter.native_transcript` (Claude Code and Codex
+  today). harnessd picks the adapter from the session's registry row; command
+  sniffing remains only as a read-only label for terminals with no row.
+- **Execution** is the adapter's `resume` operation (structured) or
+  `LaunchRequest.native_session_id` (pty). Undeclared resume is refused before
+  any driver starts, at harnessd, the hub, the web module and the iOS model.
 
 **Unchanged:** `structured/manager.py`, harnessd routing, `capabilities.py`,
 `metrics.py` (central API), `web/static/*`, and every iOS source. The gate is
@@ -128,9 +152,9 @@ contract, not worked around for the fixture:
   web candidates always carry a session ID.
 - Continue onto a matrix-less (pre-#418) host is refused. Before, the hub
   routed it by harness name. Clients already withheld it.
-- iOS still has no native-resume control. `HarnessControls.supportsNativeResume`
-  is decoded for one. Native resume stays a web Continue option, now executed
-  by the adapter.
+- iOS gains a "Resume a native session" chat action, shown only when the
+  session's host advertises structured launch and `native_resume` for its
+  harness and its adapter discovered candidates.
 
 ## Residual harness-name code
 
@@ -140,7 +164,7 @@ a future adapter does not trip over it:
 | Location | Why it is keyed by name | Suggested home |
 | --- | --- | --- |
 | `daemon.py` `harness == "shell"` | Daemon-owned terminal, no adapter | Fine as is |
-| `daemon.py` native history discovery and transcripts (`discover_native_resume_sessions`, `native_transcript_for_session`, `_harness_name_for_command`) | Reads Claude/Codex on-disk layouts. A new adapter with `native_resume` gets no resume *candidates* in the web picker | An optional adapter hook for candidate discovery |
+| `daemon.py` `_harness_name_for_command` | Read-only transcript label for a legacy terminal with no registry row | Delete once such rows age out |
 | `auth.py` `CommandAuthAdapter._probe` | Parses Claude/Codex/agy status output | A parser supplied by the adapter's `auth_adapter` |
 | `factory_observer.py` `factory_observer_command` | Rewrites Claude permission flags for unattended runs | An adapter hook for unattended policy |
 | `usage.py` `CUMULATIVE_HARNESSES` | Codex reports cumulative token counts | Adapter `usage` metadata |
