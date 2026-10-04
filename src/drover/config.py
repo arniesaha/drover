@@ -355,7 +355,6 @@ class AnalyticsConfig:
                 "extension_dir",
                 "engine_sha256",
                 "verification_sha256",
-                "epoch",
             ):
                 if not getattr(self, name):
                     raise ValueError(f"analytics.{name} is required for ducklake")
@@ -365,11 +364,12 @@ class AnalyticsConfig:
             for name in ("engine_sha256", "verification_sha256"):
                 if not re.fullmatch(r"[0-9a-f]{64}", getattr(self, name)):
                     raise ValueError(f"analytics.{name} must be SHA-256")
-            if self.exporter_enabled and (
-                not self.exporter_dsn_env
-                or self.exporter_dsn_env == self.catalog_dsn_env
-            ):
-                raise ValueError("lake export requires a separate exporter_dsn_env")
+            for name in ("catalog_dsn_env", "exporter_dsn_env"):
+                value = getattr(self, name)
+                if value and not _ENV_NAME.fullmatch(value):
+                    raise ValueError(
+                        f"analytics.{name} must name an environment variable"
+                    )
 
 
 @dataclass(frozen=True)
@@ -766,6 +766,14 @@ def _from_dict(d: dict) -> DroverConfig:
         raise ValueError(
             "runtime.role api or analytics requires control_store.backend=postgres"
         )
+    analytics_config = AnalyticsConfig(**d["analytics"])
+    if (
+        analytics_config.backend == "ducklake"
+        and control_store_config.backend != "postgres"
+    ):
+        raise ValueError(
+            "analytics.backend=ducklake requires control_store.backend=postgres"
+        )
     provider_freshness_threshold = d["provider"]["freshness_threshold_seconds"]
     if (
         type(provider_freshness_threshold) not in (int, float)
@@ -799,7 +807,7 @@ def _from_dict(d: dict) -> DroverConfig:
         ),
         setup_check=SetupCheckConfig(**d["setup_check"]),
         memory=MemoryBudgetConfig(**d["memory"]),
-        analytics=AnalyticsConfig(**d["analytics"]),
+        analytics=analytics_config,
         control_store=control_store_config,
         runtime=runtime_config,
         analytics_boundary=AnalyticsBoundaryConfig(

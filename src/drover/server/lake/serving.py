@@ -33,7 +33,11 @@ def selected_config(path: Path) -> AnalyticsConfig:
 
 def lake_spec(config: AnalyticsConfig, *, exporter=False) -> LakeSpec:
     return LakeSpec(
-        config.exporter_dsn_env if exporter else config.catalog_dsn_env,
+        (
+            (config.exporter_dsn_env or config.catalog_dsn_env)
+            if exporter
+            else config.catalog_dsn_env
+        ),
         Path(config.data_root),
         Path(config.extension_dir),
         config.engine_sha256,
@@ -122,3 +126,17 @@ def check_selected(path: Path):
     if selected_config(path).backend == "ducklake":
         with open_history(path) as con:
             con.execute("SELECT 1")
+
+
+def validate_startup_config(config: AnalyticsConfig) -> None:
+    """Reject an unusable DuckLake selection before hub workers are started."""
+    if config.backend == "legacy":
+        return
+    spec = lake_spec(config)
+    # Resolve and parse the named secret without ever exposing its value.
+    spec.dsn()
+    if not spec.data_root.is_dir():
+        raise LakeError("lake_data_root_missing")
+    from .runtime import verify_runtime
+
+    verify_runtime(spec)
