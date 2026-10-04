@@ -9,7 +9,7 @@ import duckdb
 
 from .backup import create_backup, restore_backup
 from .rebuild import rebuild, verify
-from .runtime import LakeError, LakeSpec
+from .runtime import LakeError, LakeSpec, sanitize_detail
 
 REBUILD_RSS_CEILING_ENV = "DROVER_LAKE_REBUILD_RSS_CEILING_BYTES"
 REBUILD_RSS_CEILING_MIN = 512 * 1024**2
@@ -154,3 +154,50 @@ def verify_cmd(data_root, catalog_dsn_env):
             "lake_tool_memory_limit_exceeded; incomplete root retained for inspection"
         ) from None
     click.echo(json.dumps(report, indent=2))
+
+
+@lake_cmd.command("provision-exporter")
+@click.option(
+    "--data-root", type=click.Path(exists=True, path_type=Path), required=True
+)
+@click.option(
+    "--catalog-dsn-env",
+    required=True,
+    help="Environment variable holding the catalog ADMIN DSN.",
+)
+@click.option(
+    "--exporter-role",
+    required=True,
+    help="Catalog group role that may activate the exporter guard.",
+)
+def provision_exporter_cmd(data_root, catalog_dsn_env, exporter_role):
+    """Explicit admin step: create export tables and the commit guard.
+
+    Never run at startup. Run after ``rebuild`` and before role grants and
+    ``verify``: provisioning changes the snapshot and invalidates any serving
+    proof.
+    """
+    from .exporter import provision_exporter
+
+    spec = spec_from_options(data_root, catalog_dsn_env)
+    try:
+        provision_exporter(spec, exporter_role=exporter_role)
+    except LakeError as exc:
+        raise _lake_failure(exc, data_root) from None
+    except Exception as exc:
+        # Raw driver errors may embed connection details; show only the cleaned cause.
+        failure = LakeError(
+            "lake_export_provision_failed",
+            sanitize_detail(exc, os.environ.get(catalog_dsn_env, "")),
+        )
+        raise _lake_failure(failure, data_root) from None
+    click.echo(
+        json.dumps(
+            {
+                "provisioned": True,
+                "exporter_role": exporter_role,
+                "next": "grant roles, then run lake verify (serving proof invalidated)",
+            },
+            indent=2,
+        )
+    )

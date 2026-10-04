@@ -1,14 +1,42 @@
 """One explicit exporter lifecycle; startup never provisions or retries legacy."""
 
 import logging
+import os
 import threading
 
+from .export_guard import GUARD_SCHEMA
 from .exporter import LakeOutboxExporter
-from .runtime import LakeError
+from .runtime import LakeError, sanitize_detail
 from .serving import HistoryConnection, lake_spec, selected_config
 from .serving_proof import catalog_identity
 
 log = logging.getLogger(__name__)
+
+# SQLSTATEs for a missing schema (3F000) or function (42883).
+_MISSING_GUARD_SQLSTATES = {"3F000", "42883"}
+
+
+def _guard_missing(exc: BaseException) -> bool:
+    """True when the catalog lacks the drover_lake_export schema or activate()."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if getattr(
+            exc, "sqlstate", None
+        ) in _MISSING_GUARD_SQLSTATES and GUARD_SCHEMA in str(exc):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _cause(exc: BaseException, config) -> str:
+    """Sanitized exception class and first line; never a DSN or password."""
+    secrets = [
+        os.environ.get(value)
+        for name in ("exporter_dsn_env", "reader_dsn_env", "catalog_dsn_env")
+        if isinstance(value := getattr(config.analytics, name, None), str)
+    ]
+    return sanitize_detail(exc, *secrets)
 
 
 class ExporterLifecycle:
@@ -98,10 +126,17 @@ class ExporterLifecycle:
                             )
                     self._stop.wait(0.25)
         except Exception as exc:
-            self._error = (
-                exc.code if isinstance(exc, LakeError) else "lake_export_unavailable"
+            if isinstance(exc, LakeError):
+                self._error = exc.code
+            elif _guard_missing(exc):
+                self._error = "lake_export_not_provisioned"
+            else:
+                self._error = "lake_export_unavailable"
+            log.warning(
+                "DuckLake exporter stopped: %s (%s)",
+                self._error,
+                _cause(exc, self.config),
             )
-            log.warning("DuckLake exporter stopped: %s", self._error)
         finally:
             self._running = False
             self._ready.set()

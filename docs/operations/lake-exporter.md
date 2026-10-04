@@ -7,6 +7,14 @@ configuration change, payload pruning, or derived worker activation is implied.
 
 ## Provisioning and ownership
 
+Operators run `drover-server lake provision-exporter --data-root PATH
+--catalog-dsn-env ADMIN_ENV --exporter-role ROLE`, which calls
+`provision_exporter`. The required order is **rebuild → provision-exporter →
+role grants → verify**: provisioning changes the snapshot and invalidates the
+serving proof, so it must precede `verify`. It is never run at startup; an
+unprovisioned catalog makes the hub log `lake_export_not_provisioned` with the
+sanitized cause.
+
 An admin explicitly calls `provision_exporter(spec, exporter_role=...)` against an
 initialized separate catalog with the rebuilt `agent_events` and
 `control_outbox_batches` tables. It creates stable `export_batch_receipts` and

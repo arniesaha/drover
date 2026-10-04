@@ -412,3 +412,209 @@ def test_runtime_mismatch_refuses_ownership_and_claim(
         assert con.execute(
             "SELECT count(*) FROM control_outbox_batches"
         ).fetchone() == (0,)
+
+
+@pytest.fixture
+def unprovisioned_lake(lake_spec):
+    with lake_connection(lake_spec, read_only=False, create=True) as con:
+        configure_catalog(con)
+        create_table(con, "agent_events", POLICY_SCHEMA | LINEAGE, day_partition=True)
+        create_table(con, "control_outbox_batches", OUTBOX_SCHEMA | LINEAGE)
+    return lake_spec
+
+
+def _provision_cli(spec, monkeypatch, *, role="drover_export_group"):
+    from click.testing import CliRunner
+
+    from drover.server.lake import cli as lake_cli
+
+    monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(spec.extension_dir))
+    monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", spec.engine_sha256)
+    return CliRunner().invoke(
+        lake_cli.lake_cmd,
+        [
+            "provision-exporter",
+            "--data-root",
+            str(spec.data_root),
+            "--catalog-dsn-env",
+            spec.catalog_dsn_env,
+            "--exporter-role",
+            role,
+        ],
+    )
+
+
+def test_provision_exporter_cli_success_then_already_provisioned(
+    unprovisioned_lake, postgres_dsn, monkeypatch
+):
+    import json
+
+    from psycopg import sql
+
+    spec = unprovisioned_lake
+    role = "drover_export_cli_" + spec.data_root.parent.name[-8:].replace("-", "_")
+    with psycopg.connect(postgres_dsn, autocommit=True) as con:
+        con.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(role)))
+    try:
+        result = _provision_cli(spec, monkeypatch, role=role)
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["provisioned"] is True
+        assert spec.dsn() not in result.output
+        again = _provision_cli(spec, monkeypatch, role=role)
+        assert again.exit_code != 0
+        assert "lake_export_already_provisioned" in again.output
+    finally:
+        with psycopg.connect(postgres_dsn, autocommit=True) as con:
+            con.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
+                    sql.Identifier(
+                        psycopg.conninfo.conninfo_to_dict(spec.dsn())["dbname"]
+                    )
+                )
+            )
+            con.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+def test_provision_exporter_cli_reports_missing_tables(lake_spec, monkeypatch):
+    with lake_connection(lake_spec, read_only=False, create=True) as con:
+        configure_catalog(con)
+    result = _provision_cli(lake_spec, monkeypatch)
+    assert result.exit_code != 0
+    assert "lake_export_tables_missing" in result.output
+
+
+def test_provision_exporter_cli_requires_runtime_env(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from drover.server.lake import cli as lake_cli
+
+    monkeypatch.delenv("DROVER_LAKE_EXTENSION_DIR", raising=False)
+    monkeypatch.delenv("DROVER_LAKE_ENGINE_SHA256", raising=False)
+    monkeypatch.setattr(
+        lake_cli,
+        "provision_exporter",
+        lambda *a, **k: pytest.fail("must not provision without pinned runtime"),
+        raising=False,
+    )
+    result = CliRunner().invoke(
+        lake_cli.lake_cmd,
+        [
+            "provision-exporter",
+            "--data-root",
+            str(tmp_path),
+            "--catalog-dsn-env",
+            "X",
+            "--exporter-role",
+            "r",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "DROVER_LAKE_EXTENSION_DIR" in result.output
+
+
+def test_provision_exporter_cli_sanitizes_unexpected_errors(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from drover.server.lake import cli as lake_cli
+    from drover.server.lake import exporter
+
+    def boom(spec, exporter_role=None):
+        raise psycopg.OperationalError(
+            "connection failed: postgresql://admin:hunter22@db:5432/x"
+        )
+
+    monkeypatch.setattr(exporter, "provision_exporter", boom)
+    monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(tmp_path))
+    monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", "0")
+    monkeypatch.setenv("X", "postgresql://admin:hunter22@db:5432/x")
+    result = CliRunner().invoke(
+        lake_cli.lake_cmd,
+        [
+            "provision-exporter",
+            "--data-root",
+            str(tmp_path),
+            "--catalog-dsn-env",
+            "X",
+            "--exporter-role",
+            "r",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "lake_export_provision_failed" in result.output
+    assert "hunter22" not in result.output
+    assert "hunter22" not in (tmp_path / "admin-error.log").read_text()
+
+
+def test_lifecycle_unprovisioned_catalog_yields_specific_code_and_logs_cause(
+    unprovisioned_lake, postgres_control_store, monkeypatch, caplog
+):
+    import logging
+    import threading
+    from types import SimpleNamespace
+
+    from drover.server.lake import lifecycle
+
+    control_path, _ = postgres_control_store
+    config = SimpleNamespace(
+        duckdb_path=control_path,
+        analytics=SimpleNamespace(
+            retire_legacy_writers=False,
+            exporter_dsn_env=unprovisioned_lake.catalog_dsn_env,
+        ),
+    )
+    monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: unprovisioned_lake)
+    with caplog.at_level(logging.WARNING, logger=lifecycle.log.name):
+        runner = lifecycle.ExporterLifecycle(config)
+        with pytest.raises(LakeError) as caught:
+            runner.start(shutdown_event=threading.Event())
+    assert caught.value.code == "lake_export_not_provisioned"
+    assert runner.health()["last_error"] == "lake_export_not_provisioned"
+    text = caplog.text
+    assert "drover_lake_export" in text
+    assert unprovisioned_lake.dsn() not in text
+    assert len(text) < 1000
+
+
+def test_lifecycle_unclassified_failure_keeps_stable_code_and_cleans_cause(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+    import threading
+    from types import SimpleNamespace
+
+    from drover.server.lake import lifecycle
+
+    monkeypatch.setenv("LC_DSN", "postgresql://u:hunter22@h/db")
+
+    class Boom:
+        def __init__(self, **kwargs):
+            raise psycopg.OperationalError(
+                "bad conninfo password=hunter22 host=h\nsecond line"
+            )
+
+    monkeypatch.setattr(lifecycle, "LakeOutboxExporter", Boom)
+    monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: None)
+    config = SimpleNamespace(
+        duckdb_path=tmp_path, analytics=SimpleNamespace(exporter_dsn_env="LC_DSN")
+    )
+    with caplog.at_level(logging.WARNING, logger=lifecycle.log.name):
+        runner = lifecycle.ExporterLifecycle(config)
+        with pytest.raises(LakeError) as caught:
+            runner.start(shutdown_event=threading.Event())
+    assert caught.value.code == "lake_export_unavailable"
+    assert "OperationalError: bad conninfo" in caplog.text
+    assert "hunter22" not in caplog.text
+    assert "second line" not in caplog.text
+
+
+def test_guard_missing_classifies_real_postgres_errors(postgres_dsn):
+    """Needs only a private PostgreSQL, not the pinned DuckLake extensions."""
+    from drover.server.lake.lifecycle import _guard_missing
+
+    with psycopg.connect(postgres_dsn, autocommit=True) as con:
+        with pytest.raises(psycopg.Error) as caught:
+            con.execute("SELECT drover_lake_export.activate('t')")
+        assert _guard_missing(caught.value)
+        with pytest.raises(psycopg.Error) as other:
+            con.execute("SELECT * FROM no_such_table_here")
+        assert not _guard_missing(other.value)
