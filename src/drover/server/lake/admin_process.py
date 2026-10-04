@@ -69,7 +69,10 @@ def run_admin(
             result = json.loads(reply.read_text())
             if result.get("error"):
                 failure = "child_worker"
-                raise LakeError(result["error"])
+                raise LakeError(
+                    result["error"],
+                    (result.get("detail") or None) and str(result["detail"])[:300],
+                )
             return result, peak
         except LakeError as exc:
             # A failed rebuild retains its data root for inspection.  Record
@@ -80,6 +83,7 @@ def run_admin(
                     {
                         "operation": request.get("operation"),
                         "error": exc.code,
+                        "detail": exc.detail,
                         "failure_attribution": failure or "supervisor",
                         "rss_ceiling_bytes": rss_ceiling,
                         "peak_rss_bytes": peak,

@@ -37,6 +37,21 @@ def rebuild_rss_ceiling_from_env() -> int:
     return ceiling
 
 
+def _lake_failure(exc: LakeError, data_root) -> click.ClickException:
+    """Show the stable code plus its sanitized cause; keep the cause with the root."""
+    detail = exc.detail
+    if not detail:
+        return click.ClickException(exc.code)
+    try:
+        root = Path(data_root)
+        if root.is_dir():
+            with (root / "admin-error.log").open("a") as log:
+                log.write(f"{exc.code}: {detail}\n")
+    except OSError:
+        pass
+    return click.ClickException(f"{exc.code}: {detail}")
+
+
 def spec_from_options(data_root, catalog_dsn_env):
     directory = os.environ.get("DROVER_LAKE_EXTENSION_DIR")
     digest = os.environ.get("DROVER_LAKE_ENGINE_SHA256")
@@ -75,7 +90,7 @@ def rebuild_cmd(source, data_root, catalog_dsn_env, dry_run):
             rss_ceiling=rebuild_rss_ceiling_from_env(),
         )
     except LakeError as exc:
-        raise click.ClickException(exc.code) from None
+        raise _lake_failure(exc, data_root) from None
     except duckdb.OutOfMemoryException:
         raise click.ClickException(
             "lake_tool_memory_limit_exceeded; incomplete root retained for inspection"
@@ -133,7 +148,7 @@ def verify_cmd(data_root, catalog_dsn_env):
     try:
         report = verify(spec_from_options(data_root, catalog_dsn_env))
     except LakeError as exc:
-        raise click.ClickException(exc.code) from None
+        raise _lake_failure(exc, data_root) from None
     except duckdb.OutOfMemoryException:
         raise click.ClickException(
             "lake_tool_memory_limit_exceeded; incomplete root retained for inspection"

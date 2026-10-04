@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,9 +32,43 @@ EXTENSION_HASHES = {
 class LakeError(RuntimeError):
     """Explicit analytics failure, safe to expose by code (never by raw DSN)."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, detail: str | None = None):
         self.code = code
+        # Sanitized, bounded cause for operator tooling; never part of the code.
+        self.detail = detail
         super().__init__(code)
+
+
+DETAIL_LIMIT = 300
+_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+_CONNINFO_RE = re.compile(
+    r"\b(password|passfile|sslpassword|sslkey|sslcert|sslrootcert|service|"
+    r"user|host|hostaddr|port|dbname|options)\s*=\s*('(?:[^'\\]|\\.)*'|\S+)",
+    re.IGNORECASE,
+)
+
+
+def sanitize_detail(exc: BaseException, *secrets: str | None) -> str:
+    """Exception class plus first message line, scrubbed of DSN material, <=300 chars."""
+    line = (str(exc).strip().splitlines() or [""])[0]
+    values = {s for s in secrets if s}
+    for dsn in list(values):
+        try:
+            import psycopg.conninfo
+
+            info = psycopg.conninfo.conninfo_to_dict(dsn)
+            values.update(
+                str(info[k]) for k in ("password", "sslpassword") if info.get(k)
+            )
+        except Exception:
+            pass
+    for value in sorted(values, key=len, reverse=True):
+        if len(value) >= 3:
+            line = line.replace(value, "***")
+    line = _URL_RE.sub("***", line)
+    line = _CONNINFO_RE.sub(lambda m: f"{m.group(1)}=***", line)
+    text = f"{type(exc).__name__}: {line}" if line else type(exc).__name__
+    return text[:DETAIL_LIMIT]
 
 
 def sha256_file(path: Path) -> str:
@@ -139,8 +174,11 @@ def attach_lake(con, spec: LakeSpec, *, read_only: bool = True, create: bool = F
         con.execute(
             f"ATTACH {literal('ducklake:postgres:' + spec.dsn())} AS lake ({', '.join(options)})"
         )
-    except Exception:
-        raise LakeError("analytics_unavailable") from None
+    except Exception as exc:
+        raise LakeError(
+            "analytics_unavailable",
+            sanitize_detail(exc, os.environ.get(spec.catalog_dsn_env, "")),
+        ) from None
 
 
 def create_table(
@@ -175,3 +213,42 @@ def create_table(
 def configure_catalog(con):
     con.execute("CALL lake.set_option('data_inlining_row_limit', 0)")
     con.execute("CALL lake.set_option('parquet_compression', 'zstd')")
+
+
+def catalog_permission_preflight(spec: LakeSpec, schema: str = "public") -> None:
+    """Fail fast, before any expensive build, when the catalog role cannot create.
+
+    DuckLake creates its metadata tables in the target schema; a role without
+    CONNECT or CREATE there otherwise surfaces only after the partition phase.
+    """
+    import psycopg
+
+    dsn = spec.dsn()
+    try:
+        with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as con:
+            row = con.execute(
+                "SELECT has_database_privilege(current_user, current_database(), 'CONNECT'),"
+                " to_regnamespace(%s) IS NOT NULL,"
+                " CASE WHEN to_regnamespace(%s) IS NULL THEN false"
+                " ELSE has_schema_privilege(current_user, %s, 'CREATE') END",
+                [schema, schema, schema],
+            ).fetchone()
+    except psycopg.errors.InsufficientPrivilege as exc:
+        raise LakeError(
+            "lake_catalog_permission_denied", sanitize_detail(exc, dsn)
+        ) from None
+    except Exception as exc:
+        raise LakeError("analytics_unavailable", sanitize_detail(exc, dsn)) from None
+    connect, exists, create = row
+    if not connect:
+        raise LakeError(
+            "lake_catalog_permission_denied", "role lacks CONNECT on catalog database"
+        )
+    if not exists:
+        raise LakeError(
+            "lake_catalog_permission_denied", f"catalog schema {schema} does not exist"
+        )
+    if not create:
+        raise LakeError(
+            "lake_catalog_permission_denied", f"role lacks CREATE on schema {schema}"
+        )

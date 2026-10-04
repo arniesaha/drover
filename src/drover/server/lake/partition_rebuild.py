@@ -15,6 +15,7 @@ from .rebuild_worker import LINEAGE, POLICY_SCHEMA
 from .runtime import (
     LakeError,
     LakeSpec,
+    catalog_permission_preflight,
     configure_catalog,
     create_table,
     lake_connection,
@@ -39,6 +40,9 @@ def rebuild_partitioned(
     root = spec.data_root.resolve()
     if root.exists():
         raise LakeError("rebuild_requires_new_data_root")
+    if not dry_run:
+        # Before the extract and partition phases, which take minutes.
+        catalog_permission_preflight(spec)
     root.parent.mkdir(parents=True, exist_ok=True)
     root.mkdir(mode=0o700)
     evidence = root / "verification"
