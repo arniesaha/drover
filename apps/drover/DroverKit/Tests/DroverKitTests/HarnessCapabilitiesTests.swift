@@ -369,7 +369,7 @@ struct CapabilityDrivenLaunchTests {
         model.prompt = "go"
 
         nonisolated(unsafe) var body: [String: Any] = [:]
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
             return (201, Data(#"{"session_id": "lab-2", "mode": "structured"}"#.utf8))
         }
@@ -525,7 +525,7 @@ struct CapabilityDrivenChatTests {
         """.utf8)
         nonisolated(unsafe) var listQuery: [URLQueryItem] = []
         nonisolated(unsafe) var body: [String: Any] = [:]
-        MockURLProtocol.handler = { request in
+        mock.handler = { request in
             if request.url?.path == "/harness/hosts/lab-host/native-sessions" {
                 listQuery = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
                     .queryItems ?? []
@@ -552,7 +552,7 @@ struct CapabilityDrivenChatTests {
         let lab = try await loadedChat("s-lab", harness: "fixture-lab")
         let legacy = try await loadedChat("s-legacy", harness: "codex")
         let synth = try await loadedChat("s-synth", harness: "synthetic-lab")
-        MockURLProtocol.handler = { _ in
+        mock.handler = { _ in
             Issue.record("unadvertised native resume must not reach the hub")
             return (500, Data())
         }
