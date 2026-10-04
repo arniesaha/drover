@@ -11,6 +11,31 @@ from .backup import create_backup, restore_backup
 from .rebuild import rebuild, verify
 from .runtime import LakeError, LakeSpec
 
+REBUILD_RSS_CEILING_ENV = "DROVER_LAKE_REBUILD_RSS_CEILING_BYTES"
+REBUILD_RSS_CEILING_MIN = 512 * 1024**2
+REBUILD_RSS_CEILING_MAX = 12 * 1024**3
+
+
+def rebuild_rss_ceiling_from_env() -> int:
+    """Read the rebuild-only aggregate supervisor cap in bytes.
+
+    This intentionally is not a general lake runtime setting: it is consumed
+    only by ``lake rebuild`` and is bounded to keep an accidental shell export
+    from removing the offline job's safety ceiling.
+    """
+    from .admin_process import RSS_CEILING
+
+    value = os.environ.get(REBUILD_RSS_CEILING_ENV)
+    if value is None:
+        return RSS_CEILING
+    try:
+        ceiling = int(value)
+    except ValueError as exc:
+        raise LakeError("rebuild_rss_ceiling_invalid") from exc
+    if not REBUILD_RSS_CEILING_MIN <= ceiling <= REBUILD_RSS_CEILING_MAX:
+        raise LakeError("rebuild_rss_ceiling_invalid")
+    return ceiling
+
 
 def spec_from_options(data_root, catalog_dsn_env):
     directory = os.environ.get("DROVER_LAKE_EXTENSION_DIR")
@@ -44,7 +69,10 @@ def lake_cmd():
 def rebuild_cmd(source, data_root, catalog_dsn_env, dry_run):
     try:
         report = rebuild(
-            source, spec_from_options(data_root, catalog_dsn_env), dry_run=dry_run
+            source,
+            spec_from_options(data_root, catalog_dsn_env),
+            dry_run=dry_run,
+            rss_ceiling=rebuild_rss_ceiling_from_env(),
         )
     except LakeError as exc:
         raise click.ClickException(exc.code) from None

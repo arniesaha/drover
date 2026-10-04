@@ -5,6 +5,12 @@ from types import SimpleNamespace
 import pytest
 
 from drover.server.lake import admin_process, rebuild_worker
+from drover.server.lake.cli import (
+    REBUILD_RSS_CEILING_ENV,
+    REBUILD_RSS_CEILING_MAX,
+    REBUILD_RSS_CEILING_MIN,
+    rebuild_rss_ceiling_from_env,
+)
 from drover.server.lake.runtime import LakeError
 
 
@@ -33,7 +39,45 @@ def test_admin_ceiling_kills_and_reaps(tmp_path, monkeypatch, breach):
     with pytest.raises(LakeError, match=code):
         admin_process.run_admin({"operation": "other"}, tmp_path)
     assert killed and reaped
+    failure = __import__("json").loads(
+        (tmp_path / "admin-supervision-failure.json").read_text()
+    )
+    assert failure["rss_ceiling_bytes"] == admin_process.RSS_CEILING
+    assert failure["peak_rss_bytes"] == (
+        2 * admin_process.RSS_CEILING if breach == "rss" else 200
+    )
+    assert failure["failure_attribution"] == (
+        "supervisor_aggregate_rss_limit"
+        if breach == "rss"
+        else "supervisor_partition_deadline"
+    )
+    assert set(failure["last_rss_sample_bytes"]) == {"coordinator", "child"}
     assert not (tmp_path / "admin-request.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, admin_process.RSS_CEILING),
+        (str(REBUILD_RSS_CEILING_MIN), REBUILD_RSS_CEILING_MIN),
+        (str(REBUILD_RSS_CEILING_MAX), REBUILD_RSS_CEILING_MAX),
+    ],
+)
+def test_rebuild_rss_ceiling_env_is_bounded(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv(REBUILD_RSS_CEILING_ENV, raising=False)
+    else:
+        monkeypatch.setenv(REBUILD_RSS_CEILING_ENV, value)
+    assert rebuild_rss_ceiling_from_env() == expected
+
+
+@pytest.mark.parametrize(
+    "value", ["", "not-a-number", "0", str(REBUILD_RSS_CEILING_MAX + 1)]
+)
+def test_rebuild_rss_ceiling_env_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv(REBUILD_RSS_CEILING_ENV, value)
+    with pytest.raises(LakeError, match="rebuild_rss_ceiling_invalid"):
+        rebuild_rss_ceiling_from_env()
 
 
 def test_worker_limits_and_spill_are_explicit(tmp_path, monkeypatch):

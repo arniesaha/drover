@@ -271,10 +271,16 @@ def accounting(con, relation: str, *, expression: str = "_row_sha256") -> dict:
     }
 
 
-def rebuild(source: Path, spec: LakeSpec, *, dry_run: bool = False) -> dict:
+def rebuild(
+    source: Path,
+    spec: LakeSpec,
+    *,
+    dry_run: bool = False,
+    rss_ceiling: int | None = None,
+) -> dict:
     from .partition_rebuild import rebuild_partitioned
 
-    return rebuild_partitioned(source, spec, dry_run=dry_run)
+    return rebuild_partitioned(source, spec, dry_run=dry_run, rss_ceiling=rss_ceiling)
 
 
 def verify(spec: LakeSpec) -> dict:
