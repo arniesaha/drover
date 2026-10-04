@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 import duckdb
 
+from .backup import create_backup, restore_backup
 from .rebuild import rebuild, verify
 from .runtime import LakeError, LakeSpec
 
@@ -52,6 +53,47 @@ def rebuild_cmd(source, data_root, catalog_dsn_env, dry_run):
             "lake_tool_memory_limit_exceeded; incomplete root retained for inspection"
         ) from None
     click.echo(json.dumps(report, indent=2))
+
+
+@lake_cmd.command("backup")
+@click.option(
+    "--staging-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--catalog-snapshot",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--backup-root", type=click.Path(path_type=Path), required=True)
+@click.option("--generation-id")
+def backup_cmd(staging_root, catalog_snapshot, backup_root, generation_id):
+    """Create an immutable generation only from a marked isolated staging copy."""
+    try:
+        receipt = create_backup(
+            staging_root, catalog_snapshot, backup_root, generation_id=generation_id
+        )
+    except LakeError as exc:
+        raise click.ClickException(exc.code) from None
+    click.echo(json.dumps(receipt, indent=2))
+
+
+@lake_cmd.command("restore")
+@click.option(
+    "--generation",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--data-root", type=click.Path(path_type=Path), required=True)
+@click.option("--catalog-destination", type=click.Path(path_type=Path), required=True)
+def restore_cmd(generation, data_root, catalog_destination):
+    """Verify and restore a generation into two new, separate locations."""
+    try:
+        receipt = restore_backup(generation, data_root, catalog_destination)
+    except LakeError as exc:
+        raise click.ClickException(exc.code) from None
+    click.echo(json.dumps(receipt, indent=2))
 
 
 @lake_cmd.command("verify")
