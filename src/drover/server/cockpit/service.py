@@ -308,7 +308,11 @@ class CockpitService:
                     )
 
                     raise AnalyticsSnapshotChangedError() from exc
-                log.warning("lake activity unavailable: %s", type(exc).__name__)
+
+                error_code = (
+                    exc.code if isinstance(exc, LakeError) else type(exc).__name__
+                )
+                log.warning("lake activity unavailable: %s", error_code)
                 return {
                     **_section("unavailable", data=None, coverage=None),
                     "reason": (

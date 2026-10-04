@@ -21,7 +21,7 @@ def _read_model(path, operation, **options):
     if operation == "project_activity" and options.get("project_key") is not None:
         owner, sep, name = options["project_key"].partition("/")
         if not sep or not owner or not name or "/" in name:
-            raise ValueError("project_key must be one <owner>/<name> pair")
+            raise LakeError("invalid_project_key")
     config = selected_config(path)
     if config.backend != "ducklake":
         raise LakeError("lake_backend_not_selected")
@@ -75,10 +75,51 @@ def _control_snapshot(con, request):
     with control_plane_connection(path) as pg:
         pg.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         try:
+            op = request.get("operation")
+            opts = request.get("options", {})
             for table, columns in _POSTGRES_ANALYTICS_SNAPSHOT_TABLES.items():
+                where = ""
+                params = []
+                if op in ("cockpit", "project_activity") and table in (
+                    "harness_sessions",
+                    "session_usage",
+                ):
+                    if op == "cockpit":
+                        filters = opts.get("filters", {})
+                        days = filters.get("days", 7)
+                        project = filters.get("project")
+                    else:
+                        days = opts.get("days", 7)
+                        project = opts.get("project_key")
+
+                    try:
+                        days = int(days)
+                    except (TypeError, ValueError):
+                        raise LakeError("invalid_analytics_interval")
+                    if not (1 <= days <= 366):
+                        raise LakeError("invalid_analytics_interval")
+
+                    cutoff = "(current_timestamp - interval '1 day' * ?)"
+                    params.append(days + 2)
+
+                    harness_where = (
+                        f"(coalesce(last_activity, updated_at, started_at) >= {cutoff})"
+                    )
+                    if project:
+                        parts = project.split("/")
+                        if len(parts) != 2:
+                            raise LakeError("invalid_project_key")
+                        harness_where += " AND repo_owner = ? AND repo_name = ?"
+                        params.extend(parts)
+
+                    if table == "harness_sessions":
+                        where = f"WHERE {harness_where}"
+                    else:
+                        where = f"WHERE session_id IN (SELECT session_id FROM harness_sessions WHERE {harness_where})"
+
                 names = ",".join('"' + name + '"' for name, _ in columns)
                 rows = pg.execute(
-                    f'SELECT {names} FROM "{table}" LIMIT 10001'
+                    f'SELECT {names} FROM "{table}" {where} LIMIT 10001', params
                 ).fetchall()
                 if len(rows) > 10000:
                     raise LakeError("analytics_control_row_limit_exceeded")

@@ -288,6 +288,16 @@ def test_canonical_activity_and_job_parity(verified_lake):
         (p["project_key"], p["session_count"]) for p in lake_activity["projects"]
     ] == [(p["project_key"], p["session_count"]) for p in activity["projects"]]
     assert canonical_sessions(path, since=date(2026, 10, 1)) == sessions
+
+    # Hostile project key returns no rows without error
+    hostile_activity = read_model(
+        path,
+        "project_activity",
+        project_key="foo/bar' OR '1'='1",
+        days=30,
+        now="2026-10-02T00:00:00+00:00",
+    )
+    assert hostile_activity["projects"] == []
     assert len(_source_versions(path, ["s"])["s"]) == 64
 
 
@@ -469,16 +479,21 @@ def test_lake_activity_cursor_error_preserves_reload_contract(tmp_path, monkeypa
     )
 
     def changed(*args, **kwargs):
+        from drover.server.lake.runtime import LakeError
+
         raise LakeError("snapshot_changed")
 
     monkeypatch.setattr(read_models, "read_model", changed)
     service = CockpitService(duckdb_path=path, provider_usage=None)
     with pytest.raises(AnalyticsSnapshotChangedError):
         service._activity(AnalyticsFilters())
-    with pytest.raises(ValueError, match="project_key"):
+    from drover.server.lake.runtime import LakeError
+
+    with pytest.raises(LakeError) as exc_info:
         # Validation runs before any store/credential access.
         monkeypatch.undo()
         read_models.read_model(path, "project_activity", project_key="invalid")
+    assert exc_info.value.code == "invalid_project_key"
 
 
 def test_native_freshness_metadata_does_not_certify_legacy_rollup(verified_lake):
