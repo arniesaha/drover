@@ -131,6 +131,10 @@ def apply_memory_links(control: Any, links: list[dict]) -> None:
             )
 
 
+from drover.server.lake.writer_gate import fence_derived_writer
+
+
+@fence_derived_writer("store_path", list)
 def refresh_memory_projection(
     analytics: Any, sessions: dict[str, dict], *, store_path=None
 ) -> list[dict]:

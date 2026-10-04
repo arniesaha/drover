@@ -64,7 +64,42 @@ class RecallBundleService:
             "effective_chars": effective_chars,
             "retrieval_timestamp": retrieval_timestamp,
         }
-        return with_freshness(self._build_projected_bundle(**build_arguments))
+        from drover.server.lake.runtime import LakeError
+        from drover.server.lake.serving import selected_config
+
+        config = selected_config(self._duckdb_path)
+        try:
+            from drover.server.lake.coverage import read_fence
+
+            with read_fence(self._duckdb_path):
+                config = selected_config(self._duckdb_path)
+                if config.backend == "ducklake" and _is_exact_repository(repo):
+                    from drover.server.lake.read_models import read_model
+
+                    # Missing authoritative context publication is explicit and
+                    # bound to the verified selection, never an empty legacy mix.
+                    coverage = read_model(
+                        self._duckdb_path, "contexts", limit=effective_limit
+                    )
+                    if coverage.get("status") == "unavailable":
+                        return coverage
+                bundle = self._build_projected_bundle(**build_arguments)
+                if config.backend == "ducklake":
+                    from drover.server.lake.coverage import bounded
+                    from drover.server.lake.read_models import read_model
+
+                    if not _is_exact_repository(repo):
+                        coverage = read_model(self._duckdb_path, "coverage")
+                    bundle["metadata"] = coverage["metadata"]
+                    bounded(bundle)
+                return with_freshness(bundle)
+        except LakeError as exc:
+            return {
+                "status": "unavailable",
+                "analytics_backend": config.backend,
+                "analytics_epoch": config.epoch,
+                "reason": exc.code,
+            }
 
     def _build_projected_bundle(
         self,
@@ -132,6 +167,10 @@ class RecallBundleService:
             since=since,
             limit=limit,
         )
+        if keyword_result.get("status") == "unavailable":
+            from drover.server.lake.runtime import LakeError
+
+            raise LakeError(keyword_result.get("reason") or "analytics_unavailable")
         keyword_matches = [
             _project_keyword_match(
                 row,
@@ -148,6 +187,10 @@ class RecallBundleService:
             brief = drover_project_brief(
                 duckdb_path=self._duckdb_path, project_key=repo
             )
+            if brief is not None and brief.get("status") == "unavailable":
+                from drover.server.lake.runtime import LakeError
+
+                raise LakeError(brief.get("reason") or "analytics_unavailable")
             if brief is not None:
                 project_brief_item = _project_brief(
                     brief, retrieval_timestamp=retrieval_timestamp
@@ -158,6 +201,10 @@ class RecallBundleService:
                 project_key=repo,
                 limit=limit,
             )
+            if recent.get("status") == "unavailable":
+                from drover.server.lake.runtime import LakeError
+
+                raise LakeError(recent.get("reason") or "analytics_unavailable")
             recent_summary_items = [
                 projected
                 for row in recent["sessions"]
@@ -176,6 +223,10 @@ class RecallBundleService:
                 project_key=repo,
                 limit=limit,
             )
+            if loops.get("status") == "unavailable":
+                from drover.server.lake.runtime import LakeError
+
+                raise LakeError(loops.get("reason") or "analytics_unavailable")
             open_loop_items = [
                 projected
                 for row in loops["open_loops"]

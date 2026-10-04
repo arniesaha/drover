@@ -1,0 +1,414 @@
+"""Real exporter transactions on a private PG cluster and small fixture lake."""
+
+from dataclasses import replace
+
+import duckdb
+import psycopg
+import pytest
+from psycopg.conninfo import make_conninfo
+from test_control_outbox import postgres_control_store
+from test_lake_runtime import lake_spec
+
+from drover.server.db import control_plane_connection
+from drover.server.harness.registry import HarnessRegistry
+from drover.server.lake.export_guard import APPLICATION_PREFIX
+from drover.server.lake.export_worker import export
+from drover.server.lake.exporter import LakeOutboxExporter, provision_exporter
+from drover.server.lake.rebuild import OUTBOX_SCHEMA
+from drover.server.lake.rebuild_worker import LINEAGE, POLICY_SCHEMA
+from drover.server.lake.runtime import (
+    LakeError,
+    configure_catalog,
+    create_table,
+    lake_connection,
+)
+
+
+@pytest.fixture
+def export_lake(lake_spec):
+    with lake_connection(lake_spec, read_only=False, create=True) as con:
+        configure_catalog(con)
+        create_table(con, "agent_events", POLICY_SCHEMA | LINEAGE, day_partition=True)
+        create_table(con, "control_outbox_batches", OUTBOX_SCHEMA | LINEAGE)
+    provision_exporter(lake_spec)
+    return lake_spec
+
+
+def seed(control_path, *, count=2):
+    registry = HarnessRegistry(control_path)
+    registry.register_host(host_id="export-host", display_name="Export", kind="test")
+    registry.create_session(
+        host_id="export-host",
+        harness="codex",
+        command="codex",
+        session_id="export-session",
+    )
+    for i in range(count):
+        registry.append_event(
+            session_id="export-session",
+            event_id=f"event-{i}",
+            event_type="assistant_output",
+            payload={"text": f"full substantive payload {i}"},
+            seq=i + 1,
+            content_preview="short preview",
+        )
+
+
+def lake_counts(spec):
+    with lake_connection(spec) as con:
+        return [
+            con.execute(f"SELECT count(*) FROM lake.{t}").fetchone()[0]
+            for t in (
+                "agent_events",
+                "control_outbox_batches",
+                "export_event_versions",
+                "export_batch_receipts",
+            )
+        ]
+
+
+class CrashBeforeAck(RuntimeError):
+    pass
+
+
+def test_crash_before_ack_replays_receipt_without_second_commit(
+    export_lake, postgres_control_store, monkeypatch, tmp_path
+):
+    control_path, _ = postgres_control_store
+    seed(control_path)
+    original = LakeOutboxExporter(control_path=control_path, spec=export_lake)
+
+    def crash(*args):
+        raise CrashBeforeAck()
+
+    monkeypatch.setattr(original, "_acknowledge", crash)
+    with original, pytest.raises(CrashBeforeAck):
+        original.run_once()
+    assert lake_counts(export_lake) == [2, 2, 2, 1]
+    with control_plane_connection(control_path) as control:
+        assert control.execute(
+            "SELECT state FROM control_outbox_batches"
+        ).fetchone() == ("claimed",)
+        assert control.execute(
+            "SELECT receipt_sha256 FROM lake_export_batches"
+        ).fetchone() == (None,)
+        # Identity enrichment after a crash must not change frozen projection/hash.
+        control.execute(
+            "UPDATE harness_sessions SET branch='learned-later' WHERE session_id='export-session'"
+        )
+    with lake_connection(export_lake) as con:
+        snapshot = con.execute(
+            "SELECT max(snapshot_id) FROM lake.snapshots()"
+        ).fetchone()[0]
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table({"id": ["orphan"]}), export_lake.data_root / "orphan.parquet"
+    )
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as replacement:
+        assert replacement.run_once() == {
+            "exported": 2,
+            "acknowledged": 2,
+            "replayed": True,
+        }
+        assert replacement.run_once() == {
+            "exported": 0,
+            "acknowledged": 0,
+            "replayed": False,
+        }
+    assert lake_counts(export_lake) == [2, 2, 2, 1]
+    with lake_connection(export_lake) as con:
+        assert (
+            con.execute("SELECT max(snapshot_id) FROM lake.snapshots()").fetchone()[0]
+            == snapshot
+        )
+        assert con.execute(
+            "SELECT content FROM lake.agent_events ORDER BY id"
+        ).fetchall() == [
+            ("full substantive payload 0",),
+            ("full substantive payload 1",),
+        ]
+    with control_plane_connection(control_path) as control:
+        assert control.execute(
+            "SELECT state,archive_path,content_sha256 FROM control_outbox_batches"
+        ).fetchone() == ("acknowledged", None, None)
+        assert control.execute(
+            "SELECT count(*) FROM control_outbox_events WHERE state='acknowledged'"
+        ).fetchone() == (2,)
+        assert control.execute(
+            "SELECT count(*) FROM harness_event_archives"
+        ).fetchone() == (0,)
+        assert control.execute(
+            "SELECT count(*) FROM harness_event_payloads"
+        ).fetchone() == (2,)
+
+
+def test_two_exporters_are_fenced_for_whole_owner_lifetime(
+    export_lake, postgres_control_store
+):
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as first:
+        with pytest.raises(LakeError, match="lake_mutation_fenced"):
+            with LakeOutboxExporter(control_path=control_path, spec=export_lake):
+                pytest.fail("second exporter became active")
+        assert first.run_once()["acknowledged"] == 1
+        # The fence is retained between batches, rather than borrowed per query.
+        with pytest.raises(LakeError, match="lake_mutation_fenced"):
+            with LakeOutboxExporter(control_path=control_path, spec=export_lake):
+                pytest.fail("second exporter became active")
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as successor:
+        assert successor.run_once()["acknowledged"] == 0
+
+
+def frozen(exporter):
+    from datetime import datetime, timezone
+
+    return exporter._input(datetime.now(timezone.utc))
+
+
+def test_snapshot_guard_rejects_old_token_after_replacement(
+    export_lake, postgres_control_store, monkeypatch
+):
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as old:
+        document = frozen(old)
+        stale_dsn = make_conninfo(
+            export_lake.dsn(), application_name=APPLICATION_PREFIX + old.token
+        )
+        old.fence.connection.close()
+        with LakeOutboxExporter(
+            control_path=control_path, spec=export_lake
+        ) as replacement:
+            monkeypatch.setenv("DROVER_STALE_EXPORT_DSN", stale_dsn)
+            stale_spec = replace(export_lake, catalog_dsn_env="DROVER_STALE_EXPORT_DSN")
+            with pytest.raises(duckdb.Error, match="fence lost"):
+                export(stale_spec, document)
+            assert lake_counts(export_lake) == [0, 0, 0, 0]
+            assert replacement.run_once()["acknowledged"] == 1
+    assert lake_counts(export_lake) == [1, 1, 1, 1]
+
+
+def test_atomic_rollback_leaves_no_rows_or_receipt(
+    export_lake, postgres_control_store, monkeypatch
+):
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        document = frozen(exporter)
+        monkeypatch.setenv(
+            "DROVER_BATCH_EXPORT_DSN",
+            make_conninfo(
+                export_lake.dsn(), application_name=APPLICATION_PREFIX + exporter.token
+            ),
+        )
+        batch_spec = replace(export_lake, catalog_dsn_env="DROVER_BATCH_EXPORT_DSN")
+
+        def fail():
+            raise CrashBeforeAck()
+
+        with pytest.raises(CrashBeforeAck):
+            export(batch_spec, document, before_commit=fail)
+        assert lake_counts(export_lake) == [0, 0, 0, 0]
+        assert exporter.run_once()["replayed"] is False
+    assert lake_counts(export_lake) == [1, 1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "table,column",
+    [("control_outbox_batches", "payload_json"), ("export_event_versions", "content")],
+)
+def test_recovery_rejects_payload_corruption_before_ack(
+    export_lake, postgres_control_store, monkeypatch, table, column
+):
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        monkeypatch.setattr(
+            exporter,
+            "_acknowledge",
+            lambda *args: (_ for _ in ()).throw(CrashBeforeAck()),
+        )
+        with pytest.raises(CrashBeforeAck):
+            exporter.run_once()
+    # Keeping the per-row stored hash must not conceal changed archived bytes.
+    with lake_connection(export_lake, read_only=False) as con:
+        con.execute(f"UPDATE lake.{table} SET {column}='changed'")
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        with pytest.raises(LakeError, match="receipt_content_mismatch"):
+            exporter.run_once()
+    with control_plane_connection(control_path) as con:
+        assert con.execute("SELECT state FROM control_outbox_batches").fetchone() == (
+            "claimed",
+        )
+
+
+def test_duplicate_keys_rank_before_merge(
+    export_lake, postgres_control_store, monkeypatch
+):
+    control_path, _ = postgres_control_store
+    seed(control_path)
+    from drover.server.lake import exporter as module
+
+    original = module.project_control_event
+
+    def duplicates(row, session):
+        event = original(row, session)
+        event["dedup_key"] = "same-fingerprint"
+        # Attribution beats the later timestamp/id. Exactly one source per key.
+        if row["event_id"] == "event-0":
+            event.update(repo_owner="owner", repo_name="repo")
+        return event
+
+    monkeypatch.setattr(module, "project_control_event", duplicates)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once() == {
+            "exported": 1,
+            "acknowledged": 2,
+            "replayed": False,
+        }
+    assert lake_counts(export_lake) == [1, 2, 1, 1]
+    with lake_connection(export_lake) as con:
+        assert con.execute("SELECT id FROM lake.agent_events").fetchall() == [
+            ("event-0",)
+        ]
+
+
+def test_unlock_is_detected_even_when_connection_stays_open(
+    export_lake, postgres_control_store
+):
+    from drover.server.lake.fence import MUTATION_LOCK
+
+    control_path, _ = postgres_control_store
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        exporter.fence.connection.execute(
+            "SELECT pg_advisory_unlock(%s)", [MUTATION_LOCK]
+        )
+        with pytest.raises(LakeError, match="lake_fence_lost"):
+            exporter.run_once()
+
+
+def test_limited_exporter_role_can_activate_and_commit(
+    lake_spec, postgres_control_store, monkeypatch
+):
+    from uuid import uuid4
+
+    from psycopg import sql
+
+    from drover.server.lake.catalog_roles import provision_catalog_roles
+
+    with lake_connection(lake_spec, read_only=False, create=True) as con:
+        configure_catalog(con)
+        create_table(con, "agent_events", POLICY_SCHEMA | LINEAGE, day_partition=True)
+        create_table(con, "control_outbox_batches", OUTBOX_SCHEMA | LINEAGE)
+    roles = provision_catalog_roles(
+        lake_spec, prefix="export_test_" + uuid4().hex[:12]
+    )["roles"]
+    try:
+        provision_exporter(lake_spec, exporter_role=roles["exporter"])
+        monkeypatch.setenv(
+            "DROVER_LIMITED_EXPORT_DSN",
+            make_conninfo(lake_spec.dsn(), options="-c role=" + roles["exporter"]),
+        )
+        spec = replace(lake_spec, catalog_dsn_env="DROVER_LIMITED_EXPORT_DSN")
+        control_path, _ = postgres_control_store
+        seed(control_path, count=1)
+        with LakeOutboxExporter(control_path=control_path, spec=spec) as exporter:
+            with pytest.raises(duckdb.Error, match="token required"):
+                with lake_connection(spec, read_only=False) as con:
+                    con.execute(
+                        "INSERT INTO lake.control_outbox_batches (payload_json) VALUES ('unfenced')"
+                    )
+            assert exporter.run_once()["acknowledged"] == 1
+            # No ability to change the ownership row or disable commit fencing.
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                exporter.fence.connection.execute(
+                    "UPDATE drover_lake_export.ownership SET token='forged'"
+                )
+        assert lake_counts(lake_spec) == [1, 1, 1, 1]
+    finally:
+        with psycopg.connect(lake_spec.dsn(), autocommit=True) as con:
+            for role in roles.values():
+                con.execute(
+                    sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(role))
+                )
+                con.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+def test_invalid_payload_hash_never_reaches_lake(export_lake, postgres_control_store):
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with control_plane_connection(control_path) as con:
+        con.execute("UPDATE harness_event_payloads SET payload_sha256='invalid'")
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        with pytest.raises(LakeError, match="payload_hash_mismatch"):
+            exporter.run_once()
+    assert lake_counts(export_lake) == [0, 0, 0, 0]
+    with control_plane_connection(control_path) as con:
+        assert con.execute("SELECT count(*) FROM lake_export_batches").fetchone() == (
+            0,
+        )
+
+
+def test_replacement_waits_for_validated_catalog_commit(
+    export_lake, postgres_control_store
+):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    control_path, _ = postgres_control_store
+    entered = threading.Event()
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as old:
+        # A real snapshot trigger acquires its shared ownership row lock inside
+        # the catalog transaction. It stays held after the original owner dies.
+        with psycopg.connect(
+            make_conninfo(
+                export_lake.dsn(), application_name=APPLICATION_PREFIX + old.token
+            )
+        ) as commit:
+            commit.execute(
+                "UPDATE public.ducklake_snapshot SET snapshot_time=snapshot_time WHERE snapshot_id=(SELECT max(snapshot_id) FROM public.ducklake_snapshot)"
+            )
+            old.fence.connection.close()
+
+            def replace_owner():
+                with LakeOutboxExporter(control_path=control_path, spec=export_lake):
+                    entered.set()
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(replace_owner)
+                deadline = time.monotonic() + 2
+                with psycopg.connect(export_lake.dsn(), autocommit=True) as probe:
+                    while time.monotonic() < deadline:
+                        waiting = probe.execute(
+                            "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT drover_lake_export.activate%%'"
+                        ).fetchone()[0]
+                        if waiting:
+                            break
+                        time.sleep(0.01)
+                    assert waiting, "replacement did not reach ownership drain"
+                    assert not entered.is_set()
+                commit.commit()
+                future.result(timeout=2)
+                assert entered.is_set()
+
+
+def test_runtime_mismatch_refuses_ownership_and_claim(
+    export_lake, postgres_control_store
+):
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    bad_spec = replace(export_lake, engine_sha256="bad")
+    with pytest.raises(LakeError, match="engine_hash_mismatch"):
+        with LakeOutboxExporter(control_path=control_path, spec=bad_spec):
+            pytest.fail("mismatched engine started")
+    with control_plane_connection(control_path) as con:
+        assert con.execute("SELECT state FROM control_outbox_events").fetchone() == (
+            "pending",
+        )
+        assert con.execute(
+            "SELECT count(*) FROM control_outbox_batches"
+        ).fetchone() == (0,)

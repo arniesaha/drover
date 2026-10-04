@@ -134,6 +134,7 @@ from drover.server.harness.schema import (
     migrate_duplicate_harness_events,
 )
 from drover.server.harness.usage_rollup import UsageRollupWorker
+from drover.server.lake.cli import lake_cmd
 from drover.server.ledger import (
     EMBED_SESSION,
     JobLedger,
@@ -363,6 +364,12 @@ max_request_bytes = 262144
 max_response_bytes = 4194304
 max_concurrent_requests = 8
 
+[memory]
+# This server process only; disposable query children retain a 2 GiB ceiling.
+rss_budget_bytes = 4294967296
+sample_interval_seconds = 1.0
+warn_fraction = 0.8
+
 [server]
 otlp_grpc_port = 4317  # only bound when [telemetry] spans_enabled = true
 mcp_http_port  = 7077
@@ -457,6 +464,9 @@ def _resolve_config(
         if path is None and allow_missing_default:
             cfg = default_config()
             configure_control_store(cfg.duckdb_path, cfg.control_store)
+            from drover.server.lake.serving import configure_analytics
+
+            configure_analytics(cfg.duckdb_path, cfg.analytics)
             return cfg
         raise click.ClickException(
             f"config does not exist: {p}; run drover-server init first"
@@ -466,6 +476,9 @@ def _resolve_config(
     # is deliberately absent from harnessd, which keeps its host-local DuckDB
     # store even when a hub has PostgreSQL credentials in its environment.
     configure_control_store(cfg.duckdb_path, cfg.control_store)
+    from drover.server.lake.serving import configure_analytics
+
+    configure_analytics(cfg.duckdb_path, cfg.analytics)
     return cfg
 
 
@@ -580,6 +593,7 @@ def _backfill_day_summaries(
 ) -> None:
     """Retry deferred summaries promptly; refresh completed passes every 15m."""
     from drover.schema import backfill_agent_event_day_summary
+    from drover.server.lake.writer_gate import legacy_derived_write
 
     admission = MaintenanceAdmission(analytics_gate)
     while not stop.is_set():
@@ -587,7 +601,10 @@ def _backfill_day_summaries(
         try:
             with admission.admit() as admitted:
                 if admitted:
-                    summarised = backfill_agent_event_day_summary(duckdb_path)
+                    with legacy_derived_write(duckdb_path) as allowed:
+                        if not allowed:
+                            return
+                        summarised = backfill_agent_event_day_summary(duckdb_path)
                     if summarised:
                         log.info("summarised %d event partition(s)", summarised)
                 else:
@@ -981,6 +998,9 @@ def _parse_listen_address(value: str) -> tuple[str, int]:
     from drover.server.harness.cli import parse_listen_address
 
     return parse_listen_address(value)
+
+
+main.add_command(lake_cmd)
 
 
 @main.group(name="session")
@@ -2335,7 +2355,6 @@ def _run_api_role(
     metrics_host: str,
 ) -> None:
     """Run the public/control role without opening any analytical resource."""
-
     bootstrap_control_plane_store(cfg.duckdb_path)
     require_control_store_ready(cfg.duckdb_path)
     consent = CentralContentConsent(cfg.duckdb_path, legacy_config_path=config_path)
@@ -2529,6 +2548,9 @@ def run(
     _register_stack_dump()
     with _startup_phase("resolve_startup_config"):
         cfg = _resolve_config(ctx.obj["config_path"])
+    from drover.server.process_memory import configure_memory_guard
+
+    configure_memory_guard(cfg.memory)
     runtime_config_path = (
         Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     )
@@ -2587,14 +2609,23 @@ def run(
     # external SSD that blocked all-role startup for >10 minutes before MCP or
     # OTLP could bind. The analytical views are finalized after the network
     # surfaces are listening.
-    with _startup_phase("pin_analytical_connection"):
-        pin_analytical_connection(cfg.duckdb_path)
-    with _startup_phase("bootstrap_catalog_and_control_store"):
-        bootstrap(
-            parquet_dir=cfg.parquet_dir,
-            duckdb_path=cfg.duckdb_path,
-            bind_parquet_views=False,
-        )
+    from drover.server.lake.writer_gate import activate_retirement
+
+    if cfg.analytics.retire_legacy_writers:
+        # Existing PG and a fully verified catalog are prerequisites; startup
+        # does not rebuild or migrate either store.
+        with _startup_phase("activate_legacy_writer_retirement"):
+            require_control_store_ready(cfg.duckdb_path)
+            activate_retirement(cfg.duckdb_path)
+    else:
+        with _startup_phase("pin_analytical_connection"):
+            pin_analytical_connection(cfg.duckdb_path)
+        with _startup_phase("bootstrap_catalog_and_control_store"):
+            bootstrap(
+                parquet_dir=cfg.parquet_dir,
+                duckdb_path=cfg.duckdb_path,
+                bind_parquet_views=False,
+            )
     central_consent: CentralContentConsent | None = None
     if cfg.control_store.backend == "postgres":
         with _startup_phase("require_control_store_ready"):
@@ -2662,14 +2693,15 @@ def run(
     outbox_exporter: ControlOutboxExporter | None = None
     if cfg.control_store.backend == "postgres":
         try:
-            outbox_exporter = ControlOutboxExporter(
-                control_path=cfg.duckdb_path,
-                analytical_path=cfg.duckdb_path,
-                parquet_dir=cfg.parquet_dir,
-            )
             with _startup_phase("start_control_outbox_exporter"):
-                outbox_exporter.start(shutdown_event=stop)
-            log.info("control outbox exporter ready")
+                from drover.server.lake.lifecycle import selected_exporter
+
+                outbox_exporter = selected_exporter(cfg)
+                if outbox_exporter is None:
+                    log.info("DuckLake exporter disabled until explicit activation")
+                else:
+                    outbox_exporter.start(shutdown_event=stop)
+                    log.info("control outbox exporter ready")
         except Exception:  # noqa: BLE001 - control remains available, export lags
             log.exception("control outbox exporter failed to start")
             outbox_exporter = None
@@ -2819,7 +2851,12 @@ def run(
 
     def _finish_analytical_bootstrap() -> None:
         try:
-            bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+            from drover.server.lake.writer_gate import legacy_derived_write
+
+            with legacy_derived_write(cfg.duckdb_path) as allowed:
+                if not allowed:
+                    return
+                bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
             log.info("analytical Parquet views ready")
         except Exception:  # noqa: BLE001
             log.exception("analytical Parquet view bootstrap failed")

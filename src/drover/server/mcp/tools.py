@@ -144,6 +144,58 @@ def _connect(duckdb_path: Path) -> duckdb.DuckDBPyConnection:
     return open_duckdb_connection(duckdb_path, role="diagnostic")
 
 
+def _history_connect(path: Path):
+    from drover.server.lake.serving import open_history, selected_config
+
+    if selected_config(path).backend == "legacy":
+        return _connect(path)
+    return open_history(path)
+
+
+def _history_time_bound(path: Path, value: str) -> str:
+    """Preserve legacy host-local interpretation of naive SQL timestamp bounds.
+
+    The lake engine is UTC. Carry an explicit offset instead of changing the
+    authoritative legacy result around midnight or DST transitions.
+    """
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(path).backend == "ducklake":
+        parsed = _parse_datetime(value)
+        if parsed is not None and parsed.tzinfo is None:
+            return parsed.astimezone().isoformat()
+    return value
+
+
+def _canonical_read(function):
+    """A selected lake error is explicit unavailable, never a legacy retry."""
+    from functools import wraps
+
+    from drover.server.lake.runtime import LakeError
+    from drover.server.lake.serving import check_selected, selected_config
+
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        path = kwargs["duckdb_path"]
+        config = selected_config(path)
+        if config.backend == "legacy":
+            return function(*args, **kwargs)
+        try:
+            check_selected(path)
+            return function(*args, **kwargs)
+        except (LakeError, duckdb.Error, OSError) as exc:
+            return {
+                "status": "unavailable",
+                "analytics_backend": "ducklake",
+                "analytics_epoch": config.epoch,
+                "reason": (
+                    exc.code if isinstance(exc, LakeError) else "analytics_unavailable"
+                ),
+            }
+
+    return guarded
+
+
 def _row_to_dict(cursor: duckdb.DuckDBPyConnection) -> list[dict]:
     cols = [d[0] for d in cursor.description]
     return [
@@ -173,11 +225,11 @@ def _parse_datetime(value: Any) -> datetime | None:
     return None
 
 
-def _resolve(duckdb_path: Path, session_id: str) -> dict:
+def _resolve(duckdb_path: Path, session_id: str, *, history: bool = False) -> dict:
     from drover.server.memory_identity import resolve_session
 
     try:
-        con = _connect(duckdb_path)
+        con = _history_connect(duckdb_path) if history else _connect(duckdb_path)
         try:
             return resolve_session(con, session_id, store_path=duckdb_path)
         finally:
@@ -280,6 +332,32 @@ def _repo_summaries(
     through DuckDB instead -- the repo's ``tasks`` rows, and optionally the
     ``agent_event_day_summary`` session index -- and are fetched by id.
     """
+    from drover.server.lake.serving import HistoryConnection
+
+    if isinstance(con, HistoryConnection):
+        cursor = con.execute(
+            """SELECT session_id, task_id FROM agent_events
+            WHERE repo_owner=? AND repo_name=? AND (? IS NULL OR branch=?)
+            GROUP BY session_id,task_id ORDER BY max(timestamp) DESC LIMIT ?""",
+            [owner, name, branch, branch, _RECALL_SCOPE_LIMIT],
+        )
+        rows = cursor.fetchall()
+        found = repo.summaries(row[0] for row in rows if row[0])
+        for task in {row[1] for row in rows if row[1]}:
+            for summary in repo.recent_summaries(task_id=task, limit=limit):
+                found[summary.session_id] = summary
+        if branch is None:
+            for summary in repo.recent_summaries(
+                project_key=f"{owner}/{name}", limit=limit
+            ):
+                found[summary.session_id] = summary
+        return _newest_first(
+            [
+                summary
+                for summary in found.values()
+                if summary.session_id not in _PLACEHOLDER_SESSIONS
+            ]
+        )[:limit]
     limit = max(1, int(limit))
     # Each source may return a placeholder session that is dropped below.
     fetch = limit + len(_PLACEHOLDER_SESSIONS)
@@ -465,6 +543,7 @@ def drover_handoff(
 # --- drover_session_replay ----------------------------------------------------
 
 
+@_canonical_read
 def drover_session_replay(
     *,
     duckdb_path: Path,
@@ -472,11 +551,11 @@ def drover_session_replay(
     last_n_turns: int = 30,
     include_empty: bool = False,
 ) -> dict:
-    resolution = _resolve(duckdb_path, session_id)
+    resolution = _resolve(duckdb_path, session_id, history=True)
     if resolution["status"] != "ok":
         return resolution
     session_id = resolution["session_id"]
-    con = _connect(duckdb_path)
+    con = _history_connect(duckdb_path)
     try:
         where = ["session_id = ?"]
         params: list[Any] = [session_id]
@@ -505,12 +584,13 @@ def drover_session_replay(
 # --- drover_session_summary ---------------------------------------------------
 
 
+@_canonical_read
 def drover_session_summary(
     *,
     duckdb_path: Path,
     session_id: str,
 ) -> dict:
-    resolution = _resolve(duckdb_path, session_id)
+    resolution = _resolve(duckdb_path, session_id, history=True)
     if resolution["status"] != "ok":
         return resolution
     repo = _memory(duckdb_path)
@@ -572,6 +652,7 @@ def _utc_partition_date(since: str) -> str | None:
     return instant.astimezone(timezone.utc).date().isoformat()
 
 
+@_canonical_read
 def drover_search(
     *,
     duckdb_path: Path,
@@ -593,7 +674,7 @@ def drover_search(
     scans that can exhaust file descriptors. Pass `since` or a `repo`/`task_id`
     scope for explicit historical searches.
     """
-    resolution = _resolve(duckdb_path, session_id) if session_id else None
+    resolution = _resolve(duckdb_path, session_id, history=True) if session_id else None
     if resolution and resolution["status"] != "ok":
         return resolution
     scoped = bool(task_id or repo or since or session_id)
@@ -618,7 +699,7 @@ def drover_search(
         # and ' ' sorts before 'T': ISO-8601 bounds silently dropped 60 to 100
         # percent of matching events on the reference hub. Compare instants.
         where.append("TRY_CAST(timestamp AS TIMESTAMPTZ) >= CAST(? AS TIMESTAMPTZ)")
-        params.append(since)
+        params.append(_history_time_bound(duckdb_path, since))
     elif not scoped and default_since_days > 0:
         # Computed here and bound as parameters, not written as SQL over now().
         # The production view reads a list of per-partition globs, and an
@@ -643,7 +724,7 @@ def drover_search(
       ORDER BY timestamp DESC
       LIMIT {int(limit) + 1}
     """
-    con = _connect(duckdb_path)
+    con = _history_connect(duckdb_path)
     try:
         results = _row_to_dict(con.execute(sql, params))
     finally:
@@ -669,6 +750,7 @@ def drover_search(
 # --- drover_files_touched -----------------------------------------------------
 
 
+@_canonical_read
 def drover_files_touched(
     *,
     duckdb_path: Path,
@@ -683,14 +765,14 @@ def drover_files_touched(
     ``tool_use_blocks`` entries, and pulls ``input.file_path`` /
     ``input.path``.
     """
-    resolution = _resolve(duckdb_path, session_id) if session_id else None
+    resolution = _resolve(duckdb_path, session_id, history=True) if session_id else None
     if resolution and resolution["status"] != "ok":
         return resolution
     where = ["session_id = ?" if resolution else "task_id = ?"]
     params: list[Any] = [resolution["session_id"] if resolution else task_id]
     if since:
         where.append("timestamp >= ?")
-        params.append(since)
+        params.append(_history_time_bound(duckdb_path, since))
     sql = f"""
       WITH {canonical_agent_events_cte()}
       SELECT DISTINCT event_type, raw_data
@@ -698,7 +780,7 @@ def drover_files_touched(
       WHERE {" AND ".join(where)} AND raw_data IS NOT NULL AND raw_data <> '{{}}'
       LIMIT {int(limit) + 1}
     """
-    con = _connect(duckdb_path)
+    con = _history_connect(duckdb_path)
     try:
         rows = con.execute(sql, params).fetchall()
     finally:
@@ -721,6 +803,7 @@ def drover_files_touched(
 # --- drover_task_status -------------------------------------------------------
 
 
+@_canonical_read
 def drover_session_close(
     *,
     duckdb_path: Path,
@@ -735,13 +818,13 @@ def drover_session_close(
     ``already_failed``, ``suppressed`` (dead-letter streak cap) or
     ``unavailable`` (no PostgreSQL control store).
     """
-    resolution = _resolve(duckdb_path, session_id)
+    resolution = _resolve(duckdb_path, session_id, history=True)
     # A native SessionEnd hook can arrive before collector ingestion. Keep
     # accepting that intent, while known harness identities must map explicitly.
     if resolution["status"] in ("unmapped", "unavailable"):
         return resolution
     session_id = resolution["session_id"]
-    con = open_duckdb_connection(duckdb_path)
+    con = _history_connect(duckdb_path)
     try:
         source_version = source_version_for_session(con, session_id)
     finally:
@@ -757,6 +840,7 @@ def drover_session_close(
 # --- drover_project_brief -----------------------------------------------------
 
 
+@_canonical_read
 def drover_project_brief(
     *,
     duckdb_path: Path,
@@ -785,7 +869,7 @@ def drover_project_brief(
     if brief is None:
         return None
     row = _summary_row(brief, _BRIEF_KEYS)
-    con = _connect(duckdb_path)
+    con = _history_connect(duckdb_path)
     try:
         # Newest activity the brief could have missed: summaries of the repo's
         # sessions (ended or regenerated) and the tasks' own activity marker.
@@ -796,11 +880,19 @@ def drover_project_brief(
             candidates.extend(
                 [_as_utc(summary.ended_at), _as_utc(summary.generated_at)]
             )
-        task_latest = con.execute(
-            """SELECT MAX(TRY_CAST(last_activity_at AS TIMESTAMP))
-                 FROM tasks WHERE repo_owner = ? AND repo_name = ?""",
-            [owner, name],
-        ).fetchone()
+        from drover.server.lake.serving import selected_config
+
+        if selected_config(duckdb_path).backend == "ducklake":
+            task_latest = con.execute(
+                "SELECT max(timestamp) FROM agent_events WHERE repo_owner=? AND repo_name=?",
+                [owner, name],
+            ).fetchone()
+        else:
+            task_latest = con.execute(
+                """SELECT MAX(TRY_CAST(last_activity_at AS TIMESTAMP))
+                     FROM tasks WHERE repo_owner = ? AND repo_name = ?""",
+                [owner, name],
+            ).fetchone()
         candidates.append(_as_utc(task_latest[0]) if task_latest else None)
     finally:
         con.close()
@@ -840,6 +932,7 @@ def drover_project_brief(
 # --- drover_recent_sessions ---------------------------------------------------
 
 
+@_canonical_read
 def drover_recent_sessions(
     *,
     duckdb_path: Path,
@@ -865,7 +958,7 @@ def drover_recent_sessions(
     repo = _memory(duckdb_path)
     sessions: list[dict] = []
     if repo is not None:
-        con = _connect(duckdb_path)
+        con = _history_connect(duckdb_path)
         try:
             # session_memory.project_key first, then the task link, then the
             # day-summary index so unlinked summaries still surface.
@@ -901,6 +994,20 @@ _CONTEXT_CONTAINER_COLUMNS = """
 """
 
 
+def _selected_context(path, *, limit, **options):
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(path).backend == "ducklake":
+        from drover.server.lake.read_models import read_model
+
+        result = read_model(path, "contexts", limit=limit, **options)
+        if options.get("mode") == "brief" and result.get("status") != "unavailable":
+            return result["context"]
+        return result
+    return None
+
+
+@_canonical_read
 def drover_recent_contexts(
     *,
     duckdb_path: Path,
@@ -922,6 +1029,14 @@ def drover_recent_contexts(
         where.append("source_harness = ?")
         params.append(source_harness)
     sql_where = f"WHERE {' AND '.join(where)}" if where else ""
+    selected = _selected_context(
+        duckdb_path,
+        limit=limit,
+        container_type=container_type,
+        source_harness=source_harness,
+    )
+    if selected is not None:
+        return selected
     con = _connect(duckdb_path)
     try:
         rows = _row_to_dict(
@@ -939,6 +1054,7 @@ def drover_recent_contexts(
     return {"contexts": rows, "limit": int(limit)}
 
 
+@_canonical_read
 def drover_context_brief(
     *,
     duckdb_path: Path,
@@ -950,6 +1066,12 @@ def drover_context_brief(
         raise ValueError("context_brief: need context_id or label")
     predicate = "context_id = ?" if context_id else "label = ?"
     value = context_id or label
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        return _selected_context(
+            duckdb_path, limit=1, mode="brief", context_id=context_id, label=label
+        )
     con = _connect(duckdb_path)
     try:
         rows = _row_to_dict(
@@ -967,6 +1089,7 @@ def drover_context_brief(
     return rows[0] if rows else None
 
 
+@_canonical_read
 def drover_open_loops(
     *,
     duckdb_path: Path,
@@ -991,6 +1114,15 @@ def drover_open_loops(
             raise ValueError("open_loops: project_key must be one <owner>/<name> pair")
         where.extend(["repo_owner = ?", "repo_name = ?"])
         params.extend([owner, name])
+    selected = _selected_context(
+        duckdb_path,
+        limit=limit,
+        mode="loops",
+        container_type=container_type,
+        project_key=project_key,
+    )
+    if selected is not None:
+        return selected
     con = _connect(duckdb_path)
     try:
         rows = _row_to_dict(
@@ -1008,6 +1140,7 @@ def drover_open_loops(
     return {"open_loops": rows, "limit": int(limit)}
 
 
+@_canonical_read
 def drover_resume_context(
     *,
     duckdb_path: Path,
@@ -1016,11 +1149,34 @@ def drover_resume_context(
     max_summaries: int = 5,
 ) -> Optional[dict]:
     """Return a resumable context container plus linked session summaries."""
+    from drover.server.lake.coverage import read_fence
+
+    with read_fence(duckdb_path):
+        return _resume_context(
+            duckdb_path=duckdb_path,
+            context_id=context_id,
+            label=label,
+            max_summaries=max_summaries,
+        )
+
+
+def _resume_context(*, duckdb_path, context_id, label, max_summaries):
+    from drover.server.lake.runtime import LakeError
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake" and (
+        type(max_summaries) is not int or not 1 <= max_summaries <= 1000
+    ):
+        raise LakeError("analytics_row_limit_exceeded")
+    if not (context_id or label):
+        raise ValueError("context_brief: need context_id or label")
     container = drover_context_brief(
         duckdb_path=duckdb_path, context_id=context_id, label=label
     )
     if not container:
         return None
+    if container.get("status") == "unavailable":
+        return container
     session_ids = container.get("session_ids") or []
     summaries: list[dict] = []
     repo = _memory(duckdb_path) if session_ids else None
@@ -1029,7 +1185,15 @@ def drover_resume_context(
             _summary_row(s, _RESUME_SUMMARY_KEYS)
             for s in repo.recent_summaries(session_ids=session_ids, limit=max_summaries)
         ]
-    return {"context": container, "session_summaries": summaries}
+    result = {"context": container, "session_summaries": summaries}
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        from drover.server.lake.coverage import bounded
+
+        bounded(summaries)
+        bounded(result)
+    return result
 
 
 # --- drover_project_activity --------------------------------------------------
@@ -1048,6 +1212,7 @@ def _activity_days(since: Optional[str], days: Optional[int], now: datetime) -> 
     return max(1, min(PROJECT_ACTIVITY_MAX_DAYS, int(days or 7)))
 
 
+@_canonical_read
 def drover_project_activity(
     *,
     duckdb_path: Path,
@@ -1067,6 +1232,19 @@ def drover_project_activity(
     """
     now = datetime.now(timezone.utc)
     window_days = _activity_days(since, days, now)
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        from drover.server.lake.read_models import read_model
+
+        return read_model(
+            duckdb_path,
+            "project_activity",
+            project_key=project_key,
+            days=window_days,
+            now=now.isoformat(),
+            max_sessions=int(limit),
+        )
     con = _connect(duckdb_path)
     try:
         with attached_control_plane_snapshot(con, duckdb_path):
@@ -1085,6 +1263,7 @@ def drover_project_activity(
 # --- drover_fleet_status ------------------------------------------------------
 
 
+@_canonical_read
 def drover_fleet_status(
     *,
     duckdb_path: Path,
@@ -1206,6 +1385,7 @@ def _recall_row(
     }
 
 
+@_canonical_read
 def drover_recall(
     *,
     duckdb_path: Path,
@@ -1249,7 +1429,7 @@ def drover_recall(
             raise EmbeddingMismatch(
                 f"query model {query_embedding_model!r} does not match hub model {embedding_model!r}"
             )
-    resolution = _resolve(duckdb_path, session_id) if session_id else None
+    resolution = _resolve(duckdb_path, session_id, history=True) if session_id else None
     if resolution and resolution["status"] != "ok":
         return resolution
     if not query_embedding and not query:
@@ -1275,7 +1455,7 @@ def drover_recall(
         else None
     )
     if repo_owner and repo_name:
-        con = _connect(duckdb_path)
+        con = _history_connect(duckdb_path)
         try:
             repo_scope = {
                 s.session_id
@@ -1359,12 +1539,36 @@ def drover_active_handoff(
         return _missing(resolution)
 
 
+@_canonical_read
 def drover_task_status(
     *,
     duckdb_path: Path,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> dict:
+    from drover.server.lake.serving import selected_config
+
+    if selected_config(duckdb_path).backend == "ducklake":
+        from drover.server.lake.task_projection import task_status
+
+        out = task_status(duckdb_path, task_id=task_id, session_id=session_id)
+        if out["status"] == "unknown":
+            return out
+        import psycopg
+
+        from drover.server.lake.runtime import LakeError
+
+        try:
+            repo = _memory(duckdb_path)
+            summaries = (
+                repo.recent_summaries(task_id=out["task_id"], limit=1) if repo else []
+            )
+        except psycopg.Error:
+            raise LakeError("analytics_task_summary_unavailable") from None
+        out["latest_summary"] = (
+            _summary_row(summaries[0], _TASK_SUMMARY_KEYS) if summaries else None
+        )
+        return out
     if session_id:
         resolution = _resolve(duckdb_path, session_id)
         if resolution["status"] != "ok":

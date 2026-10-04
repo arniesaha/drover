@@ -120,7 +120,10 @@ class CockpitService:
 
     def overview(self, filters: AnalyticsFilters) -> dict[str, Any]:
         if self.duckdb_path is not None:
-            require_analytical_store(self.duckdb_path)
+            from drover.server.lake.serving import selected_config
+
+            if selected_config(self.duckdb_path).backend == "legacy":
+                require_analytical_store(self.duckdb_path)
         provider_capacity = self._provider_capacity(filters)
         activity = self._activity(filters)
         projects = []
@@ -140,7 +143,10 @@ class CockpitService:
 
     def analytics(self, filters: AnalyticsFilters) -> dict[str, Any]:
         if self.duckdb_path is not None:
-            require_analytical_store(self.duckdb_path)
+            from drover.server.lake.serving import selected_config
+
+            if selected_config(self.duckdb_path).backend == "legacy":
+                require_analytical_store(self.duckdb_path)
         return {
             "cockpit_api_version": COCKPIT_API_VERSION,
             "filters": asdict(filters),
@@ -271,6 +277,46 @@ class CockpitService:
         return section
 
     def _activity(self, filters: AnalyticsFilters) -> dict[str, Any]:
+        from drover.server.lake.serving import selected_config
+
+        if (
+            self.duckdb_path is not None
+            and selected_config(self.duckdb_path).backend == "ducklake"
+        ):
+            from drover.server.lake.read_models import read_model
+            from drover.server.lake.runtime import LakeError
+
+            try:
+                if self.spans_enabled:
+                    raise LakeError("analytics_lake_spans_unavailable")
+                data = read_model(
+                    self.duckdb_path,
+                    "cockpit",
+                    filters=asdict(filters),
+                    cursor_secret=self._cursor_secret.hex(),
+                )
+                return _section(
+                    "ok",
+                    data=data,
+                    coverage=data["coverage"],
+                    observed_at=data["metadata"]["observed_at"],
+                )
+            except Exception as exc:
+                if isinstance(exc, LakeError) and exc.code == "snapshot_changed":
+                    from drover.server.cockpit.analytics import (
+                        AnalyticsSnapshotChangedError,
+                    )
+
+                    raise AnalyticsSnapshotChangedError() from exc
+                log.warning("lake activity unavailable: %s", type(exc).__name__)
+                return {
+                    **_section("unavailable", data=None, coverage=None),
+                    "reason": (
+                        exc.code
+                        if isinstance(exc, LakeError)
+                        else "analytics_unavailable"
+                    ),
+                }
         cache_key = asdict(filters)
         now = time.monotonic()
         with self._activity_lock:
