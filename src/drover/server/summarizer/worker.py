@@ -122,6 +122,11 @@ def _classify_failure(exc: BaseException) -> tuple[bool, str]:
     return True, category
 
 
+# Limit on the number of raw agent events retrieved per session for summarization
+# to bound memory usage and processing time for pathological sessions with extreme verbosity.
+MAX_RAW_EVENTS_PER_SESSION = 25000
+
+
 class SummarizerWorker:
     def __init__(
         self,
@@ -285,7 +290,7 @@ class SummarizerWorker:
             )
             return "released"
         except Exception as exc:  # noqa: BLE001
-            log.warning("summarize %s failed: %s", session_id, exc)
+            log.exception("summarize %s failed: %s", session_id, exc)
             return self._finish_failure(ledger, job, exc)
 
         if not written:
@@ -341,23 +346,24 @@ class SummarizerWorker:
             tool_events = []
             last_timestamp = None
             last_id = None
-            overall_limit = 25000
-            for _ in range(overall_limit // 1000):
+            last_dedup_key = None
+            last_raw_hash = None
+            for _ in range(MAX_RAW_EVENTS_PER_SESSION // 1000):
                 if last_timestamp is None:
                     cur = con.execute(
                         f"""WITH {_session_agent_events_ctes()}
-                        SELECT event_type, raw_data, timestamp, id FROM canonical_agent_events
+                        SELECT event_type, raw_data, timestamp, id, coalesce(dedup_key, '') AS _dedup_key, hash(raw_data) AS _raw_hash FROM canonical_agent_events
                         WHERE raw_data IS NOT NULL
-                        ORDER BY timestamp, id LIMIT 1000""",
+                        ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT 1000""",
                         [session_id],
                     )
                 else:
                     cur = con.execute(
                         f"""WITH {_session_agent_events_ctes()}
-                        SELECT event_type, raw_data, timestamp, id FROM canonical_agent_events
-                        WHERE raw_data IS NOT NULL AND (timestamp > ? OR (timestamp = ? AND id > ?))
-                        ORDER BY timestamp, id LIMIT 1000""",
-                        [session_id, last_timestamp, last_timestamp, last_id],
+                        SELECT event_type, raw_data, timestamp, id, coalesce(dedup_key, '') AS _dedup_key, hash(raw_data) AS _raw_hash FROM canonical_agent_events
+                        WHERE raw_data IS NOT NULL AND (timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data)) > (?, ?, ?, ?)
+                        ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT 1000""",
+                        [session_id, last_timestamp, last_id or '', last_dedup_key or '', last_raw_hash],
                     )
 
                 cols = [d[0] for d in cur.description]
@@ -368,6 +374,10 @@ class SummarizerWorker:
                 tool_events.extend(chunk)
                 last_timestamp = chunk[-1]["timestamp"]
                 last_id = chunk[-1]["id"]
+                last_dedup_key = chunk[-1]["_dedup_key"]
+                last_raw_hash = chunk[-1]["_raw_hash"]
+            else:
+                log.warning("Truncated session %s to %d raw events for summarization", session_id, MAX_RAW_EVENTS_PER_SESSION)
         finally:
             con.close()
 
