@@ -43,12 +43,15 @@ def process_rss(pid: int) -> int:
     if os.path.exists(f"/proc/{pid}/statm"):
         with open(f"/proc/{pid}/statm") as stream:
             return int(stream.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-    result = subprocess.run(
-        ["ps", "-o", "rss=", "-p", str(pid)],
-        capture_output=True,
-        check=True,
-        timeout=0.25,
-    )
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True,
+            check=True,
+            timeout=0.25,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise OSError(exc.returncode, "process RSS unavailable") from exc
     return int(result.stdout.strip()) * 1024
 
 
@@ -123,7 +126,7 @@ class ProcessMemoryGuard:
 
     def stop(self):
         self._stop.set()
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=1)
 
     def child_started(self, pid):
