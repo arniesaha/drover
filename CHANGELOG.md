@@ -143,6 +143,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex shell edits now contribute to `files_touched`: each turn records
+  Git commit paths and outstanding worktree changes in the normalized event
+  stream, including clean committed turns and edits subsequently reverted
+  within a turn (#492). Existing summaries need new source evidence and
+  regeneration; this does not backfill historical sessions automatically.
+
 - The Agy model catalog works with agy 1.2.11, which no longer writes
   `google_accounts.json`. Sign-in and the catalog's account scope now come
   from the same Keychain/file credential reader the usage probe uses (identity
