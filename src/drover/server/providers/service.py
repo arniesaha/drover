@@ -28,7 +28,7 @@ from drover.server.providers.types import (
 )
 
 FetchProviderUsage = Callable[[Any], Mapping[str, Any]]
-_SUCCESS_STATUSES = frozenset({"ok", "usage_unavailable"})
+_SUCCESS_STATUSES = frozenset({"ok", "usage_unavailable", "observed_exhausted"})
 
 
 def provider_operational_source_version(duckdb_path: str | Path, host_id: str) -> str:
@@ -314,6 +314,18 @@ class ProviderUsageService:
                     status=status,
                     error_category=connection.get("error_category"),
                 )
+            elif base.status == "observed_exhausted":
+                exhaustion_resets = [
+                    w.resets_at
+                    for w in base.windows
+                    if w.resets_at is not None and w.used_percent == 100.0
+                ]
+                if exhaustion_resets and max(exhaustion_resets) <= now:
+                    base = replace(
+                        base,
+                        status="stale",
+                        error_category="provider_window_expired",
+                    )
             elif (
                 base.status in _SUCCESS_STATUSES
                 and freshness_age_seconds > self.freshness_threshold_seconds

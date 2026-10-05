@@ -58,16 +58,19 @@ class AgyDriver:
         cwd: str | None,
         emit: EmitFn,
         native_session_id: str | None = None,
+        host_id: str = "local",
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.emit = emit
         self.native_session_id = native_session_id
+        self.host_id = host_id
         self._turn_lock = threading.Lock()
         self._turn_active = False
         self._turn_process: subprocess.Popen[str] | None = None
         self._turn_thread: threading.Thread | None = None
         self._closed = False
+        self._turn_model: str | None = None
 
     def start(self) -> None:
         self.emit(
@@ -137,6 +140,7 @@ class AgyDriver:
                 raise RuntimeError("turn already in flight")
             if self._closed:
                 raise RuntimeError("driver is closed")
+            self._turn_model = model
             process = subprocess.Popen(
                 self._argv_for(text, model=model),
                 cwd=self.cwd,
@@ -172,6 +176,29 @@ class AgyDriver:
             command.extend(["--print-timeout", AGY_PRINT_TIMEOUT])
         command.extend(["--output-format", "stream-json", "--print", text])
         return command
+
+    def _check_and_record_exhaustion(
+        self,
+        stderr_text: str,
+        reported_status: str | None,
+        error_text: str,
+    ) -> None:
+        from drover.server.providers.agy import (
+            model_group_from_model,
+            parse_agy_quota_exhaustion,
+            record_observed_exhaustion,
+        )
+
+        for candidate in (stderr_text, reported_status or "", error_text):
+            reset_time = parse_agy_quota_exhaustion(candidate)
+            if reset_time is not None:
+                group = model_group_from_model(self._turn_model, hint_text=candidate)
+                record_observed_exhaustion(
+                    host_id=self.host_id,
+                    model_group=group,
+                    resets_at=reset_time,
+                )
+                break
 
     def _run_turn(self, process: subprocess.Popen[str], turn_id: str) -> None:
         stderr_lines: list[str] = []
@@ -254,15 +281,19 @@ class AgyDriver:
                 saw_result,
                 reported_status or "none",
             )
-            self.emit(
-                self.parse_error(
-                    returncode,
-                    "\n".join(stderr_lines),
-                    turn_id=turn_id,
-                    after_turn_complete=saw_result,
-                    reported_status=reported_status,
-                )
+            err_msg = self.parse_error(
+                returncode,
+                "\n".join(stderr_lines),
+                turn_id=turn_id,
+                after_turn_complete=saw_result,
+                reported_status=reported_status,
             )
+            self._check_and_record_exhaustion(
+                stderr_text="\n".join(stderr_lines),
+                reported_status=reported_status,
+                error_text=err_msg.text,
+            )
+            self.emit(err_msg)
             self.emit(
                 StructuredMessage(
                     type="status",
@@ -359,6 +390,14 @@ class AgyDriver:
             conv_id = res.get("conversation_id")
             if conv_id:
                 self.native_session_id = str(conv_id)
+            status_val = res.get("status")
+            error_val = res.get("error")
+            if status_val in ("ERROR", "AGY_ERROR", "RESOURCE_EXHAUSTED") or error_val:
+                self._check_and_record_exhaustion(
+                    stderr_text="",
+                    reported_status=str(status_val or ""),
+                    error_text=str(error_val or res),
+                )
             return [
                 StructuredMessage(
                     type="status",
@@ -406,6 +445,12 @@ class AgyDriver:
         tail = _tail(stderr_text, _STDERR_TAIL_LINES)
         if tail:
             text = tail
+        elif reported_status and (
+            "RESOURCE_EXHAUSTED" in reported_status
+            or "quota reached" in reported_status.lower()
+            or "Resets in" in reported_status
+        ):
+            text = reported_status
         elif after_turn_complete:
             text = f"agy exited with code {returncode} after completing the turn"
             if reported_status:

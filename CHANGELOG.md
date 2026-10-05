@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-10-04
+
+### Fixed
+
+- Antigravity Claude/GPT quota no longer reports a false 100% remaining. Buckets
+  whose reset time slides with every fetch are omitted, and real agy 429
+  "Individual quota reached" errors are recorded per host and model group as
+  `observed_exhausted` until the reported reset (#522, #527).
+
+### Added
+
+- MCP tool `drover_provider_quota`: per-account quota windows (used %, reset,
+  status, source) with a bounded `fresh` re-probe, masked account labels and a
+  compact `routing_hint` (#523, #528).
+
 ## [0.5.6] - 2026-10-04
 
 ### Fixed

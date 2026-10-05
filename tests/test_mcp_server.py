@@ -56,6 +56,8 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
         "drover_pipeline_observatory",
         # Rolling handoff brief for OPEN sessions:
         "drover_active_handoff",
+        # Provider capacity and quota with routing hint:
+        "drover_provider_quota",
     }
     assert server.settings.host == "127.0.0.1"
 
@@ -154,3 +156,18 @@ def test_recall_bundle_returns_hub_context(
     assert result["limits"]["effective_limit"] == 5
     assert result["limits"]["effective_max_context_chars"] == 24_000
     assert result["limits"]["used_chars"] <= 24_000
+
+
+def test_provider_quota_registered_tool(tmp_path: Path) -> None:
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "nexus.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    server = build_mcp_server(duckdb_path=duckdb_path)
+
+    result = _call_registered_tool(server, "drover_provider_quota", {})
+
+    assert "accounts" in result
+    assert "routing_hint" in result
+    assert result["routing_hint"] == "no provider accounts configured"
+    assert result["store"] == "hub"
+    assert "data_watermark" in result

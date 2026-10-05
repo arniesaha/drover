@@ -48,6 +48,7 @@ READ_CAPS = {
         "fleet_status": 100,
         "data_quality": 100,
         "pipeline_observatory": 20,
+        "provider_quota": 50,
     }.items()
 }
 _LIMIT_ARGS = {

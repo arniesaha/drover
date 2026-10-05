@@ -30,6 +30,7 @@ cap; the entire serialized response has a 65,536 byte cap.
 | drover_fleet_status | 100 |
 | drover_data_quality | 100 |
 | drover_pipeline_observatory | 20 |
+| drover_provider_quota | 50 |
 
 Existing narrower bundle/activity limits still apply. Project Activity's detailed
 truncation flags move to `truncation_details`; `truncated` is now a boolean.

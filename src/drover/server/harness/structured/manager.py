@@ -55,6 +55,8 @@ class _Entry:
         # key is supplied by an untrusted client.
         self.accepted_client_turns: OrderedDict[str, str] = OrderedDict()
         self.emit: Callable[[StructuredMessage], None] | None = None
+        self.model: str | None = None
+        self.host_id: str | None = None
 
 
 class StructuredSessionManager:
@@ -230,6 +232,43 @@ class StructuredSessionManager:
                 ):
                     with entry.turn_lock:
                         entry.turn_active = False
+                if entry.harness == "agy" and message.type in ("error", "status"):
+                    from drover.server.providers.agy import (
+                        model_group_from_model,
+                        parse_agy_quota_exhaustion,
+                        record_observed_exhaustion,
+                    )
+
+                    reset_time = parse_agy_quota_exhaustion(message.text or "")
+                    if reset_time is None and isinstance(payload, dict):
+                        for val in payload.values():
+                            if isinstance(val, str):
+                                reset_time = parse_agy_quota_exhaustion(val)
+                                if reset_time is not None:
+                                    break
+                    if reset_time is not None:
+                        # Best effort: a quota observation must never break
+                        # event delivery. The host id has to match the one
+                        # harnessd's /providers/usage reads with, so it comes
+                        # from the session row, never a "local" default.
+                        try:
+                            host = entry.host_id
+                            model_name = entry.model
+                            if not host or not model_name:
+                                sess = registry.get_session(session_id)
+                                if sess is not None:
+                                    host = host or sess.host_id
+                                    model_name = model_name or sess.model
+                            if host:
+                                record_observed_exhaustion(
+                                    host_id=host,
+                                    model_group=model_group_from_model(
+                                        model_name, hint_text=message.text
+                                    ),
+                                    resets_at=reset_time,
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
                 awaiting = entry.awaiting
                 event_payload = message.to_payload()
                 event_payload["seq"] = seq
@@ -455,6 +494,8 @@ class StructuredSessionManager:
                 if entry.turn_active:
                     raise RuntimeError("turn already in flight")
                 entry.turn_active = True
+        if model:
+            entry.model = model
         turn_id = client_turn_id or f"turn-{uuid4()}"
         # Dispatch first: Codex/Agy raise RuntimeError here ("turn already in
         # flight" / "driver is closed") when a turn cannot be accepted, and

@@ -7,6 +7,7 @@ import json
 import logging
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,14 @@ from drover.server.harness.structured.agy import (
     default_command,
     resume_command,
 )
-from drover.server.providers.agy import AgyUsageProbe
+from drover.server.providers.agy import (
+    AgyUsageProbe,
+    clear_observed_exhaustions,
+    get_active_observed_exhaustions,
+    model_group_from_model,
+    parse_agy_quota_exhaustion,
+    record_observed_exhaustion,
+)
 
 FAKE_AGY = (
     "import json,sys; args=sys.argv[1:]; "
@@ -729,3 +737,331 @@ def test_id_token_subject_is_hashed_when_email_is_absent(tmp_path: Path):
         == "google-sub:" + hashlib.sha256(b"google-user-id").hexdigest()
     )
     assert snapshot.account_label == "Unknown account"
+
+
+def test_parse_agy_quota_exhaustion_durations():
+    base = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+    # h m s
+    res = parse_agy_quota_exhaustion(
+        "Individual quota reached for Claude Sonnet 3.5. Resets in 162h52m18s",
+        now=base,
+    )
+    assert res == base + timedelta(hours=162, minutes=52, seconds=18)
+
+    # 5h
+    res = parse_agy_quota_exhaustion(
+        "RESOURCE_EXHAUSTED: Individual quota reached. Resets in 5h",
+        now=base,
+    )
+    assert res == base + timedelta(hours=5)
+
+    # 30m
+    res = parse_agy_quota_exhaustion(
+        "Individual quota reached ... Resets in 30m",
+        now=base,
+    )
+    assert res == base + timedelta(minutes=30)
+
+    # 45s
+    res = parse_agy_quota_exhaustion("Resets in 45s", now=base)
+    assert res == base + timedelta(seconds=45)
+
+    # 2h15m30s
+    res = parse_agy_quota_exhaustion("Quota exceeded. Resets in 2h15m30s", now=base)
+    assert res == base + timedelta(hours=2, minutes=15, seconds=30)
+
+    # Negative / non-matching
+    assert parse_agy_quota_exhaustion("Regular error message", now=base) is None
+    assert (
+        parse_agy_quota_exhaustion("RESOURCE_EXHAUSTED without time", now=base) is None
+    )
+    assert parse_agy_quota_exhaustion("", now=base) is None
+
+
+def test_model_group_from_model():
+    assert model_group_from_model("claude-sonnet-4") == "3p"
+    assert model_group_from_model("claude-3-5-sonnet") == "3p"
+    assert model_group_from_model("gpt-4o") == "3p"
+    assert model_group_from_model("gpt-4o-mini") == "3p"
+    assert model_group_from_model("gemini-2.5-pro") == "gemini"
+    assert model_group_from_model("gemini-1.5-flash") == "gemini"
+    assert model_group_from_model(None) == "gemini"
+    assert model_group_from_model("custom-model") == "gemini"
+
+
+def test_sliding_response_omits_untracked_buckets(tmp_path: Path):
+    """Buckets whose resetTime slides with fetch_time + window are omitted."""
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com"}))
+
+    fetch_time = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+    # Sliding weekly bucket: resetTime is fetch_time + 7 days (within 120s tolerance)
+    sliding_weekly_reset = fetch_time + timedelta(days=7, seconds=10)
+    # Sliding 5h bucket: resetTime is fetch_time + 5h (within 120s tolerance)
+    sliding_5h_reset = fetch_time + timedelta(hours=5, seconds=5)
+    # Fixed gemini weekly bucket: resetTime is fixed (e.g. 4 days from now)
+    fixed_gemini_reset = fetch_time + timedelta(days=4)
+
+    payload = {
+        "groups": [
+            {
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-weekly",
+                        "window": "weekly",
+                        "resetTime": fixed_gemini_reset.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "remainingFraction": 0.85,
+                    }
+                ],
+            },
+            {
+                "displayName": "Claude and GPT models",
+                "buckets": [
+                    {
+                        "bucketId": "3p-weekly",
+                        "window": "weekly",
+                        "resetTime": sliding_weekly_reset.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                        "remainingFraction": 1,
+                    },
+                    {
+                        "bucketId": "3p-5h",
+                        "window": "5h",
+                        "resetTime": sliding_5h_reset.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "remainingFraction": 1,
+                    },
+                ],
+            },
+        ]
+    }
+
+    calls: list = []
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts,
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=_opener(calls, payload=payload),
+        now=lambda: fetch_time,
+    ).read()
+
+    assert snapshot.status == "ok"
+    # Sliding 3p buckets must be omitted, never reported as 100% remaining (0% used)
+    kinds = {w.kind: w for w in snapshot.windows}
+    assert "seven_day" in kinds
+    assert "seven_day_claude_gpt" not in kinds
+    assert "five_hour_claude_gpt" not in kinds
+    assert kinds["seven_day"].used_percent == pytest.approx(15.0)
+
+
+def test_sliding_response_with_no_fixed_buckets_is_usage_unavailable(tmp_path: Path):
+    """When all buckets in response slide, status is usage_unavailable."""
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com"}))
+
+    fetch_time = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+    sliding_weekly_reset = fetch_time + timedelta(days=7)
+
+    payload = {
+        "groups": [
+            {
+                "displayName": "Claude and GPT models",
+                "buckets": [
+                    {
+                        "bucketId": "3p-weekly",
+                        "window": "weekly",
+                        "resetTime": sliding_weekly_reset.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                        "remainingFraction": 1,
+                    }
+                ],
+            }
+        ]
+    }
+
+    calls: list = []
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts,
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=_opener(calls, payload=payload),
+        now=lambda: fetch_time,
+    ).read()
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.windows == ()
+    assert snapshot.error_category == "quota_api_unreachable"
+
+
+def test_observed_exhaustion_snapshot_and_expiry(tmp_path: Path):
+    """Observed exhaustion marks status observed_exhausted, source observed_429 until reset."""
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com"}))
+
+    clear_observed_exhaustions()
+    try:
+        t0 = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+        reset_time = t0 + timedelta(hours=2)
+
+        record_observed_exhaustion(
+            host_id="test-host",
+            model_group="3p",
+            resets_at=reset_time,
+            observed_at=t0,
+        )
+
+        calls: list = []
+        probe = AgyUsageProbe(
+            accounts_path=accounts,
+            state_dir=tmp_path,
+            keychain_reader=lambda: _cred(),
+            opener=_opener(calls, payload={"groups": []}),
+            now=lambda: t0 + timedelta(minutes=15),
+        )
+
+        # Before reset passes: status is observed_exhausted, source observed_429
+        snap1 = probe.read(host_id="test-host")
+        assert snap1.status == "observed_exhausted"
+        assert snap1.source == "observed_429"
+        assert snap1.error_category is None
+        kinds = {w.kind: w for w in snap1.windows}
+        assert "five_hour_claude_gpt" in kinds
+        assert kinds["five_hour_claude_gpt"].used_percent == 100.0
+        assert kinds["five_hour_claude_gpt"].resets_at == reset_time
+
+        # Another host is unaffected
+        snap_other = probe.read(host_id="other-host")
+        assert snap_other.status == "usage_unavailable"
+        assert snap_other.source == "agy-usage"
+
+        # After reset passes: status reverts to normal probe status
+        probe.now = lambda: t0 + timedelta(hours=2, minutes=1)
+        snap2 = probe.read(host_id="test-host")
+        assert snap2.status == "usage_unavailable"
+        assert snap2.source == "agy-usage"
+    finally:
+        clear_observed_exhaustions()
+
+
+def test_gemini_unaffected_by_3p_exhaustion(tmp_path: Path):
+    """Gemini quota windows remain accurate when 3p is observed exhausted."""
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com"}))
+
+    clear_observed_exhaustions()
+    try:
+        t0 = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+        gemini_reset = t0 + timedelta(hours=3)
+        claude_reset = t0 + timedelta(hours=162)
+
+        gemini_payload = {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-5h",
+                            "window": "5h",
+                            "resetTime": gemini_reset.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "remainingFraction": 0.75,
+                        }
+                    ],
+                }
+            ]
+        }
+
+        record_observed_exhaustion(
+            host_id="test-host",
+            model_group="3p",
+            resets_at=claude_reset,
+            observed_at=t0,
+        )
+
+        calls: list = []
+        snap = AgyUsageProbe(
+            accounts_path=accounts,
+            state_dir=tmp_path,
+            keychain_reader=lambda: _cred(),
+            opener=_opener(calls, payload=gemini_payload),
+            now=lambda: t0,
+        ).read(host_id="test-host")
+
+        assert snap.status == "observed_exhausted"
+        assert snap.source == "observed_429"
+        kinds = {w.kind: w for w in snap.windows}
+        # Gemini 5h window is preserved with its 25% used
+        assert kinds["five_hour"].used_percent == pytest.approx(25.0)
+        assert kinds["five_hour"].resets_at == gemini_reset
+        # Claude weekly window is injected at 100% used
+        assert kinds["seven_day_claude_gpt"].used_percent == 100.0
+        assert kinds["seven_day_claude_gpt"].resets_at == claude_reset
+    finally:
+        clear_observed_exhaustions()
+
+
+def test_driver_check_and_record_exhaustion():
+    """AgyDriver records observed exhaustion for host and model group on 429 error."""
+    clear_observed_exhaustions()
+    try:
+        driver = AgyDriver(["agy"], None, lambda _: None, host_id="host-xyz")
+        driver._turn_model = "claude-3-5-sonnet"
+
+        driver._check_and_record_exhaustion(
+            stderr_text="",
+            reported_status="AGY_ERROR RESOURCE_EXHAUSTED",
+            error_text="Individual quota reached for Claude 3.5 Sonnet. Resets in 162h52m18s",
+        )
+
+        active = get_active_observed_exhaustions(host_id="host-xyz")
+        assert len(active) == 1
+        assert active[0].host_id == "host-xyz"
+        assert active[0].model_group == "3p"
+        assert active[0].resets_at > datetime.now(timezone.utc) + timedelta(hours=160)
+    finally:
+        clear_observed_exhaustions()
+
+
+def test_consumed_bucket_with_fresh_window_is_kept(tmp_path: Path):
+    """A Gemini bucket used moments after its window opened has reset ~= now +
+    window too, but it is tracking: only untouched buckets count as sliding."""
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com"}))
+    fetch_time = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+    payload = {
+        "groups": [
+            {
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-5h",
+                        "window": "5h",
+                        "resetTime": (fetch_time + timedelta(hours=5)).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                        "remainingFraction": 0.98,
+                    }
+                ],
+            }
+        ]
+    }
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts,
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=_opener([], payload=payload),
+        now=lambda: fetch_time,
+    ).read()
+    kinds = {w.kind: w for w in snapshot.windows}
+    assert kinds["five_hour"].used_percent == pytest.approx(2.0)
+
+
+def test_model_group_falls_back_to_429_text():
+    text = "Individual quota reached for Claude Sonnet. Resets in 5h"
+    assert model_group_from_model(None, hint_text=text) == "3p"
+    assert (
+        model_group_from_model(None, hint_text="Gemini quota. Resets in 5h") == "gemini"
+    )
+    assert model_group_from_model("gemini-3-pro", hint_text=text) == "gemini"

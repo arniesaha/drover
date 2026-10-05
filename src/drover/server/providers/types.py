@@ -39,7 +39,9 @@ class ProviderUsageWindow:
         _require_timezone_aware(self.resets_at, "resets_at")
 
 
-ProviderStatus = Literal["ok", "usage_unavailable", "stale", "error"]
+ProviderStatus = Literal[
+    "ok", "usage_unavailable", "stale", "error", "observed_exhausted"
+]
 
 
 @dataclass(frozen=True)
@@ -60,7 +62,13 @@ class ProviderAccountSnapshot:
     account_identity: str | None = None
 
     def __post_init__(self) -> None:
-        if self.status not in {"ok", "usage_unavailable", "stale", "error"}:
+        if self.status not in {
+            "ok",
+            "usage_unavailable",
+            "stale",
+            "error",
+            "observed_exhausted",
+        }:
             raise ValueError("status must be a supported provider status")
         if self.observed_at is None:
             raise ValueError("observed_at must be timezone-aware")
