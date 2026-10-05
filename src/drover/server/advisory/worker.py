@@ -1303,6 +1303,7 @@ def _runtime_session_filter(
         f"GREATEST({prefix}updated_at, {prefix}ended_at, {prefix}started_at)"
     )
     clauses = [
+        f"{prefix}command IS DISTINCT FROM 'collector'",
         f"{latest_activity} >= ?",
         f"{latest_activity} <= ?",
     ]
@@ -1825,7 +1826,7 @@ def _load_hook_facts(con, target_id: str, analyzed_at: datetime):
         SELECT host_id, capabilities_json,
                CAST(updated_at AS TIMESTAMPTZ), CAST(last_seen_at AS TIMESTAMPTZ)
         FROM harness_hosts
-        {where + " AND retired_at IS NULL" if where else "WHERE retired_at IS NULL"}
+        {where + " AND retired_at IS NULL AND kind IS DISTINCT FROM 'collector'" if where else "WHERE retired_at IS NULL AND kind IS DISTINCT FROM 'collector'"}
         ORDER BY host_id
         LIMIT {MAX_SNAPSHOT_RECORDS}
         """,

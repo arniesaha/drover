@@ -164,6 +164,7 @@ class ControlOutboxExporter:
                 raw = _claim_rows(
                     control, OutboxClaim(str(recovery[0]), (), self.owner, stamp)
                 )
+                raw = self._projectable_rows(control, raw)
                 projected = export_projection(control, raw)
                 write_legacy_events(control, raw, self.parquet_dir, str(recovery[0]))
         acknowledged = self._rebuild_relation_and_acknowledge(acknowledge=False)
@@ -180,14 +181,13 @@ class ControlOutboxExporter:
                     now=stamp,
                 )
                 if claim is not None:
-                    projected.extend(
-                        export_projection(control, _claim_rows(control, claim))
-                    )
+                    raw = self._projectable_rows(control, _claim_rows(control, claim))
+                    projected.extend(export_projection(control, raw))
                     from drover.server.legacy_outbox import write_legacy_events
 
                     write_legacy_events(
                         control,
-                        _claim_rows(control, claim),
+                        raw,
                         self.parquet_dir,
                         claim.batch_id,
                     )
@@ -247,6 +247,12 @@ class ControlOutboxExporter:
         acknowledged = self._rebuild_relation_and_acknowledge()
         with control_plane_connection(self.control_path) as control:
             current = outbox_status(control)
+        if current.get("stalled_published_batches", 0):
+            log.warning(
+                "%s published outbox batches remain unacknowledged after 5 minutes (oldest %s)",
+                current["stalled_published_batches"],
+                current["oldest_stalled_published_at"],
+            )
         retention = self._prune_verified_payloads()
         if is_postgres_control_store(self.control_path):
             with control_plane_connection(self.control_path) as control:
@@ -267,6 +273,19 @@ class ControlOutboxExporter:
             self._last_result = result
             self._last_error = None
         return result
+
+    @staticmethod
+    def _projectable_rows(control, rows):
+        if not rows:
+            return []
+        known = {
+            r[0]
+            for r in control.execute(
+                "SELECT session_id FROM harness_sessions WHERE session_id=ANY(?::VARCHAR[])",
+                [[r["session_id"] for r in rows]],
+            ).fetchall()
+        }
+        return [r for r in rows if r["session_id"] in known]
 
     def _should_claim(self, status: dict[str, Any], now: datetime) -> bool:
         # A claimed row needs a recovery attempt even when pending is zero.
@@ -299,18 +318,49 @@ class ControlOutboxExporter:
                 self._relation_initialized = True
                 if acknowledge:
                     for (batch_id,) in rows:
-                        ids = [
-                            r[0]
-                            for r in control.execute(
-                                "SELECT event_id FROM control_outbox_batch_events WHERE batch_id=?",
-                                [batch_id],
-                            ).fetchall()
+                        members = control.execute(
+                            """SELECT e.event_id, e.dedup_key, e.normalized_source, e.created_at
+                            FROM control_outbox_batch_events b JOIN harness_events e USING(event_id)
+                            WHERE b.batch_id=?""",
+                            [batch_id],
+                        ).fetchall()
+                        harness_ids = [r[0] for r in members if r[2] != "collector"]
+                        collector_keys = [r[1] for r in members if r[2] == "collector"]
+                        dates = sorted(
+                            {
+                                r[3].date().isoformat()
+                                for r in members
+                                if r[2] == "collector"
+                            }
+                        )
+                        projected = (
+                            analytics.execute(
+                                "SELECT count(*) FROM control_memory_events WHERE id=ANY(?::VARCHAR[])",
+                                [harness_ids],
+                            ).fetchone()[0]
+                            if harness_ids
+                            else 0
+                        )
+                        paths = [
+                            str(p)
+                            for day in dates
+                            for p in (
+                                self.parquet_dir / "agent_events" / f"date={day}"
+                            ).glob("agent_id=*/*.parquet")
                         ]
-                        count = analytics.execute(
-                            "SELECT count(*) FROM control_memory_events WHERE id=ANY(?::VARCHAR[])",
-                            [ids],
-                        ).fetchone()[0]
-                        if ids and count == len(ids):
+                        native = (
+                            analytics.execute(
+                                "SELECT count(DISTINCT dedup_key) FROM read_parquet(?,union_by_name=true) WHERE dedup_key=ANY(?::VARCHAR[])",
+                                [paths, collector_keys],
+                            ).fetchone()[0]
+                            if collector_keys and paths
+                            else 0
+                        )
+                        if (
+                            members
+                            and projected == len(harness_ids)
+                            and native == len(collector_keys)
+                        ):
                             ready.append(str(batch_id))
             finally:
                 analytics.close()

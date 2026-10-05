@@ -137,7 +137,7 @@ def project_activity(
         _optional_rows(
             con,
             f"""SELECT * FROM harness_sessions
-                 WHERE session_id IN ({_placeholders(ids)})""",
+                 WHERE command IS DISTINCT FROM 'collector' AND session_id IN ({_placeholders(ids)})""",
             ids,
         )
     )

@@ -11,6 +11,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import logging
 import os
 import stat
 import sys
@@ -95,6 +96,12 @@ def ensure_legacy_outbox_schema(con: object) -> None:
             for name in names
         ):
             con.execute(statement)
+    con.execute(
+        "ALTER TABLE control_outbox_events ADD COLUMN IF NOT EXISTS rejection_reason VARCHAR"
+    )
+    con.execute(
+        "ALTER TABLE control_outbox_events ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ"
+    )
 
 
 def event_ingest_identity(
@@ -418,14 +425,14 @@ def claim_outbox_batch(
                 batch_id, tuple(str(row[0]) for row in rows), owner, lease_until
             )
 
+        candidate_lock = (
+            "FOR UPDATE OF o SKIP LOCKED" if is_postgres_connection(con) else ""
+        )
         rows = con.execute(
-            f"""
-            SELECT event_id FROM control_outbox_events
-             WHERE state = 'pending'
-             ORDER BY committed_at, event_id
-             {locking}
-             LIMIT ?
-            """,
+            f"""SELECT o.event_id FROM control_outbox_events o
+            JOIN harness_events e USING(event_id) JOIN harness_sessions s USING(session_id)
+            WHERE o.state='pending' ORDER BY o.committed_at,o.event_id
+            {candidate_lock} LIMIT ?""",
             [max(1, int(limit))],
         ).fetchall()
         sizes = []
@@ -451,6 +458,14 @@ def claim_outbox_batch(
                 )
                 + 32
             )
+            if size + 1024 > MAX_INPUT_BYTES:
+                reason = f"outbox event {event_id} needs {size + 1024} bytes; MAX_INPUT_BYTES={MAX_INPUT_BYTES}"
+                con.execute(
+                    "UPDATE control_outbox_events SET state='rejected', rejection_reason=?, rejected_at=? WHERE event_id=?",
+                    [reason, stamp, event_id],
+                )
+                logging.getLogger(__name__).error("Rejected %s", reason)
+                continue
             sizes.append((str(event_id), size))
             if sum(n for _, n in sizes) + 1024 >= target_bytes:
                 break
@@ -911,11 +926,20 @@ def outbox_status(con: object) -> dict[str, Any]:
                count(*) FILTER (WHERE state = 'claimed'),
                count(*) FILTER (WHERE state = 'published'),
                count(*) FILTER (WHERE state = 'acknowledged'),
-               min(committed_at) FILTER (WHERE state IN ('pending', 'claimed', 'published'))
+               min(committed_at) FILTER (WHERE state IN ('pending', 'claimed', 'published')),
+               count(*) FILTER (WHERE state = 'rejected')
           FROM control_outbox_events
         """).fetchone()
+    stalled = con.execute(
+        """SELECT count(*), min(published_at) FROM control_outbox_batches
+        WHERE state='published' AND published_at < ?""",
+        [_utc_now() - timedelta(minutes=5)],
+    ).fetchone()
     return {
         "enabled": True,
+        "rejected": int(row[6] or 0),
+        "stalled_published_batches": int(stalled[0] or 0),
+        "oldest_stalled_published_at": stalled[1],
         "pending": int(row[0] or 0),
         "oldest_pending_at": row[1],
         "claimed": int(row[2] or 0),
@@ -963,14 +987,16 @@ def _payload_prune_candidates(
           WHERE {where} ORDER BY p.event_id LIMIT ?
         ), session_progress AS MATERIALIZED (
           SELECT sessions.session_id, progress.event_count, progress.max_seq
-          FROM (SELECT DISTINCT session_id FROM candidates) sessions
+          FROM (SELECT DISTINCT c.session_id FROM candidates c
+                JOIN harness_sessions s USING(session_id)
+                WHERE s.command IS DISTINCT FROM 'collector') sessions
           CROSS JOIN LATERAL (
             SELECT count(*) AS event_count, COALESCE(max(seq), 0) AS max_seq
             FROM harness_events h WHERE h.session_id = sessions.session_id
           ) progress
         )
         SELECT e.event_id, e.payload_sha256,
-               s.status, o.state AS outbox_state, o.batch_id, b.state AS batch_state,
+               s.status, s.command, summary_job.status AS summary_job_status, o.state AS outbox_state, o.batch_id, b.state AS batch_state,
                progress.event_count, progress.max_seq,
                usage.source_event_count, usage.source_seq,
                recap_job.status AS recap_job_status, recap.recap_source_seq
@@ -982,6 +1008,9 @@ def _payload_prune_candidates(
           LEFT JOIN session_usage_sources usage
             ON usage.session_id = e.session_id AND usage.source = 'harness_events'
           {_RECAP_JOINS}
+          LEFT JOIN pipeline_jobs summary_job
+            ON summary_job.job_kind='summarize_session' AND summary_job.subject_key=e.session_id
+           AND summary_job.status IN ('pending','running','retry_wait')
           ORDER BY e.event_id
         """,
         [
@@ -1026,6 +1055,19 @@ def prune_acknowledged_outbox(
 
 
 def _payload_prune_protection(row: dict[str, Any]) -> str | None:
+    if row.get("command") == "collector":
+        # Collector usage lives in native parquet and has no harness recap gate.
+        # Its atomic summary intent must finish before the hot envelope goes away.
+        return (
+            "dependency"
+            if (
+                row.get("outbox_state") != "acknowledged"
+                or row.get("batch_id") is None
+                or row.get("batch_state") != "acknowledged"
+                or row.get("summary_job_status") is not None
+            )
+            else None
+        )
     terminal = {"completed", "terminated", "errored", "failed"}
     if str(row.get("status") or "") not in terminal:
         return "active"
@@ -1074,50 +1116,21 @@ def prune_verified_payloads(
     if not is_postgres_control_store(control_path):
         return result
     deadline = time.monotonic() + max(0.001, time_budget_seconds)
-    candidates = []
-    # Walk bounded windows, including protected rows, so the scan advances.
-    # The lifecycle retains the cursor when the budget expires; no protected
-    # prefix can starve eligible work on subsequent passes.
-    while len(candidates) < limit and time.monotonic() < deadline:
-        with control_plane_connection(control_path) as con:
-            window = _payload_prune_candidates(
-                con, limit=min(100, max(1, limit)), after=after
-            )
-        if not window:
-            if cursor_callback:
-                cursor_callback("")
-            break
-        for candidate in window:
-            after = str(candidate["event_id"])
-            if cursor_callback:
-                cursor_callback(after)
-            protection = _payload_prune_protection(candidate)
-            if protection:
-                result["protected_" + protection] += 1
-            else:
-                candidates.append(candidate)
-            if len(candidates) >= limit:
-                break
-    # Protection counts describe this bounded scan, not the whole database.
     stamp = _utc_now(now)
-    for candidate in candidates:
-        if time.monotonic() >= deadline:
-            break
-        # The candidate read already excluded protected rows, so reaching this
-        # branch means the row changed between that read and now. Still count
-        # it: a refusal an operator cannot see is a refusal they cannot debug.
+
+    def process(candidate):
         raced = _payload_prune_protection(candidate)
         if raced == "active":
             result["protected_active"] += 1
-            continue
+            return
         if raced == "dependency":
             result["protected_dependency"] += 1
-            continue
+            return
         expected_hash = str(candidate.get("payload_sha256") or "")
         batch_id = candidate.get("batch_id")
         if not expected_hash or not isinstance(batch_id, str) or resolver is None:
             result["verification_failed"] += 1
-            continue
+            return
         payload = resolver.resolve(
             event_id=str(candidate["event_id"]),
             batch_id=batch_id,
@@ -1125,7 +1138,7 @@ def prune_verified_payloads(
         )
         if payload is None or payload_sha256(payload) != expected_hash:
             result["verification_failed"] += 1
-            continue
+            return
         with control_plane_connection(control_path) as con:
             con.execute("BEGIN")
             try:
@@ -1140,7 +1153,7 @@ def prune_verified_payloads(
                 ):
                     con.execute("ROLLBACK")
                     result["protected_dependency"] += 1
-                    continue
+                    return
                 con.execute(
                     """
                     INSERT INTO harness_event_archives
@@ -1166,6 +1179,28 @@ def prune_verified_payloads(
                 raise
         if deleted is not None:
             result["pruned"] += 1
+
+    attempted = 0
+    # Persist only a processed prefix. A budget expiry never skips collected
+    # eligible rows: the next pass starts immediately after the last attempt.
+    while attempted < limit and time.monotonic() < deadline:
+        with control_plane_connection(control_path) as con:
+            window = _payload_prune_candidates(
+                con, limit=min(100, max(1, limit)), after=after
+            )
+        if not window:
+            if cursor_callback:
+                cursor_callback("")
+            break
+        for candidate in window:
+            if time.monotonic() >= deadline or attempted >= limit:
+                return result
+            eligible = _payload_prune_protection(candidate) is None
+            process(candidate)
+            attempted += int(eligible)
+            after = str(candidate["event_id"])
+            if cursor_callback:
+                cursor_callback(after)
     return result
 
 

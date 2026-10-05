@@ -160,6 +160,18 @@ def refresh_memory_projection(
     )
     ensure_memory_schema(analytics)
     links = []
+    # Filter before LIMIT: orphan envelopes and parquet-served collector rows
+    # cannot consume the harness projection window or starve valid sessions.
+    analytics.execute(
+        "CREATE OR REPLACE TEMP TABLE memory_projection_sessions AS SELECT unnest(?::VARCHAR[]) AS session_id",
+        [
+            [
+                sid
+                for sid, session in sessions.items()
+                if session.get("command") != "collector"
+            ]
+        ],
+    )
     for sid, native in analytics.execute(
         "SELECT harness_session_id, native_session_id FROM memory_session_identity WHERE native_session_id IS NOT NULL"
     ).fetchall():
@@ -170,10 +182,13 @@ def refresh_memory_projection(
     exported_columns = analytics.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name='harness_exported_events'"
     ).fetchall()
+    eligible = "EXISTS (SELECT 1 FROM memory_projection_sessions known WHERE known.session_id=e.session_id)"
+    if ("normalized_source",) in exported_columns:
+        eligible += " AND e.normalized_source IS DISTINCT FROM 'collector'"
     if ("payload_json",) in exported_columns:
         cur = analytics.execute(
-            """SELECT e.session_id, e.payload_json FROM harness_exported_events e
-            WHERE NOT EXISTS (SELECT 1 FROM control_memory_events c WHERE c.id=e.event_id)
+            f"""SELECT e.session_id, e.payload_json FROM harness_exported_events e
+            WHERE {eligible} AND NOT EXISTS (SELECT 1 FROM control_memory_events c WHERE c.id=e.event_id)
             ORDER BY e.created_at, e.event_id LIMIT 1000"""
         )
         for sid, raw in cur.fetchall():
@@ -212,8 +227,8 @@ def refresh_memory_projection(
         "SELECT count(*) FROM information_schema.columns WHERE table_name='harness_exported_events' AND column_name='session_id'"
     ).fetchone()[0]
     if available:
-        cur = analytics.execute("""SELECT e.* FROM harness_exported_events e
-            WHERE NOT EXISTS (SELECT 1 FROM control_memory_events c WHERE c.id=e.event_id)
+        cur = analytics.execute(f"""SELECT e.* FROM harness_exported_events e
+            WHERE {eligible} AND NOT EXISTS (SELECT 1 FROM control_memory_events c WHERE c.id=e.event_id)
             ORDER BY created_at, event_id LIMIT 1000""")
         cols = [d[0] for d in cur.description]
         events = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -256,6 +271,8 @@ def refresh_memory_projection(
     # Summary publication is a separate idempotent control-plane link effect.
     # A crash after summary completion is repaired by the next export pass.
     for sid, session in sessions.items():
+        if session.get("command") == "collector":
+            continue
         if repo is None:
             continue
         # A harness artifact wins over its explicit native alias.

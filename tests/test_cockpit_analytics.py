@@ -82,7 +82,8 @@ def _analytics_connection(
           model VARCHAR,
           started_at TIMESTAMPTZ,
           ended_at TIMESTAMPTZ,
-          updated_at TIMESTAMPTZ
+          updated_at TIMESTAMPTZ,
+          command VARCHAR DEFAULT 'test'
         );
         CREATE TABLE session_usage (
           session_id VARCHAR PRIMARY KEY,
@@ -172,7 +173,7 @@ def _insert_session(
     now = datetime.now(timezone.utc) - timedelta(hours=1)
     con.execute(
         """
-        INSERT INTO harness_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO harness_sessions (session_id,host_id,harness,repo_owner,repo_name,model,started_at,ended_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [session_id, host, harness, owner, name, model, now, now, now],
     )
@@ -336,7 +337,7 @@ def test_analytics_counts_harness_sessions_without_spans():
     now = datetime.now(timezone.utc) - timedelta(hours=1)
     con.execute(
         """
-        INSERT INTO harness_sessions VALUES (
+        INSERT INTO harness_sessions (session_id,host_id,harness,repo_owner,repo_name,model,started_at,ended_at,updated_at) VALUES (
           'local-only', 'mac-mini', 'agy', 'acme', 'offline',
           'gemini-3.6-flash', ?, NULL, ?
         )
@@ -604,7 +605,7 @@ def test_dimension_coverage_uses_every_displayed_session():
     now = datetime.now(timezone.utc) - timedelta(minutes=5)
     con.executemany(
         """
-        INSERT INTO harness_sessions VALUES (?, 'mac-mini', 'claude-code',
+        INSERT INTO harness_sessions (session_id,host_id,harness,repo_owner,repo_name,model,started_at,ended_at,updated_at) VALUES (?, 'mac-mini', 'claude-code',
           ?, ?, 'model-a', ?, ?, ?)
         """,
         [
@@ -698,7 +699,7 @@ def test_analytics_bounds_harness_sessions_by_latest_activity():
     now = datetime.now(timezone.utc)
     con.execute(
         """
-        INSERT INTO harness_sessions VALUES (
+        INSERT INTO harness_sessions (session_id,host_id,harness,repo_owner,repo_name,model,started_at,ended_at,updated_at) VALUES (
           'long-running', 'mac-mini', 'codex', 'acme', 'active',
           'gpt-5', ?, NULL, ?
         )
@@ -726,7 +727,7 @@ def test_harness_only_sessions_use_greatest_activity_for_filter_dimensions_and_c
     ):
         con.execute(
             """
-            INSERT INTO harness_sessions VALUES (
+            INSERT INTO harness_sessions (session_id,host_id,harness,repo_owner,repo_name,model,started_at,ended_at,updated_at) VALUES (
               ?, ?, 'codex', 'acme', ?, 'gpt-5', ?, ?, ?
             )
             """,
@@ -2039,7 +2040,7 @@ def test_source_coverage_counts_unattributed_sessions_without_attributing_them()
         # repository identity. They must count toward source availability, not
         # become project-attributed as a side effect of the calculation.
         con.execute(
-            """INSERT INTO harness_sessions VALUES
+            """INSERT INTO harness_sessions (session_id,host_id,harness,repo_owner,repo_name,model,started_at,ended_at,updated_at) VALUES
                 ('unattributed-usage', 'mac-mini', 'claude-code', NULL, NULL,
                  'model-a', ?, ?, ?),
                 ('unattributed-span', 'mac-mini', 'claude-code', NULL, NULL,

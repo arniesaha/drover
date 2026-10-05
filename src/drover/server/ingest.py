@@ -280,33 +280,54 @@ def ingest_file(
                 con.execute(
                     """INSERT INTO harness_hosts
                     (host_id, display_name, kind, status, capabilities_json)
-                    VALUES (?, ?, 'collector', 'online', '{}') ON CONFLICT DO NOTHING""",
+                    VALUES (?, ?, 'collector', 'offline', '{}')
+                    ON CONFLICT (host_id) DO UPDATE SET status='offline'
+                    WHERE harness_hosts.kind='collector'""",
                     [agent, agent],
                 )
             sessions = {}
             for row in sorted(
                 parsed_rows, key=lambda r: (r["agent_id"], r["session_id"])
             ):
-                sessions.setdefault(row["session_id"], row)
+                sid = row["session_id"]
+                if sid not in sessions:
+                    sessions[sid] = {
+                        **row,
+                        "first_at": row["timestamp"],
+                        "last_at": row["timestamp"],
+                    }
+                else:
+                    sessions[sid]["first_at"] = min(
+                        sessions[sid]["first_at"], row["timestamp"]
+                    )
+                    sessions[sid]["last_at"] = max(
+                        sessions[sid]["last_at"], row["timestamp"]
+                    )
             for sid in sorted(sessions):
                 row = sessions[sid]
                 con.execute(
                     """INSERT INTO harness_sessions
                     (session_id, host_id, harness, command, status, started_at,
-                     native_session_id, repo_owner, repo_name, branch)
-                    VALUES (?, ?, ?, 'collector', 'running', ?, ?, ?, ?, ?)
+                     native_session_id, repo_owner, repo_name, branch, ended_at, last_activity)
+                    VALUES (?, ?, ?, 'collector', 'completed', ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (session_id) DO UPDATE SET
-                      native_session_id=COALESCE(harness_sessions.native_session_id, EXCLUDED.native_session_id)
+                      native_session_id=COALESCE(harness_sessions.native_session_id, EXCLUDED.native_session_id),
+                      status=CASE WHEN harness_sessions.command='collector' THEN 'completed' ELSE harness_sessions.status END,
+                      started_at=CASE WHEN harness_sessions.command='collector' THEN least(harness_sessions.started_at, EXCLUDED.started_at) ELSE harness_sessions.started_at END,
+                      ended_at=CASE WHEN harness_sessions.command='collector' THEN greatest(harness_sessions.ended_at, EXCLUDED.ended_at) ELSE harness_sessions.ended_at END,
+                      last_activity=CASE WHEN harness_sessions.command='collector' THEN greatest(harness_sessions.last_activity, EXCLUDED.last_activity) ELSE harness_sessions.last_activity END
                     """,
                     [
                         row["session_id"],
                         row["agent_id"],
                         row["agent_id"],
-                        row["timestamp"],
+                        row["first_at"],
                         row["session_id"],
                         row["repo_owner"],
                         row["repo_name"],
                         row["branch"],
+                        row["last_at"],
+                        row["last_at"],
                     ],
                 )
             for sid in sorted({r["session_id"] for r in parsed_rows}):

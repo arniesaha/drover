@@ -122,7 +122,7 @@ def replay_legacy(
                 o.batch_id FROM control_outbox_events o JOIN harness_events e USING (event_id)
                 LEFT JOIN harness_event_payloads p USING (event_id)
                 LEFT JOIN harness_event_archives a USING (event_id)
-                WHERE o.committed_at >= ? AND e.event_id > ?
+                WHERE o.state <> 'rejected' AND o.committed_at >= ? AND e.event_id > ?
                 ORDER BY e.event_id LIMIT ?""",
                 [stamp, after, limit],
             )

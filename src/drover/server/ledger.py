@@ -406,7 +406,7 @@ class JobLedger:
                               SELECT 1 FROM harness_events e
                               JOIN control_outbox_events o ON o.event_id=e.event_id
                               WHERE e.session_id=pipeline_jobs.subject_key
-                                AND o.state <> 'acknowledged'
+                                AND o.state IN ('pending','claimed','published')
                             ))
                           ORDER BY priority DESC, next_run_at, enqueued_at
                           LIMIT ?
@@ -461,7 +461,7 @@ class JobLedger:
                         SELECT 1 FROM harness_events e
                         JOIN control_outbox_events o ON o.event_id=e.event_id
                         WHERE e.session_id=pipeline_jobs.subject_key
-                          AND o.state <> 'acknowledged'
+                          AND o.state IN ('pending','claimed','published')
                       ))
                     LIMIT 1""",
                 [job_kind],

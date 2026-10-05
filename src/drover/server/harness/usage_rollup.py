@@ -87,7 +87,8 @@ WITH per_session AS (
   SELECT session_id,
          count(*) AS event_count,
          COALESCE(max(seq), 0) AS max_seq
-  FROM harness_events
+  FROM harness_events e JOIN harness_sessions s USING(session_id)
+  WHERE s.command IS DISTINCT FROM 'collector'
   GROUP BY session_id
 )
 SELECT p.session_id, s.host_id, s.harness, p.event_count, p.max_seq
