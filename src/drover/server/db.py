@@ -46,6 +46,7 @@ import ctypes.util
 import itertools
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -323,6 +324,18 @@ def _path_key(duckdb_path: str | Path) -> str:
     return str(Path(duckdb_path).expanduser().resolve())
 
 
+def _write_ahead_log(source: Path) -> Path:
+    """DuckDB's WAL for ``source``, whether or not it currently exists."""
+    return source.with_name(source.name + ".wal")
+
+
+def _wal_size(wal_path: Path) -> int:
+    try:
+        return wal_path.stat().st_size
+    except OSError:
+        return 0
+
+
 def remember_live_connection(
     duckdb_path: str | Path, con: duckdb.DuckDBPyConnection
 ) -> None:
@@ -452,6 +465,78 @@ def duckdb_connect_lock(duckdb_path: str | Path) -> threading.Lock:
         return lock
 
 
+_DUCKDB_SIZE_RE = re.compile(
+    r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(B|KB|KiB|MB|MiB|GB|GiB|TB|TiB|PB|PiB)\s*$",
+    re.IGNORECASE,
+)
+
+
+def validate_duckdb_size(value: str, *, name: str = "memory_limit") -> str:
+    """Validate DuckDB memory size string (e.g. '4GB', '512MB')."""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string, got {type(value).__name__}")
+    match = _DUCKDB_SIZE_RE.match(value)
+    if not match:
+        raise ValueError(
+            f"invalid DuckDB size format for {name}: {value!r}. "
+            "Expected size like '4GB', '512MB', '1024KiB'."
+        )
+    num = float(match.group(1))
+    if num <= 0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return value.strip()
+
+
+def startup_analytical_checkpoint(duckdb_path: str | Path) -> bool:
+    """Drain any leftover WAL under a raised limit before opening the store."""
+    ckpt_limit = os.environ.get(
+        "DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT", "4GB"
+    ).strip()
+    ckpt_limit = validate_duckdb_size(
+        ckpt_limit, name="DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT"
+    )
+
+    path = Path(duckdb_path)
+    wal_path = _write_ahead_log(path)
+    if not wal_path.exists():
+        return False
+
+    wal_size_before = _wal_size(wal_path)
+    t0 = time.monotonic()
+    try:
+        with duckdb_connect_lock(path):
+            con = duckdb.connect(
+                str(path),
+                config={"memory_limit": ckpt_limit, "threads": "1"},
+            )
+            try:
+                con.execute("CHECKPOINT")
+            finally:
+                con.close()
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        log.warning(
+            "analytical store startup checkpoint failed for %s after %.2fs: %s",
+            path,
+            elapsed,
+            exc,
+            exc_info=True,
+        )
+        return False
+
+    elapsed = time.monotonic() - t0
+    wal_size_after = _wal_size(wal_path)
+    log.info(
+        "analytical store startup checkpoint for %s: WAL %d -> %d bytes in %.2fs (limit %s)",
+        path,
+        wal_size_before,
+        wal_size_after,
+        elapsed,
+        ckpt_limit,
+    )
+    return True
+
+
 def pin_analytical_connection(duckdb_path: str | Path) -> bool:
     """Keep the analytical instance open across short worker write windows.
 
@@ -478,6 +563,7 @@ def pin_analytical_connection(duckdb_path: str | Path) -> bool:
             return True
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        startup_analytical_checkpoint(path)
         con, _ = _connect_and_probe(path, role="worker", settings_overrides=None)
         remember_live_connection(path, con)
     except (duckdb.Error, OSError, AnalyticalStoreUnavailable) as exc:
@@ -1207,6 +1293,9 @@ def _apply_role_settings(
                     )
             settings[str(key)] = str(value)
 
+    if "memory_limit" in settings:
+        validate_duckdb_size(settings["memory_limit"], name=f"{role} memory_limit")
+
     if role not in {"snapshot", "control_plane"}:
         # A role override must not silently raise every live reader's CPU
         # budget. This ceiling covers all roles sharing the analytical file;
@@ -1311,11 +1400,6 @@ _SNAPSHOT_IDLE: dict[str, _CachedSnapshot] = {}
 _SNAPSHOT_DIRS: dict[str, tempfile.TemporaryDirectory] = {}
 _SNAPSHOT_SEQUENCE = itertools.count()
 _SNAPSHOT_GUARD = threading.Lock()
-
-
-def _write_ahead_log(source: Path) -> Path:
-    """DuckDB's WAL for ``source``, whether or not it currently exists."""
-    return source.with_name(source.name + ".wal")
 
 
 class AtomicCloneUnavailable(RuntimeError):

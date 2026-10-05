@@ -29,6 +29,10 @@ The `snapshot` profile is only for private files. Its existing independent
 The control-plane profile and `/harness*` behavior are unchanged: their separate
 store remains outside analytical locks, admission and cleanup.
 
+### Checkpoint headroom
+
+The steady-state autocheckpoint runs under the instance limit, so a hub that OOMs on autocheckpoint should raise `DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT` (e.g. "3GB") in the service env; the startup checkpoint only drains a WAL left by a crash/stop under `DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT` (default "4GB").
+
 ## Lifetime and observation
 
 A closed monitored cursor now drops its parent reference, allowing the parent
