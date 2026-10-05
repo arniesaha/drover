@@ -23,6 +23,13 @@ def _iter_tool_use_blocks(events: Iterable[dict]) -> Iterable[dict]:
             continue
         if not isinstance(data, dict):
             continue
+        derived_files = data.get("derived_files")
+        if isinstance(derived_files, list):
+            for path in derived_files:
+                if isinstance(path, str) and path:
+                    # S3 derives patch file paths inside DuckDB so the raw
+                    # command never crosses the bounded query-process reply.
+                    yield {"input": {"path": path}}
         changes = data.get("changes") or (
             data.get("item", {}).get("changes")
             if isinstance(data.get("item"), dict)

@@ -136,8 +136,9 @@ def _tool_projection_sql() -> str:
     """A bounded raw-data projection sufficient for deterministic derivations.
 
     Tool names and file paths are the only raw fields the post-summary
-    derivations consume. Projecting them in DuckDB prevents a huge command,
-    transcript, or tool-result blob from dominating a child-process reply.
+    derivations consume. ``derived_files`` retains paths encoded in patch
+    commands without sending the command itself through the bounded child
+    reply.
     """
     return """
     CASE WHEN json_valid(raw_data) THEN json_object(
@@ -152,10 +153,25 @@ def _tool_projection_sql() -> str:
         '[{"name": "VARCHAR", "input": {"path": "VARCHAR", "file_path": "VARCHAR"}}]'
       ),
       'tool', json_object(
-        'name', json_extract_string(raw_data, '$.tool.name'),
+        'name', coalesce(
+          json_extract_string(raw_data, '$.tool.name'),
+          json_extract_string(raw_data, '$.tool_name'),
+          json_extract_string(raw_data, '$.name'),
+          json_extract_string(raw_data, '$.tool')
+        ),
         'input', json_object(
-          'path', coalesce(json_extract_string(raw_data, '$.tool.input.path'), json_extract_string(raw_data, '$.tool.arguments.path')),
-          'file_path', coalesce(json_extract_string(raw_data, '$.tool.input.file_path'), json_extract_string(raw_data, '$.tool.arguments.file_path'))
+          'path', coalesce(
+            json_extract_string(raw_data, '$.tool.input.path'),
+            json_extract_string(raw_data, '$.tool.arguments.path'),
+            json_extract_string(raw_data, '$.input.path'),
+            json_extract_string(raw_data, '$.arguments.path')
+          ),
+          'file_path', coalesce(
+            json_extract_string(raw_data, '$.tool.input.file_path'),
+            json_extract_string(raw_data, '$.tool.arguments.file_path'),
+            json_extract_string(raw_data, '$.input.file_path'),
+            json_extract_string(raw_data, '$.arguments.file_path')
+          )
         )
       ),
       'input', json_object(
@@ -167,7 +183,21 @@ def _tool_projection_sql() -> str:
         'file_path', json_extract_string(raw_data, '$.arguments.file_path')
       ),
       'path', coalesce(json_extract_string(raw_data, '$.path'), json_extract_string(raw_data, '$.file_path')),
-      'file_path', json_extract_string(raw_data, '$.file_path')
+      'file_path', json_extract_string(raw_data, '$.file_path'),
+      'derived_files', to_json(list_concat(
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[])
+      ))
     )::VARCHAR END
     """
 
