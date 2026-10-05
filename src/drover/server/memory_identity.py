@@ -324,44 +324,33 @@ def resolve_session(con: Any, session_id: str, *, store_path=None) -> dict:
         status = (
             "ok" if exists or artifact else ("unavailable" if native else "unmapped")
         )
-        if status == "unavailable":
-            try:
+        if status == "unavailable" and store_path:
+            from drover.server.lake.serving import selected_config
+
+            if selected_config(store_path).backend == "ducklake":
                 started_at = con.execute(
                     "SELECT started_at FROM memory_session_identity "
                     "WHERE harness_session_id=?",
                     [harness],
                 ).fetchone()
-                if started_at and started_at[0]:
-                    try:
-                        watermark_date = None
-                        if store_path:
-                            try:
-                                row = con.execute(
-                                    "SELECT MIN(partition_date) "
-                                    "FROM lake.import_watermark"
-                                ).fetchone()
-                                watermark_date = str(row[0]) if row and row[0] else None
-                            except Exception:
-                                pass
-                            if not watermark_date:
-                                try:
-                                    row = con.execute(
-                                        "SELECT MIN(timestamp) FROM lake.agent_events"
-                                    ).fetchone()
-                                    watermark_date = (
-                                        str(row[0])[:10] if row and row[0] else None
-                                    )
-                                except Exception:
-                                    pass
-                    except Exception:
-                        watermark_date = None
-
-                    if watermark_date:
-                        session_date = str(started_at[0])[:10]
-                        if session_date < watermark_date:
-                            status = "archived"
-            except Exception:
-                pass
+                watermark_date = None
+                if con.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_catalog='lake' "
+                    "AND table_schema='main' AND table_name='import_watermark'"
+                ).fetchone():
+                    row = con.execute(
+                        "SELECT MIN(partition_date) FROM lake.import_watermark"
+                    ).fetchone()
+                    watermark_date = str(row[0]) if row and row[0] else None
+                if watermark_date is None:
+                    # Rebuilt lakes predating selective import use their earliest event as the archive boundary.
+                    row = con.execute(
+                        "SELECT MIN(timestamp) FROM lake.agent_events"
+                    ).fetchone()
+                    watermark_date = str(row[0])[:10] if row and row[0] else None
+                if started_at and started_at[0] and watermark_date:
+                    if str(started_at[0])[:10] < watermark_date:
+                        status = "archived"
         return {
             "status": status,
             "session_id": harness,

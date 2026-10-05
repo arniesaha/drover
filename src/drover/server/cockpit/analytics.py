@@ -102,6 +102,7 @@ class AggregateMetadata:
     observed_at: datetime | None
     freshness: Literal["fresh", "stale", "unavailable", "archived"]
     coverage: Coverage
+    archived_before: str | None = None
 
 
 @dataclass(frozen=True)
@@ -487,19 +488,21 @@ def _activity_analytics_from_facts(
             cache=MetricSources(usage_cache_pct, span_cache_pct, status),
         ),
     )
-    is_archived = False
-    try:
+    archived_before = None
+    if con.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_catalog='lake' "
+        "AND table_schema='main' AND table_name='import_watermark'"
+    ).fetchone():
         wm = con.execute(
             "SELECT min(partition_date) FROM lake.import_watermark"
         ).fetchone()[0]
         if wm is not None:
             wm_date = datetime.strptime(wm, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             if (snapshot_at - timedelta(days=filters.days)) < wm_date:
-                # If we're looking at pre-watermark data, and it's raw-derived, mark archived.
-                is_archived = True
-    except Exception:
-        pass
-    metadata = _aggregate_metadata(coverage, aggregate[12], archived=is_archived)
+                archived_before = wm
+    metadata = _aggregate_metadata(
+        coverage, aggregate[12], archived_before=archived_before
+    )
     # Spec, Track 3: rank projects by tokens only when one source alone covers
     # enough sessions to trust. A union of two thin sources is not that.
     #
@@ -1398,14 +1401,15 @@ def _snapshot_fingerprint(
 
 
 def _aggregate_metadata(
-    coverage: Coverage, observed_at: datetime | None, *, archived: bool = False
+    coverage: Coverage,
+    observed_at: datetime | None,
+    *,
+    archived_before: str | None = None,
 ) -> AggregateMetadata:
     if observed_at is not None and observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
-    freshness = "unavailable"
-    if archived:
-        freshness = "archived"
-    elif observed_at is not None:
+    freshness: Literal["fresh", "stale", "unavailable", "archived"] = "unavailable"
+    if observed_at is not None:
         age = (datetime.now(timezone.utc) - observed_at).total_seconds()
         freshness = "fresh" if age <= _FRESHNESS_SECONDS else "stale"
     return AggregateMetadata(
@@ -1413,6 +1417,7 @@ def _aggregate_metadata(
         observed_at=observed_at,
         freshness=freshness,
         coverage=coverage,
+        archived_before=archived_before,
     )
 
 

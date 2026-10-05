@@ -26,6 +26,46 @@ FIXTURE = json.loads(
 )
 
 
+@pytest.mark.parametrize(
+    ("watermark", "earliest_event", "status"),
+    [
+        ("2026-09-01", "2026-07-01", "archived"),
+        (None, "2026-09-01", "archived"),
+        (None, None, "unavailable"),
+    ],
+)
+def test_archived_identity_uses_import_or_rebuild_boundary(
+    monkeypatch, tmp_path, watermark, earliest_event, status
+):
+    from types import SimpleNamespace
+
+    from drover.server.lake import serving
+    from drover.server.memory_identity import resolve_session
+
+    monkeypatch.setattr(
+        serving, "selected_config", lambda _: SimpleNamespace(backend="ducklake")
+    )
+    monkeypatch.setattr("drover.server.ledger.memory_store_available", lambda _: False)
+    with duckdb.connect() as con:
+        con.execute("ATTACH ':memory:' AS lake")
+        con.execute("CREATE TABLE lake.agent_events(timestamp TIMESTAMPTZ)")
+        if earliest_event:
+            con.execute("INSERT INTO lake.agent_events VALUES (?)", [earliest_event])
+        if watermark:
+            con.execute("CREATE TABLE lake.import_watermark(partition_date VARCHAR)")
+            con.execute("INSERT INTO lake.import_watermark VALUES (?)", [watermark])
+        con.execute(
+            "CREATE TABLE memory_session_identity(harness_session_id VARCHAR, "
+            "native_session_id VARCHAR, summary_session_id VARCHAR, started_at TIMESTAMPTZ)"
+        )
+        con.execute(
+            "INSERT INTO memory_session_identity VALUES ('old', 'native', NULL, '2026-08-01')"
+        )
+        con.execute("CREATE TABLE control_memory_events(session_id VARCHAR)")
+        result = resolve_session(con, "old", store_path=tmp_path / "control.duckdb")
+        assert result["status"] == status
+
+
 def refresh_memory_projection(analytics, control, path):
     apply_memory_links(
         control,
