@@ -1,4 +1,10 @@
-# Phase 4 implementation checkpoint
+# Phase 4 implementation checkpoint (superseded)
+
+> **Superseded plan.** This page records the rebuild-based plan. The cutover
+> attempts on 2026-10-04 were rolled back. Production still uses the **legacy**
+> analytical backend. The current plan is **DuckLake v2** (umbrella #481,
+> planned): a fresh lake, one outbox ingest path, a 60-day import, and slices S1
+> to S6. Those slices are not built yet. Treat the primitives below as history.
 
 The backend is still legacy. These primitives are not a cutover-ready backend.
 No live configuration, catalog, data root, or services were changed.

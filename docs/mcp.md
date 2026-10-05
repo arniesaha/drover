@@ -55,6 +55,35 @@ identify `state_source`, `control_store` (Postgres on the hub), and `authoritati
 Omitting it asserts that the vector uses the configured model.
 `drover_session_close` is a mutation and is outside the read contract.
 
+## Provider quota
+
+`drover_provider_quota` shows provider quota for every account across hosts. It
+is a read tool (v0.5.7, #528).
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `provider` | string | all providers | Filter by provider: `google`, `openai`, or `anthropic`. |
+| `fresh` | boolean | `false` | If `true`, probe the online hosts again before the read. |
+
+The function also takes `timeout_s` (default `3.0` seconds). It limits how long
+a `fresh` probe waits for hosts. The MCP tool does not expose `timeout_s`.
+
+The response has these fields:
+
+- `accounts`: one record for each account, with `provider`, `account_label`,
+  `plan`, `hosts`, `status`, `windows`, and `updated_at`.
+- `routing_hint`: a short text that ranks pools by headroom.
+- `updated_at`: the newest account time.
+
+The tool masks email account labels. For example, `alice@example.com` becomes
+`a***@example.com`.
+
+Agy Claude/GPT ("3p") buckets with a sliding reset are omitted (#527). When agy
+returns a 429 error, Drover records the window as `observed_exhausted`.
+
+> **Known limitation:** If the hub has authentication on, `fresh=true` returns
+> 401 host errors. The MCP server has no hub token. Use `fresh=false` on these hubs.
+
 ## Single hub recall endpoint and freshness
 
 The hub is the single supported recall endpoint. Register the hub's `/mcp` URL
