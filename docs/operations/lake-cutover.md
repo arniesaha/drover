@@ -1,4 +1,12 @@
-# DuckLake cutover and rollback
+# DuckLake cutover and rollback (superseded)
+
+> **Superseded plan.** This page describes the earlier rebuild-based cutover
+> (rebuild the lake from a tar of the legacy root). The cutover attempts on
+> 2026-10-04 were rolled back. Production still uses the **legacy** analytical
+> backend. The current plan is **DuckLake v2** (umbrella #481, planned): a fresh
+> lake, one outbox ingest path, a 60-day import, and slices S1 to S6. These
+> slices are not built yet, and this page has no v2 procedure. Do not use the
+> steps below for production.
 
 **Status: restart-selected routing is implemented; production execution still
 requires separate operator approval.** `analytics.backend = "legacy"` remains
@@ -17,7 +25,7 @@ modify legacy files.
 6. Verify rebuild counts, hashes, and serving proof (`lake verify`).
 7. Set `analytics.backend = "ducklake"` and its catalog DSN environment reference.
 8. Start the hub and workers.
-9. Check `/healthz`, summaries, recall, and the event count against verification.
+9. Check `/readyz` (not `/healthz`, which is only liveness), summaries, recall, and the event count against verification.
 10. To roll back, set `analytics.backend = "legacy"` and restart.
 
 The order is explicit: **rebuild → provision-exporter → role grants → verify**.

@@ -22,7 +22,7 @@ ignored; use the same unit spelling). Conflicts raise `ValueError` before any
 SET, including at the startup analytical open/pin. Defaults do not count as
 conflicts. Per-call budget overrides cannot change shared budgets.
 `DROVER_DUCKDB_ANALYTICAL_MAX_THREADS` still caps shared parallelism at 1 by
-default, as in #331. No memory or thread ceiling was increased.
+default, as in #331.
 
 The `snapshot` profile is only for private files. Its existing independent
 `DROVER_DUCKDB_SNAPSHOT_*` settings remain. Do not apply it to the live file.
@@ -218,8 +218,9 @@ to the OS file cache. It neither changes query results nor reduces the explicit
 6 GB budget. The separate control store's configuration is unchanged.
 [DuckDB configuration reference](https://duckdb.org/docs/stable/configuration/overview)
 describes this setting. No cache opt-in or new instance is introduced. The
-existing 1 GB analytical default stays: previous 512 MB cockpit OOM evidence
-is stronger than this synthetic workload as justification for its floor.
+analytical default is now 4GB (v0.5.6, #520, #524). It was 1GB when this
+measurement ran. Earlier 512 MB cockpit OOM evidence and a 2026-10-04 checkpoint
+OOM of a 1.4GB legacy lake are stronger than this synthetic workload.
 
 The #438 diagnostics now also report nonzero DuckDB tags, Arrow pool bytes and
 Python traced bytes (or `None` when tracing is off). They do not import Arrow,
