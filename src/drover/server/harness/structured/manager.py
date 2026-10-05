@@ -247,22 +247,28 @@ class StructuredSessionManager:
                                 if reset_time is not None:
                                     break
                     if reset_time is not None:
-                        host = entry.host_id
-                        model_name = entry.model
-                        if not host or not model_name:
-                            try:
-                                sess = registry.session(session_id)
-                                if sess:
+                        # Best effort: a quota observation must never break
+                        # event delivery. The host id has to match the one
+                        # harnessd's /providers/usage reads with, so it comes
+                        # from the session row, never a "local" default.
+                        try:
+                            host = entry.host_id
+                            model_name = entry.model
+                            if not host or not model_name:
+                                sess = registry.get_session(session_id)
+                                if sess is not None:
                                     host = host or sess.host_id
                                     model_name = model_name or sess.model
-                            except Exception:
-                                pass
-                        group = model_group_from_model(model_name)
-                        record_observed_exhaustion(
-                            host_id=host or "local",
-                            model_group=group,
-                            resets_at=reset_time,
-                        )
+                            if host:
+                                record_observed_exhaustion(
+                                    host_id=host,
+                                    model_group=model_group_from_model(
+                                        model_name, hint_text=message.text
+                                    ),
+                                    resets_at=reset_time,
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
                 awaiting = entry.awaiting
                 event_payload = message.to_payload()
                 event_payload["seq"] = seq

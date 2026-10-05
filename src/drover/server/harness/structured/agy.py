@@ -192,7 +192,7 @@ class AgyDriver:
         for candidate in (stderr_text, reported_status or "", error_text):
             reset_time = parse_agy_quota_exhaustion(candidate)
             if reset_time is not None:
-                group = model_group_from_model(self._turn_model)
+                group = model_group_from_model(self._turn_model, hint_text=candidate)
                 record_observed_exhaustion(
                     host_id=self.host_id,
                     model_group=group,

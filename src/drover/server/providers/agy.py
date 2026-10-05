@@ -169,9 +169,16 @@ def parse_agy_quota_exhaustion(
     return base_time + duration
 
 
-def model_group_from_model(model: str | None) -> str:
-    """Map a model identifier to its agy model group ('gemini' vs '3p')."""
+def model_group_from_model(model: str | None, hint_text: str | None = None) -> str:
+    """Map a model identifier to its agy model group ('gemini' vs '3p').
+
+    Without a model, fall back to the 429 text itself ("quota reached for
+    Claude Sonnet ...") so a 3p exhaustion is never pinned on Gemini.
+    """
     if not model:
+        hint = (hint_text or "").lower()
+        if "claude" in hint or "gpt" in hint:
+            return "3p"
         return "gemini"
     m = model.strip().lower()
     if m.startswith("gemini"):
@@ -607,11 +614,20 @@ def _windows(
         resets_at = _timestamp(bucket.get("resetTime"))
         window_minutes = _WINDOW_MINUTES.get(str(bucket.get("window") or ""))
 
-        # Fix (a): any bucket whose resetTime is within ~2 min of (fetch time + window length)
-        # is a sliding bucket not tracking real individual quota. Treat as usage_unavailable / not reported,
-        # never as 100% remaining (0% used).
+        remaining = bucket.get("remainingFraction")
+        # An untouched bucket whose resetTime is within ~2 min of (fetch time +
+        # window length) slides with every call: it is not tracking the real
+        # individual quota (drover#522). Omit it rather than report 0% used.
+        # A bucket with consumption has a fixed reset, even if the window
+        # started moments ago, so it is kept.
+        untouched = not (
+            isinstance(remaining, (int, float))
+            and not isinstance(remaining, bool)
+            and remaining < 1
+        )
         if (
-            fetch_time is not None
+            untouched
+            and fetch_time is not None
             and resets_at is not None
             and window_minutes is not None
         ):
@@ -622,7 +638,6 @@ def _windows(
             ):
                 continue
 
-        remaining = bucket.get("remainingFraction")
         used_percent: float | None = None
         if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):
             used_percent = max(0.0, min(100.0, (1.0 - float(remaining)) * 100.0))

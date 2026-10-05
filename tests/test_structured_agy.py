@@ -1022,3 +1022,46 @@ def test_driver_check_and_record_exhaustion():
         assert active[0].resets_at > datetime.now(timezone.utc) + timedelta(hours=160)
     finally:
         clear_observed_exhaustions()
+
+
+def test_consumed_bucket_with_fresh_window_is_kept(tmp_path: Path):
+    """A Gemini bucket used moments after its window opened has reset ~= now +
+    window too, but it is tracking: only untouched buckets count as sliding."""
+    accounts = tmp_path / "google_accounts.json"
+    accounts.write_text(json.dumps({"active": "someone@example.com"}))
+    fetch_time = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+    payload = {
+        "groups": [
+            {
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-5h",
+                        "window": "5h",
+                        "resetTime": (fetch_time + timedelta(hours=5)).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                        "remainingFraction": 0.98,
+                    }
+                ],
+            }
+        ]
+    }
+    snapshot = AgyUsageProbe(
+        accounts_path=accounts,
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=_opener([], payload=payload),
+        now=lambda: fetch_time,
+    ).read()
+    kinds = {w.kind: w for w in snapshot.windows}
+    assert kinds["five_hour"].used_percent == pytest.approx(2.0)
+
+
+def test_model_group_falls_back_to_429_text():
+    text = "Individual quota reached for Claude Sonnet. Resets in 5h"
+    assert model_group_from_model(None, hint_text=text) == "3p"
+    assert (
+        model_group_from_model(None, hint_text="Gemini quota. Resets in 5h") == "gemini"
+    )
+    assert model_group_from_model("gemini-3-pro", hint_text=text) == "gemini"
