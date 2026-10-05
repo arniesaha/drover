@@ -15,6 +15,14 @@ from drover.config import AnalyticsConfig
 from .query_process import query
 from .runtime import LakeError, LakeSpec
 
+# Sessions whose identities one serving read carries; the cutover gate checks it.
+IDENTITY_LIMIT = 10000
+# The one identity snapshot: open_history binds it and the read-model child
+# re-reads it to prove nothing changed, so both must hash identical rows.
+IDENTITY_QUERY = f"""SELECT session_id, native_session_id, summary_session_id,
+    CAST(started_at AS VARCHAR) AS started_at
+    FROM harness_sessions WHERE command <> 'collector'
+    ORDER BY session_id LIMIT {IDENTITY_LIMIT + 1}"""
 _CONFIGS: dict[Path, AnalyticsConfig] = {}
 _SELECTION_LOCK = RLock()
 
@@ -114,13 +122,10 @@ def open_history(path: Path):
         raise LakeError("lake_serving_requires_postgres")
     try:
         with control_plane_connection(path) as con:
-            rows = con.execute(
-                """SELECT session_id, native_session_id, summary_session_id, CAST(started_at AS VARCHAR) AS started_at
-                FROM harness_sessions WHERE command <> 'collector' ORDER BY session_id LIMIT 10001"""
-            ).fetchall()
+            rows = con.execute(IDENTITY_QUERY).fetchall()
     except Exception:
         raise LakeError("analytics_identity_unavailable") from None
-    if len(rows) > 10000:
+    if len(rows) > IDENTITY_LIMIT:
         raise LakeError("analytics_identity_limit_exceeded")
     return HistoryConnection(config, identities=rows)
 

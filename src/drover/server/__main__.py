@@ -135,6 +135,7 @@ from drover.server.harness.schema import (
 )
 from drover.server.harness.usage_rollup import UsageRollupWorker
 from drover.server.lake.cli import lake_cmd
+from drover.server.lake.cutover_cli import cutover_cmd, gate_cmd
 from drover.server.ledger import (
     EMBED_SESSION,
     JobLedger,
@@ -1002,6 +1003,8 @@ def _parse_listen_address(value: str) -> tuple[str, int]:
 
 
 main.add_command(lake_cmd)
+main.add_command(gate_cmd)
+main.add_command(cutover_cmd)
 
 
 @main.group(name="session")

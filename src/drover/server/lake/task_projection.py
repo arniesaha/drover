@@ -288,7 +288,7 @@ def task_status(path, *, task_id=None, session_id=None):
                         with open_history(path) as history:
                             matches = {
                                 harness
-                                for harness, native, summary in history.identities
+                                for harness, native, summary, *_ in history.identities
                                 if sid in (harness, native, summary)
                             }
                             if len(matches) > 1:

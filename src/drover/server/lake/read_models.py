@@ -132,11 +132,11 @@ def _control_snapshot(con, request):
                         f'INSERT INTO {table} VALUES ({",".join("?" for _ in columns)})',
                         rows,
                     )
+            from .serving import IDENTITY_QUERY
             from .task_projection import _hash
 
-            identities = pg.execute(
-                "SELECT session_id,native_session_id,summary_session_id FROM harness_sessions WHERE command <> 'collector' ORDER BY session_id LIMIT 10001"
-            ).fetchall()
+            # Exactly open_history's rows, or every binding mismatches.
+            identities = pg.execute(IDENTITY_QUERY).fetchall()
             if _hash(identities) != request["binding"]["identities"]:
                 raise LakeError("analytics_identity_changed")
             # Legacy PG rollup clocks are diagnostic only: they do not prove
