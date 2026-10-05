@@ -126,6 +126,96 @@ def _classify_failure(exc: BaseException) -> tuple[bool, str]:
 # to bound memory usage and processing time for pathological sessions with extreme verbosity.
 MAX_RAW_EVENTS_PER_SESSION = 25000
 
+# Leave headroom below the one MiB process reply ceiling for JSON framing,
+# result metadata, and a pathological page's final row.
+RAW_EVENT_PAGE_BYTES = 768 * 1024
+RAW_EVENT_PAGE_ROWS = 1000
+
+
+def _tool_projection_sql() -> str:
+    """A bounded raw-data projection sufficient for deterministic derivations.
+
+    Tool names and file paths are the only raw fields the post-summary
+    derivations consume. ``derived_files`` retains paths encoded in patch
+    commands without sending the command itself through the bounded child
+    reply.
+    """
+    return """
+    CASE WHEN json_valid(raw_data) THEN json_object(
+      'tool_name', coalesce(
+        json_extract_string(raw_data, '$.tool_name'),
+        json_extract_string(raw_data, '$.name'),
+        json_extract_string(raw_data, '$.tool.name'),
+        json_extract_string(raw_data, '$.tool_use_blocks[0].name')
+      ),
+      'tool_use_blocks', json_transform(
+        json_extract(raw_data, '$.tool_use_blocks'),
+        '[{"name": "VARCHAR", "input": {"path": "VARCHAR", "file_path": "VARCHAR"}}]'
+      ),
+      'tool', json_object(
+        'name', coalesce(
+          json_extract_string(raw_data, '$.tool.name'),
+          json_extract_string(raw_data, '$.tool_name'),
+          json_extract_string(raw_data, '$.name'),
+          json_extract_string(raw_data, '$.tool')
+        ),
+        'input', json_object(
+          'path', coalesce(
+            json_extract_string(raw_data, '$.tool.input.path'),
+            json_extract_string(raw_data, '$.tool.arguments.path'),
+            json_extract_string(raw_data, '$.input.path'),
+            json_extract_string(raw_data, '$.arguments.path')
+          ),
+          'file_path', coalesce(
+            json_extract_string(raw_data, '$.tool.input.file_path'),
+            json_extract_string(raw_data, '$.tool.arguments.file_path'),
+            json_extract_string(raw_data, '$.input.file_path'),
+            json_extract_string(raw_data, '$.arguments.file_path')
+          )
+        )
+      ),
+      'input', json_object(
+        'path', json_extract_string(raw_data, '$.input.path'),
+        'file_path', json_extract_string(raw_data, '$.input.file_path')
+      ),
+      'arguments', json_object(
+        'path', json_extract_string(raw_data, '$.arguments.path'),
+        'file_path', json_extract_string(raw_data, '$.arguments.file_path')
+      ),
+      'path', coalesce(json_extract_string(raw_data, '$.path'), json_extract_string(raw_data, '$.file_path')),
+      'file_path', json_extract_string(raw_data, '$.file_path'),
+      'derived_files', to_json(list_concat(
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
+        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[])
+      ))
+    )::VARCHAR END
+    """
+
+
+def _execute_raw_event_page(con, sql: str, params: list[Any]):
+    """Execute one page with an explicit reply budget on the lake facade."""
+    from drover.server.lake.serving import HistoryConnection
+
+    if isinstance(con, HistoryConnection):
+        from drover.server.lake.query_process import QueryLimits
+
+        return con.execute(
+            sql,
+            params,
+            limits=QueryLimits(bytes=RAW_EVENT_PAGE_BYTES, rows=RAW_EVENT_PAGE_ROWS),
+        )
+    return con.execute(sql, params)
+
 
 class SummarizerWorker:
     def __init__(
@@ -348,27 +438,36 @@ class SummarizerWorker:
             last_id = None
             last_dedup_key = None
             last_raw_hash = None
-            for _ in range(MAX_RAW_EVENTS_PER_SESSION // 1000):
+            page_size = RAW_EVENT_PAGE_ROWS
+            tool_projection = _tool_projection_sql()
+            while len(tool_events) < MAX_RAW_EVENTS_PER_SESSION:
                 if last_timestamp is None:
-                    cur = con.execute(
+                    cur = _execute_raw_event_page(
+                        con,
                         f"""WITH {_session_agent_events_ctes()}
-                        SELECT event_type, raw_data, timestamp, id, coalesce(dedup_key, '') AS _dedup_key, hash(raw_data) AS _raw_hash FROM canonical_agent_events
+                        SELECT event_type, {tool_projection} AS raw_data,
+                               timestamp, id, coalesce(dedup_key, '') AS _dedup_key,
+                               hash(raw_data) AS _raw_hash FROM canonical_agent_events
                         WHERE raw_data IS NOT NULL
-                        ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT 1000""",
-                        [session_id],
+                        ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT ?""",
+                        [session_id, page_size],
                     )
                 else:
-                    cur = con.execute(
+                    cur = _execute_raw_event_page(
+                        con,
                         f"""WITH {_session_agent_events_ctes()}
-                        SELECT event_type, raw_data, timestamp, id, coalesce(dedup_key, '') AS _dedup_key, hash(raw_data) AS _raw_hash FROM canonical_agent_events
+                        SELECT event_type, {tool_projection} AS raw_data,
+                               timestamp, id, coalesce(dedup_key, '') AS _dedup_key,
+                               hash(raw_data) AS _raw_hash FROM canonical_agent_events
                         WHERE raw_data IS NOT NULL AND (timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data)) > (?::TIMESTAMPTZ, ?::VARCHAR, ?::VARCHAR, ?::UBIGINT)
-                        ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT 1000""",
+                        ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT ?""",
                         [
                             session_id,
                             last_timestamp,
                             last_id or "",
                             last_dedup_key or "",
                             last_raw_hash,
+                            page_size,
                         ],
                     )
 
@@ -377,12 +476,14 @@ class SummarizerWorker:
                 if not chunk:
                     break
 
-                tool_events.extend(chunk)
+                tool_events.extend(
+                    chunk[: MAX_RAW_EVENTS_PER_SESSION - len(tool_events)]
+                )
                 last_timestamp = chunk[-1]["timestamp"]
                 last_id = chunk[-1]["id"]
                 last_dedup_key = chunk[-1]["_dedup_key"]
                 last_raw_hash = chunk[-1]["_raw_hash"]
-            else:
+            if len(tool_events) == MAX_RAW_EVENTS_PER_SESSION:
                 log.warning(
                     "Truncated session %s to %d raw events for summarization",
                     session_id,
@@ -458,7 +559,7 @@ class SummarizerWorker:
         # so the PostgreSQL transaction holds its row locks for writes only.
         con = _open_summarizer_db(self.duckdb_path)
         try:
-            task_id = events[0].get("raw_data") and _safe_task_id(con, session_id)
+            task_id = events[0].get("has_raw_data") and _safe_task_id(con, session_id)
             project_row = con.execute(
                 f"""WITH {_session_agent_events_ctes()}
                    SELECT any_value(repo_owner), any_value(repo_name)

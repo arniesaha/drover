@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 
+import duckdb
+
 from drover.server.summarizer.derive import compute_files_touched, compute_tools_used
+from drover.server.summarizer.worker import _tool_projection_sql
 
 
 def _ev(raw_data: dict) -> dict:
@@ -90,3 +93,75 @@ def test_tools_used_handles_missing_blocks() -> None:
         {"raw_data": "garbage"},
     ]
     assert compute_tools_used(events) == {}
+
+
+def test_tool_projection_excludes_large_unneeded_raw_fields() -> None:
+    """S3 pages deterministic tool facts, never an arbitrary tool transcript."""
+    huge = "x" * (2 * 1024 * 1024)
+    raw = json.dumps(
+        {
+            "tool_use_blocks": [
+                {"name": "Edit", "input": {"path": "src/main.py", "command": huge}}
+            ],
+            "details": huge,
+        }
+    )
+    with duckdb.connect() as con:
+        con.execute("CREATE TABLE events(raw_data VARCHAR)")
+        con.execute("INSERT INTO events VALUES (?)", [raw])
+        projected = con.execute(
+            f"SELECT {_tool_projection_sql()} AS raw_data FROM events"
+        ).fetchone()[0]
+    assert len(projected.encode()) < 1024
+    assert json.loads(projected) == {
+        "tool_name": "Edit",
+        "tool_use_blocks": [
+            {"name": "Edit", "input": {"path": "src/main.py", "file_path": None}}
+        ],
+        "tool": {"name": None, "input": {"path": None, "file_path": None}},
+        "input": {"path": None, "file_path": None},
+        "arguments": {"path": None, "file_path": None},
+        "path": None,
+        "file_path": None,
+        "derived_files": [],
+    }
+
+
+def test_tool_projection_derives_patch_paths_without_returning_command() -> None:
+    command = """apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: tests/test_memory_integrity.py
+@@
+*** End Patch
+PATCH"""
+    raw = json.dumps({"tool": "shell", "input": {"command": command}})
+    with duckdb.connect() as con:
+        con.execute("CREATE TABLE events(raw_data VARCHAR)")
+        con.execute("INSERT INTO events VALUES (?)", [raw])
+        projected = con.execute(
+            f"SELECT {_tool_projection_sql()} AS raw_data FROM events"
+        ).fetchone()[0]
+    assert "apply_patch" not in projected
+    assert compute_files_touched([{"raw_data": projected}]) == [
+        "tests/test_memory_integrity.py"
+    ]
+
+
+def test_tool_projection_preserves_flat_tool_input() -> None:
+    raw = json.dumps(
+        {
+            "tool": "Edit",
+            "input": {"file_path": "src/drover/server/memory_identity.py"},
+        }
+    )
+    with duckdb.connect() as con:
+        con.execute("CREATE TABLE events(raw_data VARCHAR)")
+        con.execute("INSERT INTO events VALUES (?)", [raw])
+        projected = con.execute(
+            f"SELECT {_tool_projection_sql()} AS raw_data FROM events"
+        ).fetchone()[0]
+    projected_event = {"event_type": "tool_action", "raw_data": projected}
+    assert compute_files_touched([projected_event]) == [
+        "src/drover/server/memory_identity.py"
+    ]
+    assert compute_tools_used([projected_event]) == {"Edit": 1}

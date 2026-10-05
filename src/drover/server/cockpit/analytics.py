@@ -338,6 +338,7 @@ def _materialized_session_facts(
         event_dates,
         usage_available=usage_available,
         summarised_dates=_summarised_dates(con, event_dates),
+        use_activity_daily=_activity_daily_available(con),
     )
     con.execute(
         f"CREATE TEMP TABLE {relation} AS {base_sql} SELECT * FROM filtered_sessions",
@@ -392,12 +393,18 @@ def _agent_event_partition_dates(
     established cross-midnight repo attribution for every included span. The
     inventory reads file paths only, so no global Parquet relation is bound.
     """
-    available = {str(row[0]) for row in con.execute("""
+    cutoff_date = (snapshot_at - timedelta(days=filters.days + 1)).date()
+    available = {
+        str(row[0])
+        for row in con.execute(
+            """
             SELECT date
             FROM agent_event_partitions
-            WHERE date IS NOT NULL AND date <> '_seed'
-            """).fetchall()}
-    cutoff_date = (snapshot_at - timedelta(days=filters.days + 1)).date()
+            WHERE date IS NOT NULL AND date <> '_seed' AND date >= ?
+            """,
+            [cutoff_date.isoformat()],
+        ).fetchall()
+    }
     needed = {value for value in available if value >= cutoff_date.isoformat()}
     for value in span_dates:
         try:
@@ -408,6 +415,15 @@ def _agent_event_partition_dates(
             (span_date + timedelta(days=offset)).isoformat() for offset in (-1, 0, 1)
         )
     return tuple(sorted(available & needed))
+
+
+def _activity_daily_available(con: duckdb.DuckDBPyConnection) -> bool:
+    """Whether this connection can use the DuckLake-native compact rollup."""
+    try:
+        return con.execute("""SELECT 1 FROM information_schema.tables
+            WHERE table_name='activity_daily' LIMIT 1""").fetchone() is not None
+    except Exception:
+        return False
 
 
 def _activity_analytics_from_facts(
@@ -673,10 +689,38 @@ def _session_facts_sql(
     *,
     usage_available: bool = False,
     summarised_dates: frozenset[str] = frozenset(),
+    use_activity_daily: bool = False,
 ) -> tuple[str, list[Any]]:
     where: list[str] = []
     params: list[Any] = [snapshot_at, filters.days]
-    if event_dates:
+    if event_dates and use_activity_daily:
+        # A daily aggregate cannot know where the timestamp cutoff lands, so
+        # scan only the two UTC partitions that can straddle it. Every later
+        # date is answered by the compact, date-pruned rollup.
+        live_dates = tuple(sorted(event_dates)[:_LIVE_PARTITION_COUNT])
+        cached_dates = tuple(d for d in event_dates if d not in live_dates)
+        parts: list[str] = [
+            agent_event_day_summary_sql(windowed=True) for _ in live_dates
+        ]
+        params.extend(live_dates)
+        if cached_dates:
+            placeholders = ", ".join("?" for _ in cached_dates)
+            parts.append(f"""
+                SELECT session_id, agent_id, date, repo_owner, repo_name,
+                       event_count, event_count AS windowed_event_count,
+                       first_event_at AS started_at, last_event_at AS ended_at,
+                       is_claude_mem_observer
+                FROM activity_daily d
+                WHERE date IN ({placeholders})
+                  AND (d.source='control' OR NOT EXISTS (
+                    SELECT 1 FROM memory_session_identity m
+                    WHERE d.session_id IN (m.harness_session_id,m.native_session_id)
+                      AND m.native_session_id IS DISTINCT FROM m.harness_session_id
+                  ))
+                """)
+            params.extend(cached_dates)
+        event_source = "\nUNION ALL BY NAME\n".join(parts)
+    elif event_dates:
         # Reduce each day's partition to a session/repo summary *before* anything
         # combines them. The previous shape unioned one raw scan per partition and
         # deduplicated across the lot, so a 30-day window pushed 2,488,925 events

@@ -53,7 +53,9 @@ class HistoryConnection:
         self.description = []
         self.rows = []
 
-    def execute(self, sql, params=None):
+    def execute(self, sql, params=None, *, limits=None):
+        from .query_process import QueryLimits
+
         result = query(
             lake_spec(self.config),
             sql,
@@ -65,6 +67,7 @@ class HistoryConnection:
                 "verification_sha256": self.config.verification_sha256,
                 "identities": self.identities,
             },
+            limits=limits or QueryLimits(),
         )
         self.description = list(zip(result["columns"], result["types"]))
         self.rows = [

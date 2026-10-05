@@ -113,3 +113,15 @@ def test_native_process_rss_and_missing_pid():
     assert process_memory.process_rss(os.getpid()) > 0
     with pytest.raises((OSError, ValueError)):
         process_memory.process_rss(2147483647)
+
+
+def test_eight_gib_hub_reports_over_default_four_gib_budget(caplog):
+    """The reported production-size excess must be visible before cutover."""
+    guard = ProcessMemoryGuard(reader=lambda pid: 8 * 1024**3)
+    guard.sample()
+    payload = guard.snapshot()
+    assert payload["state"] == "over"
+    assert payload["rss_bytes"] == 8589934592
+    assert payload["budget_bytes"] == 4294967296
+    assert payload["peak_rss_bytes"] == 8589934592
+    assert "rss_bytes=8589934592 budget_bytes=4294967296" in caplog.text

@@ -212,10 +212,19 @@ def run_model(con, request, limits):
     native_freshness, contexts, context_metadata, context_error = _control_snapshot(
         con, request
     )
+    operation = request["operation"]
     # These are ephemeral query relations, never catalog tables or cached files.
-    con.execute(
-        "CREATE TEMP VIEW agent_event_partitions AS SELECT DISTINCT date FROM agent_events"
-    )
+    if operation == "cockpit":
+        # Do not bind a global raw-event relation simply to discover dates.
+        # The rollup is small, partitioned by UTC day, and maintained in the
+        # same snapshot as outbox exports.
+        con.execute(
+            "CREATE TEMP VIEW agent_event_partitions AS SELECT DISTINCT date FROM lake.activity_daily"
+        )
+    else:
+        con.execute(
+            "CREATE TEMP VIEW agent_event_partitions AS SELECT DISTINCT date FROM agent_events"
+        )
     con.execute(
         "CREATE TEMP MACRO agent_events_for_date(day) AS TABLE SELECT * FROM agent_events WHERE date=day"
     )
@@ -234,7 +243,6 @@ def run_model(con, request, limits):
         + " WHERE FALSE"
     )
     options = request["options"]
-    operation = request["operation"]
     binding = {
         **request["binding"],
         "snapshot": con.execute(

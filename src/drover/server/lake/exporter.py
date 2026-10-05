@@ -31,6 +31,7 @@ from drover.server.db import control_plane_connection
 from drover.server.memory_identity import project_control_event
 from drover.task_id import compute_task_id
 
+from .activity_daily import ACTIVITY_DAILY_SCHEMA, refresh_activity_daily
 from .export_guard import APPLICATION_PREFIX, activate, install_commit_guard
 from .export_worker import RECEIPT_SCHEMA, receipt_hash, validate_input
 from .fence import MutationFence
@@ -54,6 +55,19 @@ def provision_exporter(spec: LakeSpec, *, exporter_role: str | None = None):
             raise LakeError("lake_export_tables_missing")
         if {"export_batch_receipts", "export_event_versions"} & names:
             raise LakeError("lake_export_already_provisioned")
+        if "activity_daily" not in names:
+            create_table(
+                con, "activity_daily", ACTIVITY_DAILY_SCHEMA, day_partition=True
+            )
+            refresh_activity_daily(
+                con,
+                [
+                    row[0]
+                    for row in con.execute(
+                        "SELECT DISTINCT date FROM lake.agent_events"
+                    ).fetchall()
+                ],
+            )
         create_table(con, "export_batch_receipts", RECEIPT_SCHEMA)
         create_table(
             con, "export_event_versions", POLICY_SCHEMA | LINEAGE, day_partition=True
