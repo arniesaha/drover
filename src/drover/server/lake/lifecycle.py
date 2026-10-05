@@ -74,11 +74,7 @@ class ExporterLifecycle:
             ) as exporter:
                 # Both explicitly configured credentials must address the same
                 # catalog. Do not rely on ambient path registration for startup.
-                reader = lake_spec(self.config.analytics)
-                if catalog_identity(reader) != catalog_identity(exporter.spec):
-                    raise LakeError("lake_export_catalog_mismatch")
-                with HistoryConnection(self.config.analytics) as history:
-                    history.execute("SELECT 1")
+                _check_export_catalog(self.config, exporter)
                 if self.config.analytics.retire_legacy_writers:
                     from .writer_gate import activate_retirement
 
@@ -166,3 +162,74 @@ def selected_exporter(config):
     # opt-in bit used to leave a hub serving the lake while silently not
     # exporting new control events; do not permit that split brain.
     return ExporterLifecycle(config)
+
+
+def _check_export_catalog(config, exporter):
+    reader = lake_spec(config.analytics)
+    if catalog_identity(reader) != catalog_identity(exporter.spec):
+        raise LakeError("lake_export_catalog_mismatch")
+    with HistoryConnection(config.analytics) as history:
+        history.execute("SELECT 1")
+
+
+def export_ingested_events(config, dedup_keys, *, timeout_seconds=30, max_passes=100):
+    """Synchronously publish a CLI file, bounded by passes and elapsed time.
+
+    Check canonical dedup keys rather than incoming IDs: a retry may name an
+    already committed event differently. Never report success for rejected or
+    still outstanding rows. Each pass retains the normal byte/count limits.
+    """
+    import time
+    from contextlib import nullcontext
+
+    from drover.server.db import control_plane_connection
+
+    keys = sorted(set(dedup_keys))
+    if not keys:
+        return
+    if config.analytics.backend == "legacy":
+        owner = nullcontext(selected_exporter(config))
+    else:
+        owner = LakeOutboxExporter(
+            control_path=config.duckdb_path,
+            spec=lake_spec(config.analytics, exporter=True),
+        )
+    deadline = time.monotonic() + timeout_seconds
+    with owner as exporter:
+        if config.analytics.backend == "ducklake":
+            _check_export_catalog(config, exporter)
+        for _ in range(max_passes):
+            # CLI publication bypasses only the legacy flush delay, retaining
+            # its byte/count limits and the hub's default 5s background age.
+            if config.analytics.backend == "legacy":
+                exporter.run_once(force_flush=True)
+            else:
+                exporter.run_once()
+            outstanding = 0
+            with control_plane_connection(config.duckdb_path) as control:
+                for offset in range(0, len(keys), 1000):
+                    chunk = keys[offset : offset + 1000]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = control.execute(
+                        f"""SELECT o.state, o.rejection_reason
+                        FROM harness_events e JOIN control_outbox_events o
+                        ON o.event_id=e.event_id
+                        WHERE e.dedup_key IN ({placeholders})""",
+                        chunk,
+                    ).fetchall()
+                    outstanding += len(chunk) - len(rows)
+                    for state, reason in rows:
+                        if state == "rejected":
+                            raise RuntimeError(f"incoming event rejected: {reason}")
+                        outstanding += state != "acknowledged"
+            if not outstanding:
+                if config.analytics.backend == "ducklake":
+                    from .task_projection import refresh_if_provisioned
+
+                    refresh_if_provisioned(
+                        config.duckdb_path, lake_fence=exporter.fence
+                    )
+                return
+            if time.monotonic() >= deadline:
+                break
+    raise RuntimeError("incoming export deadline: events remain unacknowledged")

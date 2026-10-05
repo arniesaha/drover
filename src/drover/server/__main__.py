@@ -1885,12 +1885,24 @@ def incoming_ingest_once_cmd(ctx: click.Context, jsonl_path: Path, apply: bool) 
     if not apply:
         click.echo(f"mode=dry-run path={jsonl_path} size={jsonl_path.stat().st_size}")
         return
+    from drover.server.ingest import _iter_events
+    from drover.server.lake.lifecycle import export_ingested_events
+
+    dedup_keys = [
+        row["dedup_key"] for row, _ in _iter_events(jsonl_path, None) if row is not None
+    ]
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
     ingest_incoming_file_once(
         jsonl_path,
         parquet_dir=cfg.parquet_dir,
         duckdb_path=cfg.duckdb_path,
     )
+    if jsonl_path.exists():
+        raise click.ClickException("incoming ingest failed; file remains pending")
+    try:
+        export_ingested_events(cfg, dedup_keys)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(f"mode=apply ingested={jsonl_path}")
 
 

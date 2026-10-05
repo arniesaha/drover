@@ -1834,29 +1834,33 @@ def test_cli_embeddings_drain_once_requires_the_postgres_memory_store(tmp_path):
     assert "postgres" in dry.output
 
 
-def test_cli_incoming_ingest_once_dry_run_and_apply(tmp_path):
+@pytest.mark.parametrize("event_count", [1, 101])
+def test_cli_incoming_ingest_once_dry_run_and_apply(tmp_path, event_count):
     runner = CliRunner()
     cfg = _make_config(tmp_path)
     host_dir = tmp_path / "incoming" / "macmini"
     host_dir.mkdir(parents=True)
     jsonl_path = host_dir / "batch.jsonl"
     jsonl_path.write_text(
-        json.dumps(
-            {
-                "id": "incoming-cli-001",
-                "session_id": "sess-incoming-cli",
-                "timestamp": "2026-05-08T10:00:00Z",
-                "agent_id": "test-agent",
-                "event_type": "user_message",
-                "message": {"role": "user", "content": "hi"},
-                "raw_data": {
-                    "_repo_owner": "arniesaha",
-                    "_repo_name": "nexus",
-                    "gitBranch": "main",
-                },
-            }
+        "".join(
+            json.dumps(
+                {
+                    "id": f"incoming-cli-{index:03d}",
+                    "session_id": "sess-incoming-cli",
+                    "timestamp": "2026-05-08T10:00:00Z",
+                    "agent_id": "test-agent",
+                    "event_type": "user_message",
+                    "message": {"role": "user", "content": f"hi {index}"},
+                    "raw_data": {
+                        "_repo_owner": "arniesaha",
+                        "_repo_name": "nexus",
+                        "gitBranch": "main",
+                    },
+                }
+            )
+            + "\n"
+            for index in range(1, event_count + 1)
         )
-        + "\n"
     )
 
     dry = runner.invoke(
@@ -1883,6 +1887,11 @@ def test_cli_incoming_ingest_once_dry_run_and_apply(tmp_path):
             ).fetchone()[0]
             == 1
         )
+        assert (
+            con.execute("SELECT count(*) FROM agent_events").fetchone()[0]
+            == event_count
+        )
+        assert con.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
     finally:
         con.close()
 

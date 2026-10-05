@@ -129,7 +129,9 @@ class ControlOutboxExporter:
                     self._last_error = type(exc).__name__
             self._shutdown.wait(self.poll_seconds)
 
-    def run_once(self, *, now: datetime | None = None) -> dict[str, Any]:
+    def run_once(
+        self, *, now: datetime | None = None, force_flush: bool = False
+    ) -> dict[str, Any]:
         from contextlib import ExitStack
 
         from drover.server.lake.writer_gate import legacy_derived_write
@@ -142,9 +144,11 @@ class ControlOutboxExporter:
             for path in paths:
                 if not fences.enter_context(legacy_derived_write(path)):
                     return self._empty_result()
-            return self._run_once_legacy(now=now)
+            return self._run_once_legacy(now=now, force_flush=force_flush)
 
-    def _run_once_legacy(self, *, now: datetime | None = None) -> dict[str, Any]:
+    def _run_once_legacy(
+        self, *, now: datetime | None = None, force_flush: bool = False
+    ) -> dict[str, Any]:
         """Publish at most one flush-sized batch and always resume SQL receipts."""
         stamp = now or datetime.now(timezone.utc)
         with control_plane_connection(self.control_path) as control:
@@ -170,7 +174,7 @@ class ControlOutboxExporter:
         acknowledged = self._rebuild_relation_and_acknowledge(acknowledge=False)
         published = 0
 
-        should_claim = self._should_claim(before, stamp)
+        should_claim = force_flush or self._should_claim(before, stamp)
         if should_claim:
             with control_plane_connection(self.control_path) as control:
                 claim = claim_outbox_batch(

@@ -22,6 +22,8 @@ def test_context_generation_parity_and_missing_stale_incomplete(verified_lake):
             "INSERT INTO context_containers(context_id,container_type,label,source_harness,confidence,evidence,last_touched_at,next_action,open_loop,session_ids,task_ids,repo_owner,repo_name,summary_md,created_at,updated_at) VALUES ('ctx','research_thread','Research','codex',0.9,'curated',now(),'Continue','Question',['s'],[],'o','r','Known context',now(),now())"
         )
     expected = tools.drover_context_brief(duckdb_path=path, context_id="ctx")
+    # Publication takes source columns, not MCP freshness/truncation metadata.
+    source_record = {key: expected[key] for key in coverage.CONTEXT_COLUMNS}
     configure_analytics(path, config)
     assert (
         tools.drover_context_brief(duckdb_path=path, context_id="ctx")["status"]
@@ -31,7 +33,7 @@ def test_context_generation_parity_and_missing_stale_incomplete(verified_lake):
     coverage.publish_source(
         path,
         "contexts",
-        [expected],
+        [source_record],
         publisher="curator",
         watermark="ctx-v1",
         observed_at=datetime.now(timezone.utc),
@@ -45,9 +47,12 @@ def test_context_generation_parity_and_missing_stale_incomplete(verified_lake):
         )["contexts"]
         == []
     )
-    assert tools.drover_open_loops(duckdb_path=path, project_key="o/r")[
-        "open_loops"
-    ] == [expected]
+    loops = tools.drover_open_loops(duckdb_path=path, project_key="o/r")
+    assert loops["truncated"] is False
+    # Truncation belongs to the root response, not each nested context record.
+    assert loops["open_loops"] == [
+        {key: value for key, value in expected.items() if key != "truncated"}
+    ]
     assert (
         tools.drover_resume_context(duckdb_path=path, context_id="ctx")["context"]
         == expected
@@ -70,7 +75,7 @@ def test_context_generation_parity_and_missing_stale_incomplete(verified_lake):
     coverage.publish_source(
         path,
         "contexts",
-        [expected],
+        [source_record],
         publisher="curator",
         watermark="ctx-v2",
         observed_at=datetime.now(timezone.utc) - timedelta(hours=1),
@@ -336,8 +341,15 @@ def test_coverage_bounds_and_receipt_atomicity(verified_lake, monkeypatch):
         with pytest.raises(LakeError, match="coverage_changed"):
             coverage.certify(path, "contexts")
     generation = coverage.certify(path, "contexts")
+    # The public MCP contract clamps oversized limits before reaching coverage.
+    public = tools.drover_resume_context(
+        duckdb_path=path, context_id="ctx", max_summaries=1001
+    )
+    assert public["truncated"] is True
+    assert public["context"]["context_id"] == "ctx"
+    # Coverage's independent hard bound still rejects an unbounded raw call.
     assert (
-        tools.drover_resume_context(
+        tools.drover_resume_context.__wrapped__(
             duckdb_path=path, context_id="ctx", max_summaries=1001
         )["reason"]
         == "analytics_row_limit_exceeded"
