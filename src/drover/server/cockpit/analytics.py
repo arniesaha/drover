@@ -100,7 +100,7 @@ class Coverage:
 class AggregateMetadata:
     source: Literal["drover_observed"]
     observed_at: datetime | None
-    freshness: Literal["fresh", "stale", "unavailable"]
+    freshness: Literal["fresh", "stale", "unavailable", "archived"]
     coverage: Coverage
 
 
@@ -487,7 +487,17 @@ def _activity_analytics_from_facts(
             cache=MetricSources(usage_cache_pct, span_cache_pct, status),
         ),
     )
-    metadata = _aggregate_metadata(coverage, aggregate[12])
+    is_archived = False
+    try:
+        wm = con.execute("SELECT max(partition_date) FROM lake.import_watermark").fetchone()[0]
+        if wm is not None:
+            wm_date = datetime.strptime(wm, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if (snapshot_at - timedelta(days=filters.days)) < wm_date:
+                # If we're looking at pre-watermark data, and it's raw-derived, mark archived.
+                is_archived = True
+    except Exception:
+        pass
+    metadata = _aggregate_metadata(coverage, aggregate[12], archived=is_archived)
     # Spec, Track 3: rank projects by tokens only when one source alone covers
     # enough sessions to trust. A union of two thin sources is not that.
     #
@@ -1386,12 +1396,14 @@ def _snapshot_fingerprint(
 
 
 def _aggregate_metadata(
-    coverage: Coverage, observed_at: datetime | None
+    coverage: Coverage, observed_at: datetime | None, *, archived: bool = False
 ) -> AggregateMetadata:
     if observed_at is not None and observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
-    freshness: Literal["fresh", "stale", "unavailable"] = "unavailable"
-    if observed_at is not None:
+    freshness = "unavailable"
+    if archived:
+        freshness = "archived"
+    elif observed_at is not None:
         age = (datetime.now(timezone.utc) - observed_at).total_seconds()
         freshness = "fresh" if age <= _FRESHNESS_SECONDS else "stale"
     return AggregateMetadata(

@@ -139,6 +139,24 @@ def restore_cmd(generation, data_root, catalog_destination):
     click.echo(json.dumps(receipt, indent=2))
 
 
+@lake_cmd.command("import")
+@click.option("--since", help="Import events since this date (YYYY-MM-DD).")
+@click.option("--session", "session_id", help="Import only this session ID.")
+@click.option("--data-root", type=click.Path(path_type=Path), required=True)
+@click.option("--catalog-dsn-env", required=True)
+@click.option("--legacy-root", type=click.Path(exists=True, path_type=Path), required=True)
+def import_cmd(since, session_id, data_root, catalog_dsn_env, legacy_root):
+    from .legacy_import import run_import
+    try:
+        run_import(
+            spec_from_options(data_root, catalog_dsn_env),
+            legacy_root,
+            since=since,
+            session_id=session_id,
+        )
+    except LakeError as exc:
+        raise _lake_failure(exc, data_root) from None
+
 @lake_cmd.command("verify")
 @click.option(
     "--data-root", type=click.Path(exists=True, path_type=Path), required=True

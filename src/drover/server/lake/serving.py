@@ -115,7 +115,7 @@ def open_history(path: Path):
     try:
         with control_plane_connection(path) as con:
             rows = con.execute(
-                """SELECT session_id, native_session_id, summary_session_id
+                """SELECT session_id, native_session_id, summary_session_id, CAST(started_at AS VARCHAR) AS started_at
                 FROM harness_sessions WHERE command <> 'collector' ORDER BY session_id LIMIT 10001"""
             ).fetchall()
     except Exception:

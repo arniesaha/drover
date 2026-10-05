@@ -324,6 +324,38 @@ def resolve_session(con: Any, session_id: str, *, store_path=None) -> dict:
         status = (
             "ok" if exists or artifact else ("unavailable" if native else "unmapped")
         )
+        if status == "unavailable":
+            try:
+                started_at = con.execute("SELECT started_at FROM memory_session_identity WHERE harness_session_id=?", [harness]).fetchone()
+                if started_at and started_at[0]:
+                    try:
+                        watermark_date = None
+                        if store_path:
+                            from drover.server.lake.serving import open_history
+                            hcon = open_history(store_path)
+                            if hcon:
+                                try:
+                                    hcon.execute("SELECT MAX(partition_date) FROM lake.import_watermark")
+                                    if hcon.rows and hcon.rows[0][0]:
+                                        watermark_date = str(hcon.rows[0][0])
+                                except Exception:
+                                    pass
+                                if not watermark_date:
+                                    try:
+                                        hcon.execute("SELECT MIN(timestamp), COUNT(*) FROM lake.agent_events")
+                                        if hcon.rows and hcon.rows[0][0]:
+                                            watermark_date = str(hcon.rows[0][0])[:10]
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        watermark_date = None
+
+                    if watermark_date:
+                        session_date = str(started_at[0])[:10]
+                        if session_date < watermark_date:
+                            status = "archived"
+            except Exception:
+                pass
         return {
             "status": status,
             "session_id": harness,
