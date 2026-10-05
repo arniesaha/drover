@@ -97,12 +97,7 @@ def hub_http(prod_shaped, tmp_path):
         server.server_close()
 
 
-# fails today: watched collector ingestion writes legacy parquet but never publishes to DuckLake.
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="v2 S2: collector event absent from DuckLake",
-)
+# S2: the real collector/watch lifecycle must publish to the selected lake sink.
 def test_a1_collector_jsonl_in_lake_and_mcp_replay_recall(
     hub_small_lake, prod_shaped, tmp_path
 ):
@@ -179,11 +174,8 @@ def test_a1_collector_jsonl_in_lake_and_mcp_replay_recall(
         exporter.stop()
 
 
-# fails today: watcher events are absent from the outbox and raw ingest writes parquet in both modes.
+# S2: all producers dedupe in the outbox, with no parquet write during ingest.
 @pytest.mark.parametrize("backend", ["legacy", "ducklake"])
-@pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason="v2 S2: raw ingest bypasses the outbox"
-)
 def test_a2_outbox_events_dedup_semantics_no_parquet_ingest(
     prod_shaped, hub_small_lake, hub_http, tmp_path, backend
 ):
@@ -355,7 +347,7 @@ def test_a4_cockpit_overview_5m_lake_scale(
     assert p95 < 2, f"Cockpit overview p95 {p95:.3f}s exceeds 2 s"
 
 
-# Regression already fixed by released migration 11: startup must preserve the prod migration state.
+# S2: startup preserves released versions 1–11 and applies only migration 12.
 def test_a5_hub_startup_on_prod_shaped_store(prod_shaped, served_small_lake):
     from drover.server.lake.exporter import LakeOutboxExporter
 
@@ -367,11 +359,18 @@ def test_a5_hub_startup_on_prod_shaped_store(prod_shaped, served_small_lake):
     assert [r[0] for r in before] == list(range(1, 12))
     bootstrap_control_plane_store(prod_shaped)
     with store.connection() as con:
+        after = con.execute(
+            "SELECT version, applied_at FROM control_schema_migrations ORDER BY version"
+        ).fetchall()
+    assert after[:11] == before
+    assert [r[0] for r in after] == list(range(1, 13))
+    bootstrap_control_plane_store(prod_shaped)
+    with store.connection() as con:
         assert (
             con.execute(
                 "SELECT version, applied_at FROM control_schema_migrations ORDER BY version"
             ).fetchall()
-            == before
+            == after
         )
     with LakeOutboxExporter(
         control_path=prod_shaped, spec=served_small_lake.spec
@@ -380,10 +379,7 @@ def test_a5_hub_startup_on_prod_shaped_store(prod_shaped, served_small_lake):
             assert exporter._pending(con) is None
 
 
-# fails today: outbox replay --sink legacy has no CLI implementation.
-@pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason="v2 S2: outbox replay command missing"
-)
+# S2: rollback replays the retained control outbox into legacy parquet.
 def test_a6_switch_ingest_rollback_outbox_replay(
     hub_small_lake, prod_shaped, hub_http, tmp_path
 ):

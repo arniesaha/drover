@@ -361,7 +361,7 @@ class SummarizerWorker:
                     cur = con.execute(
                         f"""WITH {_session_agent_events_ctes()}
                         SELECT event_type, raw_data, timestamp, id, coalesce(dedup_key, '') AS _dedup_key, hash(raw_data) AS _raw_hash FROM canonical_agent_events
-                        WHERE raw_data IS NOT NULL AND (timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data)) > (?, ?, ?, ?)
+                        WHERE raw_data IS NOT NULL AND (timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data)) > (?::TIMESTAMPTZ, ?::VARCHAR, ?::VARCHAR, ?::UBIGINT)
                         ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT 1000""",
                         [
                             session_id,

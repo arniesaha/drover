@@ -28,8 +28,8 @@ small contracts and self-tests; the pgvector job also runs both drift guards so
 extension permits omitting the conditional embeddings table, with a warning.
 
 Each strict xfail names a known product gap and accepts only assertion failures.
-A2 has separate legacy and DuckLake cases. A5 is a passing regression test because
-migration 11 already fixes its exporter table. Scale tests rebuild and verify the
+A2 has separate legacy and DuckLake cases. A5 restores versions 1–11 and verifies that startup applies only migration 12,
+preserving the existing migration rows, before the first exporter pending read. Scale tests rebuild and verify the
 lake through production APIs, then register analytics exactly as the hub does.
 A1 starts the real hub exporter lifecycle and writes through the collector's
 actual atomic JSONL writer.
@@ -44,8 +44,7 @@ byte limits and truncation for both a large and a short session.
 
 S2's rollback CLI is specified as `outbox replay --sink legacy` against the
 isolated config's durable control outbox. S4's import CLI options name isolated
-lake/catalog and legacy source roots explicitly. Those commands remain future
-contracts. A7's lake imports only the last date; the first-day session exists in
+lake/catalog and legacy source roots explicitly. S2 replay is executable; S4 import remains a future contract. A7's lake imports only the last date; the first-day session exists in
 the retained legacy archive and control registry, with its native ID mapping
 and historical start time. This partition boundary is the
 harness's explicit import watermark until S4 persists that metadata; the harness

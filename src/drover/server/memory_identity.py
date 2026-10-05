@@ -35,6 +35,15 @@ def ensure_memory_schema(con: Any) -> None:
 def project_control_event(event: dict, session: dict) -> dict:
     """Project the full envelope, never the truncated UI preview."""
     payload = json.loads(event.get("payload_json") or "{}")
+    if event.get("normalized_source") == "collector" and isinstance(
+        payload.get("collector_row"), dict
+    ):
+        from datetime import datetime
+
+        row = dict(payload["collector_row"])
+        row["timestamp"] = datetime.fromisoformat(row["timestamp"])
+        row["source"] = "native"
+        return row
     kind = event.get("normalized_type") or event["event_type"]
     inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     item = inner.get("item") or payload.get("item")
@@ -89,8 +98,6 @@ def project_control_event(event: dict, session: dict) -> dict:
         token_usage=usage if isinstance(usage, dict) else None,
     )
     row = _row_from_event(ev, session.get("task_id"))
-    # Outbox IDs are globally stable and preserve even identical adjacent turns.
-    row["dedup_key"] = "control:" + event["event_id"]
     row["source"] = "control"
     return row
 
@@ -98,7 +105,7 @@ def project_control_event(event: dict, session: dict) -> dict:
 def read_memory_sessions(control: Any) -> dict[str, dict]:
     """Detach the small authoritative identity snapshot before analytical work."""
     cur = control.execute(
-        "SELECT session_id, native_session_id, summary_session_id, harness, repo_owner, repo_name, branch, cwd FROM harness_sessions"
+        "SELECT session_id, native_session_id, summary_session_id, harness, repo_owner, repo_name, branch, cwd, command FROM harness_sessions"
     )
     cols = [d[0] for d in cur.description]
     sessions = {r[0]: dict(zip(cols, r)) for r in cur.fetchall()}
@@ -183,6 +190,10 @@ def refresh_memory_projection(
                 sessions[sid]["native_session_id"] = native.strip()
                 links.append({"session_id": sid, "native_session_id": native.strip()})
     for session in sessions.values():
+        if session.get("command") == "collector":
+            # Native sessions are identities already; an artificial harness alias
+            # would hide older native history or collide with a real harness link.
+            continue
         analytics.execute(
             """INSERT INTO memory_session_identity VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (harness_session_id) DO UPDATE SET

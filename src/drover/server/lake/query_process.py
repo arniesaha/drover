@@ -221,8 +221,7 @@ def _worker(request: dict) -> dict:
                 con.executemany(
                     "INSERT INTO memory_session_identity VALUES (?,?,?)", identities
                 )
-            con.execute(
-                """CREATE TEMP VIEW agent_events AS
+            con.execute("""CREATE TEMP VIEW agent_events AS
                 SELECT * EXCLUDE(timestamp,repo_owner,repo_name), TRY_CAST(timestamp AS TIMESTAMPTZ) AS timestamp,
                   COALESCE(repo_owner, CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data,'$._repo_owner') END) AS repo_owner,
                   COALESCE(repo_name, CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data,'$._repo_name') END) AS repo_name,
@@ -231,8 +230,8 @@ def _worker(request: dict) -> dict:
                     THEN 'control' ELSE 'native' END AS source
                 FROM lake.agent_events e WHERE dedup_key_source='outbox' OR
                     (CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data,'$.source') END)='control' OR NOT EXISTS (
-                  SELECT 1 FROM memory_session_identity m WHERE e.session_id IN (m.harness_session_id,m.native_session_id))"""
-            )
+                  SELECT 1 FROM memory_session_identity m WHERE e.session_id IN (m.harness_session_id,m.native_session_id)
+                    AND m.native_session_id IS DISTINCT FROM m.harness_session_id)""")
             con.execute(
                 "CREATE TEMP VIEW control_memory_events AS SELECT * FROM agent_events WHERE source='control'"
             )

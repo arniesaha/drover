@@ -160,6 +160,7 @@ def selected_exporter(config):
             control_path=config.duckdb_path,
             analytical_path=config.duckdb_path,
             parquet_dir=config.parquet_dir,
+            acknowledgement_retention_days=config.control_store.outbox_retention_days,
         )
     # Restart-selected DuckLake is a complete read/write selection. A separate
     # opt-in bit used to leave a hub serving the lake while silently not

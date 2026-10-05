@@ -27,13 +27,8 @@ from watchdog.observers import Observer
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import control_plane_connection, open_duckdb_connection
 from drover.server.ingest import ingest_file
-from drover.server.ledger import memory_store_available
 from drover.server.providers.service import compact_closed_snapshot_partitions
 from drover.server.redis_shadow import ShadowPublisher
-from drover.server.summarizer.jobs import (
-    enqueue_summary_generation,
-    source_version_for_session,
-)
 
 log = logging.getLogger("drover.watcher")
 
@@ -54,32 +49,11 @@ def _is_duckdb_lock_contention(exc: BaseException) -> bool:
     return any(marker in message for marker in _DUCKDB_LOCK_MARKERS)
 
 
-def _session_ids_in_file(path: Path) -> set[str]:
-    """Best-effort session_id extraction for idempotent summarize enqueue.
-
-    The watcher may ingest rows successfully and then hit DuckDB lock contention
-    while enqueuing summarize jobs. On retry, ingest dedupes the already-written
-    events and no longer reports them as newly seen. Re-reading session ids from
-    the source JSONL lets the enqueue phase recover idempotently before moving
-    the file to .processed/.
-    """
-    session_ids: set[str] = set()
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                sid = payload.get("session_id")
-                if isinstance(sid, str) and sid:
-                    session_ids.add(sid)
-    except OSError:
-        log.exception("failed to inspect session_ids in %s", path)
-    return session_ids
+def _is_ingest_contention(exc: BaseException) -> bool:
+    return _is_duckdb_lock_contention(exc) or getattr(exc, "sqlstate", None) in {
+        "40P01",
+        "40001",
+    }
 
 
 class _Handler(FileSystemEventHandler):
@@ -116,10 +90,16 @@ class _Handler(FileSystemEventHandler):
                     self._ingest_once(path)
                     return
                 except Exception as exc:
-                    if _is_duckdb_lock_contention(exc) and attempt < attempts:
+                    label = (
+                        "Postgres transaction"
+                        if getattr(exc, "sqlstate", None) in {"40P01", "40001"}
+                        else "DuckDB lock"
+                    )
+                    if _is_ingest_contention(exc) and attempt < attempts:
                         delay = self._lock_retry_base_seconds * (2 ** (attempt - 1))
                         log.warning(
-                            "DuckDB lock contention while ingesting %s; retrying attempt %d/%d in %.1fs",
+                            "%s contention while ingesting %s; retrying attempt %d/%d in %.1fs",
+                            label,
                             path,
                             attempt + 1,
                             attempts,
@@ -128,12 +108,13 @@ class _Handler(FileSystemEventHandler):
                         if delay:
                             time.sleep(delay)
                         continue
-                    if _is_duckdb_lock_contention(exc):
+                    if _is_ingest_contention(exc):
                         log.warning(
-                            "DuckDB lock contention exhausted for %s after %d attempt(s); "
+                            "%s contention exhausted for %s after %d attempt(s); "
                             "leaving file in place. Run `drover-server runtime-audit` "
                             "to inspect pending incoming JSONL by source and restart the "
                             "writer if the backlog continues to age.",
+                            label,
                             path,
                             attempts,
                             exc_info=True,
@@ -160,83 +141,11 @@ class _Handler(FileSystemEventHandler):
             stats.errors,
             stats.shadow_published,
         )
-        # Enqueue summarize jobs idempotently. Include session IDs present in
-        # the source file so a retry after post-ingest DuckDB lock contention
-        # cannot move the file without recovering summarize jobs for the
-        # already-inserted sessions.
-        session_ids = set(stats.new_session_ids) | _session_ids_in_file(path)
-        if session_ids:
-            self._enqueue_summaries(path, session_ids)
         # Move to .processed/ for audit only after ingest + job enqueue ran.
         processed = path.parent / ".processed"
         processed.mkdir(exist_ok=True)
         target = processed / path.name
         shutil.move(str(path), str(target))
-
-    def _enqueue_summaries(self, path: Path, session_ids: set[str]) -> None:
-        """Open a summary generation in the job ledger for each touched session.
-
-        The events are committed by now, so a failed enqueue must not fail the
-        ingest (#308): re-parsing the file would only dedupe the same rows and
-        try the same enqueue again. Each failure is logged with its session and
-        skipped; the session's next batch mints a new source version and
-        enqueues it, and ``drover-server retry-summarize-jobs`` covers the rest.
-        A DuckDB failure computing the source version still propagates, so
-        lock contention keeps the whole-file retry above.
-
-        Without a PostgreSQL control store derived memory is unavailable and
-        there is nothing to enqueue, so the source versions are not computed.
-        """
-        if not memory_store_available(self._duckdb_path):
-            log.debug(
-                "derived memory unavailable (no PostgreSQL control store); "
-                "no summaries enqueued for %s",
-                path,
-            )
-            return
-        queued = 0
-        from drover.server.lake.runtime import LakeError
-        from drover.server.lake.serving import open_history
-
-        try:
-            con = open_history(self._duckdb_path)
-        except LakeError:
-            log.warning(
-                "canonical source unavailable after committed ingest; enqueue deferred"
-            )
-            return
-        try:
-            for sid in sorted(str(s) for s in session_ids):
-                try:
-                    source_version = source_version_for_session(con, sid)
-                except LakeError:
-                    log.warning(
-                        "canonical source unavailable after committed ingest; enqueue deferred"
-                    )
-                    continue
-                try:
-                    outcome = enqueue_summary_generation(
-                        self._duckdb_path, sid, source_version
-                    )
-                except Exception:  # noqa: BLE001 - the ingest is already committed
-                    log.warning(
-                        "summary enqueue failed for session %s after ingesting %s; "
-                        "its next batch will enqueue it",
-                        sid,
-                        path,
-                        exc_info=True,
-                    )
-                    continue
-                if outcome in ("queued", "requeued"):
-                    queued += 1
-        finally:
-            con.close()
-        log.info(
-            "enqueued %d summarize job(s) for %d session(s) in %s",
-            queued,
-            len(session_ids),
-            path,
-        )
 
     def on_created(self, event: FileSystemEvent) -> None:
         if event.is_directory:

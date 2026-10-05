@@ -113,7 +113,7 @@ def open_history(path: Path):
         with control_plane_connection(path) as con:
             rows = con.execute(
                 """SELECT session_id, native_session_id, summary_session_id
-                FROM harness_sessions ORDER BY session_id LIMIT 10001"""
+                FROM harness_sessions WHERE command <> 'collector' ORDER BY session_id LIMIT 10001"""
             ).fetchall()
     except Exception:
         raise LakeError("analytics_identity_unavailable") from None

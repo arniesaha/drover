@@ -464,14 +464,9 @@ def test_provision_exporter_cli_success_then_already_provisioned(
         assert again.exit_code != 0
         assert "lake_export_already_provisioned" in again.output
     finally:
+        with psycopg.connect(spec.dsn(), autocommit=True) as con:
+            con.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
         with psycopg.connect(postgres_dsn, autocommit=True) as con:
-            con.execute(
-                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
-                    sql.Identifier(
-                        psycopg.conninfo.conninfo_to_dict(spec.dsn())["dbname"]
-                    )
-                )
-            )
             con.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
 
 
@@ -618,3 +613,54 @@ def test_guard_missing_classifies_real_postgres_errors(postgres_dsn):
         with pytest.raises(psycopg.Error) as other:
             con.execute("SELECT * FROM no_such_table_here")
         assert not _guard_missing(other.value)
+
+
+def test_lake_exports_one_row_over_target_alone_then_drains_short_event(
+    export_lake, postgres_control_store, tmp_path
+):
+    import json
+
+    from drover.server.control_outbox import (
+        MAX_INPUT_BYTES,
+        TARGET_BATCH_BYTES,
+        canonical_payload,
+    )
+    from drover.server.ingest import ingest_file
+
+    path, legacy = postgres_control_store
+    source = tmp_path / "large.jsonl"
+    events = [
+        dict(
+            id=f"collector-{i}",
+            session_id="collector",
+            agent_id="host",
+            timestamp=f"2026-10-04T12:00:0{i}+00:00",
+            event_type="user_message",
+            message=dict(
+                role="user", content=("x" * (9 * 1024**2) if i == 0 else "short")
+            ),
+            raw_data={},
+        )
+        for i in range(2)
+    ]
+    source.write_text("".join(json.dumps(e) + "\n" for e in events))
+    ingest_file(source, parquet_dir=legacy, duckdb_path=path)
+    with LakeOutboxExporter(control_path=path, spec=export_lake) as exporter:
+        document = frozen(exporter)
+        assert document["event_ids"] == ["collector-0"]
+        assert (
+            TARGET_BATCH_BYTES
+            < len(canonical_payload(document).encode())
+            < MAX_INPUT_BYTES
+        )
+        assert exporter.run_once()["acknowledged"] == 1
+        assert exporter.run_once()["acknowledged"] == 1
+        assert exporter.run_once()["acknowledged"] == 0
+    from drover.server.legacy_outbox import replay_legacy
+
+    with control_plane_connection(path) as control:
+        control.execute("DELETE FROM harness_event_payloads")
+    rollback = tmp_path / "rollback"
+    assert replay_legacy(path, rollback) == 2
+    assert replay_legacy(path, rollback) == 0
+    assert lake_counts(export_lake) == [2, 2, 2, 2]

@@ -1,38 +1,23 @@
-"""Ingest a JSONL file of canonical AgentEvents into the lakehouse.
+"""Collector normalization and atomic control-outbox ingest.
 
-For each event:
-  1. Parse + validate via AgentEvent.
-  2. Compute dedup_key from (timestamp, agent_id, session_id, event_type, content[:200]).
-  3. Compute task_id from raw_data._repo_owner / _repo_name / gitBranch (or env).
-  4. Append to a date=YYYY-MM-DD/agent_id=<id> Parquet file with a unique part name.
-  5. Drop rows whose dedup_key already appears in the existing partition.
-  6. Upsert tasks rows.
-
-Idempotent: re-ingesting the same file produces zero new rows.
+Full native payloads, dedup and summary generation intent commit together.
+Only the backend-selected exporter writes analytical storage.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Set
-
-import duckdb
-import pyarrow as pa
-import pyarrow.parquet as pq
+from typing import Iterator, Optional, Set
 
 from drover.attribution import enrich_raw_repo_attribution
 from drover.dedup import make_dedup_key
 from drover.models import AgentEvent
-from drover.server.db import open_duckdb_connection
 from drover.server.harness.usage import session_totals
-from drover.server.parquet_io import atomic_write_table
 from drover.server.redis_shadow import ShadowPublisher
-from drover.server.rollup import rollup_tasks
 from drover.task_id import compute_task_id
 
 log = logging.getLogger("drover.ingest")
@@ -62,6 +47,11 @@ def _extract_content(ev: AgentEvent) -> str:
 
 
 def _row_from_event(ev: AgentEvent, env_task_id: Optional[str]) -> dict:
+    timestamp = (
+        ev.timestamp
+        if ev.timestamp.tzinfo
+        else ev.timestamp.replace(tzinfo=timezone.utc)
+    ).astimezone(timezone.utc)
     rd = enrich_raw_repo_attribution(ev.raw_data)
     rd.setdefault("source", "native")
     if ev.tool_calls:
@@ -82,8 +72,8 @@ def _row_from_event(ev: AgentEvent, env_task_id: Optional[str]) -> dict:
     return {
         "id": ev.id,
         "session_id": ev.session_id,
-        "timestamp": ev.timestamp,
-        "date": ev.timestamp.strftime("%Y-%m-%d"),
+        "timestamp": timestamp,
+        "date": timestamp.strftime("%Y-%m-%d"),
         "agent_id": ev.agent_id,
         "event_type": ev.event_type,
         "role": ev.message.role if ev.message else None,
@@ -99,7 +89,7 @@ def _row_from_event(ev: AgentEvent, env_task_id: Optional[str]) -> dict:
         "cache_write_tokens": usage.cache_write_tokens if usage else None,
         "reasoning_tokens": usage.reasoning_tokens if usage else None,
         "dedup_key": make_dedup_key(
-            ev.timestamp.isoformat(),
+            timestamp.isoformat(),
             ev.agent_id,
             ev.session_id,
             ev.event_type,
@@ -177,67 +167,6 @@ def _iter_events(
                 yield None, f"line {lineno}: {e!r}"
 
 
-def _existing_dedup_keys(con, rows: Iterable[dict]) -> set:
-    """Read existing dedup_keys only from date partitions touched by incoming rows."""
-    partitions: dict[str, set[str]] = {}
-    for row in rows:
-        date = row.get("date")
-        agent_id = row.get("agent_id")
-        if date and agent_id:
-            partitions.setdefault(str(date), set()).add(str(agent_id))
-    if not partitions:
-        return set()
-
-    source_sql = "\nUNION ALL\n".join(
-        "SELECT dedup_key, agent_id FROM raw_agent_events_for_date(?)"
-        for _ in partitions
-    )
-    params: list = list(partitions)
-    agent_ids = sorted({agent for agents in partitions.values() for agent in agents})
-    try:
-        # Not `rows`: that is this function's own parameter, and rebinding it
-        # here made the query result and the incoming batch share a name.
-        existing_rows = con.execute(
-            f"""
-            WITH bounded_agent_events AS (
-              {source_sql}
-            )
-            SELECT dedup_key
-            FROM bounded_agent_events
-            WHERE dedup_key IS NOT NULL
-              AND agent_id = ANY(?::VARCHAR[])
-            """,
-            [*params, agent_ids],
-        ).fetchall()
-        return {r[0] for r in existing_rows}
-    except duckdb.Error as exc:
-        # An empty set here does not mean "nothing is a duplicate", but that is
-        # how the caller reads it: every row looks new and the whole batch is
-        # written again. Losing the reason for that in silence is how a
-        # re-ingest turns into duplicate rows with nothing to explain them.
-        log.warning("dedup-key lookup failed; treating the batch as new: %s", exc)
-        return set()
-
-
-def _write_partition(rows: list[dict], parquet_dir: Path) -> None:
-    """Group rows by (date, agent_id) and write one parquet file per partition."""
-    grouped: dict[tuple[str, str], list[dict]] = {}
-    for r in rows:
-        grouped.setdefault((r["date"], r["agent_id"]), []).append(r)
-
-    for (date, agent_id), part_rows in grouped.items():
-        out_dir = parquet_dir / "agent_events" / f"date={date}" / f"agent_id={agent_id}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"part-{uuid.uuid4().hex[:12]}.parquet"
-        # Drop the partition columns from the row payload — Hive partitioning encodes them in path
-        payload = [
-            {k: v for k, v in r.items() if k not in ("date", "agent_id")}
-            for r in part_rows
-        ]
-        table = pa.Table.from_pylist(payload)
-        atomic_write_table(table, out_path, compression="zstd")
-
-
 def _is_valid_title(content: str) -> bool:
     """Return True only if *content* is suitable for use as a task title.
 
@@ -313,62 +242,139 @@ def ingest_file(
     When ``shadow_publisher`` is provided, newly-inserted rows are also mirrored
     to a Redis Stream (best-effort; the lakehouse stays the source of truth).
     """
-    path = Path(path)
-    parquet_dir = Path(parquet_dir)
-    duckdb_path = Path(duckdb_path)
+    from drover.server.control_outbox import (
+        canonical_payload,
+        record_event_side_effects,
+    )
+    from drover.server.control_store import is_postgres_control_store
+    from drover.server.db import control_plane_connection
+    from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
+    from drover.server.summarizer.jobs import source_version_from_facts
 
+    postgres = is_postgres_control_store(duckdb_path)
     stats = IngestStats()
-    new_rows: list[dict] = []
-
-    con = open_duckdb_connection(duckdb_path)
-    try:
-        parsed_rows: list[dict] = []
-        for row, err in _iter_events(path, env_task_id):
-            stats.read += 1
-            if err:
-                stats.errors += 1
-                log.warning("ingest %s: %s", path, err)
-                continue
-            assert row is not None
+    parsed_rows = []
+    for row, error in _iter_events(Path(path), env_task_id):
+        stats.read += 1
+        if error:
+            stats.errors += 1
+            log.warning("ingest %s: %s", path, error)
+        else:
             parsed_rows.append(row)
-
-        existing = _existing_dedup_keys(con, parsed_rows)
-        for row in parsed_rows:
-            if row["dedup_key"] in existing:
-                stats.skipped_dupes += 1
-                continue
-            new_rows.append(row)
-            existing.add(row["dedup_key"])
-            stats.new_session_ids.add(row["session_id"])
-
-        if new_rows:
-            _propagate_unique_session_repo(new_rows, env_task_id)
-            _write_partition(new_rows, parquet_dir)
-            ingested_at = datetime.now(timezone.utc).replace(tzinfo=None)
-            for date in sorted({str(row["date"]) for row in new_rows}):
+    _propagate_unique_session_repo(parsed_rows, env_task_id)
+    new_rows = []
+    with control_plane_connection(duckdb_path) as con:
+        con.execute("BEGIN")
+        try:
+            if postgres:
+                # Summary completion locks its job before linking the session.
+                # Follow that order; session -> job would deadlock with a worker.
+                for sid in sorted({r["session_id"] for r in parsed_rows}):
+                    con.execute(
+                        """SELECT job_id FROM pipeline_jobs
+                        WHERE job_kind='summarize_session' AND subject_key=?
+                          AND status IN ('pending','running','retry_wait') FOR UPDATE""",
+                        [sid],
+                    )
+            for agent in sorted({r["agent_id"] for r in parsed_rows}):
                 con.execute(
-                    """
-                    INSERT INTO agent_event_partition_activity VALUES (?, ?)
-                    ON CONFLICT (date) DO UPDATE SET
-                      latest_ingested_at = greatest(
-                        agent_event_partition_activity.latest_ingested_at,
-                        EXCLUDED.latest_ingested_at
-                      )
-                    """,
-                    [date, ingested_at],
+                    """INSERT INTO harness_hosts
+                    (host_id, display_name, kind, status, capabilities_json)
+                    VALUES (?, ?, 'collector', 'online', '{}') ON CONFLICT DO NOTHING""",
+                    [agent, agent],
                 )
-            _upsert_tasks(con, new_rows)
-            rollup_tasks(
-                con,
-                task_ids=sorted({r["task_id"] for r in new_rows}),
-                dates=sorted({r["date"] for r in new_rows}),
-            )
-            stats.inserted = len(new_rows)
-            if shadow_publisher is not None:
-                # Mirror only after the authoritative write succeeds. The
-                # publisher itself is best-effort and never raises.
-                stats.shadow_published = shadow_publisher.publish_rows(new_rows)
-    finally:
-        con.close()
-
+            sessions = {}
+            for row in sorted(
+                parsed_rows, key=lambda r: (r["agent_id"], r["session_id"])
+            ):
+                sessions.setdefault(row["session_id"], row)
+            for sid in sorted(sessions):
+                row = sessions[sid]
+                con.execute(
+                    """INSERT INTO harness_sessions
+                    (session_id, host_id, harness, command, status, started_at,
+                     native_session_id, repo_owner, repo_name, branch)
+                    VALUES (?, ?, ?, 'collector', 'running', ?, ?, ?, ?, ?)
+                    ON CONFLICT (session_id) DO UPDATE SET
+                      native_session_id=COALESCE(harness_sessions.native_session_id, EXCLUDED.native_session_id)
+                    """,
+                    [
+                        row["session_id"],
+                        row["agent_id"],
+                        row["agent_id"],
+                        row["timestamp"],
+                        row["session_id"],
+                        row["repo_owner"],
+                        row["repo_name"],
+                        row["branch"],
+                    ],
+                )
+            for sid in sorted({r["session_id"] for r in parsed_rows}):
+                con.execute(
+                    "SELECT session_id FROM harness_sessions WHERE session_id=?"
+                    + (" FOR UPDATE" if postgres else ""),
+                    [sid],
+                )
+            for row in parsed_rows:
+                payload_json = canonical_payload(
+                    {
+                        "collector_row": {
+                            **row,
+                            "timestamp": row["timestamp"].isoformat(),
+                        }
+                    }
+                )
+                inserted = con.execute(
+                    """INSERT INTO harness_events
+                    (event_id, session_id, event_type, normalized_type, normalized_source,
+                     content_preview, created_at, dedup_key, payload_json)
+                    VALUES (?, ?, ?, ?, 'collector', ?, ?, ?, ?) ON CONFLICT DO NOTHING
+                    RETURNING event_id""",
+                    [
+                        row["id"],
+                        row["session_id"],
+                        row["event_type"],
+                        row["event_type"],
+                        row["content"][:500],
+                        row["timestamp"],
+                        row["dedup_key"],
+                        None if postgres else payload_json,
+                    ],
+                ).fetchone()
+                if inserted is None:
+                    stats.skipped_dupes += 1
+                    continue
+                # Keep the canonical normalized row, including full native usage,
+                # tool payloads and explicit attribution; both sinks project it.
+                record_event_side_effects(
+                    con,
+                    event_id=row["id"],
+                    session_id=row["session_id"],
+                    event_type=row["event_type"],
+                    content_preview=row["content"][:500],
+                    payload_json=payload_json,
+                    created_at=row["timestamp"],
+                    seq=None,
+                )
+                new_rows.append(row)
+                stats.new_session_ids.add(row["session_id"])
+            for sid in sorted(stats.new_session_ids) if postgres else []:
+                facts = con.execute(
+                    """SELECT count(*), max(created_at), max(dedup_key)
+                    FROM harness_events WHERE session_id=?""",
+                    [sid],
+                ).fetchone()
+                JobLedger(duckdb_path).enqueue(
+                    SUMMARIZE_SESSION,
+                    sid,
+                    source_version=source_version_from_facts(*facts),
+                    con=con,
+                )
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+    stats.inserted = len(new_rows)
+    if shadow_publisher is not None and new_rows:
+        stats.shadow_published = shadow_publisher.publish_rows(new_rows)
     return stats

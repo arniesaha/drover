@@ -402,6 +402,12 @@ class JobLedger:
                          SELECT job_id FROM pipeline_jobs
                           WHERE job_kind = ? AND status IN ('pending', 'retry_wait')
                             AND next_run_at <= now()
+                            AND (job_kind <> 'summarize_session' OR NOT EXISTS (
+                              SELECT 1 FROM harness_events e
+                              JOIN control_outbox_events o ON o.event_id=e.event_id
+                              WHERE e.session_id=pipeline_jobs.subject_key
+                                AND o.state <> 'acknowledged'
+                            ))
                           ORDER BY priority DESC, next_run_at, enqueued_at
                           LIMIT ?
                           FOR UPDATE SKIP LOCKED
@@ -451,6 +457,12 @@ class JobLedger:
                     WHERE job_kind = ?
                       AND ((status IN ('pending', 'retry_wait') AND next_run_at <= now())
                         OR (status = 'running' AND lease_expires_at < now()))
+                      AND (job_kind <> 'summarize_session' OR NOT EXISTS (
+                        SELECT 1 FROM harness_events e
+                        JOIN control_outbox_events o ON o.event_id=e.event_id
+                        WHERE e.session_id=pipeline_jobs.subject_key
+                          AND o.state <> 'acknowledged'
+                      ))
                     LIMIT 1""",
                 [job_kind],
             ).fetchone()

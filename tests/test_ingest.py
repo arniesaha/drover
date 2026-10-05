@@ -8,15 +8,38 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server import ingest as ingest_mod
-from drover.server.ingest import IngestStats, ingest_file
+from drover.server.ingest import IngestStats
+from drover.server.ingest import ingest_file as record_file
 
 FIXTURE = Path(__file__).parent / "fixtures" / "incoming" / "sample_agent_events.jsonl"
 
 
+def ingest_file(path, **kwargs):
+    """Integration helper: explicitly drain the asynchronous legacy sink."""
+    from datetime import datetime, timedelta, timezone
+
+    from drover.server.control_exporter import ControlOutboxExporter
+
+    stats = record_file(path, **kwargs)
+    exporter = ControlOutboxExporter(
+        control_path=kwargs["duckdb_path"],
+        analytical_path=kwargs["duckdb_path"],
+        parquet_dir=kwargs["parquet_dir"],
+        batch_size=1000,
+    )
+    while True:
+        result = exporter.run_once(
+            now=datetime.now(timezone.utc) + timedelta(seconds=10)
+        )
+        if not result["pending"]:
+            break
+    return stats
+
+
 @pytest.fixture
-def tmp_lh(tmp_path):
+def tmp_lh(tmp_path, pg_control_path):
     parquet_dir = tmp_path / "parquet"
-    db_path = tmp_path / "drover.duckdb"
+    db_path = pg_control_path
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
     return parquet_dir, db_path
 
@@ -205,36 +228,24 @@ def test_ingest_propagates_unique_session_repo_to_unattributed_events(
     assert repo_rows[0][3] == repo_rows[1][3]
 
 
-def test_ingest_dedup_lookup_uses_bounded_date_macro(tmp_lh, monkeypatch):
-    """Dedup should scan only incoming date partitions, not all historical agent_events."""
+def test_ingest_dedup_is_transactional_without_analytical_lookup(tmp_lh, monkeypatch):
+    from drover.server import db
+    from drover.server.db import control_plane_connection
+
     parquet_dir, db_path = tmp_lh
-    captured = []
-    real_connect = duckdb.connect
 
-    class _TrackingConnection:
-        def __init__(self, inner):
-            self._inner = inner
+    def forbidden(*args, **kwargs):
+        raise AssertionError("ingest must not open analytical storage")
 
-        def execute(self, sql, params=None):
-            if "dedup_key" in sql and "agent_events" in sql:
-                captured.append(sql)
-            if params is None:
-                return self._inner.execute(sql)
-            return self._inner.execute(sql, params)
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-    def tracking_connect(*args, **kwargs):
-        return _TrackingConnection(real_connect(*args, **kwargs))
-
-    monkeypatch.setattr(ingest_mod.duckdb, "connect", tracking_connect)
-
-    ingest_file(FIXTURE, parquet_dir=parquet_dir, duckdb_path=db_path)
-
-    assert captured
-    assert "agent_events_for_date" in captured[0]
-    assert "FROM agent_events WHERE dedup_key IS NOT NULL" not in captured[0]
+    monkeypatch.setattr(db, "open_duckdb_connection", forbidden)
+    first = record_file(FIXTURE, parquet_dir=parquet_dir, duckdb_path=db_path)
+    second = record_file(FIXTURE, parquet_dir=parquet_dir, duckdb_path=db_path)
+    assert first.inserted == 3 and second.skipped_dupes == 3
+    with control_plane_connection(db_path) as con:
+        assert con.execute("SELECT count(*) FROM control_outbox_events").fetchone() == (
+            3,
+        )
+    assert not [p for p in parquet_dir.rglob("*.parquet") if "_seed" not in str(p)]
 
 
 def test_ingest_rollup_is_limited_to_touched_tasks(tmp_lh, monkeypatch):
@@ -245,7 +256,9 @@ def test_ingest_rollup_is_limited_to_touched_tasks(tmp_lh, monkeypatch):
         calls.append((task_ids, dates))
         return 0
 
-    monkeypatch.setattr(ingest_mod, "rollup_tasks", fake_rollup)
+    from drover.server import rollup
+
+    monkeypatch.setattr(rollup, "rollup_tasks", fake_rollup)
 
     stats = ingest_file(FIXTURE, parquet_dir=parquet_dir, duckdb_path=db_path)
 

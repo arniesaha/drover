@@ -1014,6 +1014,26 @@ def harness_cmd() -> None:
     """Audit and migrate Drover harness data."""
 
 
+@main.group(name="outbox")
+def outbox_cmd() -> None:
+    """Temporary v2 rollback operations on the durable control outbox."""
+
+
+@outbox_cmd.command(name="replay")
+@click.option(
+    "--since", type=float, default=0, help="Inclusive commit epoch (seconds)."
+)
+@click.option("--sink", type=click.Choice(["legacy"]), required=True)
+@click.pass_context
+def outbox_replay_cmd(ctx: click.Context, since: float, sink: str) -> None:
+    from drover.server.legacy_outbox import replay_legacy
+
+    cfg = _resolve_config(ctx.obj["config_path"])
+    bootstrap_control_plane_store(cfg.duckdb_path)
+    count = replay_legacy(cfg.duckdb_path, cfg.parquet_dir, since=since)
+    click.echo(f"Replayed {count} events to legacy parquet")
+
+
 @main.group(name="archive")
 def archive_cmd() -> None:
     """Capture and compare local archive inventories."""
@@ -2700,7 +2720,7 @@ def run(
     # so a worker can resume a published-but-unacknowledged batch before any
     # analytical reader observes the next pass.
     outbox_exporter: ControlOutboxExporter | None = None
-    if cfg.control_store.backend == "postgres":
+    if cfg.control_store.backend == "postgres" or cfg.analytics.backend == "legacy":
         try:
             with _startup_phase("start_control_outbox_exporter"):
                 from drover.server.lake.lifecycle import selected_exporter

@@ -133,7 +133,7 @@ def _control_snapshot(con, request):
             from .task_projection import _hash
 
             identities = pg.execute(
-                "SELECT session_id,native_session_id,summary_session_id FROM harness_sessions ORDER BY session_id LIMIT 10001"
+                "SELECT session_id,native_session_id,summary_session_id FROM harness_sessions WHERE command <> 'collector' ORDER BY session_id LIMIT 10001"
             ).fetchall()
             if _hash(identities) != request["binding"]["identities"]:
                 raise LakeError("analytics_identity_changed")

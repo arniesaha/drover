@@ -1,10 +1,8 @@
-"""Analytics-role lifecycle for the durable PostgreSQL harness outbox.
+"""Backend-selected legacy sink for the durable control event outbox.
 
-The exporter deliberately has one small responsibility: turn committed control
-events into the immutable relation that analytical jobs may read.  It does not
-compact those files or substitute the collector's ``agent_events`` relation.
-Every restart first replays the SQL manifest, so a crash between publish and
-acknowledgement cannot look like an empty backlog.
+Committed collector and harness events become legacy parquet and the immutable
+raw archive through this owner. Publication, projection and acknowledgement
+are retry-safe; restart resumes receipts before derived jobs become eligible.
 """
 
 from __future__ import annotations
@@ -19,9 +17,13 @@ from uuid import uuid4
 
 from drover.server.control_outbox import (
     LocalVerifiedArchiveResolver,
+    OutboxClaim,
+    _claim_rows,
     acknowledge_outbox_batch,
     claim_outbox_batch,
+    export_projection,
     outbox_status,
+    prune_acknowledged_outbox,
     prune_verified_payloads,
     publish_outbox_batch,
     published_batches,
@@ -48,6 +50,7 @@ class ControlOutboxExporter:
         lease_seconds: int = 60,
         retention_limit: int = 100,
         owner: str | None = None,
+        acknowledgement_retention_days: float = 14,
     ) -> None:
         if batch_size < 1:
             raise ValueError("outbox batch_size must be positive")
@@ -58,6 +61,12 @@ class ControlOutboxExporter:
             or retention_limit < 1
         ):
             raise ValueError("outbox exporter timing limits must be positive")
+        if acknowledgement_retention_days < 14:
+            raise ValueError(
+                "outbox acknowledgement retention must be at least 14 days"
+            )
+        self.acknowledgement_retention_days = acknowledgement_retention_days
+        self._prune_cursor = ""
         self.control_path = Path(control_path)
         self.analytical_path = Path(analytical_path)
         self.parquet_dir = Path(parquet_dir)
@@ -137,13 +146,6 @@ class ControlOutboxExporter:
 
     def _run_once_legacy(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Publish at most one flush-sized batch and always resume SQL receipts."""
-        if not is_postgres_control_store(self.control_path):
-            result = self._empty_result()
-            with self._lock:
-                self._last_result = result
-                self._last_error = None
-            return result
-
         stamp = now or datetime.now(timezone.utc)
         with control_plane_connection(self.control_path) as control:
             before = outbox_status(control)
@@ -151,7 +153,20 @@ class ControlOutboxExporter:
         # A published row is already a SQL-visible immutable receipt.  Rebuild
         # the analytical view before acknowledgement, including after a crash
         # between those operations.  No glob or generic compaction is involved.
-        acknowledged = self._rebuild_relation_and_acknowledge()
+        projected = []
+        with control_plane_connection(self.control_path) as control:
+            recovery = control.execute(
+                "SELECT batch_id FROM control_outbox_batches WHERE state='published' ORDER BY published_at,batch_id LIMIT 1"
+            ).fetchone()
+            if recovery:
+                from drover.server.legacy_outbox import write_legacy_events
+
+                raw = _claim_rows(
+                    control, OutboxClaim(str(recovery[0]), (), self.owner, stamp)
+                )
+                projected = export_projection(control, raw)
+                write_legacy_events(control, raw, self.parquet_dir, str(recovery[0]))
+        acknowledged = self._rebuild_relation_and_acknowledge(acknowledge=False)
         published = 0
 
         should_claim = self._should_claim(before, stamp)
@@ -165,6 +180,17 @@ class ControlOutboxExporter:
                     now=stamp,
                 )
                 if claim is not None:
+                    projected.extend(
+                        export_projection(control, _claim_rows(control, claim))
+                    )
+                    from drover.server.legacy_outbox import write_legacy_events
+
+                    write_legacy_events(
+                        control,
+                        _claim_rows(control, claim),
+                        self.parquet_dir,
+                        claim.batch_id,
+                    )
                     receipt = publish_outbox_batch(
                         control,
                         claim,
@@ -173,7 +199,7 @@ class ControlOutboxExporter:
                     )
                     published = receipt.member_count
             if published:
-                acknowledged += self._rebuild_relation_and_acknowledge()
+                self._rebuild_relation_and_acknowledge(acknowledge=False)
 
         # Detach control reads before projection/model-job work. Summary link
         # writes are short retry-safe effects after the analytical connection closes.
@@ -191,15 +217,45 @@ class ControlOutboxExporter:
                 with control_plane_connection(self.control_path) as control:
                     register_published_harness_events_relation(analytics, control)
                 self._relation_initialized = True
+            if projected:
+                from drover.server.ingest import _upsert_tasks
+                from drover.server.rollup import rollup_tasks
+
+                _upsert_tasks(analytics, projected)
+                for date in sorted({r["date"] for r in projected}):
+                    analytics.execute(
+                        """INSERT INTO agent_event_partition_activity VALUES (?, ?)
+                        ON CONFLICT (date) DO UPDATE SET latest_ingested_at = greatest(
+                          agent_event_partition_activity.latest_ingested_at, EXCLUDED.latest_ingested_at)""",
+                        [date, stamp],
+                    )
             links = refresh_memory_projection(
                 analytics, sessions, store_path=self.control_path
             )
+            if projected:
+                rollup_tasks(
+                    analytics,
+                    task_ids=sorted({r["task_id"] for r in projected}),
+                    dates=sorted({r["date"] for r in projected}),
+                )
         finally:
             analytics.close()
         with control_plane_connection(self.control_path) as control:
             apply_memory_links(control, links)
+        # Summary claims become eligible only after the full legacy read projection
+        # is visible; an ack before projection could expose an older generation.
+        acknowledged = self._rebuild_relation_and_acknowledge()
+        with control_plane_connection(self.control_path) as control:
             current = outbox_status(control)
         retention = self._prune_verified_payloads()
+        if is_postgres_control_store(self.control_path):
+            with control_plane_connection(self.control_path) as control:
+                prune_acknowledged_outbox(
+                    control,
+                    retention_days=self.acknowledgement_retention_days,
+                    limit=self.retention_limit,
+                    now=stamp,
+                )
         result = {
             **current,
             "published": published,
@@ -228,7 +284,7 @@ class ControlOutboxExporter:
             return (now - oldest).total_seconds() >= self.flush_age_seconds
         return False
 
-    def _rebuild_relation_and_acknowledge(self) -> int:
+    def _rebuild_relation_and_acknowledge(self, *, acknowledge: bool = True) -> int:
         with control_plane_connection(self.control_path) as control:
             rows = control.execute(
                 "SELECT batch_id FROM control_outbox_batches "
@@ -237,14 +293,30 @@ class ControlOutboxExporter:
             if not rows:
                 return 0
             analytics = open_duckdb_connection(self.analytical_path)
+            ready = []
             try:
                 register_published_harness_events_relation(analytics, control)
                 self._relation_initialized = True
+                if acknowledge:
+                    for (batch_id,) in rows:
+                        ids = [
+                            r[0]
+                            for r in control.execute(
+                                "SELECT event_id FROM control_outbox_batch_events WHERE batch_id=?",
+                                [batch_id],
+                            ).fetchall()
+                        ]
+                        count = analytics.execute(
+                            "SELECT count(*) FROM control_memory_events WHERE id=ANY(?::VARCHAR[])",
+                            [ids],
+                        ).fetchone()[0]
+                        if ids and count == len(ids):
+                            ready.append(str(batch_id))
             finally:
                 analytics.close()
             acknowledged = 0
-            for (batch_id,) in rows:
-                if acknowledge_outbox_batch(control, str(batch_id)):
+            for batch_id in ready:
+                if acknowledge_outbox_batch(control, batch_id):
                     acknowledged += 1
             return acknowledged
 
@@ -261,4 +333,6 @@ class ControlOutboxExporter:
                 self.parquet_dir, manifest_reader=manifest_reader
             ),
             limit=self.retention_limit,
+            after=self._prune_cursor,
+            cursor_callback=lambda cursor: setattr(self, "_prune_cursor", cursor),
         )

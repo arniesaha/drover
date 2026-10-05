@@ -31,6 +31,7 @@ RELEASED_MIGRATION_HASHES: dict[int, str] = {
     9: "6e50195a7553163ee34f8aaca0ac9788c572b258af7a8726dbc4c874d65b5140",
     10: "193bed1a46e92510b7123b9e01edfdaba0fc43756698a12f42db40ff112bd4f3",
     11: "39258199d2f697391fbd70891a1b133244b8b6bb0f454e2faeac14907a9ef0b1",
+    12: "b2738b7e051f69afbfe896280e2728a99b06409699d1cd29a46f0a3be15063d3",
 }
 
 
@@ -136,4 +137,4 @@ def test_lake_export_batches_migration_11_forward(pg_control_path):
                 "SELECT version FROM control_schema_migrations ORDER BY version"
             ).fetchall()
         ]
-        assert versions == list(range(1, 12))
+        assert versions == list(range(1, 13))
