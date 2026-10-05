@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from .activity_daily import ACTIVITY_DAILY_SCHEMA, refresh_activity_daily
 from .admin_process import run_admin
 from .fence import drained_mutation, reader_fence
 from .rebuild import SCHEMAS, extract_frozen
@@ -139,6 +140,9 @@ def rebuild_partitioned(
                         day_partition=table
                         in {"agent_events", "agent_events_legacy_metadata"},
                     )
+                create_table(
+                    con, "activity_daily", ACTIVITY_DAILY_SCHEMA, day_partition=True
+                )
             for index, partition in enumerate(partitions):
                 fence.check()
                 run(
@@ -162,6 +166,15 @@ def rebuild_partitioned(
                         spec=_spec(spec),
                         tables={table: [path]},
                     )
+            # The offline rebuild is not an outbox export, but it must leave
+            # the selected lake immediately queryable through the same compact
+            # read model. This is one derived snapshot after all immutable
+            # frozen partitions are visible.
+            with lake_connection(spec, read_only=False) as con:
+                refresh_activity_daily(
+                    con,
+                    [item["day"] for item in daily],
+                )
     report = {
         "format_version": 2,
         "dry_run": dry_run,

@@ -116,6 +116,7 @@ def _check_referenced_files(spec, con):
         "agent_events_legacy_metadata",
         "provider_usage_snapshots",
         "control_outbox_batches",
+        "activity_daily",
     }
     optional = {"export_event_versions", "export_batch_receipts"}
     tables = {

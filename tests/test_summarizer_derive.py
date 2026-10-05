@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 
+import duckdb
+
 from drover.server.summarizer.derive import compute_files_touched, compute_tools_used
+from drover.server.summarizer.worker import _tool_projection_sql
 
 
 def _ev(raw_data: dict) -> dict:
@@ -90,3 +93,34 @@ def test_tools_used_handles_missing_blocks() -> None:
         {"raw_data": "garbage"},
     ]
     assert compute_tools_used(events) == {}
+
+
+def test_tool_projection_excludes_large_unneeded_raw_fields() -> None:
+    """S3 pages deterministic tool facts, never an arbitrary tool transcript."""
+    huge = "x" * (2 * 1024 * 1024)
+    raw = json.dumps(
+        {
+            "tool_use_blocks": [
+                {"name": "Edit", "input": {"path": "src/main.py", "command": huge}}
+            ],
+            "details": huge,
+        }
+    )
+    with duckdb.connect() as con:
+        con.execute("CREATE TABLE events(raw_data VARCHAR)")
+        con.execute("INSERT INTO events VALUES (?)", [raw])
+        projected = con.execute(
+            f"SELECT {_tool_projection_sql()} AS raw_data FROM events"
+        ).fetchone()[0]
+    assert len(projected.encode()) < 1024
+    assert json.loads(projected) == {
+        "tool_name": "Edit",
+        "tool_use_blocks": [
+            {"name": "Edit", "input": {"path": "src/main.py", "file_path": None}}
+        ],
+        "tool": {"name": None, "input": {"path": None, "file_path": None}},
+        "input": {"path": None, "file_path": None},
+        "arguments": {"path": None, "file_path": None},
+        "path": None,
+        "file_path": None,
+    }

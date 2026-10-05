@@ -643,6 +643,7 @@ def test_lake_exports_one_row_over_target_alone_then_drains_short_event(
         )
         for i in range(2)
     ]
+
     source.write_text("".join(json.dumps(e) + "\n" for e in events))
     ingest_file(source, parquet_dir=legacy, duckdb_path=path)
     with LakeOutboxExporter(control_path=path, spec=export_lake) as exporter:
@@ -664,3 +665,25 @@ def test_lake_exports_one_row_over_target_alone_then_drains_short_event(
     assert replay_legacy(path, rollback) == 2
     assert replay_legacy(path, rollback) == 0
     assert lake_counts(export_lake) == [2, 2, 2, 2]
+
+
+def test_export_updates_activity_daily_in_its_single_snapshot(
+    export_lake, postgres_control_store
+):
+    """The cockpit rollup must never lag the canonical event publication."""
+    control_path, _ = postgres_control_store
+    seed(control_path, count=2)
+    with lake_connection(export_lake) as con:
+        before = con.execute(
+            "SELECT max(snapshot_id) FROM lake.snapshots()"
+        ).fetchone()[0]
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 2
+    with lake_connection(export_lake) as con:
+        after = con.execute("SELECT max(snapshot_id) FROM lake.snapshots()").fetchone()[
+            0
+        ]
+        assert after == before + 1
+        assert con.execute(
+            "SELECT session_id, sum(event_count) FROM lake.activity_daily GROUP BY session_id"
+        ).fetchall() == [("export-session", 2)]

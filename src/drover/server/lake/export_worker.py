@@ -11,6 +11,7 @@ import pyarrow as pa
 
 from drover.server.control_outbox import _batch_id, canonical_payload, payload_sha256
 
+from .activity_daily import refresh_activity_daily
 from .rebuild import EVENT_SCHEMA, OUTBOX_SCHEMA, row_hash_expression
 from .rebuild_worker import LINEAGE, POLICY_SCHEMA
 from .runtime import LakeError, LakeSpec, attach_lake, literal
@@ -238,6 +239,15 @@ def export(spec, document, *, before_commit=None):
                 con.execute("COMMIT")
                 return {"receipt": expected, "replayed": True}
             _merge_events(con)
+            refresh_activity_daily(
+                con,
+                [
+                    row[0]
+                    for row in con.execute(
+                        "SELECT DISTINCT date FROM export_events"
+                    ).fetchall()
+                ],
+            )
             con.execute(
                 "INSERT INTO lake.export_event_versions BY NAME SELECT * FROM export_events"
             )

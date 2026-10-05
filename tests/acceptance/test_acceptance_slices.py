@@ -281,13 +281,7 @@ def analytical_observations(monkeypatch):
     return observations
 
 
-# fails today: the summarizer's real 1000-row raw-data page exceeds the 1 MiB child reply cap.
 @pytest.mark.acceptance_scale
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="v2 S3: summarizer raw query exceeds analytical byte cap",
-)
 def test_a3_summarize_40k_session_scale(
     hub_scale_lake, prod_shaped, analytical_observations, caplog
 ):
@@ -319,13 +313,7 @@ def test_a3_summarize_40k_session_scale(
     ), queries
 
 
-# fails today: the 5M cockpit activity scan exceeds the analytical child RSS ceiling.
 @pytest.mark.acceptance_scale
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="v2 S3: 5M cockpit activity scan exceeds analytical RSS ceiling",
-)
 def test_a4_cockpit_overview_5m_lake_scale(
     hub_scale_lake, prod_shaped, hub_http, analytical_observations
 ):

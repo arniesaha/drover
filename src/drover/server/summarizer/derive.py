@@ -111,7 +111,12 @@ def select_substantive_window(
 ) -> list[dict]:
     cur = con.execute(
         f"""WITH {ctes}, substantive AS (
-        SELECT * FROM canonical_agent_events WHERE {SUBSTANTIVE_SQL}
+        -- The summary prompt only needs these fields. In particular it must
+        -- never marshal an arbitrary raw tool payload through the bounded
+        -- DuckLake child merely because that payload made a turn substantive.
+        SELECT role, content, timestamp, event_type, agent_id, id,
+               raw_data IS NOT NULL AS has_raw_data
+        FROM canonical_agent_events WHERE {SUBSTANTIVE_SQL}
     ), selected AS (
         SELECT * FROM substantive ORDER BY timestamp DESC, id DESC LIMIT ?
     ), final_assistant AS (
