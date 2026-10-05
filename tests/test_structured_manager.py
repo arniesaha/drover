@@ -1027,3 +1027,37 @@ def test_an_approval_is_recorded_before_output_the_cli_produces_after_it(
     types = [e.event_type for e in ordered]
     assert "approval_response" in types and "assistant_output" in types
     assert types.index("approval_response") < types.index("assistant_output"), types
+
+
+def test_agy_429_is_recorded_under_the_session_host(monkeypatch, tmp_path):
+    """drover#522: harnessd's /providers/usage reads observed exhaustion with
+    its own host id, so a 429 must be recorded under the session's host (from
+    the registry row), and a Claude 429 without a known model must land on the
+    3p group, not Gemini."""
+    from drover.server.providers.agy import (
+        clear_observed_exhaustions,
+        get_active_observed_exhaustions,
+    )
+
+    mgr, driver, _registry, _on_messages, _finalized = _build_manager(
+        monkeypatch, tmp_path
+    )
+    mgr._entries["sess-1"].harness = "agy"
+    clear_observed_exhaustions()
+    try:
+        driver.emit(
+            StructuredMessage(
+                type="error",
+                role="system",
+                text=(
+                    "RESOURCE_EXHAUSTED (code 429): Individual quota reached for "
+                    "Claude Sonnet. Resets in 162h52m18s"
+                ),
+                payload={},
+            )
+        )
+        active = get_active_observed_exhaustions(host_id="test-host")
+        assert [(a.host_id, a.model_group) for a in active] == [("test-host", "3p")]
+        assert get_active_observed_exhaustions(host_id="local") == []
+    finally:
+        clear_observed_exhaustions()
