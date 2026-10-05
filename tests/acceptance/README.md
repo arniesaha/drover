@@ -42,6 +42,18 @@ including samples from children that fail before returning a reply. A3 observes
 the actual summarizer query replies and errors, then checks ledger success,
 byte limits and truncation for both a large and a short session.
 
+S3's A3/A4 also sample the process hosting the real HTTP hub and summarizer
+every 10 ms during each serving workload and require peak RSS <= 4 GiB
+(4,294,967,296 bytes), separately from the analytical child limits. This process
+also retains pytest/rebuild coordinator allocations, so the measurement is a
+conservative disposable serving gate, not a measurement of the production hub
+or a sustained full-lifecycle soak. Run the scale script with `-s` to emit exact
+hub/child peak RSS and A4's five-request p95. Sampling failures fail the gate.
+An over-budget result blocks a future cutover pending allocation investigation;
+passing this workload alone does not resolve an observed production RSS excess.
+The existing runtime memory guard exposes `state="over"`, current/peak bytes,
+and budget bytes in readiness/data-quality responses and logs excess RSS.
+
 S2's rollback CLI is specified as `outbox replay --sink legacy` against the
 isolated config's durable control outbox. S4's import CLI options name isolated
 lake/catalog and legacy source roots explicitly. S2 replay is executable; S4 import remains a future contract. A7's lake imports only the last date; the first-day session exists in

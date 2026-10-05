@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import replace
@@ -253,8 +254,9 @@ def _summarize(path, session_id):
 def analytical_observations(monkeypatch):
     """Observe actual query replies AND failed-child RSS samples without replacing execution."""
     from drover.server.lake import query_process, read_models, serving
+    from drover.server.process_memory import process_rss
 
-    observations = {"queries": [], "rss": []}
+    observations = {"queries": [], "rss": [], "hub_rss": [], "hub_rss_errors": []}
     real_query, real_rss = query_process.query, query_process._rss
 
     def query(*args, **kwargs):
@@ -278,7 +280,46 @@ def analytical_observations(monkeypatch):
     monkeypatch.setattr(query_process, "query", query)
     monkeypatch.setattr(serving, "query", query)
     monkeypatch.setattr(read_models, "query", query)
-    return observations
+    # The real HTTP hub and summarizer run in this pytest process. Sample its
+    # RSS separately from disposable analytical children, throughout the
+    # workload (including intervals without a child). Fixture setup/rebuild
+    # happens before this monitor starts; retained coordinator memory is still
+    # included, making this a conservative serving-process budget gate.
+    stop = threading.Event()
+
+    def sample_hub():
+        try:
+            observations["hub_rss"].append(process_rss(os.getpid()))
+        except (OSError, ValueError) as exc:
+            observations["hub_rss_errors"].append(str(exc))
+
+    def monitor_hub():
+        while not stop.wait(0.01):
+            sample_hub()
+
+    sample_hub()
+    monitor = threading.Thread(target=monitor_hub, daemon=True)
+    monitor.start()
+    try:
+        yield observations
+    finally:
+        stop.set()
+        monitor.join(timeout=1)
+        sample_hub()
+
+
+def _assert_hub_rss_budget(observations):
+    """A cutover gate, not a claim about the untouched production process."""
+    samples = observations["hub_rss"]
+    assert samples and not observations["hub_rss_errors"], observations
+    peak = max(samples)
+    budget = 4 * 1024**3
+    print(f"hub_peak_rss_bytes={peak} hub_budget_bytes={budget}")
+    assert peak <= budget, (
+        f"Hub RSS {peak} bytes exceeds 4 GiB budget ({budget} bytes); "
+        "block cutover and investigate retained hub allocations. "
+        "Disposable query children are measured separately."
+    )
 
 
 @pytest.mark.acceptance_scale
@@ -311,6 +352,8 @@ def test_a3_summarize_40k_session_scale(
     assert all(
         q.get("bytes", 0) <= 1024**2 and "error" not in q for q in queries
     ), queries
+    print(f"A3 child_peak_rss_bytes={max(analytical_observations['rss'])}")
+    _assert_hub_rss_budget(analytical_observations)
 
 
 @pytest.mark.acceptance_scale
@@ -332,7 +375,9 @@ def test_a4_cockpit_overview_5m_lake_scale(
     assert rss, "No analytical child RSS samples observed"
     assert max(rss) < 1024**3, f"Analytical child peak RSS {max(rss)} exceeds 1 GiB"
     p95 = sorted(latencies)[-1]  # nearest-rank p95 for five complete HTTP requests
+    print(f"A4 child_peak_rss_bytes={max(rss)} http_p95_seconds={p95:.9f}")
     assert p95 < 2, f"Cockpit overview p95 {p95:.3f}s exceeds 2 s"
+    _assert_hub_rss_budget(analytical_observations)
 
 
 # S2: startup preserves released versions 1–11 and applies only migration 12.
