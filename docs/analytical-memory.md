@@ -10,7 +10,7 @@ foreground isolation on volumes without atomic clones. It builds on main
 DuckDB `memory_limit` and `threads` are **instance-wide**, not per connection or
 per role. Opening the same file shares its scheduler and buffer manager. Worker,
 summarizer and diagnostic therefore use `ANALYTICAL_INSTANCE_DEFAULTS`: **one
-1GB budget and one thread**, not three budgets. This is not a process RSS cap:
+4GB budget and one thread**, not three budgets. This is not a process RSS cap:
 Python, Arrow/parquet buffers, allocator-retained pages and other instances add
 to RSS; DuckDB also has allocations outside its buffer-manager limit.
 
@@ -31,7 +31,11 @@ store remains outside analytical locks, admission and cleanup.
 
 ### Checkpoint headroom
 
-The steady-state autocheckpoint runs under the instance limit, so a hub that OOMs on autocheckpoint should raise `DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT` (e.g. "3GB") in the service env; the startup checkpoint only drains a WAL left by a crash/stop under `DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT` (default "4GB").
+The steady-state autocheckpoint runs under `DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT`
+(default `4GB`), which applies to worker, summarizer, diagnostic, and recovery
+reopens. The startup checkpoint only drains a WAL left by a crash or stop. Its
+`DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT` override is explicit; when unset,
+it uses that same effective analytical limit, including the legacy role aliases.
 
 ## Lifetime and observation
 

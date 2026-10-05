@@ -939,11 +939,14 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             require_analytical_store(self.collector.duckdb_path)
         if path == "/healthz":
             health = analytical_store_health(self.collector.duckdb_path)
+            analytical_status = str(health["status"])
+            if analytical_status not in {"ok", "recovering", "failed-retrying"}:
+                analytical_status = "failed-retrying"
             self._send(
                 200,
                 "text/plain; charset=utf-8",
-                "ok\n",
-                extra_headers={"X-Drover-Analytical": str(health["status"])},
+                f"ok\nanalytical={analytical_status}\n",
+                extra_headers={"X-Drover-Analytical": analytical_status},
             )
             return
         if path == "/release-identity":
