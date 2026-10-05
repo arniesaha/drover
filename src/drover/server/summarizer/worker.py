@@ -202,6 +202,39 @@ def _tool_projection_sql() -> str:
     """
 
 
+_PAGE_ORDER = "timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data)"
+
+
+def _raw_event_page_sql(*, keyset: bool) -> str:
+    """One keyset page of raw events, tool-projected after the page is chosen.
+
+    Select and order the page on the raw rows first, then run the JSON/regex
+    tool projection over at most one page. Projecting before ``LIMIT`` made
+    DuckDB evaluate ~30 JSON extractions for every event of the session: for
+    a 40,000-event session that is ~1.6 GB of unspillable expression memory
+    per query child, peaking within a few MB of its 2 GiB cap. The order and
+    the keyset compare the source ``raw_data`` hash in both forms (DuckDB binds
+    ``hash(raw_data)`` in ORDER BY to the source column, not the alias).
+    """
+    after = (
+        " AND (timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data))"
+        " > (?::TIMESTAMPTZ, ?::VARCHAR, ?::VARCHAR, ?::UBIGINT)"
+        if keyset
+        else ""
+    )
+    return f"""WITH {_session_agent_events_ctes()},
+    raw_event_page AS (
+      SELECT event_type, raw_data, timestamp, id, dedup_key
+      FROM canonical_agent_events
+      WHERE raw_data IS NOT NULL{after}
+      ORDER BY {_PAGE_ORDER} LIMIT ?
+    )
+    SELECT event_type, {_tool_projection_sql()} AS raw_data,
+           timestamp, id, coalesce(dedup_key, '') AS _dedup_key,
+           hash(raw_data) AS _raw_hash FROM raw_event_page
+    ORDER BY {_PAGE_ORDER}"""
+
+
 def _execute_raw_event_page(con, sql: str, params: list[Any]):
     """Execute one page with an explicit reply budget on the lake facade."""
     from drover.server.lake.serving import HistoryConnection
@@ -439,28 +472,15 @@ class SummarizerWorker:
             last_dedup_key = None
             last_raw_hash = None
             page_size = RAW_EVENT_PAGE_ROWS
-            tool_projection = _tool_projection_sql()
             while len(tool_events) < MAX_RAW_EVENTS_PER_SESSION:
                 if last_timestamp is None:
                     cur = _execute_raw_event_page(
-                        con,
-                        f"""WITH {_session_agent_events_ctes()}
-                        SELECT event_type, {tool_projection} AS raw_data,
-                               timestamp, id, coalesce(dedup_key, '') AS _dedup_key,
-                               hash(raw_data) AS _raw_hash FROM canonical_agent_events
-                        WHERE raw_data IS NOT NULL
-                        ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT ?""",
-                        [session_id, page_size],
+                        con, _raw_event_page_sql(keyset=False), [session_id, page_size]
                     )
                 else:
                     cur = _execute_raw_event_page(
                         con,
-                        f"""WITH {_session_agent_events_ctes()}
-                        SELECT event_type, {tool_projection} AS raw_data,
-                               timestamp, id, coalesce(dedup_key, '') AS _dedup_key,
-                               hash(raw_data) AS _raw_hash FROM canonical_agent_events
-                        WHERE raw_data IS NOT NULL AND (timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data)) > (?::TIMESTAMPTZ, ?::VARCHAR, ?::VARCHAR, ?::UBIGINT)
-                        ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data) LIMIT ?""",
+                        _raw_event_page_sql(keyset=True),
                         [
                             session_id,
                             last_timestamp,

@@ -14,7 +14,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .runtime import LakeError, LakeSpec, lake_connection
+from .runtime import QUERY_CHILD_SETTINGS, LakeError, LakeSpec, lake_connection
 
 
 @dataclass(frozen=True)
@@ -167,6 +167,7 @@ def query(
                     "params": params or [],
                     "limits": asdict(limits),
                     "serving": serving,
+                    "spill_directory": str(root / "spill"),
                 }
             )
         )
@@ -198,7 +199,11 @@ def _worker(request: dict) -> dict:
         }
     )
     limits = QueryLimits(**request["limits"])
-    with reader_fence(spec.dsn()), lake_connection(spec) as con:
+    settings = dict(QUERY_CHILD_SETTINGS)
+    if request.get("spill_directory"):
+        # Inside the query's private scratch directory: removed with it.
+        settings["temp_directory"] = request["spill_directory"]
+    with reader_fence(spec.dsn()), lake_connection(spec, settings=settings) as con:
         import re
 
         if re.search(r"\bAT\s*\(\s*(VERSION|TIMESTAMP)\b", request["sql"], re.I):

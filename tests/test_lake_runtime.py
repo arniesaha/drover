@@ -182,6 +182,33 @@ def test_query_limit_configuration_cannot_weaken_release_caps():
             QueryLimits(**kwargs)
 
 
+def test_query_child_engine_budget_leaves_half_the_rss_cap():
+    """The A3 fix: the child's engine budget sits at most at half the kill cap."""
+    from drover.server.lake.cutover import memory_limit_bytes
+    from drover.server.lake.runtime import QUERY_CHILD_SETTINGS
+
+    cap = QueryLimits().rss_bytes
+    assert memory_limit_bytes(QUERY_CHILD_SETTINGS["memory_limit"]) <= cap // 2
+    assert QUERY_CHILD_SETTINGS["threads"] == 1
+    assert QUERY_CHILD_SETTINGS["preserve_insertion_order"] is False
+
+
+def test_query_child_runs_with_bounded_settings_and_private_spill(lake_spec):
+    with lake_connection(lake_spec, read_only=False, create=True) as con:
+        configure_catalog(con)
+    result = query(
+        lake_spec,
+        "SELECT current_setting('threads'), current_setting('memory_limit'),"
+        " current_setting('preserve_insertion_order'),"
+        " current_setting('temp_directory')",
+    )
+    threads, memory_limit, preserve, spill = result["rows"][0]
+    assert threads == 1 and preserve is False
+    assert memory_limit.startswith("732")  # 768MB, reported in MiB
+    assert Path(spill).name == "spill"
+    assert Path(spill).parent.name.startswith("drover-lake-query-")
+
+
 def _fixture_tar(tmp_path):
     import tarfile
     from datetime import datetime, timezone

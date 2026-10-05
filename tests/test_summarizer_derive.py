@@ -165,3 +165,85 @@ def test_tool_projection_preserves_flat_tool_input() -> None:
         "src/drover/server/memory_identity.py"
     ]
     assert compute_tools_used([projected_event]) == {"Edit": 1}
+
+
+def _page_fixture(con) -> None:
+    """Ties on timestamp/id, duplicate dedup keys, NULL raw_data, another session."""
+    con.execute("SET TimeZone='UTC'")
+    con.execute(
+        "CREATE TABLE agent_events(id VARCHAR, session_id VARCHAR, dedup_key VARCHAR,"
+        " repo_owner VARCHAR, repo_name VARCHAR, timestamp TIMESTAMPTZ,"
+        " event_type VARCHAR, raw_data VARCHAR)"
+    )
+    rows = []
+    for i in range(2500):
+        raw = json.dumps(
+            {
+                "tool_name": f"Tool{i % 7}",
+                "input": {"path": f"src/f{i % 13}.py", "command": "x" * (i % 50)},
+            }
+        )
+        rows.append(
+            (
+                f"id-{i // 3}",  # duplicate ids force the hash tie-break
+                "s",
+                f"k-{i // 2}" if i % 5 else None,  # duplicate keys + NULL keys
+                "o" if i % 4 else None,
+                "r" if i % 4 else None,
+                f"2026-10-01 00:{(i // 100) % 60:02d}:00+00",  # timestamp ties
+                "tool_action",
+                None if i % 97 == 0 else raw,
+            )
+        )
+    rows.append(("other", "t", "k-other", "o", "r", "2026-10-01", "x", "{}"))
+    con.executemany("INSERT INTO agent_events VALUES (?,?,?,?,?,?,?,?)", rows)
+
+
+def test_raw_event_pages_match_the_unpaged_projection_exactly() -> None:
+    """Paging before projecting keeps the exact rows and order (A3 RSS fix)."""
+    from drover.server.summarizer.worker import (
+        _raw_event_page_sql,
+        _session_agent_events_ctes,
+    )
+
+    with duckdb.connect() as con:
+        _page_fixture(con)
+        expected = con.execute(
+            f"""WITH {_session_agent_events_ctes()}
+            SELECT event_type, {_tool_projection_sql()} AS raw_data,
+                   timestamp, id, coalesce(dedup_key, '') AS _dedup_key,
+                   hash(raw_data) AS _raw_hash FROM canonical_agent_events
+            WHERE raw_data IS NOT NULL
+            ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''),
+                     hash(raw_data)""",
+            ["s"],
+        ).fetchall()
+        pages, last = [], None
+        while True:
+            if last is None:
+                page = con.execute(
+                    _raw_event_page_sql(keyset=False), ["s", 300]
+                ).fetchall()
+            else:
+                page = con.execute(
+                    _raw_event_page_sql(keyset=True),
+                    ["s", last[2], last[3] or "", last[4], last[5], 300],
+                ).fetchall()
+            if not page:
+                break
+            assert len(page) <= 300
+            pages.extend(page)
+            last = page[-1]
+    assert len(expected) > 1000
+    assert pages == expected
+
+
+def test_raw_event_page_projects_only_the_selected_page() -> None:
+    from drover.server.summarizer.worker import _raw_event_page_sql
+
+    for keyset in (False, True):
+        sql = _raw_event_page_sql(keyset=keyset)
+        page = sql.index("raw_event_page AS (")
+        # The JSON/regex projection runs only in the outer SELECT, after LIMIT.
+        assert sql.index("LIMIT ?") < sql.index("json_object") > page
+        assert "json_" not in sql[page : sql.index("LIMIT ?")]

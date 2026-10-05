@@ -1,0 +1,8 @@
+[
+  {},
+  {"threads": 1},
+  {"memory_limit": "512MB"},
+  {"memory_limit": "512MB", "threads": 1},
+  {"memory_limit": "512MB", "threads": 1, "preserve_insertion_order": false, "temp_directory": "/tmp/drover-probe-spill"},
+  {"memory_limit": "256MB", "threads": 1, "preserve_insertion_order": false, "temp_directory": "/tmp/drover-probe-spill"}
+]
