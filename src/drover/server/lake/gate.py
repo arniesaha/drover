@@ -751,9 +751,10 @@ class GateRun:
         from drover.server.summarizer.worker import SummarizerWorker
 
         enqueue_summary_generation(self.client_path, session_id, "drover-gate-v1")
+        # No backend_config: the worker always calls this deterministic stub,
+        # so no model credential (and no model) is ever involved.
         worker = SummarizerWorker(
             duckdb_path=self.client_path,
-            api_key="gate-only",
             _llm_call=lambda *a, **kw: {
                 "summary_md": f"{GATE_TEXT} summary",
                 "next_steps_md": "Continue",
