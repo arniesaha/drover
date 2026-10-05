@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from drover.server.lake import lifecycle
+from drover.server.lake import lifecycle, task_projection
 
 
 @pytest.mark.parametrize("backend", ["legacy", "ducklake"])
@@ -34,9 +34,7 @@ def test_incoming_export_selects_backend_and_checks_canonical_keys(
         "drover.server.db.control_plane_connection", lambda _: nullcontext(control)
     )
     refresh = Mock()
-    monkeypatch.setattr(
-        "drover.server.lake.task_projection.refresh_if_provisioned", refresh
-    )
+    monkeypatch.setattr(task_projection, "refresh_if_provisioned", refresh)
     lifecycle.export_ingested_events(config, ["canonical-key", "canonical-key"])
     assert exporter.run_once.call_count == 2
     assert control.execute.call_args.args[1] == ["canonical-key"]
