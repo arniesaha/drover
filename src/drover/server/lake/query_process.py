@@ -212,14 +212,14 @@ def _worker(request: dict) -> dict:
 
             check_proof(spec, con, serving["verification_sha256"])
             con.execute(
-                "CREATE TEMP TABLE memory_session_identity(harness_session_id VARCHAR, native_session_id VARCHAR, summary_session_id VARCHAR)"
+                "CREATE TEMP TABLE memory_session_identity(harness_session_id VARCHAR, native_session_id VARCHAR, summary_session_id VARCHAR, started_at TIMESTAMPTZ)"
             )
             identities = serving.get("identities", [])
             if len(identities) > 10000:
                 raise LakeError("analytics_identity_limit_exceeded")
             if identities:
                 con.executemany(
-                    "INSERT INTO memory_session_identity VALUES (?,?,?)", identities
+                    "INSERT INTO memory_session_identity VALUES (?,?,?,?)", identities
                 )
             con.execute("""CREATE TEMP VIEW agent_events AS
                 SELECT * EXCLUDE(timestamp,repo_owner,repo_name), TRY_CAST(timestamp AS TIMESTAMPTZ) AS timestamp,

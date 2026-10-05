@@ -792,6 +792,46 @@ def test_analytics_freshness_uses_recent_span_end_for_old_started_session():
     assert result.metadata.freshness == "fresh"
 
 
+@pytest.mark.parametrize(
+    ("age", "freshness"),
+    [(timedelta(minutes=5), "fresh"), (timedelta(hours=2), "stale")],
+)
+def test_partial_history_preserves_ingest_freshness(age, freshness):
+    con = _analytics_connection()
+    now = datetime.now(timezone.utc)
+    observed = now - age
+    boundary = (now - timedelta(days=60)).date().isoformat()
+    con.execute("ATTACH ':memory:' AS lake")
+    con.execute("CREATE TABLE lake.import_watermark(partition_date VARCHAR)")
+    con.execute("INSERT INTO lake.import_watermark VALUES (?)", [boundary])
+    _insert_session(
+        con,
+        session_id="recent",
+        project="acme/recent",
+        host="mac-mini",
+        harness="codex",
+        tokens=10,
+    )
+    con.execute(
+        "UPDATE harness_sessions SET started_at=?, ended_at=?, updated_at=?",
+        [observed, observed, observed],
+    )
+    con.execute("UPDATE sessions SET started_at=?, ended_at=?", [observed, observed])
+    con.execute(
+        "UPDATE spans_enriched SET start_time=?, end_time=?", [observed, observed]
+    )
+    try:
+        result = activity_analytics(con, AnalyticsFilters(days=90))
+        assert result.metadata.freshness == freshness
+        assert result.metadata.archived_before == boundary
+        assert result.totals.metadata.archived_before == boundary
+        covered = activity_analytics(con, AnalyticsFilters(days=30))
+        assert covered.metadata.freshness == freshness
+        assert covered.metadata.archived_before is None
+    finally:
+        con.close()
+
+
 def test_paginated_dimension_freshness_uses_harness_and_session_latest_activity():
     con = _analytics_connection()
     old = datetime.now(timezone.utc) - timedelta(days=2)

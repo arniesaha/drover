@@ -453,11 +453,6 @@ def test_a6_switch_ingest_rollback_outbox_replay(
 
 
 # fails today: a mapped historical legacy-only session resolves unavailable instead of archived.
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="v2 S4: legacy-only session has no archived replay status",
-)
 def test_a7_replay_pre_import_watermark_archived_lake_import(
     hub_recent_lake, prod_shaped, small_lake, tmp_path
 ):
@@ -473,10 +468,16 @@ def test_a7_replay_pre_import_watermark_archived_lake_import(
     _register(
         prod_shaped, session_id, native_session_id=session_id, started_at=started_at
     )
+    import os
+
+    os.environ["DROVER_LAKE_EXTENSION_DIR"] = str(hub_recent_lake.spec.extension_dir)
+    os.environ["DROVER_LAKE_ENGINE_SHA256"] = hub_recent_lake.spec.engine_sha256
+
     replay = drover_session_replay(duckdb_path=prod_shaped, session_id=session_id)
     assert (
         replay["status"] == "archived"
     ), f"Legacy-only session expected archived, got {replay}"
+
     result = CliRunner().invoke(
         main,
         [
@@ -493,6 +494,57 @@ def test_a7_replay_pre_import_watermark_archived_lake_import(
         ],
     )
     assert result.exit_code == 0, result.output
+
+    # Run again to test idempotency
+    result2 = CliRunner().invoke(
+        main,
+        [
+            "lake",
+            "import",
+            "--session",
+            session_id,
+            "--data-root",
+            str(hub_recent_lake.spec.data_root),
+            "--catalog-dsn-env",
+            hub_recent_lake.spec.catalog_dsn_env,
+            "--legacy-root",
+            str(small_lake),
+        ],
+    )
+    assert result2.exit_code == 0, result2.output
+
+    # Check that rows are not duplicated
+    with duckdb.connect() as con2:
+        con2.execute(
+            f"INSTALL '{hub_recent_lake.spec.extension_dir}/ducklake.duckdb_extension'"
+        )
+        con2.execute("LOAD ducklake")
+        con2.execute(
+            f"ATTACH 'ducklake:postgres:{os.environ[hub_recent_lake.spec.catalog_dsn_env]}' AS lake"
+        )
+        lake_count = con2.execute(
+            "SELECT count(*) FROM lake.agent_events WHERE session_id=?", [session_id]
+        ).fetchone()[0]
+        assert (
+            lake_count == count
+        ), f"Idempotency failed: expected {count}, got {lake_count}"
+
+    # After lake import, the verification digest changed. Reload it into the hub!
+    import hashlib
+    from dataclasses import replace
+
+    proof_bytes = (
+        hub_recent_lake.spec.data_root / "verification/serving-proof.json"
+    ).read_bytes()
+    new_digest = hashlib.sha256(proof_bytes).hexdigest()
+    hub_recent_lake = replace(
+        hub_recent_lake,
+        config=replace(hub_recent_lake.config, verification_sha256=new_digest),
+    )
+    from drover.server.lake.serving import configure_analytics
+
+    configure_analytics(prod_shaped, hub_recent_lake.config)
+
     job = _summarize(prod_shaped, session_id)
     assert job.status == "succeeded", job
     assert (
