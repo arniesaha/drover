@@ -167,7 +167,7 @@ def test_open_duckdb_connection_supports_diagnostic_snapshot_profile(tmp_path):
         )
         assert diagnostic.execute(
             "SELECT current_setting('memory_limit')"
-        ).fetchone() == ("953.6 MiB",)
+        ).fetchone() == ("3.7 GiB",)
     finally:
         diagnostic.close()
 
@@ -177,7 +177,7 @@ def test_open_duckdb_connection_supports_summarizer_profile(tmp_path):
     try:
         assert con.execute("SELECT current_setting('threads')").fetchone() == (1,)
         assert con.execute("SELECT current_setting('memory_limit')").fetchone() == (
-            "953.6 MiB",
+            "3.7 GiB",
         )
     finally:
         con.close()
