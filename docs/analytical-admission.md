@@ -35,6 +35,8 @@ All values below are positive integers, read from the environment:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
+| `DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT` | `4GB` | Shared DuckDB memory limit for live analytical worker, summarizer, diagnostic, and recovery reopens |
+| `DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT` | effective analytical memory limit | Optional startup-WAL-checkpoint limit; otherwise follows the shared analytical limit |
 | `DROVER_DUCKDB_ANALYTICAL_MAX_THREADS` | `1` | Ceiling on live analytical roles, including worker, summarizer, and diagnostic, after role settings and explicit overrides |
 | `DROVER_ANALYTICAL_HTTP_CONCURRENCY` | `1` | Concurrent heavy analytical requests per listener/dispatcher |
 | `DROVER_FLEET_HTTP_CONCURRENCY` | `4` | Concurrent fleet listing requests per listener |

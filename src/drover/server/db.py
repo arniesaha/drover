@@ -89,13 +89,15 @@ def snapshot_thread_default(cpu_count: int) -> int:
 # Roles describe callers, not budgets. Connections to the same file share both
 # memory_limit and threads (and DuckDB does not account for all process RSS).
 # These defaults are one analytical INSTANCE budget, never three allocations.
+# On 2026-10-04, a legacy production lake of about 1.4GB OOMed while
+# autocheckpointing at 1GB; checkpoints need more headroom than that limit.
 ANALYTICAL_INSTANCE_DEFAULTS = {
-    "memory_limit": "1GB",
+    "memory_limit": "4GB",
     "threads": "1",
     "preserve_insertion_order": "false",
 }
-# 512MB OOMed the 30-day cockpit build; 1GB retains the measured floor from
-# #260. Keep #331's one-thread ceiling; raising memory is not an RSS fix.
+# 512MB OOMed the 30-day cockpit build. Keep #331's one-thread ceiling;
+# raising memory is not an RSS fix.
 ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     **{
         role: ANALYTICAL_INSTANCE_DEFAULTS
@@ -487,11 +489,29 @@ def validate_duckdb_size(value: str, *, name: str = "memory_limit") -> str:
     return value.strip()
 
 
+def _effective_analytical_instance_setting(setting: str) -> str:
+    """Return one alias-aware, shared analytical instance setting."""
+    suffix = setting.upper()
+    names = [
+        f"DROVER_DUCKDB_{name}_{suffix}"
+        for name in ("ANALYTICAL", "WORKER", "SUMMARIZER", "DIAGNOSTIC")
+    ]
+    configured = {
+        name: os.environ[name].strip() for name in names if name in os.environ
+    }
+    if len({value.lower() for value in configured.values()}) > 1:
+        raise ValueError(f"conflicting analytical instance {setting}: {configured}")
+    return next(iter(configured.values()), ANALYTICAL_INSTANCE_DEFAULTS[setting])
+
+
 def startup_analytical_checkpoint(duckdb_path: str | Path) -> bool:
     """Drain any leftover WAL under a raised limit before opening the store."""
-    ckpt_limit = os.environ.get(
-        "DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT", "4GB"
-    ).strip()
+    checkpoint_limit = os.environ.get("DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT")
+    ckpt_limit = (
+        checkpoint_limit.strip()
+        if checkpoint_limit is not None
+        else _effective_analytical_instance_setting("memory_limit")
+    )
     ckpt_limit = validate_duckdb_size(
         ckpt_limit, name="DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT"
     )
@@ -1267,19 +1287,7 @@ def _apply_role_settings(
             # Accept old names as aliases for ONE budget. Inspect all aliases
             # on every open (including the startup pin), independent of role:
             # connection order must never decide the instance's settings.
-            names = [
-                f"DROVER_DUCKDB_{name}_{suffix}"
-                for name in ("ANALYTICAL", "WORKER", "SUMMARIZER", "DIAGNOSTIC")
-            ]
-            configured = {
-                name: os.environ[name].strip() for name in names if name in os.environ
-            }
-            if len({value.lower() for value in configured.values()}) > 1:
-                raise ValueError(
-                    f"conflicting analytical instance {setting}: {configured}"
-                )
-            if configured:
-                settings[setting] = next(iter(configured.values()))
+            settings[setting] = _effective_analytical_instance_setting(setting)
         else:
             settings[setting] = os.environ.get(
                 f"DROVER_DUCKDB_{role.upper()}_{suffix}", settings[setting]

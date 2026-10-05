@@ -90,7 +90,12 @@ def smoke(url, token, budget=20.0):
         if len(body) > MAX_RESPONSE_BYTES:
             raise Rejected("response_too_large")
         if path == "/healthz":
-            if body not in {b"ok", b"ok\n"}:
+            health_bodies = {b"ok", b"ok\n"}
+            health_bodies.update(
+                f"ok\nanalytical={status}\n".encode()
+                for status in ("ok", "recovering", "failed-retrying")
+            )
+            if body not in health_bodies:
                 raise Rejected("health_invalid")
         elif path == "/readyz":
             try:

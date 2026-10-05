@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import re
 import sys
 import weakref
 from types import SimpleNamespace
@@ -9,6 +10,21 @@ from types import SimpleNamespace
 import pytest
 
 from drover.server import db, memory
+
+
+def _duckdb_bytes(value):
+    match = re.fullmatch(r"([0-9.]+)\s*([A-Za-z]+)", value)
+    assert match, f"unexpected DuckDB memory limit: {value!r}"
+    units = {
+        "b": 1,
+        "kb": 1_000,
+        "kib": 1_024,
+        "mb": 1_000_000,
+        "mib": 1_048_576,
+        "gb": 1_000_000_000,
+        "gib": 1_073_741_824,
+    }
+    return float(match.group(1)) * units[match.group(2).lower()]
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +43,22 @@ def test_legacy_budget_applies_to_every_shared_role(tmp_path, monkeypatch, role)
         assert con.execute("SELECT current_setting('memory_limit')").fetchone() == (
             "61.0 MiB",
         )
+
+
+def test_default_analytical_memory_limit_is_about_4gb(tmp_path):
+    with db.open_duckdb_connection(tmp_path / "db") as con:
+        limit = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    assert _duckdb_bytes(limit) == pytest.approx(4_000_000_000, rel=0.03)
+
+
+def test_recovery_reopen_honors_analytical_memory_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT", "1536MB")
+    con = db._open_analytical_handle(tmp_path / "db", "worker", None)
+    try:
+        limit = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    finally:
+        con.close()
+    assert _duckdb_bytes(limit) == pytest.approx(1_536_000_000, rel=0.03)
 
 
 @pytest.mark.parametrize(

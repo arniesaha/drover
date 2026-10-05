@@ -3394,7 +3394,7 @@ def test_auth_healthz_open(tmp_path):
         server.shutdown()
 
     assert status == 200
-    assert body == "ok\n"
+    assert body == "ok\nanalytical=ok\n"
 
 
 def test_auth_accepts_bearer(tmp_path):

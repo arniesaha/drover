@@ -97,6 +97,7 @@ def test_checkpoint_limit_env_is_honoured(tmp_path, monkeypatch):
 
     # When no env override is provided, default 4GB is used
     monkeypatch.delenv("DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT", raising=False)
+    monkeypatch.delenv("DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT", raising=False)
     with mock.patch("duckdb.connect") as mock_connect:
         mock_con = mock.MagicMock()
         mock_connect.return_value = mock_con
@@ -108,6 +109,18 @@ def test_checkpoint_limit_env_is_honoured(tmp_path, monkeypatch):
         )
         mock_con.execute.assert_called_once_with("CHECKPOINT")
         mock_con.close.assert_called_once()
+
+    # Without a checkpoint override, use the running analytical instance limit.
+    monkeypatch.setenv("DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT", "6GB")
+    with mock.patch("duckdb.connect") as mock_connect:
+        mock_con = mock.MagicMock()
+        mock_connect.return_value = mock_con
+
+        assert startup_analytical_checkpoint(db_path) is True
+        mock_connect.assert_called_once_with(
+            str(db_path),
+            config={"memory_limit": "6GB", "threads": "1"},
+        )
 
 
 def test_failing_checkpoint_logs_and_returns_without_raising(tmp_path, caplog):

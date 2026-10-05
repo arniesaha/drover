@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Raised the shared analytical DuckDB memory limit to 4GB after a legacy-store
+  autocheckpoint OOM. Startup checkpoints now follow the effective analytical
+  limit, and `/healthz` reports observed analytical recovery status while
+  `/readyz` remains the readiness signal.
+
 ## [0.5.5] - 2026-10-04
 
 ### Fixed

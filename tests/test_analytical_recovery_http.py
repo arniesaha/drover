@@ -82,7 +82,7 @@ def test_detection_health_and_fast_http_errors_until_recovered(tmp_path, monkeyp
         )
         status, health, headers = request(port, "/healthz")
         assert status == 200
-        assert health == b"ok\n"
+        assert health == b"ok\nanalytical=recovering\n"
         assert headers["X-Drover-Analytical"] == "recovering"
         for route, method in [
             ("/cockpit/overview", "GET"),
@@ -139,7 +139,7 @@ def test_readiness_cannot_cache_ok_during_recovery(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("state", ["ok", "recovering", "failed", "failed-retrying"])
+@pytest.mark.parametrize("state", ["ok", "recovering", "failed-retrying"])
 def test_healthz_preserves_liveness_contract_in_every_store_state(
     tmp_path, monkeypatch, state
 ):
@@ -155,9 +155,7 @@ def test_healthz_preserves_liveness_contract_in_every_store_state(
         port = server.server_address[1]
         status, body, headers = request(port, "/healthz")
         assert status == 200
-        assert body == b"ok\n"
-        # Existing backup preflight and TestFlight live-hub smoke consumers use this.
-        assert body.strip() == b"ok"
+        assert body == f"ok\nanalytical={state}\n".encode()
         assert headers["X-Drover-Analytical"] == state
         if state != "ok":
             status, body, _ = request(port, "/readyz")

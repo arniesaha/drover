@@ -24,10 +24,12 @@ handles remain unusable after recovery, and their owners must open a fresh
 connection for subsequent work. Runtime workers normally open a connection for
 each pass.
 
-`/healthz` remains a liveness endpoint: HTTP 200 with the exact body `ok\n`,
-regardless of analytical state. Backup preflight, live-hub smoke, setup, and clients
-rely on this contract. The optional `X-Drover-Analytical` response header
-reports `ok`, `recovering`, or `failed-retrying` without querying the store.
+`/healthz` remains a liveness endpoint: it returns HTTP 200 while the process
+serves, regardless of analytical state. Its body is
+`ok\nanalytical=<status>\n`, where status is `ok`, `recovering`, or
+`failed-retrying`; `X-Drover-Analytical` carries the same value without querying
+the store. `/readyz` is the readiness endpoint and returns 503 while analytical
+recovery is in progress or retrying.
 This header is observed, process-local health: it cannot discover a failure
 until a connection operation encounters it.
 

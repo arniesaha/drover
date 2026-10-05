@@ -305,7 +305,7 @@ def test_healthz_observed_health_does_not_probe_the_store(tmp_path):
 
     assert ready_status == 503
     assert health_status == 200
-    assert health_body == "ok\n"
+    assert health_body == "ok\nanalytical=ok\n"
 
 
 def test_readiness_opens_no_analytical_connection(tmp_path, monkeypatch):

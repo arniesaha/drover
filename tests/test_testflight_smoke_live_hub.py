@@ -13,7 +13,7 @@ from testflight import smoke_live_hub as smoke
 def hub():
     requests = []
     responses = {
-        "/healthz": (200, b"ok\n"),
+        "/healthz": (200, b"ok\nanalytical=ok\n"),
         "/readyz": (200, b'{"ready":true}'),
         "/harness/hosts": (200, b'{"hosts":[]}'),
         "/harness/sessions": (200, b'{"sessions":[]}'),
