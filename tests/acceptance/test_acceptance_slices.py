@@ -416,7 +416,7 @@ def test_a6_switch_ingest_rollback_outbox_replay(
         }
     assert ids == {e["id"] for e in events}
     response = requests.get(hub_http + "/healthz", timeout=10)
-    assert response.status_code == 200 and response.text.strip() == "ok"
+    assert response.status_code == 200 and response.text.strip() == "ok\nanalytical=ok"
 
 
 # fails today: a mapped historical legacy-only session resolves unavailable instead of archived.
