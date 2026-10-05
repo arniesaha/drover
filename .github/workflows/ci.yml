@@ -112,7 +112,7 @@ jobs:
       # 4.0 minutes and raised the failure rate from 8% to 27%, with one run
       # stretching to 35 minutes. Two keeps most of the speedup and leaves the
       # runner room for the children. Revisit with numbers, not intuition.
-      run: pytest tests/ -n 2
+      run: pytest tests/ --ignore=tests/acceptance -n 2
 
     # The installer is shell, so pytest alone leaves it unguarded. Every
     # suite runs against stubs and temp directories and never touches the
@@ -195,6 +195,26 @@ jobs:
           tests/test_memory_integrity.py \
           tests/test_readiness_memory.py -m 'not pgvector' -q
 
+    - name: Get DuckDB extension cache version
+      id: lake-extension-version
+      run: |
+        python -c 'import duckdb; print("version=" + duckdb.__version__)' >> "$GITHUB_OUTPUT"
+
+    - name: Cache pinned DuckDB extensions
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/drover-lake-ext
+        key: ${{ runner.os }}-drover-lake-ext-${{ steps.lake-extension-version.outputs.version }}-${{ hashFiles('src/drover/server/lake/runtime.py') }}
+
+    - name: Provision and verify pinned DuckDB extensions
+      run: |
+        scripts/fetch-lake-extensions.sh "$HOME/.cache/drover-lake-ext"
+        echo "DROVER_TEST_LAKE_EXTENSIONS=$HOME/.cache/drover-lake-ext" >> "$GITHUB_ENV"
+
+    - name: Run DuckLake v2 acceptance contracts
+      run: |
+        pytest tests/acceptance -m "not acceptance_scale" -q
+
   pgvector-memory-integration:
     # Unconditional release gate; keep the plain PostgreSQL job above as well.
     runs-on: ubuntu-latest
@@ -225,3 +245,8 @@ jobs:
       run: |
         uv run --python 3.11 --locked --extra dev pytest --require-pgvector -m pgvector \
           tests/test_memory_store.py tests/test_embeddings.py -v -s
+
+    - name: Compare released schema with the production dump including vector types
+      run: |
+        uv run --python 3.11 --locked --extra dev pytest --require-pgvector \
+          tests/acceptance/test_drift_guards.py -q
