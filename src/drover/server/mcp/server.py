@@ -405,4 +405,21 @@ def build_mcp_server(
             spans_enabled=spans_enabled,
         )
 
+    @read_tool()
+    def drover_provider_quota(
+        provider: Optional[str] = None,
+        fresh: bool = False,
+    ) -> dict:
+        """Read-only provider quota for every account across hosts with routing hint.
+
+        Optional args:
+        - provider: filter to a specific provider ('google', 'openai', 'anthropic')
+        - fresh: force a re-probe of online hosts bounded by a timeout
+        """
+        return t.drover_provider_quota(
+            duckdb_path=db,
+            provider=provider,
+            fresh=fresh,
+        )
+
     return mcp

@@ -1215,3 +1215,307 @@ def test_fleet_status_reports_host_liveness_from_heartbeat_age(tmp_path):
     assert {row["host_liveness"] for row in rows if row["agent_id"] == agent_id} == {
         "offline"
     }
+
+
+def test_provider_quota_empty_database(tmp_path: Path):
+    path = tmp_path / "nexus.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+    res = mcp_tools.drover_provider_quota(duckdb_path=path)
+    assert res["accounts"] == []
+    assert res["routing_hint"] == "no provider accounts configured"
+    assert res["updated_at"] is None
+
+
+def test_provider_quota_groups_hosts_and_formats_windows(tmp_path: Path):
+    from drover.server.providers.types import (
+        ProviderAccountSnapshot,
+        ProviderUsageWindow,
+    )
+
+    path = tmp_path / "nexus.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+
+    t0 = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 8, 10, 10, 5, 0, tzinfo=timezone.utc)
+    reset_5h = t0 + timedelta(hours=3)
+    reset_weekly = t0 + timedelta(days=6)
+
+    # Google account on host-1
+    snap_google_1 = ProviderAccountSnapshot(
+        snapshot_id="snap-g1",
+        dedup_key="dedup-g1",
+        provider="google",
+        account_label="arnab@example.com",
+        plan_label="Advanced",
+        host_id="host-1",
+        status="ok",
+        observed_at=t0,
+        windows=(
+            ProviderUsageWindow(
+                kind="five_hour",
+                used_percent=25.0,
+                remaining_value=None,
+                window_minutes=300,
+                resets_at=reset_5h,
+            ),
+        ),
+        source="agy-usage",
+    )
+    # Same Google account on host-2 (newer observation)
+    snap_google_2 = ProviderAccountSnapshot(
+        snapshot_id="snap-g2",
+        dedup_key="dedup-g2",
+        provider="google",
+        account_label="arnab@example.com",
+        plan_label="Advanced",
+        host_id="host-2",
+        status="ok",
+        observed_at=t1,
+        windows=(
+            ProviderUsageWindow(
+                kind="five_hour",
+                used_percent=30.0,
+                remaining_value=None,
+                window_minutes=300,
+                resets_at=reset_5h,
+            ),
+            ProviderUsageWindow(
+                kind="seven_day",
+                used_percent=10.0,
+                remaining_value=None,
+                window_minutes=10080,
+                resets_at=reset_weekly,
+            ),
+        ),
+        source="agy-usage",
+    )
+    # OpenAI account on host-1
+    snap_openai = ProviderAccountSnapshot(
+        snapshot_id="snap-o1",
+        dedup_key="dedup-o1",
+        provider="openai",
+        account_label="Codex",
+        plan_label="plus",
+        host_id="host-1",
+        status="ok",
+        observed_at=t0,
+        windows=(
+            ProviderUsageWindow(
+                kind="primary",
+                used_percent=57.0,
+                remaining_value=None,
+                window_minutes=300,
+                resets_at=reset_5h,
+            ),
+        ),
+        source="codex-app-server",
+    )
+
+    class MockService:
+        def latest_accounts(self):
+            return [snap_google_1, snap_google_2, snap_openai]
+
+    res = mcp_tools.drover_provider_quota(
+        duckdb_path=path,
+        service=MockService(),
+        now=t1,
+    )
+
+    assert len(res["accounts"]) == 2
+    # Verify Google account grouping across host-1 and host-2
+    google_acc = next(a for a in res["accounts"] if a["provider"] == "google")
+    assert google_acc["account_label"] == "arnab@example.com"
+    assert google_acc["plan"] == "Advanced"
+    assert google_acc["hosts"] == ["host-1", "host-2"]
+    assert google_acc["status"] == "ok"
+    assert len(google_acc["windows"]) == 2
+    kinds = {w["kind"]: w for w in google_acc["windows"]}
+    assert kinds["five_hour"]["used_percent"] == 30.0
+    assert kinds["five_hour"]["status"] == "ok"
+    assert kinds["five_hour"]["source"] == "provider_api"
+    assert kinds["five_hour"]["resets_at"] == reset_5h.isoformat()
+    assert kinds["five_hour"]["updated_at"] == t1.isoformat()
+
+    # Verify OpenAI account
+    openai_acc = next(a for a in res["accounts"] if a["provider"] == "openai")
+    assert openai_acc["account_label"] == "Codex"
+    assert openai_acc["plan"] == "plus"
+    assert openai_acc["hosts"] == ["host-1"]
+    assert openai_acc["windows"][0]["used_percent"] == 57.0
+    assert openai_acc["windows"][0]["status"] == "ok"
+
+    # Routing hint
+    assert "gemini: 30%" in res["routing_hint"]
+    assert "codex: 57%" in res["routing_hint"]
+
+
+def test_provider_quota_routing_hint_out_and_observed_exhausted(tmp_path: Path):
+    from drover.server.providers.types import (
+        ProviderAccountSnapshot,
+        ProviderUsageWindow,
+    )
+
+    path = tmp_path / "nexus.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+
+    # now: 2026-08-10 12:00:00Z
+    now = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+    # Gemini reset at 14:59Z on same day
+    gemini_reset = datetime(2026, 8, 10, 14, 59, 0, tzinfo=timezone.utc)
+    # 3p reset: 7 days away
+    claude_reset = datetime(2026, 8, 17, 2, 15, 30, tzinfo=timezone.utc)
+
+    snap_google = ProviderAccountSnapshot(
+        snapshot_id="snap-g",
+        dedup_key="dedup-g",
+        provider="google",
+        account_label="arnab@example.com",
+        plan_label=None,
+        host_id="mac-mini",
+        status="observed_exhausted",
+        observed_at=now,
+        windows=(
+            ProviderUsageWindow(
+                kind="five_hour",
+                used_percent=100.0,
+                remaining_value=0.0,
+                window_minutes=300,
+                resets_at=gemini_reset,
+            ),
+            ProviderUsageWindow(
+                kind="seven_day_claude_gpt",
+                used_percent=100.0,
+                remaining_value=0.0,
+                window_minutes=10080,
+                resets_at=claude_reset,
+            ),
+        ),
+        source="observed_429",
+    )
+    snap_openai = ProviderAccountSnapshot(
+        snapshot_id="snap-o",
+        dedup_key="dedup-o",
+        provider="openai",
+        account_label="Codex",
+        plan_label="plus",
+        host_id="mac-mini",
+        status="ok",
+        observed_at=now,
+        windows=(
+            ProviderUsageWindow(
+                kind="primary",
+                used_percent=57.0,
+                remaining_value=None,
+                window_minutes=300,
+                resets_at=gemini_reset,
+            ),
+        ),
+        source="codex-app-server",
+    )
+
+    class MockService:
+        def latest_accounts(self):
+            return [snap_google, snap_openai]
+
+    res = mcp_tools.drover_provider_quota(
+        duckdb_path=path,
+        service=MockService(),
+        now=now,
+    )
+
+    hint = res["routing_hint"]
+    assert "agy-claude: observed exhausted until 2026-08-17 02:15Z" in hint
+    assert "codex: 57%" in hint
+
+
+def test_provider_quota_filter_by_provider(tmp_path: Path):
+    from drover.server.providers.types import (
+        ProviderAccountSnapshot,
+        ProviderUsageWindow,
+    )
+
+    path = tmp_path / "nexus.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+
+    t0 = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+    snap_google = ProviderAccountSnapshot(
+        snapshot_id="snap-g",
+        dedup_key="dedup-g",
+        provider="google",
+        account_label="u@g.com",
+        plan_label=None,
+        host_id="h1",
+        status="ok",
+        observed_at=t0,
+        windows=(),
+        source="agy-usage",
+    )
+    snap_openai = ProviderAccountSnapshot(
+        snapshot_id="snap-o",
+        dedup_key="dedup-o",
+        provider="openai",
+        account_label="Codex",
+        plan_label=None,
+        host_id="h1",
+        status="ok",
+        observed_at=t0,
+        windows=(
+            ProviderUsageWindow(
+                kind="primary",
+                used_percent=42.0,
+                remaining_value=None,
+                window_minutes=300,
+                resets_at=t0 + timedelta(hours=2),
+            ),
+        ),
+        source="codex-app-server",
+    )
+
+    class MockService:
+        def latest_accounts(self):
+            return [snap_google, snap_openai]
+
+    res = mcp_tools.drover_provider_quota(
+        duckdb_path=path,
+        provider="openai",
+        service=MockService(),
+        now=t0,
+    )
+    assert len(res["accounts"]) == 1
+    assert res["accounts"][0]["provider"] == "openai"
+    assert res["routing_hint"] == "codex: 42%"
+
+
+def test_provider_quota_fresh_probes_online_hosts(tmp_path: Path):
+    from drover.server.harness.registry import HarnessRegistry
+
+    path = tmp_path / "nexus.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+
+    registry = HarnessRegistry(path)
+    registry.register_host(host_id="host-online", display_name="Online", kind="mac")
+
+    refreshed: list[str] = []
+
+    class MockService:
+        def refresh_host(self, host):
+            refreshed.append(host.host_id)
+
+        def latest_accounts(self):
+            return []
+
+    # fresh=False: no refresh
+    mcp_tools.drover_provider_quota(
+        duckdb_path=path,
+        fresh=False,
+        service=MockService(),
+    )
+    assert refreshed == []
+
+    # fresh=True: refreshes online hosts
+    mcp_tools.drover_provider_quota(
+        duckdb_path=path,
+        fresh=True,
+        service=MockService(),
+    )
+    assert refreshed == ["host-online"]

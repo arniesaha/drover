@@ -1626,6 +1626,303 @@ def drover_task_status(
     return out
 
 
+# --- drover_provider_quota ----------------------------------------------------
+
+
+def _format_routing_reset_time(dt: datetime, now: datetime | None = None) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    if abs((dt - now).total_seconds()) < 24 * 3600 and dt.date() == now.date():
+        return dt.strftime("%H:%MZ")
+    return dt.strftime("%Y-%m-%d %H:%MZ")
+
+
+def _account_identity_key(snapshot: Any) -> str:
+    identity = (getattr(snapshot, "account_identity", None) or "").strip().lower()
+    label = (getattr(snapshot, "account_label", None) or "").strip().lower()
+    provider = getattr(snapshot, "provider", "")
+    if identity:
+        return f"{provider}|{identity}"
+    if "@" in label:
+        return f"{provider}|{label}"
+    if label and label != "unknown account":
+        return f"{provider}|{label}"
+    return f"{provider}|unknown|{getattr(snapshot, 'host_id', '')}"
+
+
+def _build_routing_hint(accounts: list[dict[str, Any]], now: datetime) -> str:
+    """Build compact headroom routing hint across pools (gemini, codex, agy-claude, claude)."""
+    from drover.server.mcp.freshness import _instant
+
+    pools: dict[str, list[dict[str, Any]]] = {}
+
+    for account in accounts:
+        prov = account.get("provider", "")
+        for w in account.get("windows", []):
+            kind = str(w.get("kind") or "")
+            if prov == "google":
+                if "claude_gpt" in kind or "3p" in kind:
+                    pool_name = "agy-claude"
+                else:
+                    pool_name = "gemini"
+            elif prov == "openai":
+                pool_name = "codex"
+            elif prov == "anthropic":
+                pool_name = "claude"
+            else:
+                pool_name = prov or "other"
+            pools.setdefault(pool_name, []).append(w)
+
+    if not pools:
+        return "no provider accounts configured"
+
+    priority = ["gemini", "codex", "agy-claude", "claude"]
+    ordered_keys = sorted(
+        pools.keys(),
+        key=lambda k: (priority.index(k) if k in priority else 99, k),
+    )
+
+    hints: list[str] = []
+    for pool in ordered_keys:
+        windows = pools[pool]
+        # 1. Observed exhaustion takes priority
+        obs_resets = [
+            _instant(w.get("resets_at"))
+            for w in windows
+            if w.get("status") == "observed_exhausted" and w.get("resets_at")
+        ]
+        if obs_resets:
+            valid_resets = [r for r in obs_resets if r is not None]
+            until_str = (
+                _format_routing_reset_time(max(valid_resets), now=now)
+                if valid_resets
+                else ""
+            )
+            hints.append(
+                f"{pool}: observed exhausted until {until_str}"
+                if until_str
+                else f"{pool}: observed exhausted"
+            )
+            continue
+
+        # 2. Complete exhaustion
+        exhausted_resets = [
+            _instant(w.get("resets_at"))
+            for w in windows
+            if (
+                w.get("status") == "exhausted"
+                or (
+                    w.get("used_percent") is not None and w.get("used_percent") >= 100.0
+                )
+            )
+            and w.get("resets_at")
+        ]
+        all_exhausted = windows and all(
+            w.get("status") == "exhausted"
+            or (w.get("used_percent") is not None and w.get("used_percent") >= 100.0)
+            for w in windows
+        )
+        if exhausted_resets and all_exhausted:
+            valid_resets = [r for r in exhausted_resets if r is not None]
+            until_str = (
+                _format_routing_reset_time(min(valid_resets), now=now)
+                if valid_resets
+                else ""
+            )
+            hints.append(
+                f"{pool}: out until {until_str}" if until_str else f"{pool}: out"
+            )
+            continue
+
+        # 3. Available headroom: show used % of the tightest window
+        used_percents = [
+            w.get("used_percent")
+            for w in windows
+            if isinstance(w.get("used_percent"), (int, float))
+        ]
+        if used_percents:
+            tightest = max(used_percents)
+            hints.append(f"{pool}: {int(round(tightest))}%")
+            continue
+
+        hints.append(f"{pool}: unavailable")
+
+    return "; ".join(hints)
+
+
+@_canonical_read
+def drover_provider_quota(
+    *,
+    duckdb_path: Path,
+    provider: str | None = None,
+    fresh: bool = False,
+    timeout_s: float = 3.0,
+    service: Any | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Read-only provider quota for every account across hosts with routing hint."""
+    import concurrent.futures
+
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.providers.service import ProviderUsageService
+
+    current_now = now or datetime.now(timezone.utc)
+    if current_now.tzinfo is None:
+        current_now = current_now.replace(tzinfo=timezone.utc)
+
+    db_path = Path(duckdb_path)
+    usage_service = service or ProviderUsageService(
+        duckdb_path=db_path,
+        parquet_dir=db_path.parent / "parquet",
+        clock=lambda: current_now,
+    )
+
+    if fresh:
+        try:
+            registry = HarnessRegistry(db_path)
+            online_hosts = [
+                h
+                for h in registry.list_hosts()
+                if getattr(h, "liveness", None) and h.liveness().state == "online"
+            ]
+            if online_hosts:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(8, len(online_hosts))
+                ) as executor:
+                    futures = [
+                        executor.submit(usage_service.refresh_host, host)
+                        for host in online_hosts
+                    ]
+                    concurrent.futures.wait(futures, timeout=timeout_s)
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "fresh provider quota refresh encountered an error", exc_info=True
+            )
+
+    try:
+        raw_snapshots = usage_service.latest_accounts()
+    except (duckdb.Error, OSError) as exc:
+        logging.getLogger(__name__).warning("failed to read provider accounts: %s", exc)
+        return {
+            "accounts": [],
+            "routing_hint": "no provider accounts configured",
+            "updated_at": None,
+        }
+
+    if provider:
+        provider_norm = provider.strip().lower()
+        raw_snapshots = [
+            s for s in raw_snapshots if s.provider.lower() == provider_norm
+        ]
+
+    # Group snapshots by subscription identity
+    buckets: dict[str, list[Any]] = {}
+    for snapshot in raw_snapshots:
+        key = _account_identity_key(snapshot)
+        buckets.setdefault(key, []).append(snapshot)
+
+    account_records: list[dict[str, Any]] = []
+    latest_timestamps: list[datetime] = []
+
+    for key, members in buckets.items():
+
+        def member_sort_key(s: Any):
+            status = getattr(s, "status", "")
+            status_priority = {
+                "observed_exhausted": 4,
+                "ok": 3,
+                "usage_unavailable": 2,
+                "stale": 1,
+                "error": 0,
+            }.get(status, 0)
+            obs = getattr(s, "observed_at", current_now)
+            return (status_priority, obs)
+
+        representative = max(members, key=member_sort_key)
+        rep_provider = representative.provider
+        rep_plan = representative.plan_label or next(
+            (s.plan_label for s in members if s.plan_label), None
+        )
+        rep_label = (
+            representative.account_label
+            if representative.account_label != "Unknown account"
+            else next(
+                (
+                    s.account_label
+                    for s in members
+                    if s.account_label != "Unknown account"
+                ),
+                representative.account_label,
+            )
+        )
+        hosts = sorted({s.host_id for s in members if s.host_id})
+        rep_obs = max(s.observed_at for s in members)
+        latest_timestamps.append(rep_obs)
+
+        # Build windows
+        windows_list: list[dict[str, Any]] = []
+        for w in representative.windows:
+            w_status: str
+            if (
+                representative.status == "observed_exhausted"
+                or representative.source == "observed_429"
+            ) and (w.used_percent == 100.0 or "claude_gpt" in w.kind):
+                w_status = "observed_exhausted"
+                w_source = "observed_429"
+            elif w.used_percent is not None and w.used_percent >= 100.0:
+                w_status = "exhausted"
+                w_source = "provider_api"
+            elif w.used_percent is not None:
+                w_status = "ok"
+                w_source = "provider_api"
+            else:
+                w_status = "usage_unavailable"
+                w_source = "provider_api"
+
+            windows_list.append(
+                {
+                    "kind": w.kind,
+                    "used_percent": w.used_percent,
+                    "resets_at": w.resets_at.isoformat() if w.resets_at else None,
+                    "status": w_status,
+                    "source": w_source,
+                    "updated_at": representative.observed_at.isoformat(),
+                }
+            )
+
+        account_records.append(
+            {
+                "provider": rep_provider,
+                "account_label": rep_label,
+                "plan": rep_plan,
+                "hosts": hosts,
+                "status": representative.status,
+                "windows": windows_list,
+                "updated_at": rep_obs.isoformat(),
+            }
+        )
+
+    account_records.sort(key=lambda a: (a["provider"], a["account_label"]))
+    overall_updated_at = (
+        max(latest_timestamps).isoformat() if latest_timestamps else None
+    )
+    routing_hint = _build_routing_hint(account_records, now=current_now)
+
+    return {
+        "accounts": account_records,
+        "routing_hint": routing_hint,
+        "updated_at": overall_updated_at,
+    }
+
+
 # Apply the same response caps to direct users and the MCP transport.
 for _tool_name in READ_CAPS:
     if _tool_name in globals():
@@ -1654,3 +1951,4 @@ nexus_active_handoff = drover_active_handoff
 nexus_fleet_status = drover_fleet_status
 nexus_data_quality = drover_data_quality
 nexus_pipeline_observatory = drover_pipeline_observatory
+nexus_provider_quota = drover_provider_quota
