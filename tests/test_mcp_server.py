@@ -155,6 +155,7 @@ def test_recall_bundle_returns_hub_context(
     assert result["archive_evidence"] == []
     assert result["limits"]["effective_limit"] == 5
     assert result["limits"]["effective_max_context_chars"] == 24_000
+    assert result["limits"]["used_chars"] <= 24_000
 
 
 def test_provider_quota_registered_tool(tmp_path: Path) -> None:

@@ -1645,6 +1645,14 @@ def _format_routing_reset_time(dt: datetime, now: datetime | None = None) -> str
     return dt.strftime("%Y-%m-%d %H:%MZ")
 
 
+def _mask_email(label: str | None) -> str | None:
+    """Agents get a recognisable label, never a full mailbox address."""
+    if not label or "@" not in label:
+        return label
+    local, _, domain = label.partition("@")
+    return f"{local[:1]}***@{domain}"
+
+
 def _account_identity_key(snapshot: Any) -> str:
     identity = (getattr(snapshot, "account_identity", None) or "").strip().lower()
     label = (getattr(snapshot, "account_label", None) or "").strip().lower()
@@ -1794,14 +1802,21 @@ def drover_provider_quota(
                 if getattr(h, "liveness", None) and h.liveness().state == "online"
             ]
             if online_hosts:
-                with concurrent.futures.ThreadPoolExecutor(
+                # Not a `with` block: its exit joins every worker, so a slow
+                # host would hold the call past `timeout_s`. Probes still
+                # running at the deadline finish in the background and land
+                # in the store for the next read.
+                executor = concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(8, len(online_hosts))
-                ) as executor:
+                )
+                try:
                     futures = [
                         executor.submit(usage_service.refresh_host, host)
                         for host in online_hosts
                     ]
                     concurrent.futures.wait(futures, timeout=timeout_s)
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             logging.getLogger(__name__).debug(
                 "fresh provider quota refresh encountered an error", exc_info=True
@@ -1901,7 +1916,7 @@ def drover_provider_quota(
         account_records.append(
             {
                 "provider": rep_provider,
-                "account_label": rep_label,
+                "account_label": _mask_email(rep_label),
                 "plan": rep_plan,
                 "hosts": hosts,
                 "status": representative.status,

@@ -1324,7 +1324,7 @@ def test_provider_quota_groups_hosts_and_formats_windows(tmp_path: Path):
     assert len(res["accounts"]) == 2
     # Verify Google account grouping across host-1 and host-2
     google_acc = next(a for a in res["accounts"] if a["provider"] == "google")
-    assert google_acc["account_label"] == "arnab@example.com"
+    assert google_acc["account_label"] == "a***@example.com"
     assert google_acc["plan"] == "Advanced"
     assert google_acc["hosts"] == ["host-1", "host-2"]
     assert google_acc["status"] == "ok"
@@ -1519,3 +1519,28 @@ def test_provider_quota_fresh_probes_online_hosts(tmp_path: Path):
         service=MockService(),
     )
     assert refreshed == ["host-online"]
+
+
+def test_provider_quota_fresh_returns_within_timeout(tmp_path: Path):
+    import time
+
+    from drover.server.harness.registry import HarnessRegistry
+
+    path = tmp_path / "nexus.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+    HarnessRegistry(path).register_host(
+        host_id="host-slow", display_name="Slow", kind="mac"
+    )
+
+    class SlowService:
+        def refresh_host(self, host):
+            time.sleep(2.0)
+
+        def latest_accounts(self):
+            return []
+
+    started = time.monotonic()
+    mcp_tools.drover_provider_quota(
+        duckdb_path=path, fresh=True, timeout_s=0.2, service=SlowService()
+    )
+    assert time.monotonic() - started < 1.5
