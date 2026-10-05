@@ -7,12 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-10-04
+
 ### Fixed
 
-- Raised the shared analytical DuckDB memory limit to 4GB after a legacy-store
-  autocheckpoint OOM. Startup checkpoints now follow the effective analytical
-  limit, and `/healthz` reports observed analytical recovery status while
-  `/readyz` remains the readiness signal.
+- Raised the shared analytical DuckDB memory limit default from 1GB to 4GB after
+  legacy-store autocheckpoint OOMs. Recovery reopens use the same effective limit
+  (`DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT`), and the startup checkpoint follows it
+  unless `DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT` is set. `/healthz` stays a
+  liveness probe (200) but its body now reports `analytical=<status>`; `/readyz`
+  returns 503 while analytical recovery is in progress (#520, #524).
+
+### Added
+
+- DuckLake v2 acceptance harness (`tests/acceptance/`, A1–A7) with a prod-shaped
+  control-store fixture (#521).
 
 ## [0.5.5] - 2026-10-04
 
