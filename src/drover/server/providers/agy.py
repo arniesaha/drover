@@ -55,9 +55,11 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -69,6 +71,8 @@ from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsage
 log = logging.getLogger(__name__)
 
 _SOURCE = "agy-usage"
+_OBSERVED_SOURCE = "observed_429"
+_SLIDING_WINDOW_TOLERANCE_SECONDS = 120.0
 
 _DEFAULT_BASE_URL = "https://cloudcode-pa.googleapis.com"
 _QUOTA_PATH = "/v1internal:retrieveUserQuotaSummary"
@@ -112,6 +116,131 @@ _BUCKET_KINDS = {
 # window string would be inventing data.
 _WINDOW_MINUTES = {"5h": 300, "weekly": 10080, "daily": 1440}
 
+_RESET_DURATION_PATTERN = re.compile(
+    r"Resets in\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ObservedExhaustion:
+    host_id: str
+    model_group: str
+    resets_at: datetime
+    observed_at: datetime
+
+
+_OBSERVED_EXHAUSTIONS: dict[tuple[str, str], ObservedExhaustion] = {}
+_OBSERVED_LOCK = threading.Lock()
+
+
+def parse_agy_quota_exhaustion(
+    text: str, now: datetime | None = None
+) -> datetime | None:
+    """Parse reset time from an agy 429 quota exhaustion message."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    lower = text.lower()
+    indicators = (
+        "resource_exhausted",
+        "individual quota reached",
+        "agy_error",
+        "quota reached",
+        "code 429",
+        "resets in",
+    )
+    if not any(ind in lower for ind in indicators):
+        return None
+    match = _RESET_DURATION_PATTERN.search(text)
+    if not match:
+        return None
+    h_str, m_str, s_str = match.groups()
+    if not h_str and not m_str and not s_str:
+        return None
+    hours = int(h_str) if h_str else 0
+    minutes = int(m_str) if m_str else 0
+    seconds = int(s_str) if s_str else 0
+    duration = timedelta(hours=hours, minutes=minutes, seconds=seconds)
+    if duration.total_seconds() <= 0:
+        return None
+    base_time = now if now is not None else datetime.now(timezone.utc)
+    if base_time.tzinfo is None:
+        base_time = base_time.replace(tzinfo=timezone.utc)
+    return base_time + duration
+
+
+def model_group_from_model(model: str | None) -> str:
+    """Map a model identifier to its agy model group ('gemini' vs '3p')."""
+    if not model:
+        return "gemini"
+    m = model.strip().lower()
+    if m.startswith("gemini"):
+        return "gemini"
+    if m.startswith("claude") or m.startswith("gpt") or "3p" in m:
+        return "3p"
+    return "gemini"
+
+
+def record_observed_exhaustion(
+    host_id: str,
+    model_group: str,
+    resets_at: datetime,
+    observed_at: datetime | None = None,
+    store: dict[tuple[str, str], ObservedExhaustion] | None = None,
+) -> None:
+    host = str(host_id or "local").strip() or "local"
+    group = "gemini" if model_group == "gemini" else "3p"
+    obs_at = observed_at or datetime.now(timezone.utc)
+    if obs_at.tzinfo is None:
+        obs_at = obs_at.replace(tzinfo=timezone.utc)
+    if resets_at.tzinfo is None:
+        resets_at = resets_at.replace(tzinfo=timezone.utc)
+    with _OBSERVED_LOCK:
+        target_store = _OBSERVED_EXHAUSTIONS if store is None else store
+        target_store[(host, group)] = ObservedExhaustion(
+            host_id=host,
+            model_group=group,
+            resets_at=resets_at,
+            observed_at=obs_at,
+        )
+
+
+def get_active_observed_exhaustions(
+    host_id: str | None = None,
+    now: datetime | None = None,
+    store: dict[tuple[str, str], ObservedExhaustion] | None = None,
+) -> list[ObservedExhaustion]:
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    active: list[ObservedExhaustion] = []
+    with _OBSERVED_LOCK:
+        target_store = _OBSERVED_EXHAUSTIONS if store is None else store
+        expired_keys = []
+        for key, item in list(target_store.items()):
+            if item.resets_at <= current_time:
+                expired_keys.append(key)
+                continue
+            if host_id is None or item.host_id == host_id:
+                active.append(item)
+        for key in expired_keys:
+            target_store.pop(key, None)
+    return active
+
+
+def clear_observed_exhaustions(
+    host_id: str | None = None,
+    store: dict[tuple[str, str], ObservedExhaustion] | None = None,
+) -> None:
+    with _OBSERVED_LOCK:
+        target_store = _OBSERVED_EXHAUSTIONS if store is None else store
+        if host_id is None:
+            target_store.clear()
+        else:
+            for key in list(target_store.keys()):
+                if key[0] == host_id:
+                    target_store.pop(key, None)
+
 
 class _ProbeFailure(RuntimeError):
     def __init__(self, category: str, *, status: str):
@@ -135,6 +264,7 @@ class AgyUsageProbe:
         base_url: str | None = None,
         now: Callable[[], datetime] | None = None,
         oauth_clients: Callable[[], tuple[tuple[str, str], ...]] | None = None,
+        observed_exhaustions: dict[tuple[str, str], ObservedExhaustion] | None = None,
     ):
         base = Path(state_dir) if state_dir is not None else Path.home() / ".gemini"
         self.state_dir = base
@@ -149,49 +279,74 @@ class AgyUsageProbe:
         self.base_url = (base_url or _DEFAULT_BASE_URL).rstrip("/")
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.oauth_clients = oauth_clients or _agy_oauth_clients
+        self.observed_exhaustions = observed_exhaustions
 
     def read(self, *, host_id: str = "local") -> ProviderAccountSnapshot:
         observed_at = self.now()
         account_label, account_identity = self._account_metadata()
+        active_exhaustions = get_active_observed_exhaustions(
+            host_id=host_id, now=observed_at, store=self.observed_exhaustions
+        )
         try:
-            windows = self._fetch_windows()
+            windows = self._fetch_windows(observed_at=observed_at)
+            status = "ok" if windows else "usage_unavailable"
+            error_category = None if windows else "quota_api_unreachable"
         except _ProbeFailure as exc:
-            return _snapshot(
-                host_id=host_id,
-                account_label=account_label,
-                account_identity=account_identity,
-                status=exc.status,
-                observed_at=observed_at,
-                windows=(),
-                plan_label=None,
-                error_category=exc.category,
-            )
+            windows = ()
+            status = exc.status
+            error_category = exc.category
         except Exception:  # noqa: BLE001 -- read() must never raise
             log.debug("agy capacity probe failed", exc_info=True)
-            return _snapshot(
-                host_id=host_id,
-                account_label=account_label,
-                account_identity=account_identity,
-                status="usage_unavailable",
-                observed_at=observed_at,
-                windows=(),
-                plan_label=None,
-                error_category="probe_failed",
-            )
+            windows = ()
+            status = "usage_unavailable"
+            error_category = "probe_failed"
+
+        source = _SOURCE
+        if active_exhaustions:
+            status = "observed_exhausted"
+            source = _OBSERVED_SOURCE
+            error_category = None
+            windows_by_kind = {w.kind: w for w in windows}
+            for ex in active_exhaustions:
+                duration_seconds = (ex.resets_at - observed_at).total_seconds()
+                is_weekly = duration_seconds > 5 * 3600
+                if ex.model_group == "gemini":
+                    kind = "seven_day" if is_weekly else "five_hour"
+                    window_minutes = 10080 if is_weekly else 300
+                else:
+                    kind = (
+                        "seven_day_claude_gpt" if is_weekly else "five_hour_claude_gpt"
+                    )
+                    window_minutes = 10080 if is_weekly else 300
+                windows_by_kind[kind] = ProviderUsageWindow(
+                    kind=kind,
+                    used_percent=100.0,
+                    remaining_value=0.0,
+                    window_minutes=window_minutes,
+                    resets_at=ex.resets_at,
+                )
+            windows = tuple(windows_by_kind.values())
+
         return _snapshot(
             host_id=host_id,
             account_label=account_label,
             account_identity=account_identity,
-            status="ok" if windows else "usage_unavailable",
+            status=status,
             observed_at=observed_at,
             windows=windows,
             plan_label=None,
-            error_category=None if windows else "quota_api_unreachable",
+            error_category=error_category,
+            source=source,
         )
 
-    def _fetch_windows(self) -> tuple[ProviderUsageWindow, ...]:
+    def _fetch_windows(
+        self, observed_at: datetime | None = None
+    ) -> tuple[ProviderUsageWindow, ...]:
         """Capacity windows for this account, from agy's own quota endpoint."""
-        return _windows(self._fetch(self._access_token()))
+        return _windows(
+            self._fetch(self._access_token()),
+            fetch_time=observed_at or self.now(),
+        )
 
     def _access_token(self) -> str:
         """The live token, refreshed in memory if agy left a stale one behind."""
@@ -429,7 +584,9 @@ def _timestamp(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _windows(payload: Mapping[str, Any]) -> tuple[ProviderUsageWindow, ...]:
+def _windows(
+    payload: Mapping[str, Any], *, fetch_time: datetime | None = None
+) -> tuple[ProviderUsageWindow, ...]:
     """Flatten the response's groups -> buckets into usage windows.
 
     The API reports what is LEFT; the cockpit renders what is USED.
@@ -447,6 +604,24 @@ def _windows(payload: Mapping[str, Any]) -> tuple[ProviderUsageWindow, ...]:
         bucket_id = str(bucket.get("bucketId") or "").strip()
         if not bucket_id:
             continue
+        resets_at = _timestamp(bucket.get("resetTime"))
+        window_minutes = _WINDOW_MINUTES.get(str(bucket.get("window") or ""))
+
+        # Fix (a): any bucket whose resetTime is within ~2 min of (fetch time + window length)
+        # is a sliding bucket not tracking real individual quota. Treat as usage_unavailable / not reported,
+        # never as 100% remaining (0% used).
+        if (
+            fetch_time is not None
+            and resets_at is not None
+            and window_minutes is not None
+        ):
+            expected_sliding = fetch_time + timedelta(minutes=window_minutes)
+            if (
+                abs((resets_at - expected_sliding).total_seconds())
+                <= _SLIDING_WINDOW_TOLERANCE_SECONDS
+            ):
+                continue
+
         remaining = bucket.get("remainingFraction")
         used_percent: float | None = None
         if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):
@@ -460,8 +635,8 @@ def _windows(payload: Mapping[str, Any]) -> tuple[ProviderUsageWindow, ...]:
                     if isinstance(bucket.get("remainingAmount"), (int, float))
                     else None
                 ),
-                window_minutes=_WINDOW_MINUTES.get(str(bucket.get("window") or "")),
-                resets_at=_timestamp(bucket.get("resetTime")),
+                window_minutes=window_minutes,
+                resets_at=resets_at,
             )
         )
     return tuple(windows)
@@ -548,6 +723,7 @@ def _snapshot(
     windows: tuple[ProviderUsageWindow, ...],
     plan_label: str | None,
     error_category: str | None,
+    source: str = _SOURCE,
 ) -> ProviderAccountSnapshot:
     fingerprint: dict[str, Any] = {
         "provider": "google",
@@ -567,7 +743,7 @@ def _snapshot(
             }
             for window in windows
         ],
-        "source": _SOURCE,
+        "source": source,
         "error_category": error_category,
     }
     dedup_key = hashlib.sha256(
@@ -584,6 +760,6 @@ def _snapshot(
         status=status,  # type: ignore[arg-type]
         observed_at=observed_at,
         windows=windows,
-        source=_SOURCE,
+        source=source,
         error_category=error_category,
     )

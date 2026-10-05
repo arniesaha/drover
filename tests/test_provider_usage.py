@@ -1017,3 +1017,66 @@ def test_relay_host_with_a_fresh_heartbeat_is_still_probed(tmp_path):
     loop.run_once()
 
     assert probes == ["work-laptop"]
+
+
+def test_observed_exhausted_persists_in_latest_accounts_until_reset_passes(tmp_path):
+    """An observed_exhausted snapshot remains active until its reset passes."""
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "drover.duckdb")
+    t0 = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+    current_time = [t0]
+    service = ProviderUsageService(
+        tmp_path / "drover.duckdb",
+        tmp_path / "parquet",
+        clock=lambda: current_time[0],
+    )
+    host = SimpleNamespace(
+        host_id="mac-mini", local_url="http://127.0.0.1:7081", tailscale_url=None
+    )
+
+    reset_time = t0 + timedelta(hours=2)
+    exhausted_payload = {
+        "accounts": [
+            {
+                "snapshot_id": "snap-exhausted",
+                "dedup_key": "dedup-exhausted",
+                "provider": "google",
+                "account_label": "user@example.com",
+                "plan_label": None,
+                "host_id": "mac-mini",
+                "status": "observed_exhausted",
+                "observed_at": t0.isoformat(),
+                "source": "observed_429",
+                "error_category": None,
+                "windows": [
+                    {
+                        "kind": "five_hour_claude_gpt",
+                        "used_percent": 100.0,
+                        "limit_value": None,
+                        "remaining_value": 0.0,
+                        "unit": None,
+                        "window_minutes": 300,
+                        "starts_at": None,
+                        "resets_at": reset_time.isoformat(),
+                    }
+                ],
+            }
+        ],
+        "observed_at": t0.isoformat(),
+    }
+
+    service.refresh_host(host, fetch=lambda _: exhausted_payload)
+
+    # 15 minutes later: freshness threshold (300s / 5m) has passed, but reset has not.
+    # Status must remain observed_exhausted.
+    current_time[0] = t0 + timedelta(minutes=15)
+    accounts = service.latest_accounts()
+    assert len(accounts) == 1
+    assert accounts[0].status == "observed_exhausted"
+    assert accounts[0].source == "observed_429"
+
+    # After reset passes: status transitions to stale (provider_window_expired)
+    current_time[0] = reset_time + timedelta(minutes=1)
+    accounts = service.latest_accounts()
+    assert len(accounts) == 1
+    assert accounts[0].status == "stale"
+    assert accounts[0].error_category == "provider_window_expired"
