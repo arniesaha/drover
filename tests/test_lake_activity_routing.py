@@ -248,8 +248,10 @@ def test_canonical_activity_and_job_parity(verified_lake):
     )
     from drover.server.db import attached_control_plane_snapshot, open_duckdb_connection
     from drover.server.lake.read_models import read_model
-    from drover.server.memory_requeue import _source_versions, canonical_sessions
+    from drover.server.lake.serving import open_history
+    from drover.server.memory_requeue import canonical_sessions
     from drover.server.project_activity import project_activity
+    from drover.server.summarizer.jobs import source_version_for_session
 
     spec, path, config = verified_lake
     filters = AnalyticsFilters(days=30, project_key="o/r")
@@ -298,7 +300,8 @@ def test_canonical_activity_and_job_parity(verified_lake):
         now="2026-10-02T00:00:00+00:00",
     )
     assert hostile_activity["projects"] == []
-    assert len(_source_versions(path, ["s"])["s"]) == 64
+    with open_history(path) as history:
+        assert len(source_version_for_session(history, "s")) == 64
 
 
 @pytest.mark.parametrize("failure", ["verification", "renewal"])
@@ -383,41 +386,62 @@ def test_retirement_lifecycle_rechecks_and_stops_on_error(
     assert not path.exists()
 
 
-def test_post_ingest_selected_error_defers_but_legacy_error_propagates(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("backend", ["legacy", "ducklake"])
+def test_watcher_commits_summary_intent_without_reading_selected_history(
+    pg_control_path, tmp_path, monkeypatch, backend
 ):
-    import duckdb
+    import json
 
     from drover.server import watcher
+    from drover.server.db import control_plane_connection
     from drover.server.lake import serving
 
-    handler = watcher._Handler(tmp_path / "parquet", tmp_path / "unused")
-    monkeypatch.setattr(watcher, "memory_store_available", lambda path: True)
-    monkeypatch.setattr(
-        watcher,
-        "enqueue_summary_generation",
-        lambda *a: pytest.fail("enqueue unavailable source"),
+    config = (
+        AnalyticsConfig()
+        if backend == "legacy"
+        else AnalyticsConfig(
+            backend="ducklake",
+            data_root=str(tmp_path / "unavailable-lake"),
+            extension_dir=str(tmp_path / "extensions"),
+            engine_sha256="0" * 64,
+            catalog_dsn_env="UNUSED_TEST_CATALOG",
+            epoch="test",
+            verification_sha256="0" * 64,
+        )
     )
-
-    class Cursor:
-        def close(self):
-            pass
-
-    monkeypatch.setattr(serving, "open_history", lambda path: Cursor())
-
-    def unavailable(*args):
-        raise LakeError("lake_verification_required")
-
-    monkeypatch.setattr(watcher, "source_version_for_session", unavailable)
-    handler._enqueue_summaries(tmp_path / "already-ingested", {"s"})
-
-    def locked(*args):
-        raise duckdb.IOException("Conflicting lock is held")
-
-    monkeypatch.setattr(watcher, "source_version_for_session", locked)
-    with pytest.raises(duckdb.IOException, match="Conflicting lock"):
-        handler._enqueue_summaries(tmp_path / "already-ingested", {"s"})
-    assert not (tmp_path / "unused").exists()
+    configure_analytics(pg_control_path, config)
+    monkeypatch.setattr(
+        serving,
+        "open_history",
+        lambda *a, **kw: pytest.fail("ingest read analytical history"),
+    )
+    path = tmp_path / "watcher.jsonl"
+    path.write_text(
+        json.dumps(
+            dict(
+                id="watcher-event",
+                session_id="s",
+                agent_id="host",
+                timestamp="2026-10-04T12:00:00Z",
+                event_type="user_message",
+                message=dict(role="user", content="a substantive watcher message"),
+            )
+        )
+        + "\n"
+    )
+    parquet = tmp_path / "unused-parquet"
+    handler = watcher._Handler(parquet, pg_control_path)
+    handler._maybe_ingest(path)
+    assert not path.exists()
+    assert (tmp_path / ".processed" / path.name).exists()
+    assert not parquet.exists()
+    with control_plane_connection(pg_control_path) as control:
+        assert control.execute(
+            "SELECT count(*) FROM control_outbox_events WHERE state='pending'"
+        ).fetchone() == (1,)
+        assert control.execute(
+            "SELECT count(*) FROM pipeline_jobs WHERE job_kind='summarize_session' AND subject_key='s' AND status='pending'"
+        ).fetchone() == (1,)
 
 
 def test_project_activity_http_selects_before_legacy(tmp_path, monkeypatch):
