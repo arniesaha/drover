@@ -962,6 +962,14 @@ def test_postgres_native_usage_rollup_keeps_known_utc_watermarks_comparable(
             ).inserted
             == 1
         )
+        from drover.server.control_exporter import ControlOutboxExporter
+
+        ControlOutboxExporter(
+            control_path=analytics_path,
+            analytical_path=analytics_path,
+            parquet_dir=parquet_dir,
+            batch_size=1,
+        ).run_once()
         assert rollup_pending_native_usage(analytics_path).partitions == 1
         assert rollup_pending_native_usage(analytics_path).partitions == 0
         with control_plane_connection(analytics_path) as con:

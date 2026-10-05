@@ -514,11 +514,19 @@ WITH raw_agent_events AS (
     union_by_name=true
   ) native
   WHERE NOT EXISTS (
+    SELECT 1 FROM control_memory_events c WHERE c.dedup_key = native.dedup_key AND c.date = native.date
+  ) AND NOT EXISTS (
     SELECT 1 FROM memory_session_identity m
     WHERE native.session_id IN (m.harness_session_id, m.native_session_id)
+      AND m.native_session_id IS DISTINCT FROM m.harness_session_id
   )
   UNION ALL BY NAME
-  SELECT * FROM control_memory_events
+  SELECT c.* FROM control_memory_events c
+  WHERE c.source <> 'native' OR NOT EXISTS (
+    SELECT 1 FROM memory_session_identity m
+    WHERE c.session_id = m.native_session_id
+      AND m.native_session_id IS DISTINCT FROM m.harness_session_id
+  )
 ),
 normalized_agent_events AS (
   SELECT *,
@@ -815,11 +823,19 @@ WHERE date <> '_seed';
 CREATE OR REPLACE MACRO agent_events_for_date(partition_date) AS TABLE
 SELECT *, 'native' AS source FROM raw_agent_events_for_date(partition_date) native
 WHERE NOT EXISTS (
+  SELECT 1 FROM control_memory_events c WHERE c.dedup_key = native.dedup_key AND c.date = native.date
+) AND NOT EXISTS (
   SELECT 1 FROM memory_session_identity m
   WHERE native.session_id IN (m.harness_session_id, m.native_session_id)
+    AND m.native_session_id IS DISTINCT FROM m.harness_session_id
 )
 UNION ALL BY NAME
-SELECT * FROM control_memory_events WHERE date = partition_date;
+SELECT c.* FROM control_memory_events c WHERE c.date = partition_date
+  AND (c.source <> 'native' OR NOT EXISTS (
+    SELECT 1 FROM memory_session_identity m
+    WHERE c.session_id = m.native_session_id
+      AND m.native_session_id IS DISTINCT FROM m.harness_session_id
+  ));
 
 CREATE OR REPLACE MACRO spans_enriched_for_date(partition_date) AS TABLE
 WITH date_agent_events AS (
@@ -1736,6 +1752,9 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
         # No live recap tables: recaps are derived memory and need the
         # PostgreSQL control store (#480). A DuckDB control plane has none.
         bootstrap_harness_tables(con)
+        from drover.server.control_outbox import ensure_legacy_outbox_schema
+
+        ensure_legacy_outbox_schema(con)
         con.execute(_ADVISORY_FINDINGS_DDL)
         con.execute(_ADVISORY_OCCURRENCES_DDL)
         con.execute(

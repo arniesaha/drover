@@ -23,6 +23,7 @@ from drover.server.control_outbox import (
     _validate_claim_for_publication,
     canonical_payload,
     claim_outbox_batch,
+    export_projection,
     payload_sha256,
 )
 from drover.server.control_store import is_postgres_control_store
@@ -77,7 +78,7 @@ class LakeOutboxExporter:
     """Hold one dedicated catalog PG advisory lock for the entire owner lifetime.
 
     Work is synchronous and bounded, with one isolated engine per batch. Only
-    explicit construction can run it; server/backend routing is a later slice.
+    the backend-selected hub lifecycle constructs it.
     """
 
     def __init__(
@@ -145,23 +146,7 @@ class LakeOutboxExporter:
         rows = _claim_rows(control, claim)
         if tuple(r["event_id"] for r in rows) != claim.event_ids:
             raise LakeError("lake_export_membership_mismatch")
-        events = []
-        for row in rows:
-            cur = control.execute(
-                """SELECT session_id,native_session_id,summary_session_id,harness,
-                repo_owner,repo_name,branch,cwd FROM harness_sessions WHERE session_id=?""",
-                [row["session_id"]],
-            )
-            session_row = cur.fetchone()
-            if session_row is None:
-                raise LakeError("lake_export_session_missing")
-            session = dict(
-                zip([d[0] for d in cur.description], session_row, strict=True)
-            )
-            session["task_id"] = compute_task_id(
-                None, session["repo_owner"], session["repo_name"], session["branch"]
-            )
-            events.append(project_control_event(row, session))
+        events = export_projection(control, rows, projector=project_control_event)
         document = json.loads(
             json.dumps(
                 {

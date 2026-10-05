@@ -102,9 +102,7 @@ def _control_snapshot(con, request):
                     cutoff = "(current_timestamp - interval '1 day' * ?)"
                     params.append(days + 2)
 
-                    harness_where = (
-                        f"(coalesce(last_activity, updated_at, started_at) >= {cutoff})"
-                    )
+                    harness_where = f"command IS DISTINCT FROM 'collector' AND (coalesce(last_activity, updated_at, started_at) >= {cutoff})"
                     if project:
                         parts = project.split("/")
                         if len(parts) != 2:
@@ -117,6 +115,10 @@ def _control_snapshot(con, request):
                     else:
                         where = f"WHERE session_id IN (SELECT session_id FROM harness_sessions WHERE {harness_where})"
 
+                if table == "harness_sessions" and not where:
+                    where = "WHERE command IS DISTINCT FROM 'collector'"
+                if table == "harness_hosts":
+                    where = "WHERE kind IS DISTINCT FROM 'collector'"
                 names = ",".join('"' + name + '"' for name, _ in columns)
                 rows = pg.execute(
                     f'SELECT {names} FROM "{table}" {where} LIMIT 10001', params
@@ -133,7 +135,7 @@ def _control_snapshot(con, request):
             from .task_projection import _hash
 
             identities = pg.execute(
-                "SELECT session_id,native_session_id,summary_session_id FROM harness_sessions ORDER BY session_id LIMIT 10001"
+                "SELECT session_id,native_session_id,summary_session_id FROM harness_sessions WHERE command <> 'collector' ORDER BY session_id LIMIT 10001"
             ).fetchall()
             if _hash(identities) != request["binding"]["identities"]:
                 raise LakeError("analytics_identity_changed")
@@ -262,7 +264,8 @@ def run_model(con, request, limits):
             s.repo_owner,s.repo_name,s.branch,s.started_at,
             coalesce(s.last_activity,s.updated_at) AS last_event_at,s.status,s.harness
             FROM harness_sessions s JOIN harness_hosts h ON s.host_id=h.host_id
-            WHERE h.retired_at IS NULL AND s.status IN ('running','awaiting')
+            WHERE h.retired_at IS NULL AND h.kind IS DISTINCT FROM 'collector'
+            AND s.command IS DISTINCT FROM 'collector' AND s.status IN ('running','awaiting')
             AND s.ended_at IS NULL
             ORDER BY last_event_at DESC NULLS LAST,s.session_id LIMIT ?""",
             [options.get("limit", 1000) + 1],

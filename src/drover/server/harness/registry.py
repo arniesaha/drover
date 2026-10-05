@@ -16,6 +16,7 @@ import duckdb
 from drover.server.control_outbox import (
     canonical_payload,
     event_archive_join,
+    event_ingest_identity,
     event_payload_expression,
     event_payload_join,
     event_payload_reference,
@@ -27,7 +28,6 @@ from drover.server.db import control_plane_connection, control_plane_path
 from drover.server.harness.auth import redact_auth_text
 from drover.server.harness.capabilities import validate_capabilities
 from drover.server.harness.events import normalize_harness_event
-from drover.server.harness.identity import harness_event_identity
 from drover.server.harness.model_catalog import CatalogEnvelope
 from drover.server.harness.models import (
     EventPayloadStatus,
@@ -463,7 +463,7 @@ class HarnessRegistry:
     def list_hosts(
         self, *, status: str | None = None, include_retired: bool = False
     ) -> list[HarnessHost]:
-        query = "SELECT * FROM harness_hosts WHERE 1 = 1"
+        query = "SELECT * FROM harness_hosts WHERE kind IS DISTINCT FROM 'collector'"
         params: list[Any] = []
         if not include_retired:
             query += " AND retired_at IS NULL"
@@ -490,9 +490,10 @@ class HarnessRegistry:
                 if row is None:
                     raise KeyError(host_id)
                 busy = con.execute(
-                    "SELECT session_id FROM harness_sessions WHERE host_id = ? "
-                    "AND (status IN ('running', 'awaiting') OR "
-                    "(awaiting IS NOT NULL AND status NOT IN ('completed', 'terminated', 'errored', 'failed'))) LIMIT 1",
+                    "SELECT s.session_id FROM harness_sessions s JOIN harness_hosts h USING (host_id) WHERE host_id = ? "
+                    "AND s.command IS DISTINCT FROM 'collector' AND h.kind IS DISTINCT FROM 'collector' "
+                    "AND (s.status IN ('running', 'awaiting') OR "
+                    "(s.awaiting IS NOT NULL AND s.status NOT IN ('completed', 'terminated', 'errored', 'failed'))) LIMIT 1",
                     [host_id],
                 ).fetchone()
                 if busy and not force:
@@ -784,8 +785,9 @@ class HarnessRegistry:
             rows = _rows(
                 con,
                 f"""SELECT * FROM harness_sessions
-                     WHERE parent_session_id IN ({placeholders})
-                        OR source_session_id IN ({placeholders})
+                     WHERE command IS DISTINCT FROM 'collector'
+                       AND (parent_session_id IN ({placeholders})
+                        OR source_session_id IN ({placeholders}))
                      ORDER BY started_at, session_id
                      LIMIT ?""",
                 [*session_ids, *session_ids, max(1, int(limit))],
@@ -834,7 +836,7 @@ class HarnessRegistry:
             rows = _rows(
                 con,
                 """SELECT * FROM harness_sessions
-                    WHERE handoff_mode = 'factory_observer'
+                    WHERE command IS DISTINCT FROM 'collector' AND handoff_mode = 'factory_observer'
                       AND substr(source_session_id, 1, ?) = ?
                     ORDER BY started_at, session_id
                     LIMIT ?""",
@@ -898,7 +900,7 @@ class HarnessRegistry:
         ``archived_after`` is the ``(updated_at, session_id)`` of the last
         archived row of the previous page, in this listing's own order.
         """
-        filters = []
+        filters = ["command IS DISTINCT FROM 'collector'"]
         params: list[Any] = []
         if host_id is not None:
             filters.append("host_id = ?")
@@ -1167,15 +1169,18 @@ class HarnessRegistry:
             normalized_source=normalized_source,
             content_preview=content_preview,
         )
-        dedup_key = harness_event_identity(
-            session_id=session_id,
-            seq=seq,
-            event_type=event_type,
-            created_at=created_at,
-            payload=payload,
-        )
         payload_json = canonical_payload(payload)
         with self._connect() as con:
+            dedup_key = event_ingest_identity(
+                con,
+                session_id=session_id,
+                seq=seq,
+                event_type=event_type,
+                created_at=created_at,
+                payload=payload,
+                normalized_type=normalized["normalized_type"],
+                normalized_source=normalized["normalized_source"],
+            )
             con.execute("BEGIN TRANSACTION")
             try:
                 # An event already here is a re-delivery, not an error. The
@@ -1318,12 +1323,15 @@ class HarnessRegistry:
                         None if is_postgres_connection(con) else payload_json,
                         created_at,
                         seq,
-                        harness_event_identity(
+                        event_ingest_identity(
+                            con,
                             session_id=record["session_id"],
                             seq=seq,
                             event_type=record["event_type"],
                             created_at=created_at,
                             payload=record.get("payload"),
+                            normalized_type=normalized["normalized_type"],
+                            normalized_source=normalized["normalized_source"],
                         ),
                     ]
                 )
@@ -1512,12 +1520,15 @@ class HarnessRegistry:
                             None if is_postgres_connection(con) else payload_json,
                             created_at,
                             seq,
-                            harness_event_identity(
+                            event_ingest_identity(
+                                con,
                                 session_id=session_id,
                                 seq=seq,
                                 event_type=event_type,
                                 created_at=created_at,
                                 payload=payload,
+                                normalized_type=normalized["normalized_type"],
+                                normalized_source=normalized["normalized_source"],
                             ),
                         ],
                     ).fetchone()

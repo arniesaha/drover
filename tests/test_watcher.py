@@ -7,7 +7,7 @@ import shutil
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -25,13 +25,42 @@ from drover.server.watcher import (
 )
 
 
+def _drain_legacy_after_ingest(monkeypatch):
+    """Compose the actual watcher and exporter for existing end-to-end contracts.
+
+    S2's raw ingest is asynchronous; latency is measured separately with the
+    unmodified background lifecycle in test_single_ingest_path.
+    """
+    from drover.server.control_exporter import ControlOutboxExporter
+    from drover.server.ingest import ingest_file
+
+    def record_and_export(path, **kwargs):
+        stats = ingest_file(path, **kwargs)
+        exporter = ControlOutboxExporter(
+            control_path=kwargs["duckdb_path"],
+            analytical_path=kwargs["duckdb_path"],
+            parquet_dir=kwargs["parquet_dir"],
+            batch_size=100,
+        )
+        while True:
+            result = exporter.run_once(
+                now=datetime.now(timezone.utc) + timedelta(seconds=10)
+            )
+            if not result["pending"]:
+                break
+        return stats
+
+    monkeypatch.setattr("drover.server.watcher.ingest_file", record_and_export)
+
+
 @pytest.fixture
-def lh(tmp_path):
+def lh(tmp_path, pg_control_path, monkeypatch):
     incoming = tmp_path / "incoming"
     incoming.mkdir()
     parquet_dir = tmp_path / "parquet"
-    db_path = tmp_path / "drover.duckdb"
+    db_path = pg_control_path
     bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
+    _drain_legacy_after_ingest(monkeypatch)
     return incoming, parquet_dir, db_path
 
 
@@ -357,12 +386,13 @@ def _write_two_session_events(jsonl_path: Path) -> None:
 
 
 @pytest.fixture
-def pg_lh(tmp_path, pg_control_path):
+def pg_lh(tmp_path, pg_control_path, monkeypatch):
     """Like ``lh``, with the PostgreSQL control store (and so the job ledger)."""
     incoming = tmp_path / "incoming"
     incoming.mkdir()
     parquet_dir = tmp_path / "parquet"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=pg_control_path)
+    _drain_legacy_after_ingest(monkeypatch)
     return incoming, parquet_dir, pg_control_path
 
 
@@ -430,31 +460,24 @@ def test_watcher_enqueues_summarize_jobs(pg_lh):
         w.stop()
 
 
-def test_ingest_without_postgres_skips_summary_enqueue(
-    lh, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A DuckDB control store has no ledger: ingest proceeds, nothing is enqueued."""
-    incoming, parquet_dir, db_path = lh
-    host_dir = incoming / "macmini"
-    host_dir.mkdir()
-    batch = host_dir / "batch.jsonl"
+def test_ingest_without_postgres_skips_summary_enqueue(tmp_path, monkeypatch):
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    parquet_dir, db_path = tmp_path / "parquet", tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
+    batch = incoming / "batch.jsonl"
     _write_two_session_events(batch)
-
-    def never(*_args, **_kwargs):
-        raise AssertionError("no summary work without the PostgreSQL ledger")
-
-    monkeypatch.setattr("drover.server.watcher.source_version_for_session", never)
-    monkeypatch.setattr("drover.server.watcher.enqueue_summary_generation", never)
+    _drain_legacy_after_ingest(monkeypatch)
     _Handler(parquet_dir, db_path, max_lock_retries=0)._maybe_ingest(batch)
-
-    assert (host_dir / ".processed" / "batch.jsonl").exists()
-    con = duckdb.connect(str(db_path))
-    try:
+    assert (incoming / ".processed" / "batch.jsonl").exists()
+    with duckdb.connect(str(db_path)) as con:
         assert con.execute(
-            "SELECT count(*) FROM agent_events WHERE session_id IN ('sess-w1', 'sess-w2')"
+            "SELECT count(*) FROM agent_events WHERE session_id IN ('sess-w1','sess-w2')"
         ).fetchone() == (2,)
-    finally:
-        con.close()
+    with control_plane_connection(db_path) as con:
+        assert con.execute(
+            "SELECT count(*) FROM control_outbox_events WHERE state='acknowledged'"
+        ).fetchone() == (2,)
 
 
 def test_handler_retries_duckdb_lock_and_moves_only_after_success(
@@ -504,76 +527,33 @@ def test_handler_retries_duckdb_lock_and_moves_only_after_success(
     assert "DuckDB lock contention" in caplog.text
 
 
-def test_handler_recovers_summarize_enqueue_after_post_ingest_lock(
-    tmp_path: Path, pg_control_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_handler_commits_summary_intent_without_analytical_connection(
+    tmp_path, pg_control_path, monkeypatch
+):
+    from drover.server import db
+
     incoming = tmp_path / "incoming"
-    host_dir = incoming / "nas-claude"
-    host_dir.mkdir(parents=True)
-    batch = host_dir / "openclaw.jsonl"
-    batch.write_text(
-        json.dumps(
-            {
-                "id": "event-after-ingest-lock",
-                "session_id": "sess-after-ingest-lock",
-                "timestamp": "2026-05-08T10:00:00Z",
-                "agent_id": "test-agent",
-                "event_type": "user_message",
-                "message": {"role": "user", "content": "hi"},
-            }
-        )
-        + "\n"
-    )
+    incoming.mkdir()
+    batch = incoming / "events.jsonl"
+    _write_two_session_events(batch)
     parquet_dir = tmp_path / "parquet"
-    db_path = pg_control_path
-    bootstrap(parquet_dir=parquet_dir, duckdb_path=db_path)
-    calls = {"ingest": 0, "connect": 0}
-    real_connect = duckdb.connect
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=pg_control_path)
 
-    class Stats:
-        read = 1
-        inserted = 1
-        skipped_dupes = 0
-        errors = 0
-        shadow_published = 0
+    def fail_connect(*args, **kwargs):
+        raise AssertionError("watcher must not open analytical storage")
 
-        def __init__(self, new_session_ids):
-            self.new_session_ids = new_session_ids
-
-    def fake_ingest_file(
-        path: Path, *, parquet_dir: Path, duckdb_path: Path, shadow_publisher=None
-    ):
-        calls["ingest"] += 1
-        if calls["ingest"] == 1:
-            return Stats({"sess-after-ingest-lock"})
-        return Stats(set())
-
-    def flaky_connect(*args, **kwargs):
-        calls["connect"] += 1
-        if calls["connect"] == 1:
-            raise duckdb.IOException(
-                "Could not set lock on file drover.duckdb: Conflicting lock is held"
-            )
-        return real_connect(*args, **kwargs)
-
-    monkeypatch.setattr("drover.server.watcher.ingest_file", fake_ingest_file)
-    monkeypatch.setattr("drover.server.watcher.duckdb.connect", flaky_connect)
-    monkeypatch.setattr("drover.server.watcher.time.sleep", lambda _seconds: None)
-    handler = _Handler(
-        parquet_dir=parquet_dir,
-        duckdb_path=db_path,
-        max_lock_retries=1,
-        lock_retry_base_seconds=0,
-    )
-
-    handler._maybe_ingest(batch)
-
-    assert calls["ingest"] == 2
+    monkeypatch.setattr(db, "open_duckdb_connection", fail_connect)
+    _Handler(parquet_dir, pg_control_path, max_lock_retries=0)._maybe_ingest(batch)
     assert not batch.exists()
-    assert (host_dir / ".processed" / "openclaw.jsonl").exists()
-    assert [(sid, status) for sid, status, _ in _summary_jobs(db_path)] == [
-        ("sess-after-ingest-lock", "pending")
+    assert (incoming / ".processed" / "events.jsonl").exists()
+    assert [(sid, status) for sid, status, _ in _summary_jobs(pg_control_path)] == [
+        ("sess-w1", "pending"),
+        ("sess-w2", "pending"),
     ]
+    with control_plane_connection(pg_control_path) as con:
+        assert con.execute(
+            "SELECT count(*) FROM control_outbox_events WHERE state='pending'"
+        ).fetchone() == (2,)
 
 
 def _write_live_session_event(jsonl_path: Path, event_id: str, minute: int) -> None:
@@ -666,56 +646,47 @@ def test_enqueue_waits_for_a_worker_completing_the_same_session(
     ]
 
 
-def test_failed_enqueue_does_not_fail_a_committed_ingest(
-    pg_lh, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """#308: the events are committed, so one failed enqueue is logged and skipped.
-
-    Re-parsing the file would only dedupe the same rows and retry the same
-    enqueue. The file moves on, the failure names its session, and the other
-    sessions in the batch are still enqueued; a later batch (here, a
-    redelivered copy) enqueues the one that was missed.
-    """
-    import drover.server.watcher as watcher_module
+def test_failed_enqueue_rolls_back_ingest_and_keeps_file_for_retry(
+    pg_lh, monkeypatch, caplog
+):
+    """S2: the enqueue belongs to the same transaction as the whole file."""
+    from drover.server.ledger import JobLedger
 
     incoming, parquet_dir, db_path = pg_lh
-    host_dir = incoming / "macmini-claude"
-    host_dir.mkdir()
-    batch = host_dir / "batch.jsonl"
+    batch = incoming / "batch.jsonl"
     _write_two_session_events(batch)
-    real_enqueue = watcher_module.enqueue_summary_generation
+    real_enqueue = JobLedger.enqueue
 
-    def fails_for_w1(store_path, session_id, source_version):
+    def fail(self, job_kind, session_id, **kwargs):
         if session_id == "sess-w1":
             raise RuntimeError("control store connection reset")
-        return real_enqueue(store_path, session_id, source_version)
+        return real_enqueue(self, job_kind, session_id, **kwargs)
 
-    monkeypatch.setattr(watcher_module, "enqueue_summary_generation", fails_for_w1)
+    monkeypatch.setattr(JobLedger, "enqueue", fail)
     handler = _Handler(parquet_dir, db_path, max_lock_retries=0)
-
-    with caplog.at_level(logging.WARNING, logger="drover.watcher"):
-        handler._maybe_ingest(batch)
-    assert not batch.exists(), "a failed enqueue must not leave the file for re-parse"
-    assert (host_dir / ".processed" / "batch.jsonl").exists()
-    assert "ingest failed" not in caplog.text
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("sess-w1" in r.getMessage() for r in warnings)
-    assert [sid for sid, _, _ in _summary_jobs(db_path)] == ["sess-w2"]
-
-    monkeypatch.setattr(watcher_module, "enqueue_summary_generation", real_enqueue)
-    again = host_dir / "batch-redelivered.jsonl"
-    _write_two_session_events(again)
-    handler._maybe_ingest(again)
-    assert (host_dir / ".processed" / "batch-redelivered.jsonl").exists()
-
-    con = duckdb.connect(str(db_path))
-    try:
-        events = con.execute("""SELECT id, count(*) FROM agent_events
-                WHERE session_id IN ('sess-w1', 'sess-w2')
-                GROUP BY id ORDER BY id""").fetchall()
-    finally:
-        con.close()
-    assert events == [("watcher-s1-001", 1), ("watcher-s2-001", 1)]
+    handler._maybe_ingest(batch)
+    assert batch.exists()
+    assert not (incoming / ".processed" / "batch.jsonl").exists()
+    assert "ingest failed" in caplog.text
+    with control_plane_connection(db_path) as con:
+        for table in (
+            "harness_events",
+            "harness_event_payloads",
+            "control_outbox_events",
+            "pipeline_jobs",
+        ):
+            assert con.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,)
+    monkeypatch.setattr(JobLedger, "enqueue", real_enqueue)
+    handler._maybe_ingest(batch)
+    assert (incoming / ".processed" / "batch.jsonl").exists()
+    with duckdb.connect(str(db_path)) as con:
+        assert (
+            con.execute(
+                """SELECT id, count(*) FROM agent_events
+            WHERE session_id IN ('sess-w1', 'sess-w2') GROUP BY id ORDER BY id"""
+            ).fetchall()
+            == [("watcher-s1-001", 1), ("watcher-s2-001", 1)]
+        )
     versions = {sid: _source_version(db_path, sid) for sid in ("sess-w1", "sess-w2")}
     assert _summary_jobs(db_path) == [
         ("sess-w1", "pending", versions["sess-w1"]),
@@ -1233,3 +1204,33 @@ def test_bootstrap_control_plane_store_indexes_advisory_occurrences(
     finally:
         con.close()
     assert "idx_advisory_occurrences_finding" in names
+
+
+def test_handler_retries_postgres_transaction_conflict(pg_lh, monkeypatch, caplog):
+    import psycopg
+
+    from drover.server import watcher
+
+    incoming, parquet_dir, db_path = pg_lh
+    batch = incoming / "conflict.jsonl"
+    _write_two_session_events(batch)
+    real_ingest = watcher.ingest_file
+    calls = []
+
+    def conflict_once(path, **kwargs):
+        calls.append(path)
+        if len(calls) == 1:
+            raise psycopg.errors.DeadlockDetected("injected transaction conflict")
+        return real_ingest(path, **kwargs)
+
+    monkeypatch.setattr(watcher, "ingest_file", conflict_once)
+    _Handler(
+        parquet_dir, db_path, max_lock_retries=1, lock_retry_base_seconds=0
+    )._maybe_ingest(batch)
+    assert len(calls) == 2
+    assert (incoming / ".processed" / "conflict.jsonl").exists()
+    with control_plane_connection(db_path) as con:
+        assert con.execute("SELECT count(*) FROM control_outbox_events").fetchone() == (
+            2,
+        )
+    assert "Postgres transaction contention" in caplog.text

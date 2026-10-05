@@ -6,6 +6,7 @@ import duckdb
 import pytest
 
 from drover.schema import bootstrap
+from drover.server.control_exporter import ControlOutboxExporter
 from drover.server.ingest import ingest_file
 from drover.server.rollup import rollup_tasks
 
@@ -23,14 +24,20 @@ def tmp_lh(tmp_path):
 def test_rollup_sets_session_count_from_agent_events(tmp_lh):
     parquet_dir, db_path = tmp_lh
     ingest_file(FIXTURE, parquet_dir=parquet_dir, duckdb_path=db_path)
+    ControlOutboxExporter(
+        control_path=db_path,
+        analytical_path=db_path,
+        parquet_dir=parquet_dir,
+        batch_size=100,
+    ).run_once(force_flush=True)
 
     con = duckdb.connect(str(db_path))
     try:
-        # ingest_file already calls rollup_tasks; verify counts are non-zero.
+        # The exporter creates tasks and rolls up their published events.
         rows = con.execute(
             "SELECT task_id, session_count FROM tasks WHERE task_id IS NOT NULL"
         ).fetchall()
-        assert rows, "ingest should have created at least one task row"
+        assert rows, "exported ingest should have created at least one task row"
         for _, n in rows:
             assert n >= 1, "session_count should be populated after rollup"
     finally:
@@ -40,6 +47,12 @@ def test_rollup_sets_session_count_from_agent_events(tmp_lh):
 def test_rollup_is_idempotent(tmp_lh):
     parquet_dir, db_path = tmp_lh
     ingest_file(FIXTURE, parquet_dir=parquet_dir, duckdb_path=db_path)
+    ControlOutboxExporter(
+        control_path=db_path,
+        analytical_path=db_path,
+        parquet_dir=parquet_dir,
+        batch_size=100,
+    ).run_once(force_flush=True)
 
     con = duckdb.connect(str(db_path))
     try:
@@ -61,6 +74,12 @@ def test_rollup_backfills_repo_fields_from_agent_events(tmp_lh):
     should fill in repo_owner / repo_name / branch from agent_events."""
     parquet_dir, db_path = tmp_lh
     ingest_file(FIXTURE, parquet_dir=parquet_dir, duckdb_path=db_path)
+    ControlOutboxExporter(
+        control_path=db_path,
+        analytical_path=db_path,
+        parquet_dir=parquet_dir,
+        batch_size=100,
+    ).run_once(force_flush=True)
 
     con = duckdb.connect(str(db_path))
     try:

@@ -290,6 +290,13 @@ def test_native_history_attaches_without_duplicate_memory_and_backfills(stores):
         + "\n"
     )
     assert ingest_file(incoming, parquet_dir=parquet, duckdb_path=path).inserted == 2
+    from drover.server.control_exporter import ControlOutboxExporter
+
+    ControlOutboxExporter(
+        control_path=path, analytical_path=path, parquet_dir=parquet, batch_size=1
+    ).run_once()
+    with duckdb.connect(str(path)) as analytics:
+        analytics.execute("DROP VIEW harness_exported_events")
     with control_plane_connection(path) as control:
         seed_control(control, native=None)
         con = duckdb.connect(str(path))
@@ -309,7 +316,7 @@ def test_native_history_attaches_without_duplicate_memory_and_backfills(stores):
         refresh_memory_projection(con, control, path)
         assert (
             control.execute(
-                "SELECT native_session_id FROM harness_sessions"
+                "SELECT native_session_id FROM harness_sessions WHERE session_id='harness-fixture'"
             ).fetchone()[0]
             == "native-fixture"
         )
@@ -378,7 +385,7 @@ def test_projection_repairs_enqueue_and_control_link_after_failure(stores, monke
         )
         assert (
             control.execute(
-                "SELECT native_session_id FROM harness_sessions"
+                "SELECT native_session_id FROM harness_sessions WHERE session_id='harness-fixture'"
             ).fetchone()[0]
             == "native-fixture"
         )
@@ -458,7 +465,9 @@ def test_exporter_rebuilds_canonical_memory_from_acknowledged_manifest(
     exporter = control_exporter.ControlOutboxExporter(
         control_path=path, analytical_path=path, parquet_dir=parquet
     )
-    monkeypatch.setattr(exporter, "_rebuild_relation_and_acknowledge", lambda: 0)
+    monkeypatch.setattr(
+        exporter, "_rebuild_relation_and_acknowledge", lambda **kwargs: 0
+    )
     monkeypatch.setattr(
         exporter,
         "_prune_verified_payloads",

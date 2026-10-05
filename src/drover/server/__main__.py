@@ -1014,6 +1014,26 @@ def harness_cmd() -> None:
     """Audit and migrate Drover harness data."""
 
 
+@main.group(name="outbox")
+def outbox_cmd() -> None:
+    """Temporary v2 rollback operations on the durable control outbox."""
+
+
+@outbox_cmd.command(name="replay")
+@click.option(
+    "--since", type=float, default=0, help="Inclusive commit epoch (seconds)."
+)
+@click.option("--sink", type=click.Choice(["legacy"]), required=True)
+@click.pass_context
+def outbox_replay_cmd(ctx: click.Context, since: float, sink: str) -> None:
+    from drover.server.legacy_outbox import replay_legacy
+
+    cfg = _resolve_config(ctx.obj["config_path"])
+    bootstrap_control_plane_store(cfg.duckdb_path)
+    count = replay_legacy(cfg.duckdb_path, cfg.parquet_dir, since=since)
+    click.echo(f"Replayed {count} events to legacy parquet")
+
+
 @main.group(name="archive")
 def archive_cmd() -> None:
     """Capture and compare local archive inventories."""
@@ -1865,12 +1885,24 @@ def incoming_ingest_once_cmd(ctx: click.Context, jsonl_path: Path, apply: bool) 
     if not apply:
         click.echo(f"mode=dry-run path={jsonl_path} size={jsonl_path.stat().st_size}")
         return
+    from drover.server.ingest import _iter_events
+    from drover.server.lake.lifecycle import export_ingested_events
+
+    dedup_keys = [
+        row["dedup_key"] for row, _ in _iter_events(jsonl_path, None) if row is not None
+    ]
     bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
     ingest_incoming_file_once(
         jsonl_path,
         parquet_dir=cfg.parquet_dir,
         duckdb_path=cfg.duckdb_path,
     )
+    if jsonl_path.exists():
+        raise click.ClickException("incoming ingest failed; file remains pending")
+    try:
+        export_ingested_events(cfg, dedup_keys)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(f"mode=apply ingested={jsonl_path}")
 
 
@@ -2700,7 +2732,7 @@ def run(
     # so a worker can resume a published-but-unacknowledged batch before any
     # analytical reader observes the next pass.
     outbox_exporter: ControlOutboxExporter | None = None
-    if cfg.control_store.backend == "postgres":
+    if cfg.control_store.backend == "postgres" or cfg.analytics.backend == "legacy":
         try:
             with _startup_phase("start_control_outbox_exporter"):
                 from drover.server.lake.lifecycle import selected_exporter

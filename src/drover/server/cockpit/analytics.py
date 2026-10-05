@@ -956,7 +956,7 @@ def _session_facts_sql(
         harness_base AS (
           SELECT hs.*
           FROM harness_sessions hs, bounds
-          WHERE COALESCE(
+          WHERE hs.command IS DISTINCT FROM 'collector' AND (COALESCE(
               GREATEST(hs.updated_at, hs.ended_at, hs.started_at),
               hs.updated_at, hs.ended_at, hs.started_at
             ) >= bounds.cutoff
@@ -965,7 +965,7 @@ def _session_facts_sql(
              )
              OR EXISTS (
                SELECT 1 FROM session_base s WHERE s.session_id = hs.session_id
-             )
+             ))
         ),
         session_ids AS (
           -- Each source is already unique by session_id. Build the small key

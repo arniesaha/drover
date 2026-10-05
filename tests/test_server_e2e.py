@@ -1,13 +1,17 @@
-"""End-to-end smoke test: watcher started in-process, dropped file → DuckDB row."""
+"""Hub watcher/exporter lifecycle: dropped file → queryable event and task."""
 
 import json
+import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import duckdb
 import pytest
 
+from drover.config import default_config
 from drover.schema import bootstrap
+from drover.server.lake.lifecycle import selected_exporter
 from drover.server.watcher import IncomingWatcher
 
 
@@ -23,6 +27,14 @@ def test_e2e_drop_file_appears_in_duckdb(tmp_path):
         parquet_dir=parquet_dir,
         duckdb_path=db_path,
     )
+    config = replace(
+        default_config(),
+        incoming_dir=incoming,
+        parquet_dir=parquet_dir,
+        duckdb_path=db_path,
+    )
+    exporter = selected_exporter(config)
+    exporter.start(shutdown_event=threading.Event())
     watcher.start()
     try:
         host_dir = incoming / "macmini"
@@ -49,7 +61,8 @@ def test_e2e_drop_file_appears_in_duckdb(tmp_path):
         tmp.rename(target)
 
         processed_file = host_dir / ".processed" / "e2e-batch.jsonl"
-        deadline = time.monotonic() + 5
+        # Hub defaults: up to 5s flush age plus polling and publication.
+        deadline = time.monotonic() + 15
         n = 0
         while time.monotonic() < deadline:
             con = duckdb.connect(str(db_path))
@@ -57,9 +70,15 @@ def test_e2e_drop_file_appears_in_duckdb(tmp_path):
                 n = con.execute(
                     "SELECT count(*) FROM agent_events WHERE id = 'e2e-001'"
                 ).fetchone()[0]
+                tasks_ready = con.execute(
+                    "SELECT count(*) FROM tasks WHERE task_id IN "
+                    "(SELECT task_id FROM agent_events WHERE id='e2e-001')"
+                ).fetchone()[0]
             finally:
                 con.close()
-            if n and processed_file.exists() and not target.exists():
+            # Parquet becomes visible before the same exporter pass finishes
+            # task projection. Wait for both parts of the hub's publication.
+            if n and tasks_ready and processed_file.exists() and not target.exists():
                 break
             time.sleep(0.1)
 
@@ -96,3 +115,4 @@ def test_e2e_drop_file_appears_in_duckdb(tmp_path):
         assert not target.exists()
     finally:
         watcher.stop()
+        exporter.stop()

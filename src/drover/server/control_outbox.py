@@ -11,9 +11,11 @@ import ctypes
 import errno
 import hashlib
 import json
+import logging
 import os
 import stat
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,6 +74,97 @@ def preview_priority(event_type: str) -> int:
     return {"user_input": 0, "terminal.input": 1}.get(event_type, 2)
 
 
+def ensure_legacy_outbox_schema(con: object) -> None:
+    """The DuckDB compatibility store uses the same durable outbox contract.
+
+    PostgreSQL receives these tables only through its versioned migrations.
+    DuckDB retains inline envelopes as well as the exporter payload copy.
+    """
+    from drover.server.postgres_schema import _MIGRATIONS
+
+    names = {
+        "harness_event_payloads",
+        "harness_session_previews",
+        "control_outbox_events",
+        "control_outbox_batches",
+        "control_outbox_batch_events",
+        "harness_event_archives",
+    }
+    for statement in dict(_MIGRATIONS)[2]:
+        if any(
+            statement.strip().startswith("CREATE TABLE IF NOT EXISTS " + name + " (")
+            for name in names
+        ):
+            con.execute(statement)
+    con.execute(
+        "ALTER TABLE control_outbox_events ADD COLUMN IF NOT EXISTS rejection_reason VARCHAR"
+    )
+    con.execute(
+        "ALTER TABLE control_outbox_events ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ"
+    )
+
+
+def event_ingest_identity(
+    con: object,
+    *,
+    session_id: str,
+    seq: int | None,
+    event_type: str,
+    created_at: datetime,
+    payload: dict | None,
+    normalized_type: str | None = None,
+    normalized_source: str | None = None,
+) -> str:
+    """The shared canonical projection/dedup used by central event producers.
+
+    Host-local DuckDB harness spools retain their released delivery identity;
+    the central PostgreSQL ingest and both analytical sinks normalize through
+    project_control_event -> _row_from_event -> make_dedup_key.
+    """
+    from drover.server.harness.identity import harness_event_identity
+
+    delivery_key = harness_event_identity(
+        session_id=session_id,
+        seq=seq,
+        event_type=event_type,
+        created_at=created_at,
+        payload=payload,
+    )
+    if not is_postgres_connection(con):
+        return delivery_key
+    # Released control stores retain their old delivery keys. Re-delivery must
+    # still hit that fence without rewriting frozen migrations or cold payloads.
+    if con.execute(
+        "SELECT 1 FROM harness_events WHERE dedup_key=?", [delivery_key]
+    ).fetchone():
+        return delivery_key
+    from drover.server.harness.events import normalize_harness_event
+
+    normalized = normalize_harness_event(
+        event_type=event_type,
+        payload=payload,
+        normalized_type=normalized_type,
+        normalized_source=normalized_source,
+    )
+    row = dict(
+        event_id="identity",
+        session_id=session_id,
+        event_type=event_type,
+        created_at=created_at,
+        seq=seq,
+        payload_json=canonical_payload(payload),
+        **normalized,
+    )
+    if (
+        con.execute(
+            "SELECT 1 FROM harness_sessions WHERE session_id=?", [session_id]
+        ).fetchone()
+        is None
+    ):
+        return delivery_key
+    return export_projection(con, [row])[0]["dedup_key"]
+
+
 def record_event_side_effects(
     con: object,
     *,
@@ -85,11 +178,9 @@ def record_event_side_effects(
 ) -> None:
     """Store split payload, narrow preview, and pending export intent.
 
-    This is intentionally a no-op for DuckDB.  The legacy store preserves its
-    inline event envelope and has no PostgreSQL outbox to export.
+    DuckDB compatibility keeps the inline envelope too; export intent is still
+    durable and ingestion never writes parquet in either control-store mode.
     """
-    if not is_postgres_connection(con):
-        return
     con.execute(
         """
         INSERT INTO harness_event_payloads (event_id, payload_json, payload_sha256)
@@ -205,6 +296,75 @@ def _utc_now(now: datetime | None = None) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
+TARGET_BATCH_BYTES = 8 * 1024**2
+MAX_INPUT_BYTES = 32 * 1024**2
+
+
+def export_projection(con: object, rows: list[dict], *, projector=None) -> list[dict]:
+    from drover.server.memory_identity import project_control_event
+    from drover.task_id import compute_task_id
+
+    projector = projector or project_control_event
+    events = []
+    for row in rows:
+        cur = con.execute(
+            """SELECT session_id, native_session_id, summary_session_id,
+            harness, repo_owner, repo_name, branch, cwd
+            FROM harness_sessions WHERE session_id=?""",
+            [row["session_id"]],
+        )
+        values = cur.fetchone()
+        if values is None:
+            raise RuntimeError(f"outbox session missing: {row['session_id']}")
+        session = dict(zip([d[0] for d in cur.description], values, strict=True))
+        session["task_id"] = compute_task_id(
+            None, session["repo_owner"], session["repo_name"], session["branch"]
+        )
+        events.append(projector(row, session))
+    return events
+
+
+def _export_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=lambda v: (
+            _utc_now(v).isoformat() if isinstance(v, datetime) else str(v)
+        ),
+    )
+
+
+def cut_batch_by_bytes(
+    items: list[tuple[str, int]],
+    *,
+    target_bytes: int = TARGET_BATCH_BYTES,
+    max_bytes: int = MAX_INPUT_BYTES,
+) -> list[str]:
+    """Select a prefix; an oversized row travels alone or errors before claiming.
+
+    Sizes include both the raw archive and canonical projection. Reserve 1 KiB
+    for the fixed document envelope and ordinal growth.
+    """
+    chosen = []
+    used = 1024
+    for event_id, size in items:
+        if size + 1024 > max_bytes:
+            if chosen:
+                break
+            raise ValueError(
+                f"outbox event {event_id} needs {size + 1024} bytes; "
+                f"MAX_INPUT_BYTES={max_bytes}"
+            )
+        if chosen and used + size > target_bytes:
+            break
+        chosen.append(event_id)
+        used += size
+        if used >= target_bytes:
+            break
+    return chosen
+
+
 def claim_outbox_batch(
     con: object,
     *,
@@ -212,6 +372,7 @@ def claim_outbox_batch(
     limit: int = 100,
     lease_seconds: int = 60,
     now: datetime | None = None,
+    target_bytes: int = TARGET_BATCH_BYTES,
 ) -> OutboxClaim | None:
     """Durably claim pending work, recovering one expired batch before new work.
 
@@ -219,20 +380,19 @@ def claim_outbox_batch(
     stable id.  New work is selected by durable commit order, never a max-id
     cursor, so a late transaction cannot be skipped.
     """
-    if not is_postgres_connection(con):
-        raise ValueError("the control outbox requires a PostgreSQL connection")
     if not owner.strip():
         raise ValueError("owner is required")
     stamp = _utc_now(now)
     lease_until = stamp + timedelta(seconds=max(1, int(lease_seconds)))
+    locking = "FOR UPDATE SKIP LOCKED" if is_postgres_connection(con) else ""
     con.execute("BEGIN")
     try:
         expired = con.execute(
-            """
+            f"""
             SELECT batch_id FROM control_outbox_batches
              WHERE state = 'claimed' AND lease_until < ?
              ORDER BY created_at, batch_id
-             FOR UPDATE SKIP LOCKED
+             {locking}
              LIMIT 1
             """,
             [stamp],
@@ -265,17 +425,51 @@ def claim_outbox_batch(
                 batch_id, tuple(str(row[0]) for row in rows), owner, lease_until
             )
 
+        candidate_lock = (
+            "FOR UPDATE OF o SKIP LOCKED" if is_postgres_connection(con) else ""
+        )
         rows = con.execute(
-            """
-            SELECT event_id FROM control_outbox_events
-             WHERE state = 'pending'
-             ORDER BY committed_at, event_id
-             FOR UPDATE SKIP LOCKED
-             LIMIT ?
-            """,
+            f"""SELECT o.event_id FROM control_outbox_events o
+            JOIN harness_events e USING(event_id) JOIN harness_sessions s USING(session_id)
+            WHERE o.state='pending' ORDER BY o.committed_at,o.event_id
+            {candidate_lock} LIMIT ?""",
             [max(1, int(limit))],
         ).fetchall()
-        event_ids = [str(row[0]) for row in rows]
+        sizes = []
+        for (event_id,) in rows:
+            # Measure one row at a time; don't load a huge count-sized batch.
+            cur = con.execute(
+                """SELECT 0 AS outbox_ordinal, e.event_id, e.session_id,
+                e.event_type, e.normalized_type, e.normalized_source, e.content_preview,
+                e.created_at, e.seq, e.dedup_key,
+                COALESCE(p.payload_json, e.payload_json) AS payload_json, p.payload_sha256
+                FROM harness_events e LEFT JOIN harness_event_payloads p USING (event_id)
+                WHERE e.event_id=?""",
+                [event_id],
+            )
+            raw = dict(
+                zip([d[0] for d in cur.description], cur.fetchone(), strict=True)
+            )
+            size = (
+                len(
+                    _export_json(
+                        [raw, export_projection(con, [raw])[0], event_id]
+                    ).encode()
+                )
+                + 32
+            )
+            if size + 1024 > MAX_INPUT_BYTES:
+                reason = f"outbox event {event_id} needs {size + 1024} bytes; MAX_INPUT_BYTES={MAX_INPUT_BYTES}"
+                con.execute(
+                    "UPDATE control_outbox_events SET state='rejected', rejection_reason=?, rejected_at=? WHERE event_id=?",
+                    [reason, stamp, event_id],
+                )
+                logging.getLogger(__name__).error("Rejected %s", reason)
+                continue
+            sizes.append((str(event_id), size))
+            if sum(n for _, n in sizes) + 1024 >= target_bytes:
+                break
+        event_ids = cut_batch_by_bytes(sizes, target_bytes=target_bytes)
         if not event_ids:
             con.execute("COMMIT")
             return None
@@ -609,8 +803,6 @@ def publish_outbox_batch(
     """Publish one claim to a fixed immutable path, then make it visible in SQL."""
     import pyarrow as pa
 
-    if not is_postgres_connection(con):
-        raise ValueError("the control outbox requires a PostgreSQL connection")
     _validate_claim_for_publication(con, claim)
     rows = _claim_rows(con, claim)
     if tuple(str(row["event_id"]) for row in rows) != claim.event_ids:
@@ -647,8 +839,6 @@ def acknowledge_outbox_batch(
     con: object, batch_id: str, *, now: datetime | None = None
 ) -> bool:
     """Acknowledge only a SQL-visible immutable batch."""
-    if not is_postgres_connection(con):
-        raise ValueError("the control outbox requires a PostgreSQL connection")
     stamp = _utc_now(now)
     con.execute("BEGIN")
     try:
@@ -684,8 +874,6 @@ def acknowledge_outbox_batch(
 
 def published_batches(con: object) -> list[PublishedBatch]:
     """The authoritative analytical read contract: SQL manifest, never a glob."""
-    if not is_postgres_connection(con):
-        return []
     rows = con.execute("""
         SELECT batch_id, archive_path, content_sha256, member_count, published_at
           FROM control_outbox_batches
@@ -704,9 +892,9 @@ def register_published_harness_events_relation(
 ) -> str:
     """Register the worker's distinct harness-event relation from SQL manifest rows.
 
-    This intentionally never globs a directory and never reuses
-    ``agent_events``: the source grain is central harness delivery, whereas
-    collector events may represent the same activity independently.
+    This raw envelope relation never globs a directory. Both collector and
+    harness deliveries are normalized separately into canonical agent_events;
+    the historical relation name remains for existing analytical readers.
     """
     paths: list[str] = []
     for batch in published_batches(control_con):
@@ -732,26 +920,26 @@ def register_published_harness_events_relation(
 
 def outbox_status(con: object) -> dict[str, Any]:
     """Return bounded exporter freshness without suggesting a global cursor."""
-    if not is_postgres_connection(con):
-        return {
-            "enabled": False,
-            "pending": 0,
-            "claimed": 0,
-            "published_unacknowledged": 0,
-            "oldest_pending_at": None,
-            "oldest_outstanding_at": None,
-        }
     row = con.execute("""
         SELECT count(*) FILTER (WHERE state = 'pending'),
                min(committed_at) FILTER (WHERE state = 'pending'),
                count(*) FILTER (WHERE state = 'claimed'),
                count(*) FILTER (WHERE state = 'published'),
                count(*) FILTER (WHERE state = 'acknowledged'),
-               min(committed_at) FILTER (WHERE state IN ('pending', 'claimed', 'published'))
+               min(committed_at) FILTER (WHERE state IN ('pending', 'claimed', 'published')),
+               count(*) FILTER (WHERE state = 'rejected')
           FROM control_outbox_events
         """).fetchone()
+    stalled = con.execute(
+        """SELECT count(*), min(published_at) FROM control_outbox_batches
+        WHERE state='published' AND published_at < ?""",
+        [_utc_now() - timedelta(minutes=5)],
+    ).fetchone()
     return {
         "enabled": True,
+        "rejected": int(row[6] or 0),
+        "stalled_published_batches": int(stalled[0] or 0),
+        "oldest_stalled_published_at": stalled[1],
         "pending": int(row[0] or 0),
         "oldest_pending_at": row[1],
         "claimed": int(row[2] or 0),
@@ -776,100 +964,43 @@ _RECAP_JOINS = """LEFT JOIN pipeline_jobs recap_job
            AND recap_job.status IN ('pending', 'running', 'retry_wait')
           LEFT JOIN session_memory recap ON recap.session_id = e.session_id"""
 
-#: Mirrors ``_payload_prune_protection`` in SQL so a bounded candidate read
-#: returns rows that can actually prune. Kept beside that predicate on purpose:
-#: the two must change together.
-_PRUNE_ELIGIBLE_SQL = """
-        WHERE s.status IN ('completed', 'terminated', 'errored', 'failed')
-          AND o.state = 'acknowledged'
-          AND o.batch_id IS NOT NULL
-          AND b.state = 'acknowledged'
-          AND usage.source_event_count IS NOT NULL
-          AND usage.source_event_count >= COALESCE(progress.event_count, 0)
-          AND COALESCE(usage.source_seq, 0) >= COALESCE(progress.max_seq, 0)
-          AND recap_job.job_id IS NULL
-          AND recap.recap_source_seq IS NOT NULL
-          AND COALESCE(recap.recap_source_seq, 0) >= COALESCE(progress.max_seq, 0)
-"""
-
-
-def _payload_protection_counts(con: object) -> dict[str, int]:
-    """Count every protected hot payload, not just those in one pass window.
-
-    Retention reports why it is not pruning. Once the candidate read filters
-    protected rows out, a per-pass tally would always be zero and an operator
-    would lose the signal that distinguishes "nothing left to prune" from
-    "everything is waiting on recap".
-    """
-    row = con.execute(f"""
-        WITH session_progress AS (
-          SELECT session_id, count(*) AS event_count, COALESCE(max(seq), 0) AS max_seq
-            FROM harness_events GROUP BY session_id
-        )
-        SELECT
-          count(*) FILTER (
-            WHERE s.status IS NULL
-               OR s.status NOT IN ('completed', 'terminated', 'errored', 'failed')
-          ) AS active,
-          count(*) FILTER (
-            WHERE s.status IN ('completed', 'terminated', 'errored', 'failed')
-              AND NOT (
-                    o.state = 'acknowledged'
-                AND o.batch_id IS NOT NULL
-                AND b.state = 'acknowledged'
-                AND usage.source_event_count IS NOT NULL
-                AND usage.source_event_count >= COALESCE(progress.event_count, 0)
-                AND COALESCE(usage.source_seq, 0) >= COALESCE(progress.max_seq, 0)
-                AND recap_job.job_id IS NULL
-                AND recap.recap_source_seq IS NOT NULL
-                AND COALESCE(recap.recap_source_seq, 0) >= COALESCE(progress.max_seq, 0)
-              )
-          ) AS dependency
-          FROM harness_event_payloads p
-          JOIN harness_events e ON e.event_id = p.event_id
-          LEFT JOIN harness_sessions s ON s.session_id = e.session_id
-          LEFT JOIN control_outbox_events o ON o.event_id = e.event_id
-          LEFT JOIN control_outbox_batches b ON b.batch_id = o.batch_id
-          LEFT JOIN session_progress progress ON progress.session_id = e.session_id
-          LEFT JOIN session_usage_sources usage
-            ON usage.session_id = e.session_id AND usage.source = 'harness_events'
-          {_RECAP_JOINS}
-        """).fetchone()
-    return {"active": int(row[0] or 0), "dependency": int(row[1] or 0)}
-
 
 def _payload_prune_candidates(
-    con: object, *, limit: int, event_id: str | None = None
+    con: object, *, limit: int, event_id: str | None = None, after: str = ""
 ) -> list[dict[str, Any]]:
-    """Detach hot-payload retention facts from a short PostgreSQL read."""
-    # Selecting a bounded set without this filter lets rows that cannot prune
-    # yet consume the whole pass; because the ordering is stable, the next pass
-    # re-reads the same rows and retention livelocks while eligible payloads sit
-    # further down. The filter mirrors ``_payload_prune_protection``, which stays
-    # the authoritative gate: the single-event re-read below deliberately skips
-    # this clause so that predicate still judges the row inside the
-    # transaction.
-    if event_id is not None:
-        filter_sql = "WHERE p.event_id = ?"
-        params: list[Any] = [event_id]
-    else:
-        filter_sql = _PRUNE_ELIGIBLE_SQL
-        params = []
-    params.append(max(1, int(limit)))
+    """Bound the driving relation before joins or per-session aggregation.
+
+    A LIMIT after a whole-history GROUP BY does not bound its work. Materialize
+    at most `limit` primary-key ordered hot payloads, then read progress only for
+    their distinct sessions through the covering session index from migration 12.
+    """
+    where = (
+        "p.event_id = ? AND e.event_id = ?"
+        if event_id is not None
+        else "p.event_id > ? AND e.event_id > ?"
+    )
     rows = con.execute(
         f"""
-        WITH session_progress AS (
-          SELECT session_id, count(*) AS event_count, COALESCE(max(seq), 0) AS max_seq
-            FROM harness_events GROUP BY session_id
+        WITH candidates AS MATERIALIZED (
+          SELECT p.event_id, p.payload_sha256, e.session_id
+          FROM harness_event_payloads p JOIN harness_events e USING (event_id)
+          WHERE {where} ORDER BY p.event_id LIMIT ?
+        ), session_progress AS MATERIALIZED (
+          SELECT sessions.session_id, progress.event_count, progress.max_seq
+          FROM (SELECT DISTINCT c.session_id FROM candidates c
+                JOIN harness_sessions s USING(session_id)
+                WHERE s.command IS DISTINCT FROM 'collector') sessions
+          CROSS JOIN LATERAL (
+            SELECT count(*) AS event_count, COALESCE(max(seq), 0) AS max_seq
+            FROM harness_events h WHERE h.session_id = sessions.session_id
+          ) progress
         )
-        SELECT p.event_id, p.payload_sha256,
-               s.status, o.state AS outbox_state, o.batch_id, b.state AS batch_state,
+        SELECT e.event_id, e.payload_sha256,
+               s.status, s.command, summary_job.status AS summary_job_status, o.state AS outbox_state, o.batch_id, b.state AS batch_state,
                progress.event_count, progress.max_seq,
                usage.source_event_count, usage.source_seq,
-               recap_job.status AS recap_job_status,
-               recap.recap_source_seq AS recap_source_seq
-          FROM harness_event_payloads p
-          JOIN harness_events e ON e.event_id = p.event_id
+               recap_job.status AS recap_job_status, recap.recap_source_seq
+          FROM candidates e
           LEFT JOIN harness_sessions s ON s.session_id = e.session_id
           LEFT JOIN control_outbox_events o ON o.event_id = e.event_id
           LEFT JOIN control_outbox_batches b ON b.batch_id = o.batch_id
@@ -877,17 +1008,66 @@ def _payload_prune_candidates(
           LEFT JOIN session_usage_sources usage
             ON usage.session_id = e.session_id AND usage.source = 'harness_events'
           {_RECAP_JOINS}
-          {filter_sql}
-         ORDER BY e.created_at, e.event_id
-         LIMIT ?
+          LEFT JOIN pipeline_jobs summary_job
+            ON summary_job.job_kind='summarize_session' AND summary_job.subject_key=e.session_id
+           AND summary_job.status IN ('pending','running','retry_wait')
+          ORDER BY e.event_id
         """,
-        params,
+        [
+            event_id if event_id is not None else after,
+            event_id if event_id is not None else after,
+            max(1, int(limit)),
+        ],
     )
-    columns = [item[0] for item in rows.description]
-    return [dict(zip(columns, row)) for row in rows.fetchall()]
+    return [
+        dict(zip([d[0] for d in rows.description], r, strict=True))
+        for r in rows.fetchall()
+    ]
+
+
+def prune_acknowledged_outbox(
+    con: object,
+    *,
+    retention_days: float = 14,
+    limit: int = 100,
+    now: datetime | None = None,
+) -> int:
+    """Delete only old acknowledgements whose durable archive replaced hot bytes.
+
+    Batch manifests and archive receipts remain readable. Hot/protected payloads
+    keep their outbox row even past retention so dependency checks remain valid.
+    """
+    if retention_days < 14:
+        raise ValueError("outbox acknowledgement retention must be at least 14 days")
+    rows = con.execute(
+        """WITH expired AS MATERIALIZED (
+        SELECT o.event_id FROM control_outbox_events o
+        WHERE o.state='acknowledged' AND o.acknowledged_at < ?
+        ORDER BY o.acknowledged_at, o.event_id LIMIT ?
+        ) DELETE FROM control_outbox_events o USING expired x
+          WHERE o.event_id=x.event_id
+            AND EXISTS (SELECT 1 FROM harness_event_archives a WHERE a.event_id=o.event_id)
+            AND NOT EXISTS (SELECT 1 FROM harness_event_payloads p WHERE p.event_id=o.event_id)
+          RETURNING o.event_id""",
+        [_utc_now(now) - timedelta(days=retention_days), max(1, int(limit))],
+    ).fetchall()
+    return len(rows)
 
 
 def _payload_prune_protection(row: dict[str, Any]) -> str | None:
+    if row.get("command") == "collector":
+        # Collector usage lives in native parquet and has no harness recap gate.
+        # Its atomic summary intent must finish before the hot envelope goes away.
+        return (
+            "dependency"
+            if (
+                row.get("outbox_state") != "acknowledged"
+                or row.get("batch_id") is None
+                or row.get("batch_state") != "acknowledged"
+                or row.get("summary_job_status") is not None
+            )
+            else None
+        )
     terminal = {"completed", "terminated", "errored", "failed"}
     if str(row.get("status") or "") not in terminal:
         return "active"
@@ -912,6 +1092,9 @@ def prune_verified_payloads(
     resolver: "ArchiveResolver | None",
     limit: int = 100,
     now: datetime | None = None,
+    time_budget_seconds: float = 1.0,
+    after: str = "",
+    cursor_callback: Callable[[str], None] | None = None,
 ) -> dict[str, int]:
     """Prune verified payloads without retaining a PostgreSQL slot during RPC.
 
@@ -932,28 +1115,22 @@ def prune_verified_payloads(
     control_path = Path(control_path)
     if not is_postgres_control_store(control_path):
         return result
-    with control_plane_connection(control_path) as con:
-        protection = _payload_protection_counts(con)
-        result["protected_active"] = protection["active"]
-        result["protected_dependency"] = protection["dependency"]
-        candidates = _payload_prune_candidates(con, limit=limit)
+    deadline = time.monotonic() + max(0.001, time_budget_seconds)
     stamp = _utc_now(now)
-    for candidate in candidates:
-        # The candidate read already excluded protected rows, so reaching this
-        # branch means the row changed between that read and now. Still count
-        # it: a refusal an operator cannot see is a refusal they cannot debug.
+
+    def process(candidate):
         raced = _payload_prune_protection(candidate)
         if raced == "active":
             result["protected_active"] += 1
-            continue
+            return
         if raced == "dependency":
             result["protected_dependency"] += 1
-            continue
+            return
         expected_hash = str(candidate.get("payload_sha256") or "")
         batch_id = candidate.get("batch_id")
         if not expected_hash or not isinstance(batch_id, str) or resolver is None:
             result["verification_failed"] += 1
-            continue
+            return
         payload = resolver.resolve(
             event_id=str(candidate["event_id"]),
             batch_id=batch_id,
@@ -961,7 +1138,7 @@ def prune_verified_payloads(
         )
         if payload is None or payload_sha256(payload) != expected_hash:
             result["verification_failed"] += 1
-            continue
+            return
         with control_plane_connection(control_path) as con:
             con.execute("BEGIN")
             try:
@@ -976,7 +1153,7 @@ def prune_verified_payloads(
                 ):
                     con.execute("ROLLBACK")
                     result["protected_dependency"] += 1
-                    continue
+                    return
                 con.execute(
                     """
                     INSERT INTO harness_event_archives
@@ -1002,6 +1179,28 @@ def prune_verified_payloads(
                 raise
         if deleted is not None:
             result["pruned"] += 1
+
+    attempted = 0
+    # Persist only a processed prefix. A budget expiry never skips collected
+    # eligible rows: the next pass starts immediately after the last attempt.
+    while attempted < limit and time.monotonic() < deadline:
+        with control_plane_connection(control_path) as con:
+            window = _payload_prune_candidates(
+                con, limit=min(100, max(1, limit)), after=after
+            )
+        if not window:
+            if cursor_callback:
+                cursor_callback("")
+            break
+        for candidate in window:
+            if time.monotonic() >= deadline or attempted >= limit:
+                return result
+            eligible = _payload_prune_protection(candidate) is None
+            process(candidate)
+            attempted += int(eligible)
+            after = str(candidate["event_id"])
+            if cursor_callback:
+                cursor_callback(after)
     return result
 
 

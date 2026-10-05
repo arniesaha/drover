@@ -171,6 +171,17 @@ def test_tar_rebuild_restart_selection_reads_and_starts_exporter(verified_lake):
 
     spec, path, config = verified_lake
     provision_exporter(spec)
+    import hashlib
+
+    from drover.server.lake.rebuild import verify
+
+    verify(spec)
+    config = replace(
+        config,
+        verification_sha256=hashlib.sha256(
+            (spec.data_root / "verification/serving-proof.json").read_bytes()
+        ).hexdigest(),
+    )
     configure_analytics(path, config)
     check_selected(path)
     exporter = selected_exporter(
@@ -451,6 +462,7 @@ def test_legacy_exporter_selection_never_activates_lake(tmp_path, monkeypatch):
             control_path=cfg.duckdb_path,
             analytical_path=cfg.duckdb_path,
             parquet_dir=cfg.parquet_dir,
+            acknowledgement_retention_days=cfg.control_store.outbox_retention_days,
         )
     ]
 
@@ -655,33 +667,58 @@ def test_raw_json_repository_attribution_parity(verified_lake, monkeypatch):
 
 
 def test_summarize_session_paginates_canonical_events(verified_lake):
-    from drover.server.lake.runtime import lake_connection
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+
+    from drover.collect.sources import write_events_jsonl
+    from drover.models import AgentEvent
+    from drover.server.ingest import ingest_file
+    from drover.server.lake.exporter import LakeOutboxExporter, provision_exporter
+    from drover.server.lake.rebuild import verify
     from drover.server.lake.serving import configure_analytics
     from drover.server.ledger import SUMMARIZE_SESSION, JobLedger
     from drover.server.summarizer.worker import SummarizerWorker
 
     spec, path, config = verified_lake
+    provision_exporter(spec)
+    verify(spec)
+    config = replace(
+        config,
+        verification_sha256=hashlib.sha256(
+            (spec.data_root / "verification/serving-proof.json").read_bytes()
+        ).hexdigest(),
+    )
     configure_analytics(path, config)
-
-    with lake_connection(spec, read_only=False) as con:
-        # Insert 1005 tool_call events for session 's'
-        # The limit is 1000 so this should trigger analytics_row_limit_exceeded if not paginated.
-        con.execute("""INSERT INTO lake.agent_events BY NAME
-               SELECT 'many-' || i AS id, 's' AS session_id, 'test' AS agent_id,
-                      '2026-10-01'::DATE AS date,
-                      '2026-10-01 12:00:00Z'::TIMESTAMPTZ + (i * INTERVAL '1 millisecond') AS timestamp,
-                      'tool_call' AS event_type, 'assistant' AS role, NULL AS content,
-                      'k-many-' || i AS dedup_key,
-                      'outbox' AS dedup_key_source,
-                      '{"tool_name": "test_tool", "input": {}}' AS raw_data
-               FROM range(1005) AS t(i)
-            """)
+    incoming = path.parent / "pagination"
+    events = [
+        AgentEvent(
+            id=f"many-{i}",
+            session_id="s",
+            agent_id="test",
+            timestamp=datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+            + timedelta(milliseconds=i),
+            event_type="tool_call",
+            raw_data={"tool_name": "test_tool", "input": {}},
+        )
+        for i in range(1005)
+    ]
+    write_events_jsonl(events, incoming, run_id="pagination", source_id="test")
+    source = next(incoming.glob("*.jsonl"))
+    assert (
+        ingest_file(
+            source, parquet_dir=path.parent / "unused", duckdb_path=path
+        ).inserted
+        == 1005
+    )
+    with LakeOutboxExporter(control_path=path, spec=spec, batch_size=1000) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1000
+        assert exporter.run_once()["acknowledged"] == 5
 
     # We need to test worker._summarize_session.
     # It requires a leased job.
     ledger = JobLedger(path)
     ledger.enqueue(SUMMARIZE_SESSION, "s")
-    claimed = ledger.claim(SUMMARIZE_SESSION, limit=1)
+    claimed = ledger.claim(SUMMARIZE_SESSION, limit=1, worker_id="pagination-test")
     assert claimed
     job = claimed[0]
 
@@ -706,7 +743,6 @@ def test_summarize_session_paginates_canonical_events(verified_lake):
 def test_cockpit_activity_scopes_pg_snapshot(verified_lake):
     from drover.server.cockpit.analytics import AnalyticsFilters
     from drover.server.cockpit.service import CockpitService
-    from drover.server.lake.runtime import lake_connection
     from drover.server.lake.serving import configure_analytics
 
     spec, path, config = verified_lake
@@ -715,20 +751,24 @@ def test_cockpit_activity_scopes_pg_snapshot(verified_lake):
     from drover.server.db import control_plane_connection
 
     with control_plane_connection(path) as pg:
-        # Insert 10005 rows into harness_sessions and session_usage
-        # Old rows, so they don't get included in the 7 day window
+        # Native collector identities belong to their native namespace. Older
+        # rows must also stay outside the bounded 7-day PG snapshot copy.
         pg.execute(
-            """INSERT INTO harness_sessions (session_id, host_id, harness, started_at, last_activity)
-               SELECT 'old-' || i, 'h', 'c', '2020-01-01'::DATE, '2020-01-01'::DATE
-               FROM range(10005) AS t(i)"""
+            """INSERT INTO harness_hosts (host_id,display_name,kind,status,capabilities_json)
+                      VALUES ('h','collector','collector','online','{}')"""
+        )
+        pg.execute(
+            """INSERT INTO harness_sessions (session_id, host_id, harness, command, status, started_at, last_activity)
+               SELECT 'old-' || i, 'h', 'c', 'collector', 'completed', '2020-01-01'::DATE, '2020-01-01'::DATE
+               FROM generate_series(0,10004) AS t(i)"""
         )
         # 1 new row that is within the 7 day window
         pg.execute(
-            """INSERT INTO harness_sessions (session_id, host_id, harness, started_at, last_activity)
-               VALUES ('new-1', 'h', 'c', current_timestamp, current_timestamp)"""
+            """INSERT INTO harness_sessions (session_id, host_id, harness, command, status, started_at, last_activity)
+               VALUES ('new-1', 'h', 'c', 'collector', 'running', current_timestamp, current_timestamp)"""
         )
 
-    service = CockpitService(path)
+    service = CockpitService(provider_usage=None, duckdb_path=path)
     result = service.overview(AnalyticsFilters(days=7))
     assert result["activity"]["status"] == "ok"
-    assert result["activity"]["reason"] is None
+    assert "reason" not in result["activity"]

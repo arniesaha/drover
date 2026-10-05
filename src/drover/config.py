@@ -149,6 +149,7 @@ class ControlStoreConfig:
     acquire_timeout_seconds: float
     statement_timeout_seconds: float
     schema: str = "drover_control"
+    outbox_retention_days: float = 14
 
     def __post_init__(self) -> None:
         if self.backend not in _CONTROL_STORE_BACKENDS:
@@ -183,6 +184,14 @@ class ControlStoreConfig:
                 raise ValueError(
                     f"control_store.{name} must be a finite positive number"
                 )
+        if (
+            type(self.outbox_retention_days) not in (int, float)
+            or not math.isfinite(self.outbox_retention_days)
+            or self.outbox_retention_days < 14
+        ):
+            raise ValueError(
+                "control_store.outbox_retention_days must be finite and at least 14"
+            )
         if not re.fullmatch(r"[a-z_][a-z0-9_]*", self.schema):
             raise ValueError("control_store.schema must be a lowercase SQL identifier")
 
@@ -545,6 +554,7 @@ _DEFAULTS = {
         "acquire_timeout_seconds": 2.0,
         "statement_timeout_seconds": 5.0,
         "schema": "drover_control",
+        "outbox_retention_days": 14,
     },
     "runtime": {"role": "all"},
     "analytics_boundary": {
@@ -760,6 +770,7 @@ def _from_dict(d: dict) -> DroverConfig:
         acquire_timeout_seconds=control_store["acquire_timeout_seconds"],
         statement_timeout_seconds=control_store["statement_timeout_seconds"],
         schema=str(control_store["schema"]).strip(),
+        outbox_retention_days=control_store["outbox_retention_days"],
     )
     runtime_config = RuntimeConfig(role=str(runtime["role"]).strip().lower())
     if runtime_config.role != "all" and control_store_config.backend != "postgres":

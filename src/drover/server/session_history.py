@@ -259,7 +259,7 @@ def _state_predicate(state: str) -> tuple[str, list[str]]:
 
 
 def history_where(query: HistoryQuery) -> tuple[str, list[Any]]:
-    clauses: list[str] = []
+    clauses: list[str] = ["s.command IS DISTINCT FROM 'collector'"]
     params: list[Any] = []
     if query.cursor is not None:
         clauses.append(f"({_ACTIVITY}, s.session_id) < (?, ?)")
@@ -499,7 +499,7 @@ def fetch_history_facets(control_path: str | Path) -> dict[str, Any]:
     with _connection(control_path) as con:
         hosts = _rows(
             con.execute(
-                "SELECT host_id, display_name, retired_at FROM harness_hosts "
+                "SELECT host_id, display_name, retired_at FROM harness_hosts WHERE kind IS DISTINCT FROM 'collector' "
                 "ORDER BY (retired_at IS NOT NULL), display_name, host_id LIMIT ?",
                 [MAX_FACET_HOSTS],
             )
@@ -507,7 +507,7 @@ def fetch_history_facets(control_path: str | Path) -> dict[str, Any]:
         harnesses = [
             row[0]
             for row in con.execute(
-                "SELECT DISTINCT harness FROM harness_sessions ORDER BY harness LIMIT ?",
+                "SELECT DISTINCT harness FROM harness_sessions WHERE command IS DISTINCT FROM 'collector' ORDER BY harness LIMIT ?",
                 [MAX_FACET_HARNESSES],
             ).fetchall()
         ]
@@ -517,7 +517,7 @@ def fetch_history_facets(control_path: str | Path) -> dict[str, Any]:
                 f"""
                 SELECT s.repo_owner, s.repo_name, MAX({_ACTIVITY}) AS latest
                   FROM harness_sessions s
-                 WHERE s.repo_owner IS NOT NULL AND s.repo_name IS NOT NULL
+                 WHERE s.command IS DISTINCT FROM 'collector' AND s.repo_owner IS NOT NULL AND s.repo_name IS NOT NULL
                  GROUP BY s.repo_owner, s.repo_name
                  ORDER BY latest DESC LIMIT ?
                 """,

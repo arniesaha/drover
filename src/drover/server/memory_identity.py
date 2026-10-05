@@ -35,6 +35,15 @@ def ensure_memory_schema(con: Any) -> None:
 def project_control_event(event: dict, session: dict) -> dict:
     """Project the full envelope, never the truncated UI preview."""
     payload = json.loads(event.get("payload_json") or "{}")
+    if event.get("normalized_source") == "collector" and isinstance(
+        payload.get("collector_row"), dict
+    ):
+        from datetime import datetime
+
+        row = dict(payload["collector_row"])
+        row["timestamp"] = datetime.fromisoformat(row["timestamp"])
+        row["source"] = "native"
+        return row
     kind = event.get("normalized_type") or event["event_type"]
     inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     item = inner.get("item") or payload.get("item")
@@ -89,8 +98,6 @@ def project_control_event(event: dict, session: dict) -> dict:
         token_usage=usage if isinstance(usage, dict) else None,
     )
     row = _row_from_event(ev, session.get("task_id"))
-    # Outbox IDs are globally stable and preserve even identical adjacent turns.
-    row["dedup_key"] = "control:" + event["event_id"]
     row["source"] = "control"
     return row
 
@@ -98,7 +105,7 @@ def project_control_event(event: dict, session: dict) -> dict:
 def read_memory_sessions(control: Any) -> dict[str, dict]:
     """Detach the small authoritative identity snapshot before analytical work."""
     cur = control.execute(
-        "SELECT session_id, native_session_id, summary_session_id, harness, repo_owner, repo_name, branch, cwd FROM harness_sessions"
+        "SELECT session_id, native_session_id, summary_session_id, harness, repo_owner, repo_name, branch, cwd, command FROM harness_sessions"
     )
     cols = [d[0] for d in cur.description]
     sessions = {r[0]: dict(zip(cols, r)) for r in cur.fetchall()}
@@ -153,6 +160,18 @@ def refresh_memory_projection(
     )
     ensure_memory_schema(analytics)
     links = []
+    # Filter before LIMIT: orphan envelopes and parquet-served collector rows
+    # cannot consume the harness projection window or starve valid sessions.
+    analytics.execute(
+        "CREATE OR REPLACE TEMP TABLE memory_projection_sessions AS SELECT unnest(?::VARCHAR[]) AS session_id",
+        [
+            [
+                sid
+                for sid, session in sessions.items()
+                if session.get("command") != "collector"
+            ]
+        ],
+    )
     for sid, native in analytics.execute(
         "SELECT harness_session_id, native_session_id FROM memory_session_identity WHERE native_session_id IS NOT NULL"
     ).fetchall():
@@ -163,10 +182,13 @@ def refresh_memory_projection(
     exported_columns = analytics.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name='harness_exported_events'"
     ).fetchall()
+    eligible = "EXISTS (SELECT 1 FROM memory_projection_sessions known WHERE known.session_id=e.session_id)"
+    if ("normalized_source",) in exported_columns:
+        eligible += " AND e.normalized_source IS DISTINCT FROM 'collector'"
     if ("payload_json",) in exported_columns:
         cur = analytics.execute(
-            """SELECT e.session_id, e.payload_json FROM harness_exported_events e
-            WHERE NOT EXISTS (SELECT 1 FROM control_memory_events c WHERE c.id=e.event_id)
+            f"""SELECT e.session_id, e.payload_json FROM harness_exported_events e
+            WHERE {eligible} AND NOT EXISTS (SELECT 1 FROM control_memory_events c WHERE c.id=e.event_id)
             ORDER BY e.created_at, e.event_id LIMIT 1000"""
         )
         for sid, raw in cur.fetchall():
@@ -183,6 +205,10 @@ def refresh_memory_projection(
                 sessions[sid]["native_session_id"] = native.strip()
                 links.append({"session_id": sid, "native_session_id": native.strip()})
     for session in sessions.values():
+        if session.get("command") == "collector":
+            # Native sessions are identities already; an artificial harness alias
+            # would hide older native history or collide with a real harness link.
+            continue
         analytics.execute(
             """INSERT INTO memory_session_identity VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (harness_session_id) DO UPDATE SET
@@ -201,8 +227,8 @@ def refresh_memory_projection(
         "SELECT count(*) FROM information_schema.columns WHERE table_name='harness_exported_events' AND column_name='session_id'"
     ).fetchone()[0]
     if available:
-        cur = analytics.execute("""SELECT e.* FROM harness_exported_events e
-            WHERE NOT EXISTS (SELECT 1 FROM control_memory_events c WHERE c.id=e.event_id)
+        cur = analytics.execute(f"""SELECT e.* FROM harness_exported_events e
+            WHERE {eligible} AND NOT EXISTS (SELECT 1 FROM control_memory_events c WHERE c.id=e.event_id)
             ORDER BY created_at, event_id LIMIT 1000""")
         cols = [d[0] for d in cur.description]
         events = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -245,6 +271,8 @@ def refresh_memory_projection(
     # Summary publication is a separate idempotent control-plane link effect.
     # A crash after summary completion is repaired by the next export pass.
     for sid, session in sessions.items():
+        if session.get("command") == "collector":
+            continue
         if repo is None:
             continue
         # A harness artifact wins over its explicit native alias.

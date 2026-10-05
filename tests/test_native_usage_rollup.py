@@ -27,6 +27,21 @@ def _ingest_rows(tmp_path, parquet_dir, duckdb_path, rows: list[dict]) -> None:
         incoming, parquet_dir=parquet_dir, duckdb_path=duckdb_path
     ).inserted == len(rows)
 
+    from datetime import timedelta
+
+    from drover.server.control_exporter import ControlOutboxExporter
+
+    exporter = ControlOutboxExporter(
+        control_path=duckdb_path,
+        analytical_path=duckdb_path,
+        parquet_dir=parquet_dir,
+        batch_size=100,
+    )
+    while exporter.run_once(now=datetime.now(timezone.utc) + timedelta(seconds=10))[
+        "pending"
+    ]:
+        pass
+
 
 def test_native_usage_rollup_materializes_typed_usage_by_session(tmp_path):
     parquet_dir = tmp_path / "parquet"

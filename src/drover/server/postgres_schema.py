@@ -538,6 +538,15 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        12,
+        (
+            "ALTER TABLE control_outbox_events ADD COLUMN IF NOT EXISTS rejection_reason TEXT",
+            "ALTER TABLE control_outbox_events ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ",
+            "CREATE INDEX IF NOT EXISTS harness_events_session_progress ON harness_events (session_id, seq)",
+            "CREATE INDEX IF NOT EXISTS control_outbox_ack_retention ON control_outbox_events (acknowledged_at, event_id) WHERE state = 'acknowledged'",
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
