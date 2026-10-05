@@ -380,6 +380,18 @@ def test_a4_cockpit_overview_5m_lake_scale(
     _assert_hub_rss_budget(analytical_observations)
 
 
+# S5 gate finding: open_history's identity rows and the read-model child's
+# re-read must hash alike once any session exists, or activity is unavailable.
+def test_a4_cockpit_activity_with_registered_sessions(
+    hub_small_lake, prod_shaped, hub_http
+):
+    _register(prod_shaped, "acceptance-identity-session")
+    response = requests.get(hub_http + "/cockpit/overview?days=30", timeout=15)
+    assert response.status_code == 200, response.text
+    activity = response.json()["activity"]
+    assert activity["status"] == "ok", activity
+
+
 # S2: startup preserves released versions 1–11 and applies only migration 12.
 def test_a5_hub_startup_on_prod_shaped_store(prod_shaped, served_small_lake):
     from drover.server.lake.exporter import LakeOutboxExporter

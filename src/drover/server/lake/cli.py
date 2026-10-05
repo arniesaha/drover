@@ -98,6 +98,17 @@ def rebuild_cmd(source, data_root, catalog_dsn_env, dry_run):
     click.echo(json.dumps(report, indent=2))
 
 
+@lake_cmd.command("seed-tar")
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+def seed_tar_cmd(output):
+    """Write the empty-seed tar a fresh v2 lake is rebuilt from (no data)."""
+    from .gate import write_seed_tar
+
+    if output.exists():
+        raise click.ClickException(f"{output} already exists")
+    click.echo(json.dumps({"seed_tar": str(write_seed_tar(output))}))
+
+
 @lake_cmd.command("backup")
 @click.option(
     "--staging-root",
