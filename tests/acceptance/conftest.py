@@ -243,7 +243,13 @@ def served_recent_lake(
     import shutil
 
     root = tmp_path_factory.mktemp("recent_legacy")
-    last = sorted([p for p in (small_lake / "agent_events").glob("date=*") if p.name != "date=_seed"])[-1]
+    last = sorted(
+        [
+            p
+            for p in (small_lake / "agent_events").glob("date=*")
+            if p.name != "date=_seed"
+        ]
+    )[-1]
     shutil.copytree(last, root / "agent_events" / last.name)
     return _served(
         request, postgres_dsn, lake_extension_dir, root, tmp_path_factory, "recent"

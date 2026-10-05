@@ -489,7 +489,9 @@ def _activity_analytics_from_facts(
     )
     is_archived = False
     try:
-        wm = con.execute("SELECT max(partition_date) FROM lake.import_watermark").fetchone()[0]
+        wm = con.execute(
+            "SELECT min(partition_date) FROM lake.import_watermark"
+        ).fetchone()[0]
         if wm is not None:
             wm_date = datetime.strptime(wm, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             if (snapshot_at - timedelta(days=filters.days)) < wm_date:

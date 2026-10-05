@@ -326,27 +326,33 @@ def resolve_session(con: Any, session_id: str, *, store_path=None) -> dict:
         )
         if status == "unavailable":
             try:
-                started_at = con.execute("SELECT started_at FROM memory_session_identity WHERE harness_session_id=?", [harness]).fetchone()
+                started_at = con.execute(
+                    "SELECT started_at FROM memory_session_identity "
+                    "WHERE harness_session_id=?",
+                    [harness],
+                ).fetchone()
                 if started_at and started_at[0]:
                     try:
                         watermark_date = None
                         if store_path:
-                            from drover.server.lake.serving import open_history
-                            hcon = open_history(store_path)
-                            if hcon:
+                            try:
+                                row = con.execute(
+                                    "SELECT MIN(partition_date) "
+                                    "FROM lake.import_watermark"
+                                ).fetchone()
+                                watermark_date = str(row[0]) if row and row[0] else None
+                            except Exception:
+                                pass
+                            if not watermark_date:
                                 try:
-                                    hcon.execute("SELECT MAX(partition_date) FROM lake.import_watermark")
-                                    if hcon.rows and hcon.rows[0][0]:
-                                        watermark_date = str(hcon.rows[0][0])
+                                    row = con.execute(
+                                        "SELECT MIN(timestamp) FROM lake.agent_events"
+                                    ).fetchone()
+                                    watermark_date = (
+                                        str(row[0])[:10] if row and row[0] else None
+                                    )
                                 except Exception:
                                     pass
-                                if not watermark_date:
-                                    try:
-                                        hcon.execute("SELECT MIN(timestamp), COUNT(*) FROM lake.agent_events")
-                                        if hcon.rows and hcon.rows[0][0]:
-                                            watermark_date = str(hcon.rows[0][0])[:10]
-                                    except Exception:
-                                        pass
                     except Exception:
                         watermark_date = None
 
