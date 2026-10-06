@@ -127,8 +127,27 @@ def verify_runtime(spec: LakeSpec) -> dict[str, str]:
     return hashes
 
 
+# Analytical query children are killed above QueryLimits.rss_bytes (2 GiB).
+# Their engine budget must sit well inside that: memory_limit bounds only the
+# buffer manager, and the process also carries Python, the extensions and
+# expression scratch. One thread halves per-thread operator state; sorts and
+# windows spill to the child's own scratch directory instead of growing RSS.
+QUERY_CHILD_SETTINGS = {
+    "memory_limit": "768MB",
+    "threads": 1,
+    "preserve_insertion_order": False,
+    "max_temp_directory_size": "4GB",
+}
+
+
 @contextmanager
-def lake_connection(spec: LakeSpec, *, read_only: bool = True, create: bool = False):
+def lake_connection(
+    spec: LakeSpec,
+    *,
+    read_only: bool = True,
+    create: bool = False,
+    settings: dict | None = None,
+):
     """A bounded instance; heavy readers must invoke this only in a child process."""
     if read_only and create:
         raise ValueError("a reader cannot initialize a catalog")
@@ -139,6 +158,7 @@ def lake_connection(spec: LakeSpec, *, read_only: bool = True, create: bool = Fa
             "threads": 2,
             "autoload_known_extensions": False,
             "autoinstall_known_extensions": False,
+            **(settings or {}),
         }
     )
     try:
