@@ -3,7 +3,8 @@
 Generates parquet data in the exact Hive partition structure expected by Drover
 (date=YYYY-MM-DD/agent_id=<id>/part-*.parquet) with realistic session-size
 distribution (long tail), 120 days of date partitions, and one 40k-event session
-whose raw payload is > 8 MiB.
+whose raw payload is > 8 MiB. The 5m scale adds a 640k-event session shaped like
+prod's largest (see HUGE_SESSION_ID).
 """
 
 from __future__ import annotations
@@ -23,9 +24,17 @@ import pyarrow.parquet as pq
 
 from drover.schema import _ensure_seed_parquet
 
-GENERATOR_VERSION = "2026.10.4"
+GENERATOR_VERSION = "2026.10.6"
 BIG_SESSION_ID = "session-scale-40k"
 BIG_SESSION_EVENT_COUNT = 40_000
+# 5m scale only: shaped like prod's largest session at the v2 cutover gate
+# (578,239 events over 16 days, the newest ~8 days only attachment noise).
+# Its substantive turns are all in its first HUGE_SESSION_SUBSTANTIVE events,
+# so summarizing it walks most of its history to find the prompt window.
+HUGE_SESSION_ID = "session-scale-640k"
+HUGE_SESSION_EVENT_COUNT = 640_000
+HUGE_SESSION_DAYS = 16
+HUGE_SESSION_SUBSTANTIVE = 24_000
 DAYS_COUNT = 120
 BASE_ANCHOR_DATE = datetime(2026, 10, 4, tzinfo=timezone.utc)
 
@@ -167,6 +176,8 @@ class LakeMetadata:
     big_session_id: str
     big_session_events: int
     big_session_raw_bytes: int
+    huge_session_id: str | None = None
+    huge_session_events: int = 0
 
 
 def _default_cache_dir() -> Path:
@@ -243,7 +254,8 @@ def generate_lake(
     ]
 
     target_total = 50_000 if scale == "small" else 5_000_000
-    target_non_big = target_total - BIG_SESSION_EVENT_COUNT
+    huge_events = 0 if scale == "small" else HUGE_SESSION_EVENT_COUNT
+    target_non_big = target_total - BIG_SESSION_EVENT_COUNT - huge_events
 
     # Generate 120 date partition strings
     dates = [
@@ -290,9 +302,20 @@ def generate_lake(
     day_sessions[big_session_day_idx].append(
         (BIG_SESSION_ID, BIG_SESSION_EVENT_COUNT, "claude-code", big_session_repo)
     )
+    # The huge session spans the last HUGE_SESSION_DAYS days in equal chunks;
+    # its steps continue across days (huge_steps records each chunk's offset).
+    huge_steps: dict[int, int] = {}
+    if huge_events:
+        per_day = huge_events // HUGE_SESSION_DAYS
+        for k in range(HUGE_SESSION_DAYS):
+            day_i = DAYS_COUNT - HUGE_SESSION_DAYS + k
+            huge_steps[day_i] = k * per_day
+            day_sessions[day_i].append(
+                (HUGE_SESSION_ID, per_day, "claude-code", big_session_repo)
+            )
 
     total_events_written = 0
-    total_sessions_count = session_idx + 1
+    total_sessions_count = session_idx + 1 + int(bool(huge_events))
     big_session_raw_bytes = 0
 
     event_counter = 0
@@ -334,10 +357,14 @@ def generate_lake(
             col_raw_data = []
 
             for sid, count, (r_owner, r_name, r_branch) in s_list:
-                is_big = sid == BIG_SESSION_ID
+                is_huge = sid == HUGE_SESSION_ID
+                is_big = sid == BIG_SESSION_ID or is_huge
                 task_id = f"task-{r_owner}-{r_name}"
 
                 for step in range(count):
+                    tail = is_huge and (
+                        huge_steps[day_i] + step >= HUGE_SESSION_SUBSTANTIVE
+                    )
                     event_counter += 1
                     eid = f"evt-{event_counter:09d}"
                     ts_us = day_base_us + (step * 50_000)  # offset by 50ms per step
@@ -348,7 +375,21 @@ def generate_lake(
                     # a tiny repeated phrase pool. Pareto lengths model tool-output tails.
                     word_count = min(350, max(20, int(rng.paretovariate(1.35) * 32)))
                     phrase = " ".join(rng.choices(_WORDS, k=word_count))
-                    if is_big:
+                    if tail:
+                        # Not substantive: no role, no content, no tool blocks.
+                        role, ev_type, content = None, "attachment", ""
+                        raw_payload = (
+                            '{"type": "attachment", "session_id": "%s", "step": %d, '
+                            '"_repo_owner": "%s", "_repo_name": "%s", "attachment": "%s"}'
+                            % (
+                                sid,
+                                huge_steps[day_i] + step,
+                                r_owner,
+                                r_name,
+                                phrase[:200],
+                            )
+                        )
+                    elif is_big:
                         w = _WORDS[(step * 11) % len(_WORDS)]
                         tool_name = _WORDS[(step * 5) % len(_WORDS)]
                         content = (
@@ -375,7 +416,8 @@ def generate_lake(
                                 phrase,
                             )
                         )
-                        big_session_raw_bytes += len(raw_payload.encode("utf-8"))
+                        if not is_huge:
+                            big_session_raw_bytes += len(raw_payload.encode("utf-8"))
                     else:
                         w = _WORDS[(event_counter * 13) % len(_WORDS)]
                         if role == "user":
@@ -420,7 +462,8 @@ def generate_lake(
                                 )
                             )
 
-                    dedup = f"{day_str}:{agent}:{sid}:{ev_type}:{step}"
+                    seq = step + huge_steps[day_i] if is_huge else step
+                    dedup = f"{day_str}:{agent}:{sid}:{ev_type}:{seq}"
 
                     col_id.append(eid)
                     col_session_id.append(sid)
@@ -482,6 +525,8 @@ def generate_lake(
         big_session_id=BIG_SESSION_ID,
         big_session_events=BIG_SESSION_EVENT_COUNT,
         big_session_raw_bytes=big_session_raw_bytes,
+        huge_session_id=HUGE_SESSION_ID if huge_events else None,
+        huge_session_events=huge_events,
     )
 
     (output_dir / "_SUCCESS").write_text(

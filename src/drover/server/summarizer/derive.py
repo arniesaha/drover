@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from typing import Iterable
+from typing import Iterable, Sequence
 
 _PATH_KEYS = ("file_path", "path")
 
@@ -114,14 +114,19 @@ SUBSTANTIVE_SQL = """(
 
 
 def select_substantive_window(
-    con, ctes: str, session_id: str, limit: int = 30
+    con, ctes: str, session_id: str, limit: int = 30, *, bounds: Sequence = ()
 ) -> list[dict]:
+    """The newest ``limit`` substantive turns plus the final assistant reply.
+
+    ``bounds`` are the time-slice parameters ``ctes`` binds after the session
+    id (see ``worker._session_agent_events_ctes``).
+    """
     cur = con.execute(
         f"""WITH {ctes}, substantive AS (
         -- The summary prompt only needs these fields. In particular it must
         -- never marshal an arbitrary raw tool payload through the bounded
         -- DuckLake child merely because that payload made a turn substantive.
-        SELECT role, content, timestamp, event_type, agent_id, id,
+        SELECT role, content, timestamp, event_type, agent_id, id, dedup_key,
                raw_data IS NOT NULL AS has_raw_data
         FROM canonical_agent_events WHERE {SUBSTANTIVE_SQL}
     ), selected AS (
@@ -134,7 +139,7 @@ def select_substantive_window(
     SELECT * FROM (
         SELECT * FROM selected UNION SELECT * FROM final_assistant
     ) ORDER BY timestamp, id""",
-        [session_id, max(1, limit)],
+        [session_id, *bounds, max(1, limit)],
     )
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
