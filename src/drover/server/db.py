@@ -142,8 +142,22 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     # Two threads, not one: everything here is an indexed point lookup except
     # that one window function. The setting cannot leak into analytics, because
     # this role is only ever applied to a different file.
+    #
+    # 1GB, not 256MB, since 2026-10-05. Queries still need a fraction of this;
+    # checkpoints do not. Nothing prunes `harness_events` (every
+    # terminal.output payload is kept in full), so the Studio's store reached
+    # ~1.05 GB and every checkpoint failed with "could not allocate block
+    # (244.0 MiB/244.1 MiB used)" -- 6k+ FatalExceptions, an invalidated
+    # instance each time, lost registry writes and hung session creation. A
+    # checkpoint has to hold the table's ART indexes (`event_id`, `dedup_key`)
+    # and rewrite row groups, which scales with the store, not the query. It is
+    # still a quarter of the analytical budget and still its own instance;
+    # small and isolated is the intent, 256MB was just no longer small enough.
+    # `DROVER_DUCKDB_CONTROL_PLANE_MEMORY_LIMIT` overrides it, and
+    # `DROVER_CONTROL_PLANE_CHECKPOINT_MEMORY_LIMIT` sizes the startup
+    # checkpoint separately (see `startup_control_plane_checkpoint`).
     "control_plane": {
-        "memory_limit": "256MB",
+        "memory_limit": "1GB",
         "threads": "2",
         "preserve_insertion_order": "false",
     },
@@ -557,6 +571,216 @@ def startup_analytical_checkpoint(duckdb_path: str | Path) -> bool:
     return True
 
 
+_DUCKDB_SIZE_UNITS = {
+    "b": 1,
+    "kb": 1000,
+    "kib": 1024,
+    "mb": 1000**2,
+    "mib": 1024**2,
+    "gb": 1000**3,
+    "gib": 1024**3,
+    "tb": 1000**4,
+    "tib": 1024**4,
+    "pb": 1000**5,
+    "pib": 1024**5,
+}
+
+
+def duckdb_size_bytes(value: str) -> int:
+    """Bytes in a validated DuckDB size string, for comparing two limits."""
+    match = _DUCKDB_SIZE_RE.match(validate_duckdb_size(value))
+    assert match is not None  # validate_duckdb_size already matched it
+    return int(float(match.group(1)) * _DUCKDB_SIZE_UNITS[match.group(2).lower()])
+
+
+#: Floor for an explicit control-plane checkpoint when nothing overrides it.
+#: The 2026-10-05 mitigation that brought the Studio's ~1.05 GB store back was
+#: 2GB; an explicit checkpoint is rare (startup, and recovery after a failed
+#: one) and short, so it gets that headroom without the instance keeping it.
+CONTROL_PLANE_CHECKPOINT_MEMORY_FLOOR = "2GB"
+
+
+def control_plane_memory_limit() -> str:
+    """The control-plane instance's ``memory_limit``, after env overrides."""
+    return validate_duckdb_size(
+        os.environ.get(
+            "DROVER_DUCKDB_CONTROL_PLANE_MEMORY_LIMIT",
+            ROLE_DEFAULTS["control_plane"]["memory_limit"],
+        ).strip(),
+        name="DROVER_DUCKDB_CONTROL_PLANE_MEMORY_LIMIT",
+    )
+
+
+def control_plane_checkpoint_memory_limit() -> str:
+    """The limit an explicit control-plane ``CHECKPOINT`` runs under.
+
+    ``DROVER_CONTROL_PLANE_CHECKPOINT_MEMORY_LIMIT`` wins outright, as
+    ``DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT`` does for the lakehouse.
+    Otherwise the larger of the instance limit and
+    ``CONTROL_PLANE_CHECKPOINT_MEMORY_FLOOR``: a checkpoint must never get
+    *less* than the queries that produced its WAL.
+    """
+    override = os.environ.get("DROVER_CONTROL_PLANE_CHECKPOINT_MEMORY_LIMIT")
+    if override is not None:
+        return validate_duckdb_size(
+            override.strip(), name="DROVER_CONTROL_PLANE_CHECKPOINT_MEMORY_LIMIT"
+        )
+    instance = control_plane_memory_limit()
+    floor = CONTROL_PLANE_CHECKPOINT_MEMORY_FLOOR
+    return max(instance, floor, key=duckdb_size_bytes)
+
+
+@dataclass
+class _ControlPlaneCheckpointFailure:
+    first_at: float
+    last_at: float
+    count: int
+    message: str
+
+
+#: Keyed like ``_CONTROL_PLANE_LOCKS``. Present means the control plane's last
+#: checkpoint failed and nothing has checkpointed it successfully since.
+_CONTROL_PLANE_CHECKPOINT_FAILURES: dict[str, _ControlPlaneCheckpointFailure] = {}
+
+
+def is_checkpoint_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` means a checkpoint failed, or the instance it killed.
+
+    DuckDB raises a failed automatic checkpoint as a ``FatalException``
+    ("Failed to create checkpoint ... could not allocate block") and every
+    later statement on that instance as "has been invalidated". Both mean the
+    WAL is not being folded in, which is the state that has to be visible.
+    """
+    text = str(exc).lower()
+    return (
+        is_invalidated_error(exc)
+        or "failed to create checkpoint" in text
+        or (isinstance(exc, duckdb.OutOfMemoryException) and "checkpoint" in text)
+    )
+
+
+def record_control_plane_checkpoint_failure(
+    duckdb_path: str | Path, exc: BaseException
+) -> None:
+    """Remember a failed control-plane checkpoint for ``/healthz`` and ``/readyz``.
+
+    Logged at ERROR, not WARNING: on 2026-10-05 this failed 6k+ times while
+    readiness stayed green and session creation hung. The first failure of an
+    incident logs the traceback; repeats log one line each.
+    """
+    key = _path_key(control_plane_path(duckdb_path))
+    message = f"{type(exc).__name__}: {exc}".replace("\n", " ")
+    now = time.monotonic()
+    with _CONTROL_PLANE_GUARD:
+        failure = _CONTROL_PLANE_CHECKPOINT_FAILURES.get(key)
+        if failure is None:
+            failure = _CONTROL_PLANE_CHECKPOINT_FAILURES[key] = (
+                _ControlPlaneCheckpointFailure(now, now, 0, message)
+            )
+        failure.last_at = now
+        failure.count += 1
+        failure.message = message
+        count = failure.count
+    log.error(
+        "control-plane checkpoint failed for %s (%d since the last good one; "
+        "instance limit %s, raise DROVER_DUCKDB_CONTROL_PLANE_MEMORY_LIMIT): %s",
+        key,
+        count,
+        control_plane_memory_limit(),
+        message,
+        exc_info=exc if count == 1 else None,
+    )
+
+
+def _clear_control_plane_checkpoint_failure(key: str) -> None:
+    with _CONTROL_PLANE_GUARD:
+        failure = _CONTROL_PLANE_CHECKPOINT_FAILURES.pop(key, None)
+    if failure is not None:
+        log.info(
+            "control-plane checkpoint for %s succeeded after %d failure(s)",
+            key,
+            failure.count,
+        )
+
+
+def control_plane_checkpoint_health(duckdb_path: str | Path) -> dict[str, object]:
+    """Observed state only, like ``analytical_store_health``: no lock, no query."""
+    key = _path_key(control_plane_path(duckdb_path))
+    with _CONTROL_PLANE_GUARD:
+        failure = _CONTROL_PLANE_CHECKPOINT_FAILURES.get(key)
+        if failure is None:
+            return {"status": "ok", "failures": 0, "detail": ""}
+        return {
+            "status": "checkpoint-failing",
+            "failures": failure.count,
+            "seconds_since_last": max(0.0, time.monotonic() - failure.last_at),
+            "detail": failure.message,
+        }
+
+
+def _checkpoint_control_plane(con: duckdb.DuckDBPyConnection) -> None:
+    """``CHECKPOINT`` under the dedicated limit, then restore the instance's.
+
+    ``memory_limit`` is an instance setting, and this instance is the control
+    plane's alone, so raising it for one statement lends nothing to analytics.
+    """
+    con.execute("SET memory_limit=?", [control_plane_checkpoint_memory_limit()])
+    try:
+        con.execute("CHECKPOINT")
+    finally:
+        con.execute("SET memory_limit=?", [control_plane_memory_limit()])
+
+
+def startup_control_plane_checkpoint(duckdb_path: str | Path) -> bool:
+    """Fold a leftover control-plane WAL in under the checkpoint limit.
+
+    The control plane's counterpart to ``startup_analytical_checkpoint``. A
+    store whose checkpoints have been failing has a WAL that every connect
+    replays and every close tries, and fails, to fold in again; doing it once
+    here with ``control_plane_checkpoint_memory_limit`` ends that loop before
+    anything is serving. A failure is recorded, so health says so from the
+    first request rather than after the first write.
+    """
+    if is_postgres_control_store(duckdb_path):
+        return False
+    path = control_plane_path(duckdb_path)
+    wal_path = _write_ahead_log(path)
+    if not path.exists() or not wal_path.exists():
+        return False
+    ckpt_limit = control_plane_checkpoint_memory_limit()
+    wal_size_before = _wal_size(wal_path)
+    t0 = time.monotonic()
+    try:
+        with control_plane_lock(path), duckdb_connect_lock(path):
+            con = duckdb.connect(
+                str(path), config={"memory_limit": ckpt_limit, "threads": "1"}
+            )
+            try:
+                con.execute("CHECKPOINT")
+            finally:
+                con.close()
+    except Exception as exc:  # noqa: BLE001 - recorded and reported, never raised
+        if is_checkpoint_failure(exc):
+            record_control_plane_checkpoint_failure(path, exc)
+        else:
+            # Another process holding the file, typically: not this store's
+            # checkpoint failing, and the first real window will find out.
+            log.warning(
+                "control-plane startup checkpoint skipped for %s: %s", path, exc
+            )
+        return False
+    _clear_control_plane_checkpoint_failure(_path_key(path))
+    log.info(
+        "control-plane startup checkpoint for %s: WAL %d -> %d bytes in %.2fs (limit %s)",
+        path,
+        wal_size_before,
+        _wal_size(wal_path),
+        time.monotonic() - t0,
+        ckpt_limit,
+    )
+    return True
+
+
 def pin_analytical_connection(duckdb_path: str | Path) -> bool:
     """Keep the analytical instance open across short worker write windows.
 
@@ -874,20 +1098,70 @@ def control_plane_connection(
         if con is not None:
             try:
                 yield con
-            except _CONTROL_PLANE_FATAL:
-                # A pin that died has to be replaced, or the control plane
-                # would stay broken until someone restarted the server --
-                # which is the mitigation this exists to retire. The window
-                # that found it dead still fails; every control-plane caller
-                # already logs and carries on.
-                _discard_control_plane_connection(key)
+            except duckdb.Error as exc:
+                # Callers log and carry on, which on 2026-10-05 meant 6k+
+                # failed checkpoints behind a green /readyz. Record it where
+                # health looks.
+                if is_checkpoint_failure(exc):
+                    record_control_plane_checkpoint_failure(key, exc)
+                if isinstance(exc, _CONTROL_PLANE_FATAL):
+                    # A pin that died has to be replaced, or the control plane
+                    # would stay broken until someone restarted the server --
+                    # which is the mitigation this exists to retire. The window
+                    # that found it dead still fails; every control-plane
+                    # caller already logs and carries on.
+                    _discard_control_plane_connection(key)
                 raise
+            if not _retry_failed_checkpoint(key, con):
+                _discard_control_plane_connection(key)
             return
-        con = _connect_control_plane(duckdb_path)
+        try:
+            con = _connect_control_plane(duckdb_path)
+        except duckdb.Error as exc:
+            # Opening replays the WAL, and a WAL that cannot be folded in
+            # fails here as often as on a commit.
+            if is_checkpoint_failure(exc):
+                record_control_plane_checkpoint_failure(key, exc)
+            raise
         try:
             yield con
+        except duckdb.Error as exc:
+            if is_checkpoint_failure(exc):
+                record_control_plane_checkpoint_failure(key, exc)
+            raise
+        else:
+            _retry_failed_checkpoint(key, con)
         finally:
             con.close()
+
+
+def _retry_failed_checkpoint(key: str, con: duckdb.DuckDBPyConnection) -> bool:
+    """After a clean window on a store whose checkpoint failed, checkpoint it.
+
+    Only while a failure is recorded, so a healthy store pays one dict lookup.
+    This is what clears the failure: a window that merely did not write proves
+    nothing about the WAL. Runs under ``control_plane_checkpoint_memory_limit``
+    so the retry has the headroom the automatic checkpoint did not.
+
+    Never raises: the window's own work has already committed, and failing it
+    now would report a write as lost that was not. A retry that fails is
+    recorded; one that fails for another reason (a transaction still open,
+    say) is simply tried again after the next window. Returns False only when
+    the retry left the instance invalidated, so a pin can be replaced.
+    """
+    with _CONTROL_PLANE_GUARD:
+        if key not in _CONTROL_PLANE_CHECKPOINT_FAILURES:
+            return True
+    try:
+        _checkpoint_control_plane(con)
+    except duckdb.Error as exc:
+        if is_checkpoint_failure(exc):
+            record_control_plane_checkpoint_failure(key, exc)
+        else:
+            log.debug("control-plane checkpoint retry for %s deferred: %s", key, exc)
+        return not is_invalidated_error(exc)
+    _clear_control_plane_checkpoint_failure(key)
+    return True
 
 
 def _discard_control_plane_connection(key: str) -> None:

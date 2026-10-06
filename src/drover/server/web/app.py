@@ -38,6 +38,7 @@ from drover.server.analytics_boundary import (
 from drover.server.db import (
     AnalyticalStoreUnavailable,
     analytical_store_health,
+    control_plane_checkpoint_health,
     require_analytical_store,
 )
 from drover.server.harness.capabilities import unique_capability_keys
@@ -942,11 +943,21 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             analytical_status = str(health["status"])
             if analytical_status not in {"ok", "recovering", "failed-retrying"}:
                 analytical_status = "failed-retrying"
+            # Liveness stays 200 and the body stays byte-for-byte what the
+            # cutover gate and smoke checks compare against; /readyz is what
+            # goes red on a failing control-plane checkpoint. The header is
+            # for whoever is looking at why.
+            control_plane_status = str(
+                control_plane_checkpoint_health(self.collector.duckdb_path)["status"]
+            )
             self._send(
                 200,
                 "text/plain; charset=utf-8",
                 f"ok\nanalytical={analytical_status}\n",
-                extra_headers={"X-Drover-Analytical": analytical_status},
+                extra_headers={
+                    "X-Drover-Analytical": analytical_status,
+                    "X-Drover-Control-Plane": control_plane_status,
+                },
             )
             return
         if path == "/release-identity":

@@ -48,6 +48,15 @@ that same count and must agree. Snapshot readers on private copies retain
 `DROVER_DUCKDB_SNAPSHOT_THREADS`; the control-plane instance retains
 `DROVER_DUCKDB_CONTROL_PLANE_THREADS`.
 
+The control-plane store is its own instance with its own budget:
+`DROVER_DUCKDB_CONTROL_PLANE_MEMORY_LIMIT` (default `1GB`; it was `256MB`
+until a ~1.05 GB store failed every checkpoint on 2026-10-05) and
+`DROVER_CONTROL_PLANE_CHECKPOINT_MEMORY_LIMIT` for the startup checkpoint and
+for the retry after a failed one (default: the larger of the instance limit
+and `2GB`). A failed control-plane checkpoint is logged at ERROR, turns the
+`control_plane` store `failed` in `/readyz` until a checkpoint succeeds, and
+sets `X-Drover-Control-Plane: checkpoint-failing` on `/healthz`.
+
 DuckDB `threads` and `memory_limit` are **instance-wide**, not per-query or
 per-worker allocations. See [analytical memory](analytical-memory.md) for #364's
 shared-budget validation, RSS diagnostics, resource cleanup, and the remaining
