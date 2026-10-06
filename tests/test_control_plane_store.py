@@ -196,12 +196,17 @@ def test_the_control_plane_budget_cannot_reach_an_analytical_reader(tmp_path):
     assert after == before
 
 
-def test_the_control_plane_runs_on_a_budget_sized_for_its_own_data(tmp_path):
+def test_the_control_plane_runs_on_a_budget_sized_for_its_own_data(
+    tmp_path, monkeypatch
+):
     """A private instance defaults to 80% of host RAM unless we say otherwise.
 
     On a 16 GB laptop with ~6 GB free and 10.8M pageouts, letting a second
-    instance claim ~12.7 GiB would trade one failure for a worse one.
+    instance claim ~12.7 GiB would trade one failure for a worse one. The
+    shipped default (1GB, which DuckDB reports as 953.6 MiB) is asserted, so
+    an operator's override in the environment must not leak in.
     """
+    monkeypatch.delenv("DROVER_DUCKDB_CONTROL_PLANE_MEMORY_LIMIT", raising=False)
     duckdb_path = _db(tmp_path)
 
     with control_plane_connection(duckdb_path) as con:
@@ -209,7 +214,7 @@ def test_the_control_plane_runs_on_a_budget_sized_for_its_own_data(tmp_path):
             "SELECT current_setting('memory_limit'), current_setting('threads')"
         ).fetchone()
 
-    assert "MiB" in str(limit), f"control-plane memory_limit is {limit!r}"
+    assert str(limit) == "953.6 MiB", f"control-plane memory_limit is {limit!r}"
     assert int(threads) == int(ROLE_DEFAULTS["control_plane"]["threads"])
 
 

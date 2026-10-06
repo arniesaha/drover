@@ -120,6 +120,7 @@ from drover.server.db import (
     open_duckdb_connection,
     pin_analytical_connection,
     pin_control_plane_connection,
+    startup_control_plane_checkpoint,
     sweep_orphaned_snapshot_scratch,
 )
 from drover.server.decisions import derive_decisions
@@ -2696,6 +2697,11 @@ def run(
     # DuckDB's file lock against a co-resident harnessd, which shares that
     # store -- and db.py logs which way it went. The lock split and the
     # separate database in control_plane_connection apply regardless (#95).
+    # A WAL left by checkpoints that failed is folded in first, under its own
+    # higher limit, so the pin (or the first window) does not start by
+    # replaying and failing it again. Failure is recorded for /readyz.
+    with _startup_phase("startup_control_plane_checkpoint"):
+        startup_control_plane_checkpoint(cfg.duckdb_path)
     with _startup_phase("pin_control_plane_connection"):
         pin_control_plane_connection(cfg.duckdb_path)
     # Snapshot copies are only cleaned up when a process exits gracefully, and a

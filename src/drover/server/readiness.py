@@ -123,6 +123,7 @@ from drover.server.db import (
     ControlPlaneBusy,
     analytical_probe_cursor,
     analytical_store_health,
+    control_plane_checkpoint_health,
     control_plane_connection,
     control_plane_path,
     last_connect_failure,
@@ -399,6 +400,8 @@ class ReadinessProbe:
             and analytical_store_health(self._duckdb_path)["status"] != "ok"
         ):
             return None
+        if control_plane_checkpoint_health(self._duckdb_path)["status"] != "ok":
+            return None
         with self._lock:
             cached = self._cached
             if cached is not None and cached.ok and self._time() < self._cached_until:
@@ -578,6 +581,19 @@ class ReadinessProbe:
         except Exception as exc:  # noqa: BLE001 - reported, never raised
             return self._failure(STORE_CONTROL_PLANE, exc, now)
         self._clear_busy(STORE_CONTROL_PLANE)
+        # `SELECT 1` answering proves reads work, not that writes stick: on
+        # 2026-10-05 every checkpoint failed 6k+ times while this said ok. The
+        # probe's own window retries the checkpoint, so a store that has
+        # recovered is cleared before this is read.
+        checkpoint = control_plane_checkpoint_health(self._duckdb_path)
+        if checkpoint["status"] != "ok":
+            return StoreProbe(
+                STORE_CONTROL_PLANE,
+                STATE_FAILED,
+                f"{checkpoint['failures']} control-plane checkpoint failure(s), "
+                f"last {checkpoint['seconds_since_last']:.0f}s ago: "
+                f"{checkpoint['detail']}"[:_MAX_DETAIL_CHARS],
+            )
         return StoreProbe(STORE_CONTROL_PLANE, STATE_OK, f"{PROBE_SQL} on the store")
 
     def _embeddings_state(self) -> dict[str, Any]:
