@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-05
+
+### Added
+
+- DuckLake v2 (#481): acceptance harness with a prod-shaped control store and a
+  seeded 5M-event lake (#521); a single ingest path through the control outbox
+  with `outbox replay --sink legacy` (#526); production-size read paths for the
+  summarizer and cockpit (#532); a fresh lake with selective, idempotent
+  `lake import --since/--session` and archived recall status (#531).
+- `drover-server gate`, cutover preflight, and `cutover switch|rollback|backup`
+  with `--dry-run`, backup-first ordering and a required fresh gate verdict, plus
+  the runbook in docs/operations/lake-cutover.md (#533).
+
+### Fixed
+
+- Summarizer query children project tool fields only after LIMIT and run with
+  bounded engine settings, keeping 40k-event sessions far under the child RSS
+  cap (#534).
+- Cockpit lake activity no longer reports unavailable when sessions exist
+  (identity column mismatch from #531, fixed in #533).
+
 ## [0.5.7] - 2026-10-04
 
 ### Fixed
