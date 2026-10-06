@@ -199,51 +199,217 @@ def _page_fixture(con) -> None:
     con.executemany("INSERT INTO agent_events VALUES (?,?,?,?,?,?,?,?)", rows)
 
 
-def test_raw_event_pages_match_the_unpaged_projection_exactly() -> None:
-    """Paging before projecting keeps the exact rows and order (A3 RSS fix)."""
-    from drover.server.summarizer.worker import (
-        _raw_event_page_sql,
-        _session_agent_events_ctes,
-    )
+def _newest_projected(con, limit: int) -> list[dict]:
+    """The unpaged reference: newest ``limit`` canonical raw events, projected."""
+    from drover.server.summarizer.worker import _session_agent_events_ctes
 
+    rows = con.execute(
+        f"""WITH {_session_agent_events_ctes()}
+        SELECT event_type, {_tool_projection_sql()} AS raw_data FROM (
+          SELECT event_type, raw_data FROM canonical_agent_events
+          WHERE raw_data IS NOT NULL
+          ORDER BY timestamp DESC, coalesce(id, '') DESC,
+                   coalesce(dedup_key, '') DESC, hash(raw_data) DESC
+          LIMIT ?)""",
+        ["s", limit],
+    ).fetchall()
+    return [{"event_type": t, "raw_data": r} for t, r in rows]
+
+
+def test_tool_fact_groups_match_the_unpaged_projection(monkeypatch) -> None:
+    """Grouped, paged tool facts derive exactly what per-event rows did."""
+    from drover.server.summarizer import worker
+
+    monkeypatch.setattr(worker, "MAX_RAW_EVENTS_PER_SESSION", 1500)
+    monkeypatch.setattr(worker, "RAW_EVENT_PAGE_ROWS", 10)  # force group paging
     with duckdb.connect() as con:
         _page_fixture(con)
-        expected = con.execute(
-            f"""WITH {_session_agent_events_ctes()}
-            SELECT event_type, {_tool_projection_sql()} AS raw_data,
-                   timestamp, id, coalesce(dedup_key, '') AS _dedup_key,
-                   hash(raw_data) AS _raw_hash FROM canonical_agent_events
-            WHERE raw_data IS NOT NULL
-            ORDER BY timestamp, coalesce(id, ''), coalesce(dedup_key, ''),
-                     hash(raw_data)""",
-            ["s"],
+        expected = _newest_projected(con, 1500)
+        files, tools = worker._read_tool_facts(con, "s", None)
+    assert len(expected) == 1500
+    assert files == compute_files_touched(expected)
+    assert tools == compute_tools_used(expected)
+    assert sum(tools.values()) == 1500
+
+
+def test_tool_facts_bounded_to_the_tail_match_the_unbounded_read(
+    monkeypatch,
+) -> None:
+    from drover.server.summarizer import worker
+
+    monkeypatch.setattr(worker, "MAX_RAW_EVENTS_PER_SESSION", 700)
+    with duckdb.connect() as con:
+        _page_fixture(con)
+        tail_lower, _, stored, _ = worker._session_bounds(con, "s")
+        assert tail_lower is not None and stored == 2500
+        # The tail is the newest 700 *stored* events (ties included); the
+        # dedup window then collapses duplicates among them.
+        rows = con.execute(
+            f"""WITH {worker._session_agent_events_ctes()}
+            SELECT event_type, {_tool_projection_sql()} FROM canonical_agent_events
+            WHERE raw_data IS NOT NULL AND timestamp >= ?""",
+            ["s", tail_lower],
         ).fetchall()
-        pages, last = [], None
-        while True:
-            if last is None:
-                page = con.execute(
-                    _raw_event_page_sql(keyset=False), ["s", 300]
-                ).fetchall()
-            else:
-                page = con.execute(
-                    _raw_event_page_sql(keyset=True),
-                    ["s", last[2], last[3] or "", last[4], last[5], 300],
-                ).fetchall()
-            if not page:
-                break
-            assert len(page) <= 300
-            pages.extend(page)
-            last = page[-1]
-    assert len(expected) > 1000
-    assert pages == expected
+        expected = [{"event_type": t, "raw_data": r} for t, r in rows]
+        assert 0 < len(expected) < 700
+        files, tools = worker._read_tool_facts(con, "s", tail_lower)
+    # The fixture's exact dedup ties (same key, repo, timestamp and id, other
+    # payload) are an arbitrary pick in any read, so compare what is stable.
+    assert files == compute_files_touched(expected)
+    assert sum(tools.values()) == sum(compute_tools_used(expected).values())
+    assert tools.keys() == compute_tools_used(expected).keys()
 
 
-def test_raw_event_page_projects_only_the_selected_page() -> None:
-    from drover.server.summarizer.worker import _raw_event_page_sql
+def test_tool_facts_project_only_the_chosen_events() -> None:
+    from drover.server.summarizer.worker import _tool_facts_sql
 
-    for keyset in (False, True):
-        sql = _raw_event_page_sql(keyset=keyset)
-        page = sql.index("raw_event_page AS (")
-        # The JSON/regex projection runs only in the outer SELECT, after LIMIT.
-        assert sql.index("LIMIT ?") < sql.index("json_object") > page
-        assert "json_" not in sql[page : sql.index("LIMIT ?")]
+    for lower in (False, True):
+        for after in (False, True):
+            sql = _tool_facts_sql(lower=lower, after=after)
+            chosen = sql.index("recent_events AS (")
+            # The JSON/regex projection runs only after the newest-N LIMIT.
+            assert sql.index("LIMIT ?") < sql.index("json_object") > chosen
+            assert "json_" not in sql[chosen : sql.index("LIMIT ?")]
+
+
+def _long_session(con, events: int) -> None:
+    """Substantive turns only early on, then a long non-substantive tail."""
+    con.execute("SET TimeZone='UTC'")
+    con.execute(
+        "CREATE TABLE agent_events(id VARCHAR, session_id VARCHAR,"
+        " dedup_key VARCHAR, repo_owner VARCHAR, repo_name VARCHAR,"
+        " timestamp TIMESTAMPTZ, event_type VARCHAR, role VARCHAR,"
+        " content VARCHAR, agent_id VARCHAR, task_id VARCHAR, raw_data VARCHAR)"
+    )
+    rows = []
+    for i in range(events):
+        ts = f"2026-08-{15 + i // 86400:02d} {i // 3600 % 24:02d}:{i // 60 % 60:02d}:{i % 60:02d}+00"
+        if i < events // 10:
+            role = ("user", "assistant", "tool")[i % 3]
+            kind = "tool_result" if role == "tool" else "message"
+            # A final assistant reply older than the newest 30 turns.
+            if i >= events // 10 - 40 and role == "assistant":
+                kind = "tool_call"
+            raw = json.dumps({"tool_name": f"T{i % 5}", "input": {"path": f"f{i}"}})
+            rows.append(
+                (
+                    f"id-{i}",
+                    "s",
+                    f"k-{i // 2}",
+                    "o",
+                    "r",
+                    ts,
+                    kind,
+                    role,
+                    f"turn {i}",
+                    "agent",
+                    "task",
+                    raw,
+                )
+            )
+        else:
+            rows.append(
+                (
+                    f"id-{i}",
+                    "s",
+                    f"k-{i // 2}",
+                    None,
+                    None,
+                    ts,
+                    "attachment",
+                    None,
+                    "",
+                    "agent",
+                    None,
+                    '{"type": "attachment"}',
+                )
+            )
+    rows.append(
+        (
+            "other",
+            "t",
+            "k-other",
+            "o",
+            "r",
+            "2026-08-15",
+            "message",
+            "user",
+            "elsewhere",
+            "agent",
+            "task",
+            "{}",
+        )
+    )
+    con.executemany("INSERT INTO agent_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+
+
+def test_sliced_prompt_window_matches_the_unbounded_window(monkeypatch) -> None:
+    """Walking time slices newest first finds the same turns as one read."""
+    from drover.server.summarizer import worker
+    from drover.server.summarizer.derive import select_substantive_window
+
+    monkeypatch.setattr(worker, "MAX_RAW_EVENTS_PER_SESSION", 250)
+    monkeypatch.setattr(worker, "SESSION_SLICE_EVENTS", 400)
+    reads = []
+    with duckdb.connect() as con:
+        _long_session(con, 6000)
+        whole = select_substantive_window(con, worker._session_agent_events_ctes(), "s")
+        tail_lower, slices, stored, capped = worker._session_bounds(con, "s")
+        assert stored == 6000 and len(slices) == 15 and not capped
+        assert tail_lower is not None
+        real = con.execute
+
+        class Counting:
+            def execute(self, sql, params=None):
+                reads.append(sql)
+                return real(sql, params)
+
+        sliced = worker._read_prompt_window(Counting(), "s", slices, capped)
+    assert [e["id"] for e in sliced] == [e["id"] for e in whole]
+    assert sliced == whole
+    assert any(worker._is_final_assistant(e) for e in sliced)
+    # Substantive turns sit in the oldest 600 events: the walk reaches them
+    # and stops there, short of reading the whole history at once.
+    assert 1 < len(reads) <= len(slices) + 1
+
+
+def test_prompt_walk_stops_at_the_scan_cap(monkeypatch) -> None:
+    """Beyond MAX_PROMPT_SCAN_EVENTS a session has no prompt: an input fault."""
+    from drover.server.summarizer import worker
+
+    monkeypatch.setattr(worker, "SESSION_SLICE_EVENTS", 400)
+    monkeypatch.setattr(worker, "MAX_PROMPT_SCAN_EVENTS", 2000)
+    with duckdb.connect() as con:
+        _long_session(con, 6000)
+        _, slices, _, capped = worker._session_bounds(con, "s")
+        assert capped and len(slices) == 5
+        assert worker._read_prompt_window(con, "s", slices, capped) == []
+
+
+def test_short_session_reads_once_without_bounds() -> None:
+    from drover.server.summarizer import worker
+
+    with duckdb.connect() as con:
+        _long_session(con, 300)
+        assert worker._session_bounds(con, "s") == (None, [], 0, False)
+
+
+def test_any_value_lookups_stop_at_the_newest_slice_with_a_value(
+    monkeypatch,
+) -> None:
+    from drover.server.summarizer import worker
+
+    monkeypatch.setattr(worker, "SESSION_SLICE_EVENTS", 400)
+    with duckdb.connect() as con:
+        _long_session(con, 6000)
+        _, slices, _, capped = worker._session_bounds(con, "s")
+        # Only the oldest events carry a task and a repository.
+        assert worker._safe_task_id(con, "s", slices, capped) == "task"
+        assert worker._first_in_slices(
+            con,
+            "s",
+            "SELECT any_value(repo_owner), any_value(repo_name) FROM "
+            "canonical_agent_events WHERE repo_owner IS NOT NULL",
+            slices,
+            capped,
+        ) == ("o", "r")

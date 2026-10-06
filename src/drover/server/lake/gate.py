@@ -926,9 +926,12 @@ class GateRun:
     def a3(self):
         from drover.server.lake.serving import open_history
 
+        # Count stored rows on the base table: the serving view parses every
+        # row's raw_data JSON, which on the 3.3M-event prod import took 6.7 s
+        # and tripped the 5 s child deadline before any summarizing (0.5 s here).
         with open_history(self.client_path) as con:
             row = con.execute(
-                "SELECT session_id, count(*) AS n FROM agent_events "
+                "SELECT session_id, count(*) AS n FROM lake.agent_events "
                 "WHERE session_id NOT LIKE 'drover-gate-%' "
                 "GROUP BY session_id ORDER BY n DESC LIMIT 1"
             ).fetchone()

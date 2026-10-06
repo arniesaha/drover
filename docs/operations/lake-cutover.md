@@ -126,7 +126,7 @@ complete):
 | `A1_collector_to_lake` | collector JSONL visible in the lake ≤ 30 s; MCP replay; summary; recall |
 | `A2_outbox_dedup_no_parquet` | each event once in the outbox; no ingest parquet |
 | `A4_cockpit_overview` | 5 × `/cockpit/overview?days=30`, activity `ok`, p95 < 2 s |
-| `A3_summarize_largest_session` | summary job for the largest imported session succeeded |
+| `A3_summarize_largest_session` | summary job for the largest imported session (by stored rows) succeeded |
 | `A7_pre_watermark_archived` | a session older than the watermark replays as `archived` |
 | `A6_rollback_outbox_replay` | `outbox replay --sink legacy` restores gate events; `/healthz` ok |
 | `hub_rss_budget` | **spare hub peak RSS** ≤ `DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT` |
@@ -163,6 +163,72 @@ three. With any registered session, cockpit lake activity was therefore always
 `unavailable` (`analytics_identity_changed`). `task_status` also unpacked those
 rows into three names. Both now use `serving.IDENTITY_QUERY`, and
 `test_a4_cockpit_activity_with_registered_sessions` pins it.
+
+### A3/A4 at production scale (2026-10-06)
+
+A gate run on a copy of production (3,331,991 events imported) failed only
+`A3_summarize_largest_session`, with `{"error": "analytics_deadline_exceeded"}`.
+`A4_cockpit_overview` passed at p95 1.99 s against the 2 s limit. The largest
+session, `3aa811ed-…`, has **578,239 events** over 16 days. Its newest ~8 days
+are attachment/bridge events with no substantive turn. The design assumed
+about 40k events.
+
+The failure was not the summarizer. A3's own picker
+(`GROUP BY session_id … LIMIT 1`) ran through the serving `agent_events` view.
+That view parses every row's `raw_data` JSON, which took 6.7 s for 3.3M events,
+so the 5 s query-child deadline killed it. The picker now counts stored rows on
+`lake.agent_events`: 0.5 s, 121 MB.
+
+The summarizer did complete on that session, but its cost grew with session
+size. Every 1,000-event page re-ran the dedup window over the whole session:
+26 children, about 1.3 s and 0.9–1.05 GB each, 35 s in total. It also kept the
+*oldest* 25,000 raw events, and its prompt-window, task and repository reads
+each scanned the whole session (1.8 s and 1.05 GB at 578k). At about 1M events
+those reads reach the 2 GiB child cap. The read path is now bounded:
+
+- One narrow query on the base table returns the timestamps of the newest
+  25,000th stored event and of every 50,000th (`SESSION_SLICE_EVENTS`).
+- **Prompt window:** walks those time slices newest first and stops once it
+  has 30 substantive turns and a final assistant reply. On all three
+  >300k-event production sessions, the result matched the unbounded window
+  exactly. Prompt turns are searched at most `MAX_PROMPT_SCAN_EVENTS` (2M)
+  back. A longer session with no substantive turn in that span is quarantined
+  as `no_events`.
+- **Files and tools:** derived from the **most recent**
+  `MAX_RAW_EVENTS_PER_SESSION` (25,000) stored events, aggregated as distinct
+  tool facts with counts in a single child. The summary then says
+  *"Files and tools are derived from the most recent 25,000 of this session's
+  N stored events."*, and the worker logs `Truncated session …`.
+- Task id and repository use `any_value`, so they stop at the newest slice
+  that has one.
+
+Measured on the production v2 lake through the reader DSN with
+`scripts/measure_a3_read_path.py`:
+
+| Session (events) | Before | After |
+|---|---|---|
+| A3 picker | 6.7 s, deadline exceeded | 0.53 s, 121 MB |
+| 578,239 | 35.2 s, 26 children, max 1.83 s / 1.05 GB | 7.1 s, 10 children, max 0.93 s / 409 MB |
+| 569,357 | not measured | 5.7 s, 8 children, max 0.83 s / 312 MB |
+| 321,929 | not measured | 4.0 s, 7 children, max 0.63 s |
+
+A 100k-event slice took 3.5 s on a cold file cache, hence 50k slices.
+
+**A4.** Each overview spent about 2 s in three serialized query children: a
+snapshot token child, the read model, and a second token child. Every child
+also loaded the identity table one row at a time (0.21 ms a row). The read-model
+child now binds the lake snapshot itself. It reads the newest snapshot before
+its transaction, and requires that snapshot to still be the newest inside the
+transaction before and after the read. Identities load in one statement. On the
+production lake, the lake side of the overview is 0.50–0.55 s (gate-like, 1,000
+identities; it was 1.93–2.21 s). With a populated 30-day rollup and 3,000
+identities it is 0.85–0.98 s.
+
+CI's scale job (`scripts/acceptance-scale.sh`) now has a 640k-event session in
+the 5M synthetic lake (`HUGE_SESSION_ID`), shaped like the production one. Its
+substantive turns are only in its first 24k events. The A3 scale test picks
+the largest session with the gate's own query and summarizes it. It requires
+success, no child error, every child under 1 GiB, and the truncation note.
 
 ## 3–5. Backup, fenced switch, verify
 

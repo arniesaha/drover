@@ -35,7 +35,7 @@ import random
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import duckdb
 
@@ -92,12 +92,24 @@ def _open_summarizer_db(duckdb_path: Path) -> duckdb.DuckDBPyConnection:
     return open_duckdb_connection(duckdb_path, role="summarizer")
 
 
-def _session_agent_events_ctes() -> str:
+def _session_agent_events_ctes(*, lower: bool = False, upper: bool = False) -> str:
+    """The session's canonical events, optionally within one time slice.
+
+    ``lower`` binds ``timestamp >= ?`` and ``upper`` binds ``timestamp < ?``
+    (NULL timestamps, oldest in every order, fall in the slice with no lower
+    bound), in that order after the session id. The bounds sit on the session
+    scan, before the dedup window, so the scan prunes on them.
+    """
+    bounds = ""
+    if lower:
+        bounds += " AND timestamp >= ?::TIMESTAMPTZ"
+    if upper:
+        bounds += " AND (timestamp < ?::TIMESTAMPTZ OR timestamp IS NULL)"
     return f"""
 session_agent_events AS (
   SELECT *
   FROM agent_events
-  WHERE session_id = ?
+  WHERE session_id = ?{bounds}
 ),
 {canonical_agent_events_cte(source="session_agent_events")}
 """.strip()
@@ -122,9 +134,23 @@ def _classify_failure(exc: BaseException) -> tuple[bool, str]:
     return True, category
 
 
-# Limit on the number of raw agent events retrieved per session for summarization
-# to bound memory usage and processing time for pathological sessions with extreme verbosity.
+# Tool facts (files touched, tools used) are derived from at most this many of
+# a session's most recent raw events. A session with more stored events than
+# this is summarized from its tail, and the summary says so.
 MAX_RAW_EVENTS_PER_SESSION = 25000
+
+# Every lake read is one query child with a 5 s deadline and a 2 GiB RSS cap,
+# and scanning a session through the serving view costs both in proportion to
+# its size (prod, 578k events: 1.8 s and 1.05 GB per full-session read). Reads
+# of a long session are therefore bounded by timestamp slices of this many
+# stored events, which the scan prunes on, so each child's cost stays flat
+# (prod: a 100k slice is 0.9 s warm but 3.5 s on a cold file cache; 50k keeps
+# a cold slice well inside the deadline).
+SESSION_SLICE_EVENTS = 50_000
+# Prompt turns are searched for, newest slice first, at most this far back. A
+# longer session without a substantive turn in that span is an input fault.
+MAX_PROMPT_SCAN_EVENTS = 2_000_000
+PROMPT_TURNS = 30
 
 # Leave headroom below the one MiB process reply ceiling for JSON framing,
 # result metadata, and a pathological page's final row.
@@ -202,44 +228,206 @@ def _tool_projection_sql() -> str:
     """
 
 
-_PAGE_ORDER = "timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data)"
+def _is_lake(con) -> bool:
+    from drover.server.lake.serving import HistoryConnection
+
+    return isinstance(con, HistoryConnection)
 
 
-def _raw_event_page_sql(*, keyset: bool) -> str:
-    """One keyset page of raw events, tool-projected after the page is chosen.
+def _session_bounds_sql(relation: str) -> str:
+    """Timestamps of the newest stored events at the tail and slice boundaries.
 
-    Select and order the page on the raw rows first, then run the JSON/regex
-    tool projection over at most one page. Projecting before ``LIMIT`` made
-    DuckDB evaluate ~30 JSON extractions for every event of the session: for
-    a 40,000-event session that is ~1.6 GB of unspillable expression memory
-    per query child, peaking within a few MB of its 2 GiB cap. The order and
-    the keyset compare the source ``raw_data`` hash in both forms (DuckDB binds
-    ``hash(raw_data)`` in ORDER BY to the source column, not the alias).
+    Row ``n`` is the ``n``-th newest stored event of the session, over physical
+    rows: these are only scan bounds, and every bounded read applies the full
+    serving and dedup semantics within them. Only the narrow timestamp column
+    is read, so on the lake this runs against the base table rather than the
+    serving view, whose per-row JSON costs ~10x as much (6.7 s vs 0.5 s for a
+    GROUP BY over 3.3M prod events).
     """
-    after = (
-        " AND (timestamp, coalesce(id, ''), coalesce(dedup_key, ''), hash(raw_data))"
-        " > (?::TIMESTAMPTZ, ?::VARCHAR, ?::VARCHAR, ?::UBIGINT)"
-        if keyset
-        else ""
+    return f"""SELECT n, ts, total FROM (
+      SELECT ts, row_number() OVER (ORDER BY ts DESC) AS n,
+             count(*) OVER () AS total
+      FROM (SELECT TRY_CAST(timestamp AS TIMESTAMPTZ) AS ts FROM {relation}
+            WHERE session_id = ?)
+      WHERE ts IS NOT NULL
+    ) WHERE n = ? OR n % ? = 0 ORDER BY n LIMIT ?"""
+
+
+def _session_bounds(con, session_id: str) -> tuple[Any, list[Any], int, bool]:
+    """``(tail_lower, slice_lowers, stored_events, capped)`` for one session.
+
+    ``tail_lower`` bounds the newest ``MAX_RAW_EVENTS_PER_SESSION`` stored
+    events (None: the session is not longer than that). ``slice_lowers`` are
+    the newest-first lower bounds of consecutive ``SESSION_SLICE_EVENTS``
+    slices ([] : one unbounded read suffices); ``capped`` means history older
+    than ``MAX_PROMPT_SCAN_EVENTS`` is never read.
+    """
+    max_slices = MAX_PROMPT_SCAN_EVENTS // SESSION_SLICE_EVENTS
+    relation = "lake.agent_events" if _is_lake(con) else "agent_events"
+    rows = con.execute(
+        _session_bounds_sql(relation),
+        [session_id, MAX_RAW_EVENTS_PER_SESSION, SESSION_SLICE_EVENTS, max_slices + 2],
+    ).fetchall()
+    tail_lower = next(
+        (ts for n, ts, _ in rows if n == MAX_RAW_EVENTS_PER_SESSION), None
     )
-    return f"""WITH {_session_agent_events_ctes()},
-    raw_event_page AS (
-      SELECT event_type, raw_data, timestamp, id, dedup_key
-      FROM canonical_agent_events
-      WHERE raw_data IS NOT NULL{after}
-      ORDER BY {_PAGE_ORDER} LIMIT ?
+    slices = [ts for n, ts, _ in rows if n % SESSION_SLICE_EVENTS == 0]
+    stored = rows[0][2] if rows else 0
+    return tail_lower, slices[:max_slices], stored, len(slices) > max_slices
+
+
+def _is_final_assistant(event: dict) -> bool:
+    return event.get("role") == "assistant" and event.get("event_type") not in (
+        "tool_call",
+        "tool_action",
+        "tool_result",
     )
-    SELECT event_type, {_tool_projection_sql()} AS raw_data,
-           timestamp, id, coalesce(dedup_key, '') AS _dedup_key,
-           hash(raw_data) AS _raw_hash FROM raw_event_page
-    ORDER BY {_PAGE_ORDER}"""
+
+
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _turn_order(event: dict):
+    """``ORDER BY timestamp, id`` (NULLS LAST), as the window query orders."""
+    ts = event.get("timestamp")
+    return (ts is None, ts or _EPOCH, event.get("id") or "")
+
+
+def _slice_reads(slices: list[Any], capped: bool):
+    """``(ctes, bound params)`` per read, newest slice first; [] is one read."""
+    if not slices:
+        yield _session_agent_events_ctes(), []
+        return
+    upper = None
+    for lower in slices + ([] if capped else [None]):
+        yield (
+            _session_agent_events_ctes(
+                lower=lower is not None, upper=upper is not None
+            ),
+            [b for b in (lower, upper) if b is not None],
+        )
+        upper = lower
+
+
+def _first_in_slices(
+    con, session_id: str, select: str, slices: list[Any], capped: bool
+) -> Optional[tuple]:
+    """First row whose first column is set, reading slices newest first.
+
+    For ``any_value`` lookups (task id, repository): any slice's answer is a
+    valid answer, so a long session stops at its newest slice that has one.
+    """
+    row = None
+    for ctes, bounds in _slice_reads(slices, capped):
+        row = con.execute(f"WITH {ctes} {select}", [session_id, *bounds]).fetchone()
+        if row and row[0] is not None:
+            return row
+    return row
+
+
+def _read_prompt_window(
+    con, session_id: str, slices: list[Any], capped: bool
+) -> list[dict]:
+    """The prompt's substantive turns, walking time slices newest first.
+
+    Without slices this is one ``select_substantive_window`` read of the whole
+    session, exactly as before. Otherwise each slice contributes its own
+    window; slices are disjoint in time, so once newer slices hold
+    ``PROMPT_TURNS`` turns and a final assistant reply, older ones cannot
+    change the result. A logical event duplicated across a slice boundary is
+    kept once (newest slice wins) rather than ranked against its older copy.
+    """
+    from drover.server.summarizer.derive import select_substantive_window
+
+    if not slices:
+        return select_substantive_window(
+            con, _session_agent_events_ctes(), session_id, PROMPT_TURNS
+        )
+    found: dict[Any, dict] = {}
+    for ctes, bounds in _slice_reads(slices, capped):
+        for event in select_substantive_window(
+            con, ctes, session_id, PROMPT_TURNS, bounds=bounds
+        ):
+            key = event.get("dedup_key") or (event.get("id"), event.get("timestamp"))
+            found.setdefault(key, event)
+        if len(found) >= PROMPT_TURNS and any(
+            _is_final_assistant(e) for e in found.values()
+        ):
+            break
+    newest = sorted(
+        found.values(),
+        key=lambda e: (e.get("timestamp") is not None, *_turn_order(e)[1:]),
+        reverse=True,
+    )
+    window = newest[:PROMPT_TURNS]
+    final = next((e for e in newest if _is_final_assistant(e)), None)
+    if final is not None and final not in window:
+        window.append(final)
+    return sorted(window, key=_turn_order)
+
+
+def _tool_facts_sql(*, lower: bool, after: bool) -> str:
+    """Distinct tool facts of the session's newest raw events, with counts.
+
+    Choose the newest ``MAX_RAW_EVENTS_PER_SESSION`` canonical raw events on
+    the raw rows first, then run the JSON/regex tool projection over at most
+    that many rows (projecting before ``LIMIT`` costs ~1.6 GB of expression
+    memory for a 40k-event session), then collapse identical projections into
+    one ``(event_type, raw_data, n)`` group. The derivations only count and
+    collect, so groups lose nothing, and a tail of thousands of events is
+    typically a handful of rows: one child instead of one per 1,000 events.
+    Groups page by keyset on ``(event_type, raw_data)``.
+    """
+    keyset = " WHERE (event_type, raw_data) > (?, ?)" if after else ""
+    return f"""WITH {_session_agent_events_ctes(lower=lower)},
+    recent_events AS (
+      SELECT event_type, raw_data FROM canonical_agent_events
+      WHERE raw_data IS NOT NULL
+      ORDER BY timestamp DESC, coalesce(id, '') DESC,
+               coalesce(dedup_key, '') DESC, hash(raw_data) DESC
+      LIMIT ?
+    ),
+    tool_facts AS (
+      SELECT coalesce(event_type, '') AS event_type,
+             coalesce({_tool_projection_sql()}, '') AS raw_data
+      FROM recent_events
+    )
+    SELECT event_type, raw_data, count(*) AS n FROM tool_facts{keyset}
+    GROUP BY event_type, raw_data ORDER BY event_type, raw_data LIMIT ?"""
+
+
+def _read_tool_facts(
+    con, session_id: str, tail_lower: Any
+) -> tuple[list[str], dict[str, int]]:
+    """``(files_touched, tools_used)`` over the session's newest raw events."""
+    from collections import Counter
+
+    files: set[str] = set()
+    tools: Counter[str] = Counter()
+    after: list[str] = []
+    bound = [] if tail_lower is None else [tail_lower]
+    sql = {
+        flag: _tool_facts_sql(lower=tail_lower is not None, after=flag)
+        for flag in (False, True)
+    }
+    while True:
+        params = [session_id, *bound, MAX_RAW_EVENTS_PER_SESSION, *after]
+        rows = _execute_raw_event_page(
+            con, sql[bool(after)], params + [RAW_EVENT_PAGE_ROWS]
+        ).fetchall()
+        for event_type, raw_data, n in rows:
+            event = [{"event_type": event_type, "raw_data": raw_data}]
+            files.update(compute_files_touched(event))
+            for name, count in compute_tools_used(event).items():
+                tools[name] += count * n
+        if len(rows) < RAW_EVENT_PAGE_ROWS:
+            return sorted(files), dict(tools)
+        after = [rows[-1][0], rows[-1][1]]
 
 
 def _execute_raw_event_page(con, sql: str, params: list[Any]):
     """Execute one page with an explicit reply budget on the lake facade."""
-    from drover.server.lake.serving import HistoryConnection
-
-    if isinstance(con, HistoryConnection):
+    if _is_lake(con):
         from drover.server.lake.query_process import QueryLimits
 
         return con.execute(
@@ -457,64 +645,36 @@ class SummarizerWorker:
         session_id = job.subject_key
         con = _open_summarizer_db(self.duckdb_path)
         try:
-            from drover.server.summarizer.derive import select_substantive_window
-
-            events = select_substantive_window(
-                con, _session_agent_events_ctes(), session_id
-            )
+            tail_lower, slices, stored, capped = _session_bounds(con, session_id)
+            events = _read_prompt_window(con, session_id, slices, capped)
             if not events:
+                scope = (
+                    f" in its most recent {MAX_PROMPT_SCAN_EVENTS} events"
+                    if capped
+                    else ""
+                )
                 raise RuntimeError(
-                    f"no events for session {session_id}: no substantive turns"
+                    f"no events for session {session_id}: no substantive turns{scope}"
                 )
-            tool_events = []
-            last_timestamp = None
-            last_id = None
-            last_dedup_key = None
-            last_raw_hash = None
-            page_size = RAW_EVENT_PAGE_ROWS
-            while len(tool_events) < MAX_RAW_EVENTS_PER_SESSION:
-                if last_timestamp is None:
-                    cur = _execute_raw_event_page(
-                        con, _raw_event_page_sql(keyset=False), [session_id, page_size]
-                    )
-                else:
-                    cur = _execute_raw_event_page(
-                        con,
-                        _raw_event_page_sql(keyset=True),
-                        [
-                            session_id,
-                            last_timestamp,
-                            last_id or "",
-                            last_dedup_key or "",
-                            last_raw_hash,
-                            page_size,
-                        ],
-                    )
-
-                cols = [d[0] for d in cur.description]
-                chunk = [dict(zip(cols, r)) for r in cur.fetchall()]
-                if not chunk:
-                    break
-
-                tool_events.extend(
-                    chunk[: MAX_RAW_EVENTS_PER_SESSION - len(tool_events)]
-                )
-                last_timestamp = chunk[-1]["timestamp"]
-                last_id = chunk[-1]["id"]
-                last_dedup_key = chunk[-1]["_dedup_key"]
-                last_raw_hash = chunk[-1]["_raw_hash"]
-            if len(tool_events) == MAX_RAW_EVENTS_PER_SESSION:
-                log.warning(
-                    "Truncated session %s to %d raw events for summarization",
-                    session_id,
-                    MAX_RAW_EVENTS_PER_SESSION,
-                )
+            files, tools = _read_tool_facts(con, session_id, tail_lower)
         finally:
             con.close()
+        truncation = None
+        if tail_lower is not None:
+            log.warning(
+                "Truncated session %s to %d raw events for summarization "
+                "(%d stored events)",
+                session_id,
+                MAX_RAW_EVENTS_PER_SESSION,
+                stored,
+            )
+            truncation = (
+                f"Files and tools are derived from the most recent "
+                f"{MAX_RAW_EVENTS_PER_SESSION:,} of this session's "
+                f"{stored:,} stored events."
+            )
 
         agent_id = events[-1].get("agent_id") or "unknown"
-        files = compute_files_touched(tool_events)
-        tools = compute_tools_used(tool_events)
 
         last_user = next(
             (e["content"] for e in reversed(events) if e.get("role") == "user"), ""
@@ -569,6 +729,8 @@ class SummarizerWorker:
         missing_refs = [ref for ref in refs if ref not in llm["summary_md"]]
         if missing_refs:
             llm["summary_md"] += "\n\nFinal references: " + ", ".join(missing_refs)
+        if truncation:
+            llm["summary_md"] += "\n\n_" + truncation + "_"
 
         # The test seam is deliberately before the single completion transaction:
         # any superseding generation either wins first and makes this stale, or is
@@ -579,14 +741,18 @@ class SummarizerWorker:
         # so the PostgreSQL transaction holds its row locks for writes only.
         con = _open_summarizer_db(self.duckdb_path)
         try:
-            task_id = events[0].get("has_raw_data") and _safe_task_id(con, session_id)
-            project_row = con.execute(
-                f"""WITH {_session_agent_events_ctes()}
-                   SELECT any_value(repo_owner), any_value(repo_name)
+            task_id = events[0].get("has_raw_data") and _safe_task_id(
+                con, session_id, slices, capped
+            )
+            project_row = _first_in_slices(
+                con,
+                session_id,
+                """SELECT any_value(repo_owner), any_value(repo_name)
                    FROM canonical_agent_events
                    WHERE repo_owner IS NOT NULL AND repo_name IS NOT NULL""",
-                [session_id],
-            ).fetchone()
+                slices,
+                capped,
+            )
         finally:
             con.close()
         project_key = (
@@ -658,14 +824,20 @@ def _as_utc(ts: Any) -> Any:
     return ts
 
 
-def _safe_task_id(con: duckdb.DuckDBPyConnection, session_id: str) -> Optional[str]:
+def _safe_task_id(
+    con: duckdb.DuckDBPyConnection,
+    session_id: str,
+    slices: Sequence[Any] = (),
+    capped: bool = False,
+) -> Optional[str]:
     try:
-        row = con.execute(
-            f"""WITH {_session_agent_events_ctes()}
-               SELECT any_value(task_id)
-               FROM canonical_agent_events""",
-            [session_id],
-        ).fetchone()
+        row = _first_in_slices(
+            con,
+            session_id,
+            "SELECT any_value(task_id) FROM canonical_agent_events",
+            list(slices),
+            capped,
+        )
         return row[0] if row else None
     except duckdb.Error:
         return None

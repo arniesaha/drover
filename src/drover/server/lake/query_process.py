@@ -188,6 +188,19 @@ def query(
         )
 
 
+def load_identities(con, identities: list) -> None:
+    """Fill ``memory_session_identity`` in one statement.
+
+    ``executemany`` costs ~0.2 ms a row, which every serving child paid (0.6 s
+    at 3,000 sessions); one JSON parameter costs ~3 ms for the same rows.
+    """
+    con.execute(
+        "INSERT INTO memory_session_identity SELECT r[1], r[2], r[3],"
+        " r[4]::TIMESTAMPTZ FROM (SELECT unnest(CAST(?::JSON AS VARCHAR[][])) AS r)",
+        [json.dumps(identities)],
+    )
+
+
 def _worker(request: dict) -> dict:
     from .fence import reader_fence
 
@@ -212,6 +225,12 @@ def _worker(request: dict) -> dict:
         if len(statements) != 1 or str(statements[0].type) != "StatementType.SELECT":
             raise LakeError("analytics_read_query_required")
         if serving := request.get("serving"):
+            if serving.get("operation"):
+                # A read model binds the snapshot it reads: taken before the
+                # transaction, rechecked inside it (read_models.run_model).
+                serving["snapshot_before"] = con.execute(
+                    "SELECT max(snapshot_id) FROM lake.snapshots()"
+                ).fetchone()[0]
             con.execute("BEGIN TRANSACTION")
             from .serving_proof import check_proof
 
@@ -223,9 +242,7 @@ def _worker(request: dict) -> dict:
             if len(identities) > 10000:
                 raise LakeError("analytics_identity_limit_exceeded")
             if identities:
-                con.executemany(
-                    "INSERT INTO memory_session_identity VALUES (?,?,?,?)", identities
-                )
+                load_identities(con, identities)
             con.execute("""CREATE TEMP VIEW agent_events AS
                 SELECT * EXCLUDE(timestamp,repo_owner,repo_name), TRY_CAST(timestamp AS TIMESTAMPTZ) AS timestamp,
                   COALESCE(repo_owner, CASE WHEN json_valid(raw_data) THEN json_extract_string(raw_data,'$._repo_owner') END) AS repo_owner,

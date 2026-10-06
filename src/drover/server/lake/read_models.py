@@ -28,7 +28,7 @@ def _read_model(path, operation, **options):
     control = control_store_config(path)
     if control is None or control.backend != "postgres":
         raise LakeError("lake_serving_requires_postgres")
-    from .task_projection import _capture, _hash
+    from .task_projection import _hash
 
     if operation in ("fleet", "contexts"):
         limit = options.get("limit", 1000)
@@ -36,12 +36,21 @@ def _read_model(path, operation, **options):
             raise LakeError("analytics_row_limit_exceeded")
     from .coverage import heads
 
+    def hub_binding(config, identities):
+        return {
+            "epoch": config.epoch,
+            "proof": config.verification_sha256,
+            "root": str(lake_spec(config).data_root.resolve()),
+            "identities": _hash(identities),
+        }
+
     source_heads = heads(path)
-    binding, _ = _capture(path)
     # PG identity snapshot is bounded by the existing cursor path.
     with open_history(path) as history:
-        if _hash(history.identities) != binding["identities"]:
-            raise LakeError("analytics_identity_changed")
+        # The lake snapshot is bound inside the one read child (run_model);
+        # capturing it in token children before and after cost two more
+        # serialized children, ~1 s of a ~2 s cockpit overview on prod.
+        binding = hub_binding(config, history.identities)
         result = query(
             lake_spec(config),
             "SELECT 1",
@@ -55,13 +64,20 @@ def _read_model(path, operation, **options):
                 "control_store": asdict(control),
             },
         )
-    if (
-        result["binding"] != binding
-        or _capture(path)[0] != binding
-        or heads(path) != source_heads
-    ):
+    bound = {k: v for k, v in result["binding"].items() if k != "snapshot"}
+    if bound != binding or heads(path) != source_heads:
         raise LakeError("analytics_read_model_changed")
+    # The epoch/proof selection and the PG identities must still be the ones
+    # the child read under when it returns. open_history is one PG query on
+    # the hub, not a lake child (the old post-read token child also re-ran it).
+    with open_history(path) as after:
+        if hub_binding(selected_config(path), after.identities) != binding:
+            raise LakeError("analytics_read_model_changed")
     return result["payload"]
+
+
+def _snapshot(con):
+    return con.execute("SELECT max(snapshot_id) FROM lake.snapshots()").fetchone()[0]
 
 
 def _control_snapshot(con, request):
@@ -209,6 +225,15 @@ def _control_snapshot(con, request):
 
 
 def run_model(con, request, limits):
+    # The newest snapshot before this child's transaction must still be the
+    # newest inside it, before and after the read: then the payload is exactly
+    # that snapshot's, whether or not lake.snapshots() is transaction-pinned.
+    if "snapshot_before" not in request:
+        raise LakeError("analytics_read_model_changed")
+    snapshot = request["snapshot_before"]
+    if _snapshot(con) != snapshot:
+        raise LakeError("analytics_read_model_changed")
+    request = {**request, "binding": {**request["binding"], "snapshot": snapshot}}
     native_freshness, contexts, context_metadata, context_error = _control_snapshot(
         con, request
     )
@@ -243,12 +268,7 @@ def run_model(con, request, limits):
         + " WHERE FALSE"
     )
     options = request["options"]
-    binding = {
-        **request["binding"],
-        "snapshot": con.execute(
-            "SELECT max(snapshot_id) FROM lake.snapshots()"
-        ).fetchone()[0],
-    }
+    binding = request["binding"]
     for value in native_freshness.values():
         value.setdefault("generation", None)
         value["coverage_binding"] = binding
@@ -336,4 +356,6 @@ def run_model(con, request, limits):
 
     if list_rows(payload) > limits.rows:
         raise LakeError("analytics_row_limit_exceeded")
+    if _snapshot(con) != snapshot:
+        raise LakeError("analytics_read_model_changed")
     return {"payload": payload, "binding": binding, "rows": []}
