@@ -127,6 +127,7 @@ complete):
 | `A2_outbox_dedup_no_parquet` | each event once in the outbox; no ingest parquet |
 | `A4_cockpit_overview` | 5 × `/cockpit/overview?days=30`, activity `ok`, p95 < 2 s |
 | `A3_summarize_largest_session` | summary job for the largest imported session (by stored rows) succeeded |
+| `A3_summarize_most_recent_session` | summary job for the most recently active session with a user/assistant turn succeeded |
 | `A7_pre_watermark_archived` | a session older than the watermark replays as `archived` |
 | `A6_rollback_outbox_replay` | `outbox replay --sink legacy` restores gate events; `/healthz` ok |
 | `hub_rss_budget` | **spare hub peak RSS** ≤ `DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT` |
@@ -229,6 +230,35 @@ the 5M synthetic lake (`HUGE_SESSION_ID`), shaped like the production one. Its
 substantive turns are only in its first 24k events. The A3 scale test picks
 the largest session with the gate's own query and summarizes it. It requires
 success, no child error, every child under 1 GiB, and the truncation note.
+
+### The live session after the switch (2026-10-06)
+
+The switch ran 7/7, then every summary of the live Claude Code session
+`4c298e83-…` failed with `analytics_unavailable`. That session had 57,936
+events, straddling the fenced delta import and the exporter. A3 had passed
+because it summarizes the largest *imported* session, which is old history.
+
+The real cause was hidden by the query child. Any non-`LakeError` exception
+was reported as a bare `analytics_unavailable`. Driving the same read path
+in-process against the production lake (reader DSN) showed
+`OutOfMemoryException: … (721.1 MiB/732.4 MiB used)` in the tool-facts query,
+at the child's 768 MB `memory_limit`. The 25k-event tail held only 17 MB of
+`raw_data`. The projection ran ~40 separate `json_extract*` calls per event
+under a `CASE WHEN json_valid(…)` guard, and with megabyte-sized events in a
+vector the parsed documents exhausted the limit. That failed 4 of the 25 most
+recently active production sessions.
+
+- The projection now extracts every field with one multi-path
+  `json_extract_string(raw_data, [paths])`, wrapped in `try()` instead of
+  the `CASE` guard. The failing query went from OOM to 0.58 s at 256 MiB
+  child peak RSS. On the other 21 recent sessions the files and tools are
+  identical to the old projection.
+- The child replies with a stable code plus a sanitized `detail` (class and
+  first message line, DSN material scrubbed). DuckDB OOM gets its own code,
+  `analytics_memory_limit_exceeded`. The summarizer logs and stores
+  `code: detail`.
+- New gate check `A3_summarize_most_recent_session`. On the production lake
+  its picker selects `4c298e83-…` (0.98 s, 156 MiB).
 
 ## 3–5. Backup, fenced switch, verify
 

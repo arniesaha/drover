@@ -170,6 +170,54 @@ def test_process_limits_kill_and_reap(script, limits, error, tmp_path):
     )
 
 
+def test_child_failure_carries_its_cause_to_the_hub(tmp_path):
+    """The query child's real error reaches the LakeError, not a bare code."""
+    request = tmp_path / "request.json"
+    request.write_text('{"sql": "SELECT 1"}')  # no spec: the worker raises
+    with pytest.raises(LakeError) as caught:
+        run_disposable(
+            [sys.executable, "-m", "drover.server.lake.query_process", str(request)],
+            admission_path=tmp_path / "admission",
+            limits=QueryLimits(),
+            cwd=tmp_path,
+        )
+    assert caught.value.code == "analytics_unavailable"
+    assert caught.value.detail == "KeyError: 'spec'"
+
+
+def test_child_error_reply_names_the_class_and_scrubs_secrets():
+    from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
+    from drover.server.lake.query_process import error_reply
+
+    dsn = "host=db.internal user=reader password=hunter22 dbname=lake"
+    oom = duckdb.OutOfMemoryException(
+        "Out of Memory Error: failed to allocate data of size 16.0 MiB "
+        "(721.1 MiB/732.4 MiB used)\n\nPossible solutions: ..."
+    )
+    assert error_reply(oom, dsn) == {
+        "error": "analytics_memory_limit_exceeded",
+        "detail": "OutOfMemoryException: Out of Memory Error: failed to allocate "
+        "data of size 16.0 MiB (721.1 MiB/732.4 MiB used)",
+    }
+    leaked = error_reply(
+        RuntimeError("could not connect: host=db.internal password=hunter22"), dsn
+    )
+    assert leaked["error"] == "analytics_unavailable"
+    assert leaked["detail"].startswith("RuntimeError: could not connect")
+    assert "hunter22" not in leaked["detail"]
+    assert "db.internal" not in leaked["detail"]
+    assert error_reply(LakeError("analytics_time_travel_disabled"), dsn) == {
+        "error": "analytics_time_travel_disabled"
+    }
+    assert error_reply(LakeError("x", "Error: clean cause"), dsn) == {
+        "error": "x",
+        "detail": "Error: clean cause",
+    }
+    assert error_reply(AnalyticsSnapshotChangedError(), dsn)["error"] == (
+        "snapshot_changed"
+    )
+
+
 def test_query_limit_configuration_cannot_weaken_release_caps():
     for kwargs in (
         {"rss_bytes": 3 * 1024**3},

@@ -115,6 +115,12 @@ session_agent_events AS (
 """.strip()
 
 
+def _describe(exc: BaseException) -> str:
+    """The failure text for the log and the job: a lake code plus its cause."""
+    detail = getattr(exc, "detail", None)
+    return f"{exc}: {detail}" if detail else str(exc)
+
+
 def _classify_failure(exc: BaseException) -> tuple[bool, str]:
     """(retryable, category) for one failed summarize attempt.
 
@@ -125,7 +131,7 @@ def _classify_failure(exc: BaseException) -> tuple[bool, str]:
     availability, and errors nobody has classified yet -- is retried with
     backoff and dead-letters when the budget runs out.
     """
-    message = str(exc)
+    message = _describe(exc)
     if message.startswith("no events for session"):
         return False, "no_events"
     category = classify_summarize_error(message)["category"]
@@ -158,73 +164,84 @@ RAW_EVENT_PAGE_BYTES = 768 * 1024
 RAW_EVENT_PAGE_ROWS = 1000
 
 
+# Every raw field the tool projection reads, extracted by ONE multi-path
+# ``json_extract_string`` call so each event is parsed once. Extracting them
+# one call at a time parsed each event ~40 times per vector, which pushed the
+# query child past its 768 MB DuckDB memory limit on an active Claude Code
+# session whose tail holds megabyte-sized events (prod, Oct 2026; the tail's
+# raw_data is only 17 MB in total). Invalid JSON is caught by ``try()``, not
+# ``CASE WHEN json_valid(...)``: on DuckDB 1.5.5 a JSON call inside that CASE
+# exhausts the limit on the same rows even when it is the only one.
+_TOOL_PATHS = (
+    "$.tool_name",
+    "$.name",
+    "$.tool.name",
+    "$.tool_use_blocks[0].name",
+    "$.tool",
+    "$.tool_use_blocks",
+    "$.path",
+    "$.file_path",
+    *(
+        f"$.{base}.{key}"
+        for base in ("tool.input", "tool.arguments", "input", "arguments")
+        for key in ("path", "file_path", "patch", "command", "text")
+    ),
+)
+
+
 def _tool_projection_sql() -> str:
     """A bounded raw-data projection sufficient for deterministic derivations.
 
     Tool names and file paths are the only raw fields the post-summary
     derivations consume. ``derived_files`` retains paths encoded in patch
     commands without sending the command itself through the bounded child
-    reply.
+    reply. The fields are extracted once into a list that a single-element
+    ``list_transform`` binds to ``f``, so the expression stays scalar.
     """
-    return """
-    CASE WHEN json_valid(raw_data) THEN json_object(
-      'tool_name', coalesce(
-        json_extract_string(raw_data, '$.tool_name'),
-        json_extract_string(raw_data, '$.name'),
-        json_extract_string(raw_data, '$.tool.name'),
-        json_extract_string(raw_data, '$.tool_use_blocks[0].name')
-      ),
+
+    def field(path: str) -> str:
+        return f"f[{_TOOL_PATHS.index(path) + 1}]"
+
+    def first(*paths: str) -> str:
+        return "coalesce(" + ", ".join(field(p) for p in paths) + ")"
+
+    patch_files = ",\n        ".join(
+        f"coalesce(regexp_extract_all({field(f'$.{base}.{key}')}, "
+        "'\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[])"
+        for base in ("tool.input", "tool.arguments", "input", "arguments")
+        for key in ("patch", "command", "text")
+    )
+    paths = ", ".join(f"'{p}'" for p in _TOOL_PATHS)
+    return f"""
+    list_transform(
+      list_filter([try(json_extract_string(raw_data, [{paths}]))], f -> f IS NOT NULL),
+      f -> json_object(
+      'tool_name', {first('$.tool_name', '$.name', '$.tool.name', '$.tool_use_blocks[0].name')},
       'tool_use_blocks', json_transform(
-        json_extract(raw_data, '$.tool_use_blocks'),
-        '[{"name": "VARCHAR", "input": {"path": "VARCHAR", "file_path": "VARCHAR"}}]'
+        {field('$.tool_use_blocks')},
+        '[{{"name": "VARCHAR", "input": {{"path": "VARCHAR", "file_path": "VARCHAR"}}}}]'
       ),
       'tool', json_object(
-        'name', coalesce(
-          json_extract_string(raw_data, '$.tool.name'),
-          json_extract_string(raw_data, '$.tool_name'),
-          json_extract_string(raw_data, '$.name'),
-          json_extract_string(raw_data, '$.tool')
-        ),
+        'name', {first('$.tool.name', '$.tool_name', '$.name', '$.tool')},
         'input', json_object(
-          'path', coalesce(
-            json_extract_string(raw_data, '$.tool.input.path'),
-            json_extract_string(raw_data, '$.tool.arguments.path'),
-            json_extract_string(raw_data, '$.input.path'),
-            json_extract_string(raw_data, '$.arguments.path')
-          ),
-          'file_path', coalesce(
-            json_extract_string(raw_data, '$.tool.input.file_path'),
-            json_extract_string(raw_data, '$.tool.arguments.file_path'),
-            json_extract_string(raw_data, '$.input.file_path'),
-            json_extract_string(raw_data, '$.arguments.file_path')
-          )
+          'path', {first('$.tool.input.path', '$.tool.arguments.path', '$.input.path', '$.arguments.path')},
+          'file_path', {first('$.tool.input.file_path', '$.tool.arguments.file_path', '$.input.file_path', '$.arguments.file_path')}
         )
       ),
       'input', json_object(
-        'path', json_extract_string(raw_data, '$.input.path'),
-        'file_path', json_extract_string(raw_data, '$.input.file_path')
+        'path', {field('$.input.path')},
+        'file_path', {field('$.input.file_path')}
       ),
       'arguments', json_object(
-        'path', json_extract_string(raw_data, '$.arguments.path'),
-        'file_path', json_extract_string(raw_data, '$.arguments.file_path')
+        'path', {field('$.arguments.path')},
+        'file_path', {field('$.arguments.file_path')}
       ),
-      'path', coalesce(json_extract_string(raw_data, '$.path'), json_extract_string(raw_data, '$.file_path')),
-      'file_path', json_extract_string(raw_data, '$.file_path'),
+      'path', {first('$.path', '$.file_path')},
+      'file_path', {field('$.file_path')},
       'derived_files', to_json(list_concat(
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.input.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.tool.arguments.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.input.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.patch'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.command'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[]),
-        coalesce(regexp_extract_all(json_extract_string(raw_data, '$.arguments.text'), '\\*\\*\\* (?:Add|Update|Delete) File: ([^\\n]+)', 1), []::VARCHAR[])
+        {patch_files}
       ))
-    )::VARCHAR END
+    )::VARCHAR)[1]
     """
 
 
@@ -601,7 +618,7 @@ class SummarizerWorker:
             )
             return "released"
         except Exception as exc:  # noqa: BLE001
-            log.exception("summarize %s failed: %s", session_id, exc)
+            log.exception("summarize %s failed: %s", session_id, _describe(exc))
             return self._finish_failure(ledger, job, exc)
 
         if not written:
@@ -620,7 +637,9 @@ class SummarizerWorker:
         """Spend one failure of the leased generation's budget."""
         self._before_failure_finish()
         retryable, category = _classify_failure(exc)
-        outcome = ledger.fail(job, str(exc), retryable=retryable, category=category)
+        outcome = ledger.fail(
+            job, _describe(exc), retryable=retryable, category=category
+        )
         if outcome == "stale":
             # Superseded or reclaimed while the model ran: the newer owner
             # keeps its budget, and this failure is simply dropped.
@@ -631,7 +650,11 @@ class SummarizerWorker:
             )
         elif outcome in ("dead_lettered", "quarantined"):
             log.warning(
-                "summarize %s %s (%s): %s", job.subject_key, outcome, category, exc
+                "summarize %s %s (%s): %s",
+                job.subject_key,
+                outcome,
+                category,
+                _describe(exc),
             )
         return outcome
 

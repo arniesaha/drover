@@ -1,4 +1,11 @@
-"""Process RSS guard; the hub budget excludes disposable query children."""
+"""Process memory guard; the hub budget excludes disposable query children.
+
+The budget is checked against the memory the process actually owns. On Linux
+that is RSS. On macOS it is ``phys_footprint`` (what Activity Monitor and
+``footprint`` report): there RSS also counts pages the allocator has freed
+but keeps resident ("Malloc Small (empty)"), so a hub that peaked once stays
+"over" forever. Prod after the v2 switch: RSS 4.54 GB, footprint 266 MB.
+"""
 
 from __future__ import annotations
 
@@ -55,17 +62,87 @@ def process_rss(pid: int) -> int:
     return int(result.stdout.strip()) * 1024
 
 
+@lru_cache(maxsize=1)
+def _darwin_rusage():
+    function = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pid_rusage
+    function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    return function
+
+
+def process_footprint(pid: int) -> tuple[int, int]:
+    """``(phys_footprint, lifetime_max_phys_footprint)`` in bytes (macOS).
+
+    macOS SDK sys/resource.h: RUSAGE_INFO_V4=4; ``rusage_info_v4`` is a
+    16-byte uuid then uint64_t fields, ``ri_phys_footprint`` at offset 72 and
+    ``ri_lifetime_max_phys_footprint`` at 240 (296 bytes in all). The
+    lifetime maximum is the kernel's own high-water mark, so a startup spike
+    between two samples is still reported.
+    """
+    buffer = ctypes.create_string_buffer(296)
+    if _darwin_rusage()(pid, 4, buffer) != 0:
+        raise OSError(ctypes.get_errno(), "process footprint unavailable")
+    return (
+        struct.unpack_from("=Q", buffer, 72)[0],
+        struct.unpack_from("=Q", buffer, 240)[0],
+    )
+
+
+#: What the hub budget is checked against on this platform.
+HUB_MEASUREMENT = "phys_footprint" if sys.platform == "darwin" else "rss"
+
+
+def hub_memory_bytes(pid: int) -> int:
+    if HUB_MEASUREMENT == "phys_footprint":
+        return process_footprint(pid)[0]
+    return process_rss(pid)
+
+
+_SAMPLE_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
+
+
+def memory_note(pid: int | None = None) -> str:
+    """One log-friendly reading, e.g. after each startup phase.
+
+    On macOS the lifetime peak is the kernel's high-water mark, so the phase
+    that set it is the first one whose note shows it.
+    """
+    pid = os.getpid() if pid is None else pid
+    parts = []
+    try:
+        if HUB_MEASUREMENT == "phys_footprint":
+            footprint, lifetime = process_footprint(pid)
+            parts += [f"phys_footprint={footprint}", f"lifetime_peak={lifetime}"]
+        parts.append(f"rss={process_rss(pid)}")
+    except _SAMPLE_ERRORS:
+        parts.append("memory=unavailable")
+    return " ".join(parts)
+
+
 class ProcessMemoryGuard:
     def __init__(
-        self, config: MemoryBudgetConfig = MemoryBudgetConfig(), *, reader=process_rss
+        self,
+        config: MemoryBudgetConfig = MemoryBudgetConfig(),
+        *,
+        reader=None,
+        measurement: str | None = None,
     ):
+        """``reader(pid)`` returns the budgeted bytes; it measures ``measurement``.
+
+        By default that is this platform's :data:`HUB_MEASUREMENT`. A custom
+        reader is taken to measure RSS unless told otherwise.
+        """
         self.config = config
-        self.reader = reader
+        self.reader = reader or hub_memory_bytes
+        self.measurement = measurement or (HUB_MEASUREMENT if reader is None else "rss")
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
-        self._rss = None
+        self._measured = None
         self._peak = 0
+        self._rss = None
+        self._rss_peak = 0
+        self._lifetime_peak = None
         self._state = "warn"
         self._error = False
         self._sampled_at = None
@@ -75,38 +152,64 @@ class ProcessMemoryGuard:
         self._child_completed = 0
         self._child_peak = 0
 
-    def sample(self):
+    def _side_readings(self, pid: int, measured):
+        """``(rss, lifetime peak footprint)``: reported, never budgeted."""
+        if self.measurement == "rss":
+            return measured, None
         try:
-            rss = self.reader(os.getpid())
+            rss = process_rss(pid)
+        except _SAMPLE_ERRORS:
+            rss = None
+        lifetime = None
+        if self.measurement == "phys_footprint":
+            try:
+                lifetime = process_footprint(pid)[1]
+            except _SAMPLE_ERRORS:
+                pass
+        return rss, lifetime
+
+    def sample(self):
+        pid = os.getpid()
+        try:
+            measured = self.reader(pid)
             state = (
                 "over"
-                if rss > self.config.rss_budget_bytes
+                if measured > self.config.rss_budget_bytes
                 else (
                     "warn"
-                    if rss >= self.config.rss_budget_bytes * self.config.warn_fraction
+                    if measured
+                    >= self.config.rss_budget_bytes * self.config.warn_fraction
                     else "ok"
                 )
             )
-        except (OSError, ValueError, subprocess.SubprocessError):
-            rss, state = None, "warn"
+        except _SAMPLE_ERRORS:
+            measured, state = None, "warn"
+        rss, lifetime = self._side_readings(pid, measured)
         now = time.monotonic()
         with self._lock:
             warn = state == "over" and (
                 self._state != "over" or now - self._last_warning >= 60
             )
-            self._rss, self._state, self._error, self._sampled_at = (
-                rss,
+            self._measured, self._state, self._error, self._sampled_at = (
+                measured,
                 state,
-                rss is None,
+                measured is None,
                 now,
             )
-            self._peak = max(self._peak, rss or 0)
+            self._peak = max(self._peak, measured or 0)
+            self._rss = rss
+            self._rss_peak = max(self._rss_peak, rss or 0)
+            if lifetime is not None:
+                self._lifetime_peak = lifetime
             if warn:
                 self._last_warning = now
         if warn:
+            label = "RSS" if self.measurement == "rss" else self.measurement
             log.warning(
-                "server RSS over budget: rss_bytes=%d budget_bytes=%d",
-                rss,
+                "server %s over budget: %s_bytes=%d budget_bytes=%d",
+                label,
+                self.measurement,
+                measured,
                 self.config.rss_budget_bytes,
             )
 
@@ -154,11 +257,22 @@ class ProcessMemoryGuard:
         if stale:
             self.sample()
         with self._lock:
+            extra = (
+                {"lifetime_peak_footprint_bytes": self._lifetime_peak}
+                if self.measurement == "phys_footprint"
+                else {}
+            )
             return {
+                # ``state`` compares ``measured_bytes`` with ``budget_bytes``;
+                # RSS is reported alongside it, on macOS for diagnosis only.
+                "measurement": self.measurement,
+                "measured_bytes": self._measured,
+                "peak_measured_bytes": self._peak,
+                **extra,
                 "rss_bytes": self._rss,
                 "budget_bytes": self.config.rss_budget_bytes,
                 "state": self._state,
-                "peak_rss_bytes": self._peak,
+                "peak_rss_bytes": self._rss_peak,
                 "measurement_error": self._error,
                 "sample_interval_seconds": self.config.sample_interval_seconds,
                 "query_children": {

@@ -817,6 +817,59 @@ def test_gate_child_env_strips_production_secrets(tmp_path, monkeypatch):
     assert env["DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT"] == "4GB"
 
 
+def test_gate_a3_summarizes_the_largest_and_the_most_recent_session(
+    tmp_path, monkeypatch
+):
+    """v0.6.1 passed A3 (largest, old) and then failed the live session."""
+    from types import SimpleNamespace
+
+    import duckdb
+
+    from drover.server.lake import serving
+    from drover.server.lake.gate import GateOptions
+
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS lake")
+    con.execute(
+        "CREATE TABLE lake.agent_events(session_id VARCHAR, timestamp VARCHAR,"
+        " role VARCHAR, content VARCHAR)"
+    )
+    rows = [("big", f"2026-09-01T00:00:{i:02d}Z", "user", "hi") for i in range(5)]
+    rows += [
+        ("live", "2026-10-06T18:47:47Z", "assistant", "done"),
+        ("live", "2026-10-06T18:40:00Z", "user", "go"),
+        # Newer, but nothing to summarize: it would quarantine as no_events.
+        ("meta", "2026-10-06T19:00:00Z", None, None),
+        ("drover-gate-x-a1", "2026-10-06T20:00:00Z", "user", "gate"),
+    ]
+    con.executemany("INSERT INTO lake.agent_events VALUES (?,?,?,?)", rows)
+
+    class History:
+        def __enter__(self):
+            return con
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(serving, "open_history", lambda path: History())
+    plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
+    options = GateOptions(
+        legacy_root=tmp_path, source_dsn_env="SRC", scratch_admin_dsn_env="DST"
+    )
+    gate = GateRun(plan, options, echo=lambda _: None)
+    summarized = []
+    monkeypatch.setattr(
+        gate,
+        "summarize",
+        lambda session: summarized.append(session)
+        or SimpleNamespace(status="succeeded", last_error=None),
+    )
+    assert gate.a3()[1]["session_id"] == "big"
+    passed, evidence = gate.a3_recent()
+    assert passed and evidence["session_id"] == "live" and evidence["events"] == 2
+    assert summarized == ["big", "live"]
+
+
 def test_gate_refuses_a_scratch_cluster_shared_with_the_source(tmp_path, monkeypatch):
     from drover.server.lake.gate import GateOptions
 

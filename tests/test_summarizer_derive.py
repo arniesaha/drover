@@ -167,6 +167,88 @@ def test_tool_projection_preserves_flat_tool_input() -> None:
     assert compute_tools_used([projected_event]) == {"Edit": 1}
 
 
+def test_tool_projection_of_invalid_json_is_null() -> None:
+    with duckdb.connect() as con:
+        con.execute("CREATE TABLE events(raw_data VARCHAR)")
+        con.executemany(
+            "INSERT INTO events VALUES (?)", [["garbage"], [""], [None], ["5"]]
+        )
+        projected = con.execute(
+            f"SELECT {_tool_projection_sql()} FROM events ORDER BY rowid"
+        ).fetchall()
+    assert [row[0] for row in projected[:3]] == [None, None, None]
+    # Valid JSON without tool fields projects to the all-null shape, as before.
+    assert json.loads(projected[3][0])["derived_files"] == []
+
+
+def test_tool_facts_of_large_events_fit_the_query_child_memory_limit() -> None:
+    """Regression: an active session's big events no longer exhaust DuckDB.
+
+    Prod, 2026-10-06: tool facts for a live Claude Code session failed with
+    ``OutOfMemoryException`` at the query child's 768 MB limit (reported as a
+    bare ``analytics_unavailable``) although its 25k-event tail held 17 MB of
+    raw_data: the projection parsed each event once per extracted field. The
+    same failure at a scaled-down limit: 20 events of 200 KB in 64 MB.
+    """
+    from drover.server.summarizer import worker
+
+    big = "x" * 200_000
+    with duckdb.connect(
+        config={"memory_limit": "64MB", "threads": 1, "preserve_insertion_order": False}
+    ) as con:
+        con.execute("SET TimeZone='UTC'")
+        con.execute(
+            "CREATE TABLE agent_events(id VARCHAR, session_id VARCHAR,"
+            " dedup_key VARCHAR, repo_owner VARCHAR, repo_name VARCHAR,"
+            " timestamp TIMESTAMPTZ, event_type VARCHAR, raw_data VARCHAR)"
+        )
+        rows = [
+            (
+                f"id-{i}",
+                "s",
+                f"k-{i}",
+                "o",
+                "r",
+                f"2026-10-06 00:00:{i:02d}+00",
+                "tool_result",
+                json.dumps(
+                    {
+                        "tool_use_blocks": [
+                            {"name": "Edit", "input": {"file_path": f"f{i}.py"}}
+                        ],
+                        "message": {"content": [{"type": "text", "text": big}]},
+                    }
+                ),
+            )
+            for i in range(20)
+        ]
+        con.executemany("INSERT INTO agent_events VALUES (?,?,?,?,?,?,?,?)", rows)
+        files, tools = worker._read_tool_facts(con, "s", None)
+    assert files == sorted(f"f{i}.py" for i in range(20))
+    assert tools == {"Edit": 20}
+
+
+def test_failure_text_keeps_the_lake_cause() -> None:
+    from drover.server.lake.runtime import LakeError
+    from drover.server.summarizer.worker import _classify_failure, _describe
+
+    exc = LakeError(
+        "analytics_memory_limit_exceeded",
+        "OutOfMemoryException: Out of Memory Error: failed to allocate data",
+    )
+    assert _describe(exc) == (
+        "analytics_memory_limit_exceeded: OutOfMemoryException: "
+        "Out of Memory Error: failed to allocate data"
+    )
+    assert _classify_failure(exc) == (True, "runtime")
+    assert _describe(LakeError("analytics_deadline_exceeded")) == (
+        "analytics_deadline_exceeded"
+    )
+    assert _describe(RuntimeError("no events for session s")) == (
+        "no events for session s"
+    )
+
+
 def _page_fixture(con) -> None:
     """Ties on timestamp/id, duplicate dedup keys, NULL raw_data, another session."""
     con.execute("SET TimeZone='UTC'")
