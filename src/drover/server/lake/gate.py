@@ -923,28 +923,51 @@ class GateRun:
             "ingest_parquet_files": parquet[:5],
         }
 
-    def a3(self):
+    def _summarize_picked(self, sql: str):
         from drover.server.lake.serving import open_history
 
-        # Count stored rows on the base table: the serving view parses every
-        # row's raw_data JSON, which on the 3.3M-event prod import took 6.7 s
-        # and tripped the 5 s child deadline before any summarizing (0.5 s here).
         with open_history(self.client_path) as con:
-            row = con.execute(
-                "SELECT session_id, count(*) AS n FROM lake.agent_events "
-                "WHERE session_id NOT LIKE 'drover-gate-%' "
-                "GROUP BY session_id ORDER BY n DESC LIMIT 1"
-            ).fetchone()
+            row = con.execute(sql).fetchone()
         if not row:
             return False, {"error": "the imported window has no sessions"}
-        session, events = row
+        session, events, last = row
         job = self.summarize(session)
         return job is not None and job.status == "succeeded", {
             "session_id": session,
             "events": events,
+            "last_event_at": last,
             "summary_job": getattr(job, "status", None),
             "last_error": getattr(job, "last_error", None),
         }
+
+    # Both pickers read the base table: the serving view parses every row's
+    # raw_data JSON, which on the 3.3M-event prod import took 6.7 s and
+    # tripped the 5 s child deadline before any summarizing (0.5 s here).
+    def a3(self):
+        return self._summarize_picked(
+            "SELECT session_id, count(*) AS n,"
+            " max(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS last"
+            " FROM lake.agent_events WHERE session_id NOT LIKE 'drover-gate-%'"
+            " GROUP BY session_id ORDER BY n DESC LIMIT 1"
+        )
+
+    def a3_recent(self):
+        """Summarize the most recently active session, not only the largest.
+
+        The largest session is old imported history. The live one is where
+        the newest (largest) events are, and its rows straddle the import and
+        the exporter: v0.6.1's switch failed there (tool facts ran out of
+        DuckDB memory) after A3 had passed. Sessions without a substantive
+        user/assistant turn are skipped; they quarantine as ``no_events``.
+        """
+        return self._summarize_picked(
+            "SELECT session_id, count(*) AS n,"
+            " max(TRY_CAST(timestamp AS TIMESTAMPTZ)) AS last"
+            " FROM lake.agent_events WHERE session_id NOT LIKE 'drover-gate-%'"
+            " GROUP BY session_id HAVING count(*) FILTER (WHERE role IN"
+            " ('user', 'assistant') AND trim(coalesce(content, '')) <> '') > 0"
+            " ORDER BY last DESC NULLS LAST, session_id LIMIT 1"
+        )
 
     def a4(self):
         latencies, activities, statuses = [], [], []
@@ -1153,6 +1176,7 @@ def run_gate(plan: CutoverPlan, options: GateOptions, *, echo=print) -> dict:
             ("A2_outbox_dedup_no_parquet", gate.a2),
             ("A4_cockpit_overview", gate.a4),
             ("A3_summarize_largest_session", gate.a3),
+            ("A3_summarize_most_recent_session", gate.a3_recent),
             ("A7_pre_watermark_archived", gate.a7),
             ("A6_rollback_outbox_replay", gate.a6),
         ):

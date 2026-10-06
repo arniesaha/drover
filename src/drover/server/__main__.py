@@ -2518,11 +2518,14 @@ def _startup_phase(name: str):
         )
         raise
     else:
+        from drover.server.process_memory import memory_note
+
         log.info(
-            "startup phase %s completed in %.3fs (%s)",
+            "startup phase %s completed in %.3fs (%s; %s)",
             name,
             time.monotonic() - started,
             identity,
+            memory_note(),
         )
 
 
@@ -2909,7 +2912,11 @@ def run(
                 if not allowed:
                     return
                 bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
-            log.info("analytical Parquet views ready")
+            from drover.server.process_memory import memory_note
+
+            # On 2026-10-06 both the v2 and the rolled-back hub crossed the
+            # RSS budget within seconds of this line: say what it cost.
+            log.info("analytical Parquet views ready (%s)", memory_note())
         except Exception:  # noqa: BLE001
             log.exception("analytical Parquet view bootstrap failed")
 

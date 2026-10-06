@@ -121,7 +121,13 @@ def run_disposable(
                 except (ValueError, UnicodeDecodeError):
                     raise LakeError("analytics_invalid_process_reply") from None
                 if result.get("error"):
-                    raise LakeError(result["error"])
+                    from .runtime import DETAIL_LIMIT
+
+                    detail = result.get("detail")
+                    raise LakeError(
+                        str(result["error"]),
+                        str(detail)[:DETAIL_LIMIT] if detail else None,
+                    )
                 if len(result.get("rows", [])) > limits.rows:
                     raise LakeError("analytics_row_limit_exceeded")
                 return {
@@ -291,19 +297,37 @@ def _worker(request: dict) -> dict:
         }
 
 
-if __name__ == "__main__":
-    try:
-        reply = _worker(json.loads(Path(sys.argv[1]).read_text()))
-    except LakeError as exc:
-        reply = {"error": exc.code}
-    except Exception as exc:
-        from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
+def error_reply(exc: BaseException, *secrets: str | None) -> dict:
+    """The child's reply for a failed query: a stable code plus its cause.
 
-        reply = {
-            "error": (
-                "snapshot_changed"
-                if isinstance(exc, AnalyticsSnapshotChangedError)
-                else "analytics_unavailable"
-            )
-        }
+    ``detail`` is the exception class and first message line, scrubbed of DSN
+    material, so the hub log says *why* (``OutOfMemoryException: ...``)
+    instead of only ``analytics_unavailable``.
+    """
+    import duckdb
+
+    from drover.server.cockpit.analytics import AnalyticsSnapshotChangedError
+
+    from .runtime import sanitize_detail
+
+    if isinstance(exc, LakeError):
+        # A LakeError's detail is sanitized where it is raised.
+        return {"error": exc.code, **({"detail": exc.detail} if exc.detail else {})}
+    if isinstance(exc, AnalyticsSnapshotChangedError):
+        code = "snapshot_changed"
+    elif isinstance(exc, duckdb.OutOfMemoryException):
+        code = "analytics_memory_limit_exceeded"
+    else:
+        code = "analytics_unavailable"
+    return {"error": code, "detail": sanitize_detail(exc, *secrets)}
+
+
+if __name__ == "__main__":
+    request: dict = {}
+    try:
+        request = json.loads(Path(sys.argv[1]).read_text())
+        reply = _worker(request)
+    except Exception as exc:
+        dsn = os.environ.get((request.get("spec") or {}).get("catalog_dsn_env") or "")
+        reply = error_reply(exc, dsn)
     print(json.dumps(reply, default=str))

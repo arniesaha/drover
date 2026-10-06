@@ -354,9 +354,13 @@ def test_analytical_request_releases_idle_buffers_but_health_does_not(
     from drover.server import memory
 
     released = []
-    monkeypatch.setattr(
-        memory, "release_idle_arrow_memory", lambda: released.append(True)
-    )
+    done = threading.Event()
+
+    def release():
+        released.append(True)
+        done.set()
+
+    monkeypatch.setattr(memory, "release_idle_arrow_memory", release)
     monkeypatch.setattr(collector, "render_analytics_json", lambda filters: (200, "{}"))
     if internal:
         dispatch = analytics_boundary_dispatcher(collector)
@@ -369,6 +373,9 @@ def test_analytical_request_releases_idle_buffers_but_health_does_not(
             assert request(port, "/healthz")[0][0] == 200
             assert released == []
             assert request(port, "/analytics")[0][0] == 200
+            # The handler releases in its ``finally``, after the response is
+            # on the wire, so the client can get there first (Linux CI did).
+            assert done.wait(5)
             assert released == [True]
         finally:
             server.shutdown()
