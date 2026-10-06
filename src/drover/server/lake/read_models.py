@@ -36,18 +36,21 @@ def _read_model(path, operation, **options):
             raise LakeError("analytics_row_limit_exceeded")
     from .coverage import heads
 
+    def hub_binding(config, identities):
+        return {
+            "epoch": config.epoch,
+            "proof": config.verification_sha256,
+            "root": str(lake_spec(config).data_root.resolve()),
+            "identities": _hash(identities),
+        }
+
     source_heads = heads(path)
     # PG identity snapshot is bounded by the existing cursor path.
     with open_history(path) as history:
         # The lake snapshot is bound inside the one read child (run_model);
         # capturing it in token children before and after cost two more
         # serialized children, ~1 s of a ~2 s cockpit overview on prod.
-        binding = {
-            "epoch": config.epoch,
-            "proof": config.verification_sha256,
-            "root": str(lake_spec(config).data_root.resolve()),
-            "identities": _hash(history.identities),
-        }
+        binding = hub_binding(config, history.identities)
         result = query(
             lake_spec(config),
             "SELECT 1",
@@ -64,6 +67,12 @@ def _read_model(path, operation, **options):
     bound = {k: v for k, v in result["binding"].items() if k != "snapshot"}
     if bound != binding or heads(path) != source_heads:
         raise LakeError("analytics_read_model_changed")
+    # The epoch/proof selection and the PG identities must still be the ones
+    # the child read under when it returns. open_history is one PG query on
+    # the hub, not a lake child (the old post-read token child also re-ran it).
+    with open_history(path) as after:
+        if hub_binding(selected_config(path), after.identities) != binding:
+            raise LakeError("analytics_read_model_changed")
     return result["payload"]
 
 
