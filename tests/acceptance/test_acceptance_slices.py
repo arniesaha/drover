@@ -15,7 +15,12 @@ import duckdb
 import pytest
 import requests
 from click.testing import CliRunner
-from lake_generator import BASE_ANCHOR_DATE, BIG_SESSION_ID
+from lake_generator import (
+    BASE_ANCHOR_DATE,
+    BIG_SESSION_ID,
+    HUGE_SESSION_EVENT_COUNT,
+    HUGE_SESSION_ID,
+)
 
 from drover.config import AnalyticsConfig, default_config
 from drover.schema import bootstrap, bootstrap_control_plane_store
@@ -323,26 +328,66 @@ def _assert_hub_rss_budget(observations):
 
 
 @pytest.mark.acceptance_scale
-def test_a3_summarize_40k_session_scale(
-    hub_scale_lake, prod_shaped, analytical_observations, caplog
+def test_a3_summarize_largest_session_scale(
+    hub_scale_lake, prod_shaped, analytical_observations, caplog, monkeypatch
 ):
+    """The gate's A3 at prod scale: the largest session (640k events) summarizes.
+
+    Prod's v2 gate failed here: its largest session had 578,239 events, and
+    picking it through the serving view tripped the 5 s child deadline. Every
+    summarizer read must stay a bounded child however long the session is.
+    """
+    from drover.server.memory_store import MemoryRepository
+
+    written = {}
+    put_summary = MemoryRepository.put_summary
+
+    def capture(pg, summary):
+        written[summary.session_id] = summary
+        return put_summary(pg, summary)
+
+    monkeypatch.setattr(MemoryRepository, "put_summary", staticmethod(capture))
+    # Exactly the gate's picker (gate.GateRun.a3).
+    with open_history(prod_shaped) as con:
+        session, events = con.execute(
+            "SELECT session_id, count(*) AS n FROM lake.agent_events "
+            "WHERE session_id NOT LIKE 'drover-gate-%' "
+            "GROUP BY session_id ORDER BY n DESC LIMIT 1"
+        ).fetchone()
+    assert (session, events) == (HUGE_SESSION_ID, HUGE_SESSION_EVENT_COUNT)
+    started = time.monotonic()
     with caplog.at_level("WARNING"):
-        job = _summarize(prod_shaped, BIG_SESSION_ID)
+        job = _summarize(prod_shaped, session)
+    seconds = time.monotonic() - started
     assert job.status == "succeeded", f"Summary job {job.status}: {job.last_error}"
     queries = analytical_observations["queries"]
     assert queries, "Summarizer performed no analytical queries"
-    assert all(
-        "analytics_byte_limit_exceeded" not in q.get("error", "") for q in queries
-    ), queries
+    assert all("error" not in q for q in queries), queries
     assert all(q["bytes"] <= 1024**2 for q in queries), queries
+    child_peak = max(q["peak_rss_bytes"] for q in queries)
+    assert child_peak < 1024**3, f"Summarizer child peak RSS {child_peak}"
+    warnings = [
+        r.message
+        for r in caplog.records
+        if "Truncated session" in r.message and session in r.message
+    ]
+    assert len(warnings) == 1 and str(MAX_RAW_EVENTS_PER_SESSION) in warnings[0]
+    assert f"most recent {MAX_RAW_EVENTS_PER_SESSION:,}" in written[session].summary_md
+    print(
+        f"A3 huge_session_events={events} children={len(queries)} "
+        f"seconds={seconds:.1f} child_peak_rss_bytes={child_peak}"
+    )
+    # The 40k session, past the raw-event cap, through the same worker.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        job = _summarize(prod_shaped, BIG_SESSION_ID)
+    assert job.status == "succeeded", f"Summary job {job.status}: {job.last_error}"
     warnings = [
         r.message
         for r in caplog.records
         if "Truncated session" in r.message and BIG_SESSION_ID in r.message
     ]
     assert len(warnings) == int(40_000 > MAX_RAW_EVENTS_PER_SESSION), warnings
-    if warnings:
-        assert str(MAX_RAW_EVENTS_PER_SESSION) in warnings[0]
     # Also check a session below the cap, through the same worker.
     caplog.clear()
     with caplog.at_level("WARNING"):

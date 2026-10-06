@@ -772,3 +772,31 @@ def test_cockpit_activity_scopes_pg_snapshot(verified_lake):
     result = service.overview(AnalyticsFilters(days=7))
     assert result["activity"]["status"] == "ok"
     assert "reason" not in result["activity"]
+
+
+def test_one_statement_identity_load_matches_row_by_row_inserts():
+    """The serving child's identity table is exactly what executemany built."""
+    import duckdb
+
+    from drover.server.lake.query_process import load_identities
+
+    identities = [
+        ["h-1", "n-1", "h-1", "2026-08-15 15:47:26.55+00"],
+        ["h-2", None, None, None],
+        ["h-ü '\"[]", "n,2", "s\\3", "2026-10-06 00:00:00+00"],
+    ] + [[f"h-{i}", f"n-{i}", None, "2026-09-01 00:00:00+00"] for i in range(3000)]
+    tables = []
+    with duckdb.connect() as con:
+        con.execute("SET TimeZone='UTC'")
+        for name in ("rows", "memory_session_identity"):
+            con.execute(
+                f"CREATE TABLE {name}(harness_session_id VARCHAR,"
+                " native_session_id VARCHAR, summary_session_id VARCHAR,"
+                " started_at TIMESTAMPTZ)"
+            )
+        con.executemany("INSERT INTO rows VALUES (?,?,?,?)", identities)
+        load_identities(con, identities)
+        for name in ("rows", "memory_session_identity"):
+            tables.append(con.execute(f"SELECT * FROM {name} ORDER BY ALL").fetchall())
+    assert len(tables[1]) == len(identities)
+    assert tables[0] == tables[1]
