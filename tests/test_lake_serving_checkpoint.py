@@ -8,6 +8,7 @@ so serving only re-checks exports after it, with no config edit or restart.
 import json
 from types import SimpleNamespace
 
+import duckdb
 import pyarrow as pa
 import pytest
 from test_lake_child_statement_costs import _receipt, proven_lake  # noqa: F401
@@ -249,3 +250,64 @@ def test_exporter_checkpoints_every_500_exports_and_survives_failures(
     assert calls == [("a" * 64, HELD), ("a" * 64, HELD)]
     assert lifecycle._exports_since_checkpoint == 0
     assert CHECKPOINT_EVERY_EXPORTS == 500
+
+
+@pytest.fixture
+def referenced(tmp_path):
+    """``count`` referenced files (one real file, listed repeatedly)."""
+    root = tmp_path / "lake"
+    root.mkdir()
+    data = root / "part.parquet"
+    data.write_bytes(b"x" * 7)
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS lake")
+    for table in (
+        "agent_events",
+        "agent_events_legacy_metadata",
+        "provider_usage_snapshots",
+        "control_outbox_batches",
+        "activity_daily",
+    ):
+        con.execute(f"CREATE TABLE lake.main.{table}(x INT)")
+    con.execute(
+        "CREATE TABLE files(table_name VARCHAR, data_file VARCHAR,"
+        " data_file_size_bytes BIGINT, delete_file VARCHAR,"
+        " delete_file_size_bytes BIGINT)"
+    )
+    con.execute(
+        "CREATE MACRO ducklake_list_files(cat, tbl) AS TABLE SELECT data_file,"
+        "data_file_size_bytes,delete_file,delete_file_size_bytes FROM files"
+        " WHERE table_name=tbl"
+    )
+
+    def listing(count):
+        con.execute("DELETE FROM files")
+        con.execute(
+            "INSERT INTO files SELECT 'agent_events', ?, 7, NULL, NULL FROM range(?)",
+            [str(data), count],
+        )
+        return SimpleNamespace(data_root=root), con
+
+    yield listing
+    con.close()
+
+
+def test_more_than_10000_referenced_files_still_serve(referenced):
+    # Prod adds ~4 files per export and nothing compacts yet: 10,000 was
+    # ~2,200 exports after the switch, an outage within hours.
+    serving_proof._check_referenced_files(*referenced(10_001))
+
+
+def test_referenced_files_over_the_limit_fail_closed(referenced):
+    with pytest.raises(LakeError, match="lake_verification_file_limit"):
+        serving_proof._check_referenced_files(
+            *referenced(serving_proof.REFERENCED_FILE_LIMIT + 1)
+        )
+
+
+def test_a_changed_referenced_file_still_fails_closed(referenced):
+    spec, con = referenced(10_001)
+    (spec.data_root / "part.parquet").write_bytes(b"x" * 8)
+
+    with pytest.raises(LakeError, match="lake_verification_file_missing_or_changed"):
+        serving_proof._check_referenced_files(spec, con)

@@ -14,6 +14,12 @@ CHECKPOINT_NAME = "serving-checkpoint.json"
 # Bounds one serving child's chain check: the checkpoint snapshot plus 10,000
 # exports. The exporter checkpoints far more often than that.
 MAX_SNAPSHOTS_SINCE_CHECK = 10001
+# Every serving child stats every referenced file (~30 us each on prod), and
+# nothing compacts the lake yet: each export adds ~4 files. 10,000 left about
+# 2,200 exports after the prod switch (hours at 2.5-11 exports/min); 50,000
+# costs ~1.5 s per child at the limit, inside the 5 s deadline. Raising the
+# bound changes no check. Compaction is what keeps the count down.
+REFERENCED_FILE_LIMIT = 50_000
 
 
 def catalog_identity(spec):
@@ -243,6 +249,7 @@ def _check_referenced_files(spec, con):
     }
     if not required <= tables:
         raise LakeError("lake_verification_tables_missing")
+    root = spec.data_root.resolve()
     files = 0
     for table in sorted(required | (optional & tables)):
         cursor = con.execute(
@@ -254,10 +261,10 @@ def _check_referenced_files(spec, con):
                 if name is None:
                     continue
                 files += 1
-                if files > 10000:
+                if files > REFERENCED_FILE_LIMIT:
                     raise LakeError("lake_verification_file_limit")
                 path = Path(name)
-                if not path.resolve().is_relative_to(spec.data_root.resolve()):
+                if not path.resolve().is_relative_to(root):
                     raise LakeError("lake_verification_file_outside_root")
                 try:
                     if not path.is_file() or path.stat().st_size != size:
