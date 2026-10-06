@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-06
+
+### Fixed
+
+- DuckLake v2 at production scale (#537): the gate picks the largest session from
+  the raw lake table instead of the JSON-parsing serving view (6.7s to 0.5s); the
+  summarizer reads bounded 50k-event slices and derives files and tools from the
+  newest 25,000 events, saying so in the summary (578k-event session: 35s to 7s,
+  peak 1.05GB to 409MB); cockpit overview reads in one query child with the
+  identity/epoch binding check kept (p95 about 0.6s on the prod lake).
+- Control-plane DuckDB budget is sized for checkpoints of large stores, and a
+  failing checkpoint is reported by readiness instead of failing silently (#536).
+
 ## [0.6.0] - 2026-10-05
 
 ### Added
