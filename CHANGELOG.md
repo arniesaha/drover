@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-06
+
+### Fixed
+
+- Summarizing a large active session no longer exhausts the query child's memory:
+  files and tools are extracted with one JSON parse per event (#539). The query child
+  now reports a sanitized cause (for example `analytics_memory_limit_exceeded`)
+  instead of a bare `analytics_unavailable`, and the gate adds
+  `A3_summarize_most_recent_session`.
+- On macOS the hub memory guard measures phys_footprint instead of RSS, which counted
+  freed allocator pages; `/readyz` reports the measurement source (#539).
+
 ## [0.6.1] - 2026-10-06
 
 ### Fixed
