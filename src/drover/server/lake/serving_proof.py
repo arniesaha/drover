@@ -87,26 +87,42 @@ def check_proof(spec, con, digest):
             raise ValueError()
         if proof["snapshot"] not in {row[0] for row in snapshots}:
             raise ValueError()
-        for snapshot, author, batch, receipt_digest in snapshots:
-            if snapshot <= proof["snapshot"]:
-                continue
-            if author != "drover-export":
-                raise ValueError()
-            cursor = con.execute(
-                "SELECT * FROM lake.export_batch_receipts WHERE batch_id=?", [batch]
-            )
-            names = [c[0] for c in cursor.description]
-            rows = cursor.fetchall()
-            if (
-                len(rows) != 1
-                or receipt_hash(dict(zip(names, rows[0]))) != receipt_digest
-            ):
+        later = [row for row in snapshots if row[0] > proof["snapshot"]]
+        if any(author != "drover-export" for _, author, _, _ in later):
+            raise ValueError()
+        receipts = _export_receipts(con, [batch for _, _, batch, _ in later])
+        for _, _, batch, receipt_digest in later:
+            rows = receipts.get(batch, [])
+            if len(rows) != 1 or receipt_hash(rows[0]) != receipt_digest:
                 raise ValueError()
         _check_referenced_files(spec, con)
     except LakeError:
         raise
     except Exception:
         raise LakeError("lake_verification_required") from None
+
+
+def _export_receipts(con, batches):
+    """Receipt rows for ``batches`` in one lake read, grouped by batch id.
+
+    One lookup per export snapshot cost ~4.5 ms each and every serving child
+    paid it for every export since verification: 169 snapshots after a day on
+    prod were 0.8 s of a 2 s cockpit overview, growing with each export.
+    """
+    wanted = sorted({batch for batch in batches if batch is not None})
+    if not wanted:
+        return {}
+    cursor = con.execute(
+        "SELECT * FROM lake.export_batch_receipts"
+        " WHERE batch_id IN (SELECT unnest(?::VARCHAR[]))",
+        [wanted],
+    )
+    names = [c[0] for c in cursor.description]
+    receipts = {}
+    for row in cursor.fetchall():
+        receipt = dict(zip(names, row))
+        receipts.setdefault(receipt["batch_id"], []).append(receipt)
+    return receipts
 
 
 def _check_referenced_files(spec, con):
