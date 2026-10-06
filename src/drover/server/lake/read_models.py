@@ -1,5 +1,6 @@
 """Existing activity algorithms executed inside the admitted lake child."""
 
+import json
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -192,27 +193,7 @@ def _control_snapshot(con, request):
             try:
                 native, proof = certified(pg, request["binding"], "native")
                 freshness = {name: dict(proof) for name in freshness}
-                for row in native["usage"]:
-                    con.execute(
-                        """INSERT INTO session_usage
-                        (session_id,input_tokens,output_tokens,cache_read_tokens,
-                         cache_write_tokens,reasoning_tokens,turn_count,exact,source,
-                         source_event_count,observed_at)
-                        SELECT ?,?,?,?,?,?,?,TRUE,'native_agent_events',?,?
-                        WHERE NOT EXISTS(SELECT 1 FROM session_usage WHERE session_id=?)""",
-                        [
-                            row["session_id"],
-                            row["input_tokens"],
-                            row["output_tokens"],
-                            row["cache_read_tokens"],
-                            row["cache_write_tokens"],
-                            row["reasoning_tokens"],
-                            row["turn_count"],
-                            row["source_event_count"],
-                            proof["observed_at"],
-                            row["session_id"],
-                        ],
-                    )
+                _load_native_usage(con, native["usage"], proof["observed_at"])
             except LakeError as exc:
                 for value in freshness.values():
                     if exc.code != "lake_coverage_unverified":
@@ -222,6 +203,43 @@ def _control_snapshot(con, request):
         except BaseException:
             pg.execute("ROLLBACK")
             raise
+
+
+_NATIVE_USAGE_FIELDS = (
+    "session_id",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "turn_count",
+    "source_event_count",
+)
+
+
+def _load_native_usage(con, usage, observed_at):
+    """Certified native usage for sessions with no PG usage row, in one statement.
+
+    A per-row INSERT ... WHERE NOT EXISTS cost ~0.5 ms a row: ~0.45 s of every
+    cockpit child at prod's ~830 native sessions once native coverage is
+    certified, whatever ``days`` asked for (the certified set is unwindowed).
+    ``coverage._usage`` already rejects duplicate session ids.
+    """
+    if not usage:
+        return
+    rows = [[row[name] for name in _NATIVE_USAGE_FIELDS] for row in usage]
+    con.execute(
+        """INSERT INTO session_usage
+        (session_id,input_tokens,output_tokens,cache_read_tokens,
+         cache_write_tokens,reasoning_tokens,turn_count,exact,source,
+         source_event_count,observed_at)
+        SELECT r[1], r[2]::BIGINT, r[3]::BIGINT, r[4]::BIGINT, r[5]::BIGINT,
+          r[6]::BIGINT, r[7]::INTEGER, TRUE, 'native_agent_events',
+          r[8]::INTEGER, ?::TIMESTAMPTZ
+        FROM (SELECT unnest(CAST(?::JSON AS VARCHAR[][])) AS r)
+        WHERE NOT EXISTS(SELECT 1 FROM session_usage u WHERE u.session_id=r[1])""",
+        [observed_at, json.dumps(rows)],
+    )
 
 
 def run_model(con, request, limits):
