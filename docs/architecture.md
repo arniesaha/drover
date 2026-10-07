@@ -89,7 +89,7 @@ project activity route through the selected backend. PostgreSQL remains
 authoritative for identities and mutable memory projections. The API role does
 not open the lake when roles are split; it uses the bounded authenticated
 loopback analytics boundary. MCP and UI readers therefore receive either a
-verified V2 result or an explicit unavailable response—there is no silent
+verified V2 result or an explicit unavailable response. There is no silent
 fallback to legacy analytical history.
 
 Every lake execution runs in a disposable OS query child. Admission is
