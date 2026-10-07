@@ -12,6 +12,10 @@ from .serving_proof import catalog_identity
 
 log = logging.getLogger(__name__)
 
+# Exports between serving-proof checkpoints: ~45 min at prod's peak rate of
+# ~11/min, so a serving child re-checks at most a few hundred exports.
+CHECKPOINT_EVERY_EXPORTS = 500
+
 # SQLSTATEs for a missing schema (3F000) or function (42883).
 _MISSING_GUARD_SQLSTATES = {"3F000", "42883"}
 
@@ -47,6 +51,7 @@ class ExporterLifecycle:
         self._thread = None
         self._error = None
         self._running = False
+        self._exports_since_checkpoint = 0
 
     def start(self, *, shutdown_event):
         if self._thread is not None:
@@ -91,6 +96,9 @@ class ExporterLifecycle:
                 )
                 self._running = True
                 self._ready.set()
+                # A restart after a long run must not wait 500 exports to bound
+                # the serving check again.
+                self._checkpoint(exporter)
                 while not self._stop.is_set() and not shutdown.is_set():
                     if self.config.analytics.retire_legacy_writers:
                         from .writer_gate import legacy_derived_write
@@ -120,6 +128,10 @@ class ExporterLifecycle:
                                 self.config.duckdb_path,
                                 lake_fence=getattr(exporter, "fence", None),
                             )
+                    if result and result.get("acknowledged"):
+                        self._exports_since_checkpoint += 1
+                        if self._exports_since_checkpoint >= CHECKPOINT_EVERY_EXPORTS:
+                            self._checkpoint(exporter)
                     self._stop.wait(0.25)
         except Exception as exc:
             if isinstance(exc, LakeError):
@@ -136,6 +148,32 @@ class ExporterLifecycle:
         finally:
             self._running = False
             self._ready.set()
+
+    def _checkpoint(self, exporter):
+        """Advance the serving checkpoint; a failure leaves serving to the
+        full check and never stops exports."""
+        from .serving_proof import advance_checkpoint
+
+        self._exports_since_checkpoint = 0
+        try:
+            record = advance_checkpoint(
+                lake_spec(self.config.analytics),
+                self.config.analytics.verification_sha256,
+                fence=exporter.fence,
+            )
+        except Exception as exc:  # noqa: BLE001 - exports must keep running
+            log.warning(
+                "serving proof checkpoint not advanced: %s (%s)",
+                exc.code if isinstance(exc, LakeError) else "unexpected",
+                _cause(exc, self.config),
+            )
+            return
+        if record is not None:
+            log.info(
+                "serving proof checkpoint at snapshot %s (%s exports since proof)",
+                record["snapshot"],
+                record["exports"],
+            )
 
     def stop(self):
         self._stop.set()

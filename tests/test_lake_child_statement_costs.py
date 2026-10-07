@@ -108,7 +108,7 @@ def proven_lake(tmp_path, monkeypatch):
 
 def test_export_receipts_are_checked_in_one_lake_read(proven_lake):
     # One lake read per export snapshot was 0.8 s of a 2 s prod cockpit
-    # overview after a day of exports (169 snapshots), and grew with each.
+    # overview ~1.5 h after the switch (169 snapshots), and grew with each.
     spec, con, digest, _ = proven_lake
     counting = CountingConnection(con)
 
