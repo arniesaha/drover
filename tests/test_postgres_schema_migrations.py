@@ -148,6 +148,20 @@ def test_lifecycle_13_fresh_existing_and_rerun(pg_control_path):
     from drover.server.postgres_schema import bootstrap_postgres_control_store
 
     store = postgres_control_store(pg_control_path)
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(pg_control_path)
+    registry.register_host(
+        host_id="migration-host", display_name="Migration host", kind="linux"
+    )
+    registry.create_session(
+        session_id="existing-session",
+        host_id="migration-host",
+        harness="shell",
+        command="sh",
+        status="running",
+    )
+    registry.update_session_activity("existing-session", awaiting="approval")
     with store.connection() as con:
         assert (
             con.execute("SELECT 1 FROM session_lifecycle_operations LIMIT 1").fetchone()
@@ -174,6 +188,13 @@ def test_lifecycle_13_fresh_existing_and_rerun(pg_control_path):
             ).fetchall()
         }
         assert set(SESSION_COLUMNS) <= columns
+    row = registry.get_session("existing-session")
+    assert (
+        row.status,
+        row.awaiting,
+        row.retention_policy,
+        row.lifecycle_generation,
+    ) == ("running", "approval", "auto", 1)
 
 
 def test_lifecycle_14_fresh_existing_and_rerun(pg_control_path):

@@ -6,6 +6,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
+from drover.server.control_outbox import is_postgres_connection
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
 
@@ -41,8 +42,8 @@ class LifecycleStore:
                 "FROM session_lifecycle_operations o JOIN harness_sessions s "
                 "ON s.session_id = o.session_id AND s.host_id = o.host_id "
                 "AND s.lifecycle_generation = o.generation "
-                "WHERE o.state = 'pending' AND (? IS NULL OR o.host_id = ?) "
-                "AND (? IS NULL OR o.session_id = ?)",
+                "WHERE o.state = 'pending' AND o.action = 'stop' AND o.reason = 'user' AND (CAST(? AS TEXT) IS NULL OR o.host_id = ?) "
+                "AND (CAST(? AS TEXT) IS NULL OR o.session_id = ?)",
                 [host_id, host_id, session_id, session_id],
             ).fetchall()
         return result
@@ -67,13 +68,21 @@ class LifecycleStore:
             con.execute("BEGIN")
             try:
                 row = con.execute(
-                    "SELECT o.session_id FROM session_lifecycle_operations o "
+                    "SELECT o.session_id, o.host_id FROM session_lifecycle_operations o "
                     "JOIN harness_sessions s ON s.session_id = o.session_id "
                     "AND s.host_id = o.host_id AND s.lifecycle_generation = o.generation "
-                    "WHERE o.operation_id = ? AND o.state = 'pending'",
+                    "WHERE o.operation_id = ? AND o.state = 'pending'"
+                    + (" FOR UPDATE OF s, o" if is_postgres_connection(con) else ""),
                     [operation_id],
                 ).fetchone()
-                if row is None or payload.get("session_id") != row[0]:
+                if (
+                    row is None
+                    or payload.get("session_id") != row[0]
+                    or (
+                        payload.get("host_id") is not None
+                        and payload["host_id"] != row[1]
+                    )
+                ):
                     con.execute("ROLLBACK")
                     return False
                 con.execute(
@@ -146,7 +155,11 @@ class LifecycleStore:
                 r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", payload[field]
             ):
                 raise ValueError("publication SHAs must be full hexadecimal object ids")
-        if payload["source"] not in {"orchestrator", "push_capture", "operator"}:
+        if not isinstance(payload["source"], str) or payload["source"] not in {
+            "orchestrator",
+            "push_capture",
+            "operator",
+        }:
             raise ValueError("invalid publication source")
         pr = payload.get("pr_number")
         if pr is not None and (type(pr) is not int or not 0 < pr < 2147483648):
@@ -195,3 +208,30 @@ class LifecycleStore:
             for p in self.publications(session_id)
             if p["publication_id"] == publication_id
         )
+
+    def record_inventory(self, host_id, trees, now):
+        with self.registry._connect() as con:
+            for tree in trees:
+                con.execute(
+                    "INSERT INTO session_worktrees (host_id, path, session_id, repo, branch, base_sha, "
+                    "observed_head, ownership, reasons_json, observation_json, observed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (host_id, path) DO UPDATE SET "
+                    "session_id = excluded.session_id, repo = excluded.repo, branch = excluded.branch, "
+                    "base_sha = excluded.base_sha, observed_head = excluded.observed_head, "
+                    "ownership = excluded.ownership, reasons_json = excluded.reasons_json, "
+                    "observation_json = excluded.observation_json, observed_at = excluded.observed_at",
+                    [
+                        host_id,
+                        tree["path"],
+                        tree.get("session_id"),
+                        tree.get("repo"),
+                        tree.get("branch"),
+                        tree.get("base_sha"),
+                        tree.get("observed_head"),
+                        tree["ownership"],
+                        json.dumps(tree["reasons"]),
+                        json.dumps(tree),
+                        now,
+                    ],
+                )

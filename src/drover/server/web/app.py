@@ -938,6 +938,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if self.analytics_boundary is None and self._is_analytics_public_path(path):
             require_analytical_store(self.collector.duckdb_path)
+        if path == "/healthz" and parse_qs(parsed.query).get("detail") == ["1"]:
+            self._send(
+                200,
+                "application/json",
+                json.dumps(
+                    {"ok": True, "lifecycle": self.collector.lifecycle_health()}
+                ),
+            )
+            return
+        if path == "/harness/lifecycle":
+            status, body = self.collector.lifecycle_report()
+            self._send(status, "application/json", body)
+            return
         if path == "/healthz":
             health = analytical_store_health(self.collector.duckdb_path)
             analytical_status = str(health["status"])

@@ -1450,6 +1450,7 @@ class HarnessDaemonState:
                 "display_name": self.display_name,
                 "kind": self.kind,
                 "harnesses": harnesses,
+                "lifecycle": {"worktree_inventory": 1},
             },
             self.host_id,
         )
@@ -1512,6 +1513,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     "host_id": self.server.state.host_id,
                     "active_sessions": len(self.server.state.pty.list_sessions()),
                 }
+            )
+            return
+        if parsed.path == "/lifecycle/worktrees":
+            from drover.server.harness.lifecycle_inventory import worktree_inventory
+
+            self._write_json(
+                worktree_inventory(
+                    self.server.state.registry.list_sessions(
+                        host_id=self.server.state.host_id
+                    ),
+                    dict(self.server.state.session_worktrees),
+                )
             )
             return
         if parsed.path == "/capabilities":
