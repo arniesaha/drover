@@ -983,7 +983,7 @@ def _harness_session_dict(
         item["factory_observer"] = factory_observer
     _wire_datetimes(
         item,
-        ("started_at", "updated_at", "ended_at", "last_activity"),
+        ("started_at", "updated_at", "ended_at", "last_activity", "archived_at"),
     )
     item["preview"] = _optional_str(preview)
     # Cleaned on the way out as well as on write, so recaps stored before the
@@ -1630,6 +1630,7 @@ class MetricsCollector:
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to register harness host %s: %s", host_id, exc)
             return _json_response(500, {"error": str(exc)})
+        self.reconcile_pending_stops(host_id)
         body = {
             "host": host.__dict__,
             "content_consent": self.content_consent_state(),
@@ -1834,35 +1835,66 @@ class MetricsCollector:
             return _json_response(
                 404, {"error": f"unknown harness session: {session_id}"}
             )
+        from drover.server.harness.lifecycle import LifecycleStore
+
+        store = LifecycleStore(self.duckdb_path)
+        operation_id = store.request_stop(session_id)
         host = self._harness_host(session.host_id)
         if host is None:
-            return _json_response(
-                404, {"error": f"unknown harness host: {session.host_id}"}
-            )
-        status, body = self._harness_request(
-            host,
-            f"/sessions/{session_id}/terminate",
-            method="POST",
-            payload={},
+            status, body = 502, ""
+        else:
+            try:
+                status, body = self._harness_request(
+                    host, f"/sessions/{session_id}/terminate", method="POST", payload={}
+                )
+            except Exception:
+                status, body = 502, ""
+        store.attempted(
+            operation_id, None if 200 <= status < 300 else f"host_status_{status}"
         )
-        if 200 <= status < 300:
-            self._sync_terminated_harness_session(session_id, body)
+        if 200 <= status < 300 and self._sync_terminated_harness_session(
+            session_id, body
+        ):
             return status, body
-        if status in (404, 502):
-            # The daemon no longer knows this session (restart lost it) or
-            # the host is unreachable entirely. Either way there is nothing
-            # left to terminate on the host -- tombstone the registry row so
-            # it stops looking alive, and report success to the client.
-            self._tombstone_stale_harness_session(session_id)
+        if status in (404, 502, 504) or 200 <= status < 300:
             return _json_response(
-                200,
+                202,
                 {
                     "session_id": session_id,
-                    "status": "terminated",
-                    "stale": True,
+                    "operation_id": operation_id,
+                    "state": "pending",
+                    "status": session.status,
                 },
             )
         return status, body
+
+    def reconcile_pending_stops(self, host_id: str) -> None:
+        from drover.server.harness.lifecycle import LifecycleStore
+
+        store = LifecycleStore(self.duckdb_path)
+        # Bounded work on each heartbeat; repeated requests are idempotent.
+        for operation_id, session_id, _, _ in store.pending(host_id=host_id)[:20]:
+            with self._session_lock_for(session_id):
+                host = self._harness_host(host_id)
+                if host is None:
+                    return
+                try:
+                    status, body = self._harness_request(
+                        host,
+                        f"/sessions/{session_id}",
+                        method="GET",
+                        payload={},
+                        timeout_s=1.0,
+                    )
+                    if 200 <= status < 300:
+                        payload = json.loads(body)
+                        payload = payload.get("session", payload)
+                        if store.confirm(operation_id, payload):
+                            continue
+                        # Replay only explicit user intent, never policy intent.
+                        self._proxy_terminate_harness_session(session_id)
+                except Exception:
+                    store.attempted(operation_id, "reconciliation_unavailable")
 
     def proxy_harness_session_action(
         self,
@@ -2408,6 +2440,14 @@ class MetricsCollector:
             payload={},
             timeout_s=1.0,
         )
+        from drover.server.harness.lifecycle import LifecycleStore
+
+        store = LifecycleStore(self.duckdb_path)
+        pending = store.pending(session_id=session_id)
+        if pending:
+            if 200 <= status < 300:
+                self._sync_terminated_harness_session(session_id, body)
+            return True
         if 200 <= status < 300:
             return True
         if status == 404:
@@ -2713,24 +2753,19 @@ class MetricsCollector:
         self,
         session_id: str,
         response_body: str,
-    ) -> None:
-        status = "terminated"
+    ) -> bool:
+        from drover.server.harness.lifecycle import LifecycleStore
+
         try:
             payload = json.loads(response_body)
-            if isinstance(payload, dict):
-                status = str(payload.get("status") or status)
-        except json.JSONDecodeError:
-            pass
-        try:
-            HarnessRegistry(self.duckdb_path).update_session_status(
-                session_id,
-                status,
-                ended_at=datetime.now(timezone.utc),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "failed to sync terminated harness session %s: %s", session_id, exc
-            )
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        store = LifecycleStore(self.duckdb_path)
+        return any(
+            store.confirm(op[0], payload) for op in store.pending(session_id=session_id)
+        )
 
     def _build_handoff_prompt(self, source: Any, *, target_harness: str) -> str:
         # transcript_text replays harness_events, which is where every

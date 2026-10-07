@@ -106,6 +106,12 @@ class HarnessSession:
     thinking_effort: str | None = None
     awaiting: str | None = None
     last_activity: datetime | None = None
+    end_reason: str | None = None
+    archived_at: datetime | None = None
+    retention_policy: str = "auto"
+    retention_reason: str | None = None
+    retention_actor: str | None = None
+    lifecycle_generation: int = 1
     # Optional delegation link an orchestrator records at launch (#473).
     parent_session_id: str | None = None
 
@@ -142,6 +148,12 @@ class HarnessSession:
             awaiting=row.get("awaiting"),
             last_activity=row.get("last_activity"),
             parent_session_id=row.get("parent_session_id"),
+            end_reason=row.get("end_reason"),
+            archived_at=row.get("archived_at"),
+            retention_policy=row.get("retention_policy") or "auto",
+            retention_reason=row.get("retention_reason"),
+            retention_actor=row.get("retention_actor"),
+            lifecycle_generation=row.get("lifecycle_generation") or 1,
         )
 
 

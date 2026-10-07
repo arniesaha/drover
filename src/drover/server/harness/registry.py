@@ -997,6 +997,8 @@ class HarnessRegistry:
                    SET status = 'running',
                        updated_at = ?,
                        ended_at = NULL,
+                       end_reason = NULL,
+                       lifecycle_generation = lifecycle_generation + 1,
                        last_error = NULL,
                        awaiting = 'input',
                        native_session_id = ?
