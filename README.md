@@ -41,22 +41,22 @@ Analytics expands provider-reported quota windows and usage distributions.
 - The **command plane** connects the iOS app to `drover-server` and per-host
   `drover-harnessd` daemons for session control, structured chat, approvals,
   handoff, and terminal streaming.
-- The **context plane** collects durable agent events into local Parquet and
-  DuckDB storage, then derives summaries, project briefs, and embeddings for
-  recall. OpenTelemetry span ingestion is an optional integration, off by
-  default.
-- The reference hub runs a PostgreSQL control store, migrated from DuckDB on
-  2026-09-21; its analytical lake and every host-local spool stay DuckDB.
-- A new central installation uses a **PostgreSQL control store** for fleet
-  serving. Existing DuckDB configurations and every host daemon's local spool
-  remain compatible until an operator completes the explicit migration. The analytics role exports
-  central events into immutable Parquet batches, records their manifest, then
-  acknowledges them; acknowledgement gates retention and replay.
+- The **context plane V2** sends all central events through one ingest path.
+  PostgreSQL owns operational state and the durable outbox; the fenced
+  `LakeOutboxExporter` publishes canonical facts to DuckLake's PostgreSQL
+  catalog and Parquet data files before acknowledging each batch.
+- Verified reads run in disposable, memory-capped query children. Cockpit, MCP,
+  iOS, recall, and summarizer paths fail closed if their serving proof, epoch,
+  catalog snapshot, or PostgreSQL identity binding changes.
+- DuckDB remains available as a compatibility control store and backs
+  host-local harness spools. OpenTelemetry spans are optional diagnostic data,
+  off by default.
 - The **MCP surface** exposes that context to coding agents as `drover_*` tools.
 
 See [Architecture](docs/architecture.md) for the component boundaries and
-[Context Store](docs/context-store.md) for the data model. Operators planning
-an explicit central serving store should read [PostgreSQL control store](docs/postgresql-control-store.md).
+[Context Store](docs/context-store.md) for the data model. Operators should
+read [PostgreSQL control store](docs/postgresql-control-store.md) and the
+[lake operations runbooks](docs/operations/lake-serving.md).
 
 ## Quickstart
 
@@ -101,7 +101,8 @@ and ignored with one warning per process; remove that section from your config.
 Native history `archive source-inventory` and `archive source-eligibility`
 commands remain available for private local audits.
 
-DuckLake replaces Pond in **Phase 4 (#481)**. The planned R2 backup boundary is
+DuckLake replaced Pond in the production analytical path in v0.6.2. The planned
+R2 backup boundary is
 DuckLake catalog+files generations plus a Postgres dump, with receipts and
 verification. This backup implementation does not exist yet; see
 [Backup design](docs/backup.md).
@@ -114,11 +115,12 @@ path, verification, private Tailscale setup, and optional context ingestion.
 
 ## Context store
 
-Raw agent events are durable facts. Drover stores them as partitioned Parquet,
-exposes normalized DuckDB views, and keeps mutable derived context such as
-summaries, briefs, embeddings, and job provenance in DuckDB. Derived records
-always retain links back to source sessions. Spans from an external OTLP
-producer are kept the same way when the
+Raw agent events are durable facts. Central ingest atomically records each event,
+its hot projection, and outbox intent in the control store. The lake exporter
+then commits canonical facts and receipts to DuckLake's catalog-backed Parquet
+storage. Mutable derived-memory jobs and projections live in PostgreSQL and
+retain links to source sessions. Spans from an external OTLP producer remain
+optional diagnostic input when the
 [optional span integration](docs/optional-span-integration.md) is enabled.
 
 The model and its compatibility boundary are documented in

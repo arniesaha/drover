@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="1536" height="1024" viewBox="0 0 1536 1024">
+  <title>Drover architecture</title>
+  <desc>
+    Reproducible final composite. The image-generated base preserves the prior
+    diagram's visual language; the DuckLake catalog label is redrawn as vector
+    text because three image-generation attempts truncated its final letter.
+  </desc>
+  <image x="0" y="0" width="1536" height="1024"
+         xlink:href="drover-architecture.generated.png"/>
+  <g id="ducklake-catalog-label">
+    <rect x="973" y="699" width="121" height="45" rx="8"
+          fill="#e9f1f6" stroke="#d5e3eb" stroke-width="1"/>
+    <text x="1033.5" y="726" text-anchor="middle"
+          font-family="DejaVu Sans, Arial, sans-serif" font-size="12"
+          font-weight="600" fill="#101a32">PostgreSQL catalog</text>
+  </g>
+</svg>

@@ -6,11 +6,10 @@ Drover's context store preserves:
 - **What was derived** - summaries, briefs, decisions, embeddings
 - **How results were produced** - derivation history and provenance
 
-It uses Parquet for durable telemetry facts and DuckDB for query views plus
-derived state. Fresh central configs use PostgreSQL for command serving state,
-while existing configs that omit `[control_store]` retain DuckDB until an
-explicit migration. PostgreSQL moves only central serving state; it does not
-change a host daemon's local spool.
+Production uses PostgreSQL for operational control state and derived-memory
+work, and DuckLake for catalog-backed Parquet analytical facts. Existing
+configs may still select the DuckDB compatibility control store, and host-local
+harness spools remain DuckDB.
 
 ## Design Goals
 
@@ -206,7 +205,8 @@ operator-authorized upgrade. Schema bootstrap preserves legacy derived data;
 `memory purge-legacy` previews optional cleanup and requires `--apply` to drop
 legacy DuckDB tables. A DuckDB-only control store records sessions but cannot
 produce derived memory. Missing pgvector fails memory readiness explicitly.
-DuckLake and lake cutover remain Phase 4 work.
+Production completed the DuckLake cutover on 2026-10-06. Derived-memory jobs
+and projections remain PostgreSQL-owned.
 
 ## Identity And Linking
 

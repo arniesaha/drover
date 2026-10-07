@@ -143,7 +143,7 @@ max_concurrent_requests = 8
 `duckdb_path` remains a path-scoped selector for the central control store.
 When `backend = "postgres"`, Drover uses its configuration and does not
 create a DuckDB control database at that path. The analytics role still uses
-its configured DuckDB path for analytical views and derived context.
+its selected DuckLake backend for analytical reads and derived context.
 
 Use distinct tokens for the two loopback-only directions. The API token and
 the two boundary tokens belong in the service environment or another secret
