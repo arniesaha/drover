@@ -1826,6 +1826,23 @@ class MetricsCollector:
             return {"host_id": host.host_id, "state": "failed"}
         return {"host_id": host.host_id, "state": "acknowledged"}
 
+    def harness_publications(self, session_id: str, payload=None) -> tuple[int, str]:
+        from drover.server.harness.lifecycle import LifecycleStore
+
+        store = LifecycleStore(self.duckdb_path)
+        try:
+            if store.registry.get_session(session_id) is None:
+                return _json_response(404, {"error": "unknown harness session"})
+            if payload is None:
+                return _json_response(
+                    200, {"publications": store.publications(session_id)}
+                )
+            return _json_response(
+                200, {"publication": store.report_publication(session_id, payload)}
+            )
+        except ValueError as exc:
+            return _json_response(400, {"error": str(exc)})
+
     def proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
         with self._session_lock_for(session_id):
             return self._proxy_terminate_harness_session(session_id)

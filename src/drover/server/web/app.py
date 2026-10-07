@@ -1168,6 +1168,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             self._send(status, "application/json", body)
             return
+        if path.startswith("/harness/sessions/") and path.endswith("/publications"):
+            session_id = unquote(
+                path.removeprefix("/harness/sessions/")
+                .removesuffix("/publications")
+                .strip("/")
+            )
+            status, body = self.collector.harness_publications(session_id)
+            self._send(status, "application/json", body)
+            return
         if path == "/harness/sessions":
             self._send(
                 200,
@@ -1538,6 +1547,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 return
             status, payload = self.collector.proxy_create_harness_session(host_id, body)
             self._send(status, "application/json", payload)
+            return
+        if path.startswith("/harness/sessions/") and path.endswith("/publications"):
+            session_id = unquote(
+                path.removeprefix("/harness/sessions/")
+                .removesuffix("/publications")
+                .strip("/")
+            )
+            body = self._read_json()
+            if body is None:
+                self._send(400, "application/json", '{"error":"invalid JSON"}')
+                return
+            status, response = self.collector.harness_publications(session_id, body)
+            self._send(status, "application/json", response)
             return
         for action in ("turns", "permission", "interrupt"):
             suffix = f"/{action}"
