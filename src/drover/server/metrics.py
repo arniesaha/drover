@@ -969,6 +969,7 @@ def _harness_session_dict(
     host: Any | None = None,
 ) -> dict[str, Any]:
     item = dict(session.__dict__)
+    item["awaiting"] = session.effective_awaiting
     if host is not None:
         item["host_display_name"] = host.display_name
         item["host_retired_at"] = _wire_datetime(getattr(host, "retired_at", None))
@@ -2553,7 +2554,7 @@ class MetricsCollector:
                 if isinstance(parsed, dict):
                     native_transcript = parsed
             return {
-                "session": session.__dict__,
+                "session": _harness_session_dict(session),
                 "host": host.__dict__ if host else None,
                 "events": [event.__dict__ for event in events],
                 "native_transcript": native_transcript,

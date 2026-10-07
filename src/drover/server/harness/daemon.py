@@ -3065,7 +3065,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             registry_session = self._safe_get_session(session.session_id)
         if registry_session is not None:
             data["mode"] = registry_session.mode or "pty"
-            data["awaiting"] = registry_session.awaiting
+            data["awaiting"] = registry_session.effective_awaiting
             data["last_activity"] = (
                 registry_session.last_activity.isoformat()
                 if registry_session.last_activity
@@ -4517,7 +4517,7 @@ def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
         "pid": None,
         "status": registry_session.status,
         "mode": registry_session.mode or "structured",
-        "awaiting": registry_session.awaiting,
+        "awaiting": registry_session.effective_awaiting,
         "model": registry_session.model,
         "thinking_effort": registry_session.thinking_effort,
         "last_activity": (

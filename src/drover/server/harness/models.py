@@ -73,6 +73,13 @@ class HarnessHost:
         return host_liveness(self, **kwargs)
 
 
+TERMINAL_SESSION_STATUSES = ("completed", "terminated", "errored", "failed")
+
+
+def effective_awaiting(status: str, awaiting: str | None) -> str | None:
+    return None if status in TERMINAL_SESSION_STATUSES else awaiting
+
+
 @dataclass(frozen=True)
 class HarnessSession:
     session_id: str
@@ -101,6 +108,11 @@ class HarnessSession:
     last_activity: datetime | None = None
     # Optional delegation link an orchestrator records at launch (#473).
     parent_session_id: str | None = None
+
+    @property
+    def effective_awaiting(self) -> str | None:
+        """Attention for readers; terminal history retains its raw value."""
+        return effective_awaiting(self.status, self.awaiting)
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "HarnessSession":

@@ -30,6 +30,7 @@ from drover.server.harness.capabilities import validate_capabilities
 from drover.server.harness.events import normalize_harness_event
 from drover.server.harness.model_catalog import CatalogEnvelope
 from drover.server.harness.models import (
+    TERMINAL_SESSION_STATUSES,
     EventPayloadStatus,
     HarnessEvent,
     HarnessEventPage,
@@ -59,12 +60,7 @@ _MODEL_CATALOG_SCOPES_PER_HARNESS = 2
 #: a listing. Deliberately an allowlist rather than "not running": statuses are
 #: written from several places, and a new one appearing must not make a real
 #: session silently invisible. Anything unrecognised counts as live.
-ARCHIVED_SESSION_STATUSES: tuple[str, ...] = (
-    "completed",
-    "terminated",
-    "errored",
-    "failed",
-)
+ARCHIVED_SESSION_STATUSES = TERMINAL_SESSION_STATUSES
 
 
 def _is_unique_constraint_violation(exc: BaseException) -> bool:
