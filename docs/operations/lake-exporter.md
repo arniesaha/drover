@@ -1,9 +1,10 @@
 # Fenced transactional DuckLake exporter
 
-This slice implements the durable PostgreSQL **control-event outbox** adapter.
-It is explicitly constructed, synchronous, and not started by the legacy server.
-Serving/backend selection remains a later Phase 4 slice. No production cutover,
-configuration change, payload pruning, or derived worker activation is implied.
+This is the durable PostgreSQL **control-event outbox** adapter used by the
+selected DuckLake backend in production since 2026-10-06. It is explicitly
+constructed and synchronous; legacy selection uses its legacy exporter instead.
+The provisioning procedures below remain explicit operator actions and are
+never implied by server startup.
 
 ## Provisioning and ownership
 

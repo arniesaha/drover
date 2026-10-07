@@ -1,7 +1,8 @@
 # Canonical memory backend selection
 
-This slice is code and disposable-infrastructure proof only. Production remains
-legacy. It does not authorize a cutover or a service restart.
+Production selected this backend on 2026-10-06 with v0.6.2. This document
+describes its serving contract; it does not by itself authorize another cutover
+or service restart.
 
 `[analytics] backend = "legacy"` is the default and remains authoritative even
 when lake paths or credentials are present. `exporter_enabled = false` is the
@@ -139,11 +140,12 @@ direct writer bypassing these entrypoints cannot be fenced by this code.
 Operator fencing of all old/unconverted writer processes remains mandatory.
 Raw/source collectors and ingestion are not retired by this gate. Retiring the
 native usage rollup requires operational proof of native event publication and
-periodic usage certification before production cutover.
+periodic usage certification before the production cutover.
 
-## Remaining cutover gates
+## Pre-cutover gates recorded at this checkpoint
 
-This is partial serving coverage, not full backend replacement.
+At this historical checkpoint, this was partial serving coverage rather than a
+full backend replacement. The production cutover later completed on 2026-10-06.
 Authoritative source producer integration and periodic context/native certification
 in production, plus the remaining legacy derived/advisory writer audit, still
 need operational proof. The bounded staging certification below proves the
@@ -152,8 +154,8 @@ Fleet routing now uses PostgreSQL registry liveness behind verified selection;
 it does not claim coverage of native-only collector sessions. Daily
 fenced maintenance, immutable paired backups and fresh restore,
 exporter-watermark/rollback rehearsal, platform pin/credential installation,
-audit/soak and second-machine restore remain gates. Operator approval for
-production cutover remains separate.
+audit/soak and second-machine restore were recorded as gates requiring separate
+operator approval.
 
 ## Prior disposable validation checkpoint
 

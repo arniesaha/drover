@@ -1,10 +1,10 @@
 # DuckLake v2 cutover runbook
 
-**Status:** the scripted, gated procedure for DuckLake v2 (umbrella #481, S5).
-Production still runs the **legacy** analytical backend. Running this runbook
-in production needs separate operator approval and a released build (v0.6.0 or
-later); this page does not authorize a cutover. The earlier rebuild-based
-procedure, rolled back on 2026-10-04, is retired. See git history for it.
+**Status:** production completed this scripted, gated DuckLake v2 procedure on
+2026-10-06 with v0.6.2. The steps remain the operator runbook for a new lake,
+rehearsal, recovery, or explicitly approved future cutover. The earlier
+rebuild-based procedure, rolled back on 2026-10-04, is retired. See git history
+for it.
 
 The order is fixed: **preflight → gate → backup → fence/switch → verify → soak**,
 with **rollback** available throughout the soak. Every step is a command that

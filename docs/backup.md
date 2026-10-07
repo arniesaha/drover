@@ -3,7 +3,8 @@
 **Implementation: isolated rehearsal tooling is available; production execution remains blocked.** This design
 belongs to the memory-integrity program (#476). Pond has been removed from
 Drover in Phase 1 (#478); its former backup and restore commands are unavailable.
-DuckLake replaces it in Phase 4.
+DuckLake replaced it in the production analytical path on 2026-10-06; the R2
+backup workflow described below remains unimplemented.
 
 ## Isolated backup rehearsal
 
@@ -45,7 +46,7 @@ dump** of the Drover control store. Copying data files alone is insufficient:
 the catalog identifies the snapshot, schemas, and referenced file set. The
 generation must record the consistency boundary between the analytical snapshot
 and control-store dump, including export/replay watermarks. This coordination
-still needs implementation in Phase 4.
+still needs implementation.
 
 R2 will hold backup generations, not serve live recall. Each generation must
 use a fresh immutable prefix and must be published as verified only after
@@ -57,7 +58,7 @@ receipts and logs; manifests and diagnostics must remain private.
 
 The receipt/verification principles from the retired backup design carry
 forward; its implementation and format are not reused as a working DuckLake
-backup. Phase 4 must implement:
+backup. A production backup implementation must provide:
 
 - A versioned receipt binding generation ID, parent receipt hash, creation time,
   catalog snapshot/version, Postgres dump format/version, consistency boundary,
@@ -84,5 +85,5 @@ stores as part of a drill.
 Retention and deletion require a separately implemented policy that respects
 catalog references and verified generation dependencies. Incomplete generations
 need explicit cleanup, and operators must review R2 lifecycle and cost settings.
-No backup, restore, receipt, or automated retention workflow described here is
-available yet; all are Phase 4 (#481) work.
+No production R2 backup, restore, receipt, or automated retention workflow
+described here is available yet.
