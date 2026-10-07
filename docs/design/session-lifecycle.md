@@ -563,6 +563,11 @@ all local work; offline intent eventually reconciles without false done status.
 
 ## 9. Open decisions for Arnab
 
+**Decided 2026-10-06:** see
+[ADR 0002](../adr/0002-hub-session-lifecycle-first-iteration.md). All seven
+recommendations are accepted, narrowed for the first iteration to report-only
+operation with no archive, collection or enforcement.
+
 1. **Publication authority:** orchestrator API, push interception, or content
    matching as primary. Recommend authenticated orchestrator API with optional
    push producers; content matching advisory until separately validated.
