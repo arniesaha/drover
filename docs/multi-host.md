@@ -1,5 +1,8 @@
 # Multi-Host Drover
 
+For publication reports, honest terminate responses, and report-only worktree
+inventory, see [session lifecycle](session-lifecycle.md).
+
 Start with the one-machine path in [Getting Started](getting-started.md). A
 multi-host fleet adds trusted machines over a private LAN or private Tailscale
 network; it does not change Drover's single-operator trust model.
