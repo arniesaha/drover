@@ -34,6 +34,7 @@ from drover.server.harness.model_catalog import (
     catalog_wire_bytes,
 )
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
+from drover.server.harness.models import effective_awaiting
 from drover.server.harness.recap_jobs import LiveRecap
 from drover.server.harness.recap_prompt import drop_user_subject
 from drover.server.harness.registry import (
@@ -969,7 +970,7 @@ def _harness_session_dict(
     host: Any | None = None,
 ) -> dict[str, Any]:
     item = dict(session.__dict__)
-    item["awaiting"] = session.effective_awaiting
+    item["awaiting"] = effective_awaiting(item.get("status", ""), item.get("awaiting"))
     if host is not None:
         item["host_display_name"] = host.display_name
         item["host_retired_at"] = _wire_datetime(getattr(host, "retired_at", None))

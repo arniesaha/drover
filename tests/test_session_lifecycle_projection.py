@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,3 +33,13 @@ def test_unsequenced_exit_and_restart_preserve_status_first_projection(tmp_path)
     row = restarted.get_session(session.session_id)
     assert row.awaiting == "approval"
     assert _harness_session_dict(row)["awaiting"] is None
+
+
+@pytest.mark.parametrize(
+    "status", ["running", "completed", "terminated", "errored", "failed"]
+)
+def test_wire_projection_accepts_session_records_without_model_properties(status):
+    session = SimpleNamespace(status=status, awaiting="approval")
+    item = _harness_session_dict(session)
+    assert item["awaiting"] == ("approval" if status == "running" else None)
+    assert session.awaiting == "approval"
