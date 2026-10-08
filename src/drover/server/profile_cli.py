@@ -14,8 +14,8 @@ from drover.server.profile import ProfileActor, act_on_proposal, propose_profile
 
 SENSITIVE_HEADING = re.compile(
     r"\b(?:health|medical|finance|finances|financial|money|job[\s_-]*search|personal|"
-    r"tax(?:es)?|income|salary|compensation|address|location|dating|relationships?|"
-    r"career|interviews?|offers?|resignation|therapy|pet[\s_-]*health|portfolios?|"
+    r"tax(?:es|ation)?|income|salar(?:y|ies)|compensation|address(?:es)?|locations?|dating|relationships?|"
+    r"careers?|interviews?|offers?|resignation|therapy|pet[\s_-]*health|portfolios?|"
     r"investments?|banking)\b",
     re.IGNORECASE,
 )
@@ -34,13 +34,13 @@ PII_PATTERNS = {
         re.I,
     ),
     "currency_amount": re.compile(
-        r"[$€£¥]\s*\d|\b(?:USD|CAD|EUR|GBP|JPY|AUD)\s*\d|"
-        r"\b\d[\d,.]*\s*(?:USD|CAD|EUR|GBP|JPY|AUD|dollars?|euros?|pounds?)\b",
+        r"[$€£¥₹₩₽]\s*\d|\b(?:USD|CAD|EUR|GBP|JPY|AUD|CHF|INR)\s*\d|"
+        r"\b\d[\d,.]*\s*(?:USD|CAD|EUR|GBP|JPY|AUD|CHF|INR|dollars?|euros?|pounds?)\b",
         re.I,
     ),
     "phone_number": re.compile(
         r"(?<!\w)(?:\+\d{1,3}[ .-]?)?(?:\(\d{3}\)|\d{3})[ .-]?"
-        r"\d{3}[ .-]?\d{4}(?!\w)"
+        r"\d{3}[ .-]?\d{4}(?!\w)|(?<!\w)\+\d[\d .()-]{6,}\d(?!\w)"
     ),
     "email": re.compile(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+"),
 }
@@ -50,8 +50,10 @@ def _digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def parse_markdown(text, *, tier="private"):
+def parse_markdown(text, *, tier=None):
     """Section items inherit private classification from every ancestor heading."""
+    explicit_tier = tier is not None
+    tier = "private" if tier is None else tier
     if tier not in ("general", "trusted", "private"):
         raise ValueError("import tier must be general, trusted or private")
     stack = []
@@ -65,7 +67,7 @@ def parse_markdown(text, *, tier="private"):
             return
         headings = [heading for _, heading in stack]
         heading = " / ".join(headings) or "Notes"
-        reasons = ["default_private" if tier == "private" else f"explicit_tier:{tier}"]
+        reasons = [f"explicit_tier:{tier}" if explicit_tier else "default_private"]
         reasons.extend(
             f"sensitive_heading:{h}" for h in headings if SENSITIVE_HEADING.search(h)
         )
@@ -146,7 +148,7 @@ def parse_markdown(text, *, tier="private"):
     return items
 
 
-def import_sources(source: Path, *, tier="private"):
+def import_sources(source: Path, *, tier=None):
     source = Path(source)
     files = sorted(source.rglob("*.md")) if source.is_dir() else [source]
     if not files or len(files) > 100:
@@ -236,8 +238,8 @@ def profile():
 @click.option(
     "--tier",
     type=click.Choice(["general", "trusted", "private"]),
-    default="private",
-    show_default=True,
+    default=None,
+    show_default="private",
 )
 @click.option(
     "--apply",

@@ -1,10 +1,9 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-
 from click.testing import CliRunner
 
 from drover.server.__main__ import main
@@ -226,3 +225,25 @@ def test_default_import_and_classification_provenance(pg_control_path, tmp_path)
         "key": "Preferences",
         "tier_reasons": ["default_private", "body_pii:email"],
     }
+
+
+@pytest.mark.parametrize(
+    "text,reason",
+    [
+        ("+44 20 7946 0958", "phone_number"),
+        ("+49 (30) 12345678", "phone_number"),
+        ("INR 123.45", "currency_amount"),
+        ("₹123", "currency_amount"),
+        ("123 Example Avenue", "street_address"),
+    ],
+)
+def test_additional_synthetic_pii_formats(text, reason):
+    item = parse_markdown(f"# Preferences\nSynthetic: {text}", tier="trusted")[0]
+    assert item["tier"] == "private"
+    assert f"body_pii:{reason}" in item["tier_reasons"]
+
+
+def test_explicit_private_reason():
+    assert parse_markdown("# Rules\nUse tables", tier="private")[0]["tier_reasons"] == [
+        "explicit_tier:private"
+    ]

@@ -8,10 +8,10 @@ from drover.server.__main__ import main
 from drover.server.control_store import postgres_control_store
 from drover.server.profile import (
     ProfileActor,
+    http_actor,
     issue_agent_credential,
     revoke_agent_credential,
     set_item_tier,
-    http_actor,
 )
 from drover.server.profile_cli import import_record, import_sources
 from drover.server.web.auth import AuthSettings
