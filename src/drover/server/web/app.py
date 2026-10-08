@@ -2109,6 +2109,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         sock.settimeout(0.2)
         registry = self._harness_registry()
         last_seq = after_seq
+        sent_gaps: set[str] = set()
         try:
             while True:
                 for event in registry.list_events_after(
@@ -2116,7 +2117,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     last_seq,
                     resolver=self._archive_resolver_for_request(),
                 ):
-                    if event.seq is not None:
+                    if event.payload.get("out_of_band"):
+                        if event.event_id in sent_gaps:
+                            continue
+                        sent_gaps.add(event.event_id)
+                    elif event.seq is not None:
                         last_seq = event.seq
                     send_frame(
                         sock,
