@@ -11,7 +11,7 @@ from drover.server.mcp.server import build_mcp_server
 from drover.server.profile import ProfileActor, http_actor, read_profile
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import DISABLED, AuthSettings
-from drover.server.web.credentials import CredentialStore
+from drover.server.web.credentials import PostgresCredentialStore
 
 NOW = datetime(2026, 10, 7, tzinfo=timezone.utc)
 
@@ -160,11 +160,9 @@ def test_context_privacy_and_freshness(pg_control_path, monkeypatch):
     )
 
 
-def test_verified_credential_registry(pg_control_path, tmp_path):
-    store = CredentialStore(tmp_path / "credentials.json")
-    cred, token = store.issue(
-        scope="host", label="example-agent", host_id="example-host"
-    )
+def test_verified_credential_registry(pg_control_path):
+    store = PostgresCredentialStore(pg_control_path)
+    cred, token = store.issue(scope="profile", label="example-agent")
     auth = AuthSettings(True, "example-operator-token", credentials=store)
     with postgres_control_store(pg_control_path).connection() as con:
         con.execute(
@@ -307,7 +305,6 @@ def test_future_item_age_clamps_to_zero(pg_control_path):
 
 def test_single_call_http_trusted_bundle_and_revocation(pg_control_path):
     from drover.server.profile import issue_agent_credential, revoke_agent_credential
-    from drover.server.web.credentials import PostgresCredentialStore
 
     operator = ProfileActor("operator", "private", True)
     issued = issue_agent_credential(

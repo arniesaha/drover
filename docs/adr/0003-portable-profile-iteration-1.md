@@ -2,9 +2,8 @@
 
 Status: accepted. Date: 2026-10-07. Authority: issue #545 decisions comment.
 
-Agent proposal policy in item 5 is updated for iteration 2. The current
-[profile contract](../portable-profile.md#proposals-review-and-reversal) also
-describes the residual behavior of preexisting host/device registry bindings.
+Agent proposal policy in item 5 is updated for iteration 2; see the current
+[profile contract](../portable-profile.md#proposals-review-and-reversal).
 
 1. First-turn bundles have a 1,500-token budget, including headings and withheld counts.
 2. Threads leave the bundle after 14 days without activity; decisions after 30 days.

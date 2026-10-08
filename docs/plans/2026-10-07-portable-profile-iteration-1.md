@@ -3,8 +3,7 @@
 Authority: ADR 0003 and issue #545. Read the design branch artifact
 `docs/design/portable-profile.html`; the requested `.src.html` is absent there.
 Agent proposal policy references below are updated for iteration 2; see the
-[current contract](../portable-profile.md#proposals-review-and-reversal) for the
-legacy registry binding exception.
+[current contract](../portable-profile.md#proposals-review-and-reversal).
 
 ## Commit sequence and file exhibits
 

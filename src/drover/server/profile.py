@@ -28,7 +28,9 @@ def resolve_actor(path: Path, credential_id: str | None = None) -> ProfileActor:
         return ProfileActor()
     with postgres_control_store(path).connection() as con:
         row = con.execute(
-            "SELECT agent_id, tier FROM profile_agents WHERE credential_id = ?",
+            "SELECT a.agent_id, a.tier FROM profile_agents a "
+            "JOIN control_credentials c ON c.credential_id = a.credential_id "
+            "WHERE a.credential_id = ? AND c.scope = 'profile' AND c.revoked_at IS NULL",
             [credential_id],
         ).fetchone()
     return ProfileActor(*row) if row else ProfileActor(credential_id)

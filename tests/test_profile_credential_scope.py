@@ -15,6 +15,7 @@ from drover.server.profile import (
     issue_agent_credential,
     propose_profile,
     register_agent,
+    resolve_actor,
     revoke_agent_credential,
 )
 from drover.server.web.app import start_metrics_server
@@ -247,3 +248,90 @@ def test_agent_link_requires_active_profile_credential(
                 ).fetchone()[0]
                 == 0
             )
+
+
+@pytest.mark.parametrize(
+    "scope,revoked",
+    [
+        ("host", False),
+        ("device", False),
+        ("profile", True),
+        ("profile", False),
+    ],
+)
+def test_legacy_binding_resolution_requires_active_profile(
+    pg_control_path, profile_server, scope, revoked
+):
+    _, store, _, request = profile_server
+    credential, token = store.issue(scope=scope, label="example-legacy-agent")
+    if revoked:
+        store.revoke(credential.id)
+    # Simulate a persisted binding that predates registry scope validation.
+    with postgres_control_store(pg_control_path).connection() as con:
+        con.execute(
+            "INSERT INTO profile_agents (agent_id, credential_id, tier, updated_by) "
+            "VALUES ('example-legacy-agent', ?, 'trusted', 'operator')",
+            [credential.id],
+        )
+        before = con.execute(
+            "SELECT to_jsonb(a) FROM profile_agents a WHERE agent_id = 'example-legacy-agent'"
+        ).fetchone()[0]
+    for tier in ("general", "trusted", "private"):
+        proposal = propose_profile(
+            pg_control_path,
+            dict(
+                layer="user",
+                kind="rule",
+                tier=tier,
+                body=f"Synthetic {tier} preference",
+            ),
+        )
+        act_on_proposal(
+            pg_control_path, proposal["proposal_id"], "accept", actor=OPERATOR
+        )
+    trusted = scope == "profile" and not revoked
+    expected = (
+        ProfileActor("example-legacy-agent", "trusted")
+        if trusted
+        else ProfileActor(credential.id)
+    )
+    assert resolve_actor(pg_control_path, credential.id) == expected
+    status, _, body = request("GET", "/profile", token=token)
+    if revoked:
+        assert status == 401
+    else:
+        assert status == 200
+        result = json.loads(body)
+        assert "Synthetic general preference" in result["bundle"]
+        assert ("Synthetic trusted preference" in result["bundle"]) == trusted
+        assert "Synthetic private preference" not in body.decode()
+        assert result["withheld_count"] == (1 if trusted else 2)
+    if scope in ("host", "device"):
+        status, _, body = request(
+            "POST",
+            "/profile/proposals",
+            dict(
+                layer="user",
+                kind="preference",
+                tier="general",
+                body="Synthetic new preference",
+            ),
+            token=token,
+        )
+        assert status == 200
+        proposed = json.loads(body)
+        assert proposed["status"] == "pending"
+        with postgres_control_store(pg_control_path).connection() as con:
+            assert (
+                con.execute(
+                    "SELECT agent_id FROM profile_proposals WHERE proposal_id = ?",
+                    [proposed["proposal_id"]],
+                ).fetchone()[0]
+                == credential.id
+            )
+    # Resolution must not migrate, rewrite or remove legacy registry rows.
+    with postgres_control_store(pg_control_path).connection() as con:
+        after = con.execute(
+            "SELECT to_jsonb(a) FROM profile_agents a WHERE agent_id = 'example-legacy-agent'"
+        ).fetchone()[0]
+    assert after == before

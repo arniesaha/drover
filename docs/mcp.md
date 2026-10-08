@@ -123,8 +123,7 @@ within a 1,500-token ceiling. The current MCP transport reads as general.
 `drover_profile_propose(layer, kind, tier, body, ...)` creates a pending proposal.
 See [portable profile](portable-profile.md) for credential-authenticated HTTP,
 trusted reads, pending proposals, operator review, reversal and markdown import.
-That document also describes the legacy host/device registry binding exception;
-newly issued profile credentials are read-only.
+Issued profile credentials are read-only.
 
 
 Client startup examples and the single-call profile contract are in

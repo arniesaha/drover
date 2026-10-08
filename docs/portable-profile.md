@@ -99,15 +99,9 @@ are read-only and cannot call proposal routes.
 Readers cannot edit items they cannot access. Operator-created proposals also
 start pending, keeping approval explicit.
 
-A legacy registry binding is an exception: an active `device` or `host`
-credential already bound to tier `trusted` in `profile_agents` can still submit
-`POST /profile/proposals`. HTTP identity resolution uses the stored tier without
-rechecking the credential's scope. For that caller, the service automatically
-accepts a proposal only when its target tier is not private and an existing
-target item is also not private. Private proposals remain pending. Current
-`POST /profile/agents` and `register_agent` reject creation of such bindings;
-issued profile credentials cannot reach this path. The scope restriction does
-not rewrite preexisting registry rows.
+Bindings to non-profile credentials are ignored at resolution, so existing
+host/device bindings must be reissued as profile credentials with
+`drover profile agents issue`.
 
 The operator can inspect `GET /profile/proposals?status=pending&limit=25`.
 The queue includes proposed content and source identity. Allowed statuses are
