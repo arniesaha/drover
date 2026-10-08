@@ -6,7 +6,11 @@ Authority: ADR 0003 and issue #545. Read the design branch artifact
 ## Commit sequence and file exhibits
 
 1. ADR alone, then this plan alone. Validate markdown links and whitespace.
-2. Append PostgreSQL migration **13** at `src/drover/server/postgres_schema.py:546`.
+2. Append PostgreSQL migration **15** at `src/drover/server/postgres_schema.py:546`.
+   `PROFILE_MIGRATION = 15` is the single version constant. Lifecycle migrations
+   13/14 merge first; do not copy them into this branch. The runner accepts gaps.
+   On the second merge, retain lifecycle 13/14 before profile 15 and their pinned
+   hashes; leave the profile constant at 15 and keep the registry-derived assertions.
    Never change migrations 1-12. Add profile items, proposals with before/after
    snapshots and actors, and credential-bound agent tiers. Pin the new hash in
    `tests/test_postgres_schema_migrations.py:23`. Test fresh bootstrap, upgrade

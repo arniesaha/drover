@@ -21,3 +21,9 @@ private reads. Authentication-disabled HTTP grants no approval or private access
 
 The requested write path is included now, superseding the design's v2 deferral.
 UI, hooks, schedules, deployment and editing import files are outside this iteration.
+
+Migration coordination: profile persistence uses migration 15, defined by
+`PROFILE_MIGRATION` in `src/drover/server/postgres_schema.py`. Lifecycle migrations
+13 and 14 merge first. This branch does not copy their DDL. Gaps in the local
+registry are supported; the second merge retains lifecycle 13/14 before profile 15
+and preserves all released migration hashes.

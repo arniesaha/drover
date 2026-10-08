@@ -1,7 +1,7 @@
 # Portable user profile
 
 Iteration 1 stores durable profile facts and their proposal history in Drover
-PostgreSQL, using migration **13**. Files remain read-only import sources.
+PostgreSQL, using migration **15**. Files remain read-only import sources.
 See [ADR 0003](adr/0003-portable-profile-iteration-1.md) and the
 [implementation plan](plans/2026-10-07-portable-profile-iteration-1.md).
 
