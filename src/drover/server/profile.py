@@ -256,6 +256,8 @@ def _accept(con, proposal_id, item_id, change, previous, agent, session, actor):
         "actor": actor.agent_id,
         "proposal_id": proposal_id,
     }
+    if "tier_change" in change:
+        provenance["tier_change"] = change["tier_change"]
     if "import_classification" in change:
         provenance["import_classification"] = change["import_classification"]
     con.execute(
@@ -513,3 +515,103 @@ def list_proposals(path, *, actor, status="pending", limit=25):
         ],
         "truncated": len(rows) > limit,
     }
+
+
+def set_item_tier(path, item_id, tier, *, actor, reason):
+    """Explicit operator review, using the normal reversible proposal history."""
+    if not actor.user:
+        raise PermissionError("operator scope required")
+    if tier not in TIERS:
+        raise ValueError("invalid profile tier")
+    reason = _text(reason, "reason", 1024)
+    with _profile_transaction(path) as con:
+        previous = _lock_item(con, item_id)
+        if previous is None or previous["status"] != "active":
+            raise ValueError("unknown active profile item")
+        change = {k: previous[k] for k in ("layer", "kind", "body", "expires_at")}
+        change["tier"] = tier
+        proposed = propose_profile(path, change, actor=actor, item_id=item_id, _con=con)
+        # Preserve import evidence and record the operator's explanation in history.
+        from psycopg.types.json import Jsonb
+
+        evidence = {
+            "tier_change": {"from": previous["tier"], "to": tier, "reason": reason}
+        }
+        classification = previous["provenance"].get("import_classification")
+        if classification:
+            evidence["import_classification"] = classification
+        con.execute(
+            "UPDATE profile_proposals SET change = change || ?::jsonb WHERE proposal_id = ?",
+            [Jsonb(evidence), proposed["proposal_id"]],
+        )
+        return act_on_proposal(
+            path, proposed["proposal_id"], "accept", actor=actor, _con=con
+        )
+
+
+def issue_agent_credential(path, agent_id, tier, *, actor):
+    """Atomically issue a bearer verifier and bind the profile identity."""
+    import secrets
+    from uuid import uuid4
+
+    from drover.server.web.credentials import TOKEN_BYTES, verifier_from_token
+
+    if not actor.user:
+        raise PermissionError("operator scope required")
+    if tier not in ("general", "trusted"):
+        raise ValueError("agent tier must be general or trusted")
+    agent_id = _text(agent_id, "agent_id", 256)
+    credential_id = str(uuid4())
+    token = secrets.token_urlsafe(TOKEN_BYTES)
+    with _profile_transaction(path) as con:
+        con.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(?))", [f"profile-agent:{agent_id}"]
+        )
+        existing = con.execute(
+            "SELECT 1 FROM profile_agents a JOIN control_credentials c "
+            "ON c.credential_id = a.credential_id WHERE a.agent_id = ? AND c.revoked_at IS NULL",
+            [agent_id],
+        ).fetchone()
+        if existing:
+            raise ValueError("agent already has an active credential; revoke it first")
+        con.execute(
+            "INSERT INTO control_credentials "
+            "(credential_id, scope, label, verifier, created_at, host_id) "
+            "VALUES (?, 'host', ?, ?, now(), ?)",
+            [credential_id, agent_id, verifier_from_token(token), agent_id],
+        )
+        con.execute(
+            "INSERT INTO profile_agents (agent_id, credential_id, tier, updated_by) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET "
+            "credential_id = EXCLUDED.credential_id, tier = EXCLUDED.tier, "
+            "updated_by = EXCLUDED.updated_by, updated_at = now()",
+            [agent_id, credential_id, tier, actor.agent_id],
+        )
+    return dict(agent_id=agent_id, tier=tier, credential_id=credential_id, token=token)
+
+
+def revoke_agent_credential(path, agent_id, *, actor):
+    """Revoke the bearer and remove trusted access without deleting audit rows."""
+    if not actor.user:
+        raise PermissionError("operator scope required")
+    with _profile_transaction(path) as con:
+        con.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(?))", [f"profile-agent:{agent_id}"]
+        )
+        row = con.execute(
+            "SELECT credential_id FROM profile_agents WHERE agent_id = ? FOR UPDATE",
+            [agent_id],
+        ).fetchone()
+        if row is None:
+            raise ValueError("unknown profile agent")
+        con.execute(
+            "UPDATE control_credentials SET revoked_at = COALESCE(revoked_at, now()), "
+            "apns_token = NULL, apns_environment = NULL WHERE credential_id = ?",
+            [row[0]],
+        )
+        con.execute(
+            "UPDATE profile_agents SET tier = 'general', updated_by = ?, updated_at = now() "
+            "WHERE agent_id = ?",
+            [actor.agent_id, agent_id],
+        )
+    return dict(agent_id=agent_id, credential_id=row[0], revoked=True)

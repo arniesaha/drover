@@ -259,3 +259,99 @@ def import_command(ctx, source, tier, apply):
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(json.dumps({"dry_run": not apply, "items": results}, indent=2))
+
+
+def _operator_path(ctx):
+    from drover.server.__main__ import _resolve_config
+
+    return _resolve_config((ctx.obj or {}).get("config_path")).duckdb_path
+
+
+@profile.command(name="set-tier")
+@click.argument("item_id")
+@click.option(
+    "--tier", required=True, type=click.Choice(["general", "trusted", "private"])
+)
+@click.option("--reason", required=True, help="Explanation retained in provenance.")
+@click.pass_context
+def set_tier_command(ctx, item_id, tier, reason):
+    """Promote or demote an accepted item after operator review."""
+    from drover.server.profile import set_item_tier
+
+    try:
+        result = set_item_tier(
+            _operator_path(ctx),
+            item_id,
+            tier,
+            reason=reason,
+            actor=ProfileActor("operator", "private", True),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2))
+
+
+@profile.command(name="review")
+@click.argument("proposal_id")
+@click.argument("action", type=click.Choice(["accept", "reject", "revert"]))
+@click.pass_context
+def review_command(ctx, proposal_id, action):
+    """Apply an explicit operator decision to a proposal."""
+    try:
+        result = act_on_proposal(
+            _operator_path(ctx),
+            proposal_id,
+            action,
+            actor=ProfileActor("operator", "private", True),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2))
+
+
+@profile.group(name="agents")
+def agents():
+    """Operator management of HTTP profile credentials."""
+
+
+@agents.command(name="issue")
+@click.argument("agent_id")
+@click.option(
+    "--tier",
+    type=click.Choice(["general", "trusted"]),
+    default="general",
+    show_default=True,
+)
+@click.pass_context
+def issue_command(ctx, agent_id, tier):
+    """Issue and register a bearer token, printed once. Store it securely."""
+    from drover.server.profile import issue_agent_credential
+
+    try:
+        result = issue_agent_credential(
+            _operator_path(ctx),
+            agent_id,
+            tier,
+            actor=ProfileActor("operator", "private", True),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2))
+
+
+@agents.command(name="revoke")
+@click.argument("agent_id")
+@click.pass_context
+def revoke_command(ctx, agent_id):
+    """Revoke a profile agent's bearer token and trusted access."""
+    from drover.server.profile import revoke_agent_credential
+
+    try:
+        result = revoke_agent_credential(
+            _operator_path(ctx),
+            agent_id,
+            actor=ProfileActor("operator", "private", True),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2))
