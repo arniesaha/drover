@@ -399,6 +399,10 @@ principal_id = "unknown"
 # This value must be a finite positive integer or float in seconds.
 freshness_threshold_seconds = 600
 
+[context_containers]
+# Hub-only derived-memory producer. Explicit opt-in; no model calls.
+enabled = false
+
 [summarizer]
 # backend_policy:
 #   harness = summarize with the local claude-code CLI (no API key needed)
