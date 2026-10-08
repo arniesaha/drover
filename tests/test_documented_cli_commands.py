@@ -21,6 +21,7 @@ ROOT = Path(__file__).parents[1]
         (["observatory", "--help"], "observatory"),
         (["audit-sessions", "--help"], "audit-sessions"),
         (["setup-check", "--help"], "--host"),
+        (["context", "backfill-containers", "--help"], "--apply"),
     ],
 )
 def test_documented_cli_command_is_available(args: list[str], expected: str) -> None:

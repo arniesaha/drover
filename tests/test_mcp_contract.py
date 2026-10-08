@@ -115,6 +115,7 @@ def test_deadline_retains_admission_until_work_finishes(monkeypatch):
         assert started.is_set()
         assert result["status"] == "timeout"
         assert result["store"] == "hub"
+        assert result["store_authoritative"] is True
         assert result["data_watermark"]["timestamp"] is None
         assert (await read())["status"] == "busy"
 
@@ -147,6 +148,7 @@ def test_embedding_errors_even_without_memory(tmp_path):
 
 
 def test_fleet_reads_registry_without_analytical_connection(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
     from types import SimpleNamespace
 
     from drover.server.harness.models import HarnessSession
@@ -162,6 +164,14 @@ def test_fleet_reads_registry_without_analytical_connection(tmp_path, monkeypatc
         lambda self, **kw: [
             HarnessSession("running", "live", "codex", "codex", "running"),
             HarnessSession("retired", "retired", "codex", "codex", "running"),
+            HarnessSession(
+                "ended",
+                "live",
+                "codex",
+                "codex",
+                "running",
+                ended_at=datetime.now(timezone.utc),
+            ),
         ],
     )
     for read in (tools.drover_fleet_status, tools.drover_active_sessions):
@@ -180,7 +190,8 @@ def test_public_validation_errors_are_bounded_and_identified(tmp_path):
     )
     assert result["status"] == "error"
     assert result["error_type"] == "EmbeddingMismatch"
-    assert result["store"] == "hub"
+    assert result["store"] == "local"
+    assert result["store_authoritative"] is False
     assert result["data_watermark"]["timestamp"] is None
     assert result["truncated"] is True
 

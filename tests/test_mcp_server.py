@@ -116,11 +116,14 @@ def test_recall_bundle_invocation_returns_the_public_hub_bundle(
         "limits",
         "sources",
         "store",
+        "store_authoritative",
         "host",
         "data_watermark",
         "truncated",
     ]
     assert result["sources"] == ["hub"]
+    assert result["store"] == "local"
+    assert result["store_authoritative"] is False
     assert result["archive"]["status"] == "removed"
     assert result["limits"]["effective_limit"] == 1
     assert result["limits"]["effective_max_context_chars"] == 1_500
@@ -146,11 +149,14 @@ def test_recall_bundle_returns_hub_context(
         "limits",
         "sources",
         "store",
+        "store_authoritative",
         "host",
         "data_watermark",
         "truncated",
     ]
     assert result["sources"] == ["hub"]
+    assert result["store"] == "local"
+    assert result["store_authoritative"] is False
     assert result["archive"]["status"] == "removed"
     assert result["archive_evidence"] == []
     assert result["limits"]["effective_limit"] == 5
@@ -169,5 +175,51 @@ def test_provider_quota_registered_tool(tmp_path: Path) -> None:
     assert "accounts" in result
     assert "routing_hint" in result
     assert result["routing_hint"] == "no provider accounts configured"
-    assert result["store"] == "hub"
+    assert result["store"] == "local"
+    assert result["store_authoritative"] is False
     assert "data_watermark" in result
+
+
+def test_provider_quota_registered_hub_preserves_source_identity(
+    pg_control_path, tmp_path
+):
+    from datetime import datetime, timezone
+
+    from drover.server.providers.service import ProviderUsageService
+    from drover.server.providers.types import (
+        ProviderAccountSnapshot,
+        ProviderUsageWindow,
+    )
+
+    path = pg_control_path
+    parquet = tmp_path / "parquet"
+    bootstrap(parquet_dir=parquet, duckdb_path=path)
+    observed = datetime.now(timezone.utc).replace(microsecond=0)
+    service = ProviderUsageService(duckdb_path=path, parquet_dir=parquet)
+    service._persist_new_snapshots(
+        (
+            ProviderAccountSnapshot(
+                snapshot_id="hub-snapshot",
+                dedup_key="hub-snapshot",
+                provider="codex",
+                account_label="Test subscription",
+                plan_label="Test",
+                host_id="test-host",
+                status="ok",
+                observed_at=observed,
+                windows=(ProviderUsageWindow(kind="primary", used_percent=25),),
+                source="provider_api",
+            ),
+        ),
+        host_id="test-host",
+    )
+    server = build_mcp_server(duckdb_path=path)
+    result = _call_registered_tool(server, "drover_provider_quota", {})
+    assert result["accounts"][0]["provider"] == "codex"
+    assert result["accounts"][0]["hosts"] == ["test-host"]
+    assert result["store"] == "hub"
+    assert result["store_authoritative"] is True
+    assert result["data_watermark"] == {
+        "timestamp": observed.isoformat(),
+        "basis": "control_state_updated_at",
+    }

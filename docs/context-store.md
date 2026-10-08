@@ -278,6 +278,11 @@ tools for fleet state, replay, search, recall, summaries, briefs, files touched,
 handoff, and quality checks. Operators can use `drover-server status`,
 `drover-server doctor`, and the observability endpoints for local diagnostics.
 
+The hub is the single authoritative recall endpoint. Local analytical instances
+identify themselves as non-authoritative. Recall provenance and the opt-in
+container producer are documented in
+[Continuity recall and context containers](continuity-recall-and-containers.md).
+
 ### MCP Tools Overview
 
 | Tool | Purpose | Query Pattern |
@@ -289,7 +294,7 @@ handoff, and quality checks. Operators can use `drover-server status`,
 | `drover_search` | Content search across events | LIKE on content column |
 | `drover_files_touched` | Files edited during session | Parses tool_use_blocks |
 | `drover_session_close` | Enqueue summary generation | Updates job queue |
-| `drover_project_brief` | Repo-level summary | Queries `context_containers` |
+| `drover_project_brief` | Repo-level summary | PostgreSQL `project_briefs` |
 | `drover_recent_sessions` | Recent summaries for a repo | PostgreSQL final memory ordered |
 | `drover_recent_contexts` | Recent context containers | Query containers |
 | `drover_context_brief` | Context container details | Select container |

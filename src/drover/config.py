@@ -425,6 +425,7 @@ class DroverConfig:
     agent_id: str
     principal_id: str
     # Summarizer backend knobs (all optional — sensible fallbacks via env)
+    context_containers_enabled: bool
     summarizer_backend_policy: str
     summarizer_api_model: str
     summarizer_harness_model: str
@@ -609,6 +610,7 @@ _DEFAULTS = {
         "agent_id": "unknown-agent",
         "principal_id": "unknown",
     },
+    "context_containers": {"enabled": False},
     "summarizer": {
         # harness: summarize through the claude-code CLI already installed and
         # authenticated on the host. No API key, and no local model that cannot
@@ -783,6 +785,9 @@ def _registration_deadline(value: object) -> float:
 
 
 def _from_dict(d: dict) -> DroverConfig:
+    enabled = d["context_containers"]["enabled"]
+    if type(enabled) is not bool:
+        raise ValueError("context_containers.enabled must be boolean")
     s = d["summarizer"]
     e = d["embeddings"]
     r = d["redis_shadow"]
@@ -801,6 +806,8 @@ def _from_dict(d: dict) -> DroverConfig:
         schema=str(control_store["schema"]).strip(),
         outbox_retention_days=control_store["outbox_retention_days"],
     )
+    if enabled and control_store_config.backend != "postgres":
+        raise ValueError("context_containers.enabled requires the hub PostgreSQL store")
     runtime_config = RuntimeConfig(role=str(runtime["role"]).strip().lower())
     if runtime_config.role != "all" and control_store_config.backend != "postgres":
         raise ValueError(
@@ -872,6 +879,7 @@ def _from_dict(d: dict) -> DroverConfig:
         metrics_http_port=int(d["server"]["metrics_http_port"]),
         agent_id=d["agent"]["agent_id"],
         principal_id=d["agent"]["principal_id"],
+        context_containers_enabled=enabled,
         summarizer_backend_policy=s["backend_policy"],
         summarizer_api_model=s["api_model"],
         summarizer_harness_model=s["harness_model"],
