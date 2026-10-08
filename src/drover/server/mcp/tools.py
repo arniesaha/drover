@@ -1179,11 +1179,30 @@ def _resume_context(*, duckdb_path, context_id, label, max_summaries):
         return container
     session_ids = container.get("session_ids") or []
     summaries: list[dict] = []
-    repo = _memory(duckdb_path) if session_ids else None
+    policy = container.get("redaction_policy") or "session-summary-redacted"
+    repo = (
+        _memory(duckdb_path)
+        if session_ids and policy == "session-summary-redacted"
+        else None
+    )
     if repo is not None:
         summaries = [
             _summary_row(s, _RESUME_SUMMARY_KEYS)
             for s in repo.recent_summaries(session_ids=session_ids, limit=max_summaries)
+        ]
+    # Validate the raw lake projection before redaction/truncation, preserving
+    # the selected backend's fail-closed byte budget.
+    if selected_config(duckdb_path).backend == "ducklake":
+        from drover.server.lake.coverage import bounded
+
+        bounded(summaries)
+    from drover.server.context_writer import redact_context_text
+
+    for summary in summaries:
+        for field in ("summary_md", "next_steps_md"):
+            summary[field] = redact_context_text(summary.get(field))
+        summary["open_questions"] = [
+            redact_context_text(q) for q in summary.get("open_questions") or []
         ]
     result = {"context": container, "session_summaries": summaries}
     from drover.server.lake.serving import selected_config
@@ -1287,6 +1306,10 @@ def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> d
     }
     sessions = []
     for session in registry.list_sessions(archived_limit=0):
+        # An end timestamp is authoritative even if a delayed status update
+        # still leaves the registry row marked running.
+        if session.ended_at is not None:
+            continue
         liveness = host_liveness.get(session.host_id)
         # Retired hosts retain history but are never active fleet work.
         if liveness is None or liveness == "retired":

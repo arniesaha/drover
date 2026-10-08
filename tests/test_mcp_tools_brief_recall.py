@@ -332,6 +332,7 @@ def test_recent_sessions_prefers_session_memory_project_key(
         "generator_model",
         "generated_at",
         "store",
+        "store_authoritative",
         "host",
         "data_watermark",
     }

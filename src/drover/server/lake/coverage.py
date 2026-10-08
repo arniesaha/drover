@@ -8,7 +8,7 @@ own publication complete. Certification derives usage under the bound identities
 import hashlib
 import json
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -119,11 +119,13 @@ def _contexts(rows):
     return bounded(result)
 
 
-def publish_source(path, kind, payload, *, publisher, watermark, observed_at):
+def publish_source(path, kind, payload, *, publisher, watermark, observed_at, _pg=None):
     """Publish a full authoritative revision, never import legacy state.
 
     Native payload is a canonical typed-row inventory produced independently of
     serving: version, rows, sha256. Watermarks are publisher-local labels.
+    Internal ``_pg`` reuses the producer's held projection fence so reading
+    policies and publishing their replacement cannot race another publisher.
     """
     if kind not in ("contexts", "native") or any(
         not isinstance(v, str) or not v or len(v.encode()) > 4096
@@ -147,7 +149,10 @@ def publish_source(path, kind, payload, *, publisher, watermark, observed_at):
     ):
         raise LakeError("analytics_coverage_source_invalid")
     bounded(payload)
-    with _SELECTION_LOCK, projection_fence(path) as pg:
+    with (
+        _SELECTION_LOCK,
+        nullcontext(_pg) if _pg is not None else projection_fence(path) as pg,
+    ):
         _capture(path)
         revision = str(uuid4())
         pg.execute(
@@ -199,12 +204,12 @@ def _before_receipt(pg):
     """Fault-injection boundary before the immutable completion receipt."""
 
 
-def certify(path, kind):
+def certify(path, kind, *, _pg=None):
     if kind not in ("contexts", "native"):
         raise LakeError("analytics_coverage_source_invalid")
     with (
         _SELECTION_LOCK,
-        projection_fence(path) as pg,
+        nullcontext(_pg) if _pg is not None else projection_fence(path) as pg,
         _lake_fence(path, None) as fence,
     ):
         binding, _ = _capture(path)

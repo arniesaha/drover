@@ -399,6 +399,10 @@ principal_id = "unknown"
 # This value must be a finite positive integer or float in seconds.
 freshness_threshold_seconds = 600
 
+[context_containers]
+# Hub-only derived-memory producer. Explicit opt-in; no model calls.
+enabled = false
+
 [summarizer]
 # backend_policy:
 #   harness = summarize with the local claude-code CLI (no API key needed)
@@ -1863,7 +1867,7 @@ def embeddings_cmd() -> None:
 
 @main.group(name="context")
 def context_cmd() -> None:
-    """Validate, diff, and import curated metadata bundles."""
+    """Curate metadata bundles and backfill resumable containers."""
 
 
 @main.group(name="incoming")
@@ -1951,6 +1955,37 @@ def decisions_derive_cmd(ctx: click.Context) -> None:
     )
     noun = "decision" if inserted == 1 else "decisions"
     click.echo(f"inserted {inserted} {noun}")
+
+
+@context_cmd.command(name="backfill-containers")
+@click.option(
+    "--apply/--dry-run",
+    default=False,
+    help="Write containers and certify lake publication. Default is dry-run.",
+)
+@click.option(
+    "--max-containers",
+    type=click.IntRange(1, 100_000),
+    default=1000,
+    show_default=True,
+    help="Reject larger source or container snapshots; never truncate.",
+)
+@click.pass_context
+def context_backfill_containers_cmd(
+    ctx: click.Context, apply: bool, max_containers: int
+) -> None:
+    """Build resumable containers from hub summaries and project briefs."""
+    from drover.server.context_writer import ContextContainerWriter
+    from drover.server.lake.runtime import LakeError
+
+    cfg = _resolve_config(ctx.obj["config_path"])
+    try:
+        outcome = ContextContainerWriter(
+            cfg.duckdb_path, max_containers=max_containers
+        ).run_once(apply=apply)
+    except (ValueError, LakeError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(json.dumps(outcome, sort_keys=True))
 
 
 @context_cmd.command(name="validate")
@@ -3168,6 +3203,13 @@ def run(
         )
         no_summarizer = no_embeddings = no_briefs = True
 
+    context_worker = None
+    if cfg.context_containers_enabled:
+        from drover.server.context_writer import ContextContainerWorker
+
+        context_worker = ContextContainerWorker(cfg.duckdb_path)
+        context_worker.start()
+
     summarizer: SummarizerWorker | None = None
     live_recap: LiveRecapWorker | None = None
     if not no_summarizer:
@@ -3313,6 +3355,8 @@ def run(
             content_advisory_worker.join(timeout=10.0)
         if advisory_worker is not None:
             advisory_worker.join(timeout=10.0)
+        if context_worker is not None:
+            context_worker.stop()
         if briefs is not None:
             briefs.stop()
         if embeddings is not None:

@@ -54,6 +54,7 @@ def test_hub_bundle_preserves_envelope_and_scoped_context(service):
         "limits",
         "sources",
         "store",
+        "store_authoritative",
         "host",
         "data_watermark",
     ]
