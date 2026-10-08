@@ -951,6 +951,25 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             status, body = self.collector.lifecycle_report()
             self._send(status, "application/json", body)
             return
+        if path == "/profile":
+            from drover.server.profile import http_actor, read_profile
+
+            try:
+                params = parse_qs(parsed.query)
+                if set(params) - {"scope"} or len(params.get("scope", [])) > 1:
+                    raise ValueError("unsupported profile query")
+                payload = read_profile(
+                    self.collector.duckdb_path,
+                    params.get("scope", ["first_turn"])[0],
+                    actor=http_actor(
+                        self.collector.duckdb_path, self.auth, self.headers
+                    ),
+                )
+            except ValueError as exc:
+                self._send(400, "application/json", json.dumps({"error": str(exc)}))
+                return
+            self._send(200, "application/json", json.dumps(payload))
+            return
         if path == "/healthz":
             health = analytical_store_health(self.collector.duckdb_path)
             analytical_status = str(health["status"])

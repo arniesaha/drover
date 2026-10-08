@@ -56,6 +56,11 @@ def build_mcp_server(
     )
 
     @read_tool()
+    def drover_profile(scope: str = "first_turn") -> dict:
+        """Load a bounded portable profile. This unauthenticated transport is general."""
+        return t.drover_profile(duckdb_path=db, scope=scope)
+
+    @read_tool()
     def drover_memory_acceptance(harness_ids: list[str]) -> dict:
         """Read-only memory evidence report for up to 25 harness IDs."""
         return t.drover_memory_acceptance(duckdb_path=db, harness_ids=harness_ids)
