@@ -17,7 +17,7 @@ deployment configurations:
   TestFlight production lane
 - PostgreSQL control store for a fresh central installation, either an
   operator-run server or a managed container bound to `127.0.0.1`
-- DuckDB + Parquet analytical context store and host-local spools; an existing
+- DuckLake catalog + Parquet analytical context store and DuckDB host-local spools; an existing
   DuckDB control store keeps working until an explicit operator migration
 
 ## Trust Model

@@ -31,6 +31,7 @@ RELEASED_MIGRATION_HASHES: dict[int, str] = {
     9: "6e50195a7553163ee34f8aaca0ac9788c572b258af7a8726dbc4c874d65b5140",
     10: "193bed1a46e92510b7123b9e01edfdaba0fc43756698a12f42db40ff112bd4f3",
     11: "39258199d2f697391fbd70891a1b133244b8b6bb0f454e2faeac14907a9ef0b1",
+    13: "480f8a74a4a43dae2115df2e789c727d23efaf18ec8947e39997c01ffc26503b",
     12: "835df35a9e5043c218fcfcd792a1fd84386cdb31443b25058e54b2fff9f2f30d",
 }
 
@@ -137,4 +138,38 @@ def test_lake_export_batches_migration_11_forward(pg_control_path):
                 "SELECT version FROM control_schema_migrations ORDER BY version"
             ).fetchall()
         ]
-        assert versions == list(range(1, 13))
+        assert versions == list(range(1, 14))
+
+
+def test_lifecycle_13_fresh_existing_and_rerun(pg_control_path):
+    from drover.server.control_store import postgres_control_store
+    from drover.server.lifecycle_schema import SESSION_COLUMNS
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        assert (
+            con.execute("SELECT 1 FROM session_lifecycle_operations LIMIT 1").fetchone()
+            is None
+        )
+        # Recreate the version-12 table shape to exercise the additive upgrade.
+        con.execute("DROP TABLE session_lifecycle_operations")
+        for column in SESSION_COLUMNS:
+            con.execute(f"ALTER TABLE harness_sessions DROP COLUMN {column}")
+        con.execute("DELETE FROM control_schema_migrations WHERE version = 13")
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM control_schema_migrations WHERE version = 13"
+            ).fetchone()[0]
+            == 1
+        )
+        columns = {
+            r[0]
+            for r in con.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'harness_sessions'"
+            ).fetchall()
+        }
+        assert set(SESSION_COLUMNS) <= columns

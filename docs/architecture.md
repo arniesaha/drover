@@ -1,10 +1,11 @@
 # Architecture
 
-Drover has a command plane and a context plane. A fresh central installation
-uses PostgreSQL for control state and keeps analytical state local. Existing
-DuckDB control configurations remain supported until an explicit migration.
-PostgreSQL can separate central API serving from analytical work without
-changing the host-local harness daemon.
+Drover has a command plane for live fleet operations and a context plane for
+durable memory. Production switched to the V2 context architecture in v0.6.2
+on 2026-10-06: PostgreSQL is the operational control store and DuckLake is the
+analytical lake. DuckDB remains a supported compatibility control store and is
+also used for host-local harness spools, but it is not the production analytical
+serving backend.
 
 ![Drover architecture](drover-architecture.png)
 
@@ -16,8 +17,8 @@ The command plane carries live fleet operations:
    `/harness` HTTP and WebSocket API.
 2. `drover-server` maintains the fleet registry and routes each operation to a
    host connection.
-3. A per-host `drover-harnessd` owns local agent processes, structured
-   protocol adapters, PTY/tmux sessions, and terminal I/O.
+3. A per-host `drover-harnessd` owns local agent processes, structured protocol
+   adapters, PTY/tmux sessions, and terminal I/O.
 4. Direct hosts accept private inbound connections. Relay hosts dial out to the
    central server over the same trusted LAN or tailnet.
 
@@ -28,69 +29,106 @@ Drive-capable harnesses resolve through a registered adapter contract. Hosts
 and the central hub publish a bounded, versioned capability envelope (schema v1,
 #418) in `/capabilities`, `/harness` and `/harness/hosts`; web and iOS controls
 are moving onto it (#419, #420) and today still use the legacy `enabled` flag.
-Collection remains a
-separate context-plane boundary: observing a harness does not make it a launch
-target. See [Harness Adapter Architecture](harness-adapter-architecture.md) and
-[ADR 0001](adr/0001-harness-adapter-capability-registry.md).
+Collection remains a separate context-plane boundary: observing a harness does
+not make it a launch target. See [Harness Adapter Architecture](harness-adapter-architecture.md)
+and [ADR 0001](adr/0001-harness-adapter-capability-registry.md).
 
-## Context Plane
+## Context Plane V2
 
-The context plane turns local agent activity into durable, queryable memory:
+V2 has one ingest path for central harness events. In the same control-store
+transaction, ingest records the event metadata, split payload, bounded session
+preview, and pending outbox intent. It does not write ingest Parquet directly.
+Stable event identities and canonical `dedup_key` values make replay safe while
+preserving source-native identity and raw payload provenance.
 
-1. `drover-collect` and hooks emit agent events. Spans arrive only when the
-   [optional span integration](optional-span-integration.md) is enabled; no
-   core feature depends on them.
-2. Ingest normalizes identifiers, attributes repository context, deduplicates
-   records, and writes partitioned Parquet facts.
-3. DuckDB views expose normalized events, spans, sessions, links, pull-request
-   events, and routing records without duplicating the fact store.
-4. Workers create summaries, project briefs, decisions, and embeddings in
-   mutable DuckDB tables.
-5. MCP tools query raw and derived context for recall and handoff.
+`drover-collect`, hooks, and harness delivery all enter this path. Optional OTLP
+spans remain archival/diagnostic input; core memory and recall do not depend on
+them. Pond is removed.
 
-See [Context Store](context-store.md) for table ownership, identity, and
-provenance rules.
+### Control store
 
-## PostgreSQL Serving Store
+PostgreSQL is the production authority for operational and mutable state:
 
-Fresh `drover-server init` configuration sets `[control_store] backend =
-"postgres"`. The central serving store owns fleet hosts and sessions, harness event metadata and
-payload projections, live recap state, central credentials, server identity,
-and content-consent state. It does not replace the analytical lake.
+- fleet hosts, sessions, credentials, consent, and live serving projections;
+- event metadata, hot payloads, session previews, and durable outbox state;
+- derived-memory jobs, attempts, summaries, briefs, embeddings, and task
+  projection generations.
 
-The reference hub migrated its own control store from DuckDB to PostgreSQL on
-2026-09-21 using the offline import, and runs the combined role. Its analytical
-lake and every host-local harness spool remain DuckDB. Once a control store has
-accepted PostgreSQL writes, recovery is forward-only: it needs the PostgreSQL
-state together with the immutable archive files its published manifest
-references. A pre-migration DuckDB file is an audit record of earlier history,
-not a rollback target.
+The compatibility control backend is DuckDB. It implements the same durable
+outbox contract and retains inline envelopes, but selected DuckLake serving
+requires PostgreSQL because reads bind lake facts to a bounded PostgreSQL
+identity and serving-projection snapshot. Host-local `drover-harnessd` spools
+remain DuckDB and are not the central analytical lake.
 
-An existing config that omits `[control_store]` retains its DuckDB control
-store. `drover-server init --control-store duckdb` creates an explicit fresh
-legacy configuration. Neither path creates or migrates a control store without
-the corresponding operator command.
+### DuckLake analytical lake and exporter
 
-The analytics role exports pending central harness events into immutable Parquet
-batches, records them in a PostgreSQL manifest, then acknowledges them. DuckDB
-remains the home for analytical views, derived context, MCP and optional OTLP
-work, and the local-first default. A central API role reads PostgreSQL and has no direct lake fallback;
-it uses a bounded authenticated loopback boundary for analytical routes and
-cold archived payload reads.
+`LakeOutboxExporter` is the only runtime path from the control outbox into the
+selected DuckLake catalog. One fenced owner claims bounded batches, freezes
+their exact membership and hashes in PostgreSQL, and publishes each batch in an
+isolated `export_worker` process. The DuckLake commit writes canonical events,
+raw outbox rows, event versions, and an immutable export receipt as one catalog
+snapshot. Only after the receipt is checked does the exporter acknowledge the
+batch and its member events in PostgreSQL. A crash after the lake commit but
+before acknowledgement resumes the frozen batch without creating a second
+snapshot.
+
+DuckLake has two inseparable storage parts:
+
+- a PostgreSQL catalog containing DuckLake metadata and snapshot history; and
+- Parquet data and delete files under the configured lake data root.
+
+Reader, exporter, and admin catalog roles are separate. The exporter holds a
+dedicated PostgreSQL advisory fence, and a catalog-side commit guard rejects
+stale or unauthorized snapshot publication. Startup selects exactly one
+exporter implementation; it does not provision or migrate the catalog.
+
+### Serving, query children, proofs, and epochs
+
+Canonical replay/search, files-touched, summarizer inputs, recall, cockpit and
+project activity route through the selected backend. PostgreSQL remains
+authoritative for identities and mutable memory projections. The API role does
+not open the lake when roles are split; it uses the bounded authenticated
+loopback analytics boundary. MCP and UI readers therefore receive either a
+verified V2 result or an explicit unavailable response. There is no silent
+fallback to legacy analytical history.
+
+Every lake execution runs in a disposable OS query child. Admission is
+serialized per lake, and the five-second deadline includes time waiting for
+admission. Default release ceilings are 2 GiB monitored RSS, two DuckDB threads,
+1,000 result rows, and 1 MiB of result data; individual callers may only tighten
+them. The child receives the catalog credential by environment-variable name,
+uses private spill space, permits one read-only statement, and is killed on a
+deadline, memory, row, or byte-limit breach.
+
+Offline `lake verify` creates `verification/serving-proof.json`. The proof binds
+the absolute data root, catalog schema identity, verified snapshot, rebuild
+report, and retained-table counts and hashes. Its SHA-256 is pinned in the
+selected configuration. Every serving transaction checks that proof and the
+current referenced-file set. Later snapshots are trusted only when their
+`drover-export` commit metadata matches an immutable batch receipt; arbitrary
+maintenance or provisioning invalidates serving authorization.
+
+The configured analytics `epoch` names an explicit deployment selection. Read
+models bind the epoch together with the proof hash, resolved lake root, and
+PostgreSQL identity snapshot, then recheck that binding after the child returns.
+A changed epoch, proof, root, identities, source heads, or catalog snapshot
+fails closed instead of combining results from two selections. Writer
+retirement is likewise latched to the complete verified selection and must be
+explicitly renewed after a change.
 
 ## Process Boundaries
 
 | Component | Runs on | Owns |
 | --- | --- | --- |
-| iOS app | iPhone or simulator | Presentation, local settings, token in Keychain |
+| iOS, web, and CLI clients | Operator devices | Presentation and authenticated requests |
 | `drover-server` API role | Central machine | Fleet API, pairing, relay, push, PostgreSQL control readiness |
-| `drover-server` analytics role | Central machine | Ingest, immutable export, archive resolution, derived workers, MCP, optional OTLP |
-| `drover-server` all role | Central machine | Combined API and analytics startup, with the configured control backend |
-| `drover-harnessd` | Every harness host | Agent processes, adapters, PTY, terminal stream |
-| `drover-collect` | Source hosts | Local log parsing and source-side attribution |
-| PostgreSQL control store | Default fresh central storage | Fleet serving state, credentials, consent, durable export manifest |
-| DuckDB + Parquet | Local or analytics storage | Durable analytical facts, views, derived context, ledger |
-| Redis Streams | Optional central dependency | Retry coordination only |
+| `drover-server` analytics role | Central machine | Ingest, lake exporter lifecycle, analytical routes, MCP, optional OTLP |
+| `drover-server` all role | Central machine | Combined API and analytics startup |
+| `drover-harnessd` | Every harness host | Agent processes, adapters, PTY, terminal stream, local DuckDB spool |
+| `drover-collect` and hooks | Source hosts | Source parsing and attribution |
+| PostgreSQL control store | Central storage | Operational state, hot payloads, outbox, derived-memory jobs/projections |
+| DuckLake catalog + Parquet files | Analytical storage | Canonical event facts, versions, receipts, snapshot history |
+| Disposable query child | Central machine | One bounded, verified analytical read |
 
 ## Interfaces
 
@@ -98,54 +136,39 @@ cold archived payload reads.
 - Host daemon: private HTTP and WebSocket, normally port `7081`
 - MCP: streamable HTTP at `/mcp`, normally port `7077`
 - OTLP (optional, off by default): gRPC ingest, normally port `4317`
-- Files: JSONL inputs under `~/.drover/incoming/`
-- API and analytics boundary: loopback-only HTTP, normally API port `7080` and
-  worker port `7082`
+- Collector input: JSONL under the configured incoming directory
+- API and analytics boundary: authenticated loopback-only HTTP, normally API
+  port `7080` and worker port `7082`
 
 All central listeners bind to localhost by default. Ports and bind addresses
 are configurable for deliberate private-LAN or private-Tailscale deployments.
 Public-internet exposure is not supported.
 
-## Failure And Recovery
+## Failure and Recovery
 
-- Ingest uses stable deduplication keys, so replaying a source batch is safe.
-- Parquet facts survive a DuckDB catalog rebuild; views are recreated during
-  bootstrap.
-- Pipeline receipts fence duplicate work, attempts remain append-only, and
-  artifacts record supersession explicitly.
-- Optional workers can remain unavailable without stopping the command plane or
-  durable ingest.
-- With PostgreSQL split roles, a worker outage is reported separately from API
-  readiness. Fleet and session requests remain central-store reads; analytical
-  requests return an explicit unavailable result until the worker recovers.
-- A pruned central payload requires its verified immutable archive. PostgreSQL
-  state alone cannot reconstruct cold history after retention.
-- Redis coordination can be disabled or rebuilt from durable DuckDB intent.
+- Event, payload, preview, and outbox intent commit atomically in the control
+  store; ingest never depends on a simultaneous lake write.
+- Frozen batches and immutable receipts make exporter recovery idempotent.
+- Serving fails closed when the proof, receipt chain, catalog, identities, or
+  referenced files do not match the selected configuration.
+- A query-child timeout, memory breach, crash, or malformed reply cannot take
+  the command-plane process with it.
+- With split roles, an analytics outage leaves fleet and session control-store
+  reads available while analytical routes report unavailable.
+- Recovery and backup require the PostgreSQL control store together with the
+  DuckLake catalog and every catalog-referenced data file; Parquet alone is not
+  a complete lake backup.
 
-## PostgreSQL data flow
-
-```mermaid
-flowchart LR
-  app[Authenticated client] --> api[API role]
-  api --> pg[(PostgreSQL control store)]
-  api <-->|bounded loopback| worker[Analytics role]
-  worker --> pg
-  worker --> batches[Immutable Parquet batches]
-  worker --> lake[(DuckDB analytical views and derived context)]
-  host[Host-local harnessd] --> api
-  host --> spool[(Host-local DuckDB spool)]
-```
-
-The worker reads only manifest-published batches. Generic Parquet compaction
-does not own those immutable files. See [PostgreSQL control store](postgresql-control-store.md)
-for configuration, offline cutover, retention, and recovery operations.
+See the [lake serving](operations/lake-serving.md),
+[exporter](operations/lake-exporter.md), and
+[cutover](operations/lake-cutover.md) runbooks for the detailed invariants.
 
 ## Compatibility
 
-Public processes, commands, APIs, and MCP tools use Drover naming. Historical
-Parquet spans and stored integration values may retain `nexus.*` identifiers.
-Readers preserve those values as compatibility inputs; new producers should
-emit Drover naming. Compatibility storage is not a second public product name.
+Existing configurations may still select the legacy analytical backend, and
+DuckDB remains the compatibility control backend. Selection is always explicit;
+files and environment variables do not auto-enable DuckLake. Historical facts
+may retain `nexus.*` identifiers, which readers accept as compatibility inputs.
 
 ## Security Boundary
 

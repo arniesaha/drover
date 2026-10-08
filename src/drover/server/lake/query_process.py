@@ -240,7 +240,9 @@ def _worker(request: dict) -> dict:
             con.execute("BEGIN TRANSACTION")
             from .serving_proof import check_proof
 
-            check_proof(spec, con, serving["verification_sha256"])
+            checked = check_proof(spec, con, serving["verification_sha256"])
+            if serving.get("checkpoint"):
+                return {"checkpoint": checked, "rows": []}
             con.execute(
                 "CREATE TEMP TABLE memory_session_identity(harness_session_id VARCHAR, native_session_id VARCHAR, summary_session_id VARCHAR, started_at TIMESTAMPTZ)"
             )

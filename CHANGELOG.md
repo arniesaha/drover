@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-06
+
+### Fixed
+
+- Serving-proof receipt checks run as one batched query instead of one query per export,
+  so cockpit and MCP reads stay inside the 5-second analytical deadline as exports grow (#541).
+- The exporter advances the serving proof with rolling checkpoints, so verification no longer
+  stops serving after 10,001 exports; tamper checks still fail closed (#543, #546).
+- The serving check's referenced-file bound is raised from 10,000 to 50,000 (#546).
+
 ## [0.6.2] - 2026-10-06
 
 ### Fixed
