@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-08
+
+### Added
+
+- Portable user profile, iteration 1 (#545): tier-filtered, budget-bounded
+  profile bundles over HTTP and the `drover_profile` MCP tool, proposals with
+  provenance and operator accept/reject/revert, and a dry-run-by-default
+  `drover profile import`. Adds PostgreSQL migration 15 and a `drover` console
+  script alias for `drover-server`. See [the profile guide](docs/portable-profile.md).
+- Recall, search and handoff results carry store and host identity plus a
+  computed data watermark; non-hub stores label themselves non-authoritative (#475).
+- Hub-side context container producer and a dry-run-by-default
+  `drover-server context backfill-containers` command (#475). Off by default
+  (`[context_containers] enabled = false`).
+- Report-only hub session lifecycle scans, authenticated publication snapshots,
+  durable stop intent, and read-only host worktree inventory (#547). See
+  [the API and configuration guide](docs/session-lifecycle.md). Enforcement,
+  archiving, hiding and collection remain disabled.
+- Additive PostgreSQL migrations 13 and 14 for lifecycle metadata and records.
+
+### Fixed
+
+- Terminal sessions expose null attention in session API projections while
+  retaining raw historical attention (#234).
+- Offline or missing-host terminate requests return 202 with durable pending
+  intent instead of falsely ending the session. Host acknowledgement or
+  reconnect reconciliation confirms the end.
+
 ## [0.6.3] - 2026-10-06
 
 ### Fixed

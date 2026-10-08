@@ -382,6 +382,33 @@ class AnalyticsConfig:
 
 
 @dataclass(frozen=True)
+class LifecycleConfig:
+    mode: str = "report"
+    idle_after: str = "12h"
+
+    def __post_init__(self):
+        import re
+
+        if self.mode not in {"off", "report"}:
+            raise ValueError(
+                "lifecycle.mode must be off or report; enforce is not wired"
+            )
+        if not isinstance(self.idle_after, str) or not re.fullmatch(
+            r"[1-9][0-9]*(s|m|h|d)", self.idle_after
+        ):
+            raise ValueError(
+                "lifecycle.idle_after must be a positive duration such as 12h"
+            )
+
+    @property
+    def idle_after_seconds(self):
+        return (
+            int(self.idle_after[:-1])
+            * {"s": 1, "m": 60, "h": 3600, "d": 86400}[self.idle_after[-1]]
+        )
+
+
+@dataclass(frozen=True)
 class DroverConfig:
     incoming_dir: Path
     parquet_dir: Path
@@ -398,6 +425,7 @@ class DroverConfig:
     agent_id: str
     principal_id: str
     # Summarizer backend knobs (all optional — sensible fallbacks via env)
+    context_containers_enabled: bool
     summarizer_backend_policy: str
     summarizer_api_model: str
     summarizer_harness_model: str
@@ -505,6 +533,7 @@ class DroverConfig:
     # ~/.drover/worktrees. Configurable because on the reference hub ~/.drover
     # is a USB SSD whose read stalls (57-120s measured) blocked every session
     # launch; worktree creation must not share a volume with slow bulk data.
+    lifecycle: LifecycleConfig = LifecycleConfig()
     worktrees_dir: Path | None = None
     memory: MemoryBudgetConfig = MemoryBudgetConfig()
     analytics: AnalyticsConfig = AnalyticsConfig()
@@ -519,6 +548,7 @@ class DroverConfig:
 
 
 _DEFAULTS = {
+    "lifecycle": {"mode": "report", "idle_after": "12h"},
     "analytics": {
         name: getattr(AnalyticsConfig(), name)
         for name in AnalyticsConfig.__dataclass_fields__
@@ -580,6 +610,7 @@ _DEFAULTS = {
         "agent_id": "unknown-agent",
         "principal_id": "unknown",
     },
+    "context_containers": {"enabled": False},
     "summarizer": {
         # harness: summarize through the claude-code CLI already installed and
         # authenticated on the host. No API key, and no local model that cannot
@@ -754,6 +785,9 @@ def _registration_deadline(value: object) -> float:
 
 
 def _from_dict(d: dict) -> DroverConfig:
+    enabled = d["context_containers"]["enabled"]
+    if type(enabled) is not bool:
+        raise ValueError("context_containers.enabled must be boolean")
     s = d["summarizer"]
     e = d["embeddings"]
     r = d["redis_shadow"]
@@ -772,6 +806,8 @@ def _from_dict(d: dict) -> DroverConfig:
         schema=str(control_store["schema"]).strip(),
         outbox_retention_days=control_store["outbox_retention_days"],
     )
+    if enabled and control_store_config.backend != "postgres":
+        raise ValueError("context_containers.enabled requires the hub PostgreSQL store")
     runtime_config = RuntimeConfig(role=str(runtime["role"]).strip().lower())
     if runtime_config.role != "all" and control_store_config.backend != "postgres":
         raise ValueError(
@@ -808,6 +844,7 @@ def _from_dict(d: dict) -> DroverConfig:
         if not str(d["update"]["in_place_venv"]).strip():
             raise ValueError("update.runtime_root requires update.in_place_venv")
     return DroverConfig(
+        lifecycle=LifecycleConfig(**d.get("lifecycle", {})),
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),
         duckdb_path=Path(d["paths"]["duckdb_path"]),
@@ -842,6 +879,7 @@ def _from_dict(d: dict) -> DroverConfig:
         metrics_http_port=int(d["server"]["metrics_http_port"]),
         agent_id=d["agent"]["agent_id"],
         principal_id=d["agent"]["principal_id"],
+        context_containers_enabled=enabled,
         summarizer_backend_policy=s["backend_policy"],
         summarizer_api_model=s["api_model"],
         summarizer_harness_model=s["harness_model"],

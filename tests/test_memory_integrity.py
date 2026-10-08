@@ -222,6 +222,7 @@ def test_control_stream_summarizes_every_harness_with_metadata_tail(stores, harn
     assert remote_report == {
         **report,
         "store": "hub",
+        "store_authoritative": True,
         "host": socket.gethostname(),
         "data_watermark": {"timestamp": None, "basis": "unknown"},
     }

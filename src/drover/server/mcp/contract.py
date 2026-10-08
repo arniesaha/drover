@@ -27,6 +27,7 @@ class ReadCaps:
 READ_CAPS = {
     f"drover_{name}": ReadCaps(rows=rows)
     for name, rows in {
+        "profile": 100,
         "memory_acceptance": 25,
         "handoff": 20,
         "session_replay": 100,
@@ -111,6 +112,7 @@ def bound_response(value, caps, *, truncated=False):
         "truncated",
         "status",
         "store",
+        "store_authoritative",
         "host",
         "data_watermark",
         "state_source",
@@ -152,22 +154,28 @@ def bounded_read(fn):
         arguments = signature.bind(*args, **kwargs)
         arguments.apply_defaults()
         bounded, truncated = bounded_arguments(arguments.arguments, caps)
-        return bound_response(with_freshness(fn(**bounded)), caps, truncated=truncated)
+        return bound_response(
+            with_freshness(fn(**bounded), path=bounded.get("duckdb_path")),
+            caps,
+            truncated=truncated,
+        )
 
     return wrapped
 
 
 class ReadAdmission:
-    def __init__(self, concurrency=4):
+    def __init__(self, concurrency=4, path=None):
+        self.path = path
         self.slots = threading.BoundedSemaphore(concurrency)
 
     def wrap(self, fn):
+        stamp = functools.partial(with_freshness, path=self.path)
         caps = READ_CAPS[fn.__name__]
 
         @functools.wraps(fn)
         async def wrapped(*args, **kwargs):
             if not self.slots.acquire(blocking=False):
-                return with_freshness(
+                return stamp(
                     {
                         "status": "busy",
                         "reason": "MCP read admission full",
@@ -188,14 +196,12 @@ class ReadAdmission:
                 value, error = None, None
                 try:
                     value = bound_response(
-                        with_freshness(
-                            bounded_read(fn)(*args, **kwargs), empty_envelope=True
-                        ),
+                        stamp(bounded_read(fn)(*args, **kwargs), empty_envelope=True),
                         caps,
                     )
                 except Exception as exc:
                     value = bound_response(
-                        with_freshness(
+                        stamp(
                             {
                                 "status": "error",
                                 "error_type": type(exc).__name__,
@@ -215,7 +221,7 @@ class ReadAdmission:
             try:
                 return await asyncio.wait_for(future, caps.deadline_seconds)
             except asyncio.TimeoutError:
-                return with_freshness(
+                return stamp(
                     {
                         "status": "timeout",
                         "deadline_seconds": caps.deadline_seconds,

@@ -154,6 +154,7 @@ from drover.server.metrics import (
 from drover.server.native_usage_rollup import NativeUsageRollupWorker
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.otlp.receiver import OTLPReceiver
+from drover.server.profile_cli import profile as profile_commands
 from drover.server.providers.service import ProviderUsageService
 from drover.server.quality import format_prometheus, quality_snapshot
 from drover.server.rollup import rollup_tasks
@@ -398,6 +399,10 @@ principal_id = "unknown"
 # but label them stale when no successful fetch has completed within this age.
 # This value must be a finite positive integer or float in seconds.
 freshness_threshold_seconds = 600
+
+[context_containers]
+# Hub-only derived-memory producer. Explicit opt-in; no model calls.
+enabled = false
 
 [summarizer]
 # backend_policy:
@@ -885,6 +890,9 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
     ctx.obj["config_path"] = config_path
     if _startup_diagnostics is not None:
         ctx.call_on_close(_startup_diagnostics.close)
+
+
+main.add_command(profile_commands)
 
 
 @main.command(name="setup-check")
@@ -1863,7 +1871,7 @@ def embeddings_cmd() -> None:
 
 @main.group(name="context")
 def context_cmd() -> None:
-    """Validate, diff, and import curated metadata bundles."""
+    """Curate metadata bundles and backfill resumable containers."""
 
 
 @main.group(name="incoming")
@@ -1951,6 +1959,37 @@ def decisions_derive_cmd(ctx: click.Context) -> None:
     )
     noun = "decision" if inserted == 1 else "decisions"
     click.echo(f"inserted {inserted} {noun}")
+
+
+@context_cmd.command(name="backfill-containers")
+@click.option(
+    "--apply/--dry-run",
+    default=False,
+    help="Write containers and certify lake publication. Default is dry-run.",
+)
+@click.option(
+    "--max-containers",
+    type=click.IntRange(1, 100_000),
+    default=1000,
+    show_default=True,
+    help="Reject larger source or container snapshots; never truncate.",
+)
+@click.pass_context
+def context_backfill_containers_cmd(
+    ctx: click.Context, apply: bool, max_containers: int
+) -> None:
+    """Build resumable containers from hub summaries and project briefs."""
+    from drover.server.context_writer import ContextContainerWriter
+    from drover.server.lake.runtime import LakeError
+
+    cfg = _resolve_config(ctx.obj["config_path"])
+    try:
+        outcome = ContextContainerWriter(
+            cfg.duckdb_path, max_containers=max_containers
+        ).run_once(apply=apply)
+    except (ValueError, LakeError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(json.dumps(outcome, sort_keys=True))
 
 
 @context_cmd.command(name="validate")
@@ -2410,6 +2449,7 @@ def _run_api_role(
         incoming_dir=cfg.incoming_dir,
         summarizer_report={},
         api_token=auth.api_token if auth.enabled else "",
+        lifecycle_config=cfg.lifecycle,
         favorite_cwds=cfg.harness_favorite_cwds,
         content_consent_reader=lambda: consent.state().heartbeat(),
         include_analytical_readiness=False,
@@ -2417,6 +2457,9 @@ def _run_api_role(
         archive_resolver=boundary,
         archive_resolver_factory=boundary.page_resolver,
     )
+    from drover.server.harness.lifecycle_report import start_reporter
+
+    start_reporter(collector, stop)
     if cfg.update_enabled:
         planner = UpdatePlanner(
             cfg, RuntimeLayout(config_home(), root=cfg.update_runtime_root)
@@ -2958,6 +3001,7 @@ def run(
                     ),
                     embeddings_state=embeddings_state,
                     api_token=auth.api_token if auth.enabled else "",
+                    lifecycle_config=cfg.lifecycle,
                     favorite_cwds=cfg.harness_favorite_cwds,
                     advisory_service=InsightsService(
                         cfg.duckdb_path,
@@ -3000,6 +3044,10 @@ def run(
                 # minting in-process. A restart invalidates outstanding codes.
                 pairing = PairingCodes()
 
+            from drover.server.harness.lifecycle_report import start_reporter
+
+            if selected_role != "analytics":
+                start_reporter(metrics_collector, stop)
             # The hub decides what the fleet converges on and publishes it on
             # the heartbeat every harnessd already sends. Attached to the
             # collector rather than threaded through, because the only thing
@@ -3097,6 +3145,7 @@ def run(
                 summarizer_report={},
                 embeddings_state=embeddings_state,
                 api_token=auth.api_token if auth.enabled else "",
+                lifecycle_config=cfg.lifecycle,
                 favorite_cwds=cfg.harness_favorite_cwds,
                 advisory_service=InsightsService(
                     cfg.duckdb_path,
@@ -3167,6 +3216,13 @@ def run(
             "summarizer, live recap, embedding and brief workers are not started"
         )
         no_summarizer = no_embeddings = no_briefs = True
+
+    context_worker = None
+    if cfg.context_containers_enabled:
+        from drover.server.context_writer import ContextContainerWorker
+
+        context_worker = ContextContainerWorker(cfg.duckdb_path)
+        context_worker.start()
 
     summarizer: SummarizerWorker | None = None
     live_recap: LiveRecapWorker | None = None
@@ -3313,6 +3369,8 @@ def run(
             content_advisory_worker.join(timeout=10.0)
         if advisory_worker is not None:
             advisory_worker.join(timeout=10.0)
+        if context_worker is not None:
+            context_worker.stop()
         if briefs is not None:
             briefs.stop()
         if embeddings is not None:

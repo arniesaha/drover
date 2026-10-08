@@ -437,9 +437,10 @@ def test_a4_cockpit_activity_with_registered_sessions(
     assert activity["status"] == "ok", activity
 
 
-# S2: startup preserves released versions 1–11 and applies only migration 12.
+# Startup preserves dumped migration timestamps and applies registered additions.
 def test_a5_hub_startup_on_prod_shaped_store(prod_shaped, served_small_lake):
     from drover.server.lake.exporter import LakeOutboxExporter
+    from drover.server.postgres_schema import _MIGRATIONS
 
     store = postgres_control_store(prod_shaped)
     with store.connection() as con:
@@ -452,8 +453,15 @@ def test_a5_hub_startup_on_prod_shaped_store(prod_shaped, served_small_lake):
         after = con.execute(
             "SELECT version, applied_at FROM control_schema_migrations ORDER BY version"
         ).fetchall()
-    assert after[:11] == before
-    assert [r[0] for r in after] == list(range(1, 13))
+    # Preserve every restored timestamp, including the conditional vector
+    # migration. New lifecycle/profile versions come from the registry rather
+    # than a frozen upper bound; unexpected or missing versions still fail.
+    after_by_version = dict(after)
+    assert {version: after_by_version[version] for version, _ in before} == dict(before)
+    expected_versions = sorted(
+        {version for version, _ in before} | {version for version, _ in _MIGRATIONS}
+    )
+    assert [version for version, _ in after] == expected_versions
     bootstrap_control_plane_store(prod_shaped)
     with store.connection() as con:
         assert (

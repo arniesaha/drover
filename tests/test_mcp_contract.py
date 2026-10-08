@@ -44,9 +44,12 @@ def test_every_registered_read_enforces_caps(tmp_path, monkeypatch):
     )
     server = build_mcp_server(duckdb_path=tmp_path / "unused")
     registered = asyncio.run(server.list_tools())
-    assert {t.name for t in registered} - {"drover_session_close"} == set(READ_CAPS)
+    assert {t.name for t in registered} - {
+        "drover_session_close",
+        "drover_profile_propose",
+    } == set(READ_CAPS)
     for tool in registered:
-        if tool.name == "drover_session_close":
+        if tool.name in {"drover_session_close", "drover_profile_propose"}:
             continue
         caps = READ_CAPS[tool.name]
         args = {key: "test" for key in tool.inputSchema.get("required", [])}
@@ -115,6 +118,7 @@ def test_deadline_retains_admission_until_work_finishes(monkeypatch):
         assert started.is_set()
         assert result["status"] == "timeout"
         assert result["store"] == "hub"
+        assert result["store_authoritative"] is True
         assert result["data_watermark"]["timestamp"] is None
         assert (await read())["status"] == "busy"
 
@@ -147,6 +151,7 @@ def test_embedding_errors_even_without_memory(tmp_path):
 
 
 def test_fleet_reads_registry_without_analytical_connection(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
     from types import SimpleNamespace
 
     from drover.server.harness.models import HarnessSession
@@ -162,6 +167,14 @@ def test_fleet_reads_registry_without_analytical_connection(tmp_path, monkeypatc
         lambda self, **kw: [
             HarnessSession("running", "live", "codex", "codex", "running"),
             HarnessSession("retired", "retired", "codex", "codex", "running"),
+            HarnessSession(
+                "ended",
+                "live",
+                "codex",
+                "codex",
+                "running",
+                ended_at=datetime.now(timezone.utc),
+            ),
         ],
     )
     for read in (tools.drover_fleet_status, tools.drover_active_sessions):
@@ -180,7 +193,8 @@ def test_public_validation_errors_are_bounded_and_identified(tmp_path):
     )
     assert result["status"] == "error"
     assert result["error_type"] == "EmbeddingMismatch"
-    assert result["store"] == "hub"
+    assert result["store"] == "local"
+    assert result["store_authoritative"] is False
     assert result["data_watermark"]["timestamp"] is None
     assert result["truncated"] is True
 

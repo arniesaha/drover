@@ -330,11 +330,13 @@ def test_two_concurrent_structured_sessions_do_not_corrupt_registry(tmp_path):
 
         for sid in session_ids:
             _wait_until(
-                lambda sid=sid: _fetch_session(base_url, sid)["awaiting"] == "input",
-                what=f"session {sid} awaiting=input",
+                lambda sid=sid: state.registry.get_session(sid).status == "completed"
+                and state.registry.get_session(sid).awaiting == "input",
+                what=f"session {sid} completed with raw awaiting=input",
             )
 
         for sid in session_ids:
+            assert _fetch_session(base_url, sid)["awaiting"] is None
             # list_events_after(sid, 0) orders strictly by seq (unlike
             # list_events, which ties on created_at/event_id) so this is the
             # right lens on "did every event land, in order, no corruption."

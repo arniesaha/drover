@@ -115,3 +115,11 @@ unknown watermark. `timeout` and `busy` envelopes also carry identity and an
 unknown watermark. Implementation/validation failures return a bounded
 `status: error` envelope with `error_type`, `error`, identity, and an unknown
 watermark. Identity and watermark metadata count toward the byte budget.
+
+## Portable profile
+
+`drover_profile(scope="first_turn")` returns a tier-filtered portable profile
+within a 1,500-token ceiling. The current MCP transport reads as general.
+`drover_profile_propose(layer, kind, tier, body, ...)` creates a pending proposal.
+See [portable profile](portable-profile.md) for credential-authenticated HTTP,
+trusted auto-acceptance, private review, reversal and markdown import.

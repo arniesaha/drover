@@ -9,6 +9,11 @@ import duckdb
 
 from drover.server.continuity_schema import CONTINUITY_DDL
 from drover.server.harness.identity import harness_event_identity
+from drover.server.lifecycle_schema import (
+    OPERATIONS_DDL,
+    PUBLICATION_MIGRATION,
+    SESSION_COLUMNS,
+)
 
 HARNESS_TABLES = (
     "harness_hosts",
@@ -373,6 +378,7 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             # (#473). Distinct from source_session_id, which is a handoff and
             # adopts an existing live session rather than starting a sibling.
             "parent_session_id": "VARCHAR",
+            **SESSION_COLUMNS,
         },
     )
     # A caller-supplied idempotency key, so a create whose response was lost
@@ -388,6 +394,9 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS harness_sessions_client_key "
         "ON harness_sessions (client_session_id)"
     )
+    con.execute(OPERATIONS_DDL)
+    for statement in PUBLICATION_MIGRATION:
+        con.execute(statement)
     con.execute(_HARNESS_EVENTS_DDL)
     # Dropped before the column migration below and recreated after, because
     # DuckDB refuses to drop a column an index depends on positionally.

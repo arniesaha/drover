@@ -2002,10 +2002,8 @@ def test_metrics_http_server_proxies_harness_launch_and_terminate(tmp_path):
     assert terminated.ended_at is not None
 
 
-def test_terminate_tombstones_session_missing_on_daemon(tmp_path):
-    # Daemon restarted: the registry row is still "running" but harnessd
-    # answers 404 for the session id. Central terminate must tombstone the
-    # row and report success instead of proxying the 404 to the client.
+def test_terminate_records_pending_session_missing_on_daemon(tmp_path):
+    # Missing on the host is not proof of process exit.
     _FakeHarnessHandler.requests = []
     harness_server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHarnessHandler)
     harness_thread = metrics.threading.Thread(
@@ -2057,20 +2055,18 @@ def test_terminate_tombstones_session_missing_on_daemon(tmp_path):
         harness_server.shutdown()
         harness_server.server_close()
 
-    assert status == 200
+    assert status == 202
     assert payload["session_id"] == "harness-stale"
-    assert payload["status"] == "terminated"
-    assert payload["stale"] is True
+    assert payload["state"] == "pending"
+    assert payload["operation_id"]
     session = HarnessRegistry(duckdb_path).get_session("harness-stale")
     assert session is not None
-    assert session.status == "terminated"
-    assert session.ended_at is not None
+    assert session.status == "running"
+    assert session.ended_at is None
 
 
-def test_terminate_tombstones_session_on_unreachable_host(tmp_path):
-    # Host offline: proxying the terminate fails outright (connection
-    # refused). Central terminate must still tombstone the row and report
-    # success instead of surfacing a 502.
+def test_terminate_records_pending_session_on_unreachable_host(tmp_path):
+    # Connection refusal leaves a durable, unconfirmed user stop.
     probe = socket.socket()
     probe.bind(("127.0.0.1", 0))
     dead_port = probe.getsockname()[1]
@@ -2117,14 +2113,14 @@ def test_terminate_tombstones_session_on_unreachable_host(tmp_path):
         server.shutdown()
         server.server_close()
 
-    assert status == 200
+    assert status == 202
     assert payload["session_id"] == "harness-unreachable"
-    assert payload["status"] == "terminated"
-    assert payload["stale"] is True
+    assert payload["state"] == "pending"
+    assert payload["operation_id"]
     session = HarnessRegistry(duckdb_path).get_session("harness-unreachable")
     assert session is not None
-    assert session.status == "terminated"
-    assert session.ended_at is not None
+    assert session.status == "running"
+    assert session.ended_at is None
 
 
 @pytest.fixture

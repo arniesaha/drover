@@ -938,6 +938,63 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if self.analytics_boundary is None and self._is_analytics_public_path(path):
             require_analytical_store(self.collector.duckdb_path)
+        if path == "/healthz" and parse_qs(parsed.query).get("detail") == ["1"]:
+            self._send(
+                200,
+                "application/json",
+                json.dumps(
+                    {"ok": True, "lifecycle": self.collector.lifecycle_health()}
+                ),
+            )
+            return
+        if path == "/harness/lifecycle":
+            status, body = self.collector.lifecycle_report()
+            self._send(status, "application/json", body)
+            return
+        if path == "/profile/proposals":
+            from drover.server.profile import http_actor, list_proposals
+
+            try:
+                params = parse_qs(parsed.query)
+                if set(params) - {"status", "limit"} or any(
+                    len(v) != 1 for v in params.values()
+                ):
+                    raise ValueError("invalid proposal query")
+                payload = list_proposals(
+                    self.collector.duckdb_path,
+                    actor=http_actor(
+                        self.collector.duckdb_path, self.auth, self.headers
+                    ),
+                    status=params.get("status", ["pending"])[0],
+                    limit=int(params.get("limit", ["25"])[0]),
+                )
+            except PermissionError as exc:
+                self._send(403, "application/json", json.dumps({"error": str(exc)}))
+                return
+            except ValueError as exc:
+                self._send(400, "application/json", json.dumps({"error": str(exc)}))
+                return
+            self._send(200, "application/json", json.dumps(payload))
+            return
+        if path == "/profile":
+            from drover.server.profile import http_actor, read_profile
+
+            try:
+                params = parse_qs(parsed.query)
+                if set(params) - {"scope"} or len(params.get("scope", [])) > 1:
+                    raise ValueError("unsupported profile query")
+                payload = read_profile(
+                    self.collector.duckdb_path,
+                    params.get("scope", ["first_turn"])[0],
+                    actor=http_actor(
+                        self.collector.duckdb_path, self.auth, self.headers
+                    ),
+                )
+            except ValueError as exc:
+                self._send(400, "application/json", json.dumps({"error": str(exc)}))
+                return
+            self._send(200, "application/json", json.dumps(payload))
+            return
         if path == "/healthz":
             health = analytical_store_health(self.collector.duckdb_path)
             analytical_status = str(health["status"])
@@ -1168,6 +1225,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             self._send(status, "application/json", body)
             return
+        if path.startswith("/harness/sessions/") and path.endswith("/publications"):
+            session_id = unquote(
+                path.removeprefix("/harness/sessions/")
+                .removesuffix("/publications")
+                .strip("/")
+            )
+            status, body = self.collector.harness_publications(session_id)
+            self._send(status, "application/json", body)
+            return
         if path == "/harness/sessions":
             self._send(
                 200,
@@ -1321,6 +1387,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if self.analytics_boundary is None and self._is_analytics_public_path(path):
             require_analytical_store(self.collector.duckdb_path)
+        if path.startswith("/profile/"):
+            self._profile_write(path)
+            return
         if path == "/auth/login":
             self._handle_login()
             return
@@ -1538,6 +1607,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 return
             status, payload = self.collector.proxy_create_harness_session(host_id, body)
             self._send(status, "application/json", payload)
+            return
+        if path.startswith("/harness/sessions/") and path.endswith("/publications"):
+            session_id = unquote(
+                path.removeprefix("/harness/sessions/")
+                .removesuffix("/publications")
+                .strip("/")
+            )
+            body = self._read_json()
+            if body is None:
+                self._send(400, "application/json", '{"error":"invalid JSON"}')
+                return
+            status, response = self.collector.harness_publications(session_id, body)
+            self._send(status, "application/json", response)
             return
         for action in ("turns", "permission", "interrupt"):
             suffix = f"/{action}"
@@ -2553,6 +2635,80 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         self.auth.credentials.clear_apns_registration(credential.id)
         self._send(204, "application/json", "")
+
+    def _profile_write(self, path):
+        from drover.server.profile import (
+            ProfileConflict,
+            act_on_proposal,
+            http_actor,
+            propose_profile,
+            register_agent,
+        )
+
+        body = self._read_json(capability_registration=True)
+        if body is None:
+            self._send(400, "application/json", '{"error":"JSON object required"}')
+            return
+        actor = http_actor(self.collector.duckdb_path, self.auth, self.headers)
+        try:
+            if path == "/profile/proposals":
+                if set(body) - {
+                    "layer",
+                    "kind",
+                    "tier",
+                    "body",
+                    "session_id",
+                    "item_id",
+                    "expires_at",
+                }:
+                    raise ValueError("unsupported proposal field")
+                payload = propose_profile(
+                    self.collector.duckdb_path,
+                    {
+                        k: v
+                        for k, v in body.items()
+                        if k not in {"session_id", "item_id"}
+                    },
+                    actor=actor,
+                    session_id=body.get("session_id"),
+                    item_id=body.get("item_id"),
+                )
+            elif path == "/profile/agents":
+                if not actor.user:
+                    raise PermissionError("operator scope required")
+                if set(body) != {"credential_id", "agent_id", "tier"}:
+                    raise ValueError("credential_id, agent_id and tier required")
+                credential = (
+                    self.auth.credentials.get(body["credential_id"])
+                    if self.auth.credentials
+                    else None
+                )
+                if (
+                    credential is None
+                    or not credential.is_active
+                    or credential.scope == "preflight"
+                ):
+                    raise ValueError("active non-preflight credential required")
+                payload = register_agent(
+                    self.collector.duckdb_path, actor=actor, **body
+                )
+            else:
+                parts = path.strip("/").split("/")
+                if len(parts) != 4 or parts[:2] != ["profile", "proposals"] or body:
+                    raise ValueError("invalid proposal action route or body")
+                payload = act_on_proposal(
+                    self.collector.duckdb_path, parts[2], parts[3], actor=actor
+                )
+        except PermissionError as exc:
+            self._send(403, "application/json", json.dumps({"error": str(exc)}))
+            return
+        except ProfileConflict as exc:
+            self._send(409, "application/json", json.dumps({"error": str(exc)}))
+            return
+        except (ValueError, TypeError) as exc:
+            self._send(400, "application/json", json.dumps({"error": str(exc)}))
+            return
+        self._send(200, "application/json", json.dumps(payload))
 
     def _read_json(
         self, *, capability_registration: bool = False
