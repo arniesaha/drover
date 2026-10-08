@@ -1320,6 +1320,7 @@ def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> d
         if task_id and tid != task_id:
             continue
         row = _coerce(asdict(session))
+        row["awaiting"] = session.effective_awaiting
         row.update(
             agent_id=session.host_id,
             task_id=tid,

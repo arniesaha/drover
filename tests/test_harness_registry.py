@@ -56,20 +56,25 @@ def test_bootstrap_adds_recap_reconcile_marker_to_existing_sessions(tmp_path):
     """Removing the additive marker migration breaks existing Drover databases."""
     duckdb_path = tmp_path / "pre-marker.duckdb"
     with duckdb.connect(str(duckdb_path)) as con:
-        bootstrap_harness_tables(con)
-        columns = {
-            row[1]
-            for row in con.execute("PRAGMA table_info('harness_sessions')").fetchall()
-        }
-        if "recap_reconcile_needed" in columns:
-            # A store old enough to lack this column also predates the
-            # client-key index, and DuckDB will not drop a column that an index
-            # depends on positionally. Drop both to build a faithful old store.
-            con.execute("DROP INDEX IF EXISTS harness_sessions_client_key")
-            con.execute("ALTER TABLE harness_sessions DROP COLUMN client_session_id")
-            con.execute(
-                "ALTER TABLE harness_sessions DROP COLUMN recap_reconcile_needed"
-            )
+        # Build the pre-marker store directly. Bootstrapping today's schema
+        # first creates lifecycle foreign keys, so DuckDB correctly refuses
+        # to reshape their parent table into this historical fixture.
+        con.execute("""CREATE TABLE harness_sessions (
+            session_id VARCHAR PRIMARY KEY,
+            host_id VARCHAR NOT NULL,
+            harness VARCHAR NOT NULL,
+            repo_owner VARCHAR,
+            repo_name VARCHAR,
+            branch VARCHAR,
+            cwd VARCHAR,
+            command VARCHAR NOT NULL,
+            status VARCHAR NOT NULL,
+            started_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT now(),
+            ended_at TIMESTAMP,
+            last_error VARCHAR,
+            summary_session_id VARCHAR
+        )""")
         con.execute("""INSERT INTO harness_sessions
                  (session_id, host_id, harness, command, status)
                VALUES ('existing-session', 'nas', 'codex', 'codex', 'running')""")
