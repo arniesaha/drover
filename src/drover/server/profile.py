@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -274,8 +275,28 @@ def _accept(con, proposal_id, item_id, change, previous, agent, session, actor):
     )
 
 
+@contextmanager
+def _profile_transaction(path, connection=None):
+    if connection is not None:
+        with connection._connection.transaction():
+            yield connection
+    else:
+        with (
+            postgres_control_store(path).connection() as con,
+            con._connection.transaction(),
+        ):
+            yield con
+
+
 def propose_profile(
-    path, values, *, actor=None, session_id=None, item_id=None, import_key=None
+    path,
+    values,
+    *,
+    actor=None,
+    session_id=None,
+    item_id=None,
+    import_key=None,
+    _con=None,
 ):
     from uuid import uuid4
 
@@ -288,10 +309,7 @@ def propose_profile(
     supplied_id = item_id is not None
     item_id = _text(item_id, "item_id", 256) if supplied_id else uuid4().hex
     proposal_id = uuid4().hex
-    with (
-        postgres_control_store(path).connection() as con,
-        con._connection.transaction(),
-    ):
+    with _profile_transaction(path, _con) as con:
         if import_key:
             con.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(?))",
@@ -348,17 +366,14 @@ def propose_profile(
     }
 
 
-def act_on_proposal(path, proposal_id, action, *, actor):
+def act_on_proposal(path, proposal_id, action, *, actor, _con=None):
     from psycopg.types.json import Jsonb
 
     if not actor.user:
         raise PermissionError("operator scope required")
     if action not in ("accept", "reject", "revert"):
         raise ValueError("unsupported proposal action")
-    with (
-        postgres_control_store(path).connection() as con,
-        con._connection.transaction(),
-    ):
+    with _profile_transaction(path, _con) as con:
         row = con.execute(
             "SELECT to_jsonb(p) FROM profile_proposals p WHERE proposal_id = ? FOR UPDATE",
             [proposal_id],
