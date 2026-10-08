@@ -155,7 +155,11 @@ def bounded_read(fn):
         arguments.apply_defaults()
         bounded, truncated = bounded_arguments(arguments.arguments, caps)
         return bound_response(
-            with_freshness(fn(**bounded), path=bounded.get("duckdb_path")),
+            with_freshness(
+                fn(**bounded),
+                path=bounded.get("duckdb_path"),
+                allow_store_watermark=fn.__name__ != "drover_profile",
+            ),
             caps,
             truncated=truncated,
         )
@@ -169,7 +173,11 @@ class ReadAdmission:
         self.slots = threading.BoundedSemaphore(concurrency)
 
     def wrap(self, fn):
-        stamp = functools.partial(with_freshness, path=self.path)
+        stamp = functools.partial(
+            with_freshness,
+            path=self.path,
+            allow_store_watermark=fn.__name__ != "drover_profile",
+        )
         caps = READ_CAPS[fn.__name__]
 
         @functools.wraps(fn)

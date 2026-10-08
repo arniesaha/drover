@@ -197,6 +197,11 @@ def read_profile(path: Path, scope="first_turn", *, actor=None, now=None):
             ),
             "basis": "rendered_profile_source_at" if rendered_stamps else "unknown",
         },
+        "oldest_item_age_seconds": (
+            max(0.0, (now - min(rendered_stamps)).total_seconds())
+            if rendered_stamps
+            else None
+        ),
         "token_upper_bound": token_upper_bound(bundle),
         "token_budget": BUNDLE_TOKENS,
         "withheld_count": withheld,

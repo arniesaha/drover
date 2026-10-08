@@ -266,3 +266,87 @@ def test_profile_consumes_continuity_producer(pg_control_path, tmp_path):
     assert "Stale produced context" not in result["bundle"]
     assert result["withheld_count"] == 1
     assert result["data_watermark"]["timestamp"] == NOW.isoformat()
+
+
+def test_rendered_oldest_age_ignores_hidden_stale_and_omitted(pg_control_path):
+    item(pg_control_path, "Old rule", kind="rule", age=100)
+    item(pg_control_path, "Recent preference", age=2)
+    item(pg_control_path, "Hidden older rule", kind="rule", tier="private", age=200)
+    item(pg_control_path, "x" * 2000, kind="rule", age=300)
+    item(pg_control_path, "Stale work", layer="work", age=15)
+    result = read_profile(pg_control_path, now=NOW)
+    assert result["oldest_item_age_seconds"] == 100 * 86400
+    assert (
+        result["data_watermark"]["timestamp"] == (NOW - timedelta(days=2)).isoformat()
+    )
+    assert result["truncated"] is True
+    assert "Hidden" not in json.dumps(result)
+
+
+def test_empty_profile_freshness_is_unknown_on_both_transports(pg_control_path):
+    with postgres_control_store(pg_control_path).connection() as con:
+        con.execute(
+            "INSERT INTO project_briefs (project_key, repo_owner, repo_name, brief_md, generated_at) "
+            "VALUES ('example/unrelated', 'example', 'unrelated', 'Unrelated', ?)",
+            [NOW],
+        )
+    http = read_profile(pg_control_path, "user", now=NOW)
+    mcp = build_mcp_server(duckdb_path=pg_control_path)
+    response = asyncio.run(mcp.call_tool("drover_profile", {"scope": "user"}))
+    content = response[0] if isinstance(response, tuple) else response
+    result = json.loads(content[0].text)
+    for value in (http, result):
+        assert value["oldest_item_age_seconds"] is None
+        assert value["data_watermark"] == {"timestamp": None, "basis": "unknown"}
+
+
+def test_future_item_age_clamps_to_zero(pg_control_path):
+    item(pg_control_path, "Future preference", age=-1)
+    assert read_profile(pg_control_path, now=NOW)["oldest_item_age_seconds"] == 0
+
+
+def test_single_call_http_trusted_bundle_and_revocation(pg_control_path):
+    from drover.server.profile import issue_agent_credential, revoke_agent_credential
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    operator = ProfileActor("operator", "private", True)
+    issued = issue_agent_credential(
+        pg_control_path, "example-agent", "trusted", actor=operator
+    )
+    auth = AuthSettings(
+        True,
+        "",
+        credentials=PostgresCredentialStore(pg_control_path),
+        legacy_token_enabled=False,
+    )
+    item(pg_control_path, "General preference")
+    item(pg_control_path, "Trusted preference", tier="trusted")
+    item(pg_control_path, "Private preference", tier="private")
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=SimpleNamespace(duckdb_path=pg_control_path),
+        auth=auth,
+    )
+    try:
+        request = Request(
+            f"http://127.0.0.1:{server.server_address[1]}/profile",
+            headers={"Authorization": f"Bearer {issued['token']}"},
+        )
+        with urlopen(request) as response:
+            result = json.load(response)
+        assert "General preference" in result["bundle"]
+        assert "Trusted preference" in result["bundle"]
+        assert "Private preference" not in json.dumps(result)
+        assert result["withheld_count"] == 1
+        assert result["token_upper_bound"] == len(result["bundle"].encode()) <= 1500
+        assert result["oldest_item_age_seconds"] >= 0
+        revoke_agent_credential(pg_control_path, "example-agent", actor=operator)
+        from urllib.error import HTTPError
+
+        with pytest.raises(HTTPError) as exc:
+            urlopen(request)
+        assert exc.value.code == 401
+    finally:
+        server.shutdown()
+        server.server_close()
