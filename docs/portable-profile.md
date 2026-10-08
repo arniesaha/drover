@@ -70,7 +70,8 @@ Bind an already issued, active `profile` credential with operator-authorized
 
 The existing MCP transport has no verified caller identity. Its profile reader
 is always general and its proposals always start pending. Trusted agents use
-credential-authenticated HTTP for trusted reads and automatic acceptance.
+credential-authenticated HTTP for trusted reads. Current registration accepts
+only read-only profile credentials, which cannot submit proposals.
 
 ## Proposals, review and reversal
 
@@ -92,12 +93,21 @@ existing accessible item. Optional `expires_at` requires a timezone-qualified
 ISO timestamp. Body text is limited to 65,536 UTF-8 bytes. Responses return
 proposal ID, item ID, status and an idempotence flag, without echoing content.
 
-Proposals from a registered trusted identity on an otherwise authorized transport
-automatically accept unless the target tier is private. Issued profile credentials
+Proposals submitted through the current HTTP and MCP credential setup start
+pending until the operator approves them. Issued profile credentials
 are read-only and cannot call proposal routes.
-Editing an existing private item also requires user approval; readers cannot
-edit items they cannot access. All other proposals start pending. This includes
-operator-created proposals, keeping approval explicit.
+Readers cannot edit items they cannot access. Operator-created proposals also
+start pending, keeping approval explicit.
+
+A legacy registry binding is an exception: an active `device` or `host`
+credential already bound to tier `trusted` in `profile_agents` can still submit
+`POST /profile/proposals`. HTTP identity resolution uses the stored tier without
+rechecking the credential's scope. For that caller, the service automatically
+accepts a proposal only when its target tier is not private and an existing
+target item is also not private. Private proposals remain pending. Current
+`POST /profile/agents` and `register_agent` reject creation of such bindings;
+issued profile credentials cannot reach this path. The scope restriction does
+not rewrite preexisting registry rows.
 
 The operator can inspect `GET /profile/proposals?status=pending&limit=25`.
 The queue includes proposed content and source identity. Allowed statuses are

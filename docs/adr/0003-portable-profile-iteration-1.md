@@ -2,6 +2,10 @@
 
 Status: accepted. Date: 2026-10-07. Authority: issue #545 decisions comment.
 
+Agent proposal policy in item 5 is updated for iteration 2. The current
+[profile contract](../portable-profile.md#proposals-review-and-reversal) also
+describes the residual behavior of preexisting host/device registry bindings.
+
 1. First-turn bundles have a 1,500-token budget, including headings and withheld counts.
 2. Threads leave the bundle after 14 days without activity; decisions after 30 days.
 3. Tiers are general, trusted and private. The two designated agents in the issue
@@ -9,9 +13,10 @@ Status: accepted. Date: 2026-10-07. Authority: issue #545 decisions comment.
    is available only to explicitly private readers. Other readers receive only a
    withheld count, without titles or categories. Public artifacts use example agents.
 4. Drover PostgreSQL is authoritative. Markdown files are import sources only.
-5. Trusted agents' proposals auto-accept unless they target private content.
-   Private changes require user approval. Accepted changes record agent, session
-   and time, and can be reverted.
+5. Trusted agents use read-only profile credentials for trusted HTTP reads.
+   Proposals submitted through the current transport setup remain pending until
+   operator approval. Accepted changes record agent, session and time, and can
+   be reverted.
 
 Credential bindings belong in the PostgreSQL agent registry, provisioned by the
 operator, rather than embedding deployment identities in public source code.

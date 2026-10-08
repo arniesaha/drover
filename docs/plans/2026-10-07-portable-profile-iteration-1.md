@@ -2,6 +2,9 @@
 
 Authority: ADR 0003 and issue #545. Read the design branch artifact
 `docs/design/portable-profile.html`; the requested `.src.html` is absent there.
+Agent proposal policy references below are updated for iteration 2; see the
+[current contract](../portable-profile.md#proposals-review-and-reversal) for the
+legacy registry binding exception.
 
 ## Commit sequence and file exhibits
 
@@ -33,7 +36,8 @@ Authority: ADR 0003 and issue #545. Read the design branch artifact
    Identity and tier are derived from verified credentials, never body arguments.
    POST `/profile/proposals/{id}/{accept,reject,revert}` is operator-only.
    POST `/profile/agents` binds credential_id, agent_id and tier, operator-only.
-   Auto-accept trusted proposals except private targets or existing private items.
+   Current agent bindings require read-only profile credentials. Proposals from
+   the current HTTP/MCP transport setup remain pending until operator approval.
    Transactions lock target items; snapshots and revision checks prevent stale
    accept/revert from overwriting subsequent changes. Return IDs/status only.
 5. Add `src/drover/server/profile_cli.py:1`, register at
@@ -51,7 +55,7 @@ Authority: ADR 0003 and issue #545. Read the design branch artifact
 Foreground scoped pytest runs after each code commit: migration contracts;
 profile read tests for general/trusted/private filtering, zero-container briefs,
 expiry, 14/30-day boundaries, Unicode budget and deterministic truncation;
-write tests for credential authority, trusted auto-accept, private pending,
+write tests for credential authority, trusted read isolation, pending proposals,
 provenance, reject, revert, conflicts and HTTP/MCP registration;
 CLI tests for dry-run, apply, idempotence and sensitive nested headings.
 Run black/isort on touched Python, markdown links, public release scan and
