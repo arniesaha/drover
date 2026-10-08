@@ -134,6 +134,7 @@ public actor MessageStream {
     private let coldWindowSize: Int
 
     private var lastSeq = 0
+    private var deliveredGapIDs: Set<String> = []
     private var coldHistoryComplete = false
     private var olderBeforeSeq: Int?
     private var hasOlderHistory = false
@@ -220,8 +221,8 @@ public actor MessageStream {
             throw CatchUpError.sequenceGap
         }
 
-        let visible = page.messages.filter { $0.seq > 0 }
-        guard page.hasOlder || visible.first?.seq == 1 else {
+        let visible = page.messages.filter { $0.seq > 0 || $0.isOutOfBandGap }
+        guard page.hasOlder || visible.first(where: { !$0.isOutOfBandGap })?.seq == 1 else {
             throw CatchUpError.sequenceGap
         }
         olderBeforeSeq = pageFirst
@@ -441,8 +442,8 @@ public actor MessageStream {
         guard let fixedMaxSeq = coldWindowMaxSeq else {
             throw CatchUpError.snapshotChanged
         }
-        let visible = coldWindow.filter { $0.seq > 0 }
-        guard coldWindowHasOlder || fixedMaxSeq == 0 || visible.first?.seq == 1
+        let visible = coldWindow.filter { $0.seq > 0 || $0.isOutOfBandGap }
+        guard coldWindowHasOlder || fixedMaxSeq == 0 || visible.first(where: { !$0.isOutOfBandGap })?.seq == 1
                 || toleratingGaps else {
             throw CatchUpError.sequenceGap
         }
@@ -504,9 +505,9 @@ public actor MessageStream {
                 throw CatchUpError.malformedPage
             }
 
-            let fresh = page.messages.filter { $0.seq > cursor }
+            let fresh = page.messages.filter { $0.seq > cursor || $0.isOutOfBandGap }
             var expectedSeq = cursor + 1
-            for message in fresh {
+            for message in fresh where !message.isOutOfBandGap {
                 guard message.seq == expectedSeq || toleratingGaps else {
                     throw CatchUpError.sequenceGap
                 }
@@ -543,7 +544,8 @@ public actor MessageStream {
               page.pageMaxSeq == nil || page.pageMaxSeq == page.messages.last?.seq else {
             throw CatchUpError.snapshotChanged
         }
-        for (previous, next) in zip(page.messages, page.messages.dropFirst()) {
+        let sequenced = page.messages.filter { !$0.isOutOfBandGap }
+        for (previous, next) in zip(sequenced, sequenced.dropFirst()) {
             guard next.seq == previous.seq + 1 || toleratingGaps else {
                 throw CatchUpError.sequenceGap
             }
@@ -567,6 +569,9 @@ public actor MessageStream {
     private func marked(
         _ messages: [HarnessMessage], leadingFrom lowerBound: Int?
     ) -> [HarnessMessage] {
+        let messages = messages.filter { message in
+            !message.isOutOfBandGap || deliveredGapIDs.insert(message.id).inserted
+        }
         guard let first = messages.first else { return messages }
         var result: [HarnessMessage] = []
         result.reserveCapacity(messages.count + 1)
@@ -592,6 +597,15 @@ public actor MessageStream {
         _ message: HarnessMessage,
         continuation: AsyncStream<StreamEvent>.Continuation
     ) throws {
+        // Hub gaps are attached to a stream position and never consume a
+        // host sequence. Deduplicate them by identity, including late gaps
+        // at the already-delivered cursor.
+        if message.isOutOfBandGap {
+            if deliveredGapIDs.insert(message.id).inserted {
+                continuation.yield(.message(message))
+            }
+            return
+        }
         guard message.seq > lastSeq else { return }
         guard message.seq == lastSeq + 1 else {
             throw CatchUpError.sequenceGap

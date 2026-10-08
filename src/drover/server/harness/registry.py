@@ -1157,6 +1157,9 @@ class HarnessRegistry:
         created_at: datetime | None = None,
         seq: int | None = None,
     ) -> HarnessEvent:
+        # transcript.gap is out of band: readers attach NULL-sequence markers
+        # after the last sequenced event at or before their creation timestamp.
+        # Never reserve a number owned by a remote structured manager.
         event_id = event_id or f"harness-event-{uuid4()}"
         created_at = _as_utc_datetime(created_at) or _now()
         normalized = normalize_harness_event(
@@ -1716,6 +1719,58 @@ class HarnessRegistry:
             ).fetchone()
         return int(row[0] or 0)
 
+    @staticmethod
+    def _ordered_gap_events(
+        con: Any, session_id: str, *, lower: int, upper: int | None = None
+    ) -> list[HarnessEvent]:
+        """Attach out-of-band gaps to the preceding persisted stream position.
+
+        Gaps do not consume host-owned sequence numbers. Their ordering key
+        is (preceding seq, created_at, event_id), after the content at that
+        position. Include the cursor's position so a late gap remains visible.
+        Page limits count sequenced events; attached gaps travel with their
+        position and cannot be cut off by a sequence-only pagination cursor.
+        This also admits historical NULL-sequence markers without a migration.
+        """
+        rows = _rows(
+            con,
+            f"""SELECT {_event_select_columns(con) if is_postgres_connection(con) else 'e.*'},
+                       COALESCE((SELECT MAX(prior.seq) FROM harness_events prior
+                                  WHERE prior.session_id = e.session_id
+                                    AND prior.seq > 0
+                                    AND prior.created_at <= e.created_at), 0) AS gap_after_seq
+                  FROM harness_events e {_event_read_join(con) if is_postgres_connection(con) else ''}
+                 WHERE e.session_id = ? AND e.event_type = 'transcript.gap'
+                   AND (e.seq IS NULL OR e.seq = 0)""",
+            [session_id],
+        )
+        events = []
+        for row in rows:
+            anchor = int(row.pop("gap_after_seq"))
+            if anchor < lower or (upper is not None and anchor > upper):
+                continue
+            event = HarnessEvent.from_row(row)
+            events.append(
+                replace(
+                    event,
+                    seq=anchor,
+                    payload={**event.payload, "out_of_band": True},
+                )
+            )
+        return events
+
+    @staticmethod
+    def _order_with_gaps(events: list[HarnessEvent]) -> list[HarnessEvent]:
+        return sorted(
+            events,
+            key=lambda event: (
+                event.seq or 0,
+                bool(event.payload.get("out_of_band")),
+                event.created_at or datetime.min.replace(tzinfo=timezone.utc),
+                event.event_id,
+            ),
+        )
+
     def list_events_after(
         self, session_id: str, after_seq: int, *, resolver: Any | None = None
     ) -> list[HarnessEvent]:
@@ -1738,8 +1793,12 @@ class HarnessRegistry:
                     "AND seq IS NOT NULL AND seq > ? ORDER BY seq",
                     [session_id, after_seq],
                 )
-        return self._restore_archived_payloads(
-            [HarnessEvent.from_row(row) for row in rows], resolver=resolver
+            gaps = self._ordered_gap_events(con, session_id, lower=after_seq)
+        return self._order_with_gaps(
+            self._restore_archived_payloads(
+                [HarnessEvent.from_row(row) for row in rows], resolver=resolver
+            )
+            + gaps
         )
 
     def list_event_page(
@@ -1817,8 +1876,21 @@ class HarnessRegistry:
                     rows = rows[1:]
                 has_newer = before_seq is not None and before_seq <= max_seq
 
-        events = self._restore_archived_payloads(
-            [HarnessEvent.from_row(row) for row in rows], resolver=resolver
+            sequences = [int(row["seq"]) for row in rows]
+            lower = min(sequences) if sequences else (after_seq or 0)
+            if after_seq is not None:
+                lower = after_seq
+            elif not has_older:
+                lower = 0
+            upper = max(sequences) if sequences else max_seq
+            if before_seq is not None:
+                upper = min(upper, before_seq - 1)
+            gaps = self._ordered_gap_events(con, session_id, lower=lower, upper=upper)
+        events = self._order_with_gaps(
+            self._restore_archived_payloads(
+                [HarnessEvent.from_row(row) for row in rows], resolver=resolver
+            )
+            + gaps
         )
         sequences = [event.seq for event in events if event.seq is not None]
         return HarnessEventPage(

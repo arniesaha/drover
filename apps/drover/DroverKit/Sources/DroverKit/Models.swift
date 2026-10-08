@@ -612,6 +612,7 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
     public var id: String        // event_id
     public var seq: Int
     public var type: MessageType
+    public var isOutOfBandGap: Bool = false
     public var role: String
     public var text: String
     public var turnID: String?
@@ -637,6 +638,7 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
         case type
         case role
         case text
+        case isOutOfBandGap = "out_of_band"
         case turnID = "turn_id"
         case timestamp = "ts"
         case payload
@@ -648,6 +650,8 @@ public struct HarnessMessage: Sendable, Identifiable, Decodable, Equatable {
         seq = (try? container.decode(Int.self, forKey: .seq)) ?? 0
         let rawType = (try? container.decode(String.self, forKey: .type)) ?? ""
         type = MessageType(wire: rawType)
+        isOutOfBandGap = type == .transcriptGap &&
+            ((try? container.decode(Bool.self, forKey: .isOutOfBandGap)) ?? false)
         role = (try? container.decode(String.self, forKey: .role)) ?? ""
         text = (try? container.decode(String.self, forKey: .text)) ?? ""
         turnID = try? container.decode(String.self, forKey: .turnID)

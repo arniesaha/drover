@@ -1920,3 +1920,94 @@ def test_latest_session_previews_reads_payload_only_when_preview_is_blank(
     previews = registry.latest_session_previews(["harness-session-blank"])
     assert previews == {"harness-session-blank": "payload text for the blank one"}
     assert [q for q in seen if "payload_json" in q], "never fetched the fallback"
+
+
+@pytest.mark.parametrize("store", ["duckdb", "postgres"])
+def test_out_of_band_gap_write_and_all_sequence_read_paths(store, request, tmp_path):
+    if store == "postgres":
+        registry = HarnessRegistry(request.getfixturevalue("pg_control_path"))
+    else:
+        registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="gap-session", host_id="host", harness="codex", command="codex"
+    )
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    first = registry.append_event(
+        session_id="gap-session", event_type="user_input", seq=1, created_at=start
+    )
+    gap = registry.append_event(
+        session_id="gap-session",
+        event_type="transcript.gap",
+        payload={"dropped": 3},
+        normalized_type="status",
+        created_at=start + timedelta(seconds=1),
+    )
+    # Historical rows use this same NULL sequence representation. The marker
+    # has an explicit ordering rule and never reserves the host's next seq.
+    assert gap.seq is None
+    second = registry.append_event(
+        session_id="gap-session",
+        event_type="assistant_output",
+        seq=2,
+        created_at=start + timedelta(seconds=2),
+    )
+    assert registry.max_event_seq("gap-session") == 2
+
+    paths = [
+        registry.list_events_after("gap-session", 0),
+        registry.list_event_page("gap-session").events,
+        registry.list_event_page("gap-session", after_seq=0, through_seq=2).events,
+        registry.list_event_page("gap-session", before_seq=3).events,
+    ]
+    for events in paths:
+        assert [event.event_id for event in events] == [
+            first.event_id,
+            gap.event_id,
+            second.event_id,
+        ]
+        assert [event.seq for event in events] == [1, 1, 2]
+        wire = events[1].wire_payload()
+        assert wire["type"] == "transcript.gap"
+        assert wire["out_of_band"] is True
+        assert wire["dropped"] == 3
+
+    # Page limits count host events so a gap cannot fall off a cursor boundary.
+    page = registry.list_event_page("gap-session", after_seq=0, limit=1)
+    assert [event.event_id for event in page.events] == [first.event_id, gap.event_id]
+    assert page.has_newer and page.page_max_seq == 1
+    assert gap.event_id in [
+        event.event_id for event in registry.list_events_after("gap-session", 1)
+    ]
+    newer = registry.list_event_page("gap-session", after_seq=1, limit=1)
+    assert [event.event_id for event in newer.events] == [gap.event_id, second.event_id]
+    older = registry.list_event_page("gap-session", before_seq=2, limit=1)
+    assert [event.event_id for event in older.events] == [first.event_id, gap.event_id]
+
+
+@pytest.mark.parametrize("store", ["duckdb", "postgres"])
+def test_gap_only_and_leading_legacy_gap_are_readable(store, request, tmp_path):
+    registry = (
+        HarnessRegistry(request.getfixturevalue("pg_control_path"))
+        if store == "postgres"
+        else _registry(tmp_path)[0]
+    )
+    registry.create_session(
+        session_id="gap-only", host_id="host", harness="codex", command="codex"
+    )
+    gap = registry.append_event(
+        session_id="gap-only", event_type="transcript.gap", payload={"dropped": 1}
+    )
+    for events in [
+        registry.list_events_after("gap-only", 0),
+        registry.list_event_page("gap-only").events,
+        registry.list_event_page("gap-only", after_seq=0).events,
+    ]:
+        assert [event.event_id for event in events] == [gap.event_id]
+        assert events[0].seq == 0
+        assert events[0].wire_payload()["type"] == "transcript.gap"
+    registry.append_event(session_id="gap-only", event_type="user_input", seq=1)
+    assert registry.list_event_page("gap-only").events[0].event_id == gap.event_id
+    assert (
+        registry.list_event_page("gap-only", before_seq=1).events[0].event_id
+        == gap.event_id
+    )

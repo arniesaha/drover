@@ -185,6 +185,10 @@ class HarnessEvent:
         payload["event_id"] = self.event_id
         payload["session_id"] = self.session_id
         payload["seq"] = self.seq
+        if self.event_type == "transcript.gap":
+            payload["type"] = "transcript.gap"
+            payload.setdefault("role", "system")
+            payload.setdefault("text", "Some messages are missing from this transcript")
         if self.payload_status.state == "unavailable":
             # Never substitute a preview for missing archival bytes.  Task 3
             # maps this explicit marker to its API response.

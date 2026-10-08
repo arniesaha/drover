@@ -186,6 +186,17 @@ import Testing
         #expect(model.pendingApproval == nil)
     }
 
+    @Test func historyMergePreservesGapAndContentAtTheSamePosition() {
+        let model = ChatModel.fixture(messages: [output(1, "one")])
+        var gap = HarnessMessage(id: "hub-gap", seq: 1, type: .transcriptGap, text: "missing")
+        gap.isOutOfBandGap = true
+        model.ingest(.history([gap, output(2, "two")], decodeIssues: []))
+        model.ingest(.history([gap], decodeIssues: []))
+        #expect(model.messages.map(\.seq) == [1, 1, 2])
+        #expect(model.messages.map(\.type) == [.assistantOutput, .transcriptGap, .assistantOutput])
+        #expect(model.messages.filter { $0.id == "hub-gap" }.count == 1)
+    }
+
     /// A non-message event must not invalidate the transcript caches — a
     /// reconnect blip should never cost a re-fold of the whole session.
     @Test func connectionEventsDoNotInvalidateTheTranscript() {

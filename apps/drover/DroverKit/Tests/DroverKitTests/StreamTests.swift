@@ -806,6 +806,84 @@ struct StreamTests {
     #expect(queries.first == "limit=50")
 }
 
+
+@Test func hubGapMarkersDoNotConsumeHostSequences() async throws {
+    let gap = #"{"event_id":"hub-gap", "out_of_band":true, "seq":1, "type":"transcript.gap", "role":"system", "text":"missing", "payload":{}}"#
+    mock.handler = { _ in
+        return (200, Data("""
+        {"messages":[\(wireMessage(seq: 1, text: "one")), \(gap)],
+         "page_min_seq":1,"page_max_seq":1,"max_seq":1,"has_older":false,"has_newer":false}
+        """.utf8))
+    }
+    let lateGap = #"{"event_id":"late-gap", "out_of_band":true, "seq":1, "type":"transcript.gap", "role":"system", "text":"late", "payload":{}}"#
+    let stream = MessageStream(
+        client: client(), sessionID: "s1",
+        connector: FakeConnector([.frames([gap, lateGap, lateGap, wireMessage(seq: 2, text: "two")], thenError: false)]))
+    var ids: [String] = []
+    for await event in await stream.events() {
+        switch event {
+        case let .message(message): ids.append(message.id)
+        case let .history(messages, _): ids.append(contentsOf: messages.map(\.id))
+        case .connection, .connectFailed, .busy, .unauthorized: break
+        }
+        if ids.count == 4 { break }
+    }
+    #expect(ids == ["e1", "hub-gap", "late-gap", "e2"])
+}
+
+
+@Test func reconnectCatchUpIncludesGapAtTheExistingCursor() async throws {
+    let gap = #"{"event_id":"reconnect-gap", "out_of_band":true, "seq":1, "type":"transcript.gap", "text":"missing"}"#
+    mock.handler = { request in
+        if request.url!.query == "limit=50" {
+            return (200, Data(#"{"messages":[],"max_seq":0}"#.utf8))
+        }
+        #expect(request.url!.query?.contains("after_seq=1") == true)
+        return (200, Data("""
+        {"messages":[\(gap),\(wireMessage(seq: 2, text: "two"))],"max_seq":2}
+        """.utf8))
+    }
+    let stream = MessageStream(
+        client: client(), sessionID: "s1",
+        connector: FakeConnector([
+            .frames([wireMessage(seq: 1, text: "one")], thenError: true),
+            .frames([gap, wireMessage(seq: 3, text: "three")], thenError: false),
+        ]), reconnectBaseDelay: .milliseconds(10))
+    var ids: [String] = []
+    for await event in await stream.events() {
+        switch event {
+        case let .message(message): ids.append(message.id)
+        case let .history(messages, _): ids.append(contentsOf: messages.map(\.id))
+        case .connection, .connectFailed, .busy, .unauthorized: break
+        }
+        if ids.count == 4 { break }
+    }
+    #expect(ids == ["e1", "reconnect-gap", "e2", "e3"])
+}
+
+@Test func leadingOutOfBandGapDoesNotBlockColdCatchUp() async throws {
+    let gap = #"{"event_id":"leading-gap", "out_of_band":true, "seq":0, "type":"transcript.gap", "text":"missing"}"#
+    mock.handler = { _ in
+        return (200, Data("""
+        {"messages":[\(gap),\(wireMessage(seq: 1, text: "one"))],
+         "page_min_seq":0,"page_max_seq":1,"max_seq":1,"has_older":false,"has_newer":false}
+        """.utf8))
+    }
+    let stream = MessageStream(
+        client: client(), sessionID: "s1",
+        connector: FakeConnector([.frames([wireMessage(seq: 2, text: "two")], thenError: false)]))
+    var ids: [String] = []
+    for await event in await stream.events() {
+        switch event {
+        case let .message(message): ids.append(message.id)
+        case let .history(messages, _): ids.append(contentsOf: messages.map(\.id))
+        case .connection, .connectFailed, .busy, .unauthorized: break
+        }
+        if ids.count == 3 { break }
+    }
+    #expect(ids == ["leading-gap", "e1", "e2"])
+}
+
 }
 
 }  // extension MockNetworkTests

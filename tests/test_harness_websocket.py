@@ -1025,3 +1025,76 @@ def test_terminal_mirror_bounds_backlog_and_records_overflow_gap():
     mirror.stop()
 
     assert sum(item["payload"]["dropped"] for item in gaps) == overflow
+
+
+def test_gap_markers_reach_rest_and_websocket_without_consuming_sequence(tmp_path):
+    path = tmp_path / "gaps.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+    registry = HarnessRegistry(path)
+    registry.create_session(
+        session_id="gaps",
+        host_id="host",
+        harness="codex",
+        command="codex",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id="gaps",
+        event_type="user_input",
+        seq=1,
+        payload={"type": "user_input", "text": "one"},
+    )
+    # Exercise the actual mirror marker writer, including its historical
+    # NULL-sequence representation, rather than fabricating an API response.
+    from drover.server.harness.daemon import _TerminalMirror
+
+    mirror = _TerminalMirror(registry)
+    mirror.stop()
+    mirror._note_overflow({"session_id": "gaps"})
+    mirror._flush_gap_markers()
+    gap = next(
+        event
+        for event in registry.list_events("gaps")
+        if event.event_type == "transcript.gap"
+    )
+    collector = MetricsCollector(
+        duckdb_path=path, incoming_dir=tmp_path / "incoming", summarizer_report={}
+    )
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=DISABLED
+    )
+    host, port = server.server_address
+    base = f"http://{host}:{port}"
+    sock = None
+    try:
+        for query in [
+            "",
+            "?limit=1",
+            "?after_seq=0&through_seq=1&limit=1",
+            "?before_seq=2&limit=1",
+        ]:
+            _, body = _json_request(f"{base}/harness/sessions/gaps/messages{query}")
+            assert [message["seq"] for message in body["messages"]] == [1, 1]
+            assert body["messages"][1]["event_id"] == gap.event_id
+            assert body["messages"][1]["type"] == "transcript.gap"
+            assert body["max_seq"] == 1
+        sock = _connect_ws(base, "/harness/sessions/gaps/stream?after_seq=1")
+        assert _recv_json(sock)["event_id"] == gap.event_id
+        registry.append_event(
+            session_id="gaps",
+            event_type="assistant_output",
+            seq=2,
+            payload={"type": "assistant_output", "text": "two"},
+        )
+        # The repeated gap at cursor 1 is suppressed and the next host event
+        # still arrives with its original sequence.
+        assert _recv_json(sock)["seq"] == 2
+        late = registry.append_event(
+            session_id="gaps", event_type="transcript.gap", payload={"dropped": 1}
+        )
+        assert _recv_json(sock)["event_id"] == late.event_id
+    finally:
+        if sock is not None:
+            sock.close()
+        server.shutdown()
+        server.server_close()

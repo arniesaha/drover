@@ -639,13 +639,19 @@ public final class ChatModel {
         } else {
             var bySequence: [Int: HarnessMessage] = [:]
             bySequence.reserveCapacity(messages.count + incoming.count)
-            for message in messages {
-                bySequence[message.seq] = message
+            var gapsByID: [String: HarnessMessage] = [:]
+            for message in messages + incoming {
+                if message.isOutOfBandGap {
+                    gapsByID[message.id] = message
+                } else {
+                    bySequence[message.seq] = message
+                }
             }
-            for message in incoming {
-                bySequence[message.seq] = message
+            messages = (Array(bySequence.values) + Array(gapsByID.values)).sorted {
+                if $0.seq != $1.seq { return $0.seq < $1.seq }
+                if $0.isOutOfBandGap != $1.isOutOfBandGap { return !$0.isOutOfBandGap }
+                return $0.id < $1.id
             }
-            messages = bySequence.values.sorted { $0.seq < $1.seq }
         }
 
         rebuildApprovals()
