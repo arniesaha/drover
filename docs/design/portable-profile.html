@@ -329,7 +329,7 @@ doc-claim[data-l="1"] > .pl-row > .pl-claim { font: 600 16px/1.4 var(--sans); co
 doc-claim[data-l="2"] > .pl-row > .pl-claim { font: 550 14px/1.4 var(--sans); color: var(--ink); }
 doc-claim[aux] > .pl-row > .pl-claim { color: var(--ink-2); }
 .pl-meta:empty { display: none !important; } .pl-meta { display: inline-flex; gap: 7px; align-items: center; align-self: center; white-space: nowrap; }
-.pl-bdg { font: 550 12px/1 var(--sans); border-radius: 99px; padding: 4px 8px; color: var(--accent); background: var(--accent-soft); } 
+.pl-bdg { font: 550 12px/1 var(--sans); border-radius: 99px; padding: 4px 8px; color: var(--accent); background: var(--accent-soft); }
 .pl-row > .nw-cbtn { position: static; align-self: center; } .pl-row.has-comment > .pl-claim { text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 4px; text-decoration-thickness: 2px; }
 .pl-body { margin: 0 0 6px 5px; padding: 8px 0 14px 25px; border-left: 1px solid var(--line); }
 doc-claim[data-l="2"] > .pl-body { padding: 6px 0 4px 22px; margin-bottom: 8px; }
@@ -1585,7 +1585,7 @@ define('doc-machine', (el) => {
     m.order.forEach((id) => { const st = m.states[id]; const [x, y] = pos[id]; const g = svg('g', { class: 'st' + (st.final ? ' final' : '') + (st.mark ? ' ' + st.mark : ''), 'data-state': id, tabindex: 0 });
       g.append(svg('rect', { x, y, width: NWID, height: NH, rx: NH / 2 }), svg('text', { x: x + NWID / 2, y: y + NH / 2 }, st.label)); if (st.bind.say) g.append(svg('title', null, st.bind.say)); nodeG.append(g); nodeEls[id] = g;
       const key = `machine:${name}:${id}`; if (S.comments[key]) g.classList.add('has-comment'); g.addEventListener('click', () => { if (id === cur) return; const e = m.events.find((x) => x.from === cur && x.to === id && x.mark !== 'gone'); if (e) api.fire(e.ev); else api.goto(id); }); });
-    frame.innerHTML = ''; frame.append(root); root.style.width = ''; 
+    frame.innerHTML = ''; frame.append(root); root.style.width = '';
   };
   // ── chrome ──
   const head = h('div', { class: 'mc-head' }, h('span', { class: 'mc-kind' }, 'state machine'), h('span', { class: 'mc-title' }, title), h('span', { class: 'mc-meta' }), h('span', { class: 'mc-sp' }));
@@ -1939,7 +1939,7 @@ Nix. Personal assistant on the NAS. Reply in chat.
 +   **render_bootstrap**(items, persona, budget) @ src/drover/server/profile/render.py:12
     with_freshness(result)                       @ src/drover/server/mcp/freshness.py:1
 </script>
-    
+
 <script type="text/plain" data-excerpt="src/drover/server/mcp/server.py:280" data-start="274" data-sha="428e24c">
         return t.drover_resume_context(
             duckdb_path=db,
@@ -2099,7 +2099,7 @@ def render_bootstrap(items, persona, budget=BUDGET_TOKENS):
     request(config, "GET", …)                    @ plugins/openclaw-continuity-owner/index.js:66   -- pattern to copy
 + AGENTS.md line: "call drover_profile first"    @ plugins/openclaw-profile/README.md:1   -- set by the user on the NAS
 </script>
-    
+
 <script type="text/plain" data-excerpt="plugins/openclaw-continuity-owner/index.js:66" data-start="60" data-sha="428e24c">
   checkAction(status.next_action, config.authorityScope);
   checkAction(result.delivery, config.authorityScope);
@@ -2143,7 +2143,7 @@ async function request(config, method, data, signal, assertCurrent) {
 +   profile_items where kind = 'thread'          @ src/drover/server/profile/store.py:40
 +   **dedupe_by_ref**(rows)                      @ src/drover/server/profile/work.py:48   -- one row per project or context
 </script>
-    
+
 <script type="text/plain" data-excerpt="src/drover/server/memory_store.py:460" data-start="454" data-sha="428e24c">
         return (
             ProjectBrief(*row[:5], tuple(row[5] or ()), tuple(row[6] or ()), *row[7:])
@@ -2336,7 +2336,7 @@ def tier_for(item) -> str:
 <!-- ═════ 4 · import ═════ -->
 <doc-claim>
   <p>The first import brings existing files into Drover after a review.</p>
-  <doc-mock frame="terminal" title="drover-server profile import" w="480" caption="Dry-run by default. Counts and labels only, never the text of private items."><template><span class="dim">$</span> drover-server profile import openclaw ~/nas/workspace
+  <doc-mock frame="terminal" title="drover-server profile import" w="480" caption="Dry-run by default. Counts and labels only, never the text of private items."><template><span class="dim">$</span> drover-server profile import openclaw ./openclaw-workspace
 <b>profile import (dry-run)</b>
   source   USER.md         12 items  <span class="g">+12 new</span>
   source   MEMORY.md       31 items  <span class="g">+28 new</span> <span class="y">~3 merge</span>
@@ -2344,7 +2344,7 @@ def tier_for(item) -> str:
   persona  SOUL.md          1 item   <span class="g">+1 nas-openclaw</span>
   tiers    general 19 · trusted 11 · <span class="r">private 20</span>
   review   <span class="y">7 items with no category → trusted</span>
-<span class="dim">$</span> drover-server profile import openclaw ~/nas/workspace --apply
+<span class="dim">$</span> drover-server profile import openclaw ./openclaw-workspace --apply
 applied=50 unchanged=0</template>
     <doc-pin at="10%,52%" title="Daily notes stay short-term">They are not copied as long-term items.</doc-pin>
   </doc-mock>
@@ -2417,7 +2417,7 @@ def context_import_cmd(ctx: click.Context, bundle_path: Path, apply: bool) -> No
 +   _scan_for_secrets(text)                      @ src/drover/server/context_catalog.py:472   -- refuse secrets
 +   **plan_import** → print diff | apply         @ src/drover/server/profile/importers.py:110
 </script>
-    
+
 <script type="text/plain" data-excerpt="src/drover/server/__main__.py:2006" data-start="2000" data-sha="428e24c">
     click.echo(
         format_diff(outcome["summary"], heading=f"context import ({outcome['mode']})")
