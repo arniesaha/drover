@@ -145,7 +145,10 @@
               ]
             }
           }
-        ]
+        ],
+        "lifecycle": {
+          "worktree_inventory": 1
+        }
       }
     }
   ],

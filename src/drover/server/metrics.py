@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 from urllib.parse import quote, urlencode, urlparse
 
-from drover.config import FavoriteCwd
+from drover.config import FavoriteCwd, LifecycleConfig
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
     control_plane_connection,
@@ -1145,6 +1145,14 @@ class MetricsCollector:
     # right in production and untestable everywhere else: without an override
     # a test reads the running server's own consent epoch off the machine.
     config_path: Path | None = None
+    lifecycle_config: LifecycleConfig = LifecycleConfig()
+    _lifecycle_summary: dict = field(
+        default_factory=lambda: {"state": "not_scanned"}, init=False
+    )
+    _lifecycle_scan_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False
+    )
+
     # API readiness is control-store readiness.  The analytical worker is
     # surfaced separately and can be unavailable without ejecting a healthy
     # fleet/control API from a load balancer.
@@ -1826,6 +1834,38 @@ class MetricsCollector:
             return {"host_id": host.host_id, "state": "failed"}
         return {"host_id": host.host_id, "state": "acknowledged"}
 
+    def lifecycle_report(self) -> tuple[int, str]:
+        from drover.server.harness.lifecycle_report import report
+
+        with self._lifecycle_scan_lock:
+            payload = report(self, self.lifecycle_config)
+            self._lifecycle_summary = dict(
+                payload["summary"],
+                mode=payload["mode"],
+                scanned_at=payload["scanned_at"],
+            )
+        return _json_response(200, payload)
+
+    def lifecycle_health(self) -> dict:
+        return dict(self._lifecycle_summary, mode=self.lifecycle_config.mode)
+
+    def harness_publications(self, session_id: str, payload=None) -> tuple[int, str]:
+        from drover.server.harness.lifecycle import LifecycleStore
+
+        store = LifecycleStore(self.duckdb_path)
+        try:
+            if store.registry.get_session(session_id) is None:
+                return _json_response(404, {"error": "unknown harness session"})
+            if payload is None:
+                return _json_response(
+                    200, {"publications": store.publications(session_id)}
+                )
+            return _json_response(
+                200, {"publication": store.report_publication(session_id, payload)}
+            )
+        except ValueError as exc:
+            return _json_response(400, {"error": str(exc)})
+
     def proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
         with self._session_lock_for(session_id):
             return self._proxy_terminate_harness_session(session_id)
@@ -1840,6 +1880,15 @@ class MetricsCollector:
 
         store = LifecycleStore(self.duckdb_path)
         operation_id = store.request_stop(session_id)
+        if not store.pending(session_id=session_id):
+            return _json_response(
+                200,
+                {
+                    "session_id": session_id,
+                    "status": session.status,
+                    "operation_id": operation_id,
+                },
+            )
         host = self._harness_host(session.host_id)
         if host is None:
             status, body = 502, ""
@@ -1853,8 +1902,10 @@ class MetricsCollector:
         store.attempted(
             operation_id, None if 200 <= status < 300 else f"host_status_{status}"
         )
-        if 200 <= status < 300 and self._sync_terminated_harness_session(
-            session_id, body
+        if (
+            status != 202
+            and 200 <= status < 300
+            and self._sync_terminated_harness_session(session_id, body)
         ):
             return status, body
         if status in (404, 502, 504) or 200 <= status < 300:
@@ -1876,6 +1927,11 @@ class MetricsCollector:
         # Bounded work on each heartbeat; repeated requests are idempotent.
         for operation_id, session_id, _, _ in store.pending(host_id=host_id)[:20]:
             with self._session_lock_for(session_id):
+                if not any(
+                    op[0] == operation_id
+                    for op in store.pending(host_id=host_id, session_id=session_id)
+                ):
+                    continue
                 host = self._harness_host(host_id)
                 if host is None:
                     return
@@ -2551,6 +2607,7 @@ class MetricsCollector:
                 log.warning("failed to load live session recaps: %s", exc)
                 recaps = {}
             return {
+                "lifecycle": self.lifecycle_health(),
                 "cockpit_api_version": 1,
                 "cockpit_sections": list(COCKPIT_SECTIONS),
                 "hosts": [

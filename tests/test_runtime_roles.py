@@ -765,21 +765,24 @@ def test_harnessd_keeps_local_duckdb_spool_when_postgres_dsn_is_inherited(
     ]
 
 
+@pytest.mark.parametrize("lifecycle_mode", ["off", "report"])
 def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lifecycle_mode: str
 ) -> None:
     """API startup must not create, stat, or warm an analytical DuckDB path."""
-    from drover.config import default_config
+    from drover.config import LifecycleConfig, default_config
     from drover.server import __main__ as server_main
 
     calls: list[str] = []
-
-    class Stop:
-        def set(self) -> None:
-            return None
-
-        def wait(self) -> bool:
-            return True
+    cfg = replace(
+        default_config(),
+        update_enabled=False,
+        lifecycle=LifecycleConfig(mode=lifecycle_mode, idle_after="6h"),
+    )
+    # Shutdown immediately without replacing threading.Event globally: the
+    # lifecycle reporter also needs real Event objects to start its thread.
+    stop = threading.Event()
+    stop.set()
 
     class Server:
         def shutdown(self) -> None:
@@ -801,6 +804,8 @@ def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
     class Collector:
         def __init__(self, **kwargs: object) -> None:
             calls.append("collector")
+            self.lifecycle_config = kwargs["lifecycle_config"]
+            assert self.lifecycle_config == cfg.lifecycle
             assert kwargs["include_analytical_readiness"] is False
             assert kwargs["advisory_service"] if "advisory_service" in kwargs else True
 
@@ -825,7 +830,7 @@ def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
     monkeypatch.setattr(
         server_main, "start_resilient_metrics_server", lambda **_kwargs: Server()
     )
-    monkeypatch.setattr(server_main.threading, "Event", Stop)
+    monkeypatch.setattr(server_main, "threading", SimpleNamespace(Event=lambda: stop))
     monkeypatch.setattr(server_main.signal, "signal", lambda *_args: None)
     monkeypatch.setattr(
         server_main,
@@ -839,7 +844,7 @@ def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
     )
 
     server_main._run_api_role(
-        cfg=replace(default_config(), update_enabled=False),
+        cfg=cfg,
         config_path=tmp_path / "config.toml",
         metrics_host="127.0.0.1",
     )

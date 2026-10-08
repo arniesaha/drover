@@ -382,6 +382,33 @@ class AnalyticsConfig:
 
 
 @dataclass(frozen=True)
+class LifecycleConfig:
+    mode: str = "report"
+    idle_after: str = "12h"
+
+    def __post_init__(self):
+        import re
+
+        if self.mode not in {"off", "report"}:
+            raise ValueError(
+                "lifecycle.mode must be off or report; enforce is not wired"
+            )
+        if not isinstance(self.idle_after, str) or not re.fullmatch(
+            r"[1-9][0-9]*(s|m|h|d)", self.idle_after
+        ):
+            raise ValueError(
+                "lifecycle.idle_after must be a positive duration such as 12h"
+            )
+
+    @property
+    def idle_after_seconds(self):
+        return (
+            int(self.idle_after[:-1])
+            * {"s": 1, "m": 60, "h": 3600, "d": 86400}[self.idle_after[-1]]
+        )
+
+
+@dataclass(frozen=True)
 class DroverConfig:
     incoming_dir: Path
     parquet_dir: Path
@@ -506,6 +533,7 @@ class DroverConfig:
     # ~/.drover/worktrees. Configurable because on the reference hub ~/.drover
     # is a USB SSD whose read stalls (57-120s measured) blocked every session
     # launch; worktree creation must not share a volume with slow bulk data.
+    lifecycle: LifecycleConfig = LifecycleConfig()
     worktrees_dir: Path | None = None
     memory: MemoryBudgetConfig = MemoryBudgetConfig()
     analytics: AnalyticsConfig = AnalyticsConfig()
@@ -520,6 +548,7 @@ class DroverConfig:
 
 
 _DEFAULTS = {
+    "lifecycle": {"mode": "report", "idle_after": "12h"},
     "analytics": {
         name: getattr(AnalyticsConfig(), name)
         for name in AnalyticsConfig.__dataclass_fields__
@@ -815,6 +844,7 @@ def _from_dict(d: dict) -> DroverConfig:
         if not str(d["update"]["in_place_venv"]).strip():
             raise ValueError("update.runtime_root requires update.in_place_venv")
     return DroverConfig(
+        lifecycle=LifecycleConfig(**d.get("lifecycle", {})),
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),
         duckdb_path=Path(d["paths"]["duckdb_path"]),

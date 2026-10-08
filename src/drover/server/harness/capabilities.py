@@ -178,6 +178,15 @@ def validate_capabilities(value: Any, host_id: str) -> dict[str, Any]:
     for name, limit in (("display_name", 256), ("kind", 64)):
         if name in value:
             result[name] = _text(value[name], limit)
+    if "lifecycle" in value:
+        lifecycle = value["lifecycle"]
+        if (
+            not isinstance(lifecycle, dict)
+            or lifecycle != {"worktree_inventory": 1}
+            or type(lifecycle.get("worktree_inventory")) is not int
+        ):
+            raise InvalidCapabilities("invalid lifecycle inventory capability")
+        result["lifecycle"] = {"worktree_inventory": 1}
     if "harnesses" not in value:
         return result
     rows = value["harnesses"]

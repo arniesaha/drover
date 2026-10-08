@@ -7,7 +7,7 @@ from time import monotonic
 from typing import Any
 
 from drover.server.continuity_schema import CONTINUITY_DDL
-from drover.server.lifecycle_schema import STOP_MIGRATION
+from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
 
 log = logging.getLogger(__name__)
 
@@ -549,6 +549,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         ),
     ),
     (13, STOP_MIGRATION),
+    (14, PUBLICATION_MIGRATION),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

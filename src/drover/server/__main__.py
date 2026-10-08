@@ -2445,6 +2445,7 @@ def _run_api_role(
         incoming_dir=cfg.incoming_dir,
         summarizer_report={},
         api_token=auth.api_token if auth.enabled else "",
+        lifecycle_config=cfg.lifecycle,
         favorite_cwds=cfg.harness_favorite_cwds,
         content_consent_reader=lambda: consent.state().heartbeat(),
         include_analytical_readiness=False,
@@ -2452,6 +2453,9 @@ def _run_api_role(
         archive_resolver=boundary,
         archive_resolver_factory=boundary.page_resolver,
     )
+    from drover.server.harness.lifecycle_report import start_reporter
+
+    start_reporter(collector, stop)
     if cfg.update_enabled:
         planner = UpdatePlanner(
             cfg, RuntimeLayout(config_home(), root=cfg.update_runtime_root)
@@ -2993,6 +2997,7 @@ def run(
                     ),
                     embeddings_state=embeddings_state,
                     api_token=auth.api_token if auth.enabled else "",
+                    lifecycle_config=cfg.lifecycle,
                     favorite_cwds=cfg.harness_favorite_cwds,
                     advisory_service=InsightsService(
                         cfg.duckdb_path,
@@ -3035,6 +3040,10 @@ def run(
                 # minting in-process. A restart invalidates outstanding codes.
                 pairing = PairingCodes()
 
+            from drover.server.harness.lifecycle_report import start_reporter
+
+            if selected_role != "analytics":
+                start_reporter(metrics_collector, stop)
             # The hub decides what the fleet converges on and publishes it on
             # the heartbeat every harnessd already sends. Attached to the
             # collector rather than threaded through, because the only thing
@@ -3132,6 +3141,7 @@ def run(
                 summarizer_report={},
                 embeddings_state=embeddings_state,
                 api_token=auth.api_token if auth.enabled else "",
+                lifecycle_config=cfg.lifecycle,
                 favorite_cwds=cfg.harness_favorite_cwds,
                 advisory_service=InsightsService(
                     cfg.duckdb_path,

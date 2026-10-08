@@ -938,6 +938,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if self.analytics_boundary is None and self._is_analytics_public_path(path):
             require_analytical_store(self.collector.duckdb_path)
+        if path == "/healthz" and parse_qs(parsed.query).get("detail") == ["1"]:
+            self._send(
+                200,
+                "application/json",
+                json.dumps(
+                    {"ok": True, "lifecycle": self.collector.lifecycle_health()}
+                ),
+            )
+            return
+        if path == "/harness/lifecycle":
+            status, body = self.collector.lifecycle_report()
+            self._send(status, "application/json", body)
+            return
         if path == "/healthz":
             health = analytical_store_health(self.collector.duckdb_path)
             analytical_status = str(health["status"])
@@ -1166,6 +1179,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     if values
                 },
             )
+            self._send(status, "application/json", body)
+            return
+        if path.startswith("/harness/sessions/") and path.endswith("/publications"):
+            session_id = unquote(
+                path.removeprefix("/harness/sessions/")
+                .removesuffix("/publications")
+                .strip("/")
+            )
+            status, body = self.collector.harness_publications(session_id)
             self._send(status, "application/json", body)
             return
         if path == "/harness/sessions":
@@ -1538,6 +1560,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 return
             status, payload = self.collector.proxy_create_harness_session(host_id, body)
             self._send(status, "application/json", payload)
+            return
+        if path.startswith("/harness/sessions/") and path.endswith("/publications"):
+            session_id = unquote(
+                path.removeprefix("/harness/sessions/")
+                .removesuffix("/publications")
+                .strip("/")
+            )
+            body = self._read_json()
+            if body is None:
+                self._send(400, "application/json", '{"error":"invalid JSON"}')
+                return
+            status, response = self.collector.harness_publications(session_id, body)
+            self._send(status, "application/json", response)
             return
         for action in ("turns", "permission", "interrupt"):
             suffix = f"/{action}"
