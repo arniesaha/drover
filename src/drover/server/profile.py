@@ -582,8 +582,8 @@ def issue_agent_credential(path, agent_id, tier, *, actor):
         con.execute(
             "INSERT INTO control_credentials "
             "(credential_id, scope, label, verifier, created_at, host_id) "
-            "VALUES (?, 'host', ?, ?, now(), ?)",
-            [credential_id, agent_id, verifier_from_token(token), agent_id],
+            "VALUES (?, 'profile', ?, ?, now(), NULL)",
+            [credential_id, agent_id, verifier_from_token(token)],
         )
         con.execute(
             "INSERT INTO profile_agents (agent_id, credential_id, tier, updated_by) "

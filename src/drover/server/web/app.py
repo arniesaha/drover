@@ -70,6 +70,7 @@ from drover.server.web.auth import (
     DISABLED,
     AuthSettings,
     bearer_credential,
+    credential_allows_request,
     request_authorized,
     session_cookie_value,
     token_matches,
@@ -857,6 +858,20 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         from drover.server.metrics import HarnessRenderBusy
 
         path = urlparse(self.path).path
+        # Profile bearers must pass their allowlist before any dispatch, including
+        # public pairing/login routes, internal bridges and device self-revocation.
+        # Those handlers can deliberately bypass the ordinary authentication gate.
+        credential = (
+            bearer_credential(self.auth, self.headers) if self.auth.enabled else None
+        )
+        if credential is not None and credential.scope == "profile":
+            if not credential_allows_request(
+                credential, method=self.command, path=path
+            ):
+                self._send(
+                    401, "application/json", '{"error": "authentication required"}\n'
+                )
+                return
         analytical = self._is_analytics_public_path(path)
         lane = analytics_request_lane(self.command, path)
         heavy = analytical and lane == "heavy"
