@@ -33,3 +33,19 @@ uv run --extra dev pytest -q tests/test_profile_*.py tests/test_mcp_contract.py 
 Check git diff --check and added text for private data and em dashes. Commit
 small implementation steps, then open a draft PR into main referencing both
 issues. Do not merge.
+
+
+## Review 1: credential scope isolation
+
+Keep import behavior unchanged. Replace issued host credentials with a dedicated
+profile scope and no host identity. Use a literal method/path allowlist permitting
+only GET /profile, enforced before HTTP dispatch so public and special-case
+handlers cannot bypass it. Exclude restricted scopes from generic token auth
+and browser-session exchange. Generic operator listing and revocation retain
+support for profile credentials.
+
+The control_credentials scope column has no database CHECK constraint, so no
+migration is needed. Test trusted reads, non-profile route denials, operator
+listing/revocation, browser-session refusal, and retirement of a same-named host.
+Run the original scoped verification plus tests/test_web_auth.py. Leave the
+unrelated analytical timing test unchanged.

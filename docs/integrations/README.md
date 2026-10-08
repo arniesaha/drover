@@ -25,7 +25,10 @@ curl --fail --silent --show-error --max-time 5 \
 
 Credentials are issued with `drover profile agents issue AGENT --tier trusted`
 and revoked with `drover profile agents revoke AGENT`. A newly issued credential
-only stores a verifier on the server; the plaintext token is printed once.
+has scope `profile` with no host identity and authorizes only `GET /profile`.
+Only a verifier is stored on the server; the plaintext token is printed once.
+It cannot write proposals, use fleet/harness APIs, pair clients, manage other
+credentials or exchange for a browser session.
 These commands require local operator access to the configured PostgreSQL store.
 No identities, credentials or production settings ship with these snippets.
 

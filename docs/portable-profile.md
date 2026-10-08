@@ -54,7 +54,10 @@ of this code alone.
 
 The cluster operator bearer represents the user: it can read private content,
 review proposals, approve changes, reverse changes and manage tier bindings.
-Device/host bearers cannot approve changes. Browser cookies and authentication-
+Device, host and profile bearers cannot approve changes. Profile bearers issued
+by `drover profile agents issue` authorize only `GET /profile`; they cannot write
+proposals, use fleet/harness APIs, pair clients, manage credentials or mint
+browser sessions. Browser cookies and authentication-
 disabled requests receive general profile access. Do not put agent or reader
 identity in a query parameter or proposal body; unsupported fields are rejected.
 
@@ -89,7 +92,9 @@ existing accessible item. Optional `expires_at` requires a timezone-qualified
 ISO timestamp. Body text is limited to 65,536 UTF-8 bytes. Responses return
 proposal ID, item ID, status and an idempotence flag, without echoing content.
 
-Trusted agent proposals automatically accept unless the target tier is private.
+Proposals from a registered trusted identity on an otherwise authorized transport
+automatically accept unless the target tier is private. Issued profile credentials
+are read-only and cannot call proposal routes.
 Editing an existing private item also requires user approval; readers cannot
 edit items they cannot access. All other proposals start pending. This includes
 operator-created proposals, keeping approval explicit.
@@ -187,10 +192,16 @@ classification evidence and reason. Its returned proposal can be reverted,
 subject to the normal revision conflict check.
 
 Credential issuance defaults to general. It atomically stores a verifier in
-`control_credentials` and binds it to the agent in `profile_agents`, recording
+`control_credentials` with scope `profile` and `host_id` null, and binds it to
+the agent in `profile_agents`, recording
 `updated_by` and `updated_at`. The token is printed once; store it securely in
 the client. An agent with an active credential must be revoked before reissue.
 Revocation invalidates the bearer and removes trusted access, retaining the
 credential's revocation timestamp and registry operator metadata. It is
 idempotent. Agent credentials cannot be issued at private tier by this command.
-Trusted sessions use HTTP, since MCP has no verified caller identity.
+Trusted sessions use HTTP, since MCP has no verified caller identity. The scope
+allowlist permits only `GET /profile` (including supported scope queries). Agent
+identities do not enter the host namespace, and retiring a same-named host does
+not revoke a profile credential. Operators can also list and revoke profile
+credentials through the generic credential endpoints; profile tokens cannot
+access those endpoints or revoke other credentials.
