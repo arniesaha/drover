@@ -7,14 +7,13 @@ Authority: ADR 0003 and issue #545. Read the design branch artifact
 
 1. ADR alone, then this plan alone. Validate markdown links and whitespace.
 2. Append PostgreSQL migration **15** at `src/drover/server/postgres_schema.py:546`.
-   `PROFILE_MIGRATION = 15` is the single version constant. Lifecycle migrations
-   13/14 merge first; do not copy them into this branch. The runner accepts gaps.
-   On the second merge, retain lifecycle 13/14 before profile 15 and their pinned
-   hashes; leave the profile constant at 15 and keep the registry-derived assertions.
-   Never change migrations 1-12. Add profile items, proposals with before/after
+   `PROFILE_MIGRATION = 15` is the single version constant. Main includes lifecycle
+   migrations 13/14; preserve their released DDL and hash pins. The combined
+   registry covers 1-15, including conditional pgvector migration 8.
+   Never change migrations 1-14. Add profile items, proposals with before/after
    snapshots and actors, and credential-bound agent tiers. Pin the new hash in
    `tests/test_postgres_schema_migrations.py:23`. Test fresh bootstrap, upgrade
-   from 12, direct DDL rerun and recorded migration rerun in disposable PostgreSQL.
+   from 14, direct DDL rerun and recorded migration rerun in disposable PostgreSQL.
 3. Add `src/drover/server/profile.py:1` for tier resolution, filtering and rendering.
    Register `drover_profile(scope="first_turn")` at
    `src/drover/server/mcp/server.py:58`, with a READ_CAPS entry at

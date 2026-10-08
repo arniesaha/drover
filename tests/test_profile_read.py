@@ -211,3 +211,58 @@ def test_http_and_mcp_reads(pg_control_path):
     result = json.loads(content[0].text)
     assert result["withheld_count"] == 1
     assert "private-marker" not in json.dumps(result)
+
+
+def test_profile_mcp_preserves_rendered_freshness(pg_control_path):
+    item(pg_control_path, "Standing rule", kind="rule", age=100)
+    with postgres_control_store(pg_control_path).connection() as con:
+        con.execute(
+            "INSERT INTO project_briefs (project_key, repo_owner, repo_name, brief_md, "
+            "generated_at) VALUES ('example/unrelated', 'example', 'unrelated', "
+            "'Unrelated activity', ?)",
+            [NOW],
+        )
+    mcp = build_mcp_server(duckdb_path=pg_control_path)
+    response = asyncio.run(mcp.call_tool("drover_profile", {"scope": "user"}))
+    content = response[0] if isinstance(response, tuple) else response
+    result = json.loads(content[0].text)
+    assert result["store"] == "hub"
+    assert result["store_authoritative"] is True
+    assert result["data_watermark"] == {
+        "timestamp": (NOW - timedelta(days=100)).isoformat(),
+        "basis": "rendered_profile_source_at",
+    }
+
+
+def test_profile_consumes_continuity_producer(pg_control_path, tmp_path):
+    from memory_helpers import put_summary
+
+    from drover.schema import bootstrap
+    from drover.server.context_writer import ContextContainerWriter
+
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=pg_control_path)
+    for session_id, content, project, activity in (
+        ("example-code", "Produced code context", "example/project", NOW),
+        ("example-general", "Unclassified private context", None, NOW),
+        (
+            "example-stale",
+            "Stale produced context",
+            "example/old",
+            NOW - timedelta(days=15),
+        ),
+    ):
+        put_summary(
+            pg_control_path,
+            session_id,
+            project_key=project,
+            summary_md=content,
+            generated_at=NOW,
+            ended_at=activity,
+        )
+    assert ContextContainerWriter(pg_control_path).run_once(apply=True)["applied"] == 3
+    result = read_profile(pg_control_path, now=NOW)
+    assert "Produced code context" in result["bundle"]
+    assert "Unclassified private context" not in json.dumps(result)
+    assert "Stale produced context" not in result["bundle"]
+    assert result["withheld_count"] == 1
+    assert result["data_watermark"]["timestamp"] == NOW.isoformat()

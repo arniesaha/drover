@@ -90,6 +90,9 @@ def test_migration_versions_are_unique_and_ascending():
     versions = [version for version, _ in _MIGRATIONS]
     assert versions == sorted(set(versions))
     assert VECTOR_MIGRATION not in versions
+    assert sorted([*versions, VECTOR_MIGRATION]) == list(
+        range(1, PROFILE_MIGRATION + 1)
+    )
 
 
 def test_lake_export_batches_backfill_matches_migration_2():

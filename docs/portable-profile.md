@@ -12,7 +12,9 @@ Scopes are `first_turn`, `full`, `user`, `work` and `decision`. Every scope
 keeps the 1,500-token ceiling. `full` includes all layers within that ceiling.
 
 Responses include `bundle`, `token_budget`, `token_upper_bound`,
-`withheld_count`, `truncated` and `context_status`. The renderer conservatively
+`withheld_count`, `truncated`, `context_status` and `data_watermark`. The watermark
+uses only sources rendered in the bundle; MCP preserves it alongside
+`store: "hub"` and `store_authoritative: true` for the PostgreSQL profile. The renderer conservatively
 counts one token per UTF-8 byte, including headings, counts and truncation text.
 This is an upper bound rather than a tokenizer estimate, so actual bundles can
 be substantially smaller than 1,500 model tokens. Complete items are selected

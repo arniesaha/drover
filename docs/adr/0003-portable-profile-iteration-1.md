@@ -24,6 +24,5 @@ UI, hooks, schedules, deployment and editing import files are outside this itera
 
 Migration coordination: profile persistence uses migration 15, defined by
 `PROFILE_MIGRATION` in `src/drover/server/postgres_schema.py`. Lifecycle migrations
-13 and 14 merge first. This branch does not copy their DDL. Gaps in the local
-registry are supported; the second merge retains lifecycle 13/14 before profile 15
-and preserves all released migration hashes.
+13 and 14 are on main and retain their released DDL and hash pins. The combined
+registry covers versions 1 through 15, including conditional pgvector migration 8.

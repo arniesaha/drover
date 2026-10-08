@@ -175,18 +175,28 @@ def read_profile(path: Path, scope="first_turn", *, actor=None, now=None):
     notice = "\nSome items omitted to fit the budget.\n"
     budget = BUNDLE_TOKENS - token_upper_bound(header + footer + notice)
     entries = []
+    rendered_stamps = []
     truncated = source_truncated
-    for _, layer, kind, body, _ in candidates:
+    for _, layer, kind, body, updated in candidates:
         entry = f"\n[{layer}/{kind}] {body}\n"
         size = token_upper_bound(entry)
         if size > budget:
             truncated = True
             continue
         entries.append(entry)
+        rendered_stamps.append(updated)
         budget -= size
     bundle = header + "".join(entries) + (notice if truncated else "") + footer
     return {
         "bundle": bundle,
+        "data_watermark": {
+            "timestamp": (
+                max(rendered_stamps).astimezone(timezone.utc).isoformat()
+                if rendered_stamps
+                else None
+            ),
+            "basis": "rendered_profile_source_at" if rendered_stamps else "unknown",
+        },
         "token_upper_bound": token_upper_bound(bundle),
         "token_budget": BUNDLE_TOKENS,
         "withheld_count": withheld,
