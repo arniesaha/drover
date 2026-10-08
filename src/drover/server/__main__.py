@@ -1863,7 +1863,7 @@ def embeddings_cmd() -> None:
 
 @main.group(name="context")
 def context_cmd() -> None:
-    """Validate, diff, and import curated metadata bundles."""
+    """Curate metadata bundles and backfill resumable containers."""
 
 
 @main.group(name="incoming")
@@ -1951,6 +1951,37 @@ def decisions_derive_cmd(ctx: click.Context) -> None:
     )
     noun = "decision" if inserted == 1 else "decisions"
     click.echo(f"inserted {inserted} {noun}")
+
+
+@context_cmd.command(name="backfill-containers")
+@click.option(
+    "--apply/--dry-run",
+    default=False,
+    help="Write containers and certify lake publication. Default is dry-run.",
+)
+@click.option(
+    "--max-containers",
+    type=click.IntRange(1, 100_000),
+    default=1000,
+    show_default=True,
+    help="Reject larger source or container snapshots; never truncate.",
+)
+@click.pass_context
+def context_backfill_containers_cmd(
+    ctx: click.Context, apply: bool, max_containers: int
+) -> None:
+    """Build resumable containers from hub summaries and project briefs."""
+    from drover.server.context_writer import ContextContainerWriter
+    from drover.server.lake.runtime import LakeError
+
+    cfg = _resolve_config(ctx.obj["config_path"])
+    try:
+        outcome = ContextContainerWriter(
+            cfg.duckdb_path, max_containers=max_containers
+        ).run_once(apply=apply)
+    except (ValueError, LakeError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(json.dumps(outcome, sort_keys=True))
 
 
 @context_cmd.command(name="validate")
