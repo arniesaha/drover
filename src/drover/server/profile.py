@@ -256,6 +256,8 @@ def _accept(con, proposal_id, item_id, change, previous, agent, session, actor):
         "actor": actor.agent_id,
         "proposal_id": proposal_id,
     }
+    if "import_classification" in change:
+        provenance["import_classification"] = change["import_classification"]
     con.execute(
         """INSERT INTO profile_items
            (item_id, layer, kind, tier, body, provenance, expires_at, revision)
@@ -307,6 +309,7 @@ def propose_profile(
     item_id=None,
     import_key=None,
     _con=None,
+    _classification=None,
 ):
     from uuid import uuid4
 
@@ -314,6 +317,8 @@ def propose_profile(
 
     actor = actor or ProfileActor()
     change = _change(values)
+    if _classification is not None:
+        change["import_classification"] = _classification
     if session_id is not None:
         session_id = _text(session_id, "session_id", 256)
     supplied_id = item_id is not None
