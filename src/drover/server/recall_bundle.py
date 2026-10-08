@@ -82,7 +82,7 @@ class RecallBundleService:
                         self._duckdb_path, "contexts", limit=effective_limit
                     )
                     if coverage.get("status") == "unavailable":
-                        return coverage
+                        return with_freshness(coverage, path=self._duckdb_path)
                 bundle = self._build_projected_bundle(**build_arguments)
                 if config.backend == "ducklake":
                     from drover.server.lake.coverage import bounded
@@ -94,12 +94,15 @@ class RecallBundleService:
                     bounded(bundle)
                 return with_freshness(bundle, path=self._duckdb_path)
         except LakeError as exc:
-            return {
-                "status": "unavailable",
-                "analytics_backend": config.backend,
-                "analytics_epoch": config.epoch,
-                "reason": exc.code,
-            }
+            return with_freshness(
+                {
+                    "status": "unavailable",
+                    "analytics_backend": config.backend,
+                    "analytics_epoch": config.epoch,
+                    "reason": exc.code,
+                },
+                path=self._duckdb_path,
+            )
 
     def _build_projected_bundle(
         self,
@@ -411,7 +414,7 @@ def _project_open_loop(row: dict, *, retrieval_timestamp: str) -> dict | None:
     )
     if not text:
         return None
-    return _source_item(
+    item = _source_item(
         source_type="context_container",
         source_identifiers={
             "context_id": row.get("context_id"),
@@ -426,6 +429,11 @@ def _project_open_loop(row: dict, *, retrieval_timestamp: str) -> dict | None:
         join_basis="caller_repo_scope",
         text=text,
     )
+
+    for key in ("store", "host", "data_watermark", "store_authoritative"):
+        if key in row:
+            item[key] = row[key]
+    return item
 
 
 def _join_content(*values: object) -> str:

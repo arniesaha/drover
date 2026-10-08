@@ -3168,6 +3168,13 @@ def run(
         )
         no_summarizer = no_embeddings = no_briefs = True
 
+    context_worker = None
+    if cfg.context_containers_enabled:
+        from drover.server.context_writer import ContextContainerWorker
+
+        context_worker = ContextContainerWorker(cfg.duckdb_path)
+        context_worker.start()
+
     summarizer: SummarizerWorker | None = None
     live_recap: LiveRecapWorker | None = None
     if not no_summarizer:
@@ -3313,6 +3320,8 @@ def run(
             content_advisory_worker.join(timeout=10.0)
         if advisory_worker is not None:
             advisory_worker.join(timeout=10.0)
+        if context_worker is not None:
+            context_worker.stop()
         if briefs is not None:
             briefs.stop()
         if embeddings is not None:

@@ -308,3 +308,68 @@ def test_fleet_parity_for_registry_backed_active_sessions(fleet_lake):
     assert all(r["event_count"] is None and r["task_id"] is None for r in lake)
     configure_analytics(path, AnalyticsConfig())
     assert tools.drover_fleet_status(duckdb_path=path)["active_sessions"] == legacy
+
+
+def test_writer_certifies_summary_containers_without_legacy_mix(
+    verified_lake, monkeypatch
+):
+    from datetime import datetime, timezone
+
+    from memory_helpers import put_brief, put_summary
+
+    from drover.server.context_writer import ContextContainerWriter, _key
+    from drover.server.db import control_plane_connection
+    from drover.server.lake import coverage
+    from drover.server.mcp import tools
+
+    _, path, config = verified_lake
+    stamp = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    put_summary(
+        path,
+        "s",
+        project_key="o/r",
+        summary_md="Implement recall",
+        next_steps_md="Review",
+        generated_at=stamp,
+    )
+    put_brief(
+        path,
+        "o/r",
+        brief_md="Project continuity",
+        source_session_id="s",
+        generated_at=stamp,
+    )
+    configure_analytics(path, config)
+    coverage.provision_coverage(path)
+    writer = ContextContainerWriter(path)
+    monkeypatch.setattr(
+        "drover.server.context_writer.open_duckdb_connection",
+        lambda *a, **kw: pytest.fail("legacy writer"),
+    )
+    assert writer.run_once()["created"] == 2
+    assert tools.drover_recent_contexts(duckdb_path=path)["status"] == "unavailable"
+    assert writer.run_once(apply=True)["applied"] == 2
+    recent = tools.drover_recent_contexts(duckdb_path=path)
+    assert len(recent["contexts"]) == 2
+    brief = tools.drover_context_brief(
+        duckdb_path=path, context_id=_key("session", "s")
+    )
+    assert brief["label"] == "Implement recall"
+    assert brief["redaction_policy"] == "session-summary-redacted"
+    assert len(tools.drover_open_loops(duckdb_path=path)["open_loops"]) == 1
+    resume = tools.drover_resume_context(
+        duckdb_path=path, context_id=_key("project", "o/r")
+    )
+    assert resume["session_summaries"][0]["summary_md"] == "Implement recall"
+    with control_plane_connection(path) as pg:
+        before = pg.execute("SELECT COUNT(*) FROM lake_coverage_sources").fetchone()[0]
+    assert writer.run_once()["unchanged"] == 2
+    with control_plane_connection(path) as pg:
+        assert (
+            pg.execute("SELECT COUNT(*) FROM lake_coverage_sources").fetchone()[0]
+            == before
+        )
+    assert writer.run_once(apply=True)["unchanged"] == 2
+    assert (
+        tools.drover_recent_contexts(duckdb_path=path)["contexts"] == recent["contexts"]
+    )

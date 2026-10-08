@@ -138,8 +138,9 @@ def test_restamping_preserves_projected_watermark():
 
 
 def test_empty_hub_read_uses_computable_store_time(pg_control_path):
-    from memory_helpers import put_summary
     from datetime import datetime, timezone
+
+    from memory_helpers import put_summary
 
     put_summary(
         pg_control_path,
@@ -153,4 +154,43 @@ def test_empty_hub_read_uses_computable_store_time(pg_control_path):
     assert result["data_watermark"] == {
         "timestamp": "2026-10-01T00:00:00+00:00",
         "basis": "derived_store_generated_at",
+    }
+
+
+def test_empty_local_read_can_observe_container_store(tmp_path):
+    from drover.server.db import open_duckdb_connection
+
+    path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+    with open_duckdb_connection(path) as con:
+        con.execute(
+            "INSERT INTO context_containers(context_id,updated_at) VALUES ('c','2026-10-01T00:00:00Z')"
+        )
+    result = with_freshness({"contexts": []}, path=path)
+    assert result["store"] == "local"
+    assert result["data_watermark"] == {
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "basis": "context_store_updated_at",
+    }
+
+
+def test_projected_context_preserves_generated_watermark_and_store_host():
+    from drover.server.recall_bundle import _project_open_loop
+
+    source = with_freshness(
+        {
+            "context_id": "c",
+            "next_action": "Review",
+            "source_harness": "codex",
+            "last_touched_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-02T00:00:00Z",
+        }
+    )
+    projected = _project_open_loop(source, retrieval_timestamp="2099-01-01T00:00:00Z")
+    result = with_freshness({"open_loops": [projected]})
+    assert projected["host"] == source["host"]
+    assert projected["host"] != "codex"
+    assert result["data_watermark"] == {
+        "timestamp": "2026-10-02T00:00:00+00:00",
+        "basis": "context_generated_at",
     }
