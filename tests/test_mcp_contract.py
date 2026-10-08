@@ -115,6 +115,7 @@ def test_deadline_retains_admission_until_work_finishes(monkeypatch):
         assert started.is_set()
         assert result["status"] == "timeout"
         assert result["store"] == "hub"
+        assert result["store_authoritative"] is True
         assert result["data_watermark"]["timestamp"] is None
         assert (await read())["status"] == "busy"
 
@@ -180,7 +181,8 @@ def test_public_validation_errors_are_bounded_and_identified(tmp_path):
     )
     assert result["status"] == "error"
     assert result["error_type"] == "EmbeddingMismatch"
-    assert result["store"] == "hub"
+    assert result["store"] == "local"
+    assert result["store_authoritative"] is False
     assert result["data_watermark"]["timestamp"] is None
     assert result["truncated"] is True
 

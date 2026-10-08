@@ -92,7 +92,7 @@ class RecallBundleService:
                         coverage = read_model(self._duckdb_path, "coverage")
                     bundle["metadata"] = coverage["metadata"]
                     bounded(bundle)
-                return with_freshness(bundle)
+                return with_freshness(bundle, path=self._duckdb_path)
         except LakeError as exc:
             return {
                 "status": "unavailable",

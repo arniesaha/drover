@@ -43,7 +43,7 @@ def build_mcp_server(
     mcp = FastMCP(name, host=host, port=port)
     db = Path(duckdb_path)
     bcfg = backend_config
-    admission = ReadAdmission()
+    admission = ReadAdmission(path=db)
 
     def read_tool():
         def register(fn):

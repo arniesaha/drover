@@ -92,7 +92,8 @@ def test_every_public_read_carries_freshness_even_without_data(tmp_path, monkeyp
         if isinstance(content, tuple):
             content = content[0]
         result = json.loads(content[0].text)
-        assert result["store"] == "hub", tool.name
+        assert result["store"] == "local", tool.name
+        assert result["store_authoritative"] is False
         assert result["host"], tool.name
         assert result["data_watermark"] == {
             "timestamp": None,
@@ -106,4 +107,50 @@ def test_active_handoff_uses_saved_brief_generation_time():
     assert result["data_watermark"] == {
         "timestamp": "2026-10-01T00:00:00+00:00",
         "basis": "brief_generated_at",
+    }
+
+
+def test_context_and_end_time_fallbacks_are_observed():
+    result = with_freshness(
+        {"contexts": [{"context_id": "c", "last_touched_at": "2026-10-01T00:00:00Z"}]}
+    )
+    assert result["data_watermark"]["basis"] == "context_last_activity_at"
+    result = with_freshness({"session_id": "s", "ended_at": "2026-10-01T00:00:00Z"})
+    assert result["data_watermark"]["basis"] == "session_ended_at"
+
+
+def test_restamping_preserves_projected_watermark():
+    result = with_freshness(
+        {
+            "results": [
+                {
+                    "source_type": "summary",
+                    "data_watermark": {
+                        "timestamp": "2026-10-01T00:00:00Z",
+                        "basis": "summary_generated_at",
+                    },
+                }
+            ]
+        }
+    )
+    assert result["data_watermark"]["basis"] == "summary_generated_at"
+    assert with_freshness(result) == result
+
+
+def test_empty_hub_read_uses_computable_store_time(pg_control_path):
+    from memory_helpers import put_summary
+    from datetime import datetime, timezone
+
+    put_summary(
+        pg_control_path,
+        "s",
+        summary_md="work",
+        generated_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+    )
+    result = with_freshness({"results": []}, path=pg_control_path)
+    assert result["store"] == "hub"
+    assert result["store_authoritative"] is True
+    assert result["data_watermark"] == {
+        "timestamp": "2026-10-01T00:00:00+00:00",
+        "basis": "derived_store_generated_at",
     }
