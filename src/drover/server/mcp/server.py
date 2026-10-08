@@ -55,6 +55,26 @@ def build_mcp_server(
         duckdb_path=db,
     )
 
+    @mcp.tool()
+    def drover_profile_propose(
+        layer: str,
+        kind: str,
+        tier: str,
+        body: str,
+        session_id: Optional[str] = None,
+        item_id: Optional[str] = None,
+        expires_at: Optional[str] = None,
+    ) -> dict:
+        """Propose a profile change as a general reader; user approval is required."""
+        from drover.server.profile import propose_profile
+
+        return propose_profile(
+            db,
+            dict(layer=layer, kind=kind, tier=tier, body=body, expires_at=expires_at),
+            session_id=session_id,
+            item_id=item_id,
+        )
+
     @read_tool()
     def drover_profile(scope: str = "first_turn") -> dict:
         """Load a bounded portable profile. This unauthenticated transport is general."""

@@ -192,3 +192,294 @@ def read_profile(path: Path, scope="first_turn", *, actor=None, now=None):
         "truncated": truncated,
         "context_status": context_status,
     }
+
+
+class ProfileConflict(ValueError):
+    """The target changed after the proposal or before its reversal."""
+
+
+def _text(value, name, limit=65536):
+    if not isinstance(value, str) or not value.strip() or len(value.encode()) > limit:
+        raise ValueError(f"{name} must be nonempty text within {limit} bytes")
+    return value.strip()
+
+
+def _change(values):
+    if set(values) - {"layer", "kind", "tier", "body", "expires_at"}:
+        raise ValueError("unsupported profile change field")
+    result = {key: values.get(key) for key in ("layer", "kind", "tier", "body")}
+    if result["layer"] not in LAYERS or result["tier"] not in TIERS:
+        raise ValueError("invalid profile layer or tier")
+    result["kind"] = _text(result["kind"], "kind", 64)
+    result["body"] = _text(result["body"], "body")
+    expiry = values.get("expires_at")
+    if expiry is not None:
+        if not isinstance(expiry, str):
+            raise ValueError("expires_at must be an ISO timestamp")
+        expiry = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            raise ValueError("expires_at requires a timezone")
+        expiry = expiry.isoformat()
+    result["expires_at"] = expiry
+    return result
+
+
+def _lock_item(con, item_id):
+    # Covers creation too, where there is not yet a row to SELECT FOR UPDATE.
+    con.execute("SELECT pg_advisory_xact_lock(hashtext(?))", [f"profile:{item_id}"])
+    row = con.execute(
+        "SELECT to_jsonb(i) FROM profile_items i WHERE item_id = ? FOR UPDATE",
+        [item_id],
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _accept(con, proposal_id, item_id, change, previous, agent, session, actor):
+    from psycopg.types.json import Jsonb
+
+    revision = (previous["revision"] if previous else 0) + 1
+    provenance = {
+        "agent": agent,
+        "session": session,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "actor": actor.agent_id,
+        "proposal_id": proposal_id,
+    }
+    con.execute(
+        """INSERT INTO profile_items
+           (item_id, layer, kind, tier, body, provenance, expires_at, revision)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (item_id) DO UPDATE SET
+             layer = EXCLUDED.layer, kind = EXCLUDED.kind, tier = EXCLUDED.tier,
+             body = EXCLUDED.body, provenance = EXCLUDED.provenance,
+             expires_at = EXCLUDED.expires_at, revision = EXCLUDED.revision,
+             status = 'active', updated_at = now()""",
+        [
+            item_id,
+            change["layer"],
+            change["kind"],
+            change["tier"],
+            change["body"],
+            Jsonb(provenance),
+            change["expires_at"],
+            revision,
+        ],
+    )
+    con.execute(
+        "UPDATE profile_proposals SET status = 'accepted', actor = ?, acted_at = now(), "
+        "before_snapshot = ?, accepted_revision = ?, "
+        "change = change || jsonb_build_object('accepted_provenance', ?::jsonb) "
+        "WHERE proposal_id = ?",
+        [actor.agent_id, Jsonb(previous), revision, Jsonb(provenance), proposal_id],
+    )
+
+
+def propose_profile(
+    path, values, *, actor=None, session_id=None, item_id=None, import_key=None
+):
+    from uuid import uuid4
+
+    from psycopg.types.json import Jsonb
+
+    actor = actor or ProfileActor()
+    change = _change(values)
+    if session_id is not None:
+        session_id = _text(session_id, "session_id", 256)
+    supplied_id = item_id is not None
+    item_id = _text(item_id, "item_id", 256) if supplied_id else uuid4().hex
+    proposal_id = uuid4().hex
+    with (
+        postgres_control_store(path).connection() as con,
+        con._connection.transaction(),
+    ):
+        if import_key:
+            con.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(?))",
+                [f"profile-import:{import_key}"],
+            )
+            found = con.execute(
+                "SELECT proposal_id, status FROM profile_proposals WHERE import_key = ?",
+                [import_key],
+            ).fetchone()
+            if found:
+                return {"proposal_id": found[0], "status": found[1], "unchanged": True}
+        previous = _lock_item(con, item_id)
+        if supplied_id and previous is None:
+            raise ValueError("unknown profile item")
+        if previous and TIERS.index(previous["tier"]) > TIERS.index(actor.tier):
+            raise PermissionError("target item is not accessible")
+        con.execute(
+            """INSERT INTO profile_proposals
+               (proposal_id, item_id, base_revision, change, agent_id, session_id,
+                status, actor, import_key)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            [
+                proposal_id,
+                item_id,
+                previous["revision"] if previous else 0,
+                Jsonb(change),
+                actor.agent_id,
+                session_id,
+                actor.agent_id,
+                import_key,
+            ],
+        )
+        auto = (
+            actor.tier == "trusted"
+            and change["tier"] != "private"
+            and (previous is None or previous["tier"] != "private")
+        )
+        if auto:
+            _accept(
+                con,
+                proposal_id,
+                item_id,
+                change,
+                previous,
+                actor.agent_id,
+                session_id,
+                actor,
+            )
+    return {
+        "proposal_id": proposal_id,
+        "status": "accepted" if auto else "pending",
+        "item_id": item_id,
+        "unchanged": False,
+    }
+
+
+def act_on_proposal(path, proposal_id, action, *, actor):
+    from psycopg.types.json import Jsonb
+
+    if not actor.user:
+        raise PermissionError("operator scope required")
+    if action not in ("accept", "reject", "revert"):
+        raise ValueError("unsupported proposal action")
+    with (
+        postgres_control_store(path).connection() as con,
+        con._connection.transaction(),
+    ):
+        row = con.execute(
+            "SELECT to_jsonb(p) FROM profile_proposals p WHERE proposal_id = ? FOR UPDATE",
+            [proposal_id],
+        ).fetchone()
+        if row is None:
+            raise ValueError("unknown profile proposal")
+        proposal = row[0]
+        expected = "accepted" if action == "revert" else "pending"
+        if proposal["status"] != expected:
+            raise ProfileConflict("proposal is not in the required state")
+        if action == "reject":
+            con.execute(
+                "UPDATE profile_proposals SET status = 'rejected', actor = ?, "
+                "acted_at = now() WHERE proposal_id = ?",
+                [actor.agent_id, proposal_id],
+            )
+            return {"proposal_id": proposal_id, "status": "rejected"}
+        previous = _lock_item(con, proposal["item_id"])
+        revision = previous["revision"] if previous else 0
+        expected_revision = (
+            proposal["accepted_revision"]
+            if action == "revert"
+            else proposal["base_revision"]
+        )
+        if revision != expected_revision:
+            raise ProfileConflict("item has changed; submit a new proposal")
+        if action == "accept":
+            _accept(
+                con,
+                proposal_id,
+                proposal["item_id"],
+                proposal["change"],
+                previous,
+                proposal["agent_id"],
+                proposal["session_id"],
+                actor,
+            )
+            status = "accepted"
+        else:
+            snapshot = proposal["before_snapshot"]
+            if snapshot is None:
+                con.execute(
+                    "UPDATE profile_items SET status = 'reverted', revision = revision + 1, "
+                    "updated_at = now() WHERE item_id = ?",
+                    [proposal["item_id"]],
+                )
+            else:
+                provenance = snapshot["provenance"]
+                provenance["reversion"] = {
+                    "actor": actor.agent_id,
+                    "proposal_id": proposal_id,
+                    "time": datetime.now(timezone.utc).isoformat(),
+                }
+                con.execute(
+                    """UPDATE profile_items SET layer = ?, kind = ?, tier = ?, body = ?,
+                       provenance = ?, status = ?, expires_at = ?, updated_at = ?,
+                       revision = revision + 1 WHERE item_id = ?""",
+                    [
+                        snapshot["layer"],
+                        snapshot["kind"],
+                        snapshot["tier"],
+                        snapshot["body"],
+                        Jsonb(provenance),
+                        snapshot["status"],
+                        snapshot["expires_at"],
+                        snapshot["updated_at"],
+                        proposal["item_id"],
+                    ],
+                )
+            con.execute(
+                "UPDATE profile_proposals SET status = 'reverted', actor = ?, "
+                "acted_at = now() WHERE proposal_id = ?",
+                [actor.agent_id, proposal_id],
+            )
+            status = "reverted"
+    return {"proposal_id": proposal_id, "status": status}
+
+
+def register_agent(path, credential_id, agent_id, tier, *, actor):
+    if not actor.user:
+        raise PermissionError("operator scope required")
+    if tier not in TIERS:
+        raise ValueError("invalid agent tier")
+    agent_id = _text(agent_id, "agent_id", 256)
+    credential_id = _text(credential_id, "credential_id", 256)
+    with postgres_control_store(path).connection() as con:
+        con.execute(
+            """INSERT INTO profile_agents (agent_id, credential_id, tier, updated_by)
+               VALUES (?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET
+               credential_id = EXCLUDED.credential_id, tier = EXCLUDED.tier,
+               updated_by = EXCLUDED.updated_by, updated_at = now()""",
+            [agent_id, credential_id, tier, actor.agent_id],
+        )
+    return {"agent_id": agent_id, "tier": tier}
+
+
+def list_proposals(path, *, actor, status="pending", limit=25):
+    """User review queue. Private proposal bodies never reach agent readers."""
+    if not actor.user:
+        raise PermissionError("operator scope required")
+    if status not in ("pending", "accepted", "rejected", "reverted"):
+        raise ValueError("invalid proposal status")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    with postgres_control_store(path).connection() as con:
+        rows = con.execute(
+            "SELECT proposal_id, item_id, change, agent_id, session_id, created_at "
+            "FROM profile_proposals WHERE status = ? ORDER BY created_at, proposal_id LIMIT ?",
+            [status, limit + 1],
+        ).fetchall()
+    return {
+        "proposals": [
+            dict(
+                proposal_id=r[0],
+                item_id=r[1],
+                change=r[2],
+                agent_id=r[3],
+                session_id=r[4],
+                created_at=r[5].isoformat(),
+            )
+            for r in rows[:limit]
+        ],
+        "truncated": len(rows) > limit,
+    }
