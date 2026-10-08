@@ -1991,3 +1991,10 @@ nexus_fleet_status = drover_fleet_status
 nexus_data_quality = drover_data_quality
 nexus_pipeline_observatory = drover_pipeline_observatory
 nexus_provider_quota = drover_provider_quota
+
+
+def drover_profile(*, duckdb_path: Path, scope: str = "first_turn") -> dict:
+    """General-tier profile for the unauthenticated MCP transport."""
+    from drover.server.profile import read_profile
+
+    return read_profile(duckdb_path, scope)

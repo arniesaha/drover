@@ -44,9 +44,12 @@ def test_every_registered_read_enforces_caps(tmp_path, monkeypatch):
     )
     server = build_mcp_server(duckdb_path=tmp_path / "unused")
     registered = asyncio.run(server.list_tools())
-    assert {t.name for t in registered} - {"drover_session_close"} == set(READ_CAPS)
+    assert {t.name for t in registered} - {
+        "drover_session_close",
+        "drover_profile_propose",
+    } == set(READ_CAPS)
     for tool in registered:
-        if tool.name == "drover_session_close":
+        if tool.name in {"drover_session_close", "drover_profile_propose"}:
             continue
         caps = READ_CAPS[tool.name]
         args = {key: "test" for key in tool.inputSchema.get("required", [])}

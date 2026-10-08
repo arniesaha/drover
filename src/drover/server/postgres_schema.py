@@ -11,6 +11,8 @@ from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
 
 log = logging.getLogger(__name__)
 
+PROFILE_MIGRATION = 15
+
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         1,
@@ -550,6 +552,54 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     ),
     (13, STOP_MIGRATION),
     (14, PUBLICATION_MIGRATION),
+    (
+        PROFILE_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS profile_agents (
+              agent_id TEXT PRIMARY KEY,
+              credential_id TEXT UNIQUE NOT NULL,
+              tier TEXT NOT NULL CHECK (tier IN ('general','trusted','private')),
+              updated_by TEXT NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS profile_items (
+              item_id TEXT PRIMARY KEY,
+              layer TEXT NOT NULL CHECK (layer IN ('user','work','decision')),
+              kind TEXT NOT NULL,
+              tier TEXT NOT NULL CHECK (tier IN ('general','trusted','private')),
+              body TEXT NOT NULL,
+              provenance JSONB NOT NULL,
+              status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','reverted')),
+              revision INTEGER NOT NULL DEFAULT 1,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              expires_at TIMESTAMPTZ
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS profile_proposals (
+              proposal_id TEXT PRIMARY KEY,
+              item_id TEXT NOT NULL,
+              base_revision INTEGER NOT NULL DEFAULT 0,
+              change JSONB NOT NULL,
+              before_snapshot JSONB,
+              agent_id TEXT NOT NULL,
+              session_id TEXT,
+              status TEXT NOT NULL CHECK (status IN ('pending','accepted','rejected','reverted')),
+              actor TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              acted_at TIMESTAMPTZ,
+              accepted_revision INTEGER,
+              import_key TEXT UNIQUE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS profile_items_bundle ON profile_items (status, layer, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS profile_proposals_pending ON profile_proposals (status, created_at)",
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

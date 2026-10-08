@@ -27,6 +27,7 @@ class ReadCaps:
 READ_CAPS = {
     f"drover_{name}": ReadCaps(rows=rows)
     for name, rows in {
+        "profile": 100,
         "memory_acceptance": 25,
         "handoff": 20,
         "session_replay": 100,

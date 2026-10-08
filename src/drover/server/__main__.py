@@ -154,6 +154,7 @@ from drover.server.metrics import (
 from drover.server.native_usage_rollup import NativeUsageRollupWorker
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.otlp.receiver import OTLPReceiver
+from drover.server.profile_cli import profile as profile_commands
 from drover.server.providers.service import ProviderUsageService
 from drover.server.quality import format_prometheus, quality_snapshot
 from drover.server.rollup import rollup_tasks
@@ -889,6 +890,9 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
     ctx.obj["config_path"] = config_path
     if _startup_diagnostics is not None:
         ctx.call_on_close(_startup_diagnostics.close)
+
+
+main.add_command(profile_commands)
 
 
 @main.command(name="setup-check")

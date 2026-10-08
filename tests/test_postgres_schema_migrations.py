@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 
+from drover.server.postgres_schema import PROFILE_MIGRATION
+
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
     1: "f1982d26c425aea2c00be04ba80e393d1dce5dd27db1eeb98998d6b93d60eacf",
@@ -34,6 +36,7 @@ RELEASED_MIGRATION_HASHES: dict[int, str] = {
     14: "436cfca2e4ddfce2827210f4437208664da062a000f9aeb470805a74b2b29a64",
     13: "480f8a74a4a43dae2115df2e789c727d23efaf18ec8947e39997c01ffc26503b",
     12: "835df35a9e5043c218fcfcd792a1fd84386cdb31443b25058e54b2fff9f2f30d",
+    PROFILE_MIGRATION: "939908c9cb262952f61f0feb9957f0d4c4e886a86fdd1752cd3ee20a83056ef0",
 }
 
 
@@ -87,6 +90,9 @@ def test_migration_versions_are_unique_and_ascending():
     versions = [version for version, _ in _MIGRATIONS]
     assert versions == sorted(set(versions))
     assert VECTOR_MIGRATION not in versions
+    assert sorted([*versions, VECTOR_MIGRATION]) == list(
+        range(1, PROFILE_MIGRATION + 1)
+    )
 
 
 def test_lake_export_batches_backfill_matches_migration_2():
@@ -105,7 +111,12 @@ def test_lake_export_batches_backfill_matches_migration_2():
 
 def test_lake_export_batches_migration_11_forward(pg_control_path):
     from drover.server.control_store import postgres_control_store
-    from drover.server.postgres_schema import bootstrap_postgres_control_store
+    from drover.server.postgres_schema import (
+        _MIGRATIONS,
+        VECTOR_MIGRATION,
+        bootstrap_postgres_control_store,
+        vector_extension_schema,
+    )
 
     store = postgres_control_store(pg_control_path)
 
@@ -139,7 +150,10 @@ def test_lake_export_batches_migration_11_forward(pg_control_path):
                 "SELECT version FROM control_schema_migrations ORDER BY version"
             ).fetchall()
         ]
-        assert versions == list(range(1, 15))
+        expected = {version for version, _ in _MIGRATIONS}
+        if vector_extension_schema(con) is not None:
+            expected.add(VECTOR_MIGRATION)
+        assert versions == sorted(expected)
 
 
 def test_lifecycle_13_fresh_existing_and_rerun(pg_control_path):
