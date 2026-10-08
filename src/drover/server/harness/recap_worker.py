@@ -17,6 +17,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -72,11 +73,16 @@ class LiveRecapWorker:
         backend: LLMBackend | None = None,
         backend_config: SummarizerBackendConfig | None = None,
         poll_interval_s: float = 1.0,
+        idle_poll_interval_s: float = 5.0,
     ) -> None:
         self.duckdb_path = Path(duckdb_path)
         self._backend = backend
         self._backend_config = backend_config
+        if poll_interval_s <= 0 or idle_poll_interval_s < poll_interval_s:
+            raise ValueError("poll intervals must be positive and idle >= active")
         self.poll_interval_s = poll_interval_s
+        self.idle_poll_interval_s = idle_poll_interval_s
+        self._next_reconcile_at = 0.0
         self.worker_id = f"live-recap@{socket.gethostname()}:{os.getpid()}"
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -100,19 +106,29 @@ class LiveRecapWorker:
         self._thread = None
 
     def _loop(self) -> None:
+        interval = self.poll_interval_s
         while not self._stop.is_set():
+            handled = 0
             try:
-                self.drain_once()
+                handled = self.drain_once()
             except Exception:  # noqa: BLE001 - a later poll must still run.
                 log.exception("live recap drain loop crashed")
-            self._stop.wait(self.poll_interval_s)
+            interval = (
+                self.poll_interval_s
+                if handled
+                else min(interval * 2, self.idle_poll_interval_s)
+            )
+            self._stop.wait(interval)
 
     def drain_once(self) -> int:
         """Process one recap job, returning one when a job was handled."""
         # Completions that arrived before their session row are re-enqueued
         # here; on a DuckDB control plane that enqueue is itself a no-op, but
         # the marker still clears.
-        HarnessRegistry(self.duckdb_path).reconcile_orphan_completions()
+        now = time.monotonic()
+        if now >= self._next_reconcile_at:
+            HarnessRegistry(self.duckdb_path).reconcile_orphan_completions()
+            self._next_reconcile_at = now + self.idle_poll_interval_s
         if not memory_store_available(self.duckdb_path):
             return 0
         ledger = JobLedger(self.duckdb_path)

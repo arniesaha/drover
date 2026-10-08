@@ -306,3 +306,100 @@ def test_duckdb_control_plane_drain_is_a_noop(tmp_path: Path) -> None:
     assert LiveRecapWorker(duckdb_path=duckdb_path, backend=backend).drain_once() == 0
     assert backend.calls == 0
     assert registry.latest_live_recaps(["s1"]) == {}
+
+
+class LoopClock:
+    """Run the polling loop without wall-clock sleeps."""
+
+    def __init__(self, passes: int) -> None:
+        self.passes = passes
+        self.waits: list[float] = []
+
+    def is_set(self) -> bool:
+        return len(self.waits) >= self.passes
+
+    def wait(self, interval: float) -> None:
+        self.waits.append(interval)
+
+
+def test_idle_loop_backs_off_and_work_restores_active_cadence(tmp_path, monkeypatch):
+    worker = LiveRecapWorker(duckdb_path=tmp_path / "recap.duckdb")
+    clock = LoopClock(8)
+    worker._stop = clock
+    # A job arriving at the slow cap is picked up on the next pass. Once
+    # busy, the worker uses the original one-second cadence for every job.
+    outcomes = iter([0, 0, 0, 1, 1, 1, 0, 0])
+    monkeypatch.setattr(worker, "drain_once", lambda: next(outcomes))
+    worker._loop()
+    assert clock.waits == [2, 4, 5, 1, 1, 1, 2, 4]
+
+
+def test_idle_loop_caps_poll_rate(tmp_path, monkeypatch):
+    worker = LiveRecapWorker(duckdb_path=tmp_path / "recap.duckdb")
+    clock = LoopClock(20)
+    worker._stop = clock
+    monkeypatch.setattr(worker, "drain_once", lambda: 0)
+    worker._loop()
+    assert clock.waits[:2] == [2, 4]
+    assert clock.waits[2:] == [5] * 18
+    assert sum(clock.waits) == 96  # Twenty polls instead of 96 at 1 Hz.
+
+
+def test_idle_reconciliation_is_throttled(tmp_path, monkeypatch):
+    worker = LiveRecapWorker(duckdb_path=tmp_path / "recap.duckdb")
+    reconciled = []
+    monkeypatch.setattr(
+        HarnessRegistry,
+        "reconcile_orphan_completions",
+        lambda self: reconciled.append(True),
+    )
+    monkeypatch.setattr(
+        "drover.server.harness.recap_worker.memory_store_available", lambda path: False
+    )
+    now = [0.0]
+    monkeypatch.setattr(
+        "drover.server.harness.recap_worker.time.monotonic", lambda: now[0]
+    )
+    for second in range(11):
+        now[0] = float(second)
+        assert worker.drain_once() == 0
+    assert len(reconciled) == 3
+
+
+def test_loop_errors_back_off_and_recover(tmp_path, monkeypatch):
+    worker = LiveRecapWorker(duckdb_path=tmp_path / "recap.duckdb")
+    clock = LoopClock(3)
+    worker._stop = clock
+    outcomes = iter([RuntimeError("offline"), 0, 1])
+
+    def drain():
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(worker, "drain_once", drain)
+    worker._loop()
+    assert clock.waits == [2, 4, 1]
+
+
+def test_job_arriving_at_idle_cap_is_claimed_on_next_poll(pg_control_path, monkeypatch):
+    backend = StubBackend({"recap": "Picked up after idle."})
+    worker = LiveRecapWorker(duckdb_path=pg_control_path, backend=backend)
+
+    class ArrivalClock(LoopClock):
+        def wait(self, interval):
+            super().wait(interval)
+            if len(self.waits) == 3:
+                recap_store(pg_control_path)
+
+    clock = ArrivalClock(5)
+    worker._stop = clock
+    monkeypatch.setattr(
+        "drover.server.harness.recap_worker.time.monotonic", lambda: sum(clock.waits)
+    )
+    worker._loop()
+    assert clock.waits == [2, 4, 5, 1, 2]
+    assert backend.calls == 1
+    assert recap_row(pg_control_path, "s1")[:2] == ("Picked up after idle.", 8)
+    assert jobs(pg_control_path, "s1") == [("8", "succeeded", 0, None)]
