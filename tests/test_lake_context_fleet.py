@@ -73,16 +73,24 @@ def test_fleet_pg_routing_identity_epoch_and_bounds(verified_lake, monkeypatch):
     result = tools.drover_fleet_status(duckdb_path=path)
     assert result["count"] == 1
     assert result["active_sessions"][0]["repo_owner"] == "o"
-    assert result["status_source"] == "postgres_registry"
-    binding = result["metadata"]["binding"]
+    assert result["state_source"] == "control_plane.harness_sessions+harness_hosts"
+    assert result["control_store"] == "postgres"
+    assert result["authoritative"] is True
+    assert result["store"] == "hub"
+    assert result["store_authoritative"] is True
+    # The MCP fleet response uses live control state. Lake binding metadata is
+    # the separate analytical read-model contract, not a fleet response field.
+    from drover.server.lake import read_models
+
+    binding = read_models.read_model(path, "fleet")["metadata"]["binding"]
     configure_analytics(path, replace(config, epoch="renewed"))
-    renewed = tools.drover_fleet_status(duckdb_path=path)
+    renewed = read_models.read_model(path, "fleet")
     assert renewed["metadata"]["binding"]["epoch"] == "renewed"
     with control_plane_connection(path) as con:
         con.execute(
             "UPDATE harness_sessions SET native_session_id='native-new' WHERE session_id='active'"
         )
-    changed = tools.drover_fleet_status(duckdb_path=path)
+    changed = read_models.read_model(path, "fleet")
     assert changed["metadata"]["binding"]["identities"] != binding["identities"]
     for kind in ("native_publication", "native_usage"):
         assert (
@@ -169,9 +177,16 @@ def test_fleet_response_bounds_and_retired_closed_exclusion(verified_lake):
         con.execute(
             "UPDATE harness_sessions SET repo_owner=repeat('x',1100000) WHERE session_id='a'"
         )
+    with pytest.raises(LakeError, match="analytics_byte_limit_exceeded"):
+        read_model(path, "fleet")
+    bounded_fleet = tools.drover_fleet_status(duckdb_path=path)
+    from drover.server.mcp.contract import READ_CAPS, serialized_bytes
+
+    assert bounded_fleet["truncated"] is True
+    assert [r["session_id"] for r in bounded_fleet["active_sessions"]] == ["a"]
     assert (
-        tools.drover_fleet_status(duckdb_path=path)["reason"]
-        == "analytics_byte_limit_exceeded"
+        serialized_bytes(bounded_fleet)
+        <= READ_CAPS["drover_fleet_status"].response_bytes
     )
     with control_plane_connection(path) as con:
         con.execute("UPDATE harness_sessions SET repo_owner='o' WHERE session_id='a'")
@@ -227,57 +242,36 @@ def test_repository_context_uses_bound_unavailable_coverage(verified_lake, monke
     assert result["metadata"]["binding"]["epoch"] == config.epoch
 
 
-@pytest.fixture
-def recent_event_seed(monkeypatch):
+def test_fleet_parity_for_registry_backed_active_sessions(verified_lake):
     from datetime import datetime, timedelta, timezone
-
-    import test_mcp_tools
-
-    original = test_mcp_tools._write_agent_events
-    now = datetime.now(timezone.utc)
-
-    def write(parquet, rows):
-        for index, row in enumerate(rows):
-            row["timestamp"] = now - timedelta(minutes=4 - index)
-        original(parquet, rows)
-
-    monkeypatch.setattr(test_mcp_tools, "_write_agent_events", write)
-
-
-@pytest.fixture
-def fleet_lake(recent_event_seed, verified_lake):
-    return verified_lake
-
-
-def test_fleet_parity_for_registry_backed_active_sessions(fleet_lake):
-    from datetime import datetime
 
     from drover.config import AnalyticsConfig
     from drover.server.db import control_plane_connection
     from drover.server.harness.registry import HarnessRegistry
     from drover.server.mcp import tools
 
-    _, path, config = fleet_lake
-    legacy = tools.drover_fleet_status(duckdb_path=path)["active_sessions"]
-    assert len(legacy) == 2
+    _, path, config = verified_lake
     registry = HarnessRegistry(path)
     registry.register_host(host_id="test", display_name="Test", kind="test")
-    for row in legacy:
+    now = datetime.now(timezone.utc)
+    for index, sid in enumerate(("s", "other")):
         registry.create_session(
             host_id="test",
             harness="codex",
             command="codex",
-            session_id=row["session_id"],
-            repo_owner=row["repo_owner"],
-            repo_name=row["repo_name"],
-            branch=row["branch"],
-            started_at=datetime.fromisoformat(row["started_at"]),
+            session_id=sid,
+            repo_owner="o",
+            repo_name="r",
+            branch="main",
+            started_at=now - timedelta(minutes=5 + index),
         )
         with control_plane_connection(path) as con:
             con.execute(
                 "UPDATE harness_sessions SET status='running',last_activity=? WHERE session_id=?",
-                [datetime.fromisoformat(row["last_event_at"]), row["session_id"]],
+                [now - timedelta(minutes=index), sid],
             )
+    legacy = tools.drover_fleet_status(duckdb_path=path)["active_sessions"]
+    assert len(legacy) == 2
     configure_analytics(path, config)
     lake = tools.drover_fleet_status(duckdb_path=path)["active_sessions"]
     fields = (
@@ -287,16 +281,16 @@ def test_fleet_parity_for_registry_backed_active_sessions(fleet_lake):
         "repo_name",
         "branch",
         "started_at",
-        "last_event_at",
+        "last_activity",
+        "task_id",
     )
-    from datetime import timezone
 
     def facts(rows):
         return [
             {
                 k: (
                     datetime.fromisoformat(r[k]).astimezone(timezone.utc)
-                    if k in ("started_at", "last_event_at")
+                    if k in ("started_at", "last_activity")
                     else r[k]
                 )
                 for k in fields
@@ -305,7 +299,7 @@ def test_fleet_parity_for_registry_backed_active_sessions(fleet_lake):
         ]
 
     assert facts(lake) == facts(legacy)
-    assert all(r["event_count"] is None and r["task_id"] is None for r in lake)
+    assert all(r["task_id"] and r["host_liveness"] == "online" for r in lake)
     configure_analytics(path, AnalyticsConfig())
     assert tools.drover_fleet_status(duckdb_path=path)["active_sessions"] == legacy
 

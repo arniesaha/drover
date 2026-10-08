@@ -758,6 +758,7 @@ def test_task_status_aggregates(tmp_path: Path, pg_control_path: Path) -> None:
         "ended_at",
         "generated_at",
         "store",
+        "store_authoritative",
         "host",
         "data_watermark",
     }

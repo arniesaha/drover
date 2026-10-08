@@ -1306,6 +1306,10 @@ def _control_active_sessions(duckdb_path: Path, task_id: str | None = None) -> d
     }
     sessions = []
     for session in registry.list_sessions(archived_limit=0):
+        # An end timestamp is authoritative even if a delayed status update
+        # still leaves the registry row marked running.
+        if session.ended_at is not None:
+            continue
         liveness = host_liveness.get(session.host_id)
         # Retired hosts retain history but are never active fleet work.
         if liveness is None or liveness == "retired":
