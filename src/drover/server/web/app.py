@@ -2698,12 +2698,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     if self.auth.credentials
                     else None
                 )
-                if (
-                    credential is None
-                    or not credential.is_active
-                    or credential.scope == "preflight"
+                if not (
+                    credential is not None
+                    and credential.is_active
+                    and credential.scope == "profile"
                 ):
-                    raise ValueError("active non-preflight credential required")
+                    raise ValueError("active profile credential required")
                 payload = register_agent(
                     self.collector.duckdb_path, actor=actor, **body
                 )

@@ -19,7 +19,7 @@ from drover.server.profile import (
 )
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import DISABLED, AuthSettings
-from drover.server.web.credentials import CredentialStore
+from drover.server.web.credentials import PostgresCredentialStore
 
 USER = ProfileActor("operator", "private", True)
 TRUSTED = ProfileActor("example-trusted", "trusted")
@@ -166,8 +166,11 @@ def test_registry_requires_operator(pg_control_path):
             "private",
             actor=TRUSTED,
         )
+    credential, _ = PostgresCredentialStore(pg_control_path).issue(
+        scope="profile", label="example-agent"
+    )
     register_agent(
-        pg_control_path, "example-credential", "example-agent", "trusted", actor=USER
+        pg_control_path, credential.id, "example-agent", "trusted", actor=USER
     )
 
 
@@ -186,10 +189,13 @@ def test_proposal_validation(pg_control_path, extra):
         propose_profile(pg_control_path, {**change(), **extra})
 
 
-def test_http_authority_and_mcp_pending(pg_control_path, tmp_path):
-    credentials = CredentialStore(tmp_path / "credentials.json")
-    credential, token = credentials.issue(
-        scope="host", label="example-agent", host_id="example-host"
+def test_http_authority_and_mcp_pending(pg_control_path):
+    credentials = PostgresCredentialStore(pg_control_path)
+    credential, profile_token = credentials.issue(
+        scope="profile", label="example-agent"
+    )
+    _, token = credentials.issue(
+        scope="host", label="example-host", host_id="example-host"
     )
     auth = AuthSettings(True, "example-operator-token", credentials=credentials)
     server = start_metrics_server(
@@ -235,7 +241,8 @@ def test_http_authority_and_mcp_pending(pg_control_path, tmp_path):
             )[0]
             == 200
         )
-        assert post("/profile/proposals", change())[1]["status"] == "accepted"
+        assert post("/profile/proposals", change(), profile_token)[0] == 401
+        assert post("/profile/proposals", change())[1]["status"] == "pending"
         code, pending = post("/profile/proposals", change("Sensitive", "private"))
         assert code == 200 and pending["status"] == "pending"
         route = f"/profile/proposals/{pending['proposal_id']}/accept"

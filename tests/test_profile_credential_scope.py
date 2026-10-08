@@ -6,6 +6,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+from drover.server.control_store import postgres_control_store
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.metrics import MetricsCollector
 from drover.server.profile import (
@@ -13,6 +14,7 @@ from drover.server.profile import (
     act_on_proposal,
     issue_agent_credential,
     propose_profile,
+    register_agent,
     revoke_agent_credential,
 )
 from drover.server.web.app import start_metrics_server
@@ -206,3 +208,42 @@ def test_operator_listing_and_revocation(pg_control_path, profile_server, revoca
         )
     assert store.find_active(issued["token"]) is None
     assert request("GET", "/profile")[0] == 401
+
+
+@pytest.mark.parametrize(
+    "scope,revoked",
+    [
+        ("profile", False),
+        ("device", False),
+        ("host", False),
+        ("preflight", False),
+        ("profile", True),
+    ],
+)
+def test_agent_link_requires_active_profile_credential(
+    pg_control_path, profile_server, scope, revoked
+):
+    _, store, auth, request = profile_server
+    credential, _ = store.issue(scope=scope, label="example-link")
+    if revoked:
+        store.revoke(credential.id)
+    body = dict(credential_id=credential.id, agent_id="example-link", tier="trusted")
+    status, _, payload = request("POST", "/profile/agents", body, token=auth.api_token)
+    if scope == "profile" and not revoked:
+        assert status == 200
+        assert json.loads(payload) == {"agent_id": "example-link", "tier": "trusted"}
+        assert register_agent(pg_control_path, actor=OPERATOR, **body) == json.loads(
+            payload
+        )
+    else:
+        assert status == 400
+        assert json.loads(payload) == {"error": "active profile credential required"}
+        with pytest.raises(ValueError, match="^active profile credential required$"):
+            register_agent(pg_control_path, actor=OPERATOR, **body)
+        with postgres_control_store(pg_control_path).connection() as con:
+            assert (
+                con.execute(
+                    "SELECT count(*) FROM profile_agents WHERE agent_id = 'example-link'"
+                ).fetchone()[0]
+                == 0
+            )

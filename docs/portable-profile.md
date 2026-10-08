@@ -61,7 +61,7 @@ browser sessions. Browser cookies and authentication-
 disabled requests receive general profile access. Do not put agent or reader
 identity in a query parameter or proposal body; unsupported fields are rejected.
 
-Bind an already issued, active credential with operator-authorized
+Bind an already issued, active `profile` credential with operator-authorized
 `POST /profile/agents`:
 
 ```json

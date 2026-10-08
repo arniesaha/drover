@@ -481,7 +481,14 @@ def register_agent(path, credential_id, agent_id, tier, *, actor):
         raise ValueError("invalid agent tier")
     agent_id = _text(agent_id, "agent_id", 256)
     credential_id = _text(credential_id, "credential_id", 256)
-    with postgres_control_store(path).connection() as con:
+    with _profile_transaction(path) as con:
+        credential = con.execute(
+            "SELECT credential_id FROM control_credentials WHERE credential_id = ? "
+            "AND scope = 'profile' AND revoked_at IS NULL FOR SHARE",
+            [credential_id],
+        ).fetchone()
+        if credential is None:
+            raise ValueError("active profile credential required")
         con.execute(
             """INSERT INTO profile_agents (agent_id, credential_id, tier, updated_by)
                VALUES (?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET
