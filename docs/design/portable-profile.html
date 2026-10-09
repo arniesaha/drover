@@ -2470,7 +2470,6 @@ proposed -accept->    accepted   : user
 proposed -reject->    rejected   : user
 proposed -newer->     superseded : same item
 proposed -timeout->   expired    : 30 d
-+ proposed -auto->    accepted   : low-risk
 </script>
     <div data-state="proposed"><doc-mock frame="terminal" title="drover-server profile review" w="440"><template><b>1 of 3</b> · from nas-openclaw · 2h ago
   <span class="g">+ preference</span> · style · general
@@ -2483,9 +2482,8 @@ proposed -timeout->   expired    : 30 d
   </doc-machine>
   <doc-ask id="approve">
     <p>Who approves an update proposal?</p>
-    <label><input type="radio" name="approve" value="arnab" checked> Always Arnab <small>the dashed auto arrow goes</small></label>
-    <label><input type="radio" name="approve" value="lowrisk"> Auto-accept general style items from trusted agents <small>a daily digest lists them</small></label>
-    <label><input type="radio" name="approve" value="trusted"> Auto-accept all from trusted agents, except private <small>a daily digest lists them</small></label>
+    <label><input type="radio" name="approve" value="operator" checked> The operator approves each pending proposal</label>
+    <p>Current profile credentials are read-only and cannot submit proposals. See the <a href="../portable-profile.md#proposals-review-and-reversal">profile contract</a> for operator approval.</p>
   </doc-ask>
 
   <doc-claim>

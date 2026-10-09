@@ -202,3 +202,32 @@ def test_public_validation_errors_are_bounded_and_identified(tmp_path):
 def test_default_deadline_is_five_seconds():
     assert READ_CAPS["drover_search"].deadline_seconds == 5.0
     assert all(caps.deadline_seconds == 5.0 for caps in READ_CAPS.values())
+
+
+def test_profile_startup_is_one_bounded_general_call(pg_control_path):
+    from drover.server.profile import ProfileActor, act_on_proposal, propose_profile
+
+    for tier in ("general", "trusted", "private"):
+        proposal = propose_profile(
+            pg_control_path,
+            dict(layer="user", kind="rule", tier=tier, body=f"{tier} marker"),
+        )
+        act_on_proposal(
+            pg_control_path,
+            proposal["proposal_id"],
+            "accept",
+            actor=ProfileActor("operator", "private", True),
+        )
+    server = build_mcp_server(duckdb_path=pg_control_path)
+    metadata = next(
+        t for t in asyncio.run(server.list_tools()) if t.name == "drover_profile"
+    )
+    assert set(metadata.inputSchema["properties"]) == {"scope"}
+    result = call(server, "drover_profile", {"scope": "first_turn"})
+    assert "general marker" in result["bundle"]
+    assert "trusted marker" not in json.dumps(result)
+    assert "private marker" not in json.dumps(result)
+    assert result["withheld_count"] == 2
+    assert result["token_upper_bound"] == len(result["bundle"].encode()) <= 1500
+    assert result["data_watermark"]["basis"] == "rendered_profile_source_at"
+    assert result["oldest_item_age_seconds"] >= 0

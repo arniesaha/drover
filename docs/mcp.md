@@ -122,4 +122,12 @@ watermark. Identity and watermark metadata count toward the byte budget.
 within a 1,500-token ceiling. The current MCP transport reads as general.
 `drover_profile_propose(layer, kind, tier, body, ...)` creates a pending proposal.
 See [portable profile](portable-profile.md) for credential-authenticated HTTP,
-trusted auto-acceptance, private review, reversal and markdown import.
+trusted reads, pending proposals, operator review, reversal and markdown import.
+Issued profile credentials are read-only.
+
+
+Client startup examples and the single-call profile contract are in
+[docs/integrations](integrations/README.md). Profile bundles report
+`oldest_item_age_seconds` alongside their rendered-source watermark. Empty
+profiles retain an unknown watermark even when unrelated hub data is fresh.
+Clients own startup loading; trusted profile reads use authenticated HTTP.
