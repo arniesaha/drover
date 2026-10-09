@@ -86,6 +86,7 @@ def with_freshness(
     *,
     empty_envelope: bool = False,
     path=None,
+    allow_store_watermark: bool = True,
 ) -> dict | None:
     """Stamp the envelope and each data item with its own observed watermark.
 
@@ -173,6 +174,7 @@ def with_freshness(
             item.update(identity)
             if (
                 root
+                and allow_store_watermark
                 and stamp is None
                 and path is not None
                 and item.get("status") not in {"busy", "timeout", "error"}

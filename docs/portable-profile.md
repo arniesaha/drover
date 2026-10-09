@@ -1,9 +1,10 @@
 # Portable user profile
 
-Iteration 1 stores durable profile facts and their proposal history in Drover
-PostgreSQL, using migration **15**. Files remain read-only import sources.
+Iteration 2 hardens import and adds operator commands and client startup examples.
+Profile storage introduced in iteration 1 keeps durable profile facts and their
+proposal history in Drover PostgreSQL, using migration **15**. Files remain read-only import sources.
 See [ADR 0003](adr/0003-portable-profile-iteration-1.md) and the
-[implementation plan](plans/2026-10-07-portable-profile-iteration-1.md).
+[iteration 2 plan](plans/2026-10-08-portable-profile-iteration-2.md).
 
 ## Read a first-turn bundle
 
@@ -12,7 +13,9 @@ Scopes are `first_turn`, `full`, `user`, `work` and `decision`. Every scope
 keeps the 1,500-token ceiling. `full` includes all layers within that ceiling.
 
 Responses include `bundle`, `token_budget`, `token_upper_bound`,
-`withheld_count`, `truncated`, `context_status` and `data_watermark`. The watermark
+`withheld_count`, `truncated`, `context_status`, `data_watermark` and
+`oldest_item_age_seconds`. Age is nonnegative seconds since the oldest rendered
+source timestamp, or null for an empty bundle. The watermark
 uses only sources rendered in the bundle; MCP preserves it alongside
 `store: "hub"` and `store_authoritative: true` for the PostgreSQL profile. The renderer conservatively
 counts one token per UTF-8 byte, including headings, counts and truncation text.
@@ -42,19 +45,23 @@ Private readers see all three tiers. Hidden content is represented only by
 `Withheld: N items.` No hidden titles, categories, bodies or IDs are rendered.
 
 HTTP derives identity from an active bearer credential and the PostgreSQL
-`profile_agents` registry. Unknown agents default to general. The designated
-two agents in issue #545 must be bound to their credentials as trusted by the
-operator. Deployment identities are deliberately absent from public fixtures
+`profile_agents` registry. Unknown agents default to general. The operator can
+issue and revoke registered credentials with `drover profile agents`; trusted
+access requires explicit `--tier trusted`. Deployment identities are deliberately
+absent from public fixtures
 and source. No registry or production configuration is modified by installation
 of this code alone.
 
 The cluster operator bearer represents the user: it can read private content,
 review proposals, approve changes, reverse changes and manage tier bindings.
-Device/host bearers cannot approve changes. Browser cookies and authentication-
+Device, host and profile bearers cannot approve changes. Profile bearers issued
+by `drover profile agents issue` authorize only `GET /profile`; they cannot write
+proposals, use fleet/harness APIs, pair clients, manage credentials or mint
+browser sessions. Browser cookies and authentication-
 disabled requests receive general profile access. Do not put agent or reader
 identity in a query parameter or proposal body; unsupported fields are rejected.
 
-Bind an already issued, active credential with operator-authorized
+Bind an already issued, active `profile` credential with operator-authorized
 `POST /profile/agents`:
 
 ```json
@@ -63,7 +70,8 @@ Bind an already issued, active credential with operator-authorized
 
 The existing MCP transport has no verified caller identity. Its profile reader
 is always general and its proposals always start pending. Trusted agents use
-credential-authenticated HTTP for trusted reads and automatic acceptance.
+credential-authenticated HTTP for trusted reads. Current registration accepts
+only read-only profile credentials, which cannot submit proposals.
 
 ## Proposals, review and reversal
 
@@ -85,10 +93,15 @@ existing accessible item. Optional `expires_at` requires a timezone-qualified
 ISO timestamp. Body text is limited to 65,536 UTF-8 bytes. Responses return
 proposal ID, item ID, status and an idempotence flag, without echoing content.
 
-Trusted agent proposals automatically accept unless the target tier is private.
-Editing an existing private item also requires user approval; readers cannot
-edit items they cannot access. All other proposals start pending. This includes
-operator-created proposals, keeping approval explicit.
+Proposals submitted through the current HTTP and MCP credential setup start
+pending until the operator approves them. Issued profile credentials
+are read-only and cannot call proposal routes.
+Readers cannot edit items they cannot access. Operator-created proposals also
+start pending, keeping approval explicit.
+
+Bindings to non-profile credentials are ignored at resolution, so existing
+host/device bindings must be reissued as profile credentials with
+`drover profile agents issue`.
 
 The operator can inspect `GET /profile/proposals?status=pending&limit=25`.
 The queue includes proposed content and source identity. Allowed statuses are
@@ -125,12 +138,23 @@ review. A directory imports its markdown files recursively in sorted order,
 with a limit of 100 files, each at most 2 MiB. Source files are never edited.
 
 ATX and setext headings define section items. Code-fenced headings remain
-content. Recognized preferences, rules, style, work and decision sections default to
-general; `--tier trusted` raises that default. Unrecognized headings and unheaded
-notes default to trusted, following the design's unknown-category floor. Health, medical, finance, money, job-search and personal headings force
-private classification for their entire descendant subtree. A later sibling
-heading restores the inherited parent classification. There is no general
-fallback for a detected private heading.
+content. Every item defaults to private, including recognized categories,
+unknown categories and unheaded notes. `--tier general` or `--tier trusted`
+sets an explicit visibility ceiling; headings can only restrict it.
+`--tier private` is also accepted. Sensitive ancestor headings force private for the
+entire subtree: health, medical, finance, finances, financial, money, job-search,
+personal, tax, income, salary, compensation, address, location, dating,
+relationship, career, interview, offer, resignation, therapy, pet health,
+portfolio, investment and banking. A later sibling restores the parent's
+classification ceiling.
+
+The section text, including its heading path and code fences, is scanned for
+obvious street addresses, IPv4/IPv6 addresses, currency amounts, phone numbers
+and email addresses. Any hit forces private. These conservative heuristics can
+produce false positives and cannot detect every sensitive fact; unmatched text
+still defaults to private. Dry runs include `key` (the heading path) and
+`tier_reasons` for each item. Reasons are retained in proposal history and in
+accepted item provenance as `import_classification`.
 
 With `--apply`, new general/trusted items are explicitly approved by the local
 operator import action. Private sections and changed versions of accepted
@@ -142,7 +166,46 @@ Deleted sections are not automatically deleted from PostgreSQL.
 
 ## Boundaries
 
-This iteration adds no UI, agent hooks, schedules, personas or host-file writers.
+This iteration adds no UI, schedules, personas or host-file writers. Copyable
+client startup examples live in [docs/integrations](integrations/README.md);
+clients own orchestration and configuration.
 It requires PostgreSQL for profile persistence. Proposal writes are included
 now, overriding the design artifact's v2 deferral. Context containers remain a
 derived work source rather than a second authoritative profile store.
+
+## Operator commands
+
+These commands act on the configured PostgreSQL store using local operator
+access. They do not require a running HTTP server. No import or credential
+issuance happens without an explicit command.
+
+```sh
+drover profile review PROPOSAL_ID accept
+drover profile review PROPOSAL_ID reject
+drover profile review PROPOSAL_ID revert
+drover profile set-tier ITEM_ID --tier general --reason "Reviewed for sharing"
+drover profile set-tier ITEM_ID --tier private --reason "Restrict visibility"
+drover profile agents issue AGENT_ID --tier trusted
+drover profile agents revoke AGENT_ID
+```
+
+Default imports remain pending. Accept a private proposal before changing its
+item tier. `set-tier` promotes or demotes an active item and immediately accepts
+an operator proposal. It retains the old snapshot, revision, actor, time,
+classification evidence and reason. Its returned proposal can be reverted,
+subject to the normal revision conflict check.
+
+Credential issuance defaults to general. It atomically stores a verifier in
+`control_credentials` with scope `profile` and `host_id` null, and binds it to
+the agent in `profile_agents`, recording
+`updated_by` and `updated_at`. The token is printed once; store it securely in
+the client. An agent with an active credential must be revoked before reissue.
+Revocation invalidates the bearer and removes trusted access, retaining the
+credential's revocation timestamp and registry operator metadata. It is
+idempotent. Agent credentials cannot be issued at private tier by this command.
+Trusted sessions use HTTP, since MCP has no verified caller identity. The scope
+allowlist permits only `GET /profile` (including supported scope queries). Agent
+identities do not enter the host namespace, and retiring a same-named host does
+not revoke a profile credential. Operators can also list and revoke profile
+credentials through the generic credential endpoints; profile tokens cannot
+access those endpoints or revoke other credentials.

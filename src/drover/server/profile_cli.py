@@ -13,19 +13,49 @@ from drover.server.control_store import postgres_control_store
 from drover.server.profile import ProfileActor, act_on_proposal, propose_profile
 
 SENSITIVE_HEADING = re.compile(
-    r"\b(?:health|medical|finance|finances|financial|money|job[\s_-]*search|personal)\b",
+    r"\b(?:health|medical|finance|finances|financial|money|job[\s_-]*search|personal|"
+    r"tax(?:es|ation)?|income|salar(?:y|ies)|compensation|address(?:es)?|locations?|dating|relationships?|"
+    r"careers?|interviews?|offers?|resignation|therapy|pet[\s_-]*health|portfolios?|"
+    r"investments?|banking)\b",
     re.IGNORECASE,
 )
+
+# Conservative heuristics, not a proof that unmatched text is safe to share.
+PII_PATTERNS = {
+    "street_address": re.compile(
+        r"\b\d{1,6}\s+(?:[A-Za-z0-9.'-]+\s+){1,5}"
+        r"(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|court|ct|"
+        r"boulevard|blvd|way|place|pl|terrace|ter|crescent|cres)\b",
+        re.I,
+    ),
+    "ip_address": re.compile(
+        r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|"
+        r"(?<![\w:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f:]{0,39}(?![\w:])",
+        re.I,
+    ),
+    "currency_amount": re.compile(
+        r"[$€£¥₹₩₽]\s*\d|\b(?:USD|CAD|EUR|GBP|JPY|AUD|CHF|INR)\s*\d|"
+        r"\b\d[\d,.]*\s*(?:USD|CAD|EUR|GBP|JPY|AUD|CHF|INR|dollars?|euros?|pounds?)\b",
+        re.I,
+    ),
+    "phone_number": re.compile(
+        r"(?<!\w)(?:\+\d{1,3}[ .-]?)?(?:\(\d{3}\)|\d{3})[ .-]?"
+        r"\d{3}[ .-]?\d{4}(?!\w)|(?<!\w)\+\d[\d .()-]{6,}\d(?!\w)"
+    ),
+    "email": re.compile(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+"),
+}
 
 
 def _digest(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def parse_markdown(text, *, tier="general"):
+def parse_markdown(text, *, tier=None):
     """Section items inherit private classification from every ancestor heading."""
-    if tier not in ("general", "trusted"):
-        raise ValueError("import tier must be general or trusted")
+    explicit_tier = tier is not None
+    tier = "private" if tier is None else tier
+    if tier not in ("general", "trusted", "private"):
+        raise ValueError("import tier must be general, trusted or private")
     stack = []
     body = []
     items = []
@@ -37,13 +67,16 @@ def parse_markdown(text, *, tier="general"):
             return
         headings = [heading for _, heading in stack]
         heading = " / ".join(headings) or "Notes"
-        private = any(SENSITIVE_HEADING.search(h) for h in headings)
-        public_category = re.search(
-            r"\b(?:preferences?|rules?|constraints?|style|work|projects?|threads?|decisions?)\b",
-            heading,
-            re.I,
+        reasons = [f"explicit_tier:{tier}" if explicit_tier else "default_private"]
+        reasons.extend(
+            f"sensitive_heading:{h}" for h in headings if SENSITIVE_HEADING.search(h)
         )
-        ordinary_tier = tier if public_category else "trusted"
+        reasons.extend(
+            f"body_pii:{name}"
+            for name, pattern in PII_PATTERNS.items()
+            if pattern.search(f"{heading}\n{content}")
+        )
+        private = len(reasons) > 1
         # Preserve durable preferences; work and decisions get their own freshness.
         layer = (
             "decision"
@@ -67,7 +100,9 @@ def parse_markdown(text, *, tier="general"):
             dict(
                 layer=layer,
                 kind=kind,
-                tier="private" if private else ordinary_tier,
+                tier="private" if private else tier,
+                key=heading,
+                tier_reasons=reasons,
                 body=f"{heading}\n{content}",
             )
         )
@@ -113,7 +148,7 @@ def parse_markdown(text, *, tier="general"):
     return items
 
 
-def import_sources(source: Path, *, tier="general"):
+def import_sources(source: Path, *, tier=None):
     source = Path(source)
     files = sorted(source.rglob("*.md")) if source.is_dir() else [source]
     if not files or len(files) > 100:
@@ -164,7 +199,15 @@ def import_record(path, record):
         ).fetchone()
         proposal = propose_profile(
             path,
-            record["change"],
+            {
+                k: v
+                for k, v in record["change"].items()
+                if k not in ("key", "tier_reasons")
+            },
+            _classification={
+                "key": record["change"]["key"],
+                "tier_reasons": record["change"]["tier_reasons"],
+            },
             actor=ProfileActor("profile-import", "private"),
             session_id=f"import:{record['slot']}",
             item_id=previous[0] if previous else None,
@@ -194,9 +237,9 @@ def profile():
 )
 @click.option(
     "--tier",
-    type=click.Choice(["general", "trusted"]),
-    default="general",
-    show_default=True,
+    type=click.Choice(["general", "trusted", "private"]),
+    default=None,
+    show_default="private",
 )
 @click.option(
     "--apply",
@@ -218,3 +261,99 @@ def import_command(ctx, source, tier, apply):
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(json.dumps({"dry_run": not apply, "items": results}, indent=2))
+
+
+def _operator_path(ctx):
+    from drover.server.__main__ import _resolve_config
+
+    return _resolve_config((ctx.obj or {}).get("config_path")).duckdb_path
+
+
+@profile.command(name="set-tier")
+@click.argument("item_id")
+@click.option(
+    "--tier", required=True, type=click.Choice(["general", "trusted", "private"])
+)
+@click.option("--reason", required=True, help="Explanation retained in provenance.")
+@click.pass_context
+def set_tier_command(ctx, item_id, tier, reason):
+    """Promote or demote an accepted item after operator review."""
+    from drover.server.profile import set_item_tier
+
+    try:
+        result = set_item_tier(
+            _operator_path(ctx),
+            item_id,
+            tier,
+            reason=reason,
+            actor=ProfileActor("operator", "private", True),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2))
+
+
+@profile.command(name="review")
+@click.argument("proposal_id")
+@click.argument("action", type=click.Choice(["accept", "reject", "revert"]))
+@click.pass_context
+def review_command(ctx, proposal_id, action):
+    """Apply an explicit operator decision to a proposal."""
+    try:
+        result = act_on_proposal(
+            _operator_path(ctx),
+            proposal_id,
+            action,
+            actor=ProfileActor("operator", "private", True),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2))
+
+
+@profile.group(name="agents")
+def agents():
+    """Operator management of HTTP profile credentials."""
+
+
+@agents.command(name="issue")
+@click.argument("agent_id")
+@click.option(
+    "--tier",
+    type=click.Choice(["general", "trusted"]),
+    default="general",
+    show_default=True,
+)
+@click.pass_context
+def issue_command(ctx, agent_id, tier):
+    """Issue and register a bearer token, printed once. Store it securely."""
+    from drover.server.profile import issue_agent_credential
+
+    try:
+        result = issue_agent_credential(
+            _operator_path(ctx),
+            agent_id,
+            tier,
+            actor=ProfileActor("operator", "private", True),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2))
+
+
+@agents.command(name="revoke")
+@click.argument("agent_id")
+@click.pass_context
+def revoke_command(ctx, agent_id):
+    """Revoke a profile agent's bearer token and trusted access."""
+    from drover.server.profile import revoke_agent_credential
+
+    try:
+        result = revoke_agent_credential(
+            _operator_path(ctx),
+            agent_id,
+            actor=ProfileActor("operator", "private", True),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2))

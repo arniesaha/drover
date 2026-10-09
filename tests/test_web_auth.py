@@ -250,3 +250,36 @@ def test_preflight_credential_cannot_mint_a_browser_session(tmp_path):
     _, token = store.issue(scope="preflight", label="testflight-ci")
 
     assert not token_matches(_auth(credentials=store), token)
+
+
+def test_profile_credential_only_authorizes_literal_bundle_read(tmp_path):
+    store = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    credential, token = store.issue(scope="profile", label="example-agent")
+    settings = _auth(credentials=store)
+    headers = _Headers({"Authorization": f"Bearer {token}"})
+    assert credential.host_id is None
+    assert request_authorized(settings, headers, method="GET", path="/profile")
+    # No general auth, cookie exchange or fallback to a cookie on denied requests.
+    assert not token_matches(settings, token)
+    assert not request_authorized(settings, headers)
+    headers["Cookie"] = f"{settings.cookie_name}={mint_session(settings)}"
+    for method, path in (
+        ("POST", "/profile"),
+        ("GET", "/profile/"),
+        ("GET", "/profile/proposals"),
+        ("POST", "/profile/proposals"),
+        ("POST", "/harness/hosts"),
+        ("GET", "/auth/credentials"),
+        ("DELETE", "/auth/credentials/example"),
+        ("POST", "/auth/login"),
+        ("POST", "/auth/pair"),
+        ("GET", "/unknown-future-route"),
+    ):
+        assert not request_authorized(settings, headers, method=method, path=path)
+    store.revoke(credential.id)
+    assert not request_authorized(
+        settings,
+        _Headers({"Authorization": f"Bearer {token}"}),
+        method="GET",
+        path="/profile",
+    )

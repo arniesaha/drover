@@ -121,8 +121,28 @@ def bearer_credential(auth: AuthSettings, headers) -> Credential | None:
     return _credential_for_token(auth, authorization.removeprefix("Bearer ").strip())
 
 
+# Restricted credentials authorize literal method/path pairs, never prefixes.
+CREDENTIAL_ROUTE_ALLOWLISTS = {
+    "profile": frozenset({("GET", "/profile")}),
+    "preflight": frozenset(
+        {
+            ("GET", "/release-identity"),
+            ("GET", "/readyz"),
+            ("GET", "/harness/hosts"),
+        }
+    ),
+}
+
+
+def credential_allows_request(credential, *, method=None, path=None):
+    """Deny unknown scopes; route-limited scopes cannot grant general access."""
+    if credential.scope in CREDENTIAL_ROUTE_ALLOWLISTS:
+        return (method, path) in CREDENTIAL_ROUTE_ALLOWLISTS[credential.scope]
+    return credential.scope in {"device", "host"}
+
+
 def token_matches(auth: AuthSettings, candidate: str) -> bool:
-    """Accept the legacy cluster token or an active non-preflight credential.
+    """Accept the legacy cluster token or an active device/host credential.
 
     The credential path hashes the candidate before looking it up, so lookup
     cost never varies with the secret and there is no per-credential loop.
@@ -134,7 +154,7 @@ def token_matches(auth: AuthSettings, candidate: str) -> bool:
     ):
         return True
     credential = _credential_for_token(auth, candidate)
-    return credential is not None and credential.scope != "preflight"
+    return credential is not None and credential_allows_request(credential)
 
 
 def request_authorized(
@@ -148,16 +168,7 @@ def request_authorized(
         candidate = authorization.removeprefix("Bearer ").strip()
         credential = _credential_for_token(auth, candidate)
         if credential is not None:
-            if credential.scope != "preflight":
-                return True
-            # Deliberately not "/harness": that is the full snapshot,
-            # including session previews and recaps, and the staging gate
-            # only ever needed the host listing.
-            return (method, path) in {
-                ("GET", "/release-identity"),
-                ("GET", "/readyz"),
-                ("GET", "/harness/hosts"),
-            }
+            return credential_allows_request(credential, method=method, path=path)
         if (
             auth.legacy_token_enabled
             and auth.api_token
