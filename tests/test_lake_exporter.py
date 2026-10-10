@@ -687,3 +687,188 @@ def test_export_updates_activity_daily_in_its_single_snapshot(
         assert con.execute(
             "SELECT session_id, sum(event_count) FROM lake.activity_daily GROUP BY session_id"
         ).fetchall() == [("export-session", 2)]
+
+
+@pytest.mark.parametrize("failure", ["task_exit", "deadline"])
+def test_supervised_crash_replays_and_drains_without_duplicates(
+    export_lake, postgres_control_store, monkeypatch, failure
+):
+    """Kill the owner after lake commit; its replacement must replay the receipt."""
+    import threading
+    from types import SimpleNamespace
+
+    from drover.server.lake import lifecycle, task_projection
+
+    path, _ = postgres_control_store
+    seed(path)
+    monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: export_lake)
+    monkeypatch.setattr(lifecycle, "_check_export_catalog", lambda *a: None)
+    monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
+    monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "RESTART_BACKOFF_SECONDS", 0.01)
+    original = LakeOutboxExporter._acknowledge
+    calls, replayed = [], []
+    drained = threading.Event()
+    released = []
+    original_exit = LakeOutboxExporter.__exit__
+
+    def exit_owner(self, *args):
+        original_exit(self, *args)
+        released.append(self.owner)
+
+    def acknowledge(self, document, receipt, now):
+        calls.append(self.owner)
+        if len(calls) == 1:
+            if failure == "task_exit":
+                raise SystemExit("test owner killed")
+            raise LakeError("lake_export_deadline")
+        assert released == [calls[0]]
+        original(self, document, receipt, now)
+        drained.set()
+
+    original_publish = LakeOutboxExporter._publish
+
+    def publish(self, document):
+        result = original_publish(self, document)
+        replayed.append(result["replayed"])
+        return result
+
+    monkeypatch.setattr(LakeOutboxExporter, "__exit__", exit_owner)
+    monkeypatch.setattr(LakeOutboxExporter, "_acknowledge", acknowledge)
+    monkeypatch.setattr(LakeOutboxExporter, "_publish", publish)
+    worker = lifecycle.ExporterLifecycle(
+        SimpleNamespace(
+            duckdb_path=path, analytics=SimpleNamespace(retire_legacy_writers=False)
+        )
+    )
+    try:
+        worker.start(shutdown_event=threading.Event())
+        assert drained.wait(15), worker.health()
+        assert worker.health()["running"]
+        assert worker.health()["restart_count"] == 1
+    finally:
+        worker.stop()
+    assert calls[0] != calls[1]
+    assert replayed == [False, True]
+    assert lake_counts(export_lake) == [2, 2, 2, 1]
+    from drover.server.lake.freshness import read_freshness
+
+    health = read_freshness(path)
+    assert health["unacknowledged_batches"] == 0
+    assert health["last_successful_export_at"] is not None
+    with control_plane_connection(path) as con:
+        assert con.execute(
+            "SELECT count(*) FROM control_outbox_events WHERE state='acknowledged'"
+        ).fetchone() == (2,)
+
+
+def test_live_hung_batch_cancelled_then_receipt_replayed(
+    export_lake, postgres_control_store, monkeypatch
+):
+    """A living owner stuck after commit must release before receipt replay."""
+    import threading
+    from types import SimpleNamespace
+
+    from drover.server.lake import lifecycle, task_projection
+
+    path, _ = postgres_control_store
+    seed(path)
+    monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: export_lake)
+    monkeypatch.setattr(lifecycle, "_check_export_catalog", lambda *a: None)
+    monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
+    monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "FRESHNESS_POLL_SECONDS", 0.01, raising=False)
+    monkeypatch.setattr(lifecycle, "RESTART_BACKOFF_SECONDS", 0.01)
+    original = LakeOutboxExporter._acknowledge
+    hung, drained = threading.Event(), threading.Event()
+    owners = []
+
+    def acknowledge(self, document, receipt, now):
+        if not owners:
+            owners.append(self.owner)
+            hung.set()
+            # Cooperative fake hangs in the real receipt/ack boundary. This
+            # would never drain if the watchdog only reported stalled state.
+            for _ in range(1000):
+                if getattr(self, "cancelled", False):
+                    self._check()
+                if drained.wait(0.01):
+                    return
+            raise AssertionError("watchdog never cancelled living owner")
+        assert self.owner != owners[0]
+        original(self, document, receipt, now)
+        drained.set()
+
+    monkeypatch.setattr(LakeOutboxExporter, "_acknowledge", acknowledge)
+    worker = lifecycle.ExporterLifecycle(
+        SimpleNamespace(
+            duckdb_path=path,
+            analytics=SimpleNamespace(
+                retire_legacy_writers=False, exporter_recovery_deadline_seconds=1
+            ),
+        )
+    )
+    try:
+        worker.start(shutdown_event=threading.Event())
+        assert hung.wait(5)
+        assert drained.wait(5), worker.health()
+        assert worker.health()["restart_count"] == 1
+        assert worker.health()["last_error"] == "lake_export_recovery_deadline"
+    finally:
+        drained.set()
+        worker.stop()
+    assert lake_counts(export_lake) == [2, 2, 2, 1]
+    with control_plane_connection(path) as con:
+        assert con.execute(
+            "SELECT count(*) FROM control_outbox_events WHERE state='acknowledged'"
+        ).fetchone() == (2,)
+
+
+def test_exporter_cancel_interrupts_borrowed_postgres_query(
+    export_lake, postgres_control_store
+):
+    """Cancellation must interrupt DB waits and leave the pool usable."""
+    import threading
+    import time
+
+    path, _ = postgres_control_store
+    started, finished = threading.Event(), threading.Event()
+    backend, errors = [], []
+    with LakeOutboxExporter(control_path=path, spec=export_lake) as exporter:
+
+        def query():
+            try:
+                with exporter._control() as control:
+                    backend.append(control._connection.info.backend_pid)
+                    started.set()
+                    control.execute("SELECT pg_sleep(10) /* exporter_cancel_test */")
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        task = threading.Thread(target=query)
+        task.start()
+        try:
+            assert started.wait(3)
+            deadline = time.monotonic() + 3
+            waiting = False
+            while time.monotonic() < deadline:
+                with control_plane_connection(path) as con:
+                    (waiting,) = con.execute(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid=? AND state='active' AND query LIKE '%exporter_cancel_test%')",
+                        [backend[0]],
+                    ).fetchone()
+                if waiting:
+                    break
+                time.sleep(0.01)
+            assert waiting, "query never became active"
+            exporter.cancel()
+            assert finished.wait(2), "cancellation did not interrupt DB query"
+            assert len(errors) == 1
+            assert isinstance(errors[0], psycopg.errors.QueryCanceled)
+        finally:
+            exporter.cancel()
+            task.join(12)
+    with control_plane_connection(path) as con:
+        assert con.execute("SELECT 1").fetchone() == (1,)

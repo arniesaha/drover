@@ -971,6 +971,7 @@ def test_worker_listener_authenticates_health_and_typed_archive_lookup() -> None
         config = replace(base, worker_url=f"http://{host}:{port}")
         client = AnalyticsBoundaryClient(config, token="api-worker-secret")
         assert client.health_state() == "ok"
+        assert client.health_report() == {"state": "ok", "outbox": {"pending": 0}}
         assert (
             client.resolve(
                 event_id="event-1", batch_id="batch-1", payload_sha256=digest

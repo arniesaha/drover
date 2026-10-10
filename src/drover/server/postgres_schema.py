@@ -12,6 +12,7 @@ from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
 log = logging.getLogger(__name__)
 
 PROFILE_MIGRATION = 15
+EXPORTER_FRESHNESS_MIGRATION = 16
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -598,6 +599,14 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
             "CREATE INDEX IF NOT EXISTS profile_items_bundle ON profile_items (status, layer, updated_at DESC)",
             "CREATE INDEX IF NOT EXISTS profile_proposals_pending ON profile_proposals (status, created_at)",
+        ),
+    ),
+    (
+        EXPORTER_FRESHNESS_MIGRATION,
+        (
+            "CREATE INDEX IF NOT EXISTS lake_export_batches_last_success ON lake_export_batches (acknowledged_at DESC) WHERE acknowledged_at IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS control_outbox_batches_unacknowledged ON control_outbox_batches (created_at) WHERE acknowledged_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS control_outbox_events_pending_age ON control_outbox_events (committed_at) WHERE state = 'pending'",
         ),
     ),
 )

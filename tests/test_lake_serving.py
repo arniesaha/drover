@@ -565,6 +565,12 @@ def test_recall_bundle_unscoped_history_parity_and_repository_gate(
     metadata = actual.pop("metadata")
     assert metadata["binding"]["epoch"] == config.epoch
     assert metadata["native_publication"]["freshness"] == "unavailable"
+    # Empty recall cannot use legacy partition metadata once the lake is
+    # selected. Compare content separately from the backend's watermark.
+    assert actual.pop("data_watermark") == {"timestamp": None, "basis": "unknown"}
+    legacy_watermark = expected.pop("data_watermark")
+    assert legacy_watermark["basis"] == "latest_ingested_at"
+    assert legacy_watermark["timestamp"] is not None
     assert actual == expected
     # Earlier day includes all three winners regardless of host timezone.
     actual = service.recall_bundle("remember", since="2026-09-30")
