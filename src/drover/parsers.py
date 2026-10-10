@@ -578,11 +578,75 @@ def _openclaw_raw_data(data: dict, session_state: dict[str, Any]) -> dict:
     return enrich_raw_repo_attribution(raw)
 
 
-def parse_openclaw_sessions(filepath: str) -> List[AgentEvent]:
-    """Parse OpenClaw JSONL session files."""
-    events = []
+_OPENCLAW_TOOL_CALL_BLOCKS = frozenset({"toolcall", "tool_call", "tool_use"})
 
-    def new_session_state(
+
+def _openclaw_tool_calls(content: Any) -> Optional[List[ToolCall]]:
+    """Extract tool calls from OpenClaw assistant content blocks, if any."""
+    if not isinstance(content, list):
+        return None
+    calls: List[ToolCall] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type", "")).lower() not in _OPENCLAW_TOOL_CALL_BLOCKS:
+            continue
+        name = block.get("name") or block.get("toolName")
+        if not isinstance(name, str) or not name:
+            continue
+        arguments = block.get("arguments", block.get("input"))
+        calls.append(
+            ToolCall(
+                tool_name=name,
+                input=arguments if isinstance(arguments, dict) else {},
+            )
+        )
+    return calls or None
+
+
+def _openclaw_timestamp(value: Any, fallback: Optional[datetime]) -> datetime:
+    """Read a record timestamp; ``fallback`` makes malformed values non-fatal."""
+    if fallback is None:
+        # JSONL files have no out-of-band timestamp, so keep the strict parse.
+        if value:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return datetime.now(UTC)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return fallback
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _taskflow_datetime(value) or fallback
+    return fallback
+
+
+class OpenClawRecordMapper:
+    """Map OpenClaw transcript records to ``AgentEvent`` rows.
+
+    Shared by the JSONL session files and the SQLite transcript store so both
+    produce the same event shapes. ``pinned_session_id`` is for stores which
+    already know the canonical session UUID out of band; records then cannot
+    re-point events at another session.
+    """
+
+    def __init__(
+        self,
+        *,
+        pinned_session_id: Optional[str] = None,
+        session_defaults: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self._pinned = pinned_session_id
+        self._session_defaults = dict(session_defaults or {})
+        self._states_by_uuid: dict[str, dict[str, Any]] = {}
+        if pinned_session_id is None:
+            self._state = self._new_state()
+        else:
+            self._state = self._new_state(pinned_session_id, uuid_missing=False)
+            self._state.update(self._session_defaults)
+
+    @staticmethod
+    def _new_state(
         session_id: str = "unknown_openclaw", uuid_missing: bool = True
     ) -> dict[str, Any]:
         return {
@@ -591,8 +655,95 @@ def parse_openclaw_sessions(filepath: str) -> List[AgentEvent]:
             "session_uuid_missing": uuid_missing,
         }
 
-    session_state: dict[str, Any] = new_session_state()
-    session_states_by_uuid: dict[str, dict[str, Any]] = {}
+    def feed(
+        self,
+        data: dict,
+        *,
+        fallback_timestamp: Optional[datetime] = None,
+        fallback_id: Optional[str] = None,
+    ) -> Optional[AgentEvent]:
+        """Consume one record; session headers update state and yield nothing."""
+        source_event_type = data.get("type")
+        if self._pinned is None:
+            session_id, session_key, uuid_missing = _openclaw_session_identity(
+                data,
+                self._state["session_id"],
+                self._state.get("session_key"),
+                self._state.get("session_uuid_missing", True),
+            )
+            if not uuid_missing and session_id != self._state.get("session_id"):
+                self._state = self._states_by_uuid.setdefault(
+                    session_id, self._new_state(session_id, uuid_missing=False)
+                )
+            state_updates = {
+                "session_id": session_id,
+                "session_uuid_missing": uuid_missing,
+            }
+            if session_key is not None:
+                state_updates["session_key"] = session_key
+            self._state.update(state_updates)
+            if not uuid_missing:
+                self._states_by_uuid[session_id] = self._state
+        else:
+            session_id = self._pinned
+        session_state = self._state
+
+        if source_event_type == "session":
+            session_aliases = {
+                "cwd": ("cwd", "workspaceDir"),
+                "workspace_dir": ("workspace_dir", "workspaceDir"),
+                "repository": ("repository", "repo", "remote"),
+                "project": ("project",),
+                "topic": ("topic", "task_label", "taskLabel"),
+                "harness_version": ("harness_version", "harnessVersion", "version"),
+                "runtime_id": ("runtime_id", "runtimeId"),
+                "runtime_api": ("runtime_api", "runtimeApi"),
+                "agent_id": ("agent_id", "agentId", "agent.id"),
+                "agent_type": ("agent_type", "agentType", "agent.type"),
+                "channel": ("channel",),
+                "source_surface": ("source_surface", "sourceSurface"),
+                "redaction": ("redaction",),
+                "sensitivity": ("sensitivity",),
+            }
+            for dst, aliases in session_aliases.items():
+                value = _first_openclaw_value(data, *aliases)
+                if value not in (None, ""):
+                    session_state[dst] = value
+            # Out-of-band store metadata is authoritative over the header.
+            session_state.update(self._session_defaults)
+            return None
+
+        if session_state.get("cwd") and "cwd" not in data:
+            data = {**data, "cwd": session_state["cwd"]}
+
+        timestamp = _openclaw_timestamp(data.get("timestamp"), fallback_timestamp)
+        uuid = data.get("id") or fallback_id or f"claw-{timestamp.timestamp()}"
+        normalized_type = _normalize_openclaw_event_type(source_event_type, data)
+
+        event = AgentEvent(
+            id=str(uuid),
+            session_id=session_id,
+            timestamp=timestamp,
+            agent_id="openclaw",
+            event_type=normalized_type,
+            raw_data=_openclaw_raw_data(data, session_state),
+        )
+
+        if normalized_type in {"message", "user_turn", "assistant_turn"}:
+            msg_data = data.get("message")
+            if isinstance(msg_data, dict):
+                role = msg_data.get("role", "unknown")
+                content = msg_data.get("content", "")
+                event.message = Message(role=role, content=content)
+                event.tool_calls = _openclaw_tool_calls(content)
+
+        return event
+
+
+def parse_openclaw_sessions(filepath: str) -> List[AgentEvent]:
+    """Parse OpenClaw JSONL session files."""
+    events = []
+    mapper = OpenClawRecordMapper()
     with open(filepath, "r") as f:
         for line in f:
             if not line.strip():
@@ -601,81 +752,9 @@ def parse_openclaw_sessions(filepath: str) -> List[AgentEvent]:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 continue
-
-            source_event_type = data.get("type")
-            session_id, session_key, uuid_missing = _openclaw_session_identity(
-                data,
-                session_state["session_id"],
-                session_state.get("session_key"),
-                session_state.get("session_uuid_missing", True),
-            )
-            if not uuid_missing and session_id != session_state.get("session_id"):
-                session_state = session_states_by_uuid.setdefault(
-                    session_id, new_session_state(session_id, uuid_missing=False)
-                )
-            state_updates = {
-                "session_id": session_id,
-                "session_uuid_missing": uuid_missing,
-            }
-            if session_key is not None:
-                state_updates["session_key"] = session_key
-            session_state.update(state_updates)
-            if not uuid_missing:
-                session_states_by_uuid[session_id] = session_state
-
-            if source_event_type == "session":
-                session_aliases = {
-                    "cwd": ("cwd", "workspaceDir"),
-                    "workspace_dir": ("workspace_dir", "workspaceDir"),
-                    "repository": ("repository", "repo", "remote"),
-                    "project": ("project",),
-                    "topic": ("topic", "task_label", "taskLabel"),
-                    "harness_version": ("harness_version", "harnessVersion", "version"),
-                    "runtime_id": ("runtime_id", "runtimeId"),
-                    "runtime_api": ("runtime_api", "runtimeApi"),
-                    "agent_id": ("agent_id", "agentId", "agent.id"),
-                    "agent_type": ("agent_type", "agentType", "agent.type"),
-                    "channel": ("channel",),
-                    "source_surface": ("source_surface", "sourceSurface"),
-                    "redaction": ("redaction",),
-                    "sensitivity": ("sensitivity",),
-                }
-                for dst, aliases in session_aliases.items():
-                    value = _first_openclaw_value(data, *aliases)
-                    if value not in (None, ""):
-                        session_state[dst] = value
-                continue
-
-            if session_state.get("cwd") and "cwd" not in data:
-                data = {**data, "cwd": session_state["cwd"]}
-
-            timestamp_str = data.get("timestamp")
-            if timestamp_str:
-                timestamp_str = timestamp_str.replace("Z", "+00:00")
-                timestamp = datetime.fromisoformat(timestamp_str)
-            else:
-                timestamp = datetime.now(UTC)
-
-            uuid = data.get("id", f"claw-{timestamp.timestamp()}")
-            normalized_type = _normalize_openclaw_event_type(source_event_type, data)
-
-            event = AgentEvent(
-                id=uuid,
-                session_id=session_id,
-                timestamp=timestamp,
-                agent_id="openclaw",
-                event_type=normalized_type,
-                raw_data=_openclaw_raw_data(data, session_state),
-            )
-
-            if normalized_type in {"message", "user_turn", "assistant_turn"}:
-                msg_data = data.get("message")
-                if isinstance(msg_data, dict):
-                    role = msg_data.get("role", "unknown")
-                    content = msg_data.get("content", "")
-                    event.message = Message(role=role, content=content)
-
-            events.append(event)
+            event = mapper.feed(data)
+            if event is not None:
+                events.append(event)
     return events
 
 

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `drover-collect` reads OpenClaw sessions from the per-agent SQLite transcript
+  store used by current OpenClaw releases (source id `openclaw_sqlite`). The
+  store is opened read-only, read in small batches, watermarked per session by
+  transcript sequence, and skipped with a diagnostic when busy or of an unknown
+  schema. `[sources.openclaw]` gains `store` (`auto`, `sqlite`, `jsonl`),
+  `state_dir`, `agents` and batch tuning; existing configs keep working and
+  pick the SQLite store up automatically. See
+  [OpenClaw session collection](docs/integrations/openclaw.md).
+- OpenClaw events carry `tool_calls` extracted from assistant content blocks,
+  for both the JSONL and SQLite sources.
+
 ## [0.6.4] - 2026-10-08
 
 ### Added
