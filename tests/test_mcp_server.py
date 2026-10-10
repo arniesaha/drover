@@ -11,6 +11,8 @@ import pytest
 from drover.schema import bootstrap
 from drover.server.mcp.server import build_mcp_server
 
+pytestmark = pytest.mark.usefixtures("authenticated_mcp_builder")
+
 
 def _call_registered_tool(server, name: str, arguments: dict) -> dict:
     content = asyncio.run(server.call_tool(name, arguments))

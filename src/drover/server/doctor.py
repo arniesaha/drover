@@ -2082,3 +2082,20 @@ def audit_lakehouse(
         "processed_files": processed,
         "warnings": warnings,
     }
+
+
+def format_exporter_health(health: dict) -> str:
+    """Same verdict as readiness, with actionable recovery and durable progress."""
+    return "\n".join(
+        [
+            f"DuckLake exporter: {health.get('state', 'stopped')}",
+            f"  running: {health.get('running', False)}",
+            f"  last successful export: {health.get('last_successful_export_at') or 'never'}",
+            f"  unacknowledged batches: {health.get('unacknowledged_batches', 'unknown')}",
+            f"  oldest unacknowledged age: {health.get('oldest_unacknowledged_age_seconds', 0):.1f}s",
+            f"  oldest outstanding age: {health.get('oldest_outstanding_age_seconds', 0):.1f}s",
+            f"  last error: {health.get('last_error') or health.get('freshness_error') or 'none'}",
+            f"  restarts: {health.get('restart_count', 0)}",
+            f"  recovery: {health.get('recovery_action', 'Check hub and exporter logs.')}",
+        ]
+    )

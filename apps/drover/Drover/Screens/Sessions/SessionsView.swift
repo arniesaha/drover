@@ -35,6 +35,7 @@ struct SessionsView: View {
     private let onOpenSettings: () -> Void
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
+    @State private var exporterHealth: ExporterHealth?
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
     @State private var showFinished = false
@@ -77,6 +78,16 @@ struct SessionsView: View {
                 ) {
                     providerCapacity
                 }
+            }
+
+            if let warning = exporterHealth?.warningText {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.vertical, 8)
+                    .accessibilityIdentifier("exporterFreshnessWarning")
             }
 
             ScrollView {
@@ -200,6 +211,15 @@ struct SessionsView: View {
         // `startPolling()` now leaves a live loop alone, so the two calls can
         // stay independent and neither has to know about the other.
         .task { store.startPolling() }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            while !Task.isCancelled {
+                do { exporterHealth = try await client.exporterHealth() }
+                catch { /* Keep the last known warning during transient failures. */ }
+                do { try await Task.sleep(for: .seconds(15)) }
+                catch { return }
+            }
+        }
         .task(id: store.snapshot?.cockpitAPIVersion) {
             guard let snapshot = store.snapshot else {
                 cockpitStore.updateCapability(from: nil)

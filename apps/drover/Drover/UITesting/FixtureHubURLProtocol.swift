@@ -161,6 +161,8 @@ final class FixtureHubURLProtocol: URLProtocol {
             case .coreJourney, .insightDetail:
                 return FixtureHubResponse(status: 200, body: FixtureScenarioData.snapshotData())
             }
+        case ("GET", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/fs/list":
+            return FolderBrowserFixture.response(url: url)
         case ("GET", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/model-catalog":
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.modelCatalogData())
         case ("POST", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/sessions":

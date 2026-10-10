@@ -198,13 +198,19 @@ public final class LaunchModel {
     /// was never asked about, or could not be asked about, still shows.
     public var curatedSuggestions: [String] {
         let typed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        return savedCwdSuggestions.filter { typed.isEmpty || $0.lowercased().hasPrefix(typed.lowercased()) }
+    }
+
+    /// Saved paths stay visible in the browser regardless of manual text.
+    public var savedCwdSuggestions: [String] {
+        var seen = Set<String>()
         return (snapshot?.cwdSuggestions ?? [])
             .filter { suggestion in
                 if let taggedHostID = suggestion.hostID { return taggedHostID == hostID }
                 return untaggedExistence[suggestion.path] != false
             }
             .map(\.path)
-            .filter { typed.isEmpty || $0.lowercased().hasPrefix(typed.lowercased()) }
+            .filter { seen.insert($0).inserted }
     }
 
     /// The one line under the field explaining why live completion is quiet.

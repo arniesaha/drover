@@ -375,7 +375,7 @@ def test_retirement_lifecycle_rechecks_and_stops_on_error(
     assert released.wait(3)
     exporter.stop()
     assert batches == [1]
-    assert exporter.health() == {
+    assert {key: exporter.health()[key] for key in ("enabled", "last_error")} == {
         "enabled": False,
         "last_error": (
             "lake_verification_required"

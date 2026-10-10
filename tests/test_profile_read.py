@@ -13,6 +13,8 @@ from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import DISABLED, AuthSettings
 from drover.server.web.credentials import PostgresCredentialStore
 
+pytestmark = pytest.mark.usefixtures("authenticated_mcp_builder")
+
 NOW = datetime(2026, 10, 7, tzinfo=timezone.utc)
 
 

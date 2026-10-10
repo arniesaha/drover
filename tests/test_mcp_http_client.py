@@ -27,9 +27,11 @@ class _Response:
 
 
 def test_call_tool_uses_streamable_http_session(monkeypatch) -> None:
+    monkeypatch.setenv("DROVER_MCP_TOKEN", "synthetic-mcp-token")
     calls: list[dict[str, Any]] = []
 
     def fake_post(url, *, headers, json, timeout, allow_redirects):
+        assert allow_redirects is False
         calls.append({"url": url, "headers": headers, "json": json})
         method = json["method"]
         if method == "initialize":
@@ -62,6 +64,9 @@ def test_call_tool_uses_streamable_http_session(monkeypatch) -> None:
         {"project_key": "arniesaha/mirador"},
     )
 
+    assert all(
+        c["headers"]["Authorization"] == "Bearer synthetic-mcp-token" for c in calls
+    )
     assert out["structuredContent"]["result"] == {"ok": True}
     assert calls[0]["url"] == "http://nexus.example/mcp"
     assert calls[-1]["headers"]["Mcp-Session-Id"] == "session-1"
@@ -117,3 +122,25 @@ def test_cli_mcp_call_prints_result(monkeypatch, tmp_path) -> None:
     assert payload["url"] == "http://127.0.0.1:17077/mcp"
     assert payload["name"] == "drover_recent_sessions"
     assert payload["arguments"] == {"project_key": "arniesaha/mirador", "limit": 5}
+
+
+def test_list_tools_explicit_token_overrides_environment(monkeypatch):
+    monkeypatch.setenv("DROVER_MCP_TOKEN", "wrong-token")
+    calls = []
+
+    def fake_post(url, *, headers, json, timeout, allow_redirects):
+        assert allow_redirects is False
+        assert headers["Authorization"] == "Bearer synthetic-reader"
+        calls.append(json["method"])
+        if json["method"] == "initialize":
+            return _Response(
+                {"result": {"protocolVersion": "2025-03-26"}},
+                headers={"content-type": "text/event-stream", "mcp-session-id": "test"},
+            )
+        return _Response({"result": {"tools": [{"name": "drover_profile"}]}})
+
+    monkeypatch.setattr(client.requests, "post", fake_post)
+    assert client.list_tools("http://localhost/mcp", token="synthetic-reader") == [
+        {"name": "drover_profile"}
+    ]
+    assert calls == ["initialize", "notifications/initialized", "tools/list"]

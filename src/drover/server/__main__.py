@@ -555,7 +555,12 @@ def _local_api_host(cfg: DroverConfig) -> str:
 
 
 def _local_api_request(
-    cfg: DroverConfig, method: str, path: str, payload: Optional[dict] = None
+    cfg: DroverConfig,
+    method: str,
+    path: str,
+    payload: Optional[dict] = None,
+    *,
+    allow_unready: bool = False,
 ) -> dict:
     """Call the locally running hub.
 
@@ -575,6 +580,8 @@ def _local_api_request(
             raw = response.read().decode("utf-8")
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as exc:
+        if allow_unready and exc.code == 503:
+            return json.loads(exc.read().decode("utf-8"))
         raise click.ClickException(
             f"drover-server refused {method} {path}: HTTP {exc.code}"
         ) from exc
@@ -745,6 +752,7 @@ def _build_runtime_mcp_server(
         backend_config=backend_config,
         spans_enabled=cfg.spans_enabled,
         embedding_model=_configured_embedding_model(cfg),
+        auth=load_auth(cfg),
     )
 
 
@@ -2453,7 +2461,7 @@ def _run_api_role(
         favorite_cwds=cfg.harness_favorite_cwds,
         content_consent_reader=lambda: consent.state().heartbeat(),
         include_analytical_readiness=False,
-        analytics_worker_state=boundary.health_state,
+        exporter_health=boundary.health_report,
         archive_resolver=boundary,
         archive_resolver_factory=boundary.page_resolver,
     )
@@ -2522,6 +2530,11 @@ def _analytics_worker_health(
     if exporter is None:
         return {"state": "degraded", "outbox": {"enabled": False}}
     health = exporter.health()
+    if "running" in health:
+        return {
+            "state": "ok" if health["state"] == "ok" else "degraded",
+            "exporter": health,
+        }
     oldest = health.get("oldest_outstanding_at")
     outbox = {
         key: health.get(key)
@@ -2999,6 +3012,11 @@ def run(
                         gpu_relay_url=cfg.summarizer_gpu_relay_url or None,
                         gpu_ollama_url=cfg.summarizer_gpu_ollama_url or None,
                     ),
+                    exporter_health=(
+                        outbox_exporter.health
+                        if cfg.analytics.backend == "ducklake" and outbox_exporter
+                        else None
+                    ),
                     embeddings_state=embeddings_state,
                     api_token=auth.api_token if auth.enabled else "",
                     lifecycle_config=cfg.lifecycle,
@@ -3143,6 +3161,11 @@ def run(
                 duckdb_path=cfg.duckdb_path,
                 incoming_dir=cfg.incoming_dir,
                 summarizer_report={},
+                exporter_health=(
+                    outbox_exporter.health
+                    if cfg.analytics.backend == "ducklake" and outbox_exporter
+                    else None
+                ),
                 embeddings_state=embeddings_state,
                 api_token=auth.api_token if auth.enabled else "",
                 lifecycle_config=cfg.lifecycle,
@@ -3471,8 +3494,28 @@ def _dir_size(path: Path) -> int:
 @main.command()
 @click.pass_context
 def doctor(ctx: click.Context) -> None:
-    """Audit the lakehouse and print a row-count + drift report."""
+    """Report DuckLake exporter recovery or audit legacy lakehouse counts."""
     cfg = _resolve_config(ctx.obj["config_path"])
+    if cfg.analytics.backend == "ducklake":
+        from drover.server.doctor import format_exporter_health
+        from drover.server.lake.freshness import freshness_status, read_freshness
+
+        try:
+            health = _local_api_request(cfg, "GET", "/readyz", allow_unready=True).get(
+                "exporter"
+            )
+            if not health or "running" not in health:
+                raise ValueError("exporter status unavailable")
+        except Exception:
+            try:
+                snapshot = read_freshness(cfg.duckdb_path)
+            except Exception:
+                snapshot = {"freshness_error": "lake_freshness_unavailable"}
+            health = freshness_status(
+                snapshot, running=False, last_error="hub_status_unavailable"
+            )
+        click.echo(format_exporter_health(health))
+        return
     _bootstrap_if_missing(cfg)
     with _diagnostic_db_path(cfg.duckdb_path) as db_path:
         report = audit_lakehouse(

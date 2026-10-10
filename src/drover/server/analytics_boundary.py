@@ -497,12 +497,15 @@ class AnalyticsBoundaryClient:
             self._slots.release()
 
     def health_state(self) -> str:
+        return self.health_report()["state"]
+
+    def health_report(self) -> dict:
         """Return the worker's separate readiness state without public routing."""
         if not self._token:
-            return "unavailable"
+            return {"state": "unavailable"}
         deadline = time.monotonic() + self._config.request_timeout_seconds
         if not self._slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
-            return "unavailable"
+            return {"state": "unavailable"}
         try:
             response = self._request_transport(
                 "GET",
@@ -515,12 +518,12 @@ class AnalyticsBoundaryClient:
                 response.status != 200
                 or len(response.body) > self._config.max_response_bytes
             ):
-                return "unavailable"
+                return {"state": "unavailable"}
             payload = json.loads(response.body.decode("utf-8"))
             state = payload.get("state") if isinstance(payload, dict) else None
-            return state if state in {"ok", "degraded"} else "unavailable"
+            return payload if state in {"ok", "degraded"} else {"state": "unavailable"}
         except Exception:  # noqa: BLE001 - readiness must not leak transport detail
-            return "unavailable"
+            return {"state": "unavailable"}
         finally:
             self._slots.release()
 

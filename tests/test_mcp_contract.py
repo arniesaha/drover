@@ -12,6 +12,8 @@ from drover.server.mcp.contract import READ_CAPS, ReadAdmission, serialized_byte
 from drover.server.mcp.server import build_mcp_server
 from drover.server.recall_bundle import RecallBundleService
 
+pytestmark = pytest.mark.usefixtures("authenticated_mcp_builder")
+
 
 def call(server, name, arguments):
     content = asyncio.run(server.call_tool(name, arguments))
@@ -22,6 +24,11 @@ def call(server, name, arguments):
 
 
 def test_every_registered_read_enforces_caps(tmp_path, monkeypatch):
+    from drover.server.profile import ProfileActor
+
+    monkeypatch.setattr(
+        "drover.server.mcp.server.http_actor", lambda *args: ProfileActor("test")
+    )
     seen = {}
 
     def implementation(name):

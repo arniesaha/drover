@@ -19,7 +19,18 @@ invent missing content or issue extra reads to reveal withheld items.
 
 This is a client instruction, not a guarantee that every Codex runtime implements
 a startup hook. The connected tool's displayed name may include its server
-prefix. MCP only reads general data. A trusted client bootstrap must instead
-use its own credential for the HTTP request in the [shared contract](README.md)
-and pass that bundle into the session. Supplying a tier or agent ID to MCP cannot
-grant trusted access.
+prefix. Configure the HTTP MCP entry in the client's Codex config:
+
+```toml
+[mcp_servers.drover]
+url = "http://localhost:7077/mcp"
+bearer_token_env_var = "DROVER_MCP_TOKEN"
+```
+
+Set `DROVER_MCP_TOKEN` in the environment that launches Codex, using the secret
+store value issued by the operator. Replace the URL with a protected tunnel's
+loopback endpoint when the client runs elsewhere. An issued profile credential
+permits only `drover_profile` at its registered tier. General recall and mutation
+tools require a host/device credential. Supplying a tier or agent ID to MCP
+cannot grant trusted access. See the [shared contract](README.md) and
+[Codex MCP configuration](https://developers.openai.com/codex/mcp).
