@@ -1,0 +1,39 @@
+---
+// Placeholder wordmark: a lowercase "d" whose ascender bends into a drover's
+// crook. Swap for the final logo when there is one.
+interface Props {
+  size?: number;
+  withText?: boolean;
+}
+const { size = 28, withText = true } = Astro.props;
+---
+
+<span class="logo">
+  <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+    <rect width="32" height="32" rx="9" fill="var(--text)"></rect>
+    <path
+      d="M20.5 22.5V10.2c0-2.4-1.7-4-3.9-4-1.9 0-3.3 1.2-3.6 2.9"
+      fill="none"
+      stroke="var(--bg)"
+      stroke-width="2.6"
+      stroke-linecap="round"></path>
+    <circle cx="15.3" cy="18.6" r="4.6" fill="none" stroke="var(--ember)" stroke-width="2.6"></circle>
+  </svg>
+  {withText && <span class="logo-text">drover</span>}
+</span>
+
+<style>
+  .logo {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+  .logo-text {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 1.32rem;
+    letter-spacing: -0.04em;
+    font-variation-settings: 'wdth' 88;
+    color: var(--text);
+  }
+</style>
