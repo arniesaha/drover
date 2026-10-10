@@ -2084,6 +2084,18 @@ class MetricsCollector:
             payload={},
         )
 
+    def proxy_harness_fs_list(
+        self, host_id: str, path_text: str, query: str = ""
+    ) -> tuple[int, str]:
+        """Browse bounded directory metadata on the selected host."""
+        return self._proxy_harness_fs(
+            host_id,
+            "/fs/list?"
+            + urlencode({"host_id": host_id, "path": path_text, "filter": query}),
+            method="GET",
+            payload={},
+        )
+
     def proxy_harness_fs_complete(
         self, host_id: str, path_text: str
     ) -> tuple[int, str]:
@@ -2138,6 +2150,11 @@ class MetricsCollector:
             method=method,
             payload=payload,
             timeout_s=FS_COMPLETE_TIMEOUT_S,
+            **(
+                {"max_response_bytes": 1024 * 1024}
+                if path.startswith("/fs/list?")
+                else {}
+            ),
         )
         if status == 404:
             return _json_response(

@@ -339,10 +339,15 @@ public actor DroverClient {
         return try decode(HarnessModelCatalog.self, from: data)
     }
 
-    /// Asks a host which directories the half-typed `path` could become.
-    ///
-    /// A parent that does not exist is not an error — see `PathCompletion`.
-    /// A host that cannot be reached is, and surfaces as `DroverError`.
+    /// List directories inside the selected host's allowed roots.
+    public func listFolders(hostID: String, path: String = "", filter: String = "") async throws -> FolderListing {
+        let basePath = "/harness/hosts/\(encodePathComponent(hostID))/fs/list"
+        let url = try queryURL(path: basePath, items: [("path", path), ("filter", filter)])
+        let data = try await request(url: url, method: "GET", body: nil, timeout: Self.pathRequestTimeout)
+        return try decode(FolderListing.self, from: data)
+    }
+
+    /// Complete a half-typed directory path; missing parents return an empty list.
     public func completePath(hostID: String, path: String) async throws -> PathCompletion {
         let basePath = "/harness/hosts/\(encodePathComponent(hostID))/fs/complete"
         let url = try queryURL(path: basePath, items: [("path", path)])

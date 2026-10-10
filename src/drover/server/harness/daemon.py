@@ -1536,6 +1536,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/providers/usage":
             self._provider_usage()
             return
+        if parsed.path == "/fs/list":
+            self._fs_list(parsed.query)
+            return
         if parsed.path == "/fs/complete":
             self._fs_complete(parsed.query)
             return
@@ -1636,6 +1639,26 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._interrupt_session(session_id)
             return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _fs_list(self, query: str) -> None:
+        from drover.server.harness.folders import FolderError, list_folders
+
+        if not self.server.state.api_token or not self._authorized():
+            self._write_json({"error": "authentication required"}, status=401)
+            return
+        params = parse_qs(query)
+        if (params.get("host_id") or [""])[-1] != self.server.state.host_id:
+            self._write_json({"error": "host mismatch"}, status=403)
+            return
+        try:
+            result = list_folders(
+                (params.get("path") or [""])[-1],
+                (params.get("filter") or [""])[-1],
+            )
+        except FolderError as exc:
+            self._write_json({"error": exc.code}, status=exc.status)
+            return
+        self._write_json(result)
 
     def _fs_complete(self, query: str) -> None:
         """Complete a working directory against this host's real filesystem.

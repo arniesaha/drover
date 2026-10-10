@@ -11,6 +11,8 @@ struct LaunchView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var isLaunching = false
     @State private var showAuth = false
+    @State private var showFolderBrowser = false
+    @State private var showManualPath = false
     @State private var pickerItems: [PhotosPickerItem] = []
     private let client: DroverClient
     private static let maxCombinedBytes = 6 * 1024 * 1024
@@ -93,25 +95,50 @@ struct LaunchView: View {
 
             Section("Working directory") {
                 HStack {
-                    TextField("cwd (optional)", text: $model.cwd)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                    Button { showFolderBrowser = true } label: {
+                        HStack {
+                            Label(model.cwd.isEmpty ? "Choose folder (optional)" : model.cwd,
+                                  systemImage: "folder")
+                                .lineLimit(2)
+                            Spacer()
+                        }
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.hostID.isEmpty)
+                    .accessibilityLabel("Browse working directory")
+                    .accessibilityValue(model.cwd.isEmpty ? "Not selected" : model.cwd)
+                    .accessibilityIdentifier("launch-folder-browser")
 
-                    if !model.cwdSuggestions.isEmpty {
+                    if !directoryMenuSuggestions.isEmpty {
                         Menu {
-                            ForEach(model.cwdSuggestions, id: \.self) { suggestion in
+                            ForEach(directoryMenuSuggestions, id: \.self) { suggestion in
                                 Button(suggestion) { model.cwd = suggestion }
                             }
                         } label: {
                             Image(systemName: "clock.arrow.circlepath")
+                                .frame(minWidth: 44, minHeight: 44)
                         }
+                        .accessibilityLabel("Recent working directories")
                     }
                 }
 
-                CwdSuggestionsStatus(isFetching: model.isFetchingSnapshot,
-                                     hasSuggestions: !model.cwdSuggestions.isEmpty)
+                Button(showManualPath ? "Hide manual path" : "Enter path manually") {
+                    showManualPath.toggle()
+                }
+                if showManualPath {
+                    TextField("cwd (optional)", text: $model.cwd)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityLabel("Manual working directory path")
+                        .accessibilityIdentifier("launch-manual-cwd")
+                }
 
-                if let hint = model.cwdSuggestionsHint {
+                CwdSuggestionsStatus(isFetching: model.isFetchingSnapshot,
+                                     hasSuggestions: !directoryMenuSuggestions.isEmpty)
+
+                if showManualPath, let hint = model.cwdSuggestionsHint {
                     Label(hint, systemImage: "wifi.exclamationmark")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -193,6 +220,15 @@ struct LaunchView: View {
                 Button("Cancel") { dismiss() }
             }
         }
+        .sheet(isPresented: $showFolderBrowser) {
+            FolderBrowserSheet(
+                client: client, hostID: model.hostID,
+                hostLabel: model.selectedHost?.title ?? "Selected host",
+                savedPaths: model.savedCwdSuggestions,
+                onSelect: { model.cwd = $0 }
+            )
+        }
+        .onChange(of: model.hostID) { _, _ in showFolderBrowser = false }
         .sheet(isPresented: $showAuth, onDismiss: {
             Task { await model.runPreferences.refresh(force: true) }
         }) {
@@ -230,6 +266,10 @@ struct LaunchView: View {
         .onChange(of: model.canAttachImages) { _, canAttach in
             if !canAttach { model.promptAttachments = [] }
         }
+    }
+
+    private var directoryMenuSuggestions: [String] {
+        showManualPath ? model.cwdSuggestions : model.savedCwdSuggestions
     }
 
     private func statusSuffix(for host: HostSummary) -> String {

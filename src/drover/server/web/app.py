@@ -1211,6 +1211,34 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             self._send(status, "application/json", body)
             return
+        if path.startswith("/harness/hosts/") and path.endswith("/fs/list"):
+            if not self.auth.enabled:
+                self._send(
+                    401, "application/json", '{"error": "authentication required"}\n'
+                )
+                return
+            host_id = unquote(
+                path.removeprefix("/harness/hosts/").removesuffix("/fs/list").strip("/")
+            )
+            if not host_id or "/" in host_id:
+                self._send(400, "application/json", '{"error": "invalid host_id"}\n')
+                return
+            credential = bearer_credential(self.auth, self.headers)
+            if (
+                credential is not None
+                and credential.scope == "host"
+                and credential.host_id != host_id
+            ):
+                self._send(403, "application/json", '{"error": "host mismatch"}\n')
+                return
+            params = parse_qs(parsed.query)
+            status, body = self.collector.proxy_harness_fs_list(
+                host_id,
+                (params.get("path") or [""])[-1],
+                (params.get("filter") or [""])[-1],
+            )
+            self._send(status, "application/json", body)
+            return
         if path.startswith("/harness/hosts/") and path.endswith("/fs/complete"):
             host_id = unquote(
                 path.removeprefix("/harness/hosts/")
