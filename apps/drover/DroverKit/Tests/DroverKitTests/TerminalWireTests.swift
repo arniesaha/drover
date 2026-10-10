@@ -10,7 +10,7 @@ import Testing
 /// - Incoming `output`: `{"type":"output","data":"..."}`
 /// - Incoming process-exit: `{"type":"exit"}` — note the daemon's actual
 ///   wire value is `"exit"`, not `"exited"` (`_terminal_loop` in
-///   `src/nexus/server/harness/daemon.py`).
+///   `src/sample-project/server/harness/daemon.py`).
 /// - `"detached"` is never actually sent by the daemon (a detach is only
 ///   ever observed as the socket closing), but the codec still decodes it
 ///   defensively if a frame with that type ever arrives.

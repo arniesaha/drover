@@ -173,7 +173,7 @@ public struct SessionCardPresentation: Sendable, Equatable {
         return nonEmpty(URL(fileURLWithPath: cwd).lastPathComponent)
     }
 
-    /// `/Users/arnab/src/drover` → `~/src/drover`. The hub reports the remote
+    /// `/Users/sample-user/src/drover` → `~/src/drover`. The hub reports the remote
     /// host's absolute path and we don't know that machine's home directory,
     /// so this matches the two conventional roots rather than comparing
     /// against *this* device's home — which would never match.

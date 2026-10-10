@@ -58,7 +58,7 @@ private func catalog(
     #expect(model.availableHosts.map(\.id) == ["mac-mini"])
     // Suggestions are filtered to the selected host (host-agnostic
     // favorites always pass); the fixture's "nas" entry must not leak in.
-    #expect(model.cwdSuggestions == ["/Users/arnabmac/jenny/nexus", "/Volumes/M2 1/drover"])
+    #expect(model.cwdSuggestions == ["/Users/sample-user/sample-project/sample-project", "/Volumes/M2 1/drover"])
     #expect(model.isStructured == true)
 }
 
@@ -266,7 +266,7 @@ private func catalog(
     #expect(model.hostID == "mac-mini")
     #expect(model.harness == "claude-code")
     #expect(model.availableHosts.map(\.id) == ["mac-mini"])
-    #expect(model.cwdSuggestions == ["/Users/arnabmac/jenny/nexus", "/Volumes/M2 1/drover"])
+    #expect(model.cwdSuggestions == ["/Users/sample-user/sample-project/sample-project", "/Volumes/M2 1/drover"])
     #expect(model.runPreferences.hostID == "mac-mini")
     #expect(model.runPreferences.harness == "claude-code")
     #expect(model.snapshotError == nil)

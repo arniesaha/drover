@@ -66,6 +66,7 @@ struct ChatView: View {
     /// worth acknowledging. A local open beats it and the screen stays quiet.
     @State private var coldOpenIsSlow = false
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     init(
         client: DroverClient,
@@ -173,7 +174,7 @@ struct ChatView: View {
             if let pendingTurn = model.pendingTurn,
                       pendingTurn.canRetry,
                       model.recoveryStatusMessage == nil {
-                ChatHintBanner(model.hint ?? pendingTurn.retryMessage, actionTitle: "Retry") {
+                ChatHintBanner(pendingTurn.retryMessage, actionTitle: "Retry") {
                     Task { await model.retryPendingTurn() }
                 }
             } else if let pendingTurn = model.pendingTurn,
@@ -290,24 +291,38 @@ struct ChatView: View {
             if model.isCommittingPendingDeliveryAction {
                 ChatHintBanner("Saving the local delivery update…")
             }
-            HStack(spacing: 12) {
-                Button("Check delivery") {
+            let layout = dynamicTypeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 8))
+                : AnyLayout(HStackLayout(spacing: 12))
+            layout {
+                Button {
                     model.checkPendingDelivery()
+                } label: {
+                    Label("Check delivery", systemImage: "arrow.triangle.2.circlepath")
+                        .frame(minHeight: 44)
                 }
                 .accessibilityIdentifier("chat-check-delivery")
 
-                Button("Copy to draft") {
+                Button {
                     Task { await model.copyPendingTurnToDraft() }
+                } label: {
+                    Label("Copy to draft", systemImage: "doc.on.doc")
+                        .frame(minHeight: 44)
                 }
                 .accessibilityIdentifier("chat-copy-pending-to-draft")
 
-                Button("Discard locally", role: .destructive) {
+                Button(role: .destructive) {
                     showDiscardPendingConfirm = true
+                } label: {
+                    Label("Discard locally", systemImage: "trash")
+                        .frame(minHeight: 44)
                 }
                 .accessibilityIdentifier("chat-discard-pending")
             }
             .disabled(model.isCommittingPendingDeliveryAction)
             .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 16)
         }
     }

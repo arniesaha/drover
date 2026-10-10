@@ -66,7 +66,7 @@ enum ObservabilityFixtureData {
     private static var accountValues: [[String: Any]] {
         let shared: [[String: Any]] = [("studio", "ok", 32), ("mini", "stale", 32), ("laptop", "error", 32)].map { host, status, used in
             ["snapshot_id": host, "dedup_key": host, "provider": "anthropic",
-             "account_label": "alex@example.com", "plan_label": "Max",
+             "account_label": "sample.user@example.com", "plan_label": "Max",
              // Non-ok readings older than 72h become stale hosts (and leave
              // Home), so a fixed date would change these journeys over time.
              "host_id": host, "status": status,
@@ -89,7 +89,7 @@ enum ObservabilityFixtureData {
         }
         let googleHistory: [[String: Any]] = [("mini", 2), ("nas", 5)].map { host, days in
             ["snapshot_id": "google-\(host)", "dedup_key": "google-\(host)",
-             "provider": "google", "account_label": "arniesaha@gmail.com",
+             "provider": "google", "account_label": "sample.google@example.com",
              "plan_label": NSNull(), "host_id": host, "status": "stale",
              "observed_at": ISO8601DateFormatter().string(from: Date().addingTimeInterval(-Double(days) * 86400)),
              "source": "agy-usage", "error_category": "host_offline",

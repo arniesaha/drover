@@ -101,7 +101,7 @@ struct DroverApp: App {
 #if DEBUG
             if let testScenario {
                 switch testScenario.kind {
-                case .coreJourney, .capabilityJourney:
+                case .coreJourney, .capabilityJourney, .longStreaming:
                     FixturePreparedRoot(scenario: testScenario, notifier: notifier)
                 case .insightDetail:
                     InsightDetailFixtureRoot(client: testScenario.transport.client)

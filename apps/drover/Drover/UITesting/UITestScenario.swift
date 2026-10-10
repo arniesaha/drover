@@ -3,6 +3,7 @@ import DroverKit
 
 #if DEBUG
 enum FixtureScenarioKind: String {
+    case longStreaming = "long-streaming"
     case coreJourney = "core-journey"
     /// The core journey's app root against a fleet with materially different
     /// capability envelopes, including a legacy matrix-less host (#420).
@@ -100,7 +101,7 @@ struct UITestScenario {
                 recoveryGeneration: environment.chatRecoveryGeneration,
                 streamFactory: { client, sessionID in
                     MessageStream(client: client, sessionID: sessionID,
-                                  connector: FixtureWebSocketConnector())
+                                  connector: FixtureWebSocketConnector(streamsLongTranscript: transport.kind == .longStreaming))
                 }
             )
         })

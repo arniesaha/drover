@@ -128,6 +128,18 @@ enum FixtureScenarioData {
     static let labSessionID = "fixture-lab-session"
     static let codexApprovalSessionID = "fixture-codex-approval"
 
+    static func longStreamingSnapshotData() -> Data {
+        var snapshot = try! JSONSerialization.jsonObject(with: snapshotData()) as! [String: Any]
+        var hosts = snapshot["hosts"] as! [[String: Any]]
+        hosts[0]["capabilities"] = ["display_name": coreJourney.hostName, "harnesses": [labRow]]
+        snapshot["hosts"] = hosts
+        var sessions = snapshot["sessions"] as! [[String: Any]]
+        sessions[0]["harness"] = capabilityLabHarness
+        sessions[0]["preview"] = "Long streaming sample transcript"
+        snapshot["sessions"] = [sessions[0]]
+        return jsonData(snapshot)
+    }
+
     static func snapshotData() -> Data {
         jsonData([
             "hosts": [[

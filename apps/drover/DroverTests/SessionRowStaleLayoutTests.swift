@@ -23,7 +23,7 @@ struct SessionRowStaleLayoutTests {
     /// snapshot landed.
     private static let openclaw = SessionSummary(
         id: "openclaw", hostID: "nas", harness: "claude-code", mode: "structured",
-        status: "running", awaiting: "input", cwd: "/home/arnab/src/openclaw",
+        status: "running", awaiting: "input", cwd: "/home/sample-user/src/openclaw",
         lastActivity: snapshotTaken.addingTimeInterval(-27 * 60),
         preview: "Yeah go ahead"
     )
@@ -59,7 +59,7 @@ struct SessionRowStaleLayoutTests {
         let placeholder = SessionSummary(
             id: "s", hostID: "nas", harness: "claude-code", mode: "structured",
             status: "running", awaiting: "approval",
-            cwd: "/home/arnab/src/openclaw",
+            cwd: "/home/sample-user/src/openclaw",
             lastActivity: Self.snapshotTaken.addingTimeInterval(-27 * 60),
             preview: nil
         )

@@ -13,6 +13,8 @@ import SwiftUI
 /// the eye, a tinted ground to separate it from the transcript above and the
 /// composer below, and a ramp that clears the AA floor in both themes.
 struct ChatHintBanner: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     private let hint: String
     private let actionTitle: String?
     private let onAction: (() -> Void)?
@@ -24,7 +26,10 @@ struct ChatHintBanner: View {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        let layout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 8))
+            : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 8))
+        layout {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.caption)
                 .foregroundStyle(DroverColor.warn)
@@ -39,6 +44,8 @@ struct ChatHintBanner: View {
             if let actionTitle, let onAction {
                 Button(actionTitle, action: onAction)
                     .font(.caption.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minHeight: 44)
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("chat-hint-action")
             }

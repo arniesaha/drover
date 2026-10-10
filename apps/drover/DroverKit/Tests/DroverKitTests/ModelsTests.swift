@@ -214,7 +214,7 @@ func harnessPresentationMapsKnownHarnesses(harness: String, name: String, symbol
 @Test func cwdSuggestionsDecodeTheServerObjectShape() throws {
     let snap = try HarnessSnapshot.decode(from: snapshotJSON)
     #expect(snap.cwdSuggestions.count == 3)
-    #expect(snap.cwdSuggestions[0].path == "/Users/arnabmac/jenny/nexus")
+    #expect(snap.cwdSuggestions[0].path == "/Users/sample-user/sample-project/sample-project")
     #expect(snap.cwdSuggestions[0].source == "recent session")
     #expect(snap.cwdSuggestions[0].hostID == "mac-mini")
     #expect(snap.cwdSuggestions[1].hostID == nil)   // untagged: offered everywhere

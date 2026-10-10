@@ -229,3 +229,16 @@ apps/drover/
 
 `DroverKit` keeps the network and state model independent of SwiftUI. The app
 target owns navigation, screens, notification handling, and terminal UI.
+
+## Long streaming transcript fixture
+
+For a DEBUG simulator demo, set `DROVER_UI_TEST_SCENARIO=long-streaming`
+and `DROVER_UI_TEST_RUN_ID` to a fresh UUID in the scheme launch environment.
+Open **Long streaming sample transcript** in the inbox. The fixture supplies
+281 history events with forty step groups and an approval, then delivers
+80 assistant chunks at 250 ms intervals (20 seconds) through the real message
+stream. The final chunk carries the complete answer as a single tall bubble. Older history uses the same paginated fixture transport. Reopening
+chat starts the deterministic stream again. The **Long streaming transcript**
+SwiftUI preview uses the same fixture. `LongStreamingTranscriptFixtureTests`
+checks paging and live events; the accessibility UI suite captures the approval
+and recovery actions at the largest text size.

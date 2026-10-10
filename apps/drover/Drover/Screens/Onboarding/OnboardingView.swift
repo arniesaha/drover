@@ -263,23 +263,6 @@ struct OnboardingView: View {
                     .textInputAutocapitalization(.characters)
                     .accessibilityIdentifier("onboarding-pairing-code-field")
 
-                Button {
-                    guard let payload = pairingModel.manualPayload() else { return }
-                    Task { await pair(payload) }
-                } label: {
-                    Text(pairingModel.isPairing ? "Pairing..." : "Pair")
-                        .droverText(.h3)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                }
-                .disabled(!pairingModel.canSubmitManualCode || pairingModel.isPairing)
-                .foregroundStyle(DroverColor.accentHi)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(DroverColor.accentHi, lineWidth: 1)
-                }
-                .accessibilityIdentifier("onboarding-pair-submit-button")
-
                 if let statusMessage = pairingModel.statusMessage {
                     statusRow(statusMessage)
                 }
@@ -287,6 +270,27 @@ struct OnboardingView: View {
             .padding(.horizontal, 18)
             .padding(.top, 10)
             .padding(.bottom, 28)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Button {
+                guard let payload = pairingModel.manualPayload() else { return }
+                Task { await pair(payload) }
+            } label: {
+                Text(pairingModel.isPairing ? "Pairing..." : "Pair")
+                    .droverText(.h3)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+            }
+            .disabled(!pairingModel.canSubmitManualCode || pairingModel.isPairing)
+            .foregroundStyle(DroverColor.accentHi)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+            }
+            .accessibilityIdentifier("onboarding-pair-submit-button")
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(DroverColor.bg)
         }
         .scrollDismissesKeyboard(.interactively)
         .onAppear {

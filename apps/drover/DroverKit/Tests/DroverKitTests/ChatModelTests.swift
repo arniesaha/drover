@@ -494,6 +494,9 @@ struct ChatModelTests {
     await model.sendTurn()
     #expect(model.composerText.isEmpty)
     #expect(model.pendingTurn?.canRetry == true)
+    #expect(model.pendingTurn?.statusText == "Couldn’t confirm delivery")
+    #expect(model.pendingTurn?.retryMessage == model.pendingTurn?.statusText)
+    #expect(model.hint == nil)
     #expect(model.canSendTurn == false)
     #expect(model.isSending == false)
 }
@@ -1550,6 +1553,8 @@ struct ChatModelTests {
     try await Task.sleep(for: .milliseconds(300))
 
     #expect(model.pendingTurn?.deliveryState == .awaitingConfirmation)
+    #expect(model.pendingTurn?.retryMessage == model.pendingTurn?.statusText)
+    #expect(model.pendingTurn?.statusText == "Couldn’t confirm delivery")
     #expect(model.pendingTurn?.canRetry == true)
     #expect(model.pendingTurn?.text == "Yes looks good")
 }
@@ -1594,7 +1599,8 @@ struct ChatModelTests {
     await model.sendTurn()
 
     #expect(model.pendingTurn?.canRetry == true)
-    #expect(model.hint != nil)
+    #expect(model.hint == nil)
+    #expect(model.pendingTurn?.retryMessage == model.pendingTurn?.statusText)
 
     // A successful interrupt clears `hint`, and used to take the only Retry
     // affordance with it while the delivery stayed unresolved.

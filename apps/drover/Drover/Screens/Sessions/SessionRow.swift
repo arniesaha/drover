@@ -19,6 +19,8 @@ import DroverKit
 /// that timestamp against the snapshot, and trades its verb for the snapshot's
 /// own age. Same statement the provider capacity strip has always made.
 struct SessionRow: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let session: SessionSummary
     let hostTitle: String
     /// How far behind the snapshot this card was drawn from is. The default is
@@ -32,6 +34,10 @@ struct SessionRow: View {
             freshness: freshness
         )
 
+        let detailLayout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 5))
+            : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 5))
+
         HStack(alignment: .top, spacing: 11) {
             StateDot(attention: session.attention, isStale: card.isStale)
                 .padding(.top, 5)
@@ -40,16 +46,16 @@ struct SessionRow: View {
                 // The timestamp rides the kicker row, not the title row.
                 // Kickers are short and truncate gracefully; a two-line title
                 // competing for the same width starved the date down to "3…".
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                detailLayout {
                     if let kicker = card.kicker {
                         Image(systemName: card.harness.symbolName)
                             .font(.system(size: 10, weight: .medium))
                         Text(kicker)
-                            .lineLimit(1)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                             .truncationMode(.middle)
                     }
 
-                    Spacer(minLength: 8)
+                    if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 8) }
 
                     // A stale card's timestamp is a static string measured
                     // against the snapshot, not a live formatter measured
@@ -59,12 +65,12 @@ struct SessionRow: View {
                     // refreshed in ten minutes still counts up like live data.
                     if let frozen = card.frozenActivityText {
                         Text(frozen)
-                            .lineLimit(1)
-                            .fixedSize()
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+                            .fixedSize(horizontal: !dynamicTypeSize.isAccessibilitySize, vertical: true)
                     } else if let activityDate = session.activityDate {
                         Text(activityDate, format: .relative(presentation: .numeric))
-                            .lineLimit(1)
-                            .fixedSize()
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+                            .fixedSize(horizontal: !dynamicTypeSize.isAccessibilitySize, vertical: true)
                     }
                 }
                 .droverText(.mono)
@@ -80,20 +86,20 @@ struct SessionRow: View {
                         // not something the session said — it steps back to the
                         // quiet ramp so it can't out-shout a real one.
                         .foregroundStyle(card.isTitlePlaceholder ? DroverColor.muted : DroverColor.text)
-                        .lineLimit(2)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
 
                     Spacer(minLength: 0)
                 }
 
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                detailLayout {
                     Text(card.subtitle)
                         .droverText(.subtitle)
-                        .lineLimit(1)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                         .truncationMode(.tail)
 
-                    Spacer(minLength: 8)
+                    if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 8) }
 
                     if let action = card.action {
                         // Outlined, never filled — the system guide is explicit
@@ -109,7 +115,7 @@ struct SessionRow: View {
                                     lineWidth: 1
                                 )
                             }
-                            .fixedSize()
+                            .fixedSize(horizontal: !dynamicTypeSize.isAccessibilitySize, vertical: true)
                     } else if let note = card.staleNote {
                         // Deliberately not a capsule: the outline is what says
                         // "this is a thing you do", and there is nothing here
@@ -120,7 +126,7 @@ struct SessionRow: View {
                             .foregroundStyle(DroverColor.faint)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 4)
-                            .fixedSize()
+                            .fixedSize(horizontal: !dynamicTypeSize.isAccessibilitySize, vertical: true)
                             .accessibilityIdentifier("session-stale-note")
                     }
                 }

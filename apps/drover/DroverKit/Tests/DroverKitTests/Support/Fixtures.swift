@@ -61,16 +61,16 @@ let snapshotJSON = Data("""
  "sessions": [
   {"session_id": "harness-1", "host_id": "mac-mini", "harness": "agy",
    "mode": "structured", "status": "running", "awaiting": "approval",
-   "cwd": "/Users/arnabmac/jenny/nexus",
+   "cwd": "/Users/sample-user/sample-project/sample-project",
    "last_activity": "2026-07-07T01:23:45.678901+00:00"},
   {"session_id": "harness-2", "host_id": "mac-mini", "harness": "shell",
    "status": "running", "awaiting": null, "cwd": null,
    "last_activity": null},
   {"bogus": true}],
  "cwd_suggestions": [
-  {"path": "/Users/arnabmac/jenny/nexus", "source": "recent session", "host_id": "mac-mini"},
+  {"path": "/Users/sample-user/sample-project/sample-project", "source": "recent session", "host_id": "mac-mini"},
   {"path": "/Volumes/M2 1/drover", "source": "favorite"},
-  {"path": "/home/arnab/elsewhere", "source": "recent session", "host_id": "nas"}]}
+  {"path": "/home/sample-user/elsewhere", "source": "recent session", "host_id": "nas"}]}
 """.utf8)
 
 /// Multi-host snapshot for host-switch tests (Task 8). Kept separate from

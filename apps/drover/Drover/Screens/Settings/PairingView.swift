@@ -84,29 +84,33 @@ struct PairingView: View {
                 field("K7QP-2M4X", text: $model.manualCode)
                     .textInputAutocapitalization(.characters)
 
-                Button {
-                    guard let payload = model.manualPayload() else { return }
-                    Task { await pair(payload) }
-                } label: {
-                    Text(model.isPairing ? "Pairing..." : "Pair")
-                        .droverText(.h3)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                }
-                .disabled(!model.canSubmitManualCode || model.isPairing)
-                .foregroundStyle(DroverColor.accentHi)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(DroverColor.accentHi, lineWidth: 1)
-                }
-                .accessibilityIdentifier("pairing-submit")
-
                 if let statusMessage = model.statusMessage {
                     statusRow(statusMessage)
                 }
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 14)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Button {
+                guard let payload = model.manualPayload() else { return }
+                Task { await pair(payload) }
+            } label: {
+                Text(model.isPairing ? "Pairing..." : "Pair")
+                    .droverText(.h3)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+            }
+            .disabled(!model.canSubmitManualCode || model.isPairing)
+            .foregroundStyle(DroverColor.accentHi)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+            }
+            .accessibilityIdentifier("pairing-submit")
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(DroverColor.bg)
         }
         .background(DroverColor.bg)
         .scrollDismissesKeyboard(.interactively)
