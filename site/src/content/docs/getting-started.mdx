@@ -1,0 +1,176 @@
+---
+title: Getting started
+description: Install the hub on one machine, run your first session, pair your phone, then add more machines.
+order: 1
+source: docs/getting-started.md
+---
+
+The first setup runs everything on one computer: the hub (`drover-server`), a host daemon (`drover-harnessd`) and an agent CLI you are already signed in to. Get one small task working there before you add other machines.
+
+## Before you start
+
+- macOS or Linux with Python 3.11 or later.
+- At least one supported agent CLI installed and signed in: Claude Code, Codex, Antigravity (`agy`) or DeepSeek Harness.
+- A PostgreSQL database for the control store. Either one you already operate, or a running Docker-compatible CLI (Docker or OrbStack) so the installer can manage a local one.
+- Xcode 16 or later and XcodeGen, only if you want to build the iOS app.
+
+The installer brings its own [uv](https://docs.astral.sh/uv/) if you do not have it.
+
+## Install
+
+Pick one control-store mode.
+
+**Managed.** A fresh hub with a local PostgreSQL 17 container that Drover creates and labels, bound to localhost only:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh \
+  | bash -s -- --control-store managed
+```
+
+**Existing.** A PostgreSQL you already run. The installer checks that it is reachable and ready, and does not create a database for you:
+
+```bash
+export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
+curl -fsSL https://raw.githubusercontent.com/arniesaha/drover/main/install.sh \
+  | bash -s -- --control-store existing
+```
+
+The installer then:
+
+1. Installs a checksum-verified release under `~/.drover/runtime/`.
+2. Initializes the control store once PostgreSQL is healthy.
+3. Starts the hub and a local host daemon as user services (launchd on macOS, systemd user units on Linux).
+4. Detects a private address your phone can reach and prints a QR code to pair with.
+
+It stores the database connection string in `~/.drover/server.env` with mode `0600`, never in the config file or in service arguments. It links `drover-server` into `~/.local/bin` and tells you if that directory is not on your `PATH`. It never installs Docker or any other container runtime.
+
+Useful flags:
+
+| Flag | What it does |
+| --- | --- |
+| `--dry-run` | Prints every action without changing anything. Works offline. |
+| `--verify-release` | Downloads the release into a throwaway directory and verifies its checksums, without writing `~/.drover`. |
+| `--url <host:port>` | Overrides address detection. Private addresses only. |
+| `--version vX.Y.Z` | Pins a release instead of taking the latest. |
+| `--adopt` | Migrates an existing source install instead of refusing to touch it. |
+
+> Piping a script into a shell deserves a look first. Download `install.sh`, read it, and run it with `--dry-run` before the real thing.
+
+## Check that it works
+
+```bash
+drover-server status
+drover-server doctor
+```
+
+Then ask the hub for its hosts. Your local machine should be listed:
+
+```bash
+curl -fsS \
+  -H "Authorization: Bearer $(cat ~/.drover/api_token)" \
+  http://127.0.0.1:7080/harness/hosts
+```
+
+The web cockpit is on the same port. Open `http://127.0.0.1:7080/` in a browser on the hub machine and sign in.
+
+## Run your first session
+
+The quickest way is the web cockpit or the phone app: choose the host, a harness you are signed in to, and a project directory the agent can read, then send a small task.
+
+From a terminal, the same thing is two API calls. Create a session, then send it a turn:
+
+```bash
+BEARER="Authorization: Bearer $(cat ~/.drover/api_token)"
+
+curl -fsS -X POST -H "$BEARER" -H 'Content-Type: application/json' \
+  http://127.0.0.1:7080/harness/hosts/local/sessions \
+  -d '{"mode": "structured", "harness": "claude-code", "cwd": "/path/to/your/project"}'
+
+curl -fsS -X POST -H "$BEARER" -H 'Content-Type: application/json' \
+  http://127.0.0.1:7080/harness/sessions/SESSION_ID/turns \
+  -d '{"text": "List the three largest files in this repository."}'
+```
+
+Replace `local` with the host id shown by `/harness/hosts`, and `SESSION_ID` with the id returned by the first call. The request bodies above show the common fields; see the [HTTP API](/docs/api/) page for the rest.
+
+If the session does not start, run the read-only diagnosis:
+
+```bash
+drover-server setup-check --host HOST --harness HARNESS --project PROJECT
+```
+
+## Connect the iOS app
+
+The app is built from source today. A public beta is coming soon.
+
+```bash
+brew install xcodegen
+cd apps/drover
+xcodegen generate
+open Drover.xcodeproj
+```
+
+Select your Apple development team and run the `Drover` scheme on a simulator or a connected iPhone (iOS 18 or later). Then, on the hub:
+
+```bash
+drover-server pair
+```
+
+Scan the QR code in the app. The phone receives its own credential and stores it in the iOS Keychain. Nothing is typed by hand. The code is single use and expires after ten minutes. If the camera is not available, choose **Or enter it by hand** in **Pair & Connect** and type the server address and code.
+
+For a physical phone the QR code must point at an address the phone can reach. The installer sets this for you. On a source install, set it yourself before pairing:
+
+```toml
+# ~/.drover/config.toml
+[server]
+metrics_host = "0.0.0.0"
+advertised_url = "<private-address>:7080"
+```
+
+`metrics_host` is what the hub binds to and `advertised_url` is what the QR code contains. Use a private LAN address or a private Tailscale address. Do not use Tailscale Funnel. Read [Security and privacy](/docs/security-privacy/) before binding beyond localhost.
+
+## Add another machine
+
+On the machine that already runs the hub:
+
+```bash
+drover-server pair-host --name build-mac
+```
+
+That prints a one-line command to paste on the new machine. It carries a single-use code that expires in fifteen minutes. The new machine installs only the host daemon, never a second hub. It checks whether the hub can reach it back, and registers as a **direct** host if so, or as a **relay** host that dials out if not. You do not need to know which in advance.
+
+Only enroll machines you fully control. See [Security and privacy](/docs/security-privacy/#known-limits) for why.
+
+## Build from source
+
+Contributors, and anyone who prefers not to run an installer, can do the same by hand:
+
+```bash
+git clone https://github.com/arniesaha/drover.git
+cd drover
+uv sync --extra dev
+export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
+uv run drover-server init
+uv run drover-server control-store init
+uv run drover-server run
+```
+
+In a second terminal, start a host daemon:
+
+```bash
+uv run drover-harnessd \
+  --host-id local \
+  --display-name "Local Mac" \
+  --kind macos \
+  --listen 127.0.0.1:7081 \
+  --local-url http://127.0.0.1:7081 \
+  --central-url http://127.0.0.1:7080
+```
+
+A source-run hub needs `DROVER_CONTROL_DSN` in its environment every time it starts. On first start it creates `~/.drover/api_token` with mode `0600`.
+
+## Next steps
+
+- Give your agents a memory: [MCP setup](/docs/mcp/).
+- Wire up Claude Code, Codex or an orchestrator: [Integrations](/docs/integrations/).
+- Turn on summaries and embeddings: [Configuration](/docs/configuration/).

@@ -1,0 +1,286 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import ArchitectureDiagram from '../components/ArchitectureDiagram.astro';
+import { LINKS } from '../site';
+
+const flow = [
+  {
+    title: 'A turn happens',
+    body: 'You send a turn from the phone, the web cockpit or an orchestrator. The hub looks up the session in the fleet registry and forwards it to the host that owns it, directly or over that host\'s outbound relay connection.',
+  },
+  {
+    title: 'The host does the work',
+    body: 'drover-harnessd passes the turn to the agent through its harness adapter. The agent runs with the operating system account and file permissions you gave it. Output streams back as structured events and, if you are attached, terminal bytes.',
+  },
+  {
+    title: 'Events are written once',
+    body: 'Each event enters a single ingest path. In one control-store transaction the hub records the event metadata, its payload, a session preview and an outbox entry. Stable event identities make replays safe.',
+  },
+  {
+    title: 'Facts move to the lake',
+    body: 'When DuckLake is selected, one fenced exporter claims batches from the outbox, publishes them as a single catalog snapshot with an immutable receipt, and only then acknowledges them. A crash in between resumes the same batch.',
+  },
+  {
+    title: 'Workers derive memory',
+    body: 'If you configured a model backend, workers write session summaries, project briefs and embeddings into PostgreSQL, each linked back to its source session.',
+  },
+  {
+    title: 'Readers get proof or nothing',
+    body: 'The cockpit, the iOS app and MCP tools read through a disposable query child. It checks the serving proof, runs one read-only statement inside a deadline and a memory cap, and returns a verified result or an explicit "unavailable".',
+  },
+];
+
+const components = [
+  ['iOS, web and CLI clients', 'Your devices', 'Presentation and authenticated requests'],
+  ['drover-server (hub)', 'One central machine', 'Fleet API, pairing, relay, push, ingest, exporter lifecycle, analytical routes, MCP'],
+  ['drover-harnessd', 'Every harness host', 'Agent processes, adapters, PTY and terminal stream, a local spool'],
+  ['drover-collect and hooks', 'Source hosts', 'Parsing agent logs and attributing them to repositories'],
+  ['PostgreSQL control store', 'Central storage', 'Fleet and session state, hot payloads, outbox, derived memory, profile'],
+  ['DuckLake catalog and Parquet files', 'Analytical storage', 'Canonical event facts, versions, export receipts, snapshot history'],
+  ['Disposable query child', 'Central machine', 'One bounded, verified analytical read at a time'],
+];
+
+const ports = [
+  ['Fleet API and web cockpit', '7080', 'HTTP and WebSocket', 'Bearer credential or session cookie'],
+  ['Host daemon', '7081', 'HTTP and WebSocket', 'Bearer credential'],
+  ['MCP', '7077', 'Streamable HTTP at /mcp', 'None yet; loopback by default'],
+  ['OTLP (optional, off by default)', '4317', 'gRPC', 'Loopback by default'],
+];
+---
+
+<BaseLayout
+  title="Architecture"
+  description="How Drover is put together: hub, hosts, collector, PostgreSQL control store, DuckLake lake, MCP and the iOS app."
+>
+  <section class="page-hero">
+    <div class="wrap">
+      <span class="eyebrow">Architecture</span>
+      <h1>Two planes, one operator.</h1>
+      <p class="lede">
+        A <strong>command plane</strong> carries live fleet operations: start a session, send a turn, approve a tool call,
+        stream a terminal. A <strong>context plane</strong> turns everything that happens into durable, queryable memory.
+        Both run entirely on hardware you control.
+      </p>
+    </div>
+  </section>
+
+  <section class="section-tight">
+    <div class="wrap">
+      <ArchitectureDiagram />
+      <p class="cap">
+        The diagram is generated from source in this repository and follows the site theme. On a small screen, scroll it
+        sideways.
+      </p>
+    </div>
+  </section>
+
+  <section class="section band" id="walkthrough">
+    <div class="wrap">
+      <span class="eyebrow">What is under the hood</span>
+      <h2>Follow one turn through the system.</h2>
+      <ol class="flow">
+        {
+          flow.map((s, i) => (
+            <li class="reveal">
+              <span class="n">{i + 1}</span>
+              <div>
+                <h3>{s.title}</h3>
+                <p>{s.body}</p>
+              </div>
+            </li>
+          ))
+        }
+      </ol>
+    </div>
+  </section>
+
+  <section class="section" id="components">
+    <div class="wrap">
+      <span class="eyebrow">Components</span>
+      <h2>Who owns what.</h2>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Component</th><th>Runs on</th><th>Owns</th></tr>
+          </thead>
+          <tbody>
+            {components.map((c) => <tr><td><strong>{c[0]}</strong></td><td>{c[1]}</td><td>{c[2]}</td></tr>)}
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">
+        The hub can run as one process or split into an API role and an analytics role. With split roles, an analytics
+        outage leaves fleet and session control available while analytical routes report unavailable.
+      </p>
+
+      <h3 class="sub">Listeners</h3>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Interface</th><th>Default port</th><th>Protocol</th><th>Authentication</th></tr>
+          </thead>
+          <tbody>
+            {ports.map((p) => <tr><td><strong>{p[0]}</strong></td><td><code>{p[1]}</code></td><td>{p[2]}</td><td>{p[3]}</td></tr>)}
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">Every central listener binds to localhost by default. Ports and bind addresses are configurable.</p>
+    </div>
+  </section>
+
+  <section class="section band" id="storage">
+    <div class="wrap">
+      <span class="eyebrow">Storage</span>
+      <h2>Two stores, two jobs.</h2>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>PostgreSQL control store</h3>
+          <p>
+            The authority for anything operational or mutable: hosts, sessions, credential verifiers, event metadata and
+            hot payloads, the durable outbox, summaries, briefs, embeddings and the portable profile.
+          </p>
+          <p>
+            You can point Drover at a PostgreSQL you already run, or let the installer manage a labelled PostgreSQL 17
+            container bound to localhost. Drover never installs a container runtime for you.
+          </p>
+        </div>
+        <div class="card">
+          <h3>DuckLake analytical lake</h3>
+          <p>
+            Append-only facts for analytics and long-range recall. A lake has two inseparable parts: a PostgreSQL catalog
+            holding metadata and snapshot history, and Parquet data files under a data root on disk.
+          </p>
+          <p>
+            Selecting DuckLake is explicit. Nothing auto-enables it, and a failure in a selected lake never falls back
+            silently to older history.
+          </p>
+        </div>
+        <div class="card">
+          <h3>DuckDB, where it still fits</h3>
+          <p>
+            Each host keeps a small local DuckDB spool. DuckDB also remains a supported compatibility control store for
+            existing single-machine installs, selected explicitly.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Backups</h3>
+          <p>
+            A complete backup is the PostgreSQL control store plus the DuckLake catalog plus every data file that catalog
+            references. Parquet files alone are not a backup.{' '}
+            <span class="tag roadmap">Roadmap</span> Automated off-site backup is designed but not shipped.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="privacy">
+    <div class="wrap">
+      <span class="eyebrow">Privacy model</span>
+      <h2>Your data has one home, and you hold the keys.</h2>
+      <div class="grid cols-3">
+        <div class="card">
+          <h3>Self-hosted by design</h3>
+          <p>
+            There is no Drover cloud and no Drover account. Session content stays on your configured storage unless you
+            set up something that sends it elsewhere.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Explicit exits only</h3>
+          <p>
+            Data leaves your machines in exactly the ways you configure: a model or embeddings provider for summaries,
+            Apple push notifications, or events shipped between your own hosts. The agent CLIs themselves talk to their
+            own providers, as they always do.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Private networks only</h3>
+          <p>
+            The supported boundary is localhost, a trusted private LAN, or a private Tailscale network. The built-in
+            listeners do not terminate TLS. Public internet exposure is not supported.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Per-device credentials</h3>
+          <p>
+            Every phone and host gets its own bearer credential from a single-use pairing code. The hub stores only a
+            hash, and each credential can be revoked without touching the others.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Tiered profile</h3>
+          <p>
+            Profile items are general, trusted or private. Imports default to private. Agents see only their tier, and
+            withheld items appear as a count with no titles or content.
+          </p>
+        </div>
+        <div class="card">
+          <h3>One trust domain</h3>
+          <p>
+            Drover is built for a single trusted operator. It has no multi-user isolation, role-based access control or
+            single sign-on, and it does not sandbox what an agent runs.
+          </p>
+        </div>
+      </div>
+      <p class="more">
+        Read <a href="/docs/security-privacy/">Security and privacy</a> before you bind anything beyond localhost. For the full detail, see{' '}
+        <a href={LINKS.doc('architecture.md')} rel="noopener">docs/architecture.md</a> and the{' '}
+        <a href={LINKS.doc('threat-model.md')} rel="noopener">threat model</a> in the repository.
+      </p>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .cap {
+    font-size: 0.84rem;
+    color: var(--muted);
+    margin-top: 0.8rem;
+  }
+  .flow {
+    list-style: none;
+    margin: 2rem 0 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr));
+    gap: 1rem;
+  }
+  .flow li {
+    display: flex;
+    gap: 1rem;
+    padding: 1.2rem;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+  }
+  .flow .n {
+    flex: none;
+    width: 34px;
+    height: 34px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--ember);
+    color: var(--bg);
+    font-family: var(--font-display);
+    font-weight: 800;
+  }
+  .flow h3 {
+    margin-bottom: 0.3rem;
+  }
+  .flow p {
+    margin: 0;
+    font-size: 0.95rem;
+    color: var(--text-2);
+  }
+  .sub {
+    margin-top: 2.5rem;
+  }
+  .more {
+    margin-top: 1.8rem;
+  }
+  .card .tag {
+    margin-right: 0.3rem;
+  }
+</style>

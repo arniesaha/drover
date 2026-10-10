@@ -1,0 +1,173 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { LINKS } from '../site';
+
+// Answers are HTML strings so they can carry links. Keep them short and true.
+const groups = [
+  {
+    title: 'The basics',
+    items: [
+      {
+        q: 'What is Drover?',
+        a: `A self-hosted cockpit and context store for a personal fleet of CLI coding agents. A central hub and a small daemon on each of your machines run agent sessions, record what happens, and expose it to a native iOS app, a web cockpit, an HTTP API and an MCP server.`,
+      },
+      {
+        q: 'What is it not?',
+        a: `It is not a coding agent, a model, or a hosted service. It does not write code itself; it runs and remembers the agents that do. It is also not a team product: there are no user accounts, roles or tenants. It is built for one trusted operator.`,
+      },
+      {
+        q: 'How does it relate to an orchestrator like OpenClaw or Hermes?',
+        a: `They sit on top. An orchestrator decides what work to do and whether it is good. Drover gives it somewhere to run that work (launch a session on a host, send turns, read status) and a memory to consult (search, recall, briefs). Drover also collects OpenClaw and Hermes activity as context, but it does not launch or control them. See the <a href="/use-cases/#orchestrator">orchestrator use case</a>.`,
+      },
+      {
+        q: 'Which agents can it run?',
+        a: `Today Drover launches and drives Claude Code, Codex, Antigravity (agy) and DeepSeek Harness, plus a plain shell terminal. A harness appears as a launch target on a host only when its CLI is installed there. OpenClaw and Hermes are observe-only.`,
+      },
+    ],
+  },
+  {
+    title: 'Cost and licensing',
+    items: [
+      {
+        q: 'What does it cost?',
+        a: `Nothing. Drover is free and open source. You bring your own agent CLIs, model accounts and API keys, and you pay those providers whatever you already pay them. Drover adds no subscription and takes no cut.`,
+      },
+      {
+        q: 'What is the license?',
+        a: `<a href="${LINKS.license}" rel="noopener">Apache-2.0</a>. Use it, change it, ship it, within the terms of that license.`,
+      },
+      {
+        q: 'Is the iOS app free too?',
+        a: `Yes. It is a free developer tool that you build from source with Xcode today. It is not on the App Store. A public beta is coming soon.`,
+      },
+    ],
+  },
+  {
+    title: 'Data and privacy',
+    items: [
+      {
+        q: 'Where does my data live?',
+        a: `On your machines. By default under <code>~/.drover/</code>, in a PostgreSQL database you operate, and, if you select it, a DuckLake lake on your disk. There is no Drover cloud, no Drover account, and no analytics or usage telemetry sent to the project. By default the hub does make a periodic check for new releases on GitHub, which you can pin or turn off in <a href="/docs/configuration/#updates">configuration</a>.`,
+      },
+      {
+        q: 'Does anything ever leave my machines?',
+        a: `Only through things you configure or already use. The agent CLIs talk to their own model providers as usual. If you enable summaries or embeddings with an external provider, that provider receives the text it processes. If you enable push notifications, alerts travel through Apple and can include a short response preview. Everything else stays put. Details are in <a href="/docs/security-privacy/">Security and privacy</a>.`,
+      },
+      {
+        q: 'Can I keep summaries fully local?',
+        a: `Embeddings can run on a local Ollama backend. Summaries and briefs currently use the Claude Code CLI or an Anthropic API key, and both send transcript text to Anthropic. If that is not acceptable, leave the summarizer unconfigured: ingest, search, replay and fleet control work without it.`,
+      },
+      {
+        q: 'Is it safe to expose to the internet?',
+        a: `No. The supported boundary is localhost, a trusted private LAN, or a private Tailscale network. The built-in listeners do not provide TLS, the MCP endpoint has no authentication of its own yet, and any credential is equivalent to interactive access to your hosts. Do not use Tailscale Funnel or a public reverse proxy.`,
+      },
+    ],
+  },
+  {
+    title: 'Platforms and behaviour',
+    items: [
+      {
+        q: 'What platforms are supported?',
+        a: `The hub and host daemon run on macOS and Linux with Python 3.11 or later. The phone app needs iOS 18 or later and Xcode 16 to build. Windows is not supported.`,
+      },
+      {
+        q: 'Do I need PostgreSQL?',
+        a: `For a new central hub, yes: PostgreSQL is the default control store. Use one you already run, or let the installer manage a local PostgreSQL 17 container if you have a Docker-compatible CLI running. Existing single-machine installs can stay on the DuckDB compatibility backend, without the features that require PostgreSQL such as the portable profile.`,
+      },
+      {
+        q: 'What happens when I am offline?',
+        a: `Drover's own traffic stays on your private network: the hub, hosts and phone talk to each other directly, apart from the optional release check and any integrations you configure. Your agents still need to reach their model providers unless you run local models. If a host drops off the network, its sessions keep running on that machine, and a stop request is held and confirmed when the host reconnects. The phone app keeps unsent drafts and pending turns until it can deliver them.`,
+      },
+      {
+        q: 'What happens when the hub restarts?',
+        a: `Agent processes belong to the host daemons, not the hub. Hosts re-register on their next heartbeat, recorded history is already durable in the control store, and outstanding pairing codes are invalidated because they only ever lived in memory.`,
+      },
+      {
+        q: 'How mature is it?',
+        a: `It is source-distributed software for technical users with a fast-moving release line. Expect rough edges and read the <a href="${LINKS.changelog}" rel="noopener">changelog</a> before upgrading. Known limits are listed on the <a href="/features/#roadmap">roadmap</a>.`,
+      },
+    ],
+  },
+];
+---
+
+<BaseLayout title="FAQ" description="What Drover is and is not, what it costs, where your data lives, and what platforms it supports.">
+  <section class="page-hero">
+    <div class="wrap">
+      <span class="eyebrow">FAQ</span>
+      <h1>Fair questions.</h1>
+      <p class="lede">Short answers. If yours is not here, open an issue on <a href={LINKS.issues} rel="noopener">GitHub</a>.</p>
+    </div>
+  </section>
+
+  <section class="section-tight">
+    <div class="wrap-narrow">
+      {
+        groups.map((g) => (
+          <div class="group">
+            <h2>{g.title}</h2>
+            {g.items.map((item) => (
+              <details>
+                <summary>{item.q}</summary>
+                <p set:html={item.a} />
+              </details>
+            ))}
+          </div>
+        ))
+      }
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .group {
+    margin-bottom: 3rem;
+  }
+  .group h2 {
+    font-size: 1.5rem;
+    margin-bottom: 1rem;
+  }
+  details {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    background: var(--surface);
+    margin-bottom: 0.6rem;
+    overflow: hidden;
+  }
+  details[open] {
+    border-color: var(--line-strong);
+    box-shadow: var(--shadow);
+  }
+  summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem 1.2rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.08rem;
+    letter-spacing: -0.01em;
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+  summary::after {
+    content: '+';
+    flex: none;
+    font-family: var(--font-mono);
+    font-size: 1.2rem;
+    color: var(--ember);
+    transition: transform 0.2s ease;
+  }
+  details[open] summary::after {
+    transform: rotate(45deg);
+  }
+  details p {
+    margin: 0;
+    padding: 0 1.2rem 1.1rem;
+    color: var(--text-2);
+  }
+</style>

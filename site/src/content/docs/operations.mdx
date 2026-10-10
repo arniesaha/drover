@@ -1,0 +1,136 @@
+---
+title: Operations basics
+description: Check health, manage services and credentials, back up, upgrade and uninstall.
+order: 7
+source: docs/postgresql-control-store.md
+---
+
+Day-to-day care for a small Drover fleet. Everything here runs on the hub machine unless it says otherwise.
+
+## Is it healthy?
+
+```bash
+drover-server status      # what is running and where
+drover-server doctor      # checks with suggested fixes
+```
+
+Two unauthenticated HTTP checks are meant for monitors:
+
+| Endpoint | Meaning |
+| --- | --- |
+| `GET /healthz` | The process is up. |
+| `GET /readyz` | The hub is ready to serve. Detailed reasons are returned to authenticated callers only. |
+
+If a session will not start on a particular host, run the read-only diagnosis:
+
+```bash
+drover-server setup-check --host HOST --harness HARNESS --project PROJECT
+```
+
+Add `--json` for structured output. It changes nothing.
+
+## Services
+
+The installer runs the hub and the local host daemon as per-user services.
+
+| Platform | Units |
+| --- | --- |
+| macOS | launchd agents `com.drover.server` and `com.drover.harnessd` in `~/Library/LaunchAgents` |
+| Linux | systemd user units `drover-server.service` and `drover-harnessd.service` |
+
+Restart them with the platform's own tools, for example on Linux:
+
+```bash
+systemctl --user restart drover-server.service
+systemctl --user status drover-harnessd.service
+```
+
+Restarting the hub does not stop your agents. Agent processes belong to the host daemons. Outstanding pairing codes are lost, because they only ever lived in memory.
+
+## Hosts
+
+```bash
+drover-server hosts list
+drover-server hosts retire <host-id>
+drover-server hosts unretire <host-id>
+```
+
+Retire a machine you no longer use. Retired hosts are left out of fleet views and are never sent requests. Then revoke its credential.
+
+## Credentials
+
+```bash
+drover-server pair                       # a code for a new phone
+drover-server pair-host --name <name>    # a one-line join command for a new machine
+drover-server credentials list
+drover-server credentials revoke <credential-id>
+```
+
+Revoke, do not rotate, when a single device is lost. Rotate the shared token only if it is still enabled and a machine that knew it is no longer trusted.
+
+## Managed PostgreSQL
+
+If you installed with `--control-store managed`, Drover owns one labelled PostgreSQL 17 container and its data volume. A helper manages it:
+
+```bash
+~/.drover/bin/drover-managed-postgres status
+~/.drover/bin/drover-managed-postgres stop
+~/.drover/bin/drover-managed-postgres start
+~/.drover/bin/drover-managed-postgres backup /absolute/path/outside/drover/backup.dump
+```
+
+`backup` writes a PostgreSQL custom-format dump and verifies that it can be listed. Keep the destination off the live volume. A volume is not a backup.
+
+If you brought your own PostgreSQL, it is yours to run: Drover does not manage its upgrades, capacity or recovery. Give Drover a dedicated database and a dedicated non-superuser role, and keep the database listener on loopback or your private network.
+
+## Backups
+
+A complete backup has up to three parts, and you need all that apply:
+
+1. **The control store.** A PostgreSQL dump (`pg_dump`, or the helper above).
+2. **The lake, if you selected DuckLake.** The catalog database **and** every data file it references. Parquet files without their catalog are not restorable as a lake.
+3. **`~/.drover/`.** Config, credential hashes and the service environment file. Treat this directory as secret.
+
+Encrypt backups and store them away from the hub.
+
+<div class="callout road">
+
+**Roadmap.** An automated, verified off-site backup of the lake and control store together is designed and has rehearsal tooling, but it is not a shipped feature. Today, backups are your job.
+
+</div>
+
+## Upgrades
+
+```bash
+drover-server update --check     # is there a newer release?
+drover-server update             # move to it
+drover-server rollback           # return to the previous runtime
+```
+
+Releases install side by side under `~/.drover/runtime/`, and the previous one is kept so a rollback is quick. Read the [changelog](https://github.com/arniesaha/drover/blob/main/CHANGELOG.md) first. To stay put, set `[update] pinned_version` in the [configuration](/docs/configuration/#updates).
+
+Only the latest tagged release receives fixes. Upgrading never migrates a DuckDB control store to PostgreSQL by itself.
+
+## The analytics lake
+
+Most single-machine setups can ignore this section. The DuckLake lake is an explicit selection for operators who want durable, auditable analytics, and it comes with rules:
+
+- It requires the PostgreSQL control store, a catalog database, a data root on disk and a pinned verification proof.
+- Nothing discovers or enables it automatically.
+- When it is selected and something does not verify, analytical reads return unavailable. They do not fall back to older history.
+
+The repository has runbooks for [serving](https://github.com/arniesaha/drover/blob/main/docs/operations/lake-serving.md), the [exporter](https://github.com/arniesaha/drover/blob/main/docs/operations/lake-exporter.md) and [cutover](https://github.com/arniesaha/drover/blob/main/docs/operations/lake-cutover.md). Read them in full before selecting DuckLake.
+
+## Housekeeping
+
+- Processed copies of incoming events are kept for seven days by default (`[paths] processed_retention_days`). Session history, context and credentials are not pruned automatically.
+- Lifecycle scans report idle sessions and stale worktrees through `GET /harness/lifecycle`. They are report-only. Clean up worktrees yourself, after checking nothing unpushed lives in them.
+- Each session launched in a Git repository may get its own worktree under `~/.drover/worktrees/`.
+
+## Uninstall
+
+The repository's `scripts/uninstall.sh` removes the services and the `drover-server` link. It deliberately keeps a managed PostgreSQL container and its data. Deleting that data is a separate, explicitly confirmed step. Your `~/.drover/` directory is left for you to archive or remove.
+
+## Getting help
+
+Run `drover-server status` and `drover-server doctor` first. When you open an issue, include the Drover version, platform, what you expected and what happened. Leave out credentials, pairing codes, private addresses, logs and anything from a session. The [support notes](https://github.com/arniesaha/drover/blob/main/docs/support.md) have the full checklist.

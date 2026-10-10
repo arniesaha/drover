@@ -1,0 +1,632 @@
+---
+import { Image } from 'astro:assets';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
+import RecallDemo from '../components/demos/RecallDemo.astro';
+import hero from '../assets/drover-hero.png';
+import shotFleet from '../assets/screenshots/ios-fleet.png';
+import shotLaunch from '../assets/screenshots/ios-launch.png';
+import shotCockpit from '../assets/screenshots/ios-cockpit.png';
+import shotAnalytics from '../assets/screenshots/ios-analytics.png';
+import { LINKS } from '../site';
+
+const problems = [
+  {
+    title: 'Agents forget',
+    body: 'Every new session starts cold. You re-explain the codebase, the decision you made on Tuesday, and the thing you already tried.',
+  },
+  {
+    title: 'Sessions scatter',
+    body: 'One run on the laptop, two on the desktop, another in a different harness. The history lives in four log formats on three disks.',
+  },
+  {
+    title: 'You lose the thread',
+    body: 'An agent stops to ask a question while you are making coffee. It waits. You come back an hour later to a blinking prompt.',
+  },
+];
+
+const layers = [
+  {
+    tag: 'Execution',
+    icon: 'fleet',
+    tone: '',
+    title: 'Run sessions anywhere you own',
+    body: 'A hub and a small daemon on each machine launch and drive Claude Code, Codex, Antigravity and DeepSeek Harness sessions, structured or in a real terminal.',
+  },
+  {
+    tag: 'Knowledge',
+    icon: 'layers',
+    tone: 'ember',
+    title: 'Keep what happened',
+    body: 'Every event lands in a context store on your own disks. Search it, replay it, and let optional workers turn it into session summaries and project briefs.',
+  },
+  {
+    tag: 'Continuity',
+    icon: 'loop',
+    tone: 'wheat',
+    title: 'Pick the thread back up',
+    body: 'Hand a session to another host or harness, give a new agent a recall bundle, and answer prompts from your phone while you are away from the desk.',
+  },
+] as const;
+
+const features = [
+  { icon: 'terminal', title: 'Multi-harness sessions', body: 'Claude Code, Codex, Antigravity (agy) and DeepSeek Harness behind one adapter contract.' },
+  { icon: 'fleet', title: 'Hub and hosts', body: 'One hub, many machines. Hosts connect directly or dial out over a relay, on your LAN or tailnet.' },
+  { icon: 'phone', title: 'iOS cockpit', body: 'See the fleet, send turns, answer approvals, hand work off and attach to a terminal.' },
+  { icon: 'search', title: 'Recall and search', body: 'Keyword search, optional semantic recall, and bounded recall bundles with provenance.' },
+  { icon: 'notes', title: 'Summaries and briefs', body: 'Optional workers write session summaries and rolling project briefs with a model you choose.' },
+  { icon: 'profile', title: 'Portable profile', body: 'Your preferences and standing rules, served to agents in three privacy tiers.' },
+  { icon: 'plug', title: 'MCP server', body: 'About two dozen drover_* tools give any MCP client your fleet state and history.' },
+  { icon: 'chart', title: 'Lake analytics', body: 'Usage, projects and provider quota from a DuckLake lake, served through verified reads.' },
+] as const;
+
+const shots = [
+  { src: shotFleet, alt: 'Drover iOS fleet view listing three running sessions across two hosts with provider capacity' },
+  { src: shotLaunch, alt: 'Drover iOS new session sheet with host, harness, model and reasoning controls' },
+  { src: shotCockpit, alt: 'Drover iOS cockpit showing observed sessions, token totals and busiest projects' },
+  { src: shotAnalytics, alt: 'Drover iOS analytics view with provider quota windows and usage distributions' },
+];
+---
+
+<BaseLayout>
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <span class="eyebrow">Self-hosted · open source · free</span>
+        <h1>Drive your coding-agent fleet <span class="hl">from your pocket.</span></h1>
+        <p class="lede">
+          Drover is a cockpit and a memory for your CLI coding agents. Run Claude Code, Codex and friends across the
+          machines you own, keep the thread from one session to the next, and steer the whole herd from your phone.
+        </p>
+        <div class="btn-row">
+          <a class="btn" href="/docs/getting-started/">Get started</a>
+          <a class="btn ghost" href={LINKS.repo} rel="noopener">Star on GitHub</a>
+        </div>
+        <div class="term install">
+          <div class="term-bar"><i></i><i></i><i></i><span>install on macOS or Linux</span></div>
+          <pre><code><span class="c"># a fresh hub with a managed local PostgreSQL (needs a running Docker CLI)</span>
+curl -fsSL {LINKS.installScript} \
+  | bash -s -- --control-store managed</code></pre>
+        </div>
+        <p class="fine">
+          Add <code>--dry-run</code> to preview every action first. Already run PostgreSQL? See the{' '}
+          <a href="/docs/getting-started/">install guide</a>.
+        </p>
+      </div>
+
+      <div class="hero-art">
+        <Image src={hero} alt="A white dog standing watch over three small glowing terminals in a mountain landscape" widths={[420, 640, 900]} sizes="(max-width: 900px) 80vw, 520px" loading="eager" fetchpriority="high" />
+        <span class="float f1"><i></i>studio · codex · running</span>
+        <span class="float f2"><i class="w"></i>laptop · claude-code · needs you</span>
+        <span class="float f3"><i></i>buildbox · agy · running</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="wrap">
+      <span class="eyebrow">The problem</span>
+      <h2>Coding agents are great at the work<br />and terrible at remembering it.</h2>
+      <div class="grid cols-3 probs">
+        {
+          problems.map((p, i) => (
+            <div class="prob reveal">
+              <span class="num">0{i + 1}</span>
+              <h3>{p.title}</h3>
+              <p>{p.body}</p>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <span class="eyebrow">What Drover does</span>
+      <h2>Three layers under one roof. Yours.</h2>
+      <p class="lede">
+        Drover sits underneath your agents and above your machines. It does not replace the harness you like or the
+        orchestrator you built. It gives them a place to run, a memory to share, and a way to reach you.
+      </p>
+      <div class="grid cols-3 layers">
+        {
+          layers.map((l) => (
+            <div class="card reveal">
+              <div class={`icon ${l.tone}`}>
+                <Icon name={l.icon} />
+              </div>
+              <span class="layer-tag">{l.tag} layer</span>
+              <h3>{l.title}</h3>
+              <p>{l.body}</p>
+            </div>
+          ))
+        }
+      </div>
+      <div class="callout orch">
+        <strong>Bring your own conductor.</strong> Orchestrators in the style of OpenClaw or Hermes drive Drover through
+        its HTTP API and MCP tools: they launch sessions, send turns, read fleet state and recall history. Drover also
+        collects their own activity as context. Planning, review and merge policy stay with the orchestrator.
+      </div>
+    </div>
+  </section>
+
+  <section class="section band" id="try">
+    <div class="wrap">
+      <div class="split-head">
+        <div>
+          <span class="eyebrow">Try it</span>
+          <h2>Ask your history a question.</h2>
+        </div>
+        <p class="lede">
+          Agents call this as an MCP tool. You get past sessions, what they decided, what is still open, and which
+          files they touched. Here it is with made-up data.
+        </p>
+      </div>
+      <RecallDemo />
+      <p class="more"><a href="/use-cases/">See all three interactive use cases</a></p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <span class="eyebrow">Features</span>
+      <h2>Everything a small fleet needs.</h2>
+      <div class="grid cols-4 feats">
+        {
+          features.map((f) => (
+            <div class="feat reveal">
+              <div class="ficon">
+                <Icon name={f.icon} />
+              </div>
+              <h3>{f.title}</h3>
+              <p>{f.body}</p>
+            </div>
+          ))
+        }
+      </div>
+      <p class="more"><a href="/features/">Full feature list, with what is opt-in and what is still roadmap</a></p>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="wrap caps">
+      <div>
+        <span class="eyebrow">Capabilities</span>
+        <h2>Drive four harnesses. Listen to more.</h2>
+        <p class="lede">
+          Launching a session and observing one are separate jobs. Drover drives the harnesses it has an adapter for and
+          collects session logs from others, so everything ends up in the same history.
+        </p>
+      </div>
+      <div class="cap-table">
+        <div class="cap-row head"><span>Harness</span><span>Launch and drive</span><span>Lands in your history</span></div>
+        <div class="cap-row"><span>Claude Code</span><span class="y">yes, with approvals</span><span class="y">yes</span></div>
+        <div class="cap-row"><span>Codex</span><span class="y">yes</span><span class="y">yes</span></div>
+        <div class="cap-row"><span>Antigravity (agy)</span><span class="y">yes</span><span class="y">yes</span></div>
+        <div class="cap-row"><span>DeepSeek Harness</span><span class="y">yes</span><span class="y">yes</span></div>
+        <div class="cap-row"><span>OpenClaw</span><span class="n">observe only</span><span class="y">yes, via the collector</span></div>
+        <div class="cap-row"><span>Hermes</span><span class="n">observe only</span><span class="y">yes, via the collector</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <span class="eyebrow">Use cases</span>
+      <h2>What people do with it.</h2>
+      <div class="grid cols-3">
+        <a class="card" href="/use-cases/#continuity">
+          <div class="icon"><Icon name="hand" /></div>
+          <h3>Pick up where you left off</h3>
+          <p>Start on the laptop, hand off to the desktop, approve the push from your phone.</p>
+        </a>
+        <a class="card" href="/use-cases/#orchestrator">
+          <div class="icon ember"><Icon name="fleet" /></div>
+          <h3>One orchestrator, many workers</h3>
+          <p>Fan tasks out to harness sessions on several hosts and keep a review loop running.</p>
+        </a>
+        <a class="card" href="/use-cases/#recall">
+          <div class="icon wheat"><Icon name="search" /></div>
+          <h3>Ask your history</h3>
+          <p>Give any agent the last month of decisions, open loops and touched files in one call.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="wrap hood">
+      <div>
+        <span class="eyebrow">Under the hood</span>
+        <h2>Boring storage. Paranoid reads.</h2>
+        <p class="lede">
+          Events are written once, atomically, to a PostgreSQL control store. A fenced exporter publishes them to a
+          DuckLake lake of Parquet files. Every analytical read runs in a disposable, memory-capped child process that
+          checks a serving proof first and refuses to answer if anything has drifted.
+        </p>
+        <div class="btn-row">
+          <a class="btn small" href="/architecture/">See the architecture</a>
+        </div>
+      </div>
+      <ul class="hood-list">
+        <li><Icon name="db" /><span><strong>PostgreSQL</strong> for fleet state, hot payloads, outbox and derived memory</span></li>
+        <li><Icon name="layers" /><span><strong>DuckLake</strong> for append-only facts with snapshot history</span></li>
+        <li><Icon name="shield" /><span><strong>Fail closed</strong>: a verified answer or an explicit "unavailable"</span></li>
+        <li><Icon name="cloudoff" /><span><strong>No Drover cloud</strong>: localhost, private LAN or private Tailscale</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" id="ios">
+    <div class="wrap">
+      <div class="split-head">
+        <div>
+          <span class="eyebrow">iOS app</span>
+          <h2>The cockpit lives in your pocket.</h2>
+        </div>
+        <div>
+          <p class="lede">
+            A native app for iOS 18 and later. Pair with a QR code, watch live sessions grouped by host, start a new one,
+            answer the agent when it asks, and open a terminal when you need to see for yourself.
+          </p>
+          <p class="ios-status">
+            <span class="tag beta">Beta</span>
+            <span>Free developer tool. Build it from source today; a public beta is coming soon.</span>
+          </p>
+        </div>
+      </div>
+      <div class="shots">
+        {
+          shots.map((s) => (
+            <figure class="shot reveal">
+              <Image src={s.src} alt={s.alt} widths={[260, 400]} sizes="(max-width: 700px) 44vw, 250px" />
+            </figure>
+          ))
+        }
+      </div>
+      <p class="fine center">Screenshots show the app with demo data.</p>
+    </div>
+  </section>
+
+  <section class="section cta">
+    <div class="wrap-narrow center">
+      <h2>Round up your agents.</h2>
+      <p class="lede">
+        One machine and one agent CLI is enough to start. Add hosts, the phone app and the memory features when you want
+        them.
+      </p>
+      <div class="btn-row cta-row">
+        <a class="btn" href="/docs/getting-started/">Read the getting started guide</a>
+        <a class="btn ghost" href={LINKS.repo} rel="noopener">GitHub</a>
+        <a class="btn ghost" href="/contribute/">Contribute</a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .hero {
+    background: var(--glow);
+    padding-block: clamp(2.5rem, 6vw, 5rem) clamp(3rem, 6vw, 5rem);
+    overflow: hidden;
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+    gap: clamp(1.5rem, 4vw, 4rem);
+    align-items: center;
+  }
+  .hl {
+    color: var(--ember);
+    font-style: italic;
+    font-variation-settings: 'wdth' 84;
+  }
+  .hero .lede {
+    margin-bottom: 1.6rem;
+  }
+  .install {
+    margin-top: 2rem;
+    max-width: 640px;
+  }
+  .install pre {
+    font-size: 0.8rem;
+  }
+  .install .c {
+    color: var(--muted);
+  }
+  .fine {
+    font-size: 0.86rem;
+    color: var(--muted);
+    margin-top: 0.8rem;
+  }
+  .hero-art {
+    position: relative;
+    justify-self: center;
+    max-width: 520px;
+  }
+  .hero-art :global(img) {
+    display: block;
+    width: 100%;
+    filter: drop-shadow(0 30px 40px rgba(0, 0, 0, 0.35));
+    animation: bob 7s ease-in-out infinite;
+  }
+  .float {
+    position: absolute;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.4rem 0.7rem;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    box-shadow: var(--shadow);
+    white-space: nowrap;
+    animation: bob 6s ease-in-out infinite;
+  }
+  .float i {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--ok);
+  }
+  .float i.w {
+    background: var(--ember);
+    animation: ping 1.4s ease-in-out infinite;
+  }
+  .f1 {
+    top: 9%;
+    right: -4%;
+    animation-delay: -1s;
+  }
+  .f2 {
+    top: 46%;
+    left: -10%;
+    animation-delay: -3s;
+  }
+  .f3 {
+    bottom: 6%;
+    right: 2%;
+    animation-delay: -5s;
+  }
+  @keyframes bob {
+    50% {
+      transform: translateY(-9px);
+    }
+  }
+  @keyframes ping {
+    50% {
+      box-shadow: 0 0 0 6px color-mix(in srgb, var(--ember) 25%, transparent);
+    }
+  }
+
+  .probs {
+    margin-top: 2.2rem;
+  }
+  .prob {
+    border-top: 2px solid var(--text);
+    padding-top: 1rem;
+  }
+  .prob .num {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--ember);
+  }
+  .prob h3 {
+    font-size: 1.6rem;
+    margin: 0.3rem 0 0.5rem;
+  }
+  .prob p {
+    color: var(--text-2);
+  }
+
+  .layers {
+    margin-top: 2.2rem;
+  }
+  .layer-tag {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.3rem;
+  }
+  .orch {
+    margin-top: 1.6rem;
+    max-width: none;
+  }
+
+  .split-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 1.5rem 3rem;
+    align-items: end;
+    margin-bottom: 2rem;
+  }
+  .split-head h2 {
+    margin-bottom: 0;
+  }
+  .more {
+    margin-top: 1.4rem;
+    font-weight: 600;
+  }
+  .more a::after {
+    content: ' ->';
+    font-family: var(--font-mono);
+  }
+
+  .feats {
+    margin-top: 2rem;
+    gap: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    overflow: hidden;
+    background: var(--line);
+    gap: 1px;
+  }
+  .feat {
+    background: var(--surface);
+    padding: 1.3rem;
+  }
+  .feat h3 {
+    font-size: 1.1rem;
+    margin-bottom: 0.3rem;
+  }
+  .feat p {
+    font-size: 0.92rem;
+    color: var(--text-2);
+    margin: 0;
+  }
+  .ficon {
+    width: 26px;
+    height: 26px;
+    color: var(--ember);
+    margin-bottom: 0.7rem;
+  }
+
+  .caps {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    gap: 2.5rem;
+    align-items: center;
+  }
+  .cap-table {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    background: var(--surface);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  .cap-row {
+    display: grid;
+    grid-template-columns: 1.1fr 1.1fr 1fr;
+    gap: 0.5rem;
+    padding: 0.65rem 1.1rem;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.93rem;
+  }
+  .cap-row:last-child {
+    border-bottom: 0;
+  }
+  .cap-row.head {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    background: var(--surface-2);
+  }
+  .cap-row span:first-child {
+    font-weight: 600;
+  }
+  .cap-row .y {
+    color: var(--ok);
+  }
+  .cap-row .n {
+    color: var(--muted);
+  }
+
+  .hood {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+    gap: 2.5rem;
+    align-items: center;
+  }
+  .hood-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.7rem;
+  }
+  .hood-list li {
+    display: flex;
+    gap: 0.8rem;
+    align-items: flex-start;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    background: var(--surface);
+    font-size: 0.95rem;
+    color: var(--text-2);
+  }
+  .hood-list :global(svg) {
+    flex: none;
+    width: 22px;
+    height: 22px;
+    color: var(--teal);
+    margin-top: 2px;
+  }
+  .hood-list strong {
+    color: var(--text);
+  }
+
+  .ios-status {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+    font-size: 0.95rem;
+    color: var(--text-2);
+  }
+  .shots {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1.2rem;
+    margin-top: 1rem;
+  }
+  .shot {
+    margin: 0;
+    border-radius: 28px;
+    overflow: hidden;
+    border: 6px solid #0a0d12;
+    outline: 1px solid var(--line-strong);
+    box-shadow: var(--shadow);
+    background: #0a0d12;
+  }
+  .shot:nth-child(even) {
+    transform: translateY(22px);
+  }
+  .shot :global(img) {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .shots + .fine {
+    margin-top: 2.5rem;
+  }
+
+  .cta {
+    background: var(--glow);
+  }
+  .cta-row {
+    justify-content: center;
+    margin-top: 1.6rem;
+  }
+
+  @media (max-width: 900px) {
+    .hero-grid,
+    .caps,
+    .hood,
+    .split-head {
+      grid-template-columns: 1fr;
+    }
+    .hero-art {
+      order: -1;
+      max-width: 300px;
+    }
+    .float {
+      display: none;
+    }
+    .shots {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .shot:nth-child(even) {
+      transform: none;
+    }
+  }
+</style>
