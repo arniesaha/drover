@@ -752,6 +752,7 @@ def _build_runtime_mcp_server(
         backend_config=backend_config,
         spans_enabled=cfg.spans_enabled,
         embedding_model=_configured_embedding_model(cfg),
+        auth=load_auth(cfg),
     )
 
 

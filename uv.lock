@@ -417,7 +417,7 @@ requires-dist = [
     { name = "grpcio", specifier = ">=1.60" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27" },
     { name = "isort", marker = "extra == 'dev'", specifier = "==8.0.1" },
-    { name = "mcp", specifier = ">=1.2,<2" },
+    { name = "mcp", specifier = ">=1.27.1,<2" },
     { name = "opentelemetry-proto", specifier = ">=1.30" },
     { name = "psutil", marker = "extra == 'dev'", specifier = ">=7" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2,<4" },

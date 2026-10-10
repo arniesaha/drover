@@ -1,12 +1,16 @@
 import asyncio
 import json
 
+import pytest
+
 from drover.schema import bootstrap
 from drover.server.mcp import tools
 from drover.server.mcp.contract import READ_CAPS, serialized_bytes
 from drover.server.mcp.freshness import with_freshness
 from drover.server.mcp.server import build_mcp_server
 from drover.server.recall_bundle import _project_session_summary
+
+pytestmark = pytest.mark.usefixtures("authenticated_mcp_builder")
 
 
 def test_watermarks_are_data_times_and_per_item_hosts():
@@ -70,6 +74,11 @@ def test_unknown_freshness_is_explicit():
 
 
 def test_every_public_read_carries_freshness_even_without_data(tmp_path, monkeypatch):
+    from drover.server.profile import ProfileActor
+
+    monkeypatch.setattr(
+        "drover.server.mcp.server.http_actor", lambda *args: ProfileActor("test")
+    )
     path = tmp_path / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
     for name in READ_CAPS:

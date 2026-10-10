@@ -12,12 +12,25 @@ session context. Drover does not start agents or load their prompts.
 Collecting OpenClaw conversations into Drover is separate from this startup
 contract; see [OpenClaw session collection](openclaw.md).
 
-MCP: call `drover_profile` with `{"scope":"first_turn"}`. It always resolves to
-an anonymous general reader. It takes no agent or tier override.
+MCP: call `drover_profile` with `{"scope":"first_turn"}` and pass the client
+credential as `Authorization: Bearer <credential>` on every protocol request.
+Anonymous initialization and tools are refused, including on loopback. It takes
+no agent or tier override. Profile credentials resolve the same registered tier
+as HTTP; host/device credentials read general data. There is no anonymous
+escape hatch. Use a loopback URL or an operator-managed protected tunnel to the
+hub's loopback endpoint; non-loopback MCP binds are refused.
+
+Populate `DROVER_MCP_TOKEN` from the client's secret store with an issued profile
+credential for startup-only access, or an active host/device credential for
+recall and mutation tools. `DROVER_MCP_URL` names the loopback endpoint or tunnel.
+The bundled Python client and CLI read `DROVER_MCP_TOKEN` automatically. Codex
+uses `bearer_token_env_var`; Claude Code uses an HTTP `Authorization` header.
+See the client pages for exact snippets. Never include credentials in model
+context or checked-in configuration.
 
 HTTP: one `GET /profile?scope=first_turn` resolves the agent and tier from an
 active bearer credential registered in `profile_agents`. A requested tier or
-caller-supplied agent name cannot raise access. Trusted data stays HTTP-only.
+caller-supplied agent name cannot raise access. Both transports enforce these tiers.
 For example, using client environment variables populated by the operator:
 
 ```sh
@@ -28,7 +41,8 @@ curl --fail --silent --show-error --max-time 5 \
 
 Credentials are issued with `drover profile agents issue AGENT --tier trusted`
 and revoked with `drover profile agents revoke AGENT`. A newly issued credential
-has scope `profile` with no host identity and authorizes only `GET /profile`.
+has scope `profile` with no host identity and authorizes only HTTP `GET /profile`
+and MCP `drover_profile`.
 Only a verifier is stored on the server; the plaintext token is printed once.
 It cannot write proposals, use fleet/harness APIs, pair clients, manage other
 credentials or exchange for a browser session.

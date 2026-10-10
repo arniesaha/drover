@@ -37,13 +37,31 @@ device being paired has no credential yet. It answers identically for unknown,
 already used, and expired codes, and refuses a source after five failed
 attempts in a minute.
 
-Treat any credential as equivalent to interactive access to every registered
-harness host. Revoke rather than rotate when a single device is lost:
+Host/device credentials grant interactive access to every registered harness
+host. Profile credentials permit only tier-filtered profile reads; preflight
+credentials permit only their HTTP readiness allowlist. Revoke rather than
+rotate when a single device is lost:
 
 ```bash
 drover-server credentials list
 drover-server credentials revoke <credential-id>
 ```
+
+### MCP
+
+MCP requires bearer authentication even on loopback, with the same active
+credentials, revocation and legacy-token policy as HTTP. Every tool is guarded.
+Host/device credentials retain HTTP authority; profile credentials can only
+read `drover_profile` using their registered tier and cannot submit proposals
+or enqueue session-close work. The legacy operator bearer retains private
+profile access while enabled. Cookies cannot authenticate MCP.
+
+There is no anonymous escape hatch. `[auth] enabled = false` refuses MCP startup.
+Non-loopback MCP binds are refused because protected remote transport is not
+configured. Private LAN or Tailscale membership alone does not protect the MCP
+port. Client bearer setup and the capability table are in [MCP](mcp.md) and
+[client integrations](integrations/README.md). Profile import remains private
+by default; MCP authentication does not change import or promotion policy.
 
 ### Legacy shared token
 
@@ -73,7 +91,7 @@ host:
 Drover does not currently provide:
 
 - Multiple users or tenant isolation
-- RBAC, SSO, or scoped API permissions
+- General RBAC or SSO beyond the existing credential-scope allowlists
 - Host-identity-bound credentials or cryptographic host identity: a host
   credential is individually revocable but can act as any registered host
 - A sandbox around commands launched by an agent harness

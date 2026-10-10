@@ -20,9 +20,9 @@ dependencies = [
     "opentelemetry-proto>=1.30",
     "grpcio>=1.60",
     # Upper bound is load-bearing: mcp 2.0 removed mcp.server.fastmcp, which
-    # drover.server.mcp.server imports. Floor is 1.2, the release that first
-    # shipped FastMCP in the official SDK (verified against 1.2.0 and 1.29.0).
-    "mcp>=1.2,<2",
+    # drover.server.mcp.server imports. Require the verified bearer auth and
+    # request-context implementation used by the MCP security baseline.
+    "mcp>=1.27.1,<2",
     "pytz",
     "anthropic>=0.40",
     "requests",

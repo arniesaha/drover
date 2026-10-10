@@ -212,3 +212,32 @@ def pgvector_available(postgres_dsn: str) -> bool:
             "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'"
         ).fetchone()
     return row is not None
+
+
+@pytest.fixture
+def authenticated_mcp(tmp_path):
+    """Existing behavioral tests run with an explicit general host credential."""
+    from mcp_auth_helpers import bearer_context
+
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store = CredentialStore(tmp_path / "mcp-credentials.json")
+    _, token = store.issue(
+        scope="host", label="Synthetic MCP host", host_id="test-host"
+    )
+    auth = AuthSettings(True, "", credentials=store, legacy_token_enabled=False)
+    with bearer_context(token):
+        yield auth
+
+
+@pytest.fixture
+def authenticated_mcp_builder(authenticated_mcp, monkeypatch, request):
+    """Opt-in behavioral modules retain auth while testing the read contract."""
+    from functools import partial
+
+    monkeypatch.setattr(
+        request.module,
+        "build_mcp_server",
+        partial(request.module.build_mcp_server, auth=authenticated_mcp),
+    )

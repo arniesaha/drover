@@ -7,15 +7,22 @@ over the configured path so callers don't need to pass it.
 
 from __future__ import annotations
 
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Optional
 
+from mcp.server.auth.settings import AuthSettings as MCPAuthSettings
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import AnyHttpUrl
 
 from drover.server.mcp import tools as t
+from drover.server.mcp.auth import HTTPTokenVerifier, authorize, current_headers
 from drover.server.mcp.contract import ReadAdmission
+from drover.server.profile import http_actor
 from drover.server.recall_bundle import RecallBundleService
 from drover.server.summarizer.backends import SummarizerBackendConfig
+from drover.server.web.auth import AuthSettings
 
 
 def build_mcp_server(
@@ -27,6 +34,7 @@ def build_mcp_server(
     backend_config: Optional[SummarizerBackendConfig] = None,
     spans_enabled: bool = False,
     embedding_model: Optional[str] = None,
+    auth: AuthSettings | None = None,
 ) -> FastMCP:
     """Construct a FastMCP server with all Drover tools registered.
 
@@ -39,15 +47,58 @@ def build_mcp_server(
     ``embedding_model`` names the embedding space ``drover_recall`` searches
     (the model the embedding worker writes session vectors with). Without it,
     recall falls back to keyword matching over summaries.
+    ``auth`` must use the HTTP runtime settings. Omission denies every caller;
+    explicitly disabled auth and non-loopback binds refuse construction.
     """
-    mcp = FastMCP(name, host=host, port=port)
+    # Protected remote transport is not configured by this server. Bearer auth
+    # alone does not protect tokens in transit, so remote binds fail closed.
+    try:
+        loopback = host == "localhost" or ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ValueError(
+            "MCP requires a loopback bind; protected remote transport is not configured"
+        )
+    auth = auth if auth is not None else AuthSettings(enabled=True, api_token="")
+    if not auth.enabled:
+        raise ValueError("MCP requires authentication; enable [auth] enabled")
+    bind_authority = f"[{host}]" if ":" in host else host
+    mcp = FastMCP(
+        name,
+        host=host,
+        port=port,
+        token_verifier=HTTPTokenVerifier(auth),
+        auth=MCPAuthSettings(
+            issuer_url=AnyHttpUrl(f"http://localhost:{port}"),
+            resource_server_url=None,
+        ),
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[bind_authority, f"{bind_authority}:*"],
+            allowed_origins=[f"http://{bind_authority}", f"http://{bind_authority}:*"],
+        ),
+    )
     db = Path(duckdb_path)
     bcfg = backend_config
     admission = ReadAdmission(path=db)
 
-    def read_tool():
+    def mutation_tool(*, path="/mcp/mutate"):
         def register(fn):
-            return mcp.tool()(admission.wrap(fn))
+            return mcp.tool()(authorize(auth, server=mcp, method="POST", path=path)(fn))
+
+        return register
+
+    def read_tool(*, profile=False, mutating=False):
+        def register(fn):
+            # Active handoff can generate model work on a cache miss.
+            method = "POST" if mutating else "GET"
+            path = "/profile" if profile else "/mcp/read"
+            return mcp.tool()(
+                authorize(auth, server=mcp, method=method, path=path)(
+                    admission.wrap(fn)
+                )
+            )
 
         return register
 
@@ -55,7 +106,7 @@ def build_mcp_server(
         duckdb_path=db,
     )
 
-    @mcp.tool()
+    @mutation_tool(path="/profile/proposals")
     def drover_profile_propose(
         layer: str,
         kind: str,
@@ -65,7 +116,7 @@ def build_mcp_server(
         item_id: Optional[str] = None,
         expires_at: Optional[str] = None,
     ) -> dict:
-        """Propose a profile change as a general reader; user approval is required."""
+        """Propose a profile change using the authenticated HTTP actor policy."""
         from drover.server.profile import propose_profile
 
         return propose_profile(
@@ -73,12 +124,17 @@ def build_mcp_server(
             dict(layer=layer, kind=kind, tier=tier, body=body, expires_at=expires_at),
             session_id=session_id,
             item_id=item_id,
+            actor=http_actor(db, auth, current_headers(mcp)),
         )
 
-    @read_tool()
+    @read_tool(profile=True)
     def drover_profile(scope: str = "first_turn") -> dict:
-        """Load a bounded portable profile. This unauthenticated transport is general."""
-        return t.drover_profile(duckdb_path=db, scope=scope)
+        """Load a bounded portable profile using the credential's registered tier."""
+        return t.drover_profile(
+            duckdb_path=db,
+            scope=scope,
+            actor=http_actor(db, auth, current_headers(mcp)),
+        )
 
     @read_tool()
     def drover_memory_acceptance(harness_ids: list[str]) -> dict:
@@ -198,7 +254,7 @@ def build_mcp_server(
             limit=limit,
         )
 
-    @mcp.tool()
+    @mutation_tool()
     def drover_session_close(session_id: str) -> dict:
         """Enqueue a source-versioned summary generation for the session.
 
@@ -366,7 +422,7 @@ def build_mcp_server(
             limit=limit,
         )
 
-    @read_tool()
+    @read_tool(mutating=True)
     def drover_active_handoff(session_id: str, max_age_seconds: float = 60) -> dict:
         """Rolling handoff brief for an OPEN session.
 

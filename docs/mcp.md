@@ -1,4 +1,43 @@
-# MCP read contract
+# MCP authentication and read contract
+
+## Authentication and capabilities
+
+Every MCP protocol request requires `Authorization: Bearer <credential>`,
+including initialization, tool discovery, reads and mutations. Anonymous calls
+and revoked credentials are refused. There is no anonymous local escape hatch.
+The runtime loads the same credential store, legacy-token setting and token
+resolution as HTTP. Disabling `[auth] enabled` disables MCP startup.
+
+| Credential | MCP capabilities |
+| --- | --- |
+| Active host/device | General reads, profile reads at general tier, proposals and session close |
+| Active profile | Only `drover_profile`, at the registered profile-agent tier |
+| Preflight or unknown scope | No tool access |
+| Legacy operator token, when enabled | Reads including private profile, proposals and session close |
+
+`drover_active_handoff` also requires mutation authority because a cache miss
+can generate model work. Profile credentials stay read-only at every tier.
+Caller-supplied identities or tiers cannot raise access. Each invocation
+rechecks the HTTP scope policy and revocation before execution, and profile
+reads use the shared actor resolver. HTTP session cookies are not MCP credentials.
+
+The server refuses non-loopback binds with a protected-transport error. There
+is currently no protected remote transport configuration, so private-network
+reachability alone does not permit a remote bind. Use a loopback endpoint or an
+operator-managed protected tunnel to it. TLS and internet ingress are outside
+this release step. Existing clients need the credential configuration in
+[client integrations](integrations/README.md) before upgrading.
+
+The bundled Python clients, `drover mcp tools` / `drover mcp call`, and
+`drover-hook` lifecycle commands read `DROVER_MCP_TOKEN` from the client
+environment. Lifecycle hooks need a host/device credential for handoff reads
+and session-close mutations; a profile-only credential cannot authorize them.
+Python callers may instead pass `token=` to `call_tool` or `list_tools` (including
+the hook client's `call_tool`). The credential accompanies initialization,
+the initialized notification and every subsequent request. The server CLI client
+refuses redirects.
+
+## Read contract
 
 Every registered read tool uses `src/drover/server/mcp/contract.py`. Limits must
 be positive integers; oversized limits clamp before execution and set top-level
@@ -119,7 +158,7 @@ watermark. Identity and watermark metadata count toward the byte budget.
 ## Portable profile
 
 `drover_profile(scope="first_turn")` returns a tier-filtered portable profile
-within a 1,500-token ceiling. The current MCP transport reads as general.
+within a 1,500-token ceiling, using the verified credential's profile tier.
 `drover_profile_propose(layer, kind, tier, body, ...)` creates a pending proposal.
 See [portable profile](portable-profile.md) for credential-authenticated HTTP,
 trusted reads, pending proposals, operator review, reversal and markdown import.
@@ -130,4 +169,4 @@ Client startup examples and the single-call profile contract are in
 [docs/integrations](integrations/README.md). Profile bundles report
 `oldest_item_age_seconds` alongside their rendered-source watermark. Empty
 profiles retain an unknown watermark even when unrelated hub data is fresh.
-Clients own startup loading; trusted profile reads use authenticated HTTP.
+Clients own startup loading; trusted profile reads can use either authenticated transport.

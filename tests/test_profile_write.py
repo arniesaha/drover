@@ -21,6 +21,8 @@ from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import DISABLED, AuthSettings
 from drover.server.web.credentials import PostgresCredentialStore
 
+pytestmark = pytest.mark.usefixtures("authenticated_mcp_builder")
+
 USER = ProfileActor("operator", "private", True)
 TRUSTED = ProfileActor("example-trusted", "trusted")
 GENERAL = ProfileActor("example-general")
