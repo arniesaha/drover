@@ -732,7 +732,7 @@ def test_private_content_never_appears_in_alert(tmp_path, config):
             None,
         )
     )["aps"]["alert"]
-    assert alert == {"title": "Session", "body": "Needs your input: reply in the app"}
+    assert alert == {"title": "drover", "body": "Needs your input: reply in the app"}
     sender.close()
 
 
@@ -747,7 +747,7 @@ def test_collapse_id_is_byte_bounded_and_collision_resistant():
 def test_batch_has_fixed_window_and_latest_state_per_session(tmp_path, config):
     store, _ = _paired_device(tmp_path)
     sender, client, now = _batch_sender(config, store)
-    sender.notify(_transition(awaiting="input"))
+    sender.notify(_transition(status="completed"))
     now[0] = 159
     sender.notify(_transition(session_id="sess-2", status="completed"))
     sender.notify(_transition(session_id="sess-2", status="failed"))
@@ -758,8 +758,8 @@ def test_batch_has_fixed_window_and_latest_state_per_session(tmp_path, config):
     assert len(client.posts) == 1
     payload = json.loads(client.posts[0]["content"])
     assert payload["session_ids"] == ["sess-1", "sess-2"]
-    assert payload["aps"]["alert"]["body"] == "1 session needs input, 1 session failed"
-    assert payload["aps"]["interruption-level"] == "time-sensitive"
+    assert payload["aps"]["alert"]["body"] == "1 session finished, 1 session failed"
+    assert payload["aps"]["interruption-level"] == "active"
     sender.notify(_transition(status="completed"))
     now[0] = 220
     sender.flush_due()
@@ -862,4 +862,46 @@ def test_all_updates_device_receives_progress_while_default_device_does_not(
     assert (
         json.loads(client.posts[0]["content"])["aps"]["interruption-level"] == "active"
     )
+    sender.close()
+
+
+@pytest.mark.parametrize("mode", ["action", "all"])
+@pytest.mark.parametrize("awaiting", ["input", "approval"])
+def test_needs_input_shortens_existing_batch_and_includes_pending_sessions(
+    tmp_path, config, mode, awaiting
+):
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, mode)
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition(session_id="finished", status="completed"))
+    now[0] = 110
+    sender.notify(_transition(session_id="waiting", awaiting=awaiting))
+    now[0] = 114
+    sender.notify(_transition(session_id="failed", status="failed"))
+    sender.flush_due()
+    assert client.posts == []
+    now[0] = 115
+    sender.flush_due()
+    assert len(client.posts) == 1
+    payload = json.loads(client.posts[0]["content"])
+    assert payload["session_ids"] == ["failed", "finished", "waiting"]
+    assert (
+        payload["aps"]["alert"]["body"]
+        == "1 session finished, 1 session needs input, 1 session failed"
+    )
+    assert payload["aps"]["interruption-level"] == "time-sensitive"
+    sender.close()
+
+
+def test_repeated_urgent_states_do_not_extend_short_window(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition(awaiting="approval"))
+    now[0] = 104
+    sender.notify(_transition(awaiting="input"))
+    sender.flush_due()
+    assert client.posts == []
+    now[0] = 105
+    sender.flush_due()
+    assert len(client.posts) == 1
     sender.close()

@@ -187,6 +187,7 @@ class AwaitingTransition:
     title: str = ""
     status: str = ""
     private: bool = False
+    repo_name: str | None = None
 
     @property
     def needs_user(self) -> bool:
@@ -210,7 +211,9 @@ class AwaitingTransition:
 
     def alert_title(self) -> str:
         if self.private:
-            return "Session"
+            return (
+                self._safe_text(self.repo_name) or self._safe_text(_basename(self.cwd))
+            )[:60] or "Session"
         return (self._safe_text(self.title) or self._safe_text(_basename(self.cwd)))[
             :60
         ] or "Session"
@@ -407,10 +410,12 @@ class APNsSender:
         clock=time.time,
         timer_factory=threading.Timer,
         batch_seconds: float = 60,
+        input_batch_seconds: float = 5,
     ):
         self._clock = clock
         self._timer_factory = timer_factory
         self._batch_seconds = batch_seconds
+        self._input_batch_seconds = input_batch_seconds
         self._pending_lock = threading.Lock()
         self._pending = {}
         self._timer = None
@@ -520,11 +525,21 @@ class APNsSender:
                         entry[2].pop(transition.session_id, None)
                     continue
                 delay = (
-                    (86400 - now % 86400) if mode == "digest" else self._batch_seconds
+                    (86400 - now % 86400)
+                    if mode == "digest"
+                    else (
+                        min(self._batch_seconds, self._input_batch_seconds)
+                        if transition.needs_user
+                        else self._batch_seconds
+                    )
                 )
                 if entry is None or entry[1] != mode:
                     entry = [now + delay, mode, {}]
                     self._pending[credential.id] = entry
+                else:
+                    # An urgent state can advance a normal batch's deadline;
+                    # subsequent updates can never postpone that deadline.
+                    entry[0] = min(entry[0], now + delay)
                 entry[2][transition.session_id] = transition
             self._schedule_locked()
 

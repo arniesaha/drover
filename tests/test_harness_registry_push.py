@@ -283,16 +283,118 @@ def test_terminal_status_notifies_once_and_uses_assistant_summary(registry, send
     assert sender.sent[0].alert_body() == "Finished: Capture is ready for review"
 
 
-def test_private_profile_suppresses_prompt_and_assistant_text(registry, sender):
+def test_other_sessions_private_profiles_do_not_hide_title_or_summary(registry, sender):
     with registry._connect() as con:
         con.execute("CREATE TABLE profile_items (tier TEXT)")
         con.execute("INSERT INTO profile_items VALUES ('private')")
+        con.execute("CREATE TABLE profile_agents (tier TEXT)")
+        con.execute("INSERT INTO profile_agents VALUES ('private')")
+        con.execute("CREATE TABLE profile_proposals (session_id TEXT)")
+        con.execute("INSERT INTO profile_proposals VALUES ('other-session')")
+    registry.create_session(
+        session_id="other-session",
+        host_id="mac-mini",
+        harness="claude-code",
+        command="claude",
+    )
+    registry.append_event(
+        session_id="other-session",
+        event_type="tool_action",
+        payload={"tool": "drover_profile"},
+    )
+    registry.append_event(
+        session_id="sess-1",
+        event_type="user_input",
+        payload={"text": "Fix capture preview"},
+    )
+    _assistant_says(registry, "Capture is ready for review", seq=1)
+    registry.update_session_status("sess-1", "completed")
+    assert not sender.sent[0].private
+    assert sender.sent[0].alert_title() == "Fix capture preview"
+    assert sender.sent[0].alert_body() == "Finished: Capture is ready for review"
+
+
+@pytest.mark.parametrize(
+    "event_type,payload",
+    [
+        ("tool_action", {"tool": "drover_profile"}),
+        (
+            "tool_action",
+            {
+                "payload": {
+                    "tool": "mcp__drover__drover_profile",
+                    "input": {"scope": "first_turn"},
+                }
+            },
+        ),
+        ("tool_action", {"tool_name": "profile_load"}),
+        ("tool_result", {"tool": "drover_profile"}),
+        (
+            "status",
+            {
+                "payload": {
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "drover",
+                        "tool": "drover_profile",
+                    }
+                }
+            },
+        ),
+        ("tool_action", {"tool": "shell", "input": {"command": "drover profile load"}}),
+    ],
+)
+@pytest.mark.parametrize(
+    "repo_name,want_title", [(None, "drover"), ("capture", "capture")]
+)
+def test_session_profile_read_preserves_public_title_and_drops_summary(
+    registry, sender, event_type, payload, repo_name, want_title
+):
+    with registry._connect() as con:
+        con.execute(
+            "UPDATE harness_sessions SET repo_name = ? WHERE session_id = 'sess-1'",
+            [repo_name],
+        )
+    registry.append_event(
+        session_id="sess-1",
+        event_type="user_input",
+        payload={"text": "Synthetic private prompt"},
+    )
+    registry.append_event(session_id="sess-1", event_type=event_type, payload=payload)
     _assistant_says(registry, "Synthetic private context", seq=1)
-    registry.update_session_activity("sess-1", awaiting="input")
+    registry.update_session_status("sess-1", "completed")
     assert sender.sent[0].private
     assert sender.sent[0].preview == ""
+    assert sender.sent[0].alert_title() == want_title
+    assert sender.sent[0].alert_body() == "Finished: ready for review"
+
+
+def test_profile_mention_in_assistant_text_is_not_a_profile_read(registry, sender):
+    registry.append_event(
+        session_id="sess-1",
+        event_type="tool_action",
+        payload={"tool": "read_file", "input": {"file": "profile.py"}},
+    )
+    _assistant_says(registry, "Add tests for drover_profile", seq=1)
+    registry.update_session_activity("sess-1", awaiting="input")
+    assert not sender.sent[0].private
+    assert "Add tests" in sender.sent[0].alert_body()
+
+
+def test_notification_privacy_exception_fails_closed(registry, sender, monkeypatch):
+    def broken_connection():
+        raise RuntimeError("Synthetic unavailable event store")
+
+    monkeypatch.setattr(registry, "_connect", broken_connection)
+    registry._dispatch_session_push(
+        session_id="sess-1",
+        status="completed",
+        cwd="capture",
+        preview="Synthetic private text",
+    )
+    assert sender.sent[0].private
     assert sender.sent[0].alert_title() == "Session"
-    assert "Synthetic" not in sender.sent[0].alert_body()
+    assert sender.sent[0].alert_body() == "Finished: ready for review"
 
 
 @pytest.mark.parametrize("exit_code,kind", [(0, "finished"), (1, "failed")])
@@ -346,15 +448,3 @@ def test_completed_turn_is_normal_even_though_session_accepts_input(
     assert sender.sent[0].kind == kind
     assert not sender.sent[0].needs_user
     assert registry.get_session("sess-1").status == "running"
-
-
-def test_private_profile_agent_suppresses_conversation_after_item_removal(
-    registry, sender
-):
-    with registry._connect() as con:
-        con.execute("CREATE TABLE profile_agents (tier TEXT)")
-        con.execute("INSERT INTO profile_agents VALUES ('private')")
-    _assistant_says(registry, "Synthetic private context", seq=1)
-    registry.update_session_activity("sess-1", awaiting="input")
-    assert sender.sent[0].private
-    assert sender.sent[0].preview == ""

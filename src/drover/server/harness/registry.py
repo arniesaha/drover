@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
@@ -202,6 +203,7 @@ def _dispatch_awaiting_push(
     title: str = "",
     status: str = "",
     private: bool = False,
+    repo_name: str | None = None,
 ) -> None:
     """Tell the push layer a session changed awaiting state.
 
@@ -222,6 +224,7 @@ def _dispatch_awaiting_push(
                 title=title,
                 status=status,
                 private=private,
+                repo_name=repo_name,
             )
         )
     except Exception:  # noqa: BLE001 - never break activity recording
@@ -1125,39 +1128,9 @@ class HarnessRegistry:
                             )
                 # A finished turn can accept a new prompt, but completion itself
                 # is a normal alert. Explicit input/approval states remain urgent.
-                # No provenance links assistant output to profile reads. Fail closed
-                # for the whole fleet while private material (including reverted
-                # history and pending proposals) could have entered a conversation.
-                tables = {
-                    str(item[0])
-                    for item in con.execute(
-                        "SELECT table_name FROM information_schema.tables WHERE table_name IN ('profile_items', 'profile_proposals', 'profile_agents')"
-                    ).fetchall()
-                }
-                private = False
-                if "profile_items" in tables:
-                    private = (
-                        con.execute(
-                            "SELECT 1 FROM profile_items WHERE tier = 'private' LIMIT 1"
-                        ).fetchone()
-                        is not None
-                    )
-                if "profile_proposals" in tables:
-                    private = (
-                        private
-                        or con.execute(
-                            "SELECT 1 FROM profile_proposals LIMIT 1"
-                        ).fetchone()
-                        is not None
-                    )
-                if "profile_agents" in tables:
-                    private = (
-                        private
-                        or con.execute(
-                            "SELECT 1 FROM profile_agents WHERE tier = 'private' LIMIT 1"
-                        ).fetchone()
-                        is not None
-                    )
+                # Profile reads taint only the conversation that made the call.
+                # Until tools carry result tiers, any profile read is conservative.
+                private = self._session_read_profile(con, session_id)
                 title = ""
                 if not private:
                     prompt = con.execute(
@@ -1185,6 +1158,7 @@ class HarnessRegistry:
                     title=title,
                     status=notification_status,
                     private=private,
+                    repo_name=row[1],
                 )
         except Exception:  # Notification privacy checks fail closed.
             _dispatch_awaiting_push(
@@ -1195,6 +1169,58 @@ class HarnessRegistry:
                 status=status or "",
                 private=True,
             )
+
+    @staticmethod
+    def _session_read_profile(con, session_id: str) -> bool:
+        payload_expr = event_payload_expression(con)
+        rows = con.execute(
+            f"""SELECT e.event_type, e.content_preview, {payload_expr}
+                  FROM harness_events e {event_payload_join(con)}
+                 WHERE e.session_id = ?
+                   AND (e.event_type IN ('tool_action', 'tool_result', 'approval_prompt', 'command', 'status')
+                        OR e.normalized_type IN ('tool_action', 'tool_result'))
+                   AND (lower(COALESCE({payload_expr}, '')) LIKE '%profile%'
+                        OR lower(COALESCE(e.content_preview, '')) LIKE '%profile%')""",
+            [session_id],
+        ).fetchall()
+        profile_tool = re.compile(
+            r"(?:^|[_.:/-])(?:drover[_-])?profile(?:[_.:/-](?:load|read|get))?$|(?:^|[_.:/-])load_profile$",
+            re.I,
+        )
+        profile_command = re.compile(
+            r"\bdrover(?:-server)?\s+profile\s+(?:load|read|show)\b", re.I
+        )
+        for event_type, preview, raw in rows:
+            payload = json.loads(raw or "{}")
+            if not isinstance(payload, dict):
+                raise ValueError("invalid tool event payload")
+            inner = payload.get("payload", payload)
+            if not isinstance(inner, dict):
+                raise ValueError("invalid tool event envelope")
+            # Claude/DeepSeek/AGY expose tool names directly. Codex stores
+            # MCP calls as status items, so inspect that item's metadata too.
+            item = inner.get("item")
+            metadata = [inner]
+            if isinstance(item, dict) and item.get("type") == "mcp_tool_call":
+                metadata.append(item)
+            for fields in metadata:
+                for key in ("tool", "tool_name", "name"):
+                    name = fields.get(key)
+                    if isinstance(name, str) and profile_tool.search(name):
+                        return True
+                tool_input = fields.get("input")
+                command = fields.get("command")
+                if isinstance(tool_input, dict):
+                    command = tool_input.get("command", command)
+                if isinstance(command, str) and profile_command.search(command):
+                    return True
+            # Old tool events can carry only their name/command preview.
+            if event_type != "status" and isinstance(preview, str):
+                if profile_tool.search(preview.strip()) or profile_command.search(
+                    preview
+                ):
+                    return True
+        return False
 
     @staticmethod
     def _attention_preview(con: duckdb.DuckDBPyConnection, session_id: str) -> str:
