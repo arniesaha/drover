@@ -13,6 +13,25 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
+    func testHomeHeaderScrollsAwayAtAccessibilityXXXL() {
+        let app = coreJourneyApp()
+        app.launch()
+        let fleet = app.scrollViews["fleet-list"]
+        XCTAssertTrue(fleet.waitForExistence(timeout: timeout))
+        XCTAssertGreaterThan(fleet.frame.height, app.frame.height * 0.5)
+        let header = app.descendants(matching: .any)["home-status-header"].firstMatch
+        XCTAssertTrue(header.waitForExistence(timeout: timeout))
+        let initialY = header.frame.minY
+        fleet.swipeUp()
+        XCTAssertTrue(!header.exists || !header.isHittable || header.frame.minY < initialY - 40,
+                      "The status header must move with the list at XXXL")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Home scrolling header at Accessibility XXXL"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    @MainActor
     func testCoreJourneyKeepsRecoveryControlsReachableAtAccessibilityXXXL() {
         let app = coreJourneyApp()
         app.launch()

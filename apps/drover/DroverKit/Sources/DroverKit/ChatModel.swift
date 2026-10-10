@@ -167,6 +167,10 @@ public final class ChatModel {
     /// so a slow network cannot be mistaken for a dead send button --
     /// which is what produced nine duplicate turns from one message.
     public private(set) var isSending = false
+    public private(set) var isStopping = false
+    public private(set) var isEnded = false
+    public private(set) var endedMessage = "Session ended. Start or continue a session to send a message."
+
     /// A turn that has been removed from the composer and is waiting for its
     /// exact `user_input` stream echo. It is the model-level send gate: while
     /// present, normal sends cannot create an accidental duplicate.
@@ -259,6 +263,8 @@ public final class ChatModel {
             base = SessionActivityPresentation(messages: messages)
             activityCache = (messagesVersion, base)
         }
+        if isEnded { return base.overriding(phase: .completed, title: "Session ended") }
+        if isStopping { return base.overriding(phase: .stopping, title: "Stopping...") }
         guard isConnected else {
             return base.overriding(phase: hasConnectedOnce ? .reconnecting : .connecting,
                                    title: hasConnectedOnce ? "Reconnecting" : "Connecting")
@@ -321,6 +327,8 @@ public final class ChatModel {
     /// duplicate that delivery.
     public var canSendTurn: Bool {
         controls.capabilities.launchModes.contains(.structured)
+            && !isEnded
+            && !isStopping
             && !isSending
             && !isCommittingPendingDeliveryAction
             && pendingTurn == nil
@@ -574,6 +582,7 @@ public final class ChatModel {
         case .message(let message):
             messages.append(message)
             messagesVersion &+= 1
+            noteLifecycle(message)
             noteApproval(message)
             refreshRecapAfterTurnComplete(message)
             dispatchQueuedTurnIfComplete(message)
@@ -583,6 +592,7 @@ public final class ChatModel {
             // Losing a response usually means losing the socket too, so the
             // echo that confirms a pending delivery often arrives here
             // rather than as a live message.
+            messages.forEach { noteLifecycle($0, live: false) }
             messages.forEach(confirmPendingTurn)
         case .connection(let connected):
             isConnected = connected
@@ -833,6 +843,7 @@ public final class ChatModel {
     /// The hub returns the original accepted turn without dispatching it
     /// again, so recovery is safe even if the first response was lost.
     public func retryPendingTurn() async {
+        guard !isEnded, !isStopping else { return }
         guard !isCommittingPendingDeliveryAction,
               var pendingTurn,
               pendingTurn.canRetry,
@@ -1360,6 +1371,7 @@ public final class ChatModel {
     private func dispatchQueuedTurnIfComplete(_ message: HarnessMessage) {
         guard message.type == .status,
               message.payload["turn_complete"]?.boolValue == true,
+              !isEnded, !isStopping,
               queuedTurn != nil || !queuedAttachments.isEmpty
         else { return }
         let text = queuedTurn ?? ""
@@ -1431,6 +1443,7 @@ public final class ChatModel {
     }
 
     private func sendQueued(_ text: String, images: [TurnAttachment]) async {
+        guard !isEnded, !isStopping else { return }
         guard pendingTurn == nil else {
             queuedTurn = queuedTurn.map { "\(text)\n\($0)" } ?? text
             queuedAttachments = images + queuedAttachments
@@ -1617,6 +1630,11 @@ public final class ChatModel {
     }
 
     private func applySessionMetadata(_ snapshot: HarnessSnapshot, session: SessionSummary) {
+        if ["completed", "terminated", "errored", "failed"].contains(session.status) {
+            isEnded = true
+            isStopping = false
+            pendingApproval = nil
+        }
         harnessPresentation = HarnessPresentation(session.harness)
         if let generatedRecap = session.recap, !generatedRecap.isEmpty {
             let isOlderThanCurrent = {
@@ -1659,24 +1677,50 @@ public final class ChatModel {
         await loadSessionMetadata()
     }
 
+    private func noteLifecycle(_ message: HarnessMessage, live: Bool = true) {
+        guard message.type == .status else { return }
+        if message.payload["session_status"]?.stringValue == "terminated"
+            || (message.payload["exited"] != nil && message.turnID == nil) {
+            isEnded = true
+            isStopping = false
+            pendingApproval = nil
+            endedMessage = "Session ended. Start or continue a session to send a message."
+        } else if live && message.payload["turn_complete"]?.boolValue == true {
+            isStopping = false
+        }
+    }
+
     public func interrupt() async {
+        guard !isStopping, !isEnded else { return }
         if let reason = controls.interruptUnavailableReason {
             hint = reason
             return
         }
+        isStopping = true
         do {
             try await client.interrupt(sessionID: sessionID)
             hint = nil
         } catch {
+            isStopping = false
             applyHint(for: error, action: "interrupt")
         }
     }
 
     public func terminate() async {
+        guard !isEnded else { return }
+        isEnded = true
+        isStopping = false
+        endedMessage = "Ending session. The composer is disabled."
         do {
-            try await client.terminate(sessionID: sessionID)
+            let confirmed = try await client.terminate(sessionID: sessionID)
+            endedMessage = confirmed
+                ? "Session ended. Start or continue a session to send a message."
+                : "Termination requested. Waiting for the host to confirm. The composer is disabled."
+            pendingApproval = nil
             hint = nil
         } catch {
+            // A lifecycle event can confirm termination while HTTP fails.
+            if endedMessage == "Ending session. The composer is disabled." { isEnded = false }
             applyHint(for: error, action: "terminate")
         }
     }

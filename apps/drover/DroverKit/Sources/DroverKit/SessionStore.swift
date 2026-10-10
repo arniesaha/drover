@@ -35,6 +35,20 @@ public final class SessionStore {
     }
 
     private let client: DroverClient?
+    private var optimisticEnded: [String: SessionSummary] = [:]
+
+    public func markSessionEnded(_ id: String, ended: Bool) {
+        guard let index = snapshot?.sessions.firstIndex(where: { $0.id == id }) else { return }
+        if ended {
+            if let status = snapshot?.sessions[index].status,
+               ["completed", "terminated", "errored", "failed"].contains(status) { return }
+            if optimisticEnded[id] == nil { optimisticEnded[id] = snapshot?.sessions[index] }
+            snapshot?.sessions[index].status = "terminated"
+            snapshot?.sessions[index].awaiting = nil
+        } else if let previous = optimisticEnded.removeValue(forKey: id) {
+            snapshot?.sessions[index] = previous
+        }
+    }
 
     public private(set) var snapshot: HarnessSnapshot?
     public private(set) var lastError: String?
@@ -285,7 +299,16 @@ public final class SessionStore {
         guard let client else { return }
         refreshAttempts += 1
         do {
-            let fresh = try await client.snapshot()
+            var fresh = try await client.snapshot()
+            for index in fresh.sessions.indices where optimisticEnded[fresh.sessions[index].id] != nil {
+                let session = fresh.sessions[index]
+                if ["completed", "terminated", "errored", "failed"].contains(session.status) {
+                    optimisticEnded.removeValue(forKey: session.id)
+                } else {
+                    fresh.sessions[index].status = "terminated"
+                    fresh.sessions[index].awaiting = nil
+                }
+            }
             snapshot = fresh
             busyUntil = nil
             lastError = nil

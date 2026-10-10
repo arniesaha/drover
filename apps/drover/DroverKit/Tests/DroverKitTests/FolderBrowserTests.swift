@@ -15,6 +15,29 @@ extension MockNetworkTests {
 struct FolderBrowserTests {
     let mock = MockNetwork()
 
+    @Test func errorMappingCoversEndpointPermissionsNetworkAndPaths() {
+        let cases: [(DroverError, FolderBrowserFailure)] = [
+            (.unavailable("Not Found"), .unsupported),
+            (.unavailable("{\"reason\":\"unsupported\"}"), .unsupported),
+            (.unavailable("does not support path completion"), .unsupported),
+            (.httpStatus(405, ""), .unsupported), (.httpStatus(501, ""), .unsupported),
+            (.unavailable("unknown harness host: fixture"), .hostUnavailable),
+            (.unauthorized, .authentication), (.httpStatus(401, ""), .authentication),
+            (.httpStatus(403, ""), .permissionDenied),
+            (.transport("offline"), .offline), (.transport("timed out"), .offline),
+            (.httpStatus(504, ""), .offline), (.busy(until: .now), .offline),
+            (.badRequest("invalid path"), .unavailable),
+            (.unavailable("path not found"), .unavailable),
+            (.unavailable("not_found"), .unavailable),
+            (.unavailable("not_directory"), .unavailable),
+            (.unavailable("not a directory"), .unavailable),
+            (.unavailable("outside allowed roots"), .permissionDenied),
+            (.decoding("malformed"), .invalidResponse),
+        ]
+        for (error, expected) in cases { #expect(FolderBrowserFailure.classify(error) == expected) }
+        #expect(FolderBrowserFailure.unsupported.message.contains("newer Drover version"))
+    }
+
     @Test @MainActor func listingUsesSelectedHostAndEscapesQuery() async throws {
         mock.handler = { request in
             #expect(request.url?.path == "/harness/hosts/test-host/fs/list")
