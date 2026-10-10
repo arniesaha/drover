@@ -222,8 +222,8 @@ def test_alert_carries_time_sensitive_payload_and_collapse_id(tmp_path, config):
 
     aps = json.loads(post["content"])["aps"]
     assert aps["alert"] == {
-        "title": "claude-code needs you",
-        "body": "drover — approval required",
+        "title": "drover",
+        "body": "Needs your input: approve a command",
     }
     assert aps["interruption-level"] == "time-sensitive"
 
@@ -245,7 +245,7 @@ def test_input_and_approval_read_differently(tmp_path, config):
     sender._deliver(_transition(awaiting="input"))
 
     body = json.loads(client.posts[0]["content"])["aps"]["alert"]["body"]
-    assert body == "drover — your turn"
+    assert body == "Needs your input: reply in the app"
 
 
 def test_gone_response_clears_the_registration(tmp_path, config):
@@ -585,14 +585,14 @@ def test_body_quotes_the_agent_rather_than_a_generic_phrase(tmp_path, config):
     client = FakeClient()
     sender = APNsSender(config, store, client=client)
 
-    sender._deliver(_transition(preview="Ready to deploy. Want me to push?"))
+    sender._deliver(
+        _transition(awaiting="input", preview="Ready to deploy. Want me to push?")
+    )
 
     alert = json.loads(client.posts[0]["content"])["aps"]["alert"]
-    assert alert["body"] == "Ready to deploy. Want me to push?"
-    # Title still identifies the harness; the subtitle carries what the body
-    # used to say, so nothing is lost by promoting the message.
-    assert alert["title"] == "claude-code needs you"
-    assert alert["subtitle"] == "drover · approval required"
+    assert alert["body"] == "Needs your input: Ready to deploy. Want me to push?"
+    assert alert["title"] == "drover"
+    assert "subtitle" not in alert
 
 
 def test_without_a_preview_the_old_wording_survives(tmp_path, config):
@@ -602,7 +602,7 @@ def test_without_a_preview_the_old_wording_survives(tmp_path, config):
     APNsSender(config, store, client=client)._deliver(_transition(preview=""))
 
     alert = json.loads(client.posts[0]["content"])["aps"]["alert"]
-    assert alert["body"] == "drover — approval required"
+    assert alert["body"] == "Needs your input: approve a command"
     # No subtitle, because it would only repeat the body.
     assert "subtitle" not in alert
 
@@ -611,9 +611,7 @@ def test_markdown_is_flattened_for_a_lock_screen():
     from drover.server.push.apns import _condense
 
     assert _condense("**Done**\n- one\n- two") == "Done • one • two"
-    # Backticks stay: `git push --force` still reads as a command, and
-    # stripping them would change what the command looks like.
-    assert _condense("Run `git push --force`") == "Run `git push --force`"
+    assert _condense("Run `git push --force`") == "Run git push --force"
 
 
 def test_long_messages_are_cut_on_a_word_boundary():
@@ -641,3 +639,269 @@ def test_blank_previews_never_produce_a_body_of_whitespace():
 
     assert _condense("   \n\t ") == ""
     assert _condense(None) == ""
+
+
+class ManualTimer:
+    def __init__(self, delay, callback):
+        self.delay = delay
+        self.callback = callback
+        self.daemon = False
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        pass
+
+
+def _batch_sender(config, store):
+    now = [100.0]
+    client = FakeClient()
+    sender = APNsSender(
+        config, store, client=client, clock=lambda: now[0], timer_factory=ManualTimer
+    )
+    return sender, client, now
+
+
+@pytest.mark.parametrize(
+    "mode,awaiting,status,allowed",
+    [
+        ("action", "input", "running", True),
+        ("action", "approval", "running", True),
+        ("action", None, "completed", True),
+        ("action", None, "failed", True),
+        ("action", None, "errored", True),
+        ("action", None, "running", False),
+        ("action", None, "terminated", False),
+        ("all", None, "running", True),
+        ("digest", "input", "running", True),
+        ("digest", None, "running", False),
+    ],
+)
+def test_delivery_mode_transition_filter(mode, awaiting, status, allowed):
+    assert _transition(awaiting=awaiting, status=status).allowed(mode) is allowed
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "errored"])
+def test_terminal_payload_is_normal_and_threaded(tmp_path, config, status):
+    store, _ = _paired_device(tmp_path)
+    sender = APNsSender(config, store, client=FakeClient())
+    payload = json.loads(
+        sender._payload(
+            _transition(
+                status=status, title="OpenClaw capture", preview="Ready for review"
+            ),
+            None,
+        )
+    )
+    assert payload["aps"]["interruption-level"] == "active"
+    assert payload["aps"]["thread-id"] == "sess-1"
+    assert payload["aps"]["alert"]["title"] == "OpenClaw capture"
+    assert "subtitle" not in payload["aps"]["alert"]
+    sender.close()
+
+
+def test_notification_text_strips_machine_details_and_limits_length(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender = APNsSender(config, store)
+    state = _transition(
+        session_id="harness-12345678-1234-1234-1234-123456789abc",
+        awaiting="input",
+        title="codex harness-abcdef123 run-123456789 deadbeef Fix capture",
+        preview="harness-12345678-1234-1234-1234-123456789abc deadbeef run-123 Ready "
+        + "word " * 100,
+    )
+    alert = json.loads(sender._payload(state, None))["aps"]["alert"]
+    assert alert["title"] == "Fix capture"
+    assert len(alert["body"]) <= 220
+    assert all(
+        word not in str(alert)
+        for word in ("harness", "deadbeef", "run-", "codex", "12345678")
+    )
+    sender.close()
+
+
+def test_private_content_never_appears_in_alert(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender = APNsSender(config, store)
+    alert = json.loads(
+        sender._payload(
+            _transition(
+                awaiting="input", private=True, title="secret", preview="secret"
+            ),
+            None,
+        )
+    )["aps"]["alert"]
+    assert alert == {"title": "drover", "body": "Needs your input: reply in the app"}
+    sender.close()
+
+
+def test_collapse_id_is_byte_bounded_and_collision_resistant():
+    from drover.server.push.apns import _collapse_id
+
+    a = "é" * 100
+    assert len(_collapse_id(a).encode()) == 64
+    assert _collapse_id(a) != _collapse_id(a + "x")
+
+
+def test_batch_has_fixed_window_and_latest_state_per_session(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition(status="completed"))
+    now[0] = 159
+    sender.notify(_transition(session_id="sess-2", status="completed"))
+    sender.notify(_transition(session_id="sess-2", status="failed"))
+    sender.flush_due()
+    assert client.posts == []
+    now[0] = 160
+    sender.flush_due()
+    assert len(client.posts) == 1
+    payload = json.loads(client.posts[0]["content"])
+    assert payload["session_ids"] == ["sess-1", "sess-2"]
+    assert payload["aps"]["alert"]["body"] == "1 session finished, 1 session failed"
+    assert payload["aps"]["interruption-level"] == "active"
+    sender.notify(_transition(status="completed"))
+    now[0] = 220
+    sender.flush_due()
+    assert len(client.posts) == 2
+    assert json.loads(client.posts[1]["content"])["session_id"] == "sess-1"
+    sender.close()
+
+
+def test_resolved_input_is_removed_before_batch_delivery(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition())
+    sender.notify(_transition(awaiting=None))
+    now[0] = 160
+    sender.flush_due()
+    assert client.posts == []
+    sender.close()
+
+
+def test_each_device_has_its_own_mode_and_digest_deadline(tmp_path, config):
+    store, first = _paired_device(tmp_path)
+    second, _ = store.issue(scope="device", label="Tablet")
+    store.set_apns_registration(second.id, token="tablet", environment="sandbox")
+    store.set_notification_mode(second.id, "digest")
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition())
+    now[0] = 160
+    sender.flush_due()
+    assert len(client.posts) == 1
+    assert client.posts[0]["url"].endswith("devicetoken123")
+    now[0] = 86400
+    sender.flush_due()
+    assert len(client.posts) == 2
+    assert client.posts[1]["url"].endswith("tablet")
+    assert (
+        json.loads(client.posts[1]["content"])["aps"]["interruption-level"] == "active"
+    )
+    sender.close()
+
+
+def test_delivery_rechecks_revocation_and_preference(tmp_path, config):
+    store, device = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition())
+    store.set_notification_mode(device.id, "digest")
+    now[0] = 160
+    sender.flush_due()
+    assert client.posts == []
+    sender.notify(_transition())
+    store.revoke(device.id)
+    now[0] = 86400
+    sender.flush_due()
+    assert client.posts == []
+    sender.close()
+
+
+def test_git_delivery_tail_stays_in_the_app():
+    state = _transition(
+        awaiting=None,
+        status="completed",
+        preview="Capture is ready for review\nPushed deadbeef to feat/capture\nCommit abcdef123",
+    )
+    assert state.alert_body() == "Finished: Capture is ready for review"
+
+
+def test_large_batches_keep_payloads_under_apns_limit(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+    for i in range(45):
+        sender.notify(
+            _transition(
+                session_id=f"harness-00000000-0000-0000-0000-{i:012d}",
+                status="completed",
+            )
+        )
+    now[0] = 160
+    sender.flush_due()
+    assert len(client.posts) == 3
+    assert all(len(post["content"]) <= 4096 for post in client.posts)
+    assert (
+        sum(len(json.loads(post["content"])["session_ids"]) for post in client.posts)
+        == 45
+    )
+    sender.close()
+
+
+def test_all_updates_device_receives_progress_while_default_device_does_not(
+    tmp_path, config
+):
+    store, _ = _paired_device(tmp_path)
+    second, _ = store.issue(scope="device", label="Tablet")
+    store.set_apns_registration(second.id, token="tablet", environment="sandbox")
+    store.set_notification_mode(second.id, "all")
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition(awaiting=None, status="running"))
+    now[0] = 160
+    sender.flush_due()
+    assert len(client.posts) == 1
+    assert client.posts[0]["url"].endswith("tablet")
+    assert (
+        json.loads(client.posts[0]["content"])["aps"]["interruption-level"] == "active"
+    )
+    sender.close()
+
+
+@pytest.mark.parametrize("mode", ["action", "all"])
+@pytest.mark.parametrize("awaiting", ["input", "approval"])
+def test_needs_input_shortens_existing_batch_and_includes_pending_sessions(
+    tmp_path, config, mode, awaiting
+):
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, mode)
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition(session_id="finished", status="completed"))
+    now[0] = 110
+    sender.notify(_transition(session_id="waiting", awaiting=awaiting))
+    now[0] = 114
+    sender.notify(_transition(session_id="failed", status="failed"))
+    sender.flush_due()
+    assert client.posts == []
+    now[0] = 115
+    sender.flush_due()
+    assert len(client.posts) == 1
+    payload = json.loads(client.posts[0]["content"])
+    assert payload["session_ids"] == ["failed", "finished", "waiting"]
+    assert (
+        payload["aps"]["alert"]["body"]
+        == "1 session finished, 1 session needs input, 1 session failed"
+    )
+    assert payload["aps"]["interruption-level"] == "time-sensitive"
+    sender.close()
+
+
+def test_repeated_urgent_states_do_not_extend_short_window(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(_transition(awaiting="approval"))
+    now[0] = 104
+    sender.notify(_transition(awaiting="input"))
+    sender.flush_due()
+    assert client.posts == []
+    now[0] = 105
+    sender.flush_due()
+    assert len(client.posts) == 1
+    sender.close()

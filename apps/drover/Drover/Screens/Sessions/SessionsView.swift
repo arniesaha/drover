@@ -43,6 +43,7 @@ struct SessionsView: View {
     @State private var showAccounts = false
     @State private var showInsights = false
     @State private var showHistory = false
+    @State private var notificationSessionIDs: Set<String>?
 
     init(
         client: DroverClient,
@@ -69,6 +70,14 @@ struct SessionsView: View {
     var body: some View {
         VStack(spacing: 0) {
             chromeRow
+            if notificationSessionIDs != nil {
+                HStack {
+                    Text("Notification sessions")
+                    Spacer()
+                    Button("Show all") { notificationSessionIDs = nil }
+                }
+                .padding(.horizontal, 18)
+            }
 
             if store.hasLoadedOnce {
                 InboxStatusHeader(
@@ -117,7 +126,7 @@ struct SessionsView: View {
                         }
                     }
 
-                    if !store.finished.isEmpty {
+                    if notificationSessionIDs == nil, !store.finished.isEmpty {
                         finishedSection
                     }
 
@@ -255,6 +264,9 @@ struct SessionsView: View {
         }
         // A tapped alert names one session; open that session rather than
         // leaving the user on the list to find it again themselves.
+        .onChange(of: NotificationRoute.shared.pendingSessionIDs) { _, _ in
+            openSessionFromNotification()
+        }
         .onChange(of: NotificationRoute.shared.pendingSessionID) { _, _ in
             openSessionFromNotification()
         }
@@ -351,7 +363,10 @@ struct SessionsView: View {
     /// newest-first. The store owns the order (`SessionStore.inboxSessions`) so
     /// it can be tested without a view.
     private var inboxSessions: [SessionSummary] {
-        store.inboxSessions
+        if let ids = notificationSessionIDs {
+            return store.snapshot?.sessions.filter { ids.contains($0.id) } ?? []
+        }
+        return store.inboxSessions
     }
 
     /// How far behind the snapshot every card below is drawn from.
@@ -530,10 +545,16 @@ struct SessionsView: View {
     /// snapshot: a cold launch delivers the tap before the first poll returns,
     /// and dropping it there would strand the user on the list.
     private func openSessionFromNotification() {
+        if let ids = NotificationRoute.shared.consumeSummary() {
+            notificationSessionIDs = Set(ids)
+            launchedSession = nil
+            return
+        }
         guard let pending = NotificationRoute.shared.pendingSessionID else { return }
         guard let session = store.snapshot?.sessions.first(where: { $0.id == pending }) else {
             return
         }
+        notificationSessionIDs = nil
         _ = NotificationRoute.shared.consume()
         launchedSession = LaunchedSession(
             id: session.id,

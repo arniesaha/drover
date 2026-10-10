@@ -23,8 +23,10 @@ public struct LocalNotifier: Notifying {
 
     public func notify(title: String, body: String, id: String) async {
         let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
+        guard NotificationMode.saved() != .digest else { return }
+        content.title = "Session"
+        content.body = "Needs your input: open the session"
+        content.threadIdentifier = id
         content.sound = .default
         // "Needs you" is exactly the time-sensitive case: the harness is
         // blocked on the user. Breaks through Focus modes and lock-screen

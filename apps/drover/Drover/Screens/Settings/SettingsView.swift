@@ -101,6 +101,7 @@ struct SettingsView: View {
                 }
 
                 if let client = environment.client {
+                    NotificationPreferences(client: client)
                     ContentAnalysisSettings(client: client)
                 }
 
@@ -379,6 +380,66 @@ struct SettingsView: View {
             isSigningOut = false
             statusIsError = true
             statusMessage = environment.recoveryStatusMessage ?? error.localizedDescription
+        }
+    }
+}
+
+
+private struct NotificationPreferences: View {
+    let client: DroverClient
+    @State private var mode = NotificationMode.saved()
+    @State private var saving = false
+    @State private var loaded = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Notifications").font(.headline)
+            Picker("Delivery", selection: Binding(get: { mode }, set: { save($0) })) {
+                ForEach(NotificationMode.allCases, id: \.self) { value in
+                    Text(value.label).tag(value)
+                }
+            }
+            .disabled(saving || !loaded)
+            Text("Daily digest arrives at midnight UTC.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let error { Text(error).font(.caption).foregroundStyle(.red) }
+            if !loaded {
+                Button("Retry") { Task { await load() } }
+            }
+        }
+        .task { await load() }
+    }
+
+    private func save(_ newValue: NotificationMode) {
+        guard loaded, !saving, newValue != mode else { return }
+        let oldValue = mode
+        mode = newValue
+        saving = true
+        Task {
+            do {
+                try await client.setNotificationMode(newValue)
+                newValue.save()
+                error = nil
+            } catch {
+                mode = oldValue
+                self.error = "Could not save notification preference. Try again."
+            }
+            saving = false
+        }
+    }
+
+    private func load() async {
+        do {
+            saving = true
+            mode = try await client.notificationMode()
+            mode.save()
+            loaded = true
+            error = nil
+            saving = false
+        } catch {
+            saving = false
+            self.error = "Could not load notification preference."
         }
     }
 }
