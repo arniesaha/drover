@@ -311,3 +311,44 @@ def test_unreadable_entries_are_skipped_not_fatal(tmp_path):
         encoding="utf-8",
     )
     assert CredentialStore(tmp_path / CREDENTIALS_FILENAME).list_all() == []
+
+
+def test_host_issue_requires_binding_and_rotation_is_isolated(tmp_path):
+    store = _store(tmp_path)
+    with pytest.raises(ValueError, match="host_id"):
+        store.issue(scope="host", label="legacy")
+    first, old_token = store.issue(scope="host", label="a", host_id="a")
+    _, other_token = store.issue(scope="host", label="b", host_id="b")
+    second, new_token = store.issue(scope="host", label="a", host_id="a")
+    reloaded = _store(tmp_path)
+    assert reloaded.find_active(old_token) is None
+    assert reloaded.get(first.id).revoked_at is not None
+    assert reloaded.find_active(new_token).id == second.id
+    assert reloaded.find_active(other_token).host_id == "b"
+
+
+def test_upgrade_preserves_bound_credentials_and_requires_unbound_reissue(tmp_path):
+    from drover.server.web.auth import (
+        credential_allows_request,
+        credential_matches_host,
+    )
+
+    store = _store(tmp_path)
+    bound, bound_token = store.issue(scope="host", label="a", host_id="a")
+    legacy, legacy_token = store.issue(scope="device", label="legacy")
+    document = json.loads((tmp_path / CREDENTIALS_FILENAME).read_text())
+    for item in document["credentials"]:
+        if item["id"] == legacy.id:
+            item["scope"] = "host"
+            item.pop("host_id")
+    (tmp_path / CREDENTIALS_FILENAME).write_text(json.dumps(document))
+    upgraded = _store(tmp_path)
+    assert credential_matches_host(upgraded.find_active(bound_token), "a")
+    unbound = upgraded.find_active(legacy_token)
+    assert not credential_matches_host(unbound, "legacy")
+    assert not credential_allows_request(unbound)
+    _, replacement = upgraded.issue(scope="host", label="legacy", host_id="legacy")
+    upgraded.revoke(legacy.id)
+    assert upgraded.find_active(legacy_token) is None
+    assert credential_matches_host(upgraded.find_active(replacement), "legacy")
+    assert upgraded.find_active(bound_token).id == bound.id

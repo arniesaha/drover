@@ -144,6 +144,8 @@ class CredentialStore:
     ) -> tuple[Credential, str]:
         if scope not in SCOPES:
             raise ValueError(f"unknown scope: {scope}")
+        if scope == "host" and (not isinstance(host_id, str) or not host_id.strip()):
+            raise ValueError("host credentials require host_id")
         token = secrets.token_urlsafe(TOKEN_BYTES)
         credential = Credential(
             id=str(uuid4()),
@@ -154,6 +156,14 @@ class CredentialStore:
             host_id=host_id,
         )
         with self._lock:
+            if scope == "host":
+                for previous in list(self._by_id.values()):
+                    if (
+                        previous.scope == "host"
+                        and previous.host_id == host_id
+                        and previous.is_active
+                    ):
+                        self._index(replace(previous, revoked_at=_now_iso()))
             self._index(credential)
             self._write()
         return credential, token
@@ -426,6 +436,8 @@ class PostgresCredentialStore:
     ) -> tuple[Credential, str]:
         if scope not in SCOPES:
             raise ValueError(f"unknown scope: {scope}")
+        if scope == "host" and (not isinstance(host_id, str) or not host_id.strip()):
+            raise ValueError("host credentials require host_id")
         token = secrets.token_urlsafe(TOKEN_BYTES)
         credential = Credential(
             id=str(uuid4()),
@@ -436,19 +448,35 @@ class PostgresCredentialStore:
             host_id=host_id,
         )
         with self._connection() as con:
-            con.execute(
-                """INSERT INTO control_credentials
-                   (credential_id, scope, label, verifier, created_at, host_id)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                [
-                    credential.id,
-                    credential.scope,
-                    credential.label,
-                    credential.verifier,
-                    credential.created_at,
-                    credential.host_id,
-                ],
-            )
+            con.execute("BEGIN")
+            try:
+                if scope == "host":
+                    con.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                        ["host-credential:" + host_id],
+                    )
+                    con.execute(
+                        "UPDATE control_credentials SET revoked_at = ? "
+                        "WHERE scope = 'host' AND host_id = ? AND revoked_at IS NULL",
+                        [_now_iso(), host_id],
+                    )
+                con.execute(
+                    """INSERT INTO control_credentials
+                       (credential_id, scope, label, verifier, created_at, host_id)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    [
+                        credential.id,
+                        credential.scope,
+                        credential.label,
+                        credential.verifier,
+                        credential.created_at,
+                        credential.host_id,
+                    ],
+                )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
         return credential, token
 
     def find_active(self, token: str) -> Credential | None:

@@ -361,7 +361,10 @@ class RelayClient:
                 sock,
                 host=target.netloc,
                 path=target.path,
-                headers={"Authorization": f"Bearer {self.token}"},
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "X-Drover-Host-ID": self.host_id,
+                },
             )
             client_send_json(
                 sock,

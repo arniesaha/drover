@@ -1493,6 +1493,29 @@ def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
     click.echo(minted["token"])
 
 
+@credentials_cmd.command(name="issue-host")
+@click.option("--host-id", required=True, help="Exact enrolled harness host identity")
+@click.pass_context
+def credentials_issue_host_cmd(ctx: click.Context, host_id: str) -> None:
+    """Issue a bound host token, replacing any active token for this host."""
+    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    issued = _local_api_request(
+        cfg,
+        "POST",
+        "/auth/credentials",
+        {"scope": "host", "host_id": host_id, "label": host_id},
+    )
+    click.echo(issued["token"])
+
+
+@credentials_cmd.command(name="rotate-host")
+@click.option("--host-id", required=True, help="Exact enrolled harness host identity")
+@click.pass_context
+def credentials_rotate_host_cmd(ctx: click.Context, host_id: str) -> None:
+    """Replace one host's credential and print its new token once."""
+    ctx.invoke(credentials_issue_host_cmd, host_id=host_id)
+
+
 @credentials_cmd.command(name="revoke")
 @click.argument("credential_id")
 @click.pass_context
