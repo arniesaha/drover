@@ -27,13 +27,12 @@ const features: Feature[] = [
     icon: 'terminal',
     title: 'Multi-harness sessions',
     status: 'today',
-    lede: 'One way to start, steer and stop a session, whichever agent CLI is doing the work.',
+    lede: 'One way to start, steer and stop a session on each harness.',
     points: [
-      'Launch and drive Claude Code, Codex, Antigravity (agy) and DeepSeek Harness through a registered adapter contract.',
-      'Structured chat with interrupt and native resume, plus a real PTY terminal stream when you want to watch.',
-      'Tool approvals are relayed for Claude Code, the one adapter that supports them today.',
-      'Pick the model and reasoning effort per session from the catalog each host reports.',
-      'OpenClaw and Hermes are observed as context. They are not launch targets.',
+      'Drive Claude Code, Codex, Antigravity (agy) and DeepSeek Harness through structured adapters.',
+      'Use structured chat with interrupt and native resume, or attach to a terminal.',
+      'Answer tool approvals for Claude Code. The other adapters do not support approvals.',
+      'OpenClaw and Hermes are observed. You cannot launch them from Drover.',
     ],
     more: { href: LINKS.doc('harness-adapter-architecture.md'), label: 'Harness adapter architecture' },
   },
@@ -42,44 +41,40 @@ const features: Feature[] = [
     icon: 'fleet',
     title: 'Hub and hosts',
     status: 'today',
-    lede: 'One central hub, and a small daemon on every machine that runs agents.',
+    lede: 'One hub, and a daemon on each machine that runs agents.',
     points: [
-      'drover-server keeps the fleet registry and routes each request. It never runs remote commands itself.',
-      'drover-harnessd owns the agent processes, terminals and filesystem access on its own machine.',
-      'Direct hosts accept private inbound connections. Relay hosts dial out, so no inbound port is needed.',
-      'Add a machine with a single pasted command and a pairing code that expires in fifteen minutes.',
-      'Runs on macOS and Linux with Python 3.11 or later.',
+      'The hub keeps the fleet registry and routes each operation.',
+      'The host daemon owns the agent processes, terminals and files on its machine.',
+      'A host connects directly, or dials out through a relay.',
+      'The hub and the hosts run on macOS and Linux.',
     ],
-    more: { href: '/docs/getting-started/#add-another-machine', label: 'Add another machine' },
+    more: { href: '/docs/getting-started/#add-another-host', label: 'Add another host' },
   },
   {
     id: 'ios',
     icon: 'phone',
     title: 'iOS cockpit',
     status: 'beta',
-    lede: 'A native app that treats your fleet like something you can hold.',
+    lede: 'A native app for iOS 18 and later.',
     points: [
-      'Live sessions grouped by host, with provider capacity within reach.',
-      'Start a session: choose host, harness, project, model and reasoning effort.',
-      'Send turns, answer prompts, hand a session off, attach to its terminal.',
-      'Pairs by QR code. The credential lives in the iOS Keychain and is revocable from the hub.',
-      'Push notifications when a session needs you, if you configure your own APNs key. Otherwise best-effort local notifications.',
-      'Built from source with Xcode 16 for iOS 18 and later. Not on the App Store; a public beta is coming soon.',
+      'See live sessions by host, with provider quota.',
+      'Start a session. Send turns. Answer prompts. Hand off. Attach to the terminal.',
+      'Pair with a QR code. The credential stays in the iOS Keychain.',
+      'Build the app from source. A public beta is coming soon.',
     ],
     more: { href: LINKS.file('apps/drover/README.md'), label: 'iOS build guide' },
   },
   {
     id: 'recall',
     icon: 'search',
-    title: 'Recall, search and handoffs',
+    title: 'Recall, search and handoff',
     status: 'today',
-    lede: 'The history of every session, queryable by the next one.',
+    lede: 'The next session can query the history of earlier sessions.',
     points: [
-      'Keyword search and session replay over everything the hub has ingested.',
-      'Recall bundles: keyword matches, summaries, project briefs and open loops in one bounded response.',
-      'Semantic recall when you configure an embeddings backend, with keyword fallback.',
-      'Continue a session on another host or another harness. Drover briefs the new session from the old one, or reopens it natively when the harness supports that.',
-      'Every result says which store answered and how fresh the data is. No silent stale answers.',
+      'Search and replay the events that the hub ingested.',
+      'Get a recall bundle: matches, summaries, project briefs and open loops.',
+      'Continue a session on another host or harness. Drover briefs the new session.',
+      'Each result names its store and the age of its data.',
     ],
     more: { href: '/docs/mcp/', label: 'MCP tools' },
   },
@@ -88,12 +83,11 @@ const features: Feature[] = [
     icon: 'notes',
     title: 'Session summaries and project briefs',
     status: 'optin',
-    lede: 'Optional workers that turn raw transcripts into something a person or an agent can read in a minute.',
+    lede: 'Optional workers write summaries and briefs with a model you choose.',
     points: [
-      'Per-session summaries, rolling project briefs and live recaps of long-running sessions.',
-      'Runs on a model you choose: the Claude Code CLI on a host, or an Anthropic API key.',
-      'Workers stay idle until a backend is configured. Ingest and fleet control work without them.',
-      'Whatever provider you pick receives the transcript text it summarizes, under your account and their terms.',
+      'The workers use the Claude Code CLI on a host, or an Anthropic API key.',
+      'The workers are idle until you configure a backend.',
+      'The provider receives the transcript text that it summarizes.',
     ],
     more: { href: '/docs/configuration/#models-for-summaries-and-embeddings', label: 'Configure model backends' },
   },
@@ -102,13 +96,12 @@ const features: Feature[] = [
     icon: 'profile',
     title: 'Portable profile with privacy tiers',
     status: 'today',
-    lede: 'Your preferences and standing rules, handed to each new session in under 1,500 tokens.',
+    lede: 'Your preferences and rules reach each new session in fewer than 1,500 tokens.',
     points: [
-      'Three tiers: general, trusted and private. Unknown agents get general. Hidden items show up only as a count.',
-      'Agents can propose changes. Nothing is accepted until you approve it, and every change can be reverted.',
-      'Import from Markdown with a dry run by default. Everything imports as private unless you say otherwise.',
-      'Trusted reads use a read-only credential over HTTP. The MCP transport always reads as general.',
-      'Requires the PostgreSQL control store.',
+      'Three tiers: general, trusted and private. An agent sees only its tier.',
+      'Agents propose changes. You approve them, and you can revert them.',
+      'Markdown import is a dry run by default. Imported items start as private.',
+      'The profile requires the PostgreSQL control store.',
     ],
     more: { href: LINKS.doc('portable-profile.md'), label: 'Portable profile guide' },
   },
@@ -117,12 +110,11 @@ const features: Feature[] = [
     icon: 'chart',
     title: 'Lake analytics',
     status: 'optin',
-    lede: 'Usage, projects and quota, computed from facts you can audit.',
+    lede: 'Usage, projects and quota, from facts you can audit.',
     points: [
-      'Tokens and cache numbers per session, busiest projects, activity timelines.',
-      'Provider quota windows across accounts and hosts, with a routing hint for where there is headroom.',
-      'A DuckLake lake (PostgreSQL catalog plus Parquet files) holds the canonical facts. You select it explicitly; it is not enabled by default.',
-      'Reads run in a disposable child process with a five second deadline and a memory cap.',
+      'See tokens for each session, the busiest projects and provider quota windows.',
+      'A DuckLake lake holds the facts. You select it explicitly.',
+      'Each read has a five-second deadline and a memory limit.',
     ],
     more: { href: '/architecture/#storage', label: 'How storage works' },
   },
@@ -131,12 +123,12 @@ const features: Feature[] = [
     icon: 'plug',
     title: 'MCP server',
     status: 'today',
-    lede: 'Your fleet and its memory as tools any MCP client can call.',
+    lede: 'Your fleet and its history as Model Context Protocol (MCP) tools.',
     points: [
-      'Streamable HTTP at /mcp with drover_* tools for fleet status, search, replay, recall, briefs, handoff context and profile.',
-      'Bounded by contract: capped rows, capped bytes, five second deadline, explicit busy and timeout answers.',
-      'One hub is the single recall endpoint for every agent on every host.',
-      'Binds to localhost by default and has no authentication of its own yet. Keep it on loopback or a network you trust.',
+      'About two dozen drover_* tools cover fleet status, search, recall, briefs and the profile.',
+      'Each request requires a bearer credential.',
+      'The server listens on loopback only.',
+      'Responses have size limits, a deadline and a data watermark.',
     ],
     more: { href: '/docs/mcp/', label: 'MCP setup' },
   },
@@ -145,37 +137,35 @@ const features: Feature[] = [
     icon: 'loop',
     title: 'Continuity across restarts',
     status: 'today',
-    lede: 'Restarts, crashes and closed lids should cost you nothing.',
+    lede: 'A restart or a closed lid does not lose your work.',
     points: [
-      'Event, payload and export intent commit in one transaction, so a crash cannot half-record a turn.',
-      'Sessions keep their native resume identity, so a harness that supports resume can be reopened.',
-      'A stop request to an offline host is remembered and confirmed when the host returns, instead of pretending it worked.',
-      'The iOS app keeps unsent drafts and pending turns in protected local storage until they can be delivered.',
-      'Context containers that track next actions and open loops per project are available as an opt-in worker.',
+      'The hub writes each event, its payload and its export intent in one transaction.',
+      'A session keeps its native resume identity.',
+      'The hub holds a stop request for an offline host until the host confirms it.',
+      'The iOS app keeps unsent drafts until it can deliver them.',
     ],
     more: { href: LINKS.doc('session-lifecycle.md'), label: 'Session lifecycle' },
   },
 ];
 
 const roadmap = [
-  { title: 'Authenticated MCP', body: 'Credentials for the MCP endpoint so it can be shared beyond loopback with the same confidence as the HTTP API.' },
-  { title: 'Host-bound credentials', body: 'Today a host credential can act as any host. Binding credentials to a host identity is tracked in the public issue tracker.' },
-  { title: 'Lifecycle enforcement', body: 'Lifecycle scans report idle sessions and stale worktrees. They do not stop, archive or clean anything yet.' },
-  { title: 'Off-site backup', body: 'A verified backup of the lake and control store to object storage is designed and rehearsed, not shipped.' },
-  { title: 'Public iOS beta', body: 'The app is source-built today. A public beta is planned.' },
-  { title: 'Packaging', body: 'Drover is distributed as source and a release wheel. Native packages are future work.' },
+  { title: 'Remote MCP', body: 'MCP listens on loopback only. A protected remote transport is not available.' },
+  { title: 'Host-bound credentials', body: 'A host credential can act as any host. Do not enroll a machine you do not control.' },
+  { title: 'Lifecycle enforcement', body: 'Lifecycle scans report idle sessions and stale worktrees. They do not stop or remove anything.' },
+  { title: 'Off-site backup', body: 'A verified backup to object storage is designed but not shipped.' },
+  { title: 'Public iOS beta', body: 'You build the app from source today.' },
+  { title: 'Packaging', body: 'Drover ships as source and a release wheel. Native packages do not exist.' },
 ];
 ---
 
-<BaseLayout title="Features" description="What Drover does today, what is opt-in, and what is still on the roadmap.">
+<BaseLayout title="Features" description="What Drover does today, what is opt-in and what is on the roadmap.">
   <section class="page-hero">
     <div class="wrap">
       <span class="eyebrow">Features and capabilities</span>
-      <h1>What it does, and how sure we are.</h1>
+      <h1>What Drover does, with a status on each item.</h1>
       <p class="lede">
-        Every item below is labelled. <strong>Works today</strong> is on by default in a current release.{' '}
-        <strong>Opt-in</strong> ships in the code but needs you to configure something. <strong>Roadmap</strong> is not
-        built yet.
+        <strong>Works today</strong> is on by default. <strong>Opt-in</strong> needs configuration.{' '}
+        <strong>Roadmap</strong> is not built.
       </p>
       <nav class="jump" aria-label="Features on this page">
         {features.map((f) => <a href={`#${f.id}`}>{f.title}</a>)}
@@ -214,11 +204,10 @@ const roadmap = [
   <section class="section band" id="roadmap">
     <div class="wrap">
       <span class="eyebrow">Roadmap</span>
-      <h2>Not built yet. Said plainly.</h2>
+      <h2>Not built yet.</h2>
       <p class="lede">
-        These are known gaps and planned work, not promises with dates. Follow the{' '}
-        <a href={LINKS.issues} rel="noopener">issue tracker</a> and the{' '}
-        <a href={LINKS.changelog} rel="noopener">changelog</a> for what actually lands.
+        These are known gaps, without dates. Follow the <a href={LINKS.issues} rel="noopener">issue tracker</a> and the{' '}
+        <a href={LINKS.changelog} rel="noopener">changelog</a>.
       </p>
       <div class="grid cols-3 road">
         {
@@ -335,7 +324,7 @@ const roadmap = [
   }
   @media (max-width: 860px) {
     .feature {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 </style>
