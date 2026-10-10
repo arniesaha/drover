@@ -32,6 +32,7 @@ from drover.server.metrics import (
     start_metrics_server,
 )
 from drover.server.web.auth import AuthSettings
+from drover.server.web.credentials import CredentialStore
 
 
 class _FakeCentralHandler(BaseHTTPRequestHandler):
@@ -591,7 +592,8 @@ def test_default_reconciliation_query_does_not_abandon_old_structured_events(tmp
 
 
 def test_interior_gap_repair_rebuilds_derived_state_from_the_full_sequence(tmp_path):
-    token = "reconciliation-token"
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, token = store.issue(scope="host", label="host-a", host_id="host-a")
     central_db = tmp_path / "central-derived.duckdb"
     bootstrap(parquet_dir=tmp_path / "central-derived-parquet", duckdb_path=central_db)
     collector = MetricsCollector(
@@ -613,7 +615,7 @@ def test_interior_gap_repair_rebuilds_derived_state_from_the_full_sequence(tmp_p
         host="127.0.0.1",
         port=0,
         collector=collector,
-        auth=AuthSettings(enabled=True, api_token=token),
+        auth=AuthSettings(enabled=True, api_token="operator-token", credentials=store),
     )
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
 
@@ -733,8 +735,11 @@ def test_e2e_restart_event_reconciliation(tmp_path):
     """End-to-end: Pre-populated local DuckDB events reconcile to central on daemon boot."""
     import urllib.request
 
-    test_token = "e2e-token"
-    auth = AuthSettings(enabled=True, api_token=test_token)
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, test_token = store.issue(
+        scope="host", label="test-daemon", host_id="test-daemon"
+    )
+    auth = AuthSettings(enabled=True, api_token="operator-token", credentials=store)
     auth_headers = {"Authorization": f"Bearer {test_token}"}
 
     # 1. Start central server
@@ -783,6 +788,19 @@ def test_e2e_restart_event_reconciliation(tmp_path):
         payload={"turn_complete": True, "type": "status"},
         seq=3,
         normalized_source="structured",
+    )
+
+    collector._sync_created_harness_session(
+        session.host_id,
+        {},
+        json.dumps(
+            {
+                "session_id": session.session_id,
+                "harness": session.harness,
+                "command": session.command,
+                "mode": "structured",
+            }
+        ),
     )
 
     # 3. Boot daemon: wire_event_pusher & create_harness_server run reconciliation
@@ -843,8 +861,11 @@ def test_e2e_restart_event_reconciliation(tmp_path):
 
 def test_e2e_restart_event_reconciliation_mixed_timestamps(tmp_path):
     """End-to-end: Pre-populated local events with mixed naive and aware timestamps reconcile."""
-    test_token = "e2e-token-tz"
-    auth = AuthSettings(enabled=True, api_token=test_token)
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, test_token = store.issue(
+        scope="host", label="test-daemon-tz", host_id="test-daemon-tz"
+    )
+    auth = AuthSettings(enabled=True, api_token="operator-token", credentials=store)
     auth_headers = {"Authorization": f"Bearer {test_token}"}
 
     # 1. Start central server
@@ -902,6 +923,19 @@ def test_e2e_restart_event_reconciliation_mixed_timestamps(tmp_path):
         seq=3,
         created_at=t2_aware_utc,
         normalized_source="structured",
+    )
+
+    collector._sync_created_harness_session(
+        session.host_id,
+        {},
+        json.dumps(
+            {
+                "session_id": session.session_id,
+                "harness": session.harness,
+                "command": session.command,
+                "mode": "structured",
+            }
+        ),
     )
 
     # 3. Boot daemon: wire_event_pusher & create_harness_server run reconciliation

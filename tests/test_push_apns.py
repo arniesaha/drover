@@ -519,7 +519,7 @@ def test_unregistered_and_revoked_devices_are_skipped(tmp_path, config):
     # never registered for push
     store.issue(scope="device", label="no-token phone")
     # a host, not a phone
-    host, _ = store.issue(scope="host", label="nas")
+    host, _ = store.issue(scope="host", label="nas", host_id="nas")
     # revoked after registering
     revoked, _ = store.issue(scope="device", label="lost phone")
     store.set_apns_registration(revoked.id, token="dead", environment="sandbox")

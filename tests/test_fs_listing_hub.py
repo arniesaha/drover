@@ -4,6 +4,7 @@ import json
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -79,7 +80,15 @@ def test_hub_credential_scope_and_binding(
     tmp_path, base_url, root, scope, host_id, expected
 ):
     with hub(tmp_path, base_url) as (url, store):
-        _, token = store.issue(scope=scope, label="test", host_id=host_id)
+        if scope == "host" and host_id is None:
+            # Simulate a persisted pre-upgrade credential. New issuance must
+            # reject missing bindings, while legacy records fail closed.
+            credential, token = store.issue(
+                scope="host", label="test", host_id="legacy"
+            )
+            store._index(replace(credential, host_id=None))
+        else:
+            _, token = store.issue(scope=scope, label="test", host_id=host_id)
         assert get(f"{url}/harness/hosts/test-host/fs/list", token)[0] == expected
 
 
