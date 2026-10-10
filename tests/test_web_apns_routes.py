@@ -424,7 +424,7 @@ def test_self_revocation_is_idempotent_and_clears_only_callers_push(server, capl
 def test_self_revocation_requires_device_bearer_even_without_push(server):
     _, store, auth = server
     device, _ = store.issue(scope="device", label="Phone")
-    _, host_token = store.issue(scope="host", label="Mac")
+    _, host_token = store.issue(scope="host", label="Mac", host_id="mac")
     _, preflight_token = store.issue(scope="preflight", label="Probe")
     set_sender(None)
     for token in (None, "unknown"):

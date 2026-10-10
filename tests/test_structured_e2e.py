@@ -15,8 +15,10 @@ import sys
 import threading
 import time
 import urllib.request
+from dataclasses import replace
 
 import duckdb
+import pytest
 from _timeouts import scale_timeout
 
 from drover.schema import bootstrap
@@ -32,6 +34,7 @@ from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.structured.pusher import EventPusher, reconcile_unsent_events
 from drover.server.metrics import MetricsCollector, start_metrics_server
 from drover.server.web.auth import AuthSettings
+from drover.server.web.credentials import CredentialStore
 
 # Same fake, headless-safe "claude-code"-shaped CLI as
 # tests/test_harness_daemon.py:FAKE_STRUCTURED_CLI. Duplicated rather than
@@ -76,6 +79,16 @@ FAKE_LOOPY_CLI = [
 _TEST_TOKEN = "test-token"
 _TEST_AUTH = AuthSettings(enabled=True, api_token=_TEST_TOKEN)
 _AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+
+_HOST_TOKEN = ""
+
+
+@pytest.fixture(autouse=True)
+def bound_daemon_credential(tmp_path, monkeypatch):
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, token = store.issue(scope="host", label="daemon", host_id="test-daemon")
+    monkeypatch.setitem(globals(), "_TEST_AUTH", replace(_TEST_AUTH, credentials=store))
+    monkeypatch.setitem(globals(), "_HOST_TOKEN", token)
 
 
 # A session create spawns a CLI subprocess behind this request, so the HTTP
@@ -186,7 +199,7 @@ def _start_daemon(tmp_path, *, name: str, central_url: str | None = None):
     if central_url:
         # batch_interval=0.2 (not wire_event_pusher's default 2.0) so the
         # E2E poll below doesn't need a long deadline.
-        pusher = EventPusher(central_url, _TEST_TOKEN, batch_interval=0.2)
+        pusher = EventPusher(central_url, _HOST_TOKEN, batch_interval=0.2)
         pusher.start()
         state.push_event = pusher.push
     server = create_harness_server(listen_host="127.0.0.1", listen_port=0, state=state)
@@ -220,6 +233,11 @@ def test_structured_session_events_reach_central(tmp_path):
         assert status == 201
         assert body["mode"] == "structured"
         sid = body["session_id"]
+        # Establish ownership from the daemon's create response, as hub launch
+        # does, before accepting that session's independently pushed events.
+        central_server.RequestHandlerClass.collector._sync_created_harness_session(
+            state.host_id, {}, json.dumps(body)
+        )
 
         _wait_until(
             lambda: _fetch_session(base_url, sid)["awaiting"] == "approval",
@@ -407,6 +425,11 @@ def test_a_mirrored_event_is_stored_once(tmp_path):
         )
         assert status == 201
         sid = body["session_id"]
+        # Establish ownership from the daemon's create response, as hub launch
+        # does, before accepting that session's independently pushed events.
+        central_server.RequestHandlerClass.collector._sync_created_harness_session(
+            state.host_id, {}, json.dumps(body)
+        )
 
         _wait_until(
             lambda: _fetch_session(base_url, sid)["awaiting"] == "approval",
@@ -474,6 +497,11 @@ def test_reconciliation_does_not_store_a_second_copy(tmp_path):
         )
         assert status == 201
         sid = body["session_id"]
+        # Establish ownership from the daemon's create response, as hub launch
+        # does, before accepting that session's independently pushed events.
+        central_server.RequestHandlerClass.collector._sync_created_harness_session(
+            state.host_id, {}, json.dumps(body)
+        )
 
         _wait_until(
             lambda: _fetch_session(base_url, sid)["awaiting"] == "approval",

@@ -13,11 +13,13 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import monotonic, sleep
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import duckdb
@@ -60,6 +62,7 @@ from drover.server.harness.websocket import (
 from drover.server.metrics import MetricsCollector, start_metrics_server
 from drover.server.web.app import _MetricsHandler
 from drover.server.web.auth import AuthSettings, mint_session
+from drover.server.web.credentials import CredentialStore
 from drover.server.web.ui import load_page
 
 
@@ -280,6 +283,19 @@ _TEST_AUTH = AuthSettings(enabled=True, api_token=_TEST_TOKEN)
 _AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 
 
+_HOST_HEADERS: dict[str, str] = {}
+
+
+@pytest.fixture(autouse=True)
+def bound_ingest_credential(tmp_path, monkeypatch):
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, token = store.issue(scope="host", label="NAS", host_id="nas")
+    monkeypatch.setitem(globals(), "_TEST_AUTH", replace(_TEST_AUTH, credentials=store))
+    monkeypatch.setitem(
+        globals(), "_HOST_HEADERS", {"Authorization": f"Bearer {token}"}
+    )
+
+
 def _authed_get(url: str, headers: dict[str, str] | None = None):
     request = urllib.request.Request(url, headers={**_AUTH_HEADERS, **(headers or {})})
     return urllib.request.urlopen(request, timeout=5)
@@ -376,6 +392,20 @@ def _make_collector(tmp_path) -> MetricsCollector:
         summarizer_report={},
         ttl_seconds=60,
     )
+
+
+def _make_event_collector(tmp_path) -> MetricsCollector:
+    collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    for session_id in ("harness-s1", "harness-s2"):
+        registry.create_session(
+            host_id="nas",
+            harness="claude-code",
+            command="claude",
+            session_id=session_id,
+            mode="structured",
+        )
+    return collector
 
 
 def _make_pg_collector(control_path, tmp_path) -> MetricsCollector:
@@ -518,7 +548,9 @@ def test_send_treats_expected_header_disconnect_as_access_outcome(caplog, error)
 
 def _json_request(url: str, *, payload: dict | None = None):
     data = None
-    headers = dict(_AUTH_HEADERS)
+    headers = dict(
+        _HOST_HEADERS if urlsplit(url).path == "/harness/events" else _AUTH_HEADERS
+    )
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -1906,7 +1938,7 @@ def test_metrics_http_server_registers_remote_harness_host(tmp_path):
                 }
             ).encode("utf-8"),
             method="POST",
-            headers={"Content-Type": "application/json", **_AUTH_HEADERS},
+            headers={"Content-Type": "application/json", **_HOST_HEADERS},
         )
         with urlopen(request, timeout=3) as res:
             payload = json.loads(res.read().decode("utf-8"))
@@ -3501,7 +3533,7 @@ def test_login_success_sets_cookie_and_cookie_works(tmp_path):
 
 
 def test_harness_events_ingest_idempotent(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -3530,7 +3562,7 @@ def test_harness_events_ingest_idempotent(tmp_path):
 
 
 def test_harness_events_ingest_requires_auth(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -3557,7 +3589,7 @@ def test_harness_events_ingest_requires_auth(tmp_path):
 
 
 def test_harness_events_ingest_rejects_malformed_body(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -3759,12 +3791,22 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
     )
     try:
         port = server.server_address[1]
-        status, body = _json_request(
-            f"http://127.0.0.1:{port}/harness/events",
-            payload={"events": [older_event, event]},
+        # Model legacy orphan events already persisted before host binding.
+        # New HTTP ingress rejects sessions whose ownership is not established.
+        inserted = registry.ingest_structured_events(
+            [
+                {
+                    "event_id": item["event_id"],
+                    "session_id": item["session_id"],
+                    "event_type": item["type"],
+                    "payload": item,
+                    "seq": item["seq"],
+                    "created_at": datetime.fromisoformat(item["ts"]),
+                }
+                for item in (older_event, event)
+            ]
         )
-        assert status == 200
-        assert body == {"ingested": 2}
+        assert inserted == 2
         assert _live_recap_jobs(pg_control_path, "harness-race") == []
 
         response_body = json.dumps(
@@ -3850,8 +3892,62 @@ def _event(seq: int, text: str) -> dict:
     }
 
 
-def test_messages_endpoint_orders_and_filters_by_seq(tmp_path):
+def test_harness_events_wait_for_trusted_session_ownership(tmp_path):
     collector = _make_collector(tmp_path)
+    registry = HarnessRegistry(collector.duckdb_path)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/harness/events"
+        event = _event(1, "early event")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _json_request(url, payload={"events": [event]})
+        assert exc.value.code == 403
+        assert registry.list_events_after(event["session_id"], 0) == []
+
+        # The hub establishes ownership from the host's create response.
+        collector._sync_created_harness_session(
+            "nas",
+            {},
+            json.dumps(
+                {
+                    "session_id": event["session_id"],
+                    "harness": "claude-code",
+                    "command": "claude",
+                    "mode": "structured",
+                }
+            ),
+        )
+        status, body = _json_request(url, payload={"events": [event]})
+        assert status == 200
+        assert body == {"ingested": 1}
+
+        # A NAS token cannot preclaim or submit events for another host's session.
+        registry.create_session(
+            host_id="other-host",
+            harness="claude-code",
+            command="claude",
+            session_id="other-session",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _json_request(
+                url,
+                payload={
+                    "events": [
+                        dict(event, event_id="other-event", session_id="other-session")
+                    ]
+                },
+            )
+        assert exc.value.code == 403
+        assert registry.list_events_after("other-session", 0) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_messages_endpoint_orders_and_filters_by_seq(tmp_path):
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -3870,7 +3966,7 @@ def test_messages_endpoint_orders_and_filters_by_seq(tmp_path):
 
 
 def test_messages_endpoint_overlays_canonical_event_metadata(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     HarnessRegistry(collector.duckdb_path).append_event(
         event_id="legacy-e1",
         session_id="legacy",
@@ -3900,7 +3996,7 @@ def test_messages_endpoint_overlays_canonical_event_metadata(tmp_path):
 
 
 def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -3918,7 +4014,7 @@ def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
 
 
 def test_messages_endpoint_legacy_after_seq_request_remains_unpaginated(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -3940,7 +4036,7 @@ def test_messages_endpoint_legacy_after_seq_request_remains_unpaginated(tmp_path
 
 
 def test_messages_endpoint_pages_newest_older_and_fixed_forward(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4006,7 +4102,7 @@ def test_messages_endpoint_pages_newest_older_and_fixed_forward(tmp_path):
     ],
 )
 def test_messages_endpoint_rejects_invalid_page_queries(tmp_path, query, detail):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4023,7 +4119,7 @@ def test_messages_endpoint_rejects_invalid_page_queries(tmp_path, query, detail)
 
 
 def test_messages_endpoint_selectively_gzips_large_pages(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4101,7 +4197,7 @@ def test_a_client_that_cannot_decode_gzip_still_gets_plain_json(tmp_path):
 
 
 def test_messages_endpoint_keeps_small_page_uncompressed(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4122,7 +4218,7 @@ def test_messages_endpoint_keeps_small_page_uncompressed(tmp_path):
 
 @pytest.mark.parametrize("raw_after_seq", ["nope", "--5"])
 def test_messages_endpoint_rejects_non_integer_after_seq(tmp_path, raw_after_seq):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4140,7 +4236,7 @@ def test_messages_endpoint_rejects_non_integer_after_seq(tmp_path, raw_after_seq
 
 
 def test_messages_endpoint_requires_auth(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4157,7 +4253,7 @@ def test_messages_endpoint_requires_auth(tmp_path):
 
 
 def test_session_stream_ws_delivers_new_events(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4190,7 +4286,7 @@ def test_session_stream_ws_delivers_new_events(tmp_path):
 def test_session_stream_ws_initial_catch_up_overlays_canonical_event_metadata(
     tmp_path,
 ):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     HarnessRegistry(collector.duckdb_path).append_event(
         event_id="legacy-e1",
         session_id="legacy",
@@ -4226,7 +4322,7 @@ def test_session_stream_ws_initial_catch_up_overlays_canonical_event_metadata(
 
 
 def test_session_stream_ws_answers_ping_and_stays_live(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4256,7 +4352,7 @@ def test_session_stream_ws_answers_ping_and_stays_live(tmp_path):
 
 
 def test_session_stream_ws_respects_after_seq(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4285,7 +4381,7 @@ def test_session_stream_ws_respects_after_seq(tmp_path):
 
 
 def test_session_stream_ws_requires_auth(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4307,7 +4403,7 @@ def test_session_stream_ws_requires_auth(tmp_path):
 
 
 def test_session_stream_ws_rejects_missing_websocket_key(tmp_path):
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
@@ -4342,7 +4438,7 @@ def test_session_stream_ws_rejects_missing_websocket_key(tmp_path):
 
 def test_session_stream_ws_upgrade_is_http_1_1(tmp_path):
     """Strict WebSocket clients (URLSessionWebSocketTask) reject HTTP/1.0 101."""
-    collector = _make_collector(tmp_path)
+    collector = _make_event_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
     )
