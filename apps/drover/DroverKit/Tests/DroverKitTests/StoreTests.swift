@@ -27,6 +27,39 @@ struct StoreTests {
     let mock = MockNetwork()
     private func client() -> DroverClient { mock.client() }
 
+@Test @MainActor func optimisticEndSurvivesStalePollAndRollsBack() async {
+    mock.handler = { _ in (200, snapshotJSON) }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    store.markSessionEnded("harness-2", ended: true)
+    #expect(!store.inboxSessions.contains { $0.id == "harness-2" })
+    #expect(store.finished.contains { $0.id == "harness-2" })
+    await store.refresh()
+    #expect(!store.inboxSessions.contains { $0.id == "harness-2" })
+    store.markSessionEnded("harness-2", ended: false)
+    #expect(store.working.contains { $0.id == "harness-2" })
+}
+
+@Test @MainActor func optimisticEndReconcilesWithTerminalSnapshot() async throws {
+    mock.handler = { _ in (200, snapshotJSON) }
+    let store = SessionStore(client: client())
+    await store.refresh()
+    store.markSessionEnded("harness-2", ended: true)
+    var payload = try JSONSerialization.jsonObject(with: snapshotJSON) as! [String: Any]
+    var sessions = payload["sessions"] as! [[String: Any]]
+    let index = sessions.firstIndex { $0["session_id"] as? String == "harness-2" }!
+    sessions[index]["status"] = "terminated"
+    payload["sessions"] = sessions
+    let confirmed = try JSONSerialization.data(withJSONObject: payload)
+    mock.handler = { _ in (200, confirmed) }
+    await store.refresh()
+    #expect(store.finished.contains { $0.id == "harness-2" })
+    // A later recovered session must not retain the reconciled override.
+    mock.handler = { _ in (200, snapshotJSON) }
+    await store.refresh()
+    #expect(store.working.contains { $0.id == "harness-2" })
+}
+
 @Test @MainActor func refreshBucketsSessions() async throws {
     mock.handler = { _ in (200, snapshotJSON) }  // Task 2 fixture
     let store = SessionStore(client: client())

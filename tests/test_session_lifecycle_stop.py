@@ -153,3 +153,62 @@ def test_postgres_stop_publication_inventory_roundtrip(pg_control_path):
     store.record_inventory("h", [tree], datetime.now(timezone.utc))
     with registry._connect() as con:
         assert con.execute("SELECT count(*) FROM session_worktrees").fetchone()[0] == 1
+
+
+def test_interrupt_bypasses_preparing_turn_lock(setup, monkeypatch):
+    import threading
+
+    _, registry, session, collector = setup
+    preparing = threading.Event()
+    release = threading.Event()
+    interrupted = threading.Event()
+
+    def request(host, route, **kwargs):
+        if route.endswith("/turns"):
+            preparing.set()
+            assert release.wait(3)
+        else:
+            assert route.endswith("/interrupt")
+            interrupted.set()
+        return 200, "{}"
+
+    monkeypatch.setattr(collector, "_harness_request", request)
+    turn = threading.Thread(
+        target=lambda: collector.proxy_harness_session_action(
+            session.session_id, "turns", {"text": "hello"}
+        )
+    )
+    stop = threading.Thread(
+        target=lambda: collector.proxy_harness_session_action(
+            session.session_id, "interrupt", {}
+        )
+    )
+    turn.start()
+    try:
+        assert preparing.wait(2)
+        stop.start()
+        assert interrupted.wait(1), "interrupt must reach harnessd during preparing"
+    finally:
+        release.set()
+        turn.join(3)
+        stop.join(3)
+    assert not turn.is_alive() and not stop.is_alive()
+
+
+def test_confirmed_termination_invalidates_snapshot_cache(setup, monkeypatch):
+    _, registry, session, collector = setup
+    invalidated = []
+    monkeypatch.setattr(
+        collector, "invalidate_harness_cache", lambda: invalidated.append(True)
+    )
+    monkeypatch.setattr(
+        collector,
+        "_harness_request",
+        lambda *a, **k: (
+            200,
+            json.dumps({"session_id": session.session_id, "status": "terminated"}),
+        ),
+    )
+    assert collector.proxy_terminate_harness_session(session.session_id)[0] == 200
+    assert invalidated == [True]
+    assert registry.get_session(session.session_id).status == "terminated"

@@ -1977,6 +1977,7 @@ class MetricsCollector:
                         payload = json.loads(body)
                         payload = payload.get("session", payload)
                         if store.confirm(operation_id, payload):
+                            self.invalidate_harness_cache()
                             continue
                         # Replay only explicit user intent, never policy intent.
                         self._proxy_terminate_harness_session(session_id)
@@ -1991,6 +1992,10 @@ class MetricsCollector:
     ) -> tuple[int, str]:
         """Proxy a structured-session action (turns/permission/interrupt) to
         the owning host's harnessd, forwarding the JSON body verbatim."""
+        # A turn can spend seconds preparing or recovering. Stop must reach
+        # harnessd while that request is still in flight.
+        if action == "interrupt":
+            return self._proxy_harness_session_action(session_id, action, payload)
         with self._session_lock_for(session_id):
             return self._proxy_harness_session_action(session_id, action, payload)
 
@@ -2868,9 +2873,12 @@ class MetricsCollector:
         if not isinstance(payload, dict):
             return False
         store = LifecycleStore(self.duckdb_path)
-        return any(
+        confirmed = any(
             store.confirm(op[0], payload) for op in store.pending(session_id=session_id)
         )
+        if confirmed:
+            self.invalidate_harness_cache()
+        return confirmed
 
     def _build_handoff_prompt(self, source: Any, *, target_harness: str) -> str:
         # transcript_text replays harness_events, which is where every

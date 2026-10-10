@@ -3,7 +3,7 @@ import Foundation
 /// Event-backed activity, cached by ChatModel. A missing result alone cannot
 /// keep a tool alive across a completed turn or a new user input.
 public struct SessionActivityPresentation: Sendable, Equatable {
-    public enum Phase: Sendable { case ready, preparing, working, tool, completed, failed, approval, connecting, reconnecting, sending, delivery, unknown }
+    public enum Phase: Sendable { case stopping, ready, preparing, working, tool, completed, failed, approval, connecting, reconnecting, sending, delivery, unknown }
     public var phase: Phase = .ready
     public var title = "Ready"
     public var detail: String?

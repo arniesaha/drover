@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -48,6 +49,9 @@ class _Entry:
         self.lock = threading.RLock()
         self.turn_lock = threading.Lock()
         self.turn_active = False
+        self.control_lock = threading.Lock()
+        self.preparing = False
+        self.interrupt_pending = False
         # A client can lose the response after a driver has accepted a turn.
         # Retrying that same client-generated key must return the original
         # turn instead of steering the harness a second time. Keep this
@@ -403,14 +407,15 @@ class StructuredSessionManager:
             accepted = self._accepted_turn_id(entry, client_turn_id)
             if accepted is not None:
                 return accepted
-            return self._send_turn_locked(
-                entry,
-                text,
-                images=images,
-                model=model,
-                thinking_effort=thinking_effort,
-                client_turn_id=client_turn_id,
-            )
+            with self._preparing_turn(entry):
+                return self._send_turn_locked(
+                    entry,
+                    text,
+                    images=images,
+                    model=model,
+                    thinking_effort=thinking_effort,
+                    client_turn_id=client_turn_id,
+                )
 
     def submit_turn(
         self,
@@ -435,18 +440,19 @@ class StructuredSessionManager:
             # Refuse before preparing, so a refused turn leaves no files.
             if self.is_draining():
                 raise RuntimeError(_DRAINING_ERROR)
-            text, images = prepare()
-            return (
-                self._send_turn_locked(
-                    entry,
-                    text,
-                    images=images,
-                    model=model,
-                    thinking_effort=thinking_effort,
-                    client_turn_id=client_turn_id,
-                ),
-                False,
-            )
+            with self._preparing_turn(entry):
+                text, images = prepare()
+                return (
+                    self._send_turn_locked(
+                        entry,
+                        text,
+                        images=images,
+                        model=model,
+                        thinking_effort=thinking_effort,
+                        client_turn_id=client_turn_id,
+                    ),
+                    False,
+                )
 
     @staticmethod
     def _accepted_turn_id(entry: _Entry, client_turn_id: str | None) -> str | None:
@@ -577,9 +583,40 @@ class StructuredSessionManager:
                 )
             )
 
+    @contextmanager
+    def _preparing_turn(self, entry: _Entry):
+        with entry.control_lock:
+            entry.preparing = True
+        accepted = False
+        try:
+            yield
+            accepted = True
+        finally:
+            with entry.control_lock:
+                entry.preparing = False
+                pending = entry.interrupt_pending
+                entry.interrupt_pending = False
+            if accepted and pending:
+                entry.adapter.interrupt(entry.driver)
+
     def interrupt(self, session_id: str) -> None:
         entry = self._require_entry(session_id)
+        with entry.control_lock:
+            if entry.preparing:
+                entry.interrupt_pending = True
+                return
         entry.adapter.interrupt(entry.driver)
+
+    def end(self, session_id: str) -> None:
+        entry = self._require_entry(session_id)
+        entry.driver.emit(
+            StructuredMessage(
+                type="status",
+                role="system",
+                text="session.terminated",
+                payload={"session_status": "terminated", "turn_complete": True},
+            )
+        )
 
     def close(self, session_id: str) -> None:
         with self._entries_lock:

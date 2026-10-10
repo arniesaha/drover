@@ -1061,3 +1061,60 @@ def test_agy_429_is_recorded_under_the_session_host(monkeypatch, tmp_path):
         assert get_active_observed_exhaustions(host_id="local") == []
     finally:
         clear_observed_exhaustions()
+
+
+@pytest.mark.parametrize("phase", ["prepare", "dispatch"])
+def test_single_interrupt_during_preparing_is_applied_on_start(
+    monkeypatch, tmp_path, phase
+):
+    mgr, driver, registry, messages, _ = _build_manager(monkeypatch, tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    interrupted = []
+    monkeypatch.setattr(
+        driver, "interrupt", lambda: interrupted.append(list(driver.sent_turns))
+    )
+    if phase == "dispatch":
+        driver.send_turn_started = started
+        driver.release_send_turn = release
+
+    def prepare():
+        if phase == "prepare":
+            started.set()
+            assert release.wait(2)
+        return "hello", None
+
+    errors = []
+
+    def submit():
+        try:
+            mgr.submit_turn("sess-1", prepare=prepare)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=submit)
+    worker.start()
+    try:
+        assert started.wait(2)
+        mgr.interrupt("sess-1")
+        assert not interrupted
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
+    assert not errors
+    assert len(interrupted) == 1
+    assert interrupted[0][0][0] == "hello"
+    mgr.close("sess-1")
+
+
+def test_end_publishes_terminal_message_before_driver_close(monkeypatch, tmp_path):
+    mgr, driver, registry, messages, _ = _build_manager(monkeypatch, tmp_path)
+    mgr.end("sess-1")
+    assert not driver.closed
+    terminal = messages[-1][1]
+    assert terminal["type"] == "status"
+    assert terminal["payload"]["session_status"] == "terminated"
+    assert terminal["seq"] == registry.max_event_seq("sess-1")
+    mgr.close("sess-1")
+    assert driver.closed
