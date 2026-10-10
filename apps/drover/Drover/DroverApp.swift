@@ -40,6 +40,7 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
         let request = response.notification.request
         // Parsed here: pure, and it keeps the non-Sendable response off the
         // hop below.
+        let sessionIDs = NotificationRoute.sessionIDs(userInfo: request.content.userInfo)
         let sessionID = NotificationRoute.sessionID(
             userInfo: request.content.userInfo,
             requestIdentifier: request.identifier
@@ -52,7 +53,8 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
         // quietly — if it were ever violated this would fail loudly here
         // instead of deep inside UIKit.
         MainActor.assumeIsolated {
-            if let sessionID { NotificationRoute.shared.open(sessionID: sessionID) }
+            if let sessionIDs { NotificationRoute.shared.open(sessionIDs: sessionIDs) }
+            else if let sessionID { NotificationRoute.shared.open(sessionID: sessionID) }
         }
         completionHandler()
     }

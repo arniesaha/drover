@@ -12,6 +12,29 @@ struct ClientTests {
     let mock = MockNetwork()
     private func client() -> DroverClient { mock.client() }
 
+@Test func notificationPreferenceUsesDeviceEndpointAndBearer() async throws {
+    mock.handler = { request in
+        #expect(request.url?.path == "/auth/device/notifications")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+        if request.httpMethod == "GET" {
+            return (200, Data(#"{"mode":"digest"}"#.utf8))
+        }
+        #expect(request.httpMethod == "PUT")
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: String]
+        #expect(body == ["mode": "all"])
+        return (204, Data())
+    }
+    #expect(try await client().notificationMode() == .digest)
+    try await client().setNotificationMode(.all)
+}
+
+@Test func notificationPreferenceFailureIsSurfaced() async {
+    mock.handler = { _ in (401, Data()) }
+    await #expect(throws: DroverError.unauthorized) {
+        try await client().setNotificationMode(.digest)
+    }
+}
+
 @Test func selfRevocationSendsOnlyBearerAndAcceptsNoContent() async throws {
     mock.handler = { request in
         #expect(request.httpMethod == "DELETE")

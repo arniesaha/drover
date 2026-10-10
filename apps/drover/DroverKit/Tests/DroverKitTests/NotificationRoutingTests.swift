@@ -84,3 +84,38 @@ import Testing
     // Two alerts tapped in a row should land on the one the user chose last.
     #expect(route.consume() == "harness-2")
 }
+
+@Test func notificationModeDefaultsAndPersistence() {
+    let name = "NotificationModeTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: name)!
+    defer { defaults.removePersistentDomain(forName: name) }
+    #expect(NotificationMode.saved(in: defaults) == .action)
+    for mode in NotificationMode.allCases {
+        mode.save(in: defaults)
+        #expect(NotificationMode.saved(in: UserDefaults(suiteName: name)!) == mode)
+    }
+    defaults.set("invalid", forKey: "drover.push.mode")
+    #expect(NotificationMode.saved(in: defaults) == .action)
+}
+
+@Test func summaryPayloadRoutesOnlyToItsSessions() {
+    let payload: [AnyHashable: Any] = ["session_ids": [" second ", "first", "first", " "]]
+    #expect(NotificationRoute.sessionIDs(userInfo: payload) == ["first", "second"])
+    #expect(NotificationRoute.sessionID(userInfo: payload, requestIdentifier: "apns-request") == nil)
+    #expect(NotificationRoute.sessionIDs(userInfo: ["session_ids": [" "]]) == nil)
+    #expect(NotificationRoute.sessionIDs(userInfo: ["session_ids": "wrong type"]) == nil)
+}
+
+@Test @MainActor func summaryRouteSurvivesUntilConsumedAndReplacesSingleRoute() {
+    let route = NotificationRoute()
+    route.open(sessionID: "first")
+    route.open(sessionIDs: ["second", "first", "second"])
+    #expect(route.pendingSessionID == nil)
+    #expect(route.pendingSessionIDs == ["first", "second"])
+    #expect(route.consumeSummary() == ["first", "second"])
+    #expect(route.consumeSummary() == nil)
+    route.open(sessionIDs: ["first", "second"])
+    route.open(sessionID: "third")
+    #expect(route.pendingSessionIDs == nil)
+    #expect(route.consume() == "third")
+}

@@ -66,6 +66,7 @@ class Credential:
     host_id: str | None = None
     last_used_at: str | None = None
     revoked_at: str | None = None
+    notification_mode: str = "action"
     apns_token: str | None = None
     apns_environment: str | None = None
     #: Set when Apple permanently rejected this device's registration. The
@@ -96,6 +97,7 @@ class Credential:
             "host_id": self.host_id,
             "last_used_at": self.last_used_at,
             "revoked_at": self.revoked_at,
+            "notification_mode": self.notification_mode,
             "apns_token": self.apns_token,
             "apns_environment": self.apns_environment,
             "apns_failure_reason": self.apns_failure_reason,
@@ -197,6 +199,21 @@ class CredentialStore:
                 apns_failed_at=None,
                 apns_failed_fingerprint=None,
             )
+            self._write()
+            return True
+
+    def set_notification_mode(self, credential_id: str, mode: str) -> bool:
+        if mode not in {"all", "action", "digest"}:
+            raise ValueError("invalid notification mode")
+        with self._lock:
+            credential = self._by_id.get(credential_id)
+            if (
+                credential is None
+                or not credential.is_active
+                or credential.scope != "device"
+            ):
+                return False
+            self._by_id[credential_id] = replace(credential, notification_mode=mode)
             self._write()
             return True
 
@@ -313,6 +330,7 @@ class CredentialStore:
                     host_id=item.get("host_id"),
                     last_used_at=item.get("last_used_at"),
                     revoked_at=item.get("revoked_at"),
+                    notification_mode=item.get("notification_mode", "action"),
                     apns_token=item.get("apns_token"),
                     apns_environment=item.get("apns_environment"),
                     apns_failure_reason=item.get("apns_failure_reason"),
@@ -348,7 +366,7 @@ class CredentialStore:
 _CREDENTIAL_COLUMNS = """
 credential_id, scope, label, verifier, created_at, host_id, last_used_at,
 revoked_at, apns_token, apns_environment, apns_failure_reason, apns_failed_at,
-apns_failed_fingerprint
+apns_failed_fingerprint, notification_mode
 """
 
 
@@ -376,6 +394,7 @@ def _credential_from_row(row: tuple[object, ...]) -> Credential:
         apns_failure_reason=str(row[10]) if row[10] is not None else None,
         apns_failed_at=timestamp(row[11]),
         apns_failed_fingerprint=str(row[12]) if row[12] is not None else None,
+        notification_mode=str(row[13]),
     )
 
 
@@ -475,6 +494,18 @@ class PostgresCredentialStore:
                    WHERE credential_id = ? AND revoked_at IS NULL AND scope = 'device'
                    RETURNING credential_id""",
                 [token, environment, credential_id],
+            ).fetchone()
+        return row is not None
+
+    def set_notification_mode(self, credential_id: str, mode: str) -> bool:
+        if mode not in {"all", "action", "digest"}:
+            raise ValueError("invalid notification mode")
+        with self._connection() as con:
+            row = con.execute(
+                "UPDATE control_credentials SET notification_mode = ? "
+                "WHERE credential_id = ? AND revoked_at IS NULL AND scope = 'device' "
+                "RETURNING credential_id",
+                [mode, credential_id],
             ).fetchone()
         return row is not None
 

@@ -471,3 +471,66 @@ def test_revocation_without_push_survives_store_restart(server):
     assert reopened.find_active(token) is None
     assert reopened.find_for_revocation(token).id == device.id
     assert reopened.get(device.id).apns_token is None
+
+
+def test_notification_preferences_are_device_owned_and_persisted(server, tmp_path):
+    _, store, _ = server
+    device, token = store.issue(scope="device", label="Phone")
+    other, _ = store.issue(scope="device", label="Tablet")
+    assert jsonlib.loads(
+        request(server, "GET", "/auth/device/notifications", token=token)[1]
+    ) == {"mode": "action"}
+    assert request(
+        server,
+        "PUT",
+        "/auth/device/notifications",
+        token=token,
+        json={"mode": "digest"},
+    ) == (204, b"")
+    assert jsonlib.loads(
+        request(server, "GET", "/auth/device/notifications", token=token)[1]
+    ) == {"mode": "digest"}
+    assert store.get(other.id).notification_mode == "action"
+    reopened = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
+    assert reopened.get(device.id).notification_mode == "digest"
+
+
+@pytest.mark.parametrize("mode", ["unknown", None, [], {}])
+def test_invalid_notification_preferences_are_rejected(server, mode):
+    _, store, _ = server
+    device, token = store.issue(scope="device", label="Phone")
+    assert (
+        request(
+            server,
+            "PUT",
+            "/auth/device/notifications",
+            token=token,
+            json={"mode": mode},
+        )[0]
+        == 400
+    )
+    assert store.get(device.id).notification_mode == "action"
+
+
+def test_notification_preferences_require_device_bearer(server):
+    _, store, _ = server
+    host, host_token = store.issue(scope="host", label="Host", host_id="synthetic-host")
+    for method in ("GET", "PUT"):
+        assert (
+            request(
+                server,
+                method,
+                "/auth/device/notifications",
+                token="cluster-token",
+                json={"mode": "all"},
+            )[0]
+            == 401
+        )
+        assert request(
+            server,
+            method,
+            "/auth/device/notifications",
+            token=host_token,
+            json={"mode": "all"},
+        )[0] in {401, 403}
+    assert store.get(host.id).notification_mode == "action"

@@ -26,6 +26,7 @@ from drover.server.postgres_schema import (
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
     EXPORTER_FRESHNESS_MIGRATION: "83b89a5b043a659612309179679d835d35a2c09c4dfd36bb801c7488de27352d",
+    17: "fda9bab1f66135d72af01bbe366c9ecc7edda43161498e602a0c83dd63e5d9a0",
     1: "f1982d26c425aea2c00be04ba80e393d1dce5dd27db1eeb98998d6b93d60eacf",
     2: "3228bfd9a7e26123637a9cbb2fb27bd4056a5b016c8df6f71ff12813324f46e2",
     3: "6fe7d32e0a69f2c9d3ffafb92f8be932ea3a0778052f98b407669636608dfcdd",
@@ -94,9 +95,7 @@ def test_migration_versions_are_unique_and_ascending():
     versions = [version for version, _ in _MIGRATIONS]
     assert versions == sorted(set(versions))
     assert VECTOR_MIGRATION not in versions
-    assert sorted([*versions, VECTOR_MIGRATION]) == list(
-        range(1, EXPORTER_FRESHNESS_MIGRATION + 1)
-    )
+    assert sorted([*versions, VECTOR_MIGRATION]) == list(range(1, max(versions) + 1))
 
 
 def test_lake_export_batches_backfill_matches_migration_2():
