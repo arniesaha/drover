@@ -18,10 +18,14 @@ from __future__ import annotations
 
 import hashlib
 
-from drover.server.postgres_schema import PROFILE_MIGRATION
+from drover.server.postgres_schema import (
+    EXPORTER_FRESHNESS_MIGRATION,
+    PROFILE_MIGRATION,
+)
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    EXPORTER_FRESHNESS_MIGRATION: "83b89a5b043a659612309179679d835d35a2c09c4dfd36bb801c7488de27352d",
     1: "f1982d26c425aea2c00be04ba80e393d1dce5dd27db1eeb98998d6b93d60eacf",
     2: "3228bfd9a7e26123637a9cbb2fb27bd4056a5b016c8df6f71ff12813324f46e2",
     3: "6fe7d32e0a69f2c9d3ffafb92f8be932ea3a0778052f98b407669636608dfcdd",
@@ -91,7 +95,7 @@ def test_migration_versions_are_unique_and_ascending():
     assert versions == sorted(set(versions))
     assert VECTOR_MIGRATION not in versions
     assert sorted([*versions, VECTOR_MIGRATION]) == list(
-        range(1, PROFILE_MIGRATION + 1)
+        range(1, EXPORTER_FRESHNESS_MIGRATION + 1)
     )
 
 
@@ -231,3 +235,61 @@ def test_lifecycle_14_fresh_existing_and_rerun(pg_control_path):
             == 1
         )
         assert con.execute("SELECT count(*) FROM session_worktrees").fetchone()[0] == 0
+
+
+def test_freshness_migration_existing_store_and_index_plan(pg_control_path):
+    """History growth must not turn the last-success lookup into a full scan."""
+    import json
+
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    indexes = (
+        "lake_export_batches_last_success",
+        "control_outbox_batches_unacknowledged",
+        "control_outbox_events_pending_age",
+    )
+    with store.connection() as con:
+        con.execute("DELETE FROM control_schema_migrations WHERE version = 16")
+        for name in indexes:
+            con.execute(f"DROP INDEX IF EXISTS {name}")
+        con.execute(
+            "INSERT INTO control_outbox_batches (batch_id, state, member_count, acknowledged_at) SELECT 'history-' || n, 'acknowledged', 1, now() - n * interval '1 second' FROM generate_series(1, 10000) n"
+        )
+        con.execute(
+            "INSERT INTO lake_export_batches (batch_id, catalog_id, input_json, input_sha256, acknowledged_at) SELECT batch_id, 'test', '{}', 'test', acknowledged_at FROM control_outbox_batches"
+        )
+        con.execute(
+            "INSERT INTO control_outbox_events (event_id, state, acknowledged_at) SELECT 'history-' || n, 'acknowledged', now() FROM generate_series(1, 10000) n"
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        con.execute("ANALYZE lake_export_batches")
+        con.execute("ANALYZE control_outbox_batches")
+        con.execute("ANALYZE control_outbox_events")
+        from drover.server.lake.freshness import FRESHNESS_SQL
+
+        full_plan = con.execute("EXPLAIN (FORMAT JSON) " + FRESHNESS_SQL).fetchone()[0]
+        encoded_plan = json.dumps(full_plan)
+        assert "Seq Scan" not in encoded_plan, full_plan
+        for index in indexes:
+            assert index in encoded_plan, full_plan
+        for query, index in [
+            ("SELECT max(acknowledged_at) FROM lake_export_batches", indexes[0]),
+            (
+                "SELECT count(*), min(created_at) FROM control_outbox_batches WHERE acknowledged_at IS NULL",
+                indexes[1],
+            ),
+            (
+                "SELECT min(committed_at) FROM control_outbox_events WHERE state='pending'",
+                indexes[2],
+            ),
+        ]:
+            plan = con.execute("EXPLAIN (FORMAT JSON) " + query).fetchone()[0]
+            assert index in json.dumps(plan), plan
+        (applied,) = con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = 16"
+        ).fetchone()
+        assert applied == 1

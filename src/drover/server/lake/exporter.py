@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,6 +109,9 @@ class LakeOutboxExporter:
         self.owner = owner or "lake-exporter-" + uuid4().hex
         self.fence = None
         self._batch_lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._cancel_lock = threading.Lock()
+        self._control_connection = None
         self.catalog_id = None
         self.token = None
 
@@ -126,12 +130,52 @@ class LakeOutboxExporter:
         return self
 
     def __exit__(self, *exc):
-        if self.fence:
-            self.fence.__exit__(*exc)
-        self.fence = None
-        self.token = None
+        with self._cancel_lock:
+            if self.fence:
+                self.fence.__exit__(*exc)
+            self.fence = None
+            self.token = None
+
+    @property
+    def cancelled(self):
+        return self._cancelled.is_set()
+
+    def cancel(self):
+        """Cooperatively unwind the owner, never release its fence remotely.
+
+        libpq cancellation is thread-safe. Hold registration until it completes
+        so a returned pool connection cannot cancel a different borrower's work.
+        The publisher's next check kills/reaps its isolated child in finally.
+        """
+        self._cancelled.set()
+        with self._cancel_lock:
+            connections = [self._control_connection]
+            if self.fence is not None:
+                connections.append(self.fence.connection)
+            for connection in connections:
+                if connection is not None:
+                    try:
+                        connection.cancel_safe(timeout=1)
+                    except Exception:
+                        # Cancellation is best effort. The lifecycle never
+                        # replaces an owner that has not exited and fenced out.
+                        pass
+
+    @contextmanager
+    def _control(self):
+        with control_plane_connection(self.control_path, timeout=2) as control:
+            with self._cancel_lock:
+                self._control_connection = control._connection
+            try:
+                self._check()
+                yield control
+            finally:
+                with self._cancel_lock:
+                    self._control_connection = None
 
     def _check(self):
+        if self.cancelled:
+            raise LakeError("lake_export_recovery_deadline")
         if self.fence is None:
             raise LakeError("lake_exporter_not_owned")
         self.fence.check()
@@ -185,7 +229,7 @@ class LakeOutboxExporter:
         return document
 
     def _input(self, now):
-        with control_plane_connection(self.control_path) as control:
+        with self._control() as control:
             document = self._pending(control)
             if document:
                 return document
@@ -286,7 +330,7 @@ class LakeOutboxExporter:
             or receipt["catalog_id"] != self.catalog_id
         ):
             raise LakeError("lake_export_receipt_mismatch")
-        with control_plane_connection(self.control_path) as control:
+        with self._control() as control:
             control.execute("BEGIN")
             try:
                 frozen = control.execute(

@@ -8,14 +8,7 @@ LAG_SECONDS = 30
 STALL_SECONDS = 120
 
 
-def read_freshness(path):
-    with control_plane_connection(path, timeout=2) as control:
-        control.execute("BEGIN READ ONLY")
-        try:
-            # LOCAL avoids changing timeout policy for the next pool borrower.
-            control.execute("SET LOCAL statement_timeout = '2s'")
-            last, count, oldest, pending = control.execute(
-                """SELECT x.last_success, b.count, b.oldest, p.oldest
+FRESHNESS_SQL = """SELECT x.last_success, b.count, b.oldest, p.oldest
                 FROM (SELECT max(acknowledged_at) AS last_success
                       FROM lake_export_batches) x
                 CROSS JOIN (SELECT count(*) AS count, min(created_at) AS oldest
@@ -23,7 +16,15 @@ def read_freshness(path):
                             WHERE acknowledged_at IS NULL) b
                 CROSS JOIN (SELECT min(committed_at) AS oldest
                             FROM control_outbox_events WHERE state='pending') p"""
-            ).fetchone()
+
+
+def read_freshness(path):
+    with control_plane_connection(path, timeout=2) as control:
+        control.execute("BEGIN READ ONLY")
+        try:
+            # LOCAL avoids changing timeout policy for the next pool borrower.
+            control.execute("SET LOCAL statement_timeout = '2s'")
+            last, count, oldest, pending = control.execute(FRESHNESS_SQL).fetchone()
             control.execute("COMMIT")
         except BaseException:
             control.execute("ROLLBACK")

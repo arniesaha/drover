@@ -138,7 +138,7 @@ was hours ago. Outstanding work is `lagging` at 30 seconds and `stalled` at
 without a running owner reports `stopped`. The last error is retained after
 recovery for diagnosis; the verdict uses current running state and backlog.
 
-Freshness is sampled every two seconds from PostgreSQL with a two-second SQL
+Freshness is sampled every ten seconds from PostgreSQL with a two-second SQL
 timeout. Ages advance between samples. Readiness uses the cached snapshot and
 does not open DuckLake for these fields. `/healthz` remains unchanged. Exporter
 lag is separate from the control API readiness verdict, so fleet management
@@ -153,13 +153,29 @@ reports stopped with `hub_status_unavailable`; it cannot infer a live owner
 from the database alone. The iOS fleet header polls readiness while active and
 shows "Search and recall may be out of date" for lagging, stalled or stopped.
 
-After a runtime owner failure (including a killed batch process or the existing
-30-second export deadline), the owner releases its fence before replacement.
+The supervisor also watches elapsed batch-attempt time in memory, independent
+of the freshness query. `[analytics] exporter_recovery_deadline_seconds = 120`
+is the default and may be set to any finite positive number. If an in-flight
+attempt exceeds that deadline, the watchdog requests cooperative cancellation,
+interrupts active PostgreSQL calls, and lets the publisher kill and reap its
+isolated child. It then unwinds transactions and releases its fence. Each
+replacement gets a full attempt deadline, even for an old unacknowledged batch.
+Cancellation runs on a separate thread so the watchdog remains responsive even
+when an older libpq cancellation call blocks. The owner retains its fence until
+cleanup completes. Projection refreshes and checkpoints use their own deadlines.
+Detection may take up to one polling interval plus the bounded freshness probe.
+
+After a runtime owner failure (including cancellation of a living hung batch,
+a killed batch process or the existing 30-second export deadline), the owner
+releases its fence before replacement.
 The supervisor allows five replacements per hub process lifetime, waiting
 1, 2, 4, 8 and 16 seconds. A replacement reacquires the fence and reuses frozen
 inputs and committed receipts before acknowledging PostgreSQL. Never delete
 outbox rows or receipts to recover a backlog. Startup validation failures still
-fail closed. Shutdown interrupts backoff and prevents replacement.
+fail closed. Shutdown interrupts backoff and prevents replacement. If an owner
+cannot unwind within the 35-second cancellation grace, the exporter reports
+`lake_export_cancellation_stuck` and stopped; no overlapping owner is started.
+A hub restart is then needed to clear the unresponsive thread.
 
 For lagging work, wait briefly and run doctor again. For stalled or stopped
 work, check exporter error codes and control/catalog connectivity, runtime pins,
@@ -169,8 +185,20 @@ status, decreasing outstanding age and batch count, and a new successful export
 time after synthetic ingestion. Verify that synthetic content is returned by
 recall and search before declaring recovery complete.
 
-Deployment needs no new environment variables, configuration options or schema
-migration. Restart the upgraded hub to load the supervisor. Existing #481
+Deployment needs no new environment variables. The recovery deadline config
+is optional. Restart the upgraded hub to load the supervisor and apply control
+schema migration 16 through normal bootstrap. This adds partial indexes for
+last successful export, unacknowledged batch age/count, and pending event age.
+Existing migration statements are unchanged. Index creation uses the normal
+migration transaction and bounded DDL lock wait, so schedule the restart using
+the normal maintenance procedure.
+
+The last-success maximum uses a B-tree limit lookup; backlog queries touch only
+unacknowledged batches or pending events, not accumulated acknowledged history.
+The foreground migration regression loads 10,000 acknowledged historical rows,
+runs ANALYZE and checks the actual combined freshness SQL with EXPLAIN: all
+three indexes are used and there is no sequential scan. SQL and pool acquisition
+remain bounded at two seconds each. Existing #481
 runtime pins, catalog credentials and provisioning remain required. The broader
 #482 soak, restore and ingest-to-recall release gates remain required separately;
 this slice does not change update draining or terminal creation safety.

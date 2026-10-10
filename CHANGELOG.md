@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - DuckLake exporter freshness in readiness, `drover doctor` and the iOS fleet
   header, including backlog ages, durable last success and recovery guidance.
 - Bounded in-process exporter recovery with fenced receipt replay, five retries
-  and exponential backoff. No new configuration or schema migration required.
+  and exponential backoff, including cancellation of live hung batches after
+  an optional configurable deadline (default 120 seconds).
+- Control-schema migration 16 adds freshness indexes; exporter sampling now
+  runs every ten seconds and avoids scanning acknowledged history.
 
 ## [0.6.4] - 2026-10-08
 
