@@ -7,6 +7,7 @@ import DroverKit
 /// real `MessageStream` report a connected chat without live network traffic.
 struct FixtureWebSocketConnector: WebSocketConnecting {
     var streamsLongTranscript = false
+    var streamsReadingTranscript = ProcessInfo.processInfo.environment["DROVER_UI_TEST_TRANSCRIPT_STREAM"] == "1"
 
     func connect(_ request: URLRequest) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
@@ -37,7 +38,7 @@ struct FixtureWebSocketConnector: WebSocketConnecting {
                 continuation.onTermination = { _ in pump.cancel() }
                 return
             }
-            guard ProcessInfo.processInfo.environment["DROVER_UI_TEST_TRANSCRIPT_STREAM"] == "1" else {
+            guard streamsReadingTranscript else {
                 continuation.onTermination = { _ in }
                 return
             }

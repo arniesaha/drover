@@ -340,7 +340,7 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             VStack(spacing: 0) {
                 // Folded once per transcript change on the model and cached
-                // there — re-folding here meant a full pass over every message
+                // there. Re-folding here meant a full pass over every message
                 // on each scroll-phase change.
                 let items = model.items
                 let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
