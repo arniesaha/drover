@@ -9,6 +9,9 @@ session context. Drover does not start agents or load their prompts.
 | Codex | [AGENTS.md and MCP instruction](codex.md) |
 | OpenClaw / Hermes | [Bootstrap note](openclaw-hermes.md) |
 
+Collecting OpenClaw conversations into Drover is separate from this startup
+contract; see [OpenClaw session collection](openclaw.md).
+
 MCP: call `drover_profile` with `{"scope":"first_turn"}`. It always resolves to
 an anonymous general reader. It takes no agent or tier override.
 

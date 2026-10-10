@@ -138,6 +138,39 @@ workers, and that includes the `claude-code` path: it runs locally but sends
 the transcript to Anthropic under your Claude Code login. Only the embeddings
 backend and advisory content analysis can be kept entirely on your hardware.
 
+### OpenClaw sessions
+
+`drover-collect` reads OpenClaw conversations from either store OpenClaw has
+used: JSONL session files (older installs) or the per-agent SQLite databases at
+`<state dir>/agents/<agentId>/agent/openclaw-agent.sqlite` (current releases).
+
+```toml
+[sources.openclaw]
+enabled   = true
+store     = "auto"            # "auto" | "sqlite" | "jsonl"
+state_dir = "~/.openclaw"     # SQLite stores are discovered under here
+root      = "~/.openclaw/agents/main/sessions"   # JSONL session files
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `store` | `auto` | `auto` reads JSONL under `root` and adds the SQLite reader when a store exists under `state_dir`. `sqlite` or `jsonl` forces one. |
+| `state_dir` | derived from `root`, else `~/.openclaw` | OpenClaw state directory. Set it when OpenClaw's state has been relocated. |
+| `root` | none | JSONL session directory. Optional with `store = "sqlite"`. |
+| `agents` | all | Optional list of agent ids to read. |
+| `batch_size` | 200 | Rows per SQLite statement. |
+| `max_events_per_run` | 5000 | Upper bound of events staged per run; a backlog drains over several runs. |
+| `busy_timeout_ms` | 250 | How long one statement waits on a locked database before retrying. |
+
+A config written before the SQLite store needs no edit: with only `root` set,
+`store` is `auto` and the state directory is taken from the
+`<state dir>/agents/<agentId>/sessions` layout of `root`.
+
+The SQLite reader has its own source id and cursor, `openclaw_sqlite`
+(`drover-collect run --source openclaw_sqlite`). See
+[OpenClaw session collection](integrations/openclaw.md) for the read-only
+guarantees, the watermark, the event mapping and troubleshooting.
+
 ### OpenClaw managed TaskFlow (Capability Factory)
 
 `drover-collect` can emit read-only provenance events from OpenClaw's managed
