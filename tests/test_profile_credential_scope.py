@@ -225,7 +225,11 @@ def test_agent_link_requires_active_profile_credential(
     pg_control_path, profile_server, scope, revoked
 ):
     _, store, auth, request = profile_server
-    credential, _ = store.issue(scope=scope, label="example-link")
+    credential, _ = store.issue(
+        scope=scope,
+        label="example-link",
+        host_id="example-host" if scope == "host" else None,
+    )
     if revoked:
         store.revoke(credential.id)
     body = dict(credential_id=credential.id, agent_id="example-link", tier="trusted")
@@ -263,7 +267,11 @@ def test_legacy_binding_resolution_requires_active_profile(
     pg_control_path, profile_server, scope, revoked
 ):
     _, store, _, request = profile_server
-    credential, token = store.issue(scope=scope, label="example-legacy-agent")
+    credential, token = store.issue(
+        scope=scope,
+        label="example-legacy-agent",
+        host_id="example-host" if scope == "host" else None,
+    )
     if revoked:
         store.revoke(credential.id)
     # Simulate a persisted binding that predates registry scope validation.
