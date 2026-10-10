@@ -1,24 +1,18 @@
 ---
-// Placeholder wordmark: a lowercase "d" whose ascender bends into a drover's
-// crook. Swap for the final logo when there is one.
+// The mascot mark is cropped from the README hero artwork by
+// scripts/gen-brand.mjs, so the site and the repository share one identity.
+import { Image } from 'astro:assets';
+import mark from '../assets/drover-mark.png';
+
 interface Props {
   size?: number;
   withText?: boolean;
 }
-const { size = 28, withText = true } = Astro.props;
+const { size = 32, withText = true } = Astro.props;
 ---
 
 <span class="logo">
-  <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden="true" focusable="false">
-    <rect width="32" height="32" rx="9" fill="var(--text)"></rect>
-    <path
-      d="M20.5 22.5V10.2c0-2.4-1.7-4-3.9-4-1.9 0-3.3 1.2-3.6 2.9"
-      fill="none"
-      stroke="var(--bg)"
-      stroke-width="2.6"
-      stroke-linecap="round"></path>
-    <circle cx="15.3" cy="18.6" r="4.6" fill="none" stroke="var(--ember)" stroke-width="2.6"></circle>
-  </svg>
+  <Image src={mark} alt="" width={size} height={size} densities={[1, 2, 3]} loading="eager" />
   {withText && <span class="logo-text">drover</span>}
 </span>
 
@@ -27,6 +21,11 @@ const { size = 28, withText = true } = Astro.props;
     display: inline-flex;
     align-items: center;
     gap: 0.55rem;
+  }
+  .logo :global(img) {
+    display: block;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1.5px var(--line-strong);
   }
   .logo-text {
     font-family: var(--font-display);

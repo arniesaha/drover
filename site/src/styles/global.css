@@ -1,5 +1,7 @@
-/* Drover site styles. Palette is lifted from the hero artwork: dusk teal,
-   ember rust, wheat and cream paper. Fonts are self-hosted (see fonts.css). */
+/* Drover site styles. The palette is sampled from the README hero artwork
+   (run scripts/gen-brand.mjs to print it): cream #f7ebd8, sky teal #1d667a,
+   dusk ink #142d36 to #031f2f, rust #a75d2c, plus the wheat of the grasses.
+   Fonts are self-hosted (see fonts.css). */
 
 :root {
   --font-display: 'Bricolage Grotesque Variable', 'Avenir Next', 'Segoe UI', system-ui, sans-serif;
@@ -13,51 +15,51 @@
   --wrap-narrow: 760px;
   --header-h: 64px;
 
-  /* Light theme: cream paper */
-  --bg: #f6efe1;
-  --bg-2: #efe5d2;
-  --surface: #fffaf0;
-  --surface-2: #f3ead9;
-  --line: #dccfb6;
-  --line-strong: #c5b596;
-  --text: #17212b;
-  --text-2: #3d4954;
-  --muted: #5d6871;
-  --ember: #b04614;
-  --ember-soft: #f4d9c6;
-  --teal: #0f6a73;
-  --teal-soft: #cfe6e4;
-  --wheat: #8a6410;
-  --wheat-soft: #f2e2b6;
+  /* Light theme: the cream paper and dusk ink of the hero artwork */
+  --bg: #f7ebd8;
+  --bg-2: #efe0c8;
+  --surface: #fdf6e9;
+  --surface-2: #f1e3cc;
+  --line: #dfd1bc;
+  --line-strong: #bfa993;
+  --text: #0e2733;
+  --text-2: #2e4645;
+  --muted: #56645f;
+  --ember: #984e1e;
+  --ember-soft: #f2d6bf;
+  --teal: #1d667a;
+  --teal-soft: #cfe3e4;
+  --wheat: #7a5a14;
+  --wheat-soft: #f0dfb4;
   --ok: #2c7a4b;
-  --code-bg: #fbf5e8;
-  --shadow: 0 1px 0 rgba(23, 33, 43, 0.04), 0 12px 32px -16px rgba(23, 33, 43, 0.25);
-  --glow: radial-gradient(60% 60% at 70% 10%, rgba(176, 70, 20, 0.14), transparent 70%),
-    radial-gradient(50% 50% at 10% 0%, rgba(15, 106, 115, 0.14), transparent 70%);
+  --code-bg: #fbf3e4;
+  --shadow: 0 1px 0 rgba(14, 39, 51, 0.04), 0 12px 32px -16px rgba(14, 39, 51, 0.28);
+  --glow: radial-gradient(60% 60% at 70% 10%, rgba(167, 93, 44, 0.16), transparent 70%),
+    radial-gradient(50% 50% at 10% 0%, rgba(29, 102, 122, 0.16), transparent 70%);
   color-scheme: light;
 }
 
 :root[data-theme='dark'] {
-  --bg: #0d151e;
-  --bg-2: #111c27;
-  --surface: #15212e;
-  --surface-2: #1b2a3a;
-  --line: #24384b;
-  --line-strong: #35506a;
-  --text: #f3ebda;
-  --text-2: #d3d0c5;
-  --muted: #9aa8b3;
-  --ember: #f58a4b;
-  --ember-soft: #40241a;
-  --teal: #56c9c8;
-  --teal-soft: #14353b;
-  --wheat: #e9c46a;
-  --wheat-soft: #3a3118;
+  --bg: #071c28;
+  --bg-2: #0a2431;
+  --surface: #0f2c39;
+  --surface-2: #143542;
+  --line: #1d4049;
+  --line-strong: #2f5964;
+  --text: #f7ebd8;
+  --text-2: #dfd1bc;
+  --muted: #9bb0b3;
+  --ember: #e88c50;
+  --ember-soft: #3b2417;
+  --teal: #56b7c8;
+  --teal-soft: #113a47;
+  --wheat: #e2b866;
+  --wheat-soft: #3a3018;
   --ok: #6fd39a;
-  --code-bg: #0a1119;
+  --code-bg: #04151e;
   --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 18px 40px -20px rgba(0, 0, 0, 0.7);
-  --glow: radial-gradient(60% 60% at 75% 0%, rgba(245, 138, 75, 0.16), transparent 70%),
-    radial-gradient(50% 50% at 5% 0%, rgba(86, 201, 200, 0.13), transparent 70%);
+  --glow: radial-gradient(60% 60% at 75% 0%, rgba(167, 93, 44, 0.26), transparent 70%),
+    radial-gradient(50% 50% at 5% 0%, rgba(29, 102, 122, 0.34), transparent 70%);
   color-scheme: dark;
 }
 
@@ -639,4 +641,21 @@ th {
 .chip-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* Phone frame for real app screenshots */
+.phone-frame {
+  margin: 0;
+  border-radius: 34px;
+  overflow: hidden;
+  border: 7px solid #05090d;
+  outline: 1.5px solid var(--line-strong);
+  box-shadow: var(--shadow), 0 30px 50px -30px rgba(0, 0, 0, 0.6);
+  background: #05090d;
+}
+.phone-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 27px;
 }

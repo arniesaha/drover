@@ -24,8 +24,9 @@ const isActive = (href: string) => path === href || path.startsWith(href);
     <title>{fullTitle}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="theme-color" content="#0d151e" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="theme-color" content="#071c28" />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content={SITE.name} />
     <meta property="og:title" content={fullTitle} />
@@ -108,7 +109,7 @@ const isActive = (href: string) => path === href || path.startsWith(href);
         <div class="foot-brand">
           <Logo />
           <p>
-            A self-hosted cockpit and memory for your coding-agent fleet. Free, open source, and yours to run.
+            One interface above your native coding harnesses. Free, open source, and yours to run.
           </p>
           <p class="fine">{SITE.license} licensed. No trackers, no analytics, no third-party requests on this site.</p>
         </div>
@@ -130,6 +131,7 @@ const isActive = (href: string) => path === href || path.startsWith(href);
           <div>
             <h4>Project</h4>
             <a href={LINKS.repo} rel="noopener">GitHub</a>
+            <a href={LINKS.article} rel="noopener">Launch article</a>
             <a href={LINKS.changelog} rel="noopener">Changelog</a>
             <a href="/contribute/">Contribute</a>
             <a href={LINKS.securityPolicy} rel="noopener">Security policy</a>
