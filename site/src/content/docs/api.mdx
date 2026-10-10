@@ -1,17 +1,17 @@
 ---
 title: HTTP API
-description: Authenticate with a bearer credential and drive the fleet over plain HTTP and WebSocket.
+description: Authenticate with a bearer credential and control the fleet with HTTP and WebSocket.
 order: 2
 source: docs/security.md
 ---
 
-The hub serves one HTTP surface, normally on port `7080`. The iOS app, the web cockpit and any orchestrator you write all use it. It is JSON over HTTP, with WebSocket for live streams.
+The hub serves one HTTP API, on port `7080` by default. The iOS app, the web cockpit and your orchestrator use it. The API uses JSON, and WebSocket for live streams.
 
-> The API is for your private network. The built-in listener does not terminate TLS. Read [Security and privacy](/docs/security-privacy/) before reaching it from another machine.
+> Use the API on your private network only. The listener does not provide TLS. Read [Security and privacy](/docs/security-privacy/).
 
 ## Authentication
 
-Every route needs a credential except the health checks, the login page, pairing-code redemption and the host join probe. Send it as a bearer header:
+Send a bearer credential on each request:
 
 ```bash
 curl -fsS \
@@ -19,26 +19,26 @@ curl -fsS \
   http://127.0.0.1:7080/harness/hosts
 ```
 
-A request without a valid credential gets `401`.
+A request without a valid credential returns `401`. The health checks, the login page, pairing-code redemption and the host join probe need no credential.
 
-### Kinds of credential
+### Credential types
 
-| Credential | How you get it | What it can do |
+| Credential | Source | Access |
 | --- | --- | --- |
-| Device | Redeem a pairing code from `drover-server pair` | The full fleet API. This is what the phone holds. |
-| Host | Redeem a pairing code from `drover-server pair-host` | Register a host and relay its sessions. |
-| Profile | `drover profile agents issue AGENT` | Read-only. Only `GET /profile`. |
+| Device | A pairing code from `drover-server pair` | The fleet API. The phone holds one. |
+| Host | A pairing code from `drover-server pair-host` | Host registration and relay. |
+| Profile | `drover profile agents issue AGENT` | Read-only. Only the profile. |
 | Preflight | `drover-server credentials issue-preflight` | Read-only. Health, release identity and the host list. |
-| Shared token | `~/.drover/api_token`, created on first start | Everything, including operator-only actions. Kept for upgrades; see below. |
+| Shared token | `~/.drover/api_token` | All routes, and operator actions. |
 
-Each device, host and agent credential is issued individually. The hub stores only a hash of it, so a leaked credentials file cannot be replayed, and revoking one credential leaves the others working:
+The hub stores only a hash of each credential. To revoke one credential:
 
 ```bash
 drover-server credentials list
 drover-server credentials revoke <credential-id>
 ```
 
-The original shared token is still accepted by default so that upgrades do not lock anyone out. Once every device and host has its own credential, turn it off:
+The shared token is on by default so that upgrades continue to work. After each device and host has its own credential, disable it:
 
 ```toml
 # ~/.drover/config.toml
@@ -46,130 +46,139 @@ The original shared token is still accepted by default so that upgrades do not l
 legacy_token_enabled = false
 ```
 
-For a script or orchestrator, prefer a dedicated credential you can revoke over the shared token. Treat any credential except the read-only kinds as equivalent to an interactive shell on every registered host.
+For a script or an orchestrator, use a dedicated credential. A device or host credential gives shell access to each registered host.
 
-### Pairing a client programmatically
+### Pair a client with the API
 
-Pairing is two calls. An authenticated caller mints a code, and the new client redeems it:
+1. Create a pairing code with an authenticated request:
 
-```bash
-# on the hub: mint a single-use device code
-curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
-  -H 'Content-Type: application/json' \
-  http://127.0.0.1:7080/auth/pair-codes -d '{"scope": "device"}'
+   ```bash
+   curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
+     -H 'Content-Type: application/json' \
+     http://127.0.0.1:7080/auth/pair-codes -d '{"scope": "device"}'
+   ```
 
-# on the new client: redeem it for a credential
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  http://127.0.0.1:7080/auth/pair \
-  -d '{"code": "XXXX-XXXX", "device_name": "my-orchestrator"}'
-```
+2. Redeem the code on the new client:
 
-Codes live only in the running hub's memory, are single use, and expire after ten minutes for a device and fifteen for a host. Redemption is rate limited.
+   ```bash
+   curl -fsS -X POST -H 'Content-Type: application/json' \
+     http://127.0.0.1:7080/auth/pair \
+     -d '{"code": "XXXX-XXXX", "device_name": "my-orchestrator"}'
+   ```
 
-## Main endpoints
+A code is single use. A device code expires after ten minutes. A host code expires after fifteen minutes.
 
-Paths are relative to the hub address. `{id}` is a session id and `{host_id}` a host id.
+## Endpoints
+
+`{id}` is a session id. `{host_id}` is a host id. This list is not complete, and no OpenAPI schema exists.
 
 ### Health
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/healthz` | Liveness. Public. Add `?detail=1` for a lifecycle summary. |
-| `GET` | `/readyz` | Readiness. Public; detail is returned only to authorized callers. |
+| `GET` | `/healthz` | Liveness. No credential. |
+| `GET` | `/readyz` | Readiness. Detail needs a credential. |
 
 ### Fleet and hosts
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/harness` | The whole fleet: hosts and their sessions. |
-| `GET` | `/harness/hosts` | Hosts, with connection type, heartbeat and the harnesses each can launch. |
-| `GET` | `/harness/hosts/{host_id}/model-catalog` | Models and reasoning levels the host reports. |
-| `POST` | `/harness/hosts/{host_id}/sessions` | Start a session on that host. |
+| `GET` | `/harness` | Hosts and their sessions. |
+| `GET` | `/harness/hosts` | Hosts, with connection type and available harnesses. |
+| `GET` | `/harness/hosts/{host_id}/model-catalog` | Models that the host reports. |
+| `POST` | `/harness/hosts/{host_id}/sessions` | Start a session. |
 
 ### Sessions
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/harness/sessions` | List sessions. |
-| `GET` | `/harness/sessions/{id}` | One session's state. |
-| `GET` | `/harness/sessions/{id}/messages` | Paged transcript. |
+| `GET` | `/harness/sessions/{id}` | Get one session. |
+| `GET` | `/harness/sessions/{id}/messages` | Get the transcript, in pages. |
 | `POST` | `/harness/sessions/{id}/turns` | Send a turn. |
 | `POST` | `/harness/sessions/{id}/permission` | Answer an approval request. |
 | `POST` | `/harness/sessions/{id}/interrupt` | Interrupt the current turn. |
-| `POST` | `/harness/sessions/{id}/continue` | Hand the session off to another host or harness. |
+| `POST` | `/harness/sessions/{id}/continue` | Hand off to another host or harness. |
 | `POST` | `/harness/sessions/{id}/terminate` | Stop the session. |
-| `GET` `POST` | `/harness/sessions/{id}/publications` | Read or record which branch and pull request the session produced. |
+| `GET` `POST` | `/harness/sessions/{id}/publications` | Read or record the branch and pull request of a session. |
 | WebSocket | `/harness/sessions/{id}/stream` | Live structured events. |
-| WebSocket | `/harness/sessions/{id}/terminal` | Live terminal attach. |
+| WebSocket | `/harness/sessions/{id}/terminal` | Live terminal. |
 
 ### Memory and analytics
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/profile` | Portable profile bundle. `?scope=first_turn` is the default. |
+| `GET` | `/profile` | The portable profile. |
 | `GET` | `/sessions/history` | Past sessions. |
-| `GET` | `/cockpit/overview` | The numbers behind the cockpit home view. |
-| `GET` | `/projects/activity` | Per-project activity. |
-| `GET` | `/harness/lifecycle` | Report-only scan of idle sessions and worktrees. |
+| `GET` | `/cockpit/overview` | Data for the cockpit home view. |
+| `GET` | `/projects/activity` | Activity for each project. |
+| `GET` | `/harness/lifecycle` | A report of idle sessions and worktrees. |
 
-This list covers the routes most integrations need. It is not exhaustive, and there is no published OpenAPI schema yet, so check the repository when you need exact response shapes.
+## Run a session
 
-## A session from start to finish
+1. Start a session. Set `mode` to `structured` for chat control, or to `pty` for a terminal:
 
-Start a structured session. `mode` is `structured` for chat-style control or `pty` for a raw terminal:
+   ```bash
+   curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
+     -H 'Content-Type: application/json' \
+     http://127.0.0.1:7080/harness/hosts/studio/sessions \
+     -d '{
+       "mode": "structured",
+       "harness": "codex",
+       "cwd": "/path/to/project",
+       "prompt": "Add rate limiting to the export endpoint."
+     }'
+   ```
 
-```bash
-curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
-  -H 'Content-Type: application/json' \
-  http://127.0.0.1:7080/harness/hosts/studio/sessions \
-  -d '{
-    "mode": "structured",
-    "harness": "codex",
-    "cwd": "/path/to/project",
-    "prompt": "Add rate limiting to the export endpoint."
-  }'
-```
+   `model` and `thinking_effort` are optional. Take their values from the model catalog of the host.
 
-`model` and `thinking_effort` are optional and must come from the host's model catalog. Send a follow-up turn:
+2. Send a turn:
 
-```bash
-curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
-  -H 'Content-Type: application/json' \
-  http://127.0.0.1:7080/harness/sessions/SESSION_ID/turns \
-  -d '{"text": "Also cover the empty config case."}'
-```
+   ```bash
+   curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
+     -H 'Content-Type: application/json' \
+     http://127.0.0.1:7080/harness/sessions/SESSION_ID/turns \
+     -d '{"text": "Also cover the empty config case."}'
+   ```
 
-When a Claude Code session asks for approval, answer with the request id from the event stream:
+3. Answer an approval. Use the request id from the event stream. Set `decision` to `allow` or `deny`:
 
-```bash
-curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
-  -H 'Content-Type: application/json' \
-  http://127.0.0.1:7080/harness/sessions/SESSION_ID/permission \
-  -d '{"request_id": "REQUEST_ID", "decision": "allow"}'
-```
+   ```bash
+   curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
+     -H 'Content-Type: application/json' \
+     http://127.0.0.1:7080/harness/sessions/SESSION_ID/permission \
+     -d '{"request_id": "REQUEST_ID", "decision": "allow"}'
+   ```
 
-`decision` is `allow` or `deny`. Approvals are supported for Claude Code sessions only; other harnesses reject this call.
+   Only Claude Code sessions support approvals.
 
-Hand the session to another machine or another harness:
+4. Hand off the session to another host or harness:
 
-```bash
-curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
-  -H 'Content-Type: application/json' \
-  http://127.0.0.1:7080/harness/sessions/SESSION_ID/continue \
-  -d '{"target_host_id": "laptop", "target_harness": "claude-code"}'
-```
+   ```bash
+   curl -fsS -X POST -H "Authorization: Bearer $DROVER_BEARER" \
+     -H 'Content-Type: application/json' \
+     http://127.0.0.1:7080/harness/sessions/SESSION_ID/continue \
+     -d '{"target_host_id": "laptop", "target_harness": "claude-code"}'
+   ```
 
-Both fields default to the source session's values. The new session starts in the same working directory path, so the project needs to exist at that path on the target host.
+   The two fields default to the values of the source session. The new session starts in the same directory path, so the project must be at that path on the target host.
 
-## Stopping a session honestly
+## Stop a session
 
-`POST /harness/sessions/{id}/terminate` records your intent before it contacts the host. If the host confirms, you get the normal success response. If the host is offline or does not confirm, you get `202` with `"state": "pending"`. A `202` means the request was accepted, not that the process has ended. The hub confirms or retries when the host next checks in.
+`POST /harness/sessions/{id}/terminate` records your stop request, then contacts the host.
 
-## Errors and limits
+- If the host confirms, the response is the normal success response.
+- If the host is offline or does not confirm, the response is `202` with `"state": "pending"`.
 
-- `401`: missing or invalid credential.
-- `403`: the credential's scope does not allow this route.
-- `400`: invalid input, or the target harness cannot do what you asked.
-- `503` with `Retry-After`: an analytical route is busy or unavailable. Back off and retry.
+A `202` means that the hub accepted the request. It does not mean that the process stopped. The hub confirms or tries again when the host connects.
 
-Analytical reads have a five second deadline and return an explicit unavailable response instead of partial data.
+## Errors
+
+| Status | Meaning |
+| --- | --- |
+| `400` | The input is not valid, or the harness cannot do the operation. |
+| `401` | The credential is missing or not valid. |
+| `403` | The scope of the credential does not permit this route. |
+| `503` | An analytical route is busy or unavailable. Wait for `Retry-After`, then try again. |
+
+Analytical reads have a five-second deadline. They return an unavailable response, not partial data.

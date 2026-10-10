@@ -108,10 +108,8 @@ const isActive = (href: string) => path === href || path.startsWith(href);
       <div class="wrap foot">
         <div class="foot-brand">
           <Logo />
-          <p>
-            One interface above your native coding harnesses. Free, open source, and yours to run.
-          </p>
-          <p class="fine">{SITE.license} licensed. No trackers, no analytics, no third-party requests on this site.</p>
+          <p>One interface above your native coding harnesses.</p>
+          <p class="fine">{SITE.license} license. This site has no trackers and no third-party requests.</p>
         </div>
         <div class="foot-cols">
           <div>
@@ -342,7 +340,7 @@ const isActive = (href: string) => path === href || path.startsWith(href);
   }
   @media (max-width: 760px) {
     .foot {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
     .foot-cols {
       grid-template-columns: repeat(2, minmax(0, 1fr));

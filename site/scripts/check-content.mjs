@@ -72,6 +72,16 @@ for (const file of distFiles) {
       problems.push(`${rel}: missing space before inline element near "${at}"`);
     }
   }
+  // A bare "1fr" grid track cannot shrink below its content, so one long code
+  // line widens the page on a phone. Every flexible track must be minmax(0, ...)
+  // or have an explicit minimum. scripts/check-overflow.mjs proves the result
+  // in a real browser; this rule catches the cause without one.
+  if (file.endsWith('.html') || file.endsWith('.css')) {
+    for (const m of text.matchAll(/grid-template-columns:([^;}]+)/g)) {
+      const bare = m[1].replace(/minmax\([^()]*(?:\([^()]*\)[^()]*)*\)/g, '');
+      if (/\dfr\b/.test(bare)) problems.push(`${rel}: grid track without a minimum: "${m[1].trim().slice(0, 60)}"`);
+    }
+  }
   if (file.endsWith('.html') || file.endsWith('.css')) {
     for (const re of [cssUrl, cssImport]) {
       for (const m of text.matchAll(re)) problems.push(`${rel}: third-party CSS resource ${m[1]}`);

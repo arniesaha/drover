@@ -85,18 +85,19 @@ const panels = [...LAYERS, RAIL];
             <span class={`status ${p.status}`}>{STATUS_LABEL[p.status]}</span>
           </header>
           <p>{p.summary}</p>
-          <ul>
-            {p.items.map((item) => (
-              <li>
-                <span>{item.text}</span>
-                {item.status && <span class={`status sm ${item.status}`}>{STATUS_LABEL[item.status]}</span>}
-              </li>
-            ))}
-          </ul>
+          {!compact && (
+            <ul>
+              {p.items.map((item) => (
+                <li>
+                  <span>{item.text}</span>
+                  {item.status && <span class={`status sm ${item.status}`}>{STATUS_LABEL[item.status]}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
       ))
     }
-    <p class="hint">Hover or tap a layer.</p>
   </div>
 </drover-layers>
 
@@ -413,7 +414,7 @@ const panels = [...LAYERS, RAIL];
 
   @media (max-width: 860px) {
     drover-layers {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
     .detail {
       position: static;

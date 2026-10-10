@@ -3,22 +3,10 @@
 // session to a desktop session to a phone approval, with the hub carrying the
 // thread. Everything here is synthetic.
 const steps = [
-  {
-    title: 'Start on the laptop',
-    body: 'A Codex session works on a flaky test. Every turn and tool call streams to your hub as it happens.',
-  },
-  {
-    title: 'Walk away',
-    body: 'You leave the laptop. The hub already holds the session history, and with a summarizer configured, a summary and the loop you left open.',
-  },
-  {
-    title: 'Hand off to the desktop',
-    body: 'Continue the session on another host and another harness. Drover briefs the new Claude Code session from the old one, and it can pull more with a recall bundle.',
-  },
-  {
-    title: 'Approve from your phone',
-    body: 'Claude Code asks before it pushes. The prompt lands in the iOS app. One tap and it carries on.',
-  },
+  { title: 'Start on the laptop', body: 'A Codex session works on a test. Each event goes to your hub.' },
+  { title: 'Walk away', body: 'The hub holds the session history.' },
+  { title: 'Hand off to the desktop', body: 'A Claude Code session on another host continues. Drover briefs it.' },
+  { title: 'Approve from your phone', body: 'Claude Code asks before it pushes. Tap Approve.' },
 ];
 ---
 
@@ -109,7 +97,7 @@ const steps = [
       }
     </ol>
   </div>
-  <p class="demo-note">Synthetic data. Session context travels through your own hub and nowhere else.</p>
+  <p class="demo-note">Synthetic data.</p>
 </drover-continuity>
 
 <script>
@@ -200,7 +188,7 @@ const steps = [
   }
   .devices {
     display: grid;
-    grid-template-columns: 1fr 1fr 0.8fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.8fr);
     gap: 0.8rem;
   }
   .device {
@@ -401,7 +389,7 @@ const steps = [
     margin: 0;
     padding: 0;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 0.6rem;
   }
   .steps button {
@@ -455,10 +443,10 @@ const steps = [
   }
   @media (max-width: 860px) {
     .devices {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
     .steps {
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
     .screen {
       min-height: 96px;
@@ -469,7 +457,7 @@ const steps = [
   }
   @media (max-width: 520px) {
     .steps {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 </style>
