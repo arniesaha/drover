@@ -52,15 +52,14 @@ struct ChatView: View {
     @State private var showDiscardPendingConfirm = false
     @State private var handoffSession: HandoffSession?
     @State private var pendingScroll: Task<Void, Never>?
+    @State private var scrollGeneration = 0
     @State private var pendingPrependScroll: Task<Void, Never>?
     @State private var prependScrollGeneration = 0
-    /// True while the user is at (or within ~80pt of) the transcript's end.
-    /// Auto-scroll only runs while pinned; scrolling up unpins (so reading
-    /// is never yanked back down) and shows the scroll-to-bottom button.
-    @State private var isPinnedToBottom = true
-    /// Current scroll phase — only user-driven phases may unpin (content
-    /// growth pushing the bottom away must not; that was the stuck-button
-    /// race: a tall new row unpinned before the coalesced scroll fired).
+    @State private var followState = TranscriptFollowState()
+    @State private var scrollPosition = ScrollPosition(y: 0)
+    @State private var rowFrames: [String: CGRect] = [:]
+    @State private var transcriptOffset: CGFloat = 0
+    @State private var isTailVisible = false
     @State private var scrollPhase: ScrollPhase = .idle
     /// Flipped by a timer once the cold open has lasted long enough to be
     /// worth acknowledging. A local open beats it and the screen stays quiet.
@@ -358,9 +357,8 @@ struct ChatView: View {
                             let anchorMessageID = items.first?.anchorMessageID
                             cancelPrependScroll()
                             let generation = prependScrollGeneration
-                            pendingScroll?.cancel()
-                            pendingScroll = nil
-                            isPinnedToBottom = false
+                            cancelFollowingScroll()
+                            followState.detach()
                             pendingPrependScroll = Task { @MainActor in
                                 defer {
                                     if prependScrollGeneration == generation {
@@ -415,10 +413,26 @@ struct ChatView: View {
                     ForEach(items) { item in
                         row(for: item, isNewest: item.id == items.last?.id)
                             .id(item.id)
+                            .background {
+                                GeometryReader { geometry in
+                                    Color.clear.preference(
+                                        key: TranscriptRowFrames.self,
+                                        value: [item.anchorMessageID: geometry.frame(in: .named("transcript-content"))]
+                                    )
+                                }
+                            }
                     }
 
                     if let pendingTurn = model.pendingTurn {
                         PendingTurnBubble(pendingTurn: pendingTurn)
+                            .background {
+                                GeometryReader { geometry in
+                                    Color.clear.preference(
+                                        key: TranscriptRowFrames.self,
+                                        value: ["pending-turn:\(pendingTurn.clientTurnID)": geometry.frame(in: .named("transcript-content"))]
+                                    )
+                                }
+                            }
                     }
 
                     // The ID belongs to the bottom of the clearance, not the
@@ -429,8 +443,18 @@ struct ChatView: View {
                         Color.clear
                             .frame(height: 16)
                             .id(visualTailID)
+                            // Visibility confirms the actual end even while keyboard
+                            // content insets are settling after a viewport change.
+                            .onScrollVisibilityChange(threshold: 0.1) { visible in
+                                isTailVisible = visible
+                                let isUserDriven = scrollPhase == .interacting || scrollPhase == .decelerating
+                                followState.positionChanged(
+                                    bottomDistance: visible ? 0 : 49, isUserDriven: isUserDriven
+                                )
+                            }
                     }
                 }
+                .coordinateSpace(name: "transcript-content")
                 .padding(.horizontal, 14)
                 .padding(.top, 12)
                 // An empty transcript has no row to take the width, so this
@@ -447,32 +471,64 @@ struct ChatView: View {
             // keyboard gone, and dragging it away is cheaper than reaching
             // for the accessory bar's dismiss button.
             .scrollDismissesKeyboard(.interactively)
-            // Pinned means "within 48pt of the end" — close enough that the
-            // user is following the stream, far enough that the last row's
-            // own growth doesn't flap the state.
-            .onScrollGeometryChange(for: Bool.self) { geometry in
-                geometry.contentOffset.y + geometry.containerSize.height
-                    >= geometry.contentSize.height + geometry.contentInsets.bottom - 48
-            } action: { _, isNearBottom in
-                guard isNearBottom != isPinnedToBottom else { return }
-                // Re-pin whenever the bottom is reached, by any means; unpin
-                // only mid-gesture (tracking/interacting/decelerating), so
-                // content growth can't silently disable auto-scroll.
-                let isUserDriven = scrollPhase == .tracking
-                    || scrollPhase == .interacting
-                    || scrollPhase == .decelerating
-                guard isNearBottom || isUserDriven else { return }
-                withAnimation(.snappy(duration: 0.2)) { isPinnedToBottom = isNearBottom }
+            .scrollPosition($scrollPosition)
+            .onPreferenceChange(TranscriptRowFrames.self) { frames in
+                rowFrames = frames
+                if scrollPhase == .idle || scrollPhase == .animating,
+                   let offset = followState.preservedOffset(in: frames),
+                   abs(offset - transcriptOffset) > 0.5 {
+                    scrollPosition.scrollTo(y: offset)
+                }
             }
-            .onScrollPhaseChange { _, newPhase in
+            .onScrollGeometryChange(for: TranscriptScrollGeometry.self) { geometry in
+                TranscriptScrollGeometry(
+                    // ScrollPosition uses a point measured from the content's
+                    // start, while ScrollGeometry includes the top safe-area inset.
+                    offset: geometry.contentOffset.y + geometry.contentInsets.top,
+                    bottomDistance: geometry.contentSize.height + geometry.contentInsets.bottom
+                        - geometry.contentOffset.y - geometry.containerSize.height,
+                    contentHeight: geometry.contentSize.height,
+                    viewportHeight: geometry.containerSize.height
+                )
+            } action: { old, geometry in
+                transcriptOffset = geometry.offset
+                let isUserDriven = scrollPhase == .interacting || scrollPhase == .decelerating
+                followState.positionChanged(
+                    bottomDistance: isTailVisible ? 0 : geometry.bottomDistance,
+                    isUserDriven: isUserDriven
+                )
+                if isUserDriven {
+                    followState.captureAnchor(in: rowFrames, offset: geometry.offset)
+                    if !followState.isFollowing {
+                        cancelFollowingScroll()
+                    }
+                } else if scrollPhase == .idle || scrollPhase == .animating,
+                          let offset = followState.preservedOffset(in: rowFrames),
+                          abs(offset - geometry.offset) > 0.5 {
+                    // Keyboard avoidance can change the offset without changing any
+                    // row frames. Restore the reading anchor for those changes too.
+                    scrollPosition.scrollTo(y: offset)
+                }
+                if followState.isFollowing,
+                   old.contentHeight != geometry.contentHeight
+                    || old.viewportHeight != geometry.viewportHeight {
+                    scheduleScroll(with: proxy)
+                }
+            }
+            .onScrollPhaseChange { oldPhase, newPhase in
                 scrollPhase = newPhase
-                if newPhase == .tracking || newPhase == .interacting
-                    || newPhase == .decelerating {
+                if newPhase == .tracking || newPhase == .interacting || newPhase == .decelerating {
                     cancelPrependScroll()
+                    cancelFollowingScroll()
+                }
+                if newPhase == .idle,
+                   oldPhase == .interacting || oldPhase == .decelerating || oldPhase == .tracking {
+                    followState.captureAnchor(in: rowFrames, offset: transcriptOffset)
+                    if followState.isFollowing { scheduleScroll(with: proxy) }
                 }
             }
             .overlay(alignment: .bottomTrailing) {
-                if !isPinnedToBottom {
+                if !followState.isFollowing {
                     scrollToBottomButton(proxy)
                 }
             }
@@ -482,18 +538,24 @@ struct ChatView: View {
             // per ~120ms window, always to the visual tail at fire time,
             // keeps the transcript following the stream without an animation
             // storm. Gated on pinning so it never fights the user's finger.
-            .onChange(of: model.messages.last?.id) { _, newestID in
-                guard newestID != nil, isPinnedToBottom else { return }
-                scheduleScroll(with: proxy)
+            .onChange(of: model.messagesVersion) { _, _ in
+                // Also observes in-place streaming updates, whose last ID may be unchanged.
+                if followState.contentChanged() { scheduleScroll(with: proxy) }
+            }
+            .onChange(of: model.messages.last?.seq) { previous, newest in
+                guard let previous, let newest, newest > previous else { return }
+                followState.recordNewEvents(model.messages.filter { $0.seq > previous }.count)
             }
             .onChange(of: model.pendingTurn?.clientTurnID) { _, _ in
-                guard isPinnedToBottom else { return }
-                scheduleScroll(with: proxy)
+                if followState.contentChanged() { scheduleScroll(with: proxy) }
             }
-            .defaultScrollAnchor(.bottom)
+            // Bottom anchoring is only an opening policy. Applying it to size changes
+            // moves a detached reader whenever streaming text or the keyboard changes layout.
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.top, for: .sizeChanges)
             .onDisappear {
-                pendingScroll?.cancel()
-                pendingPrependScroll?.cancel()
+                cancelFollowingScroll()
+                cancelPrependScroll()
             }
         }
     }
@@ -523,50 +585,58 @@ struct ChatView: View {
                 for: model.items, hasPendingTurn: model.pendingTurn != nil
             ) else { return }
             withAnimation(.snappy) {
-                isPinnedToBottom = true
+                followState.jumpToLatest()
                 proxy.scrollTo(visualTailID, anchor: .bottom)
             }
             // One unanimated follow-up after layout settles closes any gap
             // left by a tall row changing size during the animated scroll.
             scheduleScroll(with: proxy)
         } label: {
-            Image(systemName: "arrow.down")
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.down")
+                Text("Jump to latest")
+                if followState.newEventCount > 0 {
+                    Text("\(followState.newEventCount)").monospacedDigit()
+                } else if followState.hasUnseenContent {
+                    Circle().frame(width: 6, height: 6).accessibilityHidden(true)
+                }
+            }
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(DroverColor.accentHi)
                 .padding(10)
-                .background(DroverColor.surface, in: Circle())
-                .overlay(Circle().strokeBorder(DroverColor.accent.opacity(0.4), lineWidth: 1))
+                .background(DroverColor.surface, in: Capsule())
+                .overlay(Capsule().strokeBorder(DroverColor.accent.opacity(0.4), lineWidth: 1))
                 .shadow(color: .black.opacity(0.3), radius: 6, y: 3)
         }
         .padding(.trailing, 16)
         .padding(.bottom, 16)
         .transition(.opacity.combined(with: .scale(scale: 0.8)))
-        .accessibilityLabel("Scroll to bottom")
+        .accessibilityLabel("Jump to latest")
+        .accessibilityValue(followState.newEventCount > 0 ? "\(followState.newEventCount) new events" : "")
         .accessibilityIdentifier("chat-scroll-to-bottom")
     }
 
     private func scheduleScroll(with proxy: ScrollViewProxy) {
-        guard pendingScroll == nil else { return }
+        guard pendingScroll == nil, followState.isFollowing,
+              scrollPhase == .idle || scrollPhase == .animating else { return }
+        let generation = scrollGeneration
         pendingScroll = Task { @MainActor in
+            defer {
+                if scrollGeneration == generation { pendingScroll = nil }
+            }
             try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled, isPinnedToBottom,
+            guard !Task.isCancelled, followState.isFollowing,
                   let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
                     for: model.items, hasPendingTurn: model.pendingTurn != nil
-                  ) else {
-                pendingScroll = nil
-                return
-            }
-            proxy.scrollTo(visualTailID, anchor: .bottom)
-            // A row can still grow after the first scroll (for example a
-            // disclosure or tall diff), so pin once more after layout settles.
-            try? await Task.sleep(for: .milliseconds(200))
-            pendingScroll = nil
-            guard !Task.isCancelled, isPinnedToBottom,
-                  let settledVisualTailID = ChatTranscriptScrollTarget.bottomDestination(
-                    for: model.items, hasPendingTurn: model.pendingTurn != nil
                   ) else { return }
-            proxy.scrollTo(settledVisualTailID, anchor: .bottom)
+            proxy.scrollTo(visualTailID, anchor: .bottom)
         }
+    }
+
+    private func cancelFollowingScroll() {
+        scrollGeneration &+= 1
+        pendingScroll?.cancel()
+        pendingScroll = nil
     }
 
     private func cancelPrependScroll() {
