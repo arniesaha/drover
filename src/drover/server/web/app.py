@@ -71,6 +71,7 @@ from drover.server.web.auth import (
     AuthSettings,
     bearer_credential,
     credential_allows_request,
+    credential_matches_host,
     request_authorized,
     session_cookie_value,
     token_matches,
@@ -841,6 +842,26 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         """
         if path in _PUBLIC_PATHS or not self.auth.enabled:
             return True
+        credential = bearer_credential(self.auth, self.headers)
+        if (
+            credential is not None
+            and credential.scope == "host"
+            and path.startswith("/harness/hosts/")
+        ):
+            host_id = unquote(path.removeprefix("/harness/hosts/").split("/", 1)[0])
+            if not self._authorize_host(host_id):
+                return False
+        if (
+            credential is not None
+            and credential.scope == "host"
+            and path.startswith("/harness/sessions/")
+        ):
+            session_id = unquote(
+                path.removeprefix("/harness/sessions/").split("/", 1)[0]
+            )
+            session = self._harness_registry().get_session(session_id)
+            if not self._authorize_host(session.host_id if session else ""):
+                return False
         if request_authorized(self.auth, self.headers, method=self.command, path=path):
             return True
         if path in {"/", "/ui"} or path.startswith("/ui/"):
@@ -853,6 +874,38 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 401, "application/json", '{"error": "authentication required"}\n'
             )
         return False
+
+    def _authorize_host(self, host_id: str) -> bool:
+        if not self.auth.enabled:
+            return True
+        credential = bearer_credential(self.auth, self.headers)
+        if credential_matches_host(credential, host_id):
+            return True
+        reason = (
+            "host credential identity mismatch"
+            if credential and credential.scope == "host" and credential.host_id
+            else "bound host credential required"
+        )
+        log.warning("host authorization rejected: %s", reason)
+        self._send(403, "application/json", json.dumps({"error": reason}) + "\n")
+        return False
+
+    def _operator_credential(self) -> bool:
+        import hmac
+
+        allowed = (
+            self.auth.enabled
+            and self.auth.legacy_token_enabled
+            and self.auth.api_token
+            and hmac.compare_digest(
+                self.headers.get("Authorization", ""), f"Bearer {self.auth.api_token}"
+            )
+        )
+        if not allowed:
+            self._send(
+                403, "application/json", '{"error": "operator scope required"}\n'
+            )
+        return bool(allowed)
 
     def _dispatch_request(self, dispatch: Callable[[], None]) -> None:
         from drover.server.metrics import HarnessRenderBusy
@@ -1226,14 +1279,6 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if not host_id or "/" in host_id:
                 self._send(400, "application/json", '{"error": "invalid host_id"}\n')
                 return
-            credential = bearer_credential(self.auth, self.headers)
-            if (
-                credential is not None
-                and credential.scope == "host"
-                and credential.host_id != host_id
-            ):
-                self._send(403, "application/json", '{"error": "host mismatch"}\n')
-                return
             params = parse_qs(parsed.query)
             status, body = self.collector.proxy_harness_fs_list(
                 host_id,
@@ -1564,6 +1609,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     '{"error": "request body must be valid JSON"}\n',
                 )
                 return
+            if not self._authorize_host(str(body.get("host_id") or "").strip()):
+                return
             status, payload = self.collector.register_harness_host(body)
             self._send(status, "application/json", payload)
             return
@@ -1585,11 +1632,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 )
                 return
             if "host_id" in body and body["host_id"] != host_id:
+                if not self._authorize_host(str(body["host_id"])):
+                    return
                 self._send(
                     400, "application/json", '{"error": "host identity mismatch"}\n'
                 )
                 return
             body["host_id"] = host_id
+            if not self._authorize_host(str(body.get("host_id") or "").strip()):
+                return
             status, payload = self.collector.register_harness_host(body)
             self._send(status, "application/json", payload)
             return
@@ -2050,6 +2101,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
 
+        credential = bearer_credential(self.auth, self.headers)
+        declared_host = self.headers.get("X-Drover-Host-ID")
+        # Older bound daemons declare identity in hello only.
+        expected_host = (
+            declared_host
+            if declared_host is not None
+            else (credential.host_id if credential else "")
+        )
+        if not self._authorize_host(expected_host):
+            return
+
         # See _proxy_terminal_websocket: HTTP/1.1 status line required by
         # strict WebSocket clients; scoped to this hijacked upgrade only.
         self.protocol_version = "HTTP/1.1"
@@ -2087,6 +2149,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             host_id = str(parsed.get("host_id") or "").strip()
             if not host_id:
                 raise RelayProtocolError("hello frame missing host_id")
+            if self.auth.enabled and not credential_matches_host(
+                bearer_credential(self.auth, self.headers), host_id
+            ):
+                log.warning(
+                    "host authorization rejected: relay hello host credential identity mismatch"
+                )
+                send_frame(
+                    sock, OPCODE_CLOSE, b"\x03\xf0host credential identity mismatch"
+                )
+                sock.close()
+                return
             raw_capabilities = parsed.get("capabilities") or []
             if not isinstance(raw_capabilities, list) or any(
                 not isinstance(item, str) for item in raw_capabilities
@@ -2114,7 +2187,23 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         fd = sock.detach()
         relay_sock = socket.socket(fileno=fd)
         self.collector.relay_manager.attach(
-            host_id, relay_sock, capabilities=capabilities
+            host_id,
+            relay_sock,
+            capabilities=capabilities,
+            authorized=(
+                (
+                    lambda: credential_matches_host(
+                        self.auth.credentials.find_active(
+                            self.headers.get("Authorization", "")
+                            .removeprefix("Bearer ")
+                            .strip()
+                        ),
+                        host_id,
+                    )
+                )
+                if self.auth.enabled
+                else None
+            ),
         )
 
     def _harness_registry(self) -> HarnessRegistry:
@@ -2317,6 +2406,21 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
         registry = self._harness_registry()
+        if self.auth.enabled:
+            credential = bearer_credential(self.auth, self.headers)
+            if not self._authorize_host(credential.host_id if credential else ""):
+                return
+            if "host_id" in body and not self._authorize_host(str(body["host_id"])):
+                return
+            # Validate the entire batch before any write, using persisted ownership.
+            for event in events:
+                session = registry.get_session(str(event["session_id"]))
+                if not self._authorize_host(session.host_id if session else ""):
+                    return
+                if "host_id" in event and not self._authorize_host(
+                    str(event["host_id"])
+                ):
+                    return
         ingested = 0
         # Sort defensively by seq: the derivation rules are order-sensitive
         # (e.g. approval_prompt then approval_response must land as "not
@@ -2353,6 +2457,21 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         )
         fields = parse_qs(raw)
         candidate = (fields.get("token") or [""])[0].strip()
+        credential = (
+            self.auth.credentials.find_active(candidate)
+            if self.auth.credentials
+            else None
+        )
+        if credential is not None and credential.scope == "host":
+            log.warning(
+                "host authorization rejected: host credential cannot create browser session"
+            )
+            self._send(
+                403,
+                "application/json",
+                '{"error": "host credential cannot create browser session"}\n',
+            )
+            return
         if self.auth.enabled and not token_matches(self.auth, candidate):
             self.send_response(302)
             self.send_header("Location", "/auth/login?error=1")
@@ -2467,6 +2586,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         label = str(body.get("label") or "").strip() or default_label
         raw_host_id = body.get("host_id")
         host_id = str(raw_host_id).strip() if raw_host_id else None
+        if scope == "host":
+            if not self._operator_credential():
+                return
+            if not host_id:
+                self._send(400, "application/json", '{"error": "host_id required"}\n')
+                return
         entry = self.pairing.mint(scope=scope, label=label, host_id=host_id)
         remaining = max(int(entry.expires_at - time.monotonic()), 0)
         payload = {
@@ -2509,6 +2634,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         label = str(body.get("device_name") or "").strip() or entry.label
         # Scope comes from the code, never from the body: a device code must
         # not be redeemable into a host credential.
+        if entry.scope == "host" and not entry.host_id:
+            self._send(
+                410,
+                "application/json",
+                '{"error": "reissue a bound host pairing code"}\n',
+            )
+            return
         credential, token = store.issue(
             scope=entry.scope, label=label, host_id=entry.host_id
         )
@@ -2516,20 +2648,21 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             "token": token,
             "credential_id": credential.id,
             "scope": credential.scope,
+            "host_id": credential.host_id,
             "server_id": store.server_id,
             "fleet_name": store.fleet_name,
         }
         self._send(201, "application/json", json.dumps(payload, sort_keys=True) + "\n")
 
     def _issue_credential(self) -> None:
-        """Issue a preflight credential inside the process that must honour it.
+        """Issue a credential inside the process that must honour it.
 
         `CredentialStore` reads the file once, in `__init__`, and the server
         holds that instance for its whole life. A credential minted by any
         other process is therefore invisible here -- and erased from disk by
         this server's next write, which rebuilds the file from what it still
-        has in memory. Preflight is the only scope this route issues: a device
-        or host credential only ever comes from a redeemed pairing code.
+        has in memory. Host issuance requires the operator bearer and replaces
+        only the named host's active credentials.
         """
         if not self._pairing_ready():
             return
@@ -2539,6 +2672,30 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 400,
                 "application/json",
                 '{"error": "request body must be a JSON object"}\n',
+            )
+            return
+        if body.get("scope") == "host":
+            if not self._operator_credential():
+                return
+            host_id = body.get("host_id")
+            if not isinstance(host_id, str) or not host_id.strip():
+                self._send(400, "application/json", '{"error": "host_id required"}\n')
+                return
+            credential, token = self.auth.credentials.issue(
+                scope="host", label=str(body.get("label") or host_id), host_id=host_id
+            )
+            self._send(
+                201,
+                "application/json",
+                json.dumps(
+                    {
+                        "token": token,
+                        "credential_id": credential.id,
+                        "scope": "host",
+                        "host_id": host_id,
+                    }
+                )
+                + "\n",
             )
             return
         if body.get("scope") != "preflight":
@@ -2557,6 +2714,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             "token": token,
             "credential_id": credential.id,
             "scope": credential.scope,
+            "host_id": credential.host_id,
         }
         self._send(201, "application/json", json.dumps(payload, sort_keys=True) + "\n")
 
@@ -2578,6 +2736,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
         if not self._pairing_ready():
+            return
+        target = self.auth.credentials.get(credential_id)
+        if (
+            target is not None
+            and target.scope == "host"
+            and not self._operator_credential()
+        ):
             return
         if self.auth.credentials.revoke(credential_id):
             self._send(204, "application/json", "")

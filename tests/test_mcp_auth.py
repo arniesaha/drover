@@ -54,7 +54,9 @@ def test_anonymous_and_revoked_tools_refused(
     tmp_path, credentials, name, args, identity
 ):
     store, auth = credentials
-    credential, token = store.issue(scope="host", label="Synthetic host")
+    credential, token = store.issue(
+        scope="host", label="Synthetic host", host_id="synthetic-host"
+    )
     store.revoke(credential.id)
     server = build_mcp_server(duckdb_path=tmp_path / "absent.duckdb", auth=auth)
     with bearer_context(token if identity == "revoked" else None):
@@ -93,7 +95,11 @@ def test_host_and_device_match_http_policy(
     tmp_path, credentials, monkeypatch, scope, name, args
 ):
     store, auth = credentials
-    credential, token = store.issue(scope=scope, label="Synthetic client")
+    credential, token = store.issue(
+        scope=scope,
+        label="Synthetic client",
+        host_id="synthetic-host" if scope == "host" else None,
+    )
     assert credential_allows_request(
         credential, method="POST", path="/profile/proposals"
     )
@@ -166,7 +172,9 @@ def test_registered_profile_tiers_unchanged(pg_control_path, tier):
 
 def test_transport_requires_bearer_on_every_request(tmp_path, credentials):
     store, auth = credentials
-    credential, token = store.issue(scope="host", label="Synthetic host")
+    credential, token = store.issue(
+        scope="host", label="Synthetic host", host_id="synthetic-host"
+    )
     server = build_mcp_server(
         duckdb_path=tmp_path / "absent.duckdb", host="localhost", auth=auth
     )
@@ -255,7 +263,9 @@ def test_every_registered_tool_refuses_anonymous(tmp_path):
 
 def test_transport_uses_current_request_capability(tmp_path, credentials, monkeypatch):
     store, auth = credentials
-    _, host_token = store.issue(scope="host", label="Synthetic host")
+    _, host_token = store.issue(
+        scope="host", label="Synthetic host", host_id="synthetic-host"
+    )
     _, profile_token = store.issue(scope="profile", label="Synthetic profile")
     calls = []
 

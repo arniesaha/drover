@@ -1077,3 +1077,40 @@ def test_host_retirement_migration_upgrades_existing_host(postgres_control_store
     host = registry.list_hosts()[0]
     assert host.display_name == "Existing Mac"
     assert host.retired_at is None and host.retired_reason is None
+
+
+def test_postgres_bound_host_rotation_is_isolated(postgres_control_store):
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    path, _ = postgres_control_store
+    issuer = PostgresCredentialStore(path)
+    verifier = PostgresCredentialStore(path)
+    with pytest.raises(ValueError, match="host_id"):
+        issuer.issue(scope="host", label="legacy")
+    first, old = issuer.issue(scope="host", label="a", host_id="a")
+    _, other = issuer.issue(scope="host", label="b", host_id="b")
+    second, new = issuer.issue(scope="host", label="a", host_id="a")
+    assert verifier.find_active(old) is None
+    assert verifier.get(first.id).revoked_at is not None
+    assert verifier.find_active(new).id == second.id
+    assert verifier.find_active(other).host_id == "b"
+    issuer.revoke(second.id)
+    assert verifier.find_active(new) is None
+    assert verifier.find_active(other) is not None
+
+
+def test_postgres_concurrent_host_issuance_keeps_one_active(postgres_control_store):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    path, _ = postgres_control_store
+    stores = [PostgresCredentialStore(path), PostgresCredentialStore(path)]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        issued = list(
+            executor.map(
+                lambda store: store.issue(scope="host", label="a", host_id="a"), stores
+            )
+        )
+    assert sum(stores[0].find_active(token) is not None for _, token in issued) == 1
+    assert sum(item.is_active for item in stores[0].list_all()) == 1

@@ -123,6 +123,7 @@ def test_host_code_mints_a_host_credential(server):
     status, paired = _call(base, "POST", "/auth/pair", {"code": minted["code"]})
     assert status == 201
     assert paired["scope"] == "host"
+    assert paired["host_id"] == "build-mac"
     assert store.list_all()[0].host_id == "build-mac"
 
 
@@ -196,10 +197,10 @@ def test_preflight_credentials_are_issued_by_the_running_server(server):
     assert minted["credential_id"] == issued.id
 
 
-def test_issuing_a_credential_refuses_any_scope_but_preflight(server):
-    """Device and host credentials only ever come from a redeemed code."""
+def test_issuing_a_credential_refuses_device_and_unknown_scopes(server):
+    """Device credentials only come from a redeemed code."""
     base, store, _ = server
-    for scope in ("device", "host", "admin"):
+    for scope in ("device", "admin"):
         status, _ = _call(
             base,
             "POST",
@@ -274,3 +275,78 @@ def test_preflight_release_identity_returns_fixed_503_when_launch_identity_is_in
 
     assert status == 503
     assert response == {"error": "staging release identity unavailable"}
+
+
+def test_host_rotation_and_revoke_are_operator_only(server):
+    base, store, _ = server
+    _, other = store.issue(scope="host", label="b", host_id="b")
+    status, first = _call(
+        base,
+        "POST",
+        "/auth/credentials",
+        {"scope": "host", "host_id": "a"},
+        token="cluster-token",
+    )
+    assert status == 201
+    status, _ = _call(
+        base,
+        "POST",
+        "/auth/credentials",
+        {"scope": "host", "host_id": "b"},
+        token=first["token"],
+    )
+    assert status in (401, 403)
+    status, _ = _call(
+        base,
+        "DELETE",
+        "/auth/credentials/" + store.find_active(other).id,
+        token=first["token"],
+    )
+    assert status in (401, 403)
+    status, second = _call(
+        base,
+        "POST",
+        "/auth/credentials",
+        {"scope": "host", "host_id": "a"},
+        token="cluster-token",
+    )
+    assert status == 201
+    assert store.find_active(first["token"]) is None
+    assert store.find_active(second["token"]).host_id == "a"
+    assert store.find_active(other) is not None
+    assert (
+        _call(
+            base,
+            "DELETE",
+            "/auth/credentials/" + second["credential_id"],
+            token="cluster-token",
+        )[0]
+        == 204
+    )
+    assert _call(base, "GET", "/harness/hosts", token=second["token"])[0] == 401
+
+
+def test_host_pair_code_requires_binding(server):
+    base, _, codes = server
+    assert (
+        _call(
+            base, "POST", "/auth/pair-codes", {"scope": "host"}, token="cluster-token"
+        )[0]
+        == 400
+    )
+    entry = codes.mint(scope="host", label="legacy")
+    assert _call(base, "POST", "/auth/pair", {"code": entry.code})[0] == 410
+
+
+def test_host_token_cannot_exchange_for_unbound_browser_cookie(server):
+    base, store, _ = server
+    _, token = store.issue(scope="host", label="a", host_id="a")
+    request = urllib.request.Request(
+        base + "/auth/login",
+        data=("token=" + token).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(request)
+    assert exc.value.code == 403
+    assert exc.value.headers.get("Set-Cookie") is None

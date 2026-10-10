@@ -628,7 +628,7 @@ fleet_harness_args() {
 #                second hub, which would give the fleet two control planes.
 install_units() {
   local mode="$1" central_url="$2" extra="${3:-}" server_env_file="${4:-}"
-  local host_id; host_id="$(hostname -s 2>/dev/null || echo drover-host)"
+  local host_id; host_id="${5:-$(hostname -s 2>/dev/null || echo drover-host)}"
   local host_kind
   case "$OS" in
     darwin) host_kind="macos" ;;
@@ -850,8 +850,11 @@ EOF
   ( umask 077; printf "%s\n" "$host_token" > "$DROVER_HOME/api_token" )
   success "host credential stored"
 
-  # Rewrite the harnessd unit with the connection mode the probe chose.
-  install_units join "http://${HUB_ADDRESS}" "$listen_args"
+  host_id="$(printf '%s' "$paired" | "$DROVER_HOME/runtime/current/bin/python" -c \
+    'import json,sys; print(json.load(sys.stdin)["host_id"])')"
+  [ -n "$host_id" ] && [ "$host_id" != "None" ] || fail "hub must issue a bound host credential"
+  # Rewrite the harnessd unit with the identity issued by the hub.
+  install_units join "http://${HUB_ADDRESS}" "$listen_args" "" "$host_id"
   start_units harnessd
   success "joined $HUB_ADDRESS as $host_id"
 }

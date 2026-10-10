@@ -117,15 +117,100 @@ uv run drover-server credentials revoke <credential-id>
 
 Revocation takes effect on the next request.
 
-The original shared cluster token still works while
-`[auth] legacy_token_enabled` is true, which is the default. The daemon
-resolves it from `--host-token`, `DROVER_API_TOKEN`, or `~/.drover/api_token`.
-Prefer the environment or token file so it does not appear in shell history.
-Turn the setting off once every device and host holds its own credential.
+Host credentials are bound to the exact `--host-id` issued by the hub.
+Registration, heartbeats, relay attachment and event ingest require that binding.
+A different declared host receives 403 and a reason in the hub log. Event
+batches are checked against stored session ownership before any event is written.
+Host credentials cannot issue pairing codes or change fleet credentials.
+Device credentials retain interactive fleet access, but cannot submit host ingress.
 
-Because Drover does not yet bind a credential to a specific `host-id`, a host
-credential can act as any host. Do not enroll a machine you do not fully
-control. See [Security](security.md).
+To rotate just one host, run on the hub:
+
+```bash
+drover-server credentials rotate-host --host-id '<host-id>'
+```
+
+This prints the new token once and immediately invalidates every previous
+credential bound to that host. Install the token on that host and restart its
+daemon. Other hosts retain their tokens. To revoke without replacement, use
+`drover-server credentials revoke '<credential-id>'` on the hub.
+Credential administration requires the hub's operator bearer, with
+`[auth] legacy_token_enabled = true`; it does not accept a device or host token.
+Keep that operator bearer only on the hub. It cannot authenticate host ingress.
+
+### Upgrade to host identity binding
+
+Install this release on the hub and daemons using your existing release
+installation method, then restart the hub. No schema change is required:
+existing `host_id` fields in JSON and PostgreSQL are preserved. A credential
+already bound to the daemon's exact `--host-id` continues working, including
+an older relay daemon that declares identity only in its hello frame.
+
+On the hub, run:
+
+```bash
+drover-server credentials list
+```
+
+For each host using the shared operator token, an unbound host credential, a
+binding different from its configured `--host-id`, or multiple active
+credentials for the same host, run:
+
+```bash
+drover-server credentials issue-host --host-id '<existing-host-id>'
+```
+
+Use the host identity already registered in the fleet. Do not infer identity
+from a credential label. Shared or unbound credentials cannot be safely bound
+on first use, because their holder could claim another host. Reissue is
+required for those hosts; they cannot attach or ingest until it is complete.
+This does not re-enroll other hosts or alter session ownership.
+
+On the affected host, securely transfer the printed token, then store it
+without placing the secret in shell history (set `DROVER_HOME` to the existing
+installation directory). On a daemon colocated with the hub, keep the hub's
+operator token file intact and configure a separate daemon-only
+`DROVER_API_TOKEN` service environment value instead:
+
+```bash
+read -r -s HOST_CREDENTIAL
+printf '\n'
+(umask 077; printf '%s\n' "$HOST_CREDENTIAL" > "$DROVER_HOME/api_token")
+unset HOST_CREDENTIAL
+```
+
+Paste the token at the `read` prompt. If the daemon uses `--host-token` or
+`DROVER_API_TOKEN`, replace that configured value instead, since it takes
+precedence over the token file. Restart each affected daemon with its existing
+service manager, or stop and rerun its existing `drover-harnessd` command.
+For installer-managed services, use the relevant command:
+
+```bash
+# macOS, hub restart, then daemon restart on each affected host:
+launchctl kickstart -k "gui/$(id -u)/com.drover.server"
+launchctl kickstart -k "gui/$(id -u)/com.drover.harnessd"
+# Linux user services, same order:
+systemctl --user restart drover-server.service
+systemctl --user restart drover-harnessd.service
+```
+
+Confirm the affected host returns online with `drover-server hosts list` on the
+hub. Revoke any old **unbound** host credential by its ID with
+`drover-server credentials revoke '<old-credential-id>'`. Bound predecessors
+are already revoked by issuance. Unbound records remain listed for audit, but
+cannot authorize requests. Do not revoke the shared operator bearer as a host
+credential; retain it only for local administration.
+
+A relay declared identity mismatch gets HTTP 403 before WebSocket upgrade.
+For older clients that declare only in hello, the hub closes the upgraded
+socket with WebSocket policy status 1008 and logs the mismatch. An attached
+relay is rechecked before routing requests, processing control frames, and
+sending periodic pings; revocation or rotation tears it down.
+
+Public relay ingress, including Tailscale Funnel, remains unsupported until
+these controls and an explicit relay threat review are complete. Host binding
+is not cryptographic proof of machine identity or a replacement for the
+private-network trust boundary.
 
 ## Favourite Working Directories
 

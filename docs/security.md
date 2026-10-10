@@ -13,10 +13,9 @@ support policy.
 
 Tailscale Funnel and other public-internet exposure are not supported. The
 relay protocol forwards requests that create and control agent sessions and
-carries bidirectional terminal streams. Drover does not yet bind a host
-credential to the host identity it was issued for
-([#13](https://github.com/arniesaha/drover/issues/13)), so public relay
-ingress stays unsupported.
+carries bidirectional terminal streams. Host credentials are now bound to their
+issued host identity, but public relay ingress remains unsupported until these
+controls and an explicit relay threat review are complete.
 
 ## Authentication
 
@@ -37,8 +36,24 @@ device being paired has no credential yet. It answers identically for unknown,
 already used, and expired codes, and refuses a source after five failed
 attempts in a minute.
 
-Host/device credentials grant interactive access to every registered harness
-host. Profile credentials permit only tier-filtered profile reads; preflight
+Device credentials grant interactive fleet access. Host credentials are bound
+to an explicit host ID and cannot address another host's HTTP routes or sessions.
+Host registration, heartbeats, relay attachment, and event ingest require an
+active matching host credential, even when legacy operator auth is enabled.
+Event batches validate stored session ownership before writing. Mismatches are
+rejected with 403 and a clear reason in the log. A hello-only relay mismatch
+closes with WebSocket status 1008 after upgrade; newer clients declare identity
+in the upgrade request and receive HTTP 403. Relay authorization is rechecked
+during use, so revoked or replaced credentials lose their attachment.
+
+The running hub issues bound credentials with `credentials issue-host --host-id`
+and replaces only that host's credentials with `credentials rotate-host --host-id`.
+Issuance and revocation of host credentials require the operator bearer.
+See [the exact upgrade steps](multi-host.md#upgrade-to-host-identity-binding)
+for reissuing shared or unbound credentials. Existing matching bindings survive
+upgrade without changing the token; missing bindings are never guessed from
+labels or client claims. Host tokens cannot be exchanged for unbound browser
+cookies. Profile credentials permit only tier-filtered profile reads; preflight
 credentials permit only their HTTP readiness allowlist. Revoke rather than
 rotate when a single device is lost:
 
@@ -66,17 +81,19 @@ by default; MCP authentication does not change import or promotion policy.
 ### Legacy shared token
 
 The original single shared bearer token is still accepted while
-`[auth] legacy_token_enabled` is true, which is the default so that upgrading
-does not lock out an existing host or phone. Turn it off once every device and
-host has been paired. Resolution order is:
+`[auth] legacy_token_enabled` is true. It retains operator and device-facing
+access, but cannot authenticate host ingress. Hosts using it must follow the
+reissue steps above. Host credential administration also requires this setting;
+if you disable it after enrollment, enable it on the private hub and restart
+before the next issuance, rotation, or revocation. Resolution order is:
 
 1. `DROVER_API_TOKEN`
 2. `[auth].api_token` in `~/.drover/config.toml`
 3. Auto-generated `~/.drover/api_token`
 
 The generated token file uses mode `0600`, as does `~/.drover/credentials.json`.
-Treat any token as equivalent to interactive access to every registered harness
-host:
+Protect every token as a secret. Scope checks do not replace the trusted
+operator and private-network boundary:
 
 - Do not commit it or paste it into issue bodies, logs, screenshots, or shell
   commands that will be shared.
@@ -92,8 +109,7 @@ Drover does not currently provide:
 
 - Multiple users or tenant isolation
 - General RBAC or SSO beyond the existing credential-scope allowlists
-- Host-identity-bound credentials or cryptographic host identity: a host
-  credential is individually revocable but can act as any registered host
+- Cryptographic machine identity or protection against theft of a host's token
 - A sandbox around commands launched by an agent harness
 - A hosted backup, recovery, or availability service
 

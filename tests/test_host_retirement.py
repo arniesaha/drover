@@ -142,10 +142,8 @@ def test_api_operator_revocation_and_visibility(fleet, tmp_path):
         assert call("GET", "/harness/hosts?include_retired=1")[1]["hosts"][0][
             "retired_at"
         ]
-        assert call("POST", "/harness/hosts/mac-mini/heartbeat", {}) == (
-            409,
-            {"error": "host retired; unretire to rejoin"},
-        )
+        # The operator bearer cannot impersonate a host, even after retirement.
+        assert call("POST", "/harness/hosts/mac-mini/heartbeat", {})[0] == 403
         assert call("POST", "/harness/hosts/mac-mini/unretire", {})[0] == 200
         assert store.find_active(host_token) is None
     finally:
