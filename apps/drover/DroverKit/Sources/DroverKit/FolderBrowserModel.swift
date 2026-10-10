@@ -39,12 +39,35 @@ public struct FolderListing: Decodable, Sendable, Equatable {
 public enum FolderBrowserFailure: Sendable, Equatable {
     case permissionDenied, authentication, offline, unsupported, hostUnavailable, unavailable, invalidResponse
 
+    public static func classify(_ error: Error) -> Self {
+        switch error as? DroverError {
+        case .unauthorized, .httpStatus(401, _): return .authentication
+        case .httpStatus(403, _): return .permissionDenied
+        case .httpStatus(408, _), .httpStatus(502, _), .httpStatus(503, _),
+             .httpStatus(504, _), .transport, .busy: return .offline
+        case .httpStatus(405, _), .httpStatus(501, _): return .unsupported
+        case .unavailable(let detail):
+            let detail = detail.lowercased()
+            if detail.contains("unknown harness host") { return .hostUnavailable }
+            if detail.contains("permission") || detail.contains("outside") { return .permissionDenied }
+            if detail.contains("offline") || detail.contains("unreachable") { return .offline }
+            if ["not_found", "not_directory", "invalid_path", "unavailable"].contains(detail)
+                || detail.contains("not a directory") || detail.contains("not a folder")
+                || detail.contains("no such file") || detail.contains("path not found") { return .unavailable }
+            // A generic 404 (including an HTML router response) means the
+            // folder endpoint is missing, not that the selected host vanished.
+            return .unsupported
+        case .badRequest: return .unavailable
+        default: return .invalidResponse
+        }
+    }
+
     public var message: String {
         switch self {
-        case .permissionDenied: "This folder is unavailable or outside the allowed locations."
+        case .permissionDenied: "You do not have permission to browse this folder."
         case .authentication: "Check the connection credential in Settings."
         case .offline: "Host offline or unreachable. Try again when it reconnects."
-        case .unsupported: "Update this host to browse folders."
+        case .unsupported: "This host needs a newer Drover version to browse folders. You can still enter a path manually."
         case .hostUnavailable: "This host is no longer available. Select another host."
         case .unavailable: "This path is missing or is not a folder."
         case .invalidResponse: "The host returned an invalid folder listing."
@@ -115,16 +138,7 @@ public final class FolderBrowserModel {
                 isLoading = false
                 return
             }
-            switch error as? DroverError {
-            case .unauthorized: failure = .authentication
-            case .httpStatus(403, _): failure = .permissionDenied
-            case .httpStatus(502, _), .httpStatus(504, _), .transport, .busy: failure = .offline
-            case .unavailable(let detail):
-                failure = detail.contains("does not support path completion") || detail.contains("unsupported")
-                    ? .unsupported : .hostUnavailable
-            case .badRequest: failure = .unavailable
-            default: failure = .invalidResponse
-            }
+            failure = FolderBrowserFailure.classify(error)
         }
         isLoading = false
     }

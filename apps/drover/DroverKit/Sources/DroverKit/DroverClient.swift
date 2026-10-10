@@ -566,9 +566,12 @@ public actor DroverClient {
         _ = try await request(path: path, method: "POST", body: nil)
     }
 
-    public func terminate(sessionID: String) async throws {
+    @discardableResult
+    public func terminate(sessionID: String) async throws -> Bool {
         let path = "/harness/sessions/\(encodePathComponent(sessionID))/terminate"
-        _ = try await request(path: path, method: "POST", body: nil)
+        let data = try await request(path: path, method: "POST", body: nil)
+        let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return payload?["state"] as? String != "pending"
     }
 
     /// Hand the hub this device's APNs token so it can push "needs you"

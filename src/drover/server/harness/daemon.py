@@ -3351,13 +3351,17 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # _finalize_structured_session into re-finalizing a session this
         # method is already finalizing.
         self.server.state.terminated_session_ids.add(session_id)
-        self.server.state.structured.close(session_id)
         self._safe_update_session_status(
             session_id,
             "terminated",
             last_error=None,
             ended_at=datetime.now(timezone.utc),
         )
+        try:
+            self.server.state.structured.end(session_id)
+        except KeyError:
+            pass  # The process already exited or was lost on daemon restart.
+        self.server.state.structured.close(session_id)
         self._safe_append_event(
             session_id=session_id,
             event_type="session.terminated",

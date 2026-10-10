@@ -181,6 +181,67 @@ struct ChatModelTests {
         return sc
     }
 
+@Test @MainActor func interruptDuringPreparingShowsStoppingAndNeedsOneTap() async {
+    let response = DelayedSnapshotResponse(Data())
+    mock.handler = { _ in (200, response.waitForRelease()) }
+    let model = recoveryChatModel(client: client(), sessionID: "s1", initialMessages: [.fixture(seq: 1, type: .userInput)])
+    model.controls = .everythingAdvertised
+    model.ingest(.connection(true))
+    #expect(model.activity.phase == .preparing)
+    let stop = Task { await model.interrupt() }
+    await eventually { response.hasStarted }
+    #expect(model.isStopping)
+    #expect(model.activity.title == "Stopping...")
+    model.ingest(.history([.fixture(seq: 0, type: .status, payload: ["turn_complete": .bool(true)])], decodeIssues: []))
+    #expect(model.isStopping)
+    #expect(!model.activity.isActive)
+    #expect(!model.canSendTurn)
+    await model.interrupt()
+    response.finish()
+    await stop.value
+    model.ingest(.message(.fixture(seq: 2, type: .status, payload: ["turn_complete": .bool(true)])))
+    #expect(!model.isStopping)
+}
+
+@Test @MainActor func terminateEndsChatAndStreamReconciles() async {
+    let response = DelayedSnapshotResponse(Data("{\"status\":\"terminated\"}".utf8))
+    mock.handler = { _ in (200, response.waitForRelease()) }
+    let model = recoveryChatModel(client: client(), sessionID: "s1", initialMessages: [.fixture(seq: 1, type: .userInput)])
+    model.controls = .everythingAdvertised
+    model.ingest(.connection(true))
+    let ending = Task { await model.terminate() }
+    await eventually { response.hasStarted }
+    #expect(model.isEnded)
+    #expect(!model.canSendTurn)
+    #expect(!model.activity.isActive)
+    #expect(model.endedMessage.contains("Ending session"))
+    response.finish()
+    await ending.value
+    #expect(model.activity.title == "Session ended")
+    model.ingest(.message(.fixture(seq: 2, type: .status, payload: ["session_status": .string("terminated")])))
+    #expect(model.isEnded)
+    #expect(model.pendingApproval == nil)
+}
+
+@Test @MainActor func terminationFailureRestoresComposerAndPendingStopExplainsState() async {
+    mock.handler = { _ in (403, Data()) }
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
+    await model.terminate()
+    #expect(!model.isEnded)
+    mock.handler = { _ in (202, Data("{\"state\":\"pending\"}".utf8)) }
+    await model.terminate()
+    #expect(model.isEnded)
+    #expect(!model.canSendTurn)
+    #expect(model.endedMessage.contains("Waiting for the host"))
+}
+
+@Test @MainActor func terminalHistoryEndsChatWithoutAnAction() {
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.ingest(.history([.fixture(seq: 1, type: .status, payload: ["session_status": .string("terminated")])], decodeIssues: []))
+    #expect(model.isEnded)
+    #expect(!model.activity.isActive)
+}
+
 @Test @MainActor func initialRecapBecomesHeaderTitle() {
     let model = recoveryChatModel(client: client(), sessionID: "s1", harness: "codex",
                           recap: "Improving previews; awaiting tests.", recapSourceSeq: 8)

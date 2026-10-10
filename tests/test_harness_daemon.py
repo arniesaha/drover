@@ -4192,6 +4192,8 @@ def test_structured_interrupt_unknown_session_is_404(tmp_path):
 
 def test_structured_terminate_closes_driver_and_marks_terminated(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
+    pushed = []
+    state.push_event = lambda session_id, event: pushed.append(event)
     try:
         status, body = _json_request(
             f"{base_url}/sessions",
@@ -4211,6 +4213,10 @@ def test_structured_terminate_closes_driver_and_marks_terminated(tmp_path):
         )
         assert status == 200
         assert terminated["terminated"] is True
+        assert any(
+            event.get("payload", {}).get("session_status") == "terminated"
+            for event in pushed
+        )
         assert not state.structured.has(sid)
 
         session = state.registry.get_session(sid)
