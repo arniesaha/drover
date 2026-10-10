@@ -242,6 +242,16 @@ enum FixtureScenarioData {
             "text": "Fixture ready: \(sessionID)",
             "payload": [:],
         ]]
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_TRANSCRIPT_STREAM"] == "1" {
+            messages = (1...40).map { index in
+                [
+                    "event_id": "reading-\(index)", "seq": index,
+                    "type": "assistant_output", "role": "assistant",
+                    "text": "Reading marker \(index). " + String(repeating: "Earlier transcript content. ", count: 8),
+                    "payload": [:],
+                ]
+            }
+        }
         // Capability sessions wait on a tool approval, so the journey can
         // see who may answer it from iOS.
         if sessionID == labSessionID || sessionID == codexApprovalSessionID {
