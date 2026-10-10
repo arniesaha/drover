@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Control-schema migration 16 adds freshness indexes; exporter sampling now
   runs every ten seconds and avoids scanning acknowledged history.
 
+### Security
+
+- MCP now requires active bearer credentials for every protocol request and tool,
+  sharing HTTP credential scopes, revocation and profile-agent tiers. Profile
+  credentials remain read-only. Anonymous access and non-loopback binds are
+  refused; disabling authentication prevents MCP startup. Client integrations
+  must configure credentials before upgrading. The bundled MCP client reads
+  `DROVER_MCP_TOKEN` and refuses redirects. Profile import defaults are unchanged.
+
 ## [0.6.4] - 2026-10-08
 
 ### Added

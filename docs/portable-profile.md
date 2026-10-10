@@ -68,10 +68,11 @@ Bind an already issued, active `profile` credential with operator-authorized
 {"credential_id":"example-credential-id","agent_id":"example-agent","tier":"trusted"}
 ```
 
-The existing MCP transport has no verified caller identity. Its profile reader
-is always general and its proposals always start pending. Trusted agents use
-credential-authenticated HTTP for trusted reads. Current registration accepts
-only read-only profile credentials, which cannot submit proposals.
+MCP verifies bearer credentials and uses the same actor and tier rules as HTTP.
+Host/device credentials read general profile data; registered profile credentials
+read their assigned tier; the enabled legacy operator token can read private data.
+Current registration accepts only read-only profile credentials, which cannot
+submit proposals. Anonymous MCP calls are refused. See [MCP authentication](mcp.md).
 
 ## Proposals, review and reversal
 
@@ -203,8 +204,9 @@ the client. An agent with an active credential must be revoked before reissue.
 Revocation invalidates the bearer and removes trusted access, retaining the
 credential's revocation timestamp and registry operator metadata. It is
 idempotent. Agent credentials cannot be issued at private tier by this command.
-Trusted sessions use HTTP, since MCP has no verified caller identity. The scope
-allowlist permits only `GET /profile` (including supported scope queries). Agent
+Trusted sessions can use HTTP or MCP with their issued credential. The scope
+allowlist permits only HTTP `GET /profile` (including supported scope queries)
+and MCP `drover_profile`. Agent
 identities do not enter the host namespace, and retiring a same-named host does
 not revoke a profile credential. Operators can also list and revoke profile
 credentials through the generic credential endpoints; profile tokens cannot

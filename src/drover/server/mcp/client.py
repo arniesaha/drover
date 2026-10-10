@@ -8,6 +8,7 @@ native callable tools.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import requests
@@ -90,11 +91,14 @@ def _post(
     payload: dict[str, Any],
     timeout: float,
     session_id: str | None = None,
+    token: str | None = None,
 ) -> requests.Response:
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     if session_id:
         headers["Mcp-Session-Id"] = session_id
     return requests.post(
@@ -102,14 +106,15 @@ def _post(
         headers=headers,
         json=payload,
         timeout=timeout,
-        allow_redirects=True,
+        allow_redirects=False,
     )
 
 
-def _session(url: str, *, timeout: float) -> str:
+def _session(url: str, *, timeout: float, token: str | None) -> str:
     response = _post(
         url=url,
         timeout=timeout,
+        token=token,
         payload={
             "jsonrpc": "2.0",
             "id": 1,
@@ -132,18 +137,23 @@ def _session(url: str, *, timeout: float) -> str:
     _post(
         url=url,
         timeout=timeout,
+        token=token,
         session_id=session_id,
         payload={"jsonrpc": "2.0", "method": "notifications/initialized"},
     )
     return session_id
 
 
-def list_tools(url: str, *, timeout: float = 10) -> list[dict[str, Any]]:
+def list_tools(
+    url: str, *, timeout: float = 10, token: str | None = None
+) -> list[dict[str, Any]]:
     """Return tool metadata from a streamable HTTP MCP endpoint."""
-    session_id = _session(url, timeout=timeout)
+    token = token if token is not None else os.environ.get("DROVER_MCP_TOKEN")
+    session_id = _session(url, timeout=timeout, token=token)
     response = _post(
         url=url,
         timeout=timeout,
+        token=token,
         session_id=session_id,
         payload={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     )
@@ -162,12 +172,15 @@ def call_tool(
     arguments: dict[str, Any] | None = None,
     *,
     timeout: float = 30,
+    token: str | None = None,
 ) -> dict[str, Any]:
     """Call a Drover MCP tool over streamable HTTP."""
-    session_id = _session(url, timeout=timeout)
+    token = token if token is not None else os.environ.get("DROVER_MCP_TOKEN")
+    session_id = _session(url, timeout=timeout, token=token)
     response = _post(
         url=url,
         timeout=timeout,
+        token=token,
         session_id=session_id,
         payload={
             "jsonrpc": "2.0",

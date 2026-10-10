@@ -11,6 +11,7 @@ import functools
 import inspect
 import json
 import threading
+from contextvars import copy_context
 from dataclasses import dataclass
 
 from drover.server.mcp.freshness import with_freshness
@@ -225,7 +226,11 @@ class ReadAdmission:
                 except RuntimeError:
                     pass  # Caller's loop closed after timeout.
 
-            threading.Thread(target=run, daemon=True, name="mcp-read").start()
+            # Preserve the verified request identity in the read worker.
+            context = copy_context()
+            threading.Thread(
+                target=context.run, args=(run,), daemon=True, name="mcp-read"
+            ).start()
             try:
                 return await asyncio.wait_for(future, caps.deadline_seconds)
             except asyncio.TimeoutError:
