@@ -4,6 +4,8 @@ final class TranscriptFollowingUITests: XCTestCase {
     @MainActor
     func testDetachedReaderSurvivesEventsKeyboardRotationAndBackgroundThenResumes() {
         continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        defer { XCUIDevice.shared.orientation = .portrait }
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
         app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
@@ -24,8 +26,14 @@ final class TranscriptFollowingUITests: XCTestCase {
         let visible = app.staticTexts.allElementsBoundByIndex.filter {
             $0.label.hasPrefix("Reading marker") && $0.isHittable
                 && $0.frame.minY > readingTop
+                && $0.frame.maxY <= transcript.frame.maxY
         }
         XCTAssertFalse(visible.isEmpty)
+        XCTAssertLessThanOrEqual(transcript.frame.maxY, jump.frame.minY)
+        if let lastVisibleLabel = visible.last?.label {
+            let lastVisible = app.staticTexts.matching(NSPredicate(format: "label == %@", lastVisibleLabel)).firstMatch
+            XCTAssertFalse(lastVisible.frame.intersects(jump.frame), "Jump must leave the last visible transcript row readable")
+        }
         guard let markerLabel = visible.first?.label else { return }
         // Use a stable label query. Keyboard elements change the global text indexes.
         let marker = app.staticTexts.matching(NSPredicate(format: "label == %@", markerLabel)).firstMatch
@@ -63,7 +71,10 @@ final class TranscriptFollowingUITests: XCTestCase {
         let end = transcript.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.55))
         start.press(forDuration: 0.1, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.2)
         XCTAssertTrue(jump.waitForExistence(timeout: 3))
-        for _ in 0..<4 where jump.exists { transcript.swipeUp() }
-        XCTAssertTrue(jump.waitForNonExistence(timeout: 5))
+        // Its reserved area must sit above the composer, outside transcript content.
+        XCTAssertLessThanOrEqual(jump.frame.maxY, composer.frame.minY)
+        XCTAssertLessThanOrEqual(transcript.frame.maxY, jump.frame.minY)
+        transcript.swipeUp()
+        XCTAssertTrue(jump.waitForNonExistence(timeout: 5), "One swipe back to the bottom must resume following")
     }
 }

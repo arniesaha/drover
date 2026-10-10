@@ -5,14 +5,43 @@ struct TranscriptFollowState {
     private(set) var isFollowing = true
     private(set) var newEventCount = 0
     private(set) var hasUnseenContent = false
+    private var followingLayoutGrowth: CGFloat = 0
     private var anchor: (id: String, viewportY: CGFloat)?
 
-    mutating func positionChanged(bottomDistance: CGFloat, isUserDriven: Bool) {
+    mutating func positionChanged(bottomDistance: CGFloat, isUserDriven: Bool,
+                                 isDecelerating: Bool = false) {
         guard isUserDriven else { return }
-        if bottomDistance <= 48 { jumpToLatest() } else { detach() }
+        if isFollowing {
+            // A direct drag can reach the new end and reverse direction. A
+            // decelerating bounce can still return to its old target after growth.
+            if bottomDistance <= 48 && !isDecelerating { followingLayoutGrowth = 0 }
+            if bottomDistance - followingLayoutGrowth > 48 { detach() }
+        } else if bottomDistance <= 48 {
+            jumpToLatest()
+        }
     }
 
-    mutating func detach() { isFollowing = false }
+    /// Content arriving during deceleration must not look like scrolling away.
+    /// Keep the threshold relative to the end the user actually reached until idle.
+    mutating func layoutChanged(bottomDistanceChange: CGFloat) {
+        guard isFollowing else { return }
+        followingLayoutGrowth = max(0, followingLayoutGrowth + bottomDistanceChange)
+    }
+
+    mutating func scrollingBegan() { followingLayoutGrowth = 0 }
+
+    mutating func scrollingEnded(bottomDistance: CGFloat) {
+        // Movement already detaches during the gesture. An append or resize
+        // after reaching bottom must not undo the user's return to following.
+        followingLayoutGrowth = 0
+        guard !isFollowing else { return }
+        positionChanged(bottomDistance: bottomDistance, isUserDriven: true)
+    }
+
+    mutating func detach() {
+        isFollowing = false
+        followingLayoutGrowth = 0
+    }
 
     /// The return value authorizes a scroll to the tail.
     mutating func contentChanged() -> Bool {
@@ -28,6 +57,7 @@ struct TranscriptFollowState {
 
     mutating func jumpToLatest() {
         isFollowing = true
+        followingLayoutGrowth = 0
         newEventCount = 0
         hasUnseenContent = false
         anchor = nil
@@ -53,6 +83,28 @@ struct TranscriptScrollGeometry: Equatable {
     let bottomDistance: CGFloat
     let contentHeight: CGFloat
     let viewportHeight: CGFloat
+    let bottomInset: CGFloat
+
+    init(contentOffset: CGFloat, contentHeight: CGFloat, viewportHeight: CGFloat,
+         topInset: CGFloat, bottomInset: CGFloat) {
+        offset = contentOffset + topInset
+        // ScrollGeometry's viewport already excludes the composer/safe-area
+        // insets. Measure in the same content coordinates as ScrollPosition;
+        // adding insets again leaves a false gap at the physical bottom.
+        // Overscroll and content shorter than the viewport are both at bottom.
+        bottomDistance = max(0, contentHeight - offset - viewportHeight)
+        self.contentHeight = contentHeight
+        self.viewportHeight = viewportHeight
+        self.bottomInset = bottomInset
+    }
+
+    init(_ geometry: ScrollGeometry) {
+        self.init(contentOffset: geometry.contentOffset.y,
+                  contentHeight: geometry.contentSize.height,
+                  viewportHeight: geometry.containerSize.height,
+                  topInset: geometry.contentInsets.top,
+                  bottomInset: geometry.contentInsets.bottom)
+    }
 }
 
 struct TranscriptRowFrames: PreferenceKey {

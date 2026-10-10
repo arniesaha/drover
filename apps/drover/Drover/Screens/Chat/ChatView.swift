@@ -59,7 +59,6 @@ struct ChatView: View {
     @State private var scrollPosition = ScrollPosition(y: 0)
     @State private var rowFrames: [String: CGRect] = [:]
     @State private var transcriptOffset: CGFloat = 0
-    @State private var isTailVisible = false
     @State private var scrollPhase: ScrollPhase = .idle
     /// Flipped by a timer once the cold open has lasted long enough to be
     /// worth acknowledging. A local open beats it and the screen stays quiet.
@@ -339,223 +338,234 @@ struct ChatView: View {
 
     private var transcript: some View {
         ScrollViewReader { proxy in
-            // Folded once per transcript change on the model and cached
-            // there — re-folding here meant a full pass over every message
-            // on each scroll-phase change.
-            let items = model.items
-            let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
-                for: items, hasPendingTurn: model.pendingTurn != nil
-            )
-            ScrollView {
-                // Cold open is bounded to the newest 200 raw messages, which
-                // fold to substantially fewer rows. Keep that bounded tail
-                // materialized so keyboard/composer geometry changes cannot
-                // briefly evict the visible transcript.
-                VStack(alignment: .leading, spacing: 8) {
-                    if model.hasOlderHistory {
-                        Button {
-                            let anchorMessageID = items.first?.anchorMessageID
-                            cancelPrependScroll()
-                            let generation = prependScrollGeneration
-                            cancelFollowingScroll()
-                            followState.detach()
-                            pendingPrependScroll = Task { @MainActor in
-                                defer {
-                                    if prependScrollGeneration == generation {
-                                        pendingPrependScroll = nil
+            VStack(spacing: 0) {
+                // Folded once per transcript change on the model and cached
+                // there — re-folding here meant a full pass over every message
+                // on each scroll-phase change.
+                let items = model.items
+                let visualTailID = ChatTranscriptScrollTarget.bottomDestination(
+                    for: items, hasPendingTurn: model.pendingTurn != nil
+                )
+                ScrollView {
+                    // Cold open is bounded to the newest 200 raw messages, which
+                    // fold to substantially fewer rows. Keep that bounded tail
+                    // materialized so keyboard/composer geometry changes cannot
+                    // briefly evict the visible transcript.
+                    VStack(alignment: .leading, spacing: 8) {
+                        if model.hasOlderHistory {
+                            Button {
+                                let anchorMessageID = items.first?.anchorMessageID
+                                cancelPrependScroll()
+                                let generation = prependScrollGeneration
+                                cancelFollowingScroll()
+                                followState.detach()
+                                pendingPrependScroll = Task { @MainActor in
+                                    defer {
+                                        if prependScrollGeneration == generation {
+                                            pendingPrependScroll = nil
+                                        }
+                                    }
+                                    let didLoad = await model.loadOlderHistory()
+                                    guard !Task.isCancelled,
+                                          prependScrollGeneration == generation,
+                                          didLoad, let anchorMessageID,
+                                          let anchorRowID = TranscriptItem.rowID(
+                                            containing: anchorMessageID,
+                                            in: model.messages
+                                          ) else { return }
+                                    // Prepending must not move the row the user
+                                    // was reading. A folded run's rendered ID can
+                                    // change at the page boundary, so follow one
+                                    // of its raw messages into the regrouped row.
+                                    try? await Task.sleep(for: .milliseconds(50))
+                                    guard !Task.isCancelled else { return }
+                                    proxy.scrollTo(anchorRowID, anchor: .top)
+                                    // Settle once more against the raw anchor's
+                                    // current rendered row after layout completes.
+                                    try? await Task.sleep(for: .milliseconds(200))
+                                    guard !Task.isCancelled,
+                                          prependScrollGeneration == generation,
+                                          let settledRowID = TranscriptItem.rowID(
+                                            containing: anchorMessageID,
+                                            in: model.messages
+                                          ) else { return }
+                                    proxy.scrollTo(settledRowID, anchor: .top)
+                                }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    if model.isLoadingOlderHistory {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    }
+                                    Text(model.isLoadingOlderHistory
+                                         ? "Loading earlier messages…"
+                                         : "Load earlier messages")
+                                        .font(.caption.weight(.medium))
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(model.isLoadingOlderHistory)
+                            .accessibilityIdentifier("chat-load-earlier")
+                        }
+
+                        ForEach(items) { item in
+                            row(for: item, isNewest: item.id == items.last?.id)
+                                .id(item.id)
+                                .background {
+                                    GeometryReader { geometry in
+                                        Color.clear.preference(
+                                            key: TranscriptRowFrames.self,
+                                            value: [item.anchorMessageID: geometry.frame(in: .named("transcript-content"))]
+                                        )
                                     }
                                 }
-                                let didLoad = await model.loadOlderHistory()
-                                guard !Task.isCancelled,
-                                      prependScrollGeneration == generation,
-                                      didLoad, let anchorMessageID,
-                                      let anchorRowID = TranscriptItem.rowID(
-                                        containing: anchorMessageID,
-                                        in: model.messages
-                                      ) else { return }
-                                // Prepending must not move the row the user
-                                // was reading. A folded run's rendered ID can
-                                // change at the page boundary, so follow one
-                                // of its raw messages into the regrouped row.
-                                try? await Task.sleep(for: .milliseconds(50))
-                                guard !Task.isCancelled else { return }
-                                proxy.scrollTo(anchorRowID, anchor: .top)
-                                // Settle once more against the raw anchor's
-                                // current rendered row after layout completes.
-                                try? await Task.sleep(for: .milliseconds(200))
-                                guard !Task.isCancelled,
-                                      prependScrollGeneration == generation,
-                                      let settledRowID = TranscriptItem.rowID(
-                                        containing: anchorMessageID,
-                                        in: model.messages
-                                      ) else { return }
-                                proxy.scrollTo(settledRowID, anchor: .top)
-                            }
-                        } label: {
-                            HStack(spacing: 8) {
-                                if model.isLoadingOlderHistory {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                }
-                                Text(model.isLoadingOlderHistory
-                                     ? "Loading earlier messages…"
-                                     : "Load earlier messages")
-                                    .font(.caption.weight(.medium))
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
                         }
-                        .buttonStyle(.plain)
-                        .disabled(model.isLoadingOlderHistory)
-                        .accessibilityIdentifier("chat-load-earlier")
-                    }
 
-                    ForEach(items) { item in
-                        row(for: item, isNewest: item.id == items.last?.id)
-                            .id(item.id)
-                            .background {
-                                GeometryReader { geometry in
-                                    Color.clear.preference(
-                                        key: TranscriptRowFrames.self,
-                                        value: [item.anchorMessageID: geometry.frame(in: .named("transcript-content"))]
-                                    )
+                        if let pendingTurn = model.pendingTurn {
+                            PendingTurnBubble(pendingTurn: pendingTurn)
+                                .background {
+                                    GeometryReader { geometry in
+                                        Color.clear.preference(
+                                            key: TranscriptRowFrames.self,
+                                            value: ["pending-turn:\(pendingTurn.clientTurnID)": geometry.frame(in: .named("transcript-content"))]
+                                        )
+                                    }
                                 }
-                            }
-                    }
+                        }
 
-                    if let pendingTurn = model.pendingTurn {
-                        PendingTurnBubble(pendingTurn: pendingTurn)
-                            .background {
-                                GeometryReader { geometry in
-                                    Color.clear.preference(
-                                        key: TranscriptRowFrames.self,
-                                        value: ["pending-turn:\(pendingTurn.clientTurnID)": geometry.frame(in: .named("transcript-content"))]
-                                    )
-                                }
-                            }
+                        // The ID belongs to the bottom of the clearance, not the
+                        // final transcript row. `scrollTo(..., anchor: .bottom)`
+                        // therefore keeps this 24pt gap visible above the composer.
+                        // VStack contributes 8pt before this final 16pt tail.
+                        if let visualTailID {
+                            Color.clear
+                                .frame(height: 16)
+                                .id(visualTailID)
+                        }
                     }
-
-                    // The ID belongs to the bottom of the clearance, not the
-                    // final transcript row. `scrollTo(..., anchor: .bottom)`
-                    // therefore keeps this 24pt gap visible above the composer.
-                    // VStack contributes 8pt before this final 16pt tail.
-                    if let visualTailID {
-                        Color.clear
-                            .frame(height: 16)
-                            .id(visualTailID)
-                            // Visibility confirms the actual end even while keyboard
-                            // content insets are settling after a viewport change.
-                            .onScrollVisibilityChange(threshold: 0.1) { visible in
-                                isTailVisible = visible
-                                let isUserDriven = scrollPhase == .interacting || scrollPhase == .decelerating
-                                followState.positionChanged(
-                                    bottomDistance: visible ? 0 : 49, isUserDriven: isUserDriven
-                                )
-                            }
+                    .coordinateSpace(name: "transcript-content")
+                    .padding(.horizontal, 14)
+                    .padding(.top, 12)
+                    // An empty transcript has no row to take the width, so this
+                    // stack sized to its padding and the ScrollView sized to the
+                    // stack. Nothing showed it while the only thing overlaid on a
+                    // cold open was a spinner, which is small and centred either
+                    // way. The failure state added in #170 is text, and inherited
+                    // a container about one character wide: "Can't reach the
+                    // Drover server" rendered one letter per line, down the
+                    // screen and past the composer.
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                // Scrolling back to read is the other moment you want the
+                // keyboard gone, and dragging it away is cheaper than reaching
+                // for the accessory bar's dismiss button.
+                .scrollDismissesKeyboard(.interactively)
+                .scrollPosition($scrollPosition)
+                .onPreferenceChange(TranscriptRowFrames.self) { frames in
+                    rowFrames = frames
+                    if scrollPhase == .idle || scrollPhase == .animating,
+                       let offset = followState.preservedOffset(in: frames),
+                       abs(offset - transcriptOffset) > 0.5 {
+                        scrollPosition.scrollTo(y: offset)
                     }
                 }
-                .coordinateSpace(name: "transcript-content")
-                .padding(.horizontal, 14)
-                .padding(.top, 12)
-                // An empty transcript has no row to take the width, so this
-                // stack sized to its padding and the ScrollView sized to the
-                // stack. Nothing showed it while the only thing overlaid on a
-                // cold open was a spinner, which is small and centred either
-                // way. The failure state added in #170 is text, and inherited
-                // a container about one character wide: "Can't reach the
-                // Drover server" rendered one letter per line, down the
-                // screen and past the composer.
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            // Scrolling back to read is the other moment you want the
-            // keyboard gone, and dragging it away is cheaper than reaching
-            // for the accessory bar's dismiss button.
-            .scrollDismissesKeyboard(.interactively)
-            .scrollPosition($scrollPosition)
-            .onPreferenceChange(TranscriptRowFrames.self) { frames in
-                rowFrames = frames
-                if scrollPhase == .idle || scrollPhase == .animating,
-                   let offset = followState.preservedOffset(in: frames),
-                   abs(offset - transcriptOffset) > 0.5 {
-                    scrollPosition.scrollTo(y: offset)
+                .onScrollGeometryChange(for: TranscriptScrollGeometry.self) { geometry in
+                    TranscriptScrollGeometry(geometry)
+                } action: { old, geometry in
+                    transcriptOffset = geometry.offset
+                    let isUserDriven = scrollPhase == .interacting || scrollPhase == .decelerating
+                    // A layout callback during a gesture is still a layout change.
+                    // Streaming/composer changes cannot detach a following reader.
+                    let isMovement = isUserDriven
+                        && old.contentHeight == geometry.contentHeight
+                        && old.viewportHeight == geometry.viewportHeight
+                        && old.bottomInset == geometry.bottomInset
+                    if isUserDriven && !isMovement {
+                        followState.layoutChanged(
+                            bottomDistanceChange: geometry.contentHeight - old.contentHeight
+                                + old.viewportHeight - geometry.viewportHeight
+                        )
+                    }
+                    followState.positionChanged(
+                        bottomDistance: geometry.bottomDistance,
+                        isUserDriven: isMovement,
+                        isDecelerating: scrollPhase == .decelerating
+                    )
+                    if isUserDriven {
+                        followState.captureAnchor(in: rowFrames, offset: geometry.offset)
+                        if !followState.isFollowing {
+                            cancelFollowingScroll()
+                        }
+                    } else if scrollPhase == .idle || scrollPhase == .animating,
+                              let offset = followState.preservedOffset(in: rowFrames),
+                              abs(offset - geometry.offset) > 0.5 {
+                        // Keyboard avoidance can change the offset without changing any
+                        // row frames. Restore the reading anchor for those changes too.
+                        scrollPosition.scrollTo(y: offset)
+                    }
+                    if followState.isFollowing,
+                       old.contentHeight != geometry.contentHeight
+                        || old.viewportHeight != geometry.viewportHeight
+                        || old.bottomInset != geometry.bottomInset {
+                        scheduleScroll(with: proxy)
+                    }
                 }
-            }
-            .onScrollGeometryChange(for: TranscriptScrollGeometry.self) { geometry in
-                TranscriptScrollGeometry(
-                    // ScrollPosition uses a point measured from the content's
-                    // start, while ScrollGeometry includes the top safe-area inset.
-                    offset: geometry.contentOffset.y + geometry.contentInsets.top,
-                    bottomDistance: geometry.contentSize.height + geometry.contentInsets.bottom
-                        - geometry.contentOffset.y - geometry.containerSize.height,
-                    contentHeight: geometry.contentSize.height,
-                    viewportHeight: geometry.containerSize.height
-                )
-            } action: { old, geometry in
-                transcriptOffset = geometry.offset
-                let isUserDriven = scrollPhase == .interacting || scrollPhase == .decelerating
-                followState.positionChanged(
-                    bottomDistance: isTailVisible ? 0 : geometry.bottomDistance,
-                    isUserDriven: isUserDriven
-                )
-                if isUserDriven {
-                    followState.captureAnchor(in: rowFrames, offset: geometry.offset)
-                    if !followState.isFollowing {
+                .onScrollPhaseChange { oldPhase, newPhase, context in
+                    scrollPhase = newPhase
+                    if newPhase == .tracking
+                        || (newPhase == .interacting && oldPhase != .tracking) {
+                        followState.scrollingBegan()
+                    }
+                    if newPhase == .tracking || newPhase == .interacting || newPhase == .decelerating {
+                        cancelPrependScroll()
                         cancelFollowingScroll()
                     }
-                } else if scrollPhase == .idle || scrollPhase == .animating,
-                          let offset = followState.preservedOffset(in: rowFrames),
-                          abs(offset - geometry.offset) > 0.5 {
-                    // Keyboard avoidance can change the offset without changing any
-                    // row frames. Restore the reading anchor for those changes too.
-                    scrollPosition.scrollTo(y: offset)
+                    if newPhase == .idle,
+                       oldPhase == .interacting || oldPhase == .decelerating || oldPhase == .tracking {
+                        // The last geometry callback can precede the final deceleration
+                        // position. Re-check the real inset/offset at the phase transition.
+                        let geometry = TranscriptScrollGeometry(context.geometry)
+                        transcriptOffset = geometry.offset
+                        followState.scrollingEnded(bottomDistance: geometry.bottomDistance)
+                        followState.captureAnchor(in: rowFrames, offset: geometry.offset)
+                        if followState.isFollowing { scheduleScroll(with: proxy) }
+                    }
                 }
-                if followState.isFollowing,
-                   old.contentHeight != geometry.contentHeight
-                    || old.viewportHeight != geometry.viewportHeight {
-                    scheduleScroll(with: proxy)
+                // Auto-scroll is coalesced and unanimated on purpose: firing an
+                // animated scrollTo per appended message piles up overlapping
+                // animations faster than they can finish. One unanimated scroll
+                // per ~120ms window, always to the visual tail at fire time,
+                // keeps the transcript following the stream without an animation
+                // storm. Gated on pinning so it never fights the user's finger.
+                .onChange(of: model.messagesVersion) { _, _ in
+                    // Also observes in-place streaming updates, whose last ID may be unchanged.
+                    if followState.contentChanged() { scheduleScroll(with: proxy) }
                 }
-            }
-            .onScrollPhaseChange { oldPhase, newPhase in
-                scrollPhase = newPhase
-                if newPhase == .tracking || newPhase == .interacting || newPhase == .decelerating {
-                    cancelPrependScroll()
+                .onChange(of: model.messages.last?.seq) { previous, newest in
+                    guard let previous, let newest, newest > previous else { return }
+                    followState.recordNewEvents(model.messages.filter { $0.seq > previous }.count)
+                }
+                .onChange(of: model.pendingTurn?.clientTurnID) { _, _ in
+                    if followState.contentChanged() { scheduleScroll(with: proxy) }
+                }
+                // Bottom anchoring is only an opening policy. Applying it to size changes
+                // moves a detached reader whenever streaming text or the keyboard changes layout.
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(.top, for: .sizeChanges)
+                .onDisappear {
                     cancelFollowingScroll()
+                    cancelPrependScroll()
                 }
-                if newPhase == .idle,
-                   oldPhase == .interacting || oldPhase == .decelerating || oldPhase == .tracking {
-                    followState.captureAnchor(in: rowFrames, offset: transcriptOffset)
-                    if followState.isFollowing { scheduleScroll(with: proxy) }
-                }
-            }
-            .overlay(alignment: .bottomTrailing) {
                 if !followState.isFollowing {
-                    scrollToBottomButton(proxy)
+                    // A sibling outside the scroll viewport cannot cover transcript text.
+                    HStack {
+                        Spacer()
+                        scrollToBottomButton(proxy)
+                    }
+                    .padding(.top, 8)
                 }
-            }
-            // Auto-scroll is coalesced and unanimated on purpose: firing an
-            // animated scrollTo per appended message piles up overlapping
-            // animations faster than they can finish. One unanimated scroll
-            // per ~120ms window, always to the visual tail at fire time,
-            // keeps the transcript following the stream without an animation
-            // storm. Gated on pinning so it never fights the user's finger.
-            .onChange(of: model.messagesVersion) { _, _ in
-                // Also observes in-place streaming updates, whose last ID may be unchanged.
-                if followState.contentChanged() { scheduleScroll(with: proxy) }
-            }
-            .onChange(of: model.messages.last?.seq) { previous, newest in
-                guard let previous, let newest, newest > previous else { return }
-                followState.recordNewEvents(model.messages.filter { $0.seq > previous }.count)
-            }
-            .onChange(of: model.pendingTurn?.clientTurnID) { _, _ in
-                if followState.contentChanged() { scheduleScroll(with: proxy) }
-            }
-            // Bottom anchoring is only an opening policy. Applying it to size changes
-            // moves a detached reader whenever streaming text or the keyboard changes layout.
-            .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .defaultScrollAnchor(.top, for: .sizeChanges)
-            .onDisappear {
-                cancelFollowingScroll()
-                cancelPrependScroll()
             }
         }
     }
