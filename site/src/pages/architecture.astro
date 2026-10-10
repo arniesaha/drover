@@ -1,6 +1,7 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 import ArchitectureDiagram from '../components/ArchitectureDiagram.astro';
+import LayerStack from '../components/LayerStack.astro';
 import { LINKS } from '../site';
 
 const flow = [
@@ -59,22 +60,49 @@ const ports = [
       <p class="lede">
         A <strong>command plane</strong> carries live fleet operations: start a session, send a turn, approve a tool call,
         stream a terminal. A <strong>context plane</strong> turns everything that happens into durable, queryable memory.
-        Both run entirely on hardware you control.
+        The central server routes intent and aggregates state. It does not pretend to own remote processes or files.
       </p>
     </div>
   </section>
 
-  <section class="section-tight">
+  <section class="section-tight" id="where-drover-fits">
     <div class="wrap">
-      <ArchitectureDiagram />
+      <span class="eyebrow">Where Drover fits</span>
+      <h2>Six layers. Drover is the middle three.</h2>
+      <p class="lede">
+        Before the boxes and arrows, the map. People act at the top and native harnesses do the work at the bottom.
+        Drover is execution, context and the continuity that bridges them to whatever plans the work. Hover or tap a
+        layer to see what lives there and how far along it is.
+      </p>
+      <div class="fit">
+        <LayerStack />
+      </div>
       <p class="cap">
-        The diagram is generated from source in this repository and follows the site theme. On a small screen, scroll it
-        sideways.
+        Statuses are deliberate. Continuity is partly shipped and is the direction Drover is being built toward. Layers
+        marked "you bring it" are not Drover's: it talks to orchestrators over MCP and the HTTP API, and to harnesses
+        through adapters.
       </p>
     </div>
   </section>
 
-  <section class="section band" id="walkthrough">
+  <section class="section band" id="diagram">
+    <div class="wrap">
+      <span class="eyebrow">Inside Drover</span>
+      <h2>Command plane above, context plane below.</h2>
+      <p class="lede">
+        The host daemon owns execution. PostgreSQL owns operational state. DuckLake owns the durable analytical facts.
+      </p>
+      <div class="fit">
+        <ArchitectureDiagram />
+      </div>
+      <p class="cap">
+        Drawn as a vector from data in this repository, after the diagram in the project README. On a small screen,
+        scroll it sideways.
+      </p>
+    </div>
+  </section>
+
+  <section class="section" id="walkthrough">
     <div class="wrap">
       <span class="eyebrow">What is under the hood</span>
       <h2>Follow one turn through the system.</h2>
@@ -94,7 +122,7 @@ const ports = [
     </div>
   </section>
 
-  <section class="section" id="components">
+  <section class="section band" id="components">
     <div class="wrap">
       <span class="eyebrow">Components</span>
       <h2>Who owns what.</h2>
@@ -128,7 +156,7 @@ const ports = [
     </div>
   </section>
 
-  <section class="section band" id="storage">
+  <section class="section" id="storage">
     <div class="wrap">
       <span class="eyebrow">Storage</span>
       <h2>Two stores, two jobs.</h2>
@@ -174,7 +202,7 @@ const ports = [
     </div>
   </section>
 
-  <section class="section" id="privacy">
+  <section class="section band" id="privacy">
     <div class="wrap">
       <span class="eyebrow">Privacy model</span>
       <h2>Your data has one home, and you hold the keys.</h2>
@@ -236,7 +264,11 @@ const ports = [
   .cap {
     font-size: 0.84rem;
     color: var(--muted);
-    margin-top: 0.8rem;
+    margin-top: 0.9rem;
+    max-width: 80ch;
+  }
+  .fit {
+    margin-top: 1.8rem;
   }
   .flow {
     list-style: none;
