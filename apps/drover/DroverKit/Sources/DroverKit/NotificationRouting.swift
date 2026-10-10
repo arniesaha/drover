@@ -9,6 +9,7 @@ import Foundation
 public enum NotificationPayloadKey {
     /// Matches the `session_id` the server puts in its APNs payload.
     public static let sessionID = "session_id"
+    public static let sessionIDs = "session_ids"
 }
 
 /// Whether the hub is currently announcing "needs you" over APNs.
@@ -36,6 +37,26 @@ public enum PushRegistration {
     }
 }
 
+public enum NotificationMode: String, CaseIterable, Codable, Sendable {
+    case all, action, digest
+
+    public var label: String {
+        switch self {
+        case .all: "All updates"
+        case .action: "Action needed only"
+        case .digest: "Daily digest"
+        }
+    }
+
+    public static func saved(in store: UserDefaults = .standard) -> Self {
+        Self(rawValue: store.string(forKey: "drover.push.mode") ?? "") ?? .action
+    }
+
+    public func save(in store: UserDefaults = .standard) {
+        store.set(rawValue, forKey: "drover.push.mode")
+    }
+}
+
 /// Where a tapped notification puts the session it was about, until a screen
 /// is ready to navigate there.
 ///
@@ -50,13 +71,35 @@ public final class NotificationRoute {
 
     /// Set by the notification delegate, cleared by whoever navigates.
     public private(set) var pendingSessionID: String?
+    public private(set) var pendingSessionIDs: [String]?
 
     public init() {}
 
     public func open(sessionID: String) {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        pendingSessionIDs = nil
         pendingSessionID = trimmed
+    }
+
+    public func open(sessionIDs: [String]) {
+        let ids = Array(Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })).sorted()
+        guard !ids.isEmpty else { return }
+        pendingSessionID = nil
+        pendingSessionIDs = ids
+    }
+
+    public func consumeSummary() -> [String]? {
+        defer { pendingSessionIDs = nil }
+        return pendingSessionIDs
+    }
+
+    public nonisolated static func sessionIDs(userInfo: [AnyHashable: Any]) -> [String]? {
+        guard let ids = userInfo[NotificationPayloadKey.sessionIDs] as? [String] else { return nil }
+        let cleaned = Array(Set(ids.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })).sorted()
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     /// Take the pending id, if any, leaving nothing behind — a tap must not
@@ -77,6 +120,7 @@ public final class NotificationRoute {
     public nonisolated static func sessionID(
         userInfo: [AnyHashable: Any], requestIdentifier: String
     ) -> String? {
+        if userInfo[NotificationPayloadKey.sessionIDs] != nil { return nil }
         if let value = userInfo[NotificationPayloadKey.sessionID] as? String,
            !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return value

@@ -953,6 +953,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if self.analytics_boundary is None and self._is_analytics_public_path(path):
             require_analytical_store(self.collector.duckdb_path)
+        if path == "/auth/device/notifications":
+            self._device_notification_settings()
+            return
         if path == "/healthz" and parse_qs(parsed.query).get("detail") == ["1"]:
             self._send(
                 200,
@@ -1729,6 +1732,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
 
     def _do_PUT(self) -> None:
         path = urlparse(self.path).path
+        if path == "/auth/device/notifications":
+            self._device_notification_settings()
+            return
         if path == "/auth/device/apns":
             self._set_device_apns_registration()
             return
@@ -2625,6 +2631,30 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return None
         return credential
+
+    def _device_notification_settings(self) -> None:
+        credential = self._device_bearer_credential()
+        if credential is None:
+            return
+        if self.command == "PUT":
+            body = self._read_json()
+            if (
+                not isinstance(body, dict)
+                or not isinstance(body.get("mode"), str)
+                or body.get("mode") not in {"all", "action", "digest"}
+            ):
+                self._send(
+                    400, "application/json", '{"error":"invalid notification mode"}\n'
+                )
+                return
+            self.auth.credentials.set_notification_mode(credential.id, body["mode"])
+            self._send(204, "application/json", "")
+        else:
+            self._send(
+                200,
+                "application/json",
+                json.dumps({"mode": credential.notification_mode}),
+            )
 
     def _set_device_apns_registration(self) -> None:
         credential = self._device_bearer_credential()

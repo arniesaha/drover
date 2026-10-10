@@ -17,6 +17,7 @@ sessions list stay truthful even when this path is down.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -173,7 +174,7 @@ class APNsConfig:
 
 @dataclass(frozen=True)
 class AwaitingTransition:
-    """A session that just started (or stopped) waiting on the user."""
+    """A session state transition, with public notification context."""
 
     session_id: str
     harness: str
@@ -183,42 +184,90 @@ class AwaitingTransition:
     #: the session has no visible assistant output yet.
     preview: str = ""
 
+    title: str = ""
+    status: str = ""
+    private: bool = False
+
     @property
     def needs_user(self) -> bool:
-        return self.awaiting in _AWAITING_TITLES
+        return self.awaiting in _AWAITING_TITLES and not self.status in {
+            "completed",
+            "failed",
+            "errored",
+            "terminated",
+        }
+
+    @property
+    def kind(self) -> str:
+        if self.status in {"failed", "errored"}:
+            return "failed"
+        if self.status == "completed":
+            return "finished"
+        return "input" if self.needs_user else "progress"
+
+    def allowed(self, mode: str) -> bool:
+        return mode == "all" or self.kind != "progress"
 
     def alert_title(self) -> str:
-        return f"{self.harness or 'Harness'} needs you"
+        if self.private:
+            return "Session"
+        return (self._safe_text(self.title) or self._safe_text(_basename(self.cwd)))[
+            :60
+        ] or "Session"
 
     def alert_subtitle(self) -> str:
-        """Where and what, so the body is free to carry the agent's words.
-
-        Empty without a preview, because then the body already says exactly
-        this and a notification repeating itself reads worse than a plain one.
-        """
-        if not self.summary():
-            return ""
-        return f"{self._project()} · {_AWAITING_TITLES.get(self.awaiting or '', 'your turn')}"
+        return ""
 
     def alert_body(self) -> str:
-        """The agent's own words when there are any, else the old summary.
-
-        "claude-code needs you / drover — your turn" tells you a session
-        stopped, not whether it stopped on something you care about. Quoting
-        the last message is the difference between unlocking the phone to find
-        out and knowing before you do.
-        """
-        return self.summary() or self._fallback_body()
+        prefix = {
+            "input": "Needs your input",
+            "finished": "Finished",
+            "failed": "Failed",
+            "progress": "Update",
+        }[self.kind]
+        fallback = {
+            "input": (
+                "approve a command"
+                if self.awaiting == "approval"
+                else "reply in the app"
+            ),
+            "finished": "ready for review",
+            "failed": "open the session for details",
+            "progress": "work is continuing",
+        }[self.kind]
+        # Approval text is deliberately fixed: raw command details belong in the app.
+        summary = (
+            ""
+            if self.private or (self.needs_user and self.awaiting == "approval")
+            else self.summary()
+        )
+        return _condense(f"{prefix}: {summary or fallback}")
 
     def summary(self) -> str:
-        return _condense(self.preview)
+        # Git delivery details and command transcripts belong in the session.
+        lines = [
+            line
+            for line in self.preview.splitlines()
+            if not re.match(
+                r"\s*(?:[-*]\s*)?(?:Pushed|Committed|Commit|SHA|Run ID|Session ID)\b",
+                line,
+                re.I,
+            )
+        ]
+        return self._safe_text(" ".join(lines))
 
-    def _fallback_body(self) -> str:
-        suffix = _AWAITING_TITLES.get(self.awaiting or "", "your turn")
-        return f"{self._project()} — {suffix}"
+    def _safe_text(self, text: str | None) -> str:
+        for identifier in (self.session_id, self.harness):
+            if identifier and text:
+                text = re.sub(re.escape(identifier), "", text, flags=re.I)
+        return _condense(text)
 
-    def _project(self) -> str:
-        return _basename(self.cwd) or self.harness or "session"
+
+def _collapse_id(session_id: str) -> str:
+    # APNs limits bytes, not characters. Hash long/non-ASCII IDs without collisions.
+    if session_id.isascii() and len(session_id) <= 64:
+        return session_id
+    return hashlib.sha256(session_id.encode()).hexdigest()
 
 
 def _basename(cwd: str | None) -> str:
@@ -239,11 +288,30 @@ def _condense(text: str | None) -> str:
     stand.\\n**Done**\\n- ..."), and a notification renders none of it: the
     newlines collapse anyway and the bold markers show up as literal asterisks.
     So whitespace folds to single spaces and the emphasis markers are dropped,
-    while backticks stay -- `git push --force` reads as code even unrendered,
-    and stripping them would silently change what a command looks like.
+    and code delimiters are removed. Machine identifiers and locations are
+    stripped before truncation.
     """
     if not text:
         return ""
+    # Keep identifiers, secrets, links, and machine locations off the lock screen.
+    from drover.server.harness.auth import redact_auth_text
+
+    text = redact_auth_text(str(text))
+    text = re.sub(
+        r"\b(?:run|session|harness)[_ -]?id\s*[:=]\s*[^\s,;]+", "", text, flags=re.I
+    )
+    text = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "", text)
+    text = re.sub(r"\b(?:codex|claude-code|gemini|opencode)\b", "", text, flags=re.I)
+    text = re.sub(r"\b(?:harness|run|session)[-_][\w-]+\b", "", text, flags=re.I)
+    text = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b|\b[0-9a-f]{7,64}\b", "", text, flags=re.I
+    )
+    text = re.sub(
+        r"https?://\S+|(?:[/~][\w.~-]+){2,}|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[\w-]+\.(?:local|internal|lan)\b",
+        "",
+        text,
+    )
+    text = text.replace("—", ":").replace("`", "")
     condensed = " ".join(str(text).split())
     condensed = condensed.replace("**", "").replace("__", "")
     # Leading list/heading markers survive the whitespace fold as stray
@@ -254,7 +322,7 @@ def _condense(text: str | None) -> str:
     if len(condensed) <= _SUMMARY_MAX_CHARS:
         return condensed
     # Cut on a word boundary; a mid-word truncation reads like corruption.
-    cut = condensed[:_SUMMARY_MAX_CHARS]
+    cut = condensed[: _SUMMARY_MAX_CHARS - 1]
     space = cut.rfind(" ")
     if space > _SUMMARY_MAX_CHARS // 2:
         cut = cut[:space]
@@ -322,7 +390,7 @@ class _AuthToken:
 
 
 class APNsSender:
-    """Sends one alert per awaiting transition to every paired device.
+    """Batches state transitions according to each paired device's preference.
 
     ``credentials`` is the live ``CredentialStore``; device tokens are read at
     send time rather than cached so a revoked or re-paired phone stops getting
@@ -336,7 +404,17 @@ class APNsSender:
         *,
         client=None,
         max_workers: int = 2,
+        clock=time.time,
+        timer_factory=threading.Timer,
+        batch_seconds: float = 60,
     ):
+        self._clock = clock
+        self._timer_factory = timer_factory
+        self._batch_seconds = batch_seconds
+        self._pending_lock = threading.Lock()
+        self._pending = {}
+        self._timer = None
+        self._closed = False
         self._config = config
         self._credentials = credentials
         self._auth = _AuthToken(config)
@@ -427,13 +505,71 @@ class APNsSender:
         return self._client
 
     def notify(self, transition: AwaitingTransition) -> None:
-        """Queue delivery. Never raises into the caller's request path."""
-        if not self._config.is_usable or not transition.needs_user:
+        """Coalesce each device's latest session states in a fixed window."""
+        if not self._config.is_usable:
             return
+        now = self._clock()
+        with self._pending_lock:
+            if self._closed:
+                return
+            for credential in self._targets():
+                mode = credential.notification_mode
+                entry = self._pending.get(credential.id)
+                if not transition.allowed(mode):
+                    if entry:
+                        entry[2].pop(transition.session_id, None)
+                    continue
+                delay = (
+                    (86400 - now % 86400) if mode == "digest" else self._batch_seconds
+                )
+                if entry is None or entry[1] != mode:
+                    entry = [now + delay, mode, {}]
+                    self._pending[credential.id] = entry
+                entry[2][transition.session_id] = transition
+            self._schedule_locked()
+
+    def _schedule_locked(self):
+        if self._timer is not None:
+            self._timer.cancel()
+        if self._pending and not self._closed:
+            deadline = min(entry[0] for entry in self._pending.values())
+            self._timer = self._timer_factory(
+                max(0, deadline - self._clock()), self._flush_async
+            )
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _flush_async(self):
         try:
-            self._pool.submit(self._deliver, transition)
-        except RuntimeError:  # pool shut down during interpreter teardown
+            self._pool.submit(self.flush_due)
+        except RuntimeError:
             pass
+
+    def flush_due(self):
+        now = self._clock()
+        with self._pending_lock:
+            due = [
+                (key, self._pending.pop(key))
+                for key, entry in list(self._pending.items())
+                if entry[0] <= now
+            ]
+            self._schedule_locked()
+        targets = {credential.id: credential for credential in self._targets()}
+        for key, (_, mode, states) in due:
+            credential = targets.get(key)
+            if credential is None:
+                continue
+            if credential.notification_mode != mode:
+                # A preference change must never send an alert under the old mode.
+                continue
+            transitions = [state for state in states.values() if state.allowed(mode)]
+            if transitions:
+                for offset in range(0, len(transitions), 20):
+                    self._send_one(
+                        credential,
+                        transitions[offset : offset + 20],
+                        self._needs_user_count(),
+                    )
 
     def _targets(self):
         for credential in self._credentials.list_all():
@@ -456,7 +592,11 @@ class APNsSender:
             return
         badge = self._needs_user_count()
         for credential in targets:
-            self._send_one(credential, transition, badge)
+            if (
+                transition.allowed(credential.notification_mode)
+                and credential.notification_mode != "digest"
+            ):
+                self._send_one(credential, transition, badge)
 
     def _needs_user_count(self) -> int | None:
         """Best-effort badge value; ``None`` leaves the app's badge alone."""
@@ -471,27 +611,52 @@ class APNsSender:
     def set_badge_source(self, counter) -> None:
         self._badge_source = counter
 
-    def _payload(self, transition: AwaitingTransition, badge: int | None) -> bytes:
-        alert: dict = {
-            "title": transition.alert_title(),
-            "body": transition.alert_body(),
-        }
-        subtitle = transition.alert_subtitle()
-        if subtitle:
-            # Only present alongside a real preview, so the three lines never
-            # say the same thing twice.
-            alert["subtitle"] = subtitle
-        aps: dict = {
+    def _payload(self, transition, badge: int | None) -> bytes:
+        states = transition if isinstance(transition, list) else [transition]
+        ids = sorted(state.session_id for state in states)
+        if len(states) == 1:
+            alert = {"title": states[0].alert_title(), "body": states[0].alert_body()}
+            route = {"session_id": ids[0]}
+            thread = _collapse_id(ids[0])
+        else:
+            counts = {
+                kind: sum(state.kind == kind for state in states)
+                for kind in ("finished", "input", "failed", "progress")
+            }
+            parts = []
+            for kind, verb in (
+                ("finished", "finished"),
+                ("input", "needs input"),
+                ("failed", "failed"),
+                ("progress", "updated"),
+            ):
+                count = counts[kind]
+                if count:
+                    if kind == "input" and count > 1:
+                        verb = "need input"
+                    parts.append(f"{count} session{'s' if count != 1 else ''} {verb}")
+            alert = {"title": "Session updates", "body": ", ".join(parts)}
+            route = {"session_ids": ids}
+            thread = "session-summary"
+        aps = {
             "alert": alert,
             "sound": "default",
-            # Matches LocalNotifier's .timeSensitive so a pushed alert and a
-            # locally-generated one behave identically under Focus.
-            "interruption-level": "time-sensitive",
+            "thread-id": thread,
+            "interruption-level": (
+                "time-sensitive"
+                if any(state.needs_user for state in states)
+                else "active"
+            ),
         }
         if badge is not None:
             aps["badge"] = badge
-        body = {"aps": aps, "session_id": transition.session_id}
-        return json.dumps(body, separators=(",", ":")).encode("utf-8")
+        return json.dumps({"aps": aps, **route}, separators=(",", ":")).encode("utf-8")
+
+    def _device_payload(self, credential, transition, badge):
+        payload = json.loads(self._payload(transition, badge))
+        if credential.notification_mode == "digest":
+            payload["aps"]["interruption-level"] = "active"
+        return json.dumps(payload, separators=(",", ":")).encode()
 
     def _send_one(self, credential, transition: AwaitingTransition, badge) -> None:
         host = _HOSTS.get(credential.apns_environment or "")
@@ -508,11 +673,25 @@ class APNsSender:
             # One session collapses onto itself: a phone that was offline
             # through three transitions wakes to the latest state, not three
             # stacked banners for the same session.
-            "apns-collapse-id": transition.session_id[:64],
+            "apns-collapse-id": (
+                _collapse_id(transition.session_id)
+                if not isinstance(transition, list)
+                else (
+                    _collapse_id(transition[0].session_id)
+                    if len(transition) == 1
+                    else hashlib.sha256(
+                        "\0".join(
+                            sorted(state.session_id for state in transition)
+                        ).encode()
+                    ).hexdigest()
+                )
+            ),
         }
         try:
             response = self._http().post(
-                url, content=self._payload(transition, badge), headers=headers
+                url,
+                content=self._device_payload(credential, transition, badge),
+                headers=headers,
             )
         except Exception as exc:  # noqa: BLE001
             # Timeouts and connection resets say nothing about the token.
@@ -567,6 +746,11 @@ class APNsSender:
             )
 
     def close(self) -> None:
+        with self._pending_lock:
+            self._closed = True
+            if self._timer is not None:
+                self._timer.cancel()
+            self._pending.clear()
         self._pool.shutdown(wait=False)
         client = self._client
         if client is not None:

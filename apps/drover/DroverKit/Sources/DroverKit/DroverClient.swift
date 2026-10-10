@@ -589,6 +589,17 @@ public actor DroverClient {
         _ = try await request(path: "/auth/device/apns", method: "PUT", body: body)
     }
 
+    public func notificationMode() async throws -> NotificationMode {
+        struct Preference: Decodable { let mode: NotificationMode }
+        let data = try await request(path: "/auth/device/notifications", method: "GET", body: nil)
+        return try JSONDecoder().decode(Preference.self, from: data).mode
+    }
+
+    public func setNotificationMode(_ mode: NotificationMode) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["mode": mode.rawValue])
+        _ = try await request(path: "/auth/device/notifications", method: "PUT", body: body)
+    }
+
     /// Drop this device's registration, so a signed-out phone stops lighting
     /// up for a fleet it no longer belongs to.
     public func unregisterAPNsToken() async throws {

@@ -199,6 +199,9 @@ def _dispatch_awaiting_push(
     harness: str | None,
     cwd: str | None,
     preview: str = "",
+    title: str = "",
+    status: str = "",
+    private: bool = False,
 ) -> None:
     """Tell the push layer a session changed awaiting state.
 
@@ -216,6 +219,9 @@ def _dispatch_awaiting_push(
                 cwd=cwd,
                 awaiting=awaiting,
                 preview=preview,
+                title=title,
+                status=status,
+                private=private,
             )
         )
     except Exception:  # noqa: BLE001 - never break activity recording
@@ -962,6 +968,9 @@ class HarnessRegistry:
         now = _now()
         ended_at = _as_utc_datetime(ended_at)
         with self._connect() as con:
+            previous = con.execute(
+                "SELECT status FROM harness_sessions WHERE session_id = ?", [session_id]
+            ).fetchone()
             con.execute(
                 """
                 UPDATE harness_sessions
@@ -984,6 +993,10 @@ class HarnessRegistry:
         session = self.get_session(session_id)
         if session is None:
             raise KeyError(f"unknown harness session {session_id!r}")
+        if previous is not None and previous[0] != status:
+            self._dispatch_session_push(
+                session_id=session_id, awaiting=session.awaiting, status=status
+            )
         return session
 
     def mark_session_recovered(
@@ -1061,13 +1074,127 @@ class HarnessRegistry:
             )
         if not changed:
             return
-        _dispatch_awaiting_push(
+        self._dispatch_session_push(
             session_id=session_id,
             awaiting=effective_awaiting,
             harness=previous[1],
             cwd=previous[2],
             preview=preview,
         )
+
+    def _dispatch_session_push(
+        self,
+        *,
+        session_id,
+        awaiting=None,
+        harness=None,
+        cwd=None,
+        preview="",
+        status=None,
+    ):
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT status, repo_name, cwd FROM harness_sessions WHERE session_id = ?",
+                    [session_id],
+                ).fetchone()
+                if row is None:
+                    return
+                notification_status = status or str(row[0])
+                if (
+                    awaiting == "input"
+                    and notification_status not in ARCHIVED_SESSION_STATUSES
+                ):
+                    latest = con.execute(
+                        "SELECT payload_json FROM harness_events WHERE session_id = ? AND event_type = 'status' "
+                        "ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC LIMIT 1",
+                        [session_id],
+                    ).fetchone()
+                    if latest:
+                        payload = json.loads(latest[0] or "{}")
+                        inner = payload.get("payload", payload)
+                        if (
+                            isinstance(inner, dict)
+                            and inner.get("turn_complete") is True
+                        ):
+                            result = inner.get("result") or {}
+                            notification_status = (
+                                "failed"
+                                if isinstance(result, dict) and result.get("is_error")
+                                else "completed"
+                            )
+                # A finished turn can accept a new prompt, but completion itself
+                # is a normal alert. Explicit input/approval states remain urgent.
+                # No provenance links assistant output to profile reads. Fail closed
+                # for the whole fleet while private material (including reverted
+                # history and pending proposals) could have entered a conversation.
+                tables = {
+                    str(item[0])
+                    for item in con.execute(
+                        "SELECT table_name FROM information_schema.tables WHERE table_name IN ('profile_items', 'profile_proposals', 'profile_agents')"
+                    ).fetchall()
+                }
+                private = False
+                if "profile_items" in tables:
+                    private = (
+                        con.execute(
+                            "SELECT 1 FROM profile_items WHERE tier = 'private' LIMIT 1"
+                        ).fetchone()
+                        is not None
+                    )
+                if "profile_proposals" in tables:
+                    private = (
+                        private
+                        or con.execute(
+                            "SELECT 1 FROM profile_proposals LIMIT 1"
+                        ).fetchone()
+                        is not None
+                    )
+                if "profile_agents" in tables:
+                    private = (
+                        private
+                        or con.execute(
+                            "SELECT 1 FROM profile_agents WHERE tier = 'private' LIMIT 1"
+                        ).fetchone()
+                        is not None
+                    )
+                title = ""
+                if not private:
+                    prompt = con.execute(
+                        "SELECT content_preview FROM harness_events WHERE session_id = ? AND event_type = 'user_input' "
+                        "ORDER BY created_at, COALESCE(seq, 0), event_id LIMIT 1",
+                        [session_id],
+                    ).fetchone()
+                    title = (
+                        self._safe_session_preview(str(prompt[0] or ""))
+                        if prompt
+                        else str(row[1] or "")
+                    )
+                    if awaiting in _AWAITING_STATES or (status or row[0]) in {
+                        "completed",
+                        "failed",
+                        "errored",
+                    }:
+                        preview = self._attention_preview(con, session_id)
+                _dispatch_awaiting_push(
+                    session_id=session_id,
+                    awaiting=awaiting,
+                    harness=harness,
+                    cwd=cwd or row[2],
+                    preview="" if private else preview,
+                    title=title,
+                    status=notification_status,
+                    private=private,
+                )
+        except Exception:  # Notification privacy checks fail closed.
+            _dispatch_awaiting_push(
+                session_id=session_id,
+                awaiting=awaiting,
+                harness="",
+                cwd=None,
+                status=status or "",
+                private=True,
+            )
 
     @staticmethod
     def _attention_preview(con: duckdb.DuckDBPyConnection, session_id: str) -> str:
@@ -1619,6 +1746,7 @@ class HarnessRegistry:
 
                     latest_activity: datetime | None = None
                     native_session_id: str | None = None
+                    terminal_status = None
                     for event in projection_events:
                         raw_payload = event.get("payload")
                         if raw_payload is None:
@@ -1634,12 +1762,20 @@ class HarnessRegistry:
                             else None
                         )
                         if not isinstance(inner_payload, dict):
-                            inner_payload = {}
+                            inner_payload = (
+                                raw_payload if isinstance(raw_payload, dict) else {}
+                            )
                         awaiting = _derive_structured_awaiting(
                             event_type=str(event["event_type"]),
                             payload=inner_payload,
                             current=awaiting,
                         )
+                        if event["event_type"] == "session.exited":
+                            terminal_status = (
+                                "failed"
+                                if inner_payload.get("exited", 0) != 0
+                                else "completed"
+                            )
                         candidate_native_id = inner_payload.get("native_session_id")
                         if (
                             isinstance(candidate_native_id, str)
@@ -1652,7 +1788,7 @@ class HarnessRegistry:
                         ):
                             latest_activity = created_at
 
-                    status = str(previous.get("status") or "")
+                    status = terminal_status or str(previous.get("status") or "")
                     effective_awaiting = (
                         None if status in ARCHIVED_SESSION_STATUSES else awaiting
                     )
@@ -1680,7 +1816,14 @@ class HarnessRegistry:
                             session_id,
                         ],
                     )
-                    if previous.get("awaiting") != effective_awaiting:
+                    if terminal_status and previous.get("status") != terminal_status:
+                        con.execute(
+                            "UPDATE harness_sessions SET status = ?, awaiting = NULL WHERE session_id = ?",
+                            [terminal_status, session_id],
+                        )
+                    if previous.get("awaiting") != effective_awaiting or (
+                        terminal_status and previous.get("status") != terminal_status
+                    ):
                         preview = (
                             self._attention_preview(con, session_id)
                             if effective_awaiting in _AWAITING_STATES
@@ -1701,7 +1844,7 @@ class HarnessRegistry:
                 raise
 
         for session_id, awaiting, harness, cwd, preview in notifications:
-            _dispatch_awaiting_push(
+            self._dispatch_session_push(
                 session_id=session_id,
                 awaiting=awaiting,
                 harness=harness,

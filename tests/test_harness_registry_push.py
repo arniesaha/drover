@@ -176,7 +176,7 @@ def test_session_with_nothing_said_yet_has_no_preview(registry, sender):
 
     assert sender.sent[0].preview == ""
     # And still alerts, on the old generic wording.
-    assert sender.sent[0].alert_body() == "drover — your turn"
+    assert sender.sent[0].alert_body() == "Needs your input: reply in the app"
 
 
 def test_preview_is_redacted_before_it_leaves_the_host(registry, sender):
@@ -272,3 +272,89 @@ def test_derive_structured_awaiting_clears_on_session_exited(registry, sender):
         )
         is None
     )
+
+
+def test_terminal_status_notifies_once_and_uses_assistant_summary(registry, sender):
+    _assistant_says(registry, "Capture is ready for review", seq=1)
+    registry.update_session_status("sess-1", "completed")
+    registry.update_session_status("sess-1", "completed")
+    assert len(sender.sent) == 1
+    assert sender.sent[0].kind == "finished"
+    assert sender.sent[0].alert_body() == "Finished: Capture is ready for review"
+
+
+def test_private_profile_suppresses_prompt_and_assistant_text(registry, sender):
+    with registry._connect() as con:
+        con.execute("CREATE TABLE profile_items (tier TEXT)")
+        con.execute("INSERT INTO profile_items VALUES ('private')")
+    _assistant_says(registry, "Synthetic private context", seq=1)
+    registry.update_session_activity("sess-1", awaiting="input")
+    assert sender.sent[0].private
+    assert sender.sent[0].preview == ""
+    assert sender.sent[0].alert_title() == "Session"
+    assert "Synthetic" not in sender.sent[0].alert_body()
+
+
+@pytest.mark.parametrize("exit_code,kind", [(0, "finished"), (1, "failed")])
+def test_remote_terminal_event_notifies_once_on_replay(
+    registry, sender, exit_code, kind
+):
+    from datetime import datetime, timezone
+
+    record = {
+        "event_id": "synthetic-exit",
+        "session_id": "sess-1",
+        "event_type": "session.exited",
+        "payload": {"payload": {"exited": exit_code}},
+        "seq": 1,
+        "created_at": datetime.now(timezone.utc),
+    }
+    registry.ingest_structured_events([record])
+    registry.ingest_structured_events([record])
+    assert len(sender.sent) == 1
+    assert sender.sent[0].kind == kind
+
+
+def test_title_is_derived_from_first_prompt(registry, sender):
+    registry.append_event(
+        session_id="sess-1",
+        event_type="user_input",
+        payload={"text": "Fix capture preview"},
+    )
+    registry.update_session_activity("sess-1", awaiting="input")
+    assert sender.sent[0].alert_title() == "Fix capture preview"
+
+
+@pytest.mark.parametrize("is_error,kind", [(False, "finished"), (True, "failed")])
+def test_completed_turn_is_normal_even_though_session_accepts_input(
+    registry, sender, is_error, kind
+):
+    _assistant_says(registry, "Capture ready for review", seq=1)
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        seq=2,
+        payload={
+            "payload": {
+                "turn_complete": True,
+                "awaiting": "input",
+                "result": {"is_error": is_error},
+            }
+        },
+    )
+    registry.update_session_activity("sess-1", awaiting="input")
+    assert sender.sent[0].kind == kind
+    assert not sender.sent[0].needs_user
+    assert registry.get_session("sess-1").status == "running"
+
+
+def test_private_profile_agent_suppresses_conversation_after_item_removal(
+    registry, sender
+):
+    with registry._connect() as con:
+        con.execute("CREATE TABLE profile_agents (tier TEXT)")
+        con.execute("INSERT INTO profile_agents VALUES ('private')")
+    _assistant_says(registry, "Synthetic private context", seq=1)
+    registry.update_session_activity("sess-1", awaiting="input")
+    assert sender.sent[0].private
+    assert sender.sent[0].preview == ""

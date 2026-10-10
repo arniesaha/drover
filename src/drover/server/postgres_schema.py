@@ -609,6 +609,12 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS control_outbox_events_pending_age ON control_outbox_events (committed_at) WHERE state = 'pending'",
         ),
     ),
+    (
+        17,
+        (
+            "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS notification_mode TEXT NOT NULL DEFAULT 'action' CHECK (notification_mode IN ('all', 'action', 'digest'))",
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
