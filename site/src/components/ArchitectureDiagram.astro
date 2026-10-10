@@ -1,0 +1,341 @@
+---
+// Architecture diagram, generated here as inline SVG from the data below so it
+// stays a vector, follows the colour theme, and is easy to keep in step with
+// docs/architecture.md. Edit the arrays, not a drawing tool.
+
+type Tone = 'plain' | 'teal' | 'ember' | 'wheat';
+
+interface Panel {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+}
+interface Box {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  title: string;
+  lines?: string[];
+  tone?: Tone;
+  port?: string;
+}
+interface Edge {
+  d: string;
+  kind: 'control' | 'context' | 'async';
+  both?: boolean;
+  label?: { x: number; y: number; text: string; anchor?: 'start' | 'middle' | 'end' };
+}
+
+const W = 1200;
+const H = 736;
+
+const panels: Panel[] = [
+  { x: 30, y: 180, w: 300, h: 440, label: 'YOUR MACHINES · 1..N HOSTS' },
+  { x: 380, y: 180, w: 440, h: 440, label: 'DROVER-SERVER · THE HUB' },
+  { x: 870, y: 180, w: 300, h: 440, label: 'STORAGE · ON YOUR DISKS' },
+];
+
+const boxes: Box[] = [
+  // Clients
+  { x: 250, y: 40, w: 190, h: 70, title: 'iOS app', lines: ['fleet, chat, approvals,', 'terminal attach'], tone: 'teal' },
+  { x: 505, y: 40, w: 190, h: 70, title: 'Orchestrators', lines: ['OpenClaw, Hermes,', 'or your own script'], tone: 'ember' },
+  { x: 760, y: 40, w: 190, h: 70, title: 'Coding agents', lines: ['any MCP client:', 'Claude Code, Codex, ...'], tone: 'wheat' },
+
+  // Hosts
+  { x: 50, y: 226, w: 260, h: 68, title: 'drover-harnessd', lines: ['owns agent processes, adapters, PTY'], port: ':7081' },
+  { x: 50, y: 420, w: 260, h: 68, title: 'drover-collect + hooks', lines: ['parse local agent logs, attribute repos'] },
+
+  // Hub
+  { x: 400, y: 230, w: 190, h: 60, title: 'Fleet API', lines: ['HTTP + WebSocket'], tone: 'teal', port: ':7080' },
+  { x: 610, y: 230, w: 190, h: 60, title: 'MCP server', lines: ['drover_* tools at /mcp'], tone: 'wheat', port: ':7077' },
+  { x: 400, y: 310, w: 400, h: 60, title: 'Single ingest path', lines: ['normalize, dedupe, write event + preview + outbox atomically'], tone: 'ember' },
+  { x: 400, y: 390, w: 400, h: 60, title: 'Derived-memory workers', lines: ['summaries, project briefs, embeddings (optional models)'] },
+  { x: 400, y: 510, w: 400, h: 72, title: 'Verified reads', lines: ['disposable query child: 5 s, memory-capped,', 'checks the serving proof or refuses'] },
+
+  // Storage
+  {
+    x: 890,
+    y: 226,
+    w: 260,
+    h: 218,
+    title: 'PostgreSQL control store',
+    lines: [
+      'fleet, sessions, credentials',
+      'event metadata + hot payloads',
+      'durable outbox',
+      'summaries, briefs, embeddings',
+      'portable profile',
+    ],
+  },
+  { x: 890, y: 500, w: 260, h: 86, title: 'DuckLake', lines: ['PostgreSQL catalog + Parquet files', 'append-only facts and receipts'] },
+];
+
+const chips = [
+  { x: 50, y: 306, text: 'Claude Code' },
+  { x: 146, y: 306, text: 'Codex' },
+  { x: 202, y: 306, text: 'agy' },
+  { x: 50, y: 334, text: 'DeepSeek Harness' },
+  { x: 50, y: 500, text: 'Claude Code' },
+  { x: 146, y: 500, text: 'OpenClaw' },
+  { x: 224, y: 500, text: 'Hermes' },
+];
+
+const edges: Edge[] = [
+  // Clients into the hub
+  { d: 'M345 110 V150 H455 V230', kind: 'control', label: { x: 337, y: 143, text: '/harness', anchor: 'end' } },
+  { d: 'M570 110 V160 H535 V230', kind: 'control' },
+  { d: 'M630 110 V160 H665 V230', kind: 'context', label: { x: 600, y: 174, text: 'launch + recall', anchor: 'middle' } },
+  { d: 'M855 110 V150 H745 V230', kind: 'context', label: { x: 863, y: 143, text: 'read context', anchor: 'start' } },
+  // Hub to hosts: live control, direct or relay
+  { d: 'M400 250 H310', kind: 'control', both: true, label: { x: 355, y: 216, text: 'direct or relay', anchor: 'middle' } },
+  // Events into ingest
+  { d: 'M310 276 H352 V330 H400', kind: 'context' },
+  { d: 'M310 454 H366 V352 H400', kind: 'context', label: { x: 342, y: 478, text: 'events', anchor: 'middle' } },
+  // Ingest and workers to PostgreSQL
+  { d: 'M800 340 H890', kind: 'context', label: { x: 845, y: 332, text: '1 txn', anchor: 'middle' } },
+  { d: 'M800 420 H890', kind: 'async', both: true },
+  // Exporter: PostgreSQL outbox to DuckLake
+  { d: 'M1020 444 V500', kind: 'async', label: { x: 1032, y: 476, text: 'fenced lake exporter', anchor: 'start' } },
+  // Verified reads from the lake, served to API and MCP
+  { d: 'M890 542 H800', kind: 'async', label: { x: 845, y: 534, text: 'read', anchor: 'middle' } },
+];
+
+const legend: { kind: Edge['kind']; text: string }[] = [
+  { kind: 'control', text: 'live control' },
+  { kind: 'context', text: 'context flow' },
+  { kind: 'async', text: 'async, derived or verified' },
+];
+---
+
+<div class="arch-scroll" tabindex="0" role="group" aria-label="Scrollable architecture diagram">
+  <svg class="arch" viewBox={`0 0 ${W} ${H}`} role="img" aria-labelledby="arch-title arch-desc">
+    <title id="arch-title">Drover architecture</title>
+    <desc id="arch-desc">
+      The iOS app, orchestrators and coding agents talk to the hub, drover-server. The hub's fleet API routes live
+      sessions to drover-harnessd on each of your machines, directly or over an outbound relay. Events from harnessd and
+      from drover-collect enter one ingest path that writes to the PostgreSQL control store. A fenced exporter publishes
+      those facts to DuckLake. Verified reads from the lake are served back through the fleet API and the MCP server.
+    </desc>
+    <defs>
+      <marker id="ah-control" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" class="ah control"></path>
+      </marker>
+      <marker id="ah-context" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" class="ah context"></path>
+      </marker>
+      <marker id="ah-async" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" class="ah async"></path>
+      </marker>
+    </defs>
+
+    {
+      panels.map((p) => (
+        <g>
+          <rect class="panel" x={p.x} y={p.y} width={p.w} height={p.h} rx="18" />
+          <text class="panel-label" x={p.x + 20} y={p.y + p.h - 16}>
+            {p.label}
+          </text>
+        </g>
+      ))
+    }
+
+    {
+      edges.map((e) => (
+        <g>
+          <path
+            class={`edge ${e.kind}`}
+            d={e.d}
+            marker-end={`url(#ah-${e.kind})`}
+            marker-start={e.both ? `url(#ah-${e.kind})` : undefined}
+          />
+          {e.label && (
+            <text class="edge-label" x={e.label.x} y={e.label.y} text-anchor={e.label.anchor ?? 'middle'}>
+              {e.label.text}
+            </text>
+          )}
+        </g>
+      ))
+    }
+
+    {
+      boxes.map((b) => (
+        <g class={`box ${b.tone ?? 'plain'}`}>
+          <rect x={b.x} y={b.y} width={b.w} height={b.h} rx="12" />
+          <text class="box-title" x={b.x + 14} y={b.y + 25}>
+            {b.title}
+          </text>
+          {b.port && (
+            <text class="box-port" x={b.x + b.w - 12} y={b.y + 25} text-anchor="end">
+              {b.port}
+            </text>
+          )}
+          {(b.lines ?? []).map((line, i) => (
+            <text class="box-line" x={b.x + 14} y={b.y + 45 + i * (b.h > 120 ? 30 : 16)}>
+              {b.h > 120 ? `· ${line}` : line}
+            </text>
+          ))}
+        </g>
+      ))
+    }
+
+    {
+      chips.map((c) => (
+        <g class="chip">
+          <rect x={c.x} y={c.y} width={c.text.length * 6.6 + 18} height="22" rx="11" />
+          <text x={c.x + 9} y={c.y + 15}>
+            {c.text}
+          </text>
+        </g>
+      ))
+    }
+    <text class="edge-label" x="50" y="372">launch and drive</text>
+    <text class="edge-label" x="50" y="538">observe as context</text>
+
+    <g class="trust">
+      <rect x="30" y="642" width="1140" height="64" rx="16"></rect>
+      <text class="trust-title" x="52" y="669">One trusted operator. Localhost, a private LAN or a private Tailscale network.</text>
+      <text class="trust-sub" x="52" y="690">No public exposure, no Drover cloud. Every box above runs on hardware you control.</text>
+      {
+        legend.map((l, i) => (
+          <g>
+            <path class={`edge ${l.kind}`} d={`M${800} ${660 + i * 16} h34`} />
+            <text class="edge-label" x="842" y={664 + i * 16} text-anchor="start">
+              {l.text}
+            </text>
+          </g>
+        ))
+      }
+    </g>
+  </svg>
+</div>
+
+<style>
+  .arch-scroll {
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    padding: 0.5rem;
+  }
+  .arch {
+    display: block;
+    width: 100%;
+    min-width: 940px;
+    height: auto;
+    font-family: var(--font-body);
+  }
+  .panel {
+    fill: var(--bg-2);
+    stroke: var(--line);
+    stroke-width: 1;
+  }
+  .panel-label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 1.4px;
+    fill: var(--muted);
+  }
+  .box rect {
+    fill: var(--surface);
+    stroke: var(--line-strong);
+    stroke-width: 1.2;
+  }
+  .box.teal rect {
+    fill: var(--teal-soft);
+    stroke: var(--teal);
+  }
+  .box.ember rect {
+    fill: var(--ember-soft);
+    stroke: var(--ember);
+  }
+  .box.wheat rect {
+    fill: var(--wheat-soft);
+    stroke: var(--wheat);
+  }
+  .box-title {
+    font-family: var(--font-display);
+    font-size: 15.5px;
+    font-weight: 700;
+    letter-spacing: -0.2px;
+    fill: var(--text);
+  }
+  .box-port {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    fill: var(--muted);
+  }
+  .box-line {
+    font-size: 11.5px;
+    fill: var(--text-2);
+  }
+  .chip rect {
+    fill: var(--surface);
+    stroke: var(--line-strong);
+  }
+  .chip text {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    fill: var(--text-2);
+  }
+  .edge {
+    fill: none;
+    stroke-width: 1.8;
+    stroke-linejoin: round;
+  }
+  .edge.control {
+    stroke: var(--teal);
+  }
+  .edge.context {
+    stroke: var(--ember);
+  }
+  .edge.async {
+    stroke: var(--muted);
+    stroke-dasharray: 5 5;
+  }
+  .ah.control {
+    fill: var(--teal);
+  }
+  .ah.context {
+    fill: var(--ember);
+  }
+  .ah.async {
+    fill: var(--muted);
+  }
+  .edge-label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    fill: var(--muted);
+  }
+  .trust rect {
+    fill: none;
+    stroke: var(--line-strong);
+    stroke-dasharray: 3 5;
+  }
+  .trust-title {
+    font-family: var(--font-display);
+    font-size: 15px;
+    font-weight: 700;
+    fill: var(--text);
+  }
+  .trust-sub {
+    font-size: 12px;
+    fill: var(--text-2);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .edge.context {
+      stroke-dasharray: 7 5;
+      animation: arch-flow 1.4s linear infinite;
+    }
+  }
+  @keyframes arch-flow {
+    to {
+      stroke-dashoffset: -24;
+    }
+  }
+</style>

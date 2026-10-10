@@ -1,0 +1,401 @@
+---
+// Use case C: ask your history. A small in-browser keyword ranker over
+// synthetic sessions stands in for the hub's recall tools. It shows the shape
+// of the answer (matches, summaries, open loops, files, provenance), not the
+// real ranking.
+import { SESSIONS, PRESETS } from '../../data/sessions';
+---
+
+<drover-recall class="demo">
+  <div class="demo-head">
+    <span class="demo-title">Use case 03 · ask your history</span>
+    <span class="tool">drover_recall_bundle</span>
+  </div>
+
+  <div class="demo-body">
+    <form class="ask" data-form>
+      <label class="sr-only" for="recall-q">Ask your session history</label>
+      <span class="prompt" aria-hidden="true">&gt;</span>
+      <input
+        id="recall-q"
+        type="text"
+        name="q"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Ask your history, or pick a question below"
+        data-input
+      />
+      <button class="chip-btn primary" type="submit">Recall</button>
+    </form>
+    <div class="presets">
+      {
+        PRESETS.map((q) => (
+          <button class="chip-btn" type="button" data-preset={q}>
+            {q}
+          </button>
+        ))
+      }
+    </div>
+
+    <div class="cols">
+      <div>
+        <h4 class="col-h">Sessions <span data-count></span></h4>
+        <ol class="results" data-results>
+          {
+            SESSIONS.slice(0, 4).map((s) => (
+              <li class="hit">
+                <div class="meta">
+                  <span>{s.repo}</span>
+                  <span>
+                    {s.host} · {s.harness}
+                  </span>
+                  <span>{s.when}</span>
+                </div>
+                <strong>{s.title}</strong>
+                <p>{s.summary}</p>
+              </li>
+            ))
+          }
+        </ol>
+      </div>
+      <aside class="bundle">
+        <h4 class="col-h">Open loops</h4>
+        <ul data-loops>
+          {SESSIONS.slice(0, 4).flatMap((s) => s.loops.slice(0, 1)).map((l) => <li>{l}</li>)}
+        </ul>
+        <h4 class="col-h">Files touched</h4>
+        <ul class="files" data-files>
+          {SESSIONS.slice(0, 2).flatMap((s) => s.files).map((f) => <li>{f}</li>)}
+        </ul>
+        <p class="prov" data-prov>store: hub · watermark: 2 days ago (summary_generated_at)</p>
+      </aside>
+    </div>
+  </div>
+  <p class="demo-note">
+    Synthetic data and a toy ranker running in your browser. The real tools answer from your own hub, with store identity
+    and a data watermark on every result.
+  </p>
+</drover-recall>
+
+<script>
+  import { SESSIONS, type DemoSession } from '../../data/sessions';
+
+  const STOP = new Set(
+    'a an and are did do does for how i in is it me my of on or still that the this to was we what when where which who why with you our touch'.split(
+      ' ',
+    ),
+  );
+
+  const tokens = (q: string) =>
+    q
+      .toLowerCase()
+      .split(/[^a-z0-9/_.-]+/)
+      .map((t) => t.replace(/^[.?/-]+|[.?/-]+$/g, ''))
+      .filter((t) => t.length > 1 && !STOP.has(t));
+
+  function score(s: DemoSession, terms: string[]) {
+    const fields: [string, number][] = [
+      [s.title, 3],
+      [s.repo, 3],
+      [s.summary, 1],
+      [s.loops.join(' '), 2],
+      [s.files.join(' '), 2],
+    ];
+    let total = 0;
+    for (const term of terms) {
+      for (const [text, weight] of fields) {
+        if (text.toLowerCase().includes(term)) total += weight;
+      }
+    }
+    return total;
+  }
+
+  // Build highlighted text with DOM nodes, never innerHTML.
+  function highlight(text: string, terms: string[]) {
+    const frag = document.createDocumentFragment();
+    if (!terms.length) {
+      frag.append(text);
+      return frag;
+    }
+    const escaped = terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const re = new RegExp(`(${escaped.join('|')})`, 'gi');
+    let last = 0;
+    for (const m of text.matchAll(re)) {
+      const i = m.index ?? 0;
+      if (i > last) frag.append(text.slice(last, i));
+      const mark = document.createElement('mark');
+      mark.textContent = m[0];
+      frag.append(mark);
+      last = i + m[0].length;
+    }
+    if (last < text.length) frag.append(text.slice(last));
+    return frag;
+  }
+
+  class DroverRecall extends HTMLElement {
+    typing = 0;
+
+    connectedCallback() {
+      const input = this.querySelector<HTMLInputElement>('[data-input]')!;
+      this.querySelector('[data-form]')?.addEventListener('submit', (e) => {
+        e.preventDefault();
+        this.typing++;
+        this.render(input.value);
+      });
+      input.addEventListener('input', () => {
+        this.typing++;
+        this.render(input.value);
+      });
+      this.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((btn) =>
+        btn.addEventListener('click', () => this.type(btn.dataset.preset ?? '')),
+      );
+    }
+
+    async type(q: string) {
+      const input = this.querySelector<HTMLInputElement>('[data-input]')!;
+      const run = ++this.typing;
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduced) {
+        input.value = q;
+        this.render(q);
+        return;
+      }
+      input.value = '';
+      for (const ch of q) {
+        if (run !== this.typing) return;
+        input.value += ch;
+        await new Promise((r) => setTimeout(r, 16));
+      }
+      this.render(q);
+    }
+
+    render(q: string) {
+      const terms = tokens(q);
+      const ranked = SESSIONS.map((s) => ({ s, score: terms.length ? score(s, terms) : 1 }))
+        .filter((r) => r.score > 0)
+        .sort((a, b) => b.score - a.score || a.s.ageDays - b.s.ageDays)
+        .slice(0, 4);
+
+      const results = this.querySelector('[data-results]')!;
+      results.replaceChildren();
+      ranked.forEach(({ s }, i) => {
+        const li = document.createElement('li');
+        li.className = 'hit';
+        li.style.animationDelay = `${i * 70}ms`;
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        for (const part of [s.repo, `${s.host} · ${s.harness}`, s.when]) {
+          const span = document.createElement('span');
+          span.textContent = part;
+          meta.append(span);
+        }
+        const title = document.createElement('strong');
+        title.append(highlight(s.title, terms));
+        const p = document.createElement('p');
+        p.append(highlight(s.summary, terms));
+        li.append(meta, title, p);
+        results.append(li);
+      });
+      if (!ranked.length) {
+        const li = document.createElement('li');
+        li.className = 'hit empty';
+        li.textContent = 'No matching sessions in this synthetic history. Try "retry", "redis" or "export".';
+        results.append(li);
+      }
+
+      const fill = (sel: string, items: string[], empty: string) => {
+        const ul = this.querySelector(sel)!;
+        ul.replaceChildren();
+        for (const item of items.length ? items : [empty]) {
+          const li = document.createElement('li');
+          li.append(items.length ? highlight(item, terms) : item);
+          if (!items.length) li.className = 'none';
+          ul.append(li);
+        }
+      };
+      fill('[data-loops]', ranked.flatMap((r) => r.s.loops).slice(0, 4), 'No open loops in these sessions.');
+      fill('[data-files]', [...new Set(ranked.flatMap((r) => r.s.files))].slice(0, 6), 'No files.');
+
+      this.querySelector('[data-count]')!.textContent = ranked.length ? `(${ranked.length})` : '';
+      const newest = ranked.length ? ranked.reduce((a, b) => (a.s.ageDays < b.s.ageDays ? a : b)).s.when : null;
+      this.querySelector('[data-prov]')!.textContent = newest
+        ? `store: hub · watermark: ${newest} (summary_generated_at)`
+        : 'store: hub · watermark: unknown';
+    }
+  }
+  customElements.define('drover-recall', DroverRecall);
+</script>
+
+<style>
+  drover-recall {
+    display: block;
+  }
+  .tool {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--teal);
+  }
+  .ask {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    border: 1.5px solid var(--line-strong);
+    border-radius: 999px;
+    padding: 0.35rem 0.4rem 0.35rem 1rem;
+    background: var(--code-bg);
+  }
+  .ask:focus-within {
+    border-color: var(--ember);
+  }
+  .prompt {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: var(--ember);
+  }
+  .ask input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    padding: 0.4rem 0;
+  }
+  .ask input::placeholder {
+    color: var(--muted);
+  }
+  .presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin: 0.8rem 0 1.2rem;
+  }
+  .cols {
+    display: grid;
+    grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr);
+    gap: 1.2rem;
+    align-items: start;
+  }
+  .col-h {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 0.6rem;
+  }
+  .results {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.6rem;
+    min-height: 420px;
+    align-content: start;
+  }
+  .results :global(.hit) {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    padding: 0.75rem 0.9rem;
+    background: var(--code-bg);
+    animation: hit-in 0.4s ease both;
+  }
+  .results :global(.hit.empty) {
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .results :global(.meta) {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 0.8rem;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--muted);
+    margin-bottom: 0.3rem;
+  }
+  .results :global(.meta span:first-child) {
+    color: var(--teal);
+  }
+  .results :global(strong) {
+    font-family: var(--font-display);
+    font-size: 1.02rem;
+    line-height: 1.25;
+  }
+  .results :global(p) {
+    margin: 0.25rem 0 0;
+    font-size: 0.86rem;
+    line-height: 1.5;
+    color: var(--text-2);
+  }
+  drover-recall :global(mark) {
+    background: var(--wheat-soft);
+    color: var(--text);
+    border-radius: 3px;
+    padding: 0 0.15em;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--wheat) 40%, transparent);
+  }
+  .bundle {
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--radius-m);
+    padding: 0.9rem;
+  }
+  .bundle ul {
+    list-style: none;
+    margin: 0 0 1.1rem;
+    padding: 0;
+    display: grid;
+    gap: 0.4rem;
+    font-size: 0.86rem;
+    line-height: 1.4;
+  }
+  .bundle ul :global(li) {
+    padding-left: 0.9rem;
+    position: relative;
+    overflow-wrap: anywhere;
+  }
+  .bundle ul :global(li)::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0.55em;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    border: 1.5px solid var(--ember);
+  }
+  .bundle ul :global(li.none) {
+    color: var(--muted);
+  }
+  .bundle .files {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+  }
+  .bundle .files :global(li)::before {
+    border-radius: 1px;
+    border-color: var(--teal);
+  }
+  .prov {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--muted);
+    margin: 0;
+    padding-top: 0.7rem;
+    border-top: 1px solid var(--line);
+  }
+  @keyframes hit-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+  }
+  @media (max-width: 820px) {
+    .cols {
+      grid-template-columns: 1fr;
+    }
+    .results {
+      min-height: 0;
+    }
+  }
+</style>
