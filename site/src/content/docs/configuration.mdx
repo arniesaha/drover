@@ -1,0 +1,155 @@
+---
+title: Configuration
+description: The config file, the settings most people change, and the environment variables that matter.
+order: 5
+source: docs/getting-started.md
+---
+
+The hub reads `~/.drover/config.toml`. Pass `--config` to any `drover-server` command to use a different file. The collector has its own file, `~/.drover/collect.toml`. Secrets do not belong in either: they go in environment variables or mode `0600` files.
+
+Changes take effect when the hub restarts.
+
+## Network and ports
+
+```toml
+[server]
+metrics_http_port = 7080      # fleet API and web cockpit
+mcp_http_port     = 7077      # MCP
+metrics_host      = "127.0.0.1"
+advertised_url    = ""        # what the pairing QR code points at
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `metrics_host` | `127.0.0.1` | The bind address for the API. Set a private address, or `0.0.0.0` on a machine with both a LAN and a VPN address. |
+| `advertised_url` | empty | `host:port` the phone should use. Private addresses only. |
+| `metrics_http_port` | `7080` | |
+| `mcp_http_port` | `7077` | The MCP bind host is a command-line flag, `--mcp-host`, and defaults to loopback. |
+
+The host daemon listens on `127.0.0.1:7081` unless you pass `--listen`.
+
+## Authentication
+
+```toml
+[auth]
+enabled = true
+legacy_token_enabled = true
+```
+
+Leave `enabled` on outside isolated local development. Set `legacy_token_enabled = false` once every device and host has paired and holds its own credential. The shared token is resolved from `DROVER_API_TOKEN`, then `[auth] api_token`, then the generated `~/.drover/api_token` file.
+
+## Control store
+
+```toml
+[control_store]
+backend = "postgres"
+dsn_env = "DROVER_CONTROL_DSN"
+```
+
+The config names the environment variable that holds the connection string. It never contains the connection string itself. The installer keeps that variable in `~/.drover/server.env` with mode `0600`.
+
+`backend = "duckdb"` is the compatibility option for existing single-machine installs. Moving from DuckDB to PostgreSQL is an explicit offline step; upgrading does not do it for you. See the [control store guide](https://github.com/arniesaha/drover/blob/main/docs/postgresql-control-store.md).
+
+## Models for summaries and embeddings
+
+These are optional. With nothing configured, the workers stay idle and everything else works.
+
+```toml
+[summarizer]
+backend_policy = "harness"    # "harness" | "hybrid" | "cloud"
+```
+
+| Policy | Summaries are written by |
+| --- | --- |
+| `harness` | The Claude Code CLI installed on the host, under your Claude Code login. |
+| `cloud` | The Anthropic API, with a key you supply. |
+| `hybrid` | Both, as available. |
+
+Either way, the transcript text being summarized is sent to Anthropic. The `harness` policy runs a local CLI, but that CLI still calls the provider.
+
+```toml
+[embeddings]
+api_base_url = ""             # an OpenAI-compatible endpoint
+api_model    = "text-embedding-3-small"
+local_model  = "nomic-embed-text"
+```
+
+Embeddings power semantic recall. They can use an OpenAI-compatible endpoint or an Ollama backend. Supply the key through `DROVER_EMBEDDINGS_API_KEY`. Embeddings are the one model feature that can stay entirely on your own hardware.
+
+## Analytics lake
+
+```toml
+[analytics]
+backend = "legacy"            # or "ducklake"
+```
+
+DuckLake is selected explicitly and requires the PostgreSQL control store. It needs a catalog database, a data root on disk, and a verified serving proof before it will answer reads. This is an operator task with its own runbooks; start with [Operations](/docs/operations/#the-analytics-lake).
+
+## Context containers
+
+```toml
+[context_containers]
+enabled = false
+```
+
+When enabled, a hub worker builds one container per session and per project brief, holding a summary, next action and open questions. It does not call a model. It requires PostgreSQL, and it is what the `drover_open_loops` and `drover_resume_context` tools read.
+
+## Session lifecycle
+
+```toml
+[lifecycle]
+mode = "report"               # "report" | "off"
+idle_after = "12h"
+```
+
+In `report` mode the hub periodically notes which sessions look idle and which worktrees look stale. It only reports. It never stops a process, removes a worktree or hides a session.
+
+## Push notifications
+
+```toml
+[apns]
+enabled = false
+```
+
+Push is off until you configure your own Apple Push Notification key. Without it the app falls back to best-effort local notifications. See the [iOS guide](https://github.com/arniesaha/drover/blob/main/apps/drover/README.md) for the key setup.
+
+## Updates
+
+```toml
+[update]
+enabled = true
+check_interval_hours = 6
+pinned_version = ""
+```
+
+By default the hub checks GitHub for a newer Drover release every six hours. That check is an outbound request to GitHub. Set `pinned_version` to stay on a release, or `enabled = false` to stop checking. `drover-server update` and `drover-server rollback` do it by hand.
+
+## Favourite directories
+
+The new-session sheet suggests working directories. Add your own:
+
+```toml
+[harness]
+favorite_cwds = [
+  "/srv/shared",
+  {path = "/opt/checkouts/example", host_id = "build-mac"},
+]
+```
+
+A bare string is offered on every host. An entry with `host_id` is offered only there, which is what you want when machines have different directory layouts.
+
+## Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `DROVER_CONTROL_DSN` | PostgreSQL connection string for the control store. |
+| `DROVER_API_TOKEN` | Overrides the shared API token. |
+| `DROVER_EMBEDDINGS_API_KEY` | Key for the embeddings endpoint. |
+| `DROVER_SUMMARIZER_BACKEND_POLICY` | Overrides `[summarizer] backend_policy`. |
+| `DROVER_REPO_ROOTS_JSON` | Maps directory prefixes to `owner/name` repositories. |
+| `DROVER_CLAUDE_CWD_MAP` | Disambiguates Claude Code project directory names. |
+| `DROVER_GENERAL_WORKSPACE_ROOTS` | Directories to classify as non-project activity. |
+| `DROVER_DEEPSEEK_HARNESS_URL` | Address of the local DeepSeek Harness Web RPC service. |
+| `DROVER_MCP_URL` | Used by client hooks to find the hub's MCP endpoint. |
+
+There are more sections than this page covers, mostly for tuning and for advanced deployments. `drover-server init` writes a commented starting file, and the repository docs describe the rest.

@@ -1,0 +1,108 @@
+---
+title: Security and privacy
+description: The trust model, where your data goes, the known limits, and a checklist for opening Drover to your private network.
+order: 6
+source: docs/security.md
+---
+
+Drover is built for **one trusted operator** on machines and networks they control. That sentence explains most of the decisions below. It is not a multi-tenant service and does not pretend to be one.
+
+## Supported boundary
+
+Drover is supported on:
+
+- localhost on a single machine,
+- a trusted private LAN,
+- a private Tailscale network whose members you control.
+
+Tailscale Funnel, public reverse proxies and public port forwards are **not supported**. The relay protocol can create and control agent sessions and carries terminal streams in both directions, so it must never face the internet.
+
+The built-in listeners do not provide TLS. If you use plain HTTP addresses, traffic to the hub is not encrypted by HTTPS, so run it over a network and transport you trust. A tailnet encrypts traffic between its members.
+
+## How authentication works
+
+- Every phone and every host holds its **own** bearer credential, issued by redeeming a pairing code.
+- The hub stores only a SHA-256 hash of each credential, never the credential. A leaked credentials file cannot be replayed.
+- Pairing codes exist only in the running hub's memory. They are single use, expire after ten minutes for a device and fifteen for a host, and carry their own scope, so a device code cannot become a host credential.
+- Redeeming a code is the only unauthenticated write in the API. It answers identically for unknown, used and expired codes, and blocks a source after five failed attempts in a minute.
+- Revocation is per credential and takes effect on the next request.
+
+```bash
+drover-server credentials list
+drover-server credentials revoke <credential-id>
+```
+
+If a phone is lost, revoke its credential. Nothing else needs to change.
+
+## Known limits
+
+Read these before you add machines or people.
+
+- **Host credentials are not bound to a host identity.** Any host credential can act as any registered host. Do not enroll a machine you do not fully control. This is tracked as [issue 13](https://github.com/arniesaha/drover/issues/13).
+- **The MCP endpoint has no authentication yet.** It binds to loopback by default. See [MCP](/docs/mcp/#authentication-today).
+- **The legacy shared token is on by default** so upgrades keep working. Turn it off with `[auth] legacy_token_enabled = false` once everything has paired.
+- **No users, roles or tenants.** There is no RBAC, SSO or per-user isolation. Every paired device and registered host is in the same trust domain.
+- **No sandbox.** Drover does not sandbox what an agent runs. Agents act with the operating-system account and file permissions of the host daemon. Some harnesses bring their own sandbox; that is theirs, not Drover's.
+- **A credential is a shell.** Treat any device or host credential, and the shared token, as equivalent to interactive access to every registered host.
+
+## What Drover stores
+
+The context store can contain prompts, responses, repository paths, diffs, tool calls and terminal output. It lives where you put it:
+
+| Data | Location |
+| --- | --- |
+| Config, credential hashes, generated token | `~/.drover/`, sensitive files at mode `0600` |
+| Fleet state, events, summaries, profile | Your PostgreSQL control store |
+| Analytical facts | Your DuckLake catalog and Parquet files, if selected |
+| Per-host spool | A local DuckDB file on each host |
+| Phone credential | The iOS Keychain |
+
+There is no Drover account, no Drover-hosted store and no analytics or usage telemetry sent to the project. Because of that, there is also nothing the project can delete or recover on your behalf.
+
+## When data leaves your machines
+
+Only in these cases:
+
+| When | What leaves | Where to |
+| --- | --- | --- |
+| Agents run | Whatever the agent CLI sends | That CLI's model provider, as it would without Drover |
+| Summaries and briefs are enabled | Transcript text being summarized | Anthropic, through the Claude Code CLI or the API |
+| Embeddings use a remote endpoint | Text being embedded | The endpoint you configured |
+| Push notifications are enabled | A device token, and alerts with session id, project folder name, harness name and a short response preview | Apple |
+| You add a host | Events and session traffic | Between your own machines |
+| Update checks are on | A request for the latest release | GitHub |
+
+Push alerts can appear on a lock screen. If that is not acceptable for your work, leave push disabled or turn off Drover notifications in iOS.
+
+## The portable profile
+
+Profile items carry one of three tiers:
+
+- **General**: visible to any agent.
+- **Trusted**: visible to agents you have issued a trusted credential.
+- **Private**: visible only to you, the operator.
+
+Agents never see a hint of what they cannot read beyond a count of withheld items. Markdown imports default to private, and headings such as health, finance or address force a section private regardless of what you ask for. The import also scans for things that look like street addresses, IP addresses, amounts, phone numbers and emails, and keeps those private. These are conservative heuristics, not a guarantee, so review before you promote anything.
+
+Agents can propose profile changes. Proposals wait for your approval and every accepted change can be reverted.
+
+## The iOS app
+
+The app asks for three permissions, each for one purpose: the camera to scan a pairing code, the local network to reach your hub, and notifications if you want alerts. It talks directly to the hub address you give it. There is no relay service run by the project in between.
+
+**Sign Out** removes the phone's credential, saved address and local recovery data, and asks the hub to revoke the credential. If the hub cannot be reached, sign-out still completes locally and you should revoke the credential on the hub.
+
+## Before you bind beyond localhost
+
+1. Confirm an unauthenticated request to `/harness/hosts` returns `401`.
+2. Confirm authenticated access works through the private address you intend to use.
+3. Restrict the port with the host firewall or a Tailscale policy.
+4. Confirm no Funnel, public reverse proxy or public port forward is active.
+5. Prefer a single private address over a wildcard bind on a laptop that joins untrusted networks.
+6. After removing a host from your fleet, revoke its credential and rotate the shared token if it is still enabled.
+
+## Reporting a vulnerability
+
+Do not open a public issue. Follow the private reporting process in [SECURITY.md](https://github.com/arniesaha/drover/blob/main/SECURITY.md). Only the latest tagged release receives security fixes.
+
+For the full analysis, see the [threat model](https://github.com/arniesaha/drover/blob/main/docs/threat-model.md) and the [privacy notes](https://github.com/arniesaha/drover/blob/main/docs/privacy.md) in the repository.

@@ -1,0 +1,240 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from './BaseLayout.astro';
+import { LINKS } from '../site';
+
+interface Heading {
+  depth: number;
+  slug: string;
+  text: string;
+}
+interface Props {
+  title: string;
+  description: string;
+  current?: string;
+  headings?: Heading[];
+  source?: string;
+}
+
+const { title, description, current, headings = [], source } = Astro.props;
+const pages = (await getCollection('docs')).sort((a, b) => a.data.order - b.data.order);
+const index = pages.findIndex((p) => p.id === current);
+const prev = index > 0 ? pages[index - 1] : undefined;
+const next = index >= 0 && index < pages.length - 1 ? pages[index + 1] : undefined;
+const toc = headings.filter((h) => h.depth === 2);
+---
+
+<BaseLayout title={title} description={description}>
+  <div class="wrap docs">
+    <aside class="sidebar">
+      <details class="side-toggle" open>
+        <summary>Documentation</summary>
+        <nav aria-label="Documentation">
+          <a href="/docs/" aria-current={current ? undefined : 'page'}>Overview</a>
+          {
+            pages.map((p) => (
+              <a href={`/docs/${p.id}/`} aria-current={p.id === current ? 'page' : undefined}>
+                {p.data.title}
+              </a>
+            ))
+          }
+        </nav>
+      </details>
+    </aside>
+
+    <article class="doc">
+      <header class="doc-head">
+        <span class="eyebrow">Docs</span>
+        <h1>{title}</h1>
+        <p class="lede">{description}</p>
+      </header>
+      <div class="prose">
+        <slot />
+      </div>
+      {
+        source && (
+          <p class="source">
+            This page is the public summary. The in-repo reference is{' '}
+            <a href={LINKS.file(source)} rel="noopener">
+              {source}
+            </a>
+            .
+          </p>
+        )
+      }
+      {
+        (prev || next) && (
+          <nav class="pager" aria-label="Docs pages">
+            {prev ? (
+              <a href={`/docs/${prev.id}/`}>
+                <span>Previous</span>
+                {prev.data.title}
+              </a>
+            ) : (
+              <span />
+            )}
+            {next && (
+              <a class="next" href={`/docs/${next.id}/`}>
+                <span>Next</span>
+                {next.data.title}
+              </a>
+            )}
+          </nav>
+        )
+      }
+    </article>
+
+    {
+      toc.length > 0 && (
+        <aside class="toc">
+          <h4>On this page</h4>
+          {toc.map((h) => (
+            <a href={`#${h.slug}`}>{h.text}</a>
+          ))}
+        </aside>
+      )
+    }
+  </div>
+</BaseLayout>
+
+<style>
+  .docs {
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr) 200px;
+    gap: 3rem;
+    padding-block: 2.5rem 4rem;
+    align-items: start;
+  }
+  .sidebar,
+  .toc {
+    position: sticky;
+    top: calc(var(--header-h) + 24px);
+  }
+  .side-toggle summary {
+    list-style: none;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.7rem;
+    cursor: default;
+  }
+  .side-toggle summary::-webkit-details-marker {
+    display: none;
+  }
+  .sidebar nav {
+    display: grid;
+    gap: 2px;
+  }
+  .sidebar a {
+    display: block;
+    padding: 0.42rem 0.75rem;
+    border-radius: 9px;
+    color: var(--text-2);
+    text-decoration: none;
+    font-size: 0.95rem;
+    font-weight: 500;
+  }
+  .sidebar a:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+  .sidebar a[aria-current='page'] {
+    background: var(--ember-soft);
+    color: var(--ember);
+    font-weight: 600;
+  }
+  .doc-head h1 {
+    font-size: clamp(2.2rem, 4.6vw, 3.3rem);
+  }
+  .doc-head {
+    margin-bottom: 2rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .source {
+    margin-top: 3rem;
+    padding: 0.9rem 1.1rem;
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--radius-m);
+    font-size: 0.9rem;
+    color: var(--muted);
+    max-width: 74ch;
+  }
+  .pager {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-top: 2rem;
+    max-width: 74ch;
+  }
+  .pager a {
+    display: block;
+    padding: 0.9rem 1.1rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    background: var(--surface);
+    text-decoration: none;
+    color: var(--text);
+    font-family: var(--font-display);
+    font-weight: 600;
+  }
+  .pager a:hover {
+    border-color: var(--ember);
+  }
+  .pager a span {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .pager .next {
+    text-align: right;
+  }
+  .toc h4 {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.7rem;
+  }
+  .toc a {
+    display: block;
+    padding: 0.25rem 0 0.25rem 0.8rem;
+    border-left: 2px solid var(--line);
+    color: var(--text-2);
+    text-decoration: none;
+    font-size: 0.86rem;
+    line-height: 1.35;
+  }
+  .toc a:hover {
+    color: var(--ember);
+    border-left-color: var(--ember);
+  }
+  @media (max-width: 1100px) {
+    .docs {
+      grid-template-columns: 200px minmax(0, 1fr);
+    }
+    .toc {
+      display: none;
+    }
+  }
+  @media (max-width: 760px) {
+    .docs {
+      grid-template-columns: 1fr;
+      gap: 1.5rem;
+      padding-top: 1.5rem;
+    }
+    .sidebar {
+      position: static;
+    }
+    .sidebar nav {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+</style>

@@ -1,0 +1,389 @@
+---
+// Drover's own architecture, as inline SVG rendered from the data below.
+//
+// Reference: docs/drover-architecture.png and its generation prompt in
+// docs/assets/drover-architecture.prompt.md. This follows the same grammar
+// (trust strip, command plane above, context plane below, three line styles)
+// but is a true vector that follows the site theme. The checked-in
+// docs/assets/drover-architecture.svg wraps a raster image, so it is used as a
+// reference only. Reconciled with docs/architecture.md: PostgreSQL control
+// store plus DuckLake lake, orchestrators as API clients.
+
+type Tone = 'plain' | 'teal' | 'ember';
+
+interface Sub {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  title: string;
+  line?: string;
+  port?: string;
+}
+interface Card {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  title: string;
+  tag?: string;
+  lines?: string[];
+  subs?: Sub[];
+  note?: string;
+}
+interface Edge {
+  d: string;
+  kind: 'control' | 'context' | 'async';
+  label?: { x: number; y: number; text: string; anchor?: 'start' | 'middle' | 'end' };
+}
+
+const W = 1200;
+const H = 800;
+
+const trust = [
+  'Single trusted operator boundary',
+  'localhost / private LAN / Tailscale only',
+  'No public-internet exposure',
+  'Device + host credentials · no RBAC or tenants',
+];
+
+const planes: { y: number; h: number; tone: Tone; title: string; caption: string }[] = [
+  { y: 76, h: 290, tone: 'teal', title: 'COMMAND PLANE · LIVE CONTROL', caption: 'Interactive session control, routing, streaming events and terminal I/O' },
+  { y: 420, h: 330, tone: 'ember', title: 'CONTEXT PLANE · DURABLE MEMORY', caption: 'capture · normalize · export · verify · derive · recall' },
+];
+
+const cards: Card[] = [
+  // Command plane
+  {
+    x: 40, y: 140, w: 230, h: 200, title: 'Operator clients',
+    subs: [
+      { x: 56, y: 176, w: 198, h: 40, title: 'iOS app' },
+      { x: 56, y: 224, w: 198, h: 40, title: 'Web cockpit / CLI' },
+      { x: 56, y: 272, w: 198, h: 52, title: 'Orchestrators', line: 'OpenClaw, Hermes, your scripts' },
+    ],
+  },
+  {
+    x: 360, y: 140, w: 400, h: 200, title: 'drover-server', tag: 'CENTRAL MACHINE',
+    subs: [
+      { x: 376, y: 176, w: 178, h: 56, title: 'Fleet API', line: 'HTTP + WebSocket', port: ':7080' },
+      { x: 566, y: 176, w: 178, h: 56, title: 'Control store', line: 'PostgreSQL · fleet state' },
+      { x: 376, y: 244, w: 368, h: 56, title: 'Command coordinator', line: 'Routes operations; never executes remote commands itself' },
+    ],
+    note: 'One hub. It knows the fleet and routes intent.',
+  },
+  {
+    x: 850, y: 140, w: 310, h: 200, title: 'Harness hosts', tag: '1..N MACHINES',
+    subs: [
+      { x: 866, y: 176, w: 278, h: 68, title: 'drover-harnessd', line: 'sessions · adapters · PTY · terminal stream', port: ':7081' },
+      { x: 866, y: 252, w: 133, h: 48, title: 'Direct host', line: 'private inbound' },
+      { x: 1011, y: 252, w: 133, h: 48, title: 'Relay host', line: 'outbound dial' },
+    ],
+    note: 'Claude Code · Codex · Antigravity · DeepSeek Harness',
+  },
+  // Context plane
+  { x: 40, y: 486, w: 150, h: 196, title: 'Activity sources', lines: ['harness sessions', 'drover-collect + hooks', 'OpenClaw + Hermes', 'optional OTLP spans'] },
+  { x: 210, y: 486, w: 140, h: 196, title: 'Single ingest path', lines: ['normalize identifiers', 'attribute repository', 'deduplicate records', 'event + preview +', 'outbox, atomically'] },
+  { x: 370, y: 486, w: 166, h: 196, title: 'Control store', lines: ['PostgreSQL authority', 'fleet · sessions · payloads', 'transactional outbox', 'derived-memory jobs', 'portable profile'] },
+  { x: 556, y: 486, w: 136, h: 196, title: 'Lake exporter', lines: ['one fenced owner', 'frozen batches', 'immutable receipts', 'ack after commit'] },
+  { x: 712, y: 486, w: 136, h: 196, title: 'DuckLake', lines: ['PostgreSQL catalog', 'Parquet data files', 'append-only facts', 'snapshot history'] },
+  { x: 868, y: 486, w: 132, h: 196, title: 'Query child', lines: ['disposable process', '5 s deadline', 'memory-capped', 'serving proof +', 'epoch, or refuse'] },
+  { x: 1020, y: 486, w: 140, h: 196, title: 'Derive + retrieve', lines: ['summaries, briefs,', 'embeddings', 'MCP /mcp :7077', 'cockpit · iOS app', 'coding agents'] },
+];
+
+const edges: Edge[] = [
+  { d: 'M270 232 H360', kind: 'control', label: { x: 315, y: 222, text: '/harness', anchor: 'middle' } },
+  { d: 'M760 204 H850', kind: 'control', label: { x: 805, y: 194, text: ':7081', anchor: 'middle' } },
+  { d: 'M850 276 H760', kind: 'async', label: { x: 805, y: 294, text: 'dial-out', anchor: 'middle' } },
+  // Cross-plane
+  { d: 'M453 340 V486', kind: 'async', label: { x: 463, y: 410, text: 'operational state', anchor: 'start' } },
+  { d: 'M1005 340 V388 H330 V486', kind: 'context', label: { x: 760, y: 380, text: 'agent events', anchor: 'middle' } },
+  // Context flow, left to right, along the foot of the cards
+  { d: 'M190 668 H210', kind: 'context' },
+  { d: 'M350 668 H370', kind: 'context' },
+  { d: 'M536 668 H556', kind: 'async' },
+  { d: 'M692 668 H712', kind: 'async' },
+  { d: 'M848 668 H868', kind: 'context' },
+  { d: 'M1000 668 H1020', kind: 'context' },
+];
+
+const legend: { kind: Edge['kind']; text: string }[] = [
+  { kind: 'control', text: 'live control / routing' },
+  { kind: 'context', text: 'context flow' },
+  { kind: 'async', text: 'async / derived' },
+];
+---
+
+<div class="arch-scroll" tabindex="0" role="group" aria-label="Scrollable architecture diagram">
+  <svg class="arch" viewBox={`0 0 ${W} ${H}`} role="img" aria-labelledby="arch-title arch-desc">
+    <title id="arch-title">Drover architecture</title>
+    <desc id="arch-desc">
+      Two planes inside one trusted operator boundary. In the command plane, operator clients (the iOS app, the web
+      cockpit and CLI, and orchestrators) call drover-server over the /harness API. The server routes operations to
+      drover-harnessd on each host, directly or over an outbound relay, and the host daemon owns the agent processes. In
+      the context plane, events from harness sessions and collectors enter a single ingest path that writes to the
+      PostgreSQL control store with a transactional outbox. A fenced exporter publishes facts to DuckLake. Reads run in
+      a disposable query child that checks a serving proof, and feed summaries, the MCP server, the cockpit and the iOS
+      app.
+    </desc>
+    <defs>
+      {
+        (['control', 'context', 'async'] as const).map((k) => (
+          <marker id={`ah-${k}`} viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" class={`ah ${k}`} />
+          </marker>
+        ))
+      }
+    </defs>
+
+    <g class="trust">
+      <rect x="20" y="16" width="1160" height="40" rx="12"></rect>
+      <rect class="dot" x="38" y="29" width="14" height="14" rx="4"></rect>
+      {
+        trust.map((t, i) => (
+          <text class={i === 0 ? 'trust-title' : 'trust-item'} x={[62, 360, 640, 868][i]} y="41">
+            {t}
+          </text>
+        ))
+      }
+    </g>
+
+    {
+      planes.map((p) => (
+        <g class={`plane ${p.tone}`}>
+          <rect x="20" y={p.y} width="1160" height={p.h} rx="18" />
+          <text class="plane-title" x="40" y={p.y + 30}>
+            {p.title}
+          </text>
+          <text class="plane-caption" x="40" y={p.y + 48}>
+            {p.caption}
+          </text>
+        </g>
+      ))
+    }
+
+    {
+      edges.map((e) => (
+        <g>
+          <path class={`edge ${e.kind}`} d={e.d} marker-end={`url(#ah-${e.kind})`} />
+          {e.label && (
+            <text class="edge-label" x={e.label.x} y={e.label.y} text-anchor={e.label.anchor ?? 'middle'}>
+              {e.label.text}
+            </text>
+          )}
+        </g>
+      ))
+    }
+
+    {
+      cards.map((c) => (
+        <g class="card">
+          <rect x={c.x} y={c.y} width={c.w} height={c.h} rx="14" />
+          <text class="card-title" x={c.x + 14} y={c.y + 25}>
+            {c.title}
+          </text>
+          {c.tag && (
+            <text class="card-tag" x={c.x + c.w - 14} y={c.y + 24} text-anchor="end">
+              {c.tag}
+            </text>
+          )}
+          {(c.lines ?? []).map((line, i) => (
+            <g>
+              <circle class="bullet" cx={c.x + 17} cy={c.y + 52 + i * 26} r="2" />
+              <text class="card-line" x={c.x + 26} y={c.y + 56 + i * 26}>
+                {line}
+              </text>
+            </g>
+          ))}
+          {(c.subs ?? []).map((s) => (
+            <g class="sub">
+              <rect x={s.x} y={s.y} width={s.w} height={s.h} rx="9" />
+              <text class="sub-title" x={s.x + 12} y={s.y + (s.line ? 22 : s.h / 2 + 5)}>
+                {s.title}
+              </text>
+              {s.port && (
+                <text class="sub-port" x={s.x + s.w - 10} y={s.y + 22} text-anchor="end">
+                  {s.port}
+                </text>
+              )}
+              {s.line && (
+                <text class="sub-line" x={s.x + 12} y={s.y + 40}>
+                  {s.line}
+                </text>
+              )}
+            </g>
+          ))}
+          {c.note && (
+            <text class="card-note" x={c.x + 16} y={c.y + c.h - 14}>
+              {c.note}
+            </text>
+          )}
+        </g>
+      ))
+    }
+
+    <g class="consistency">
+      <rect x="40" y="696" width="1120" height="38" rx="10"></rect>
+      <text class="trust-title" x="56" y="720">Consistency</text>
+      <text class="trust-item" x="160" y="720">Control reads: PostgreSQL, read-your-writes</text>
+      <text class="trust-item" x="452" y="720">Lake reads: eventually consistent, exported in batches</text>
+      <text class="trust-item" x="812" y="720">Verified selection only; proof failure refuses the read</text>
+    </g>
+
+    <g>
+      {
+        legend.map((l, i) => (
+          <g>
+            <path class={`edge ${l.kind}`} d={`M${40 + i * 220} 774 h40`} marker-end={`url(#ah-${l.kind})`} />
+            <text class="edge-label" x={90 + i * 220} y="778" text-anchor="start">
+              {l.text}
+            </text>
+          </g>
+        ))
+      }
+      <text class="edge-label" x="1160" y="778" text-anchor="end">PostgreSQL serves control. DuckLake serves verified analytical reads.</text>
+    </g>
+  </svg>
+</div>
+
+<style>
+  .arch-scroll {
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    padding: 0.5rem;
+  }
+  .arch {
+    display: block;
+    width: 100%;
+    min-width: 980px;
+    height: auto;
+    font-family: var(--font-body);
+  }
+  .trust rect,
+  .consistency rect {
+    fill: var(--surface);
+    stroke: var(--line-strong);
+  }
+  .trust .dot {
+    fill: var(--teal);
+    stroke: none;
+  }
+  .trust-title {
+    font-family: var(--font-display);
+    font-size: 13.5px;
+    font-weight: 700;
+    fill: var(--text);
+  }
+  .trust-item {
+    font-size: 11.5px;
+    fill: var(--text-2);
+  }
+  .plane rect {
+    stroke-width: 1.2;
+  }
+  .plane.teal rect {
+    fill: color-mix(in srgb, var(--teal-soft) 55%, var(--surface));
+    stroke: color-mix(in srgb, var(--teal) 55%, transparent);
+  }
+  .plane.ember rect {
+    fill: color-mix(in srgb, var(--ember-soft) 45%, var(--surface));
+    stroke: color-mix(in srgb, var(--ember) 50%, transparent);
+  }
+  .plane-title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1.4px;
+  }
+  .plane.teal .plane-title {
+    fill: var(--teal);
+  }
+  .plane.ember .plane-title {
+    fill: var(--ember);
+  }
+  .plane-caption {
+    font-size: 11.5px;
+    fill: var(--text-2);
+  }
+  .card > rect {
+    fill: var(--surface);
+    stroke: var(--line-strong);
+    stroke-width: 1.1;
+  }
+  .card-title {
+    font-family: var(--font-display);
+    font-size: 14.5px;
+    font-weight: 700;
+    letter-spacing: -0.2px;
+    fill: var(--text);
+  }
+  .card-tag {
+    font-family: var(--font-mono);
+    font-size: 8.5px;
+    font-weight: 600;
+    letter-spacing: 0.9px;
+    fill: var(--muted);
+  }
+  .card-line {
+    font-size: 11px;
+    fill: var(--text-2);
+  }
+  .bullet {
+    fill: var(--ember);
+  }
+  .card-note {
+    font-size: 10.5px;
+    fill: var(--muted);
+  }
+  .sub rect {
+    fill: var(--surface-2);
+    stroke: var(--line);
+  }
+  .sub-title {
+    font-family: var(--font-display);
+    font-size: 13px;
+    font-weight: 600;
+    fill: var(--text);
+  }
+  .sub-line {
+    font-size: 10.5px;
+    fill: var(--text-2);
+  }
+  .sub-port {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    fill: var(--muted);
+  }
+  .edge {
+    fill: none;
+    stroke-width: 1.8;
+    stroke-linejoin: round;
+  }
+  .edge.control {
+    stroke: var(--teal);
+  }
+  .edge.context {
+    stroke: var(--ember);
+  }
+  .edge.async {
+    stroke: var(--muted);
+    stroke-dasharray: 5 4;
+  }
+  .ah.control {
+    fill: var(--teal);
+  }
+  .ah.context {
+    fill: var(--ember);
+  }
+  .ah.async {
+    fill: var(--muted);
+  }
+  .edge-label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    fill: var(--muted);
+  }
+</style>

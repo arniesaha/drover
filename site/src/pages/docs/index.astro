@@ -1,0 +1,75 @@
+---
+import { getCollection } from 'astro:content';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { LINKS } from '../../site';
+
+const pages = (await getCollection('docs')).sort((a, b) => a.data.order - b.data.order);
+
+const deep = [
+  ['Architecture', 'architecture.md'],
+  ['Context store', 'context-store.md'],
+  ['Multi-host fleets', 'multi-host.md'],
+  ['PostgreSQL control store', 'postgresql-control-store.md'],
+  ['Harness adapter architecture', 'harness-adapter-architecture.md'],
+  ['Portable profile', 'portable-profile.md'],
+  ['MCP read contract', 'mcp.md'],
+  ['Session lifecycle', 'session-lifecycle.md'],
+  ['Security', 'security.md'],
+  ['Threat model', 'threat-model.md'],
+  ['Privacy', 'privacy.md'],
+  ['Support', 'support.md'],
+];
+---
+
+<DocsLayout
+  title="Documentation"
+  description="Install Drover, pair a host and a phone, connect your agents, and run it day to day."
+>
+  <div class="cards">
+    {
+      pages.map((p, i) => (
+        <a class="card" href={`/docs/${p.id}/`}>
+          <span class="n">0{i + 1}</span>
+          <h3>{p.data.title}</h3>
+          <p>{p.data.description}</p>
+        </a>
+      ))
+    }
+  </div>
+
+  <h2 id="reference">Reference in the repository</h2>
+  <p>
+    These pages are written for someone arriving cold. The repository carries the deeper reference, which changes with
+    the code and is the final word when the two disagree.
+  </p>
+  <ul>
+    {
+      deep.map(([label, path]) => (
+        <li>
+          <a href={LINKS.doc(path)} rel="noopener">
+            {label}
+          </a>
+        </li>
+      ))
+    }
+    <li><a href={LINKS.changelog} rel="noopener">Changelog</a></li>
+  </ul>
+</DocsLayout>
+
+<style>
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+    gap: 1rem;
+    max-width: none;
+  }
+  .cards .n {
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    font-weight: 700;
+    color: var(--ember);
+  }
+  .cards h3 {
+    margin-top: 0.3rem;
+  }
+</style>

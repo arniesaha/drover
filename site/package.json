@@ -1,0 +1,28 @@
+{
+  "name": "drover-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Product and documentation site for Drover (drover.fyi). Fully static.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check:links": "node scripts/check-links.mjs",
+    "check:content": "node scripts/check-content.mjs",
+    "check:budget": "node scripts/check-budget.mjs",
+    "check": "npm run check:links && npm run check:content && npm run check:budget",
+    "test": "npm run build && npm run check"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "^8.0.3",
+    "@fontsource-variable/bricolage-grotesque": "^5.3.0",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "astro": "^7.3.8"
+  }
+}

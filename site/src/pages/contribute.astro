@@ -1,0 +1,201 @@
+---
+import { Code } from 'astro:components';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { LINKS } from '../site';
+
+const themes = { light: 'vitesse-light', dark: 'vitesse-dark' } as const;
+
+const setup = `git clone https://github.com/arniesaha/drover.git
+cd drover
+uv sync --extra dev
+git config core.hooksPath .githooks
+
+export DROVER_CONTROL_DSN='postgresql://USER:PASSWORD@HOST/DATABASE'
+uv run drover-server init
+uv run drover-server control-store init`;
+
+const run = `# terminal 1: the hub
+uv run drover-server run
+
+# terminal 2: a local harness host
+uv run drover-harnessd \\
+  --host-id local-dev \\
+  --display-name "Local Dev Host" \\
+  --kind macos \\
+  --listen 127.0.0.1:7081 \\
+  --local-url http://127.0.0.1:7081 \\
+  --central-url http://127.0.0.1:7080`;
+
+const tests = `# the whole Python suite, in parallel
+uv run pytest -n auto
+
+# one module, serially, when you are debugging
+uv run pytest tests/test_check_public_release.py
+
+# formatting, as CI checks it
+uv run black --check .
+uv run isort --check-only .
+
+# Markdown links in the repository docs
+make docs`;
+
+const ios = `brew install xcodegen
+cd apps/drover
+xcodegen generate
+open Drover.xcodeproj`;
+
+const site = `cd site
+npm ci
+npm run dev      # local preview with hot reload
+npm test         # build, then link, content and size checks`;
+---
+
+<BaseLayout title="Contribute" description="Set up a Drover development environment, run the tests and open a pull request.">
+  <section class="page-hero">
+    <div class="wrap">
+      <span class="eyebrow">Contribute</span>
+      <h1>Come herd with us.</h1>
+      <p class="lede">
+        Drover is a small open source project and help is welcome: bug reports, docs fixes, new harness adapters, iOS
+        polish. This page is the short version of{' '}
+        <a href={LINKS.contributing} rel="noopener">CONTRIBUTING.md</a>, which is the source of truth.
+      </p>
+      <div class="btn-row" style="margin-top:1.5rem">
+        <a class="btn" href={LINKS.goodFirstIssues} rel="noopener">Good first issues</a>
+        <a class="btn ghost" href={LINKS.helpWanted} rel="noopener">Help wanted</a>
+        <a class="btn ghost" href={LINKS.repo} rel="noopener">Repository</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-tight">
+    <div class="wrap two">
+      <div class="prose">
+        <h2 id="where-to-start">Where to start</h2>
+        <p>Issues carry labels that tell you what kind of help is wanted:</p>
+        <ul>
+          <li><code>good first issue</code>: scoped and friendly to someone new to the codebase.</li>
+          <li><code>documentation</code>: improvements to the docs, including this site.</li>
+          <li><code>help wanted</code>: the maintainers would like a hand.</li>
+        </ul>
+        <p>
+          For a bug, use the bug report template. For a feature, open a request and sketch how you would build it before
+          writing much code. General questions go to GitHub Discussions.
+        </p>
+
+        <h2 id="dev-setup">Development setup</h2>
+        <p>
+          You need Python 3.11 or later, <a href="https://docs.astral.sh/uv/" rel="noopener">uv</a>, a PostgreSQL database
+          for the control store, and at least one agent CLI. Xcode 16 and XcodeGen are only needed for the iOS app.
+        </p>
+        <Code code={setup} lang="bash" themes={themes} defaultColor={false} />
+        <p>
+          The <code>core.hooksPath</code> line turns on a pre-commit hook that runs the public release audit over your
+          staged files. It refuses commits that would publish a private value such as a home directory path, a private
+          address or a credential. CI runs the same audit.
+        </p>
+        <p>Then start the two processes:</p>
+        <Code code={run} lang="bash" themes={themes} defaultColor={false} />
+
+        <h3 id="ios">The iOS app</h3>
+        <Code code={ios} lang="bash" themes={themes} defaultColor={false} />
+        <p>
+          Pick your Apple development team and run the <code>Drover</code> scheme on a simulator or a connected iPhone. The{' '}
+          <a href={LINKS.file('apps/drover/README.md')} rel="noopener">iOS guide</a> covers tests and device signing.
+        </p>
+
+        <h3 id="this-site">This site</h3>
+        <p>
+          The site you are reading lives in <code>site/</code> in the same repository, so docs can change in the same pull
+          request as the code they describe.
+        </p>
+        <Code code={site} lang="bash" themes={themes} defaultColor={false} />
+
+        <h2 id="tests">Tests and style</h2>
+        <Code code={tests} lang="bash" themes={themes} defaultColor={false} />
+        <ul>
+          <li>Python is formatted with Black at line length 88 and imports are sorted with isort.</li>
+          <li>
+            A bare <code>pytest</code> runs serially on purpose. Add <code>-n auto</code> for the full suite and leave it off when
+            debugging a single test.
+          </li>
+          <li>Tests that need PostgreSQL or the lake extensions skip when those are not available locally. CI runs them.</li>
+        </ul>
+
+        <h2 id="pull-requests">Pull requests</h2>
+        <ol>
+          <li>Make sure the tests pass and the code is formatted.</li>
+          <li>Update the docs for anything a user would notice.</li>
+          <li>Add an entry under <code>[Unreleased]</code> in <code>CHANGELOG.md</code>.</li>
+          <li>Describe the change, how you validated it, and any user-visible effect. Add screenshots for UI changes.</li>
+          <li>Call out breaking changes explicitly.</li>
+        </ol>
+        <p>
+          Commits follow <a href="https://www.conventionalcommits.org/" rel="noopener">Conventional Commits</a>, for example{' '}
+          <code>fix(harnessd): handle PTY session termination gracefully</code>. Write the body in the imperative mood and
+          explain why, not what. All checks must pass and at least one reviewer must approve. Merged branches are deleted
+          automatically.
+        </p>
+
+        <h2 id="conduct">Code of conduct</h2>
+        <p>
+          Be respectful and professional. The project is committed to a welcoming and inclusive environment, and
+          unacceptable behaviour can be reported to the maintainers. The{' '}
+          <a href={`${LINKS.contributing}#code-of-conduct`} rel="noopener">code of conduct section</a> of CONTRIBUTING.md is the
+          reference.
+        </p>
+
+        <h2 id="security">Security reports</h2>
+        <p>
+          Please do not file security issues in public. Follow the private reporting instructions in{' '}
+          <a href={LINKS.securityPolicy} rel="noopener">SECURITY.md</a>. And never paste tokens, pairing codes, private
+          addresses, logs or session content into a public issue.
+        </p>
+      </div>
+
+      <aside class="side">
+        <div class="card">
+          <h3>Good first contributions</h3>
+          <p>Fix a doc that confused you. Add a test for a bug you hit. Improve an error message.</p>
+        </div>
+        <div class="card">
+          <h3>Bigger ideas</h3>
+          <p>
+            A new harness adapter or a collector source is welcome. Open an issue first so the
+            design gets a look before you invest a weekend.
+          </p>
+        </div>
+        <div class="card">
+          <h3>What reviewers look for</h3>
+          <p>Small, focused changes. Tests that fail without the fix. No private values in the diff.</p>
+        </div>
+      </aside>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .two {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 3rem;
+    align-items: start;
+  }
+  .prose h2:first-child {
+    margin-top: 0;
+  }
+  .side {
+    display: grid;
+    gap: 1rem;
+    position: sticky;
+    top: calc(var(--header-h) + 24px);
+  }
+  @media (max-width: 960px) {
+    .two {
+      grid-template-columns: 1fr;
+    }
+    .side {
+      position: static;
+    }
+  }
+</style>
