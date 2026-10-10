@@ -4,9 +4,9 @@ import Foundation
 
 /// One directory the host offered for the text typed so far.
 public struct PathCompletionEntry: Sendable, Equatable, Decodable, Identifiable {
-    /// The leaf name, e.g. "arnabmac".
+    /// The leaf name, e.g. "sample-user".
     public var name: String
-    /// The absolute path, e.g. "/Users/arnabmac".
+    /// The absolute path, e.g. "/Users/sample-user".
     public var path: String
 
     public var id: String { path }

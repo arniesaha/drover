@@ -31,7 +31,7 @@ public struct ChatPendingTurn: Sendable, Equatable {
         case .sending:
             return "Sending…"
         case .awaitingConfirmation:
-            return "Still confirming delivery"
+            return "Couldn’t confirm delivery"
         case .needsManualReview:
             return "Delivery needs review"
         }
@@ -46,7 +46,7 @@ public struct ChatPendingTurn: Sendable, Equatable {
     /// all clear that field; a delivery the user still has to resolve must
     /// outlive them.
     public var retryMessage: String {
-        "Couldn’t confirm delivery. Retry is safe."
+        statusText
     }
 
     public var manualReviewMessage: String {
@@ -1086,7 +1086,7 @@ public final class ChatModel {
             guard pendingTurn?.clientTurnID == turn.clientTurnID else { return }
             if isAmbiguousSendFailure(error) {
                 pendingTurn?.deliveryState = .awaitingConfirmation
-                hint = "Couldn’t confirm delivery. Retry is safe."
+                hint = nil
                 scheduleRecoveryCheckpoint()
             } else {
                 pendingTurn = nil

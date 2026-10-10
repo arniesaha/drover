@@ -152,6 +152,8 @@ final class FixtureHubURLProtocol: URLProtocol {
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.insightDetailData())
         case ("GET", "/harness"):
             switch state.kind {
+            case .longStreaming:
+                return FixtureHubResponse(status: 200, body: FixtureScenarioData.longStreamingSnapshotData())
             case .observability:
                 return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.homeSnapshot)
             case .capabilityJourney:
@@ -166,12 +168,17 @@ final class FixtureHubURLProtocol: URLProtocol {
                 "session_id": FixtureScenarioData.launchedSessionID,
                 "mode": "structured",
             ])
+        case ("POST", let path) where state.kind == .longStreaming && path.hasSuffix("/permission"):
+            return .json(status: 200, ["status": "ok"])
         case ("POST", let path) where path == "/harness/sessions/\(FixtureScenarioData.primarySessionID)/turns":
             return state.acceptTurn(from: request)
         case ("GET", let path) where path.hasPrefix("/harness/sessions/") && path.hasSuffix("/messages"):
             let sessionID = path
                 .replacingOccurrences(of: "/harness/sessions/", with: "")
                 .replacingOccurrences(of: "/messages", with: "")
+            if state.kind == .longStreaming, sessionID == FixtureScenarioData.primarySessionID {
+                return FixtureHubResponse(status: 200, body: LongStreamingTranscriptFixture.historyData(url: url))
+            }
             return FixtureHubResponse(status: 200, body: state.historyData(for: sessionID))
         default:
             return .json(status: 404, ["error": "unknown fixture route"])

@@ -105,7 +105,7 @@ import Testing
     let session = SessionSummary(
         id: "s2", hostID: "mac-mini", harness: "claude-code", mode: "structured",
         status: "running", awaiting: "input",
-        cwd: "/Users/arnabmac/max/projects/meridian",
+        cwd: "/Users/sample-user/sample-workspace/projects/sample-project",
         lastActivity: nil, preview: nil
     )
 
@@ -113,7 +113,7 @@ import Testing
 
     #expect(card.title == "Asked a question")
     #expect(card.isTitlePlaceholder == true)
-    #expect(card.kicker == "meridian")
+    #expect(card.kicker == "sample-project")
     #expect(card.subtitle == "Claude · Mac Mini", "the state must not be said twice")
 }
 
@@ -136,7 +136,7 @@ import Testing
     let session = SessionSummary(
         id: "p1", hostID: "mac-mini", harness: "shell", mode: "pty",
         status: "running", awaiting: nil,
-        cwd: "/Users/arnabmac/src/nexus-shipper",
+        cwd: "/Users/sample-user/src/sample-shipper",
         lastActivity: nil,
         preview: "........................................ [100%]\n40 passed in 35.61s\n"
     )
@@ -144,7 +144,7 @@ import Testing
     let card = SessionCardPresentation(session: session, hostTitle: "Mac Mini")
 
     #expect(card.species == .terminal)
-    #expect(card.kicker == "~/src/nexus-shipper")
+    #expect(card.kicker == "~/src/sample-shipper")
     #expect(card.title == "40 passed in 35.61s")
     #expect(card.action == .attach)
     #expect(card.sigil == "$")
@@ -156,7 +156,7 @@ import Testing
 @Test func terminalCardKeepsLastOutputPreviewWhenRecapIsPresent() {
     let session = SessionSummary(
         id: "p1", hostID: "mac-mini", harness: "shell", mode: "pty",
-        status: "running", awaiting: nil, cwd: "/Users/arnabmac/src/drover",
+        status: "running", awaiting: nil, cwd: "/Users/sample-user/src/drover",
         lastActivity: nil, preview: "build started\n40 passed",
         recap: "This must not replace terminal output."
     )
@@ -173,7 +173,7 @@ import Testing
     let session = SessionSummary(
         id: "p2", hostID: "mac-mini", harness: "shell", mode: "pty",
         status: "running", awaiting: nil,
-        cwd: "/Users/arnabmac/src/drover",
+        cwd: "/Users/sample-user/src/drover",
         lastActivity: nil, preview: nil
     )
 
@@ -188,7 +188,7 @@ import Testing
 @Test func exitedTerminalOffersReopenAndChangesItsSigil() {
     let session = SessionSummary(
         id: "p3", hostID: "h", harness: "shell", mode: "pty",
-        status: "completed", awaiting: nil, cwd: "/home/arnab/src/drover",
+        status: "completed", awaiting: nil, cwd: "/home/sample-user/src/drover",
         lastActivity: nil, preview: "40 passed in 35.61s"
     )
 
@@ -246,7 +246,7 @@ import Testing
 @Test func aStaleCardOffersNoVerbToActOn() {
     let session = SessionSummary(
         id: "openclaw", hostID: "nas", harness: "claude-code", mode: "structured",
-        status: "running", awaiting: "input", cwd: "/home/arnab/src/openclaw",
+        status: "running", awaiting: "input", cwd: "/home/sample-user/src/openclaw",
         lastActivity: Date(timeIntervalSince1970: 1_754_913_600),
         preview: "Yeah go ahead"
     )
@@ -303,7 +303,7 @@ import Testing
     let snapshotTaken = Date(timeIntervalSince1970: 1_754_913_600)
     let session = SessionSummary(
         id: "openclaw", hostID: "nas", harness: "claude-code", mode: "structured",
-        status: "running", awaiting: "input", cwd: "/home/arnab/src/openclaw",
+        status: "running", awaiting: "input", cwd: "/home/sample-user/src/openclaw",
         lastActivity: snapshotTaken.addingTimeInterval(-27 * 60),
         preview: "Yeah go ahead"
     )

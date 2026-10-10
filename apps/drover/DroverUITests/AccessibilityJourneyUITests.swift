@@ -41,11 +41,42 @@ final class AccessibilityJourneyUITests: XCTestCase {
             "Discard locally should remain reachable at XXXL"
         )
 
+        XCTAssertEqual(checkDelivery.label, "Check delivery")
+        XCTAssertEqual(app.buttons["chat-copy-pending-to-draft"].label, "Copy to draft")
+        XCTAssertLessThanOrEqual(checkDelivery.frame.maxY, app.buttons["chat-copy-pending-to-draft"].frame.minY)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Chat recovery at Accessibility XXXL"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
         checkDelivery.tap()
         let receiptCount = app.staticTexts["fixture-turn-receipt-count"]
         XCTAssertTrue(receiptCount.waitForExistence(timeout: timeout))
         XCTAssertEqual(receiptCount.label, "1", "checking delivery must not create a second turn")
         XCTAssertFalse(app.staticTexts["chat-delivery-manual-review"].exists)
+    }
+
+    @MainActor
+    func testStreamingApprovalLabelsAtLargestTextSize() {
+        let app = coreJourneyApp()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "long-streaming"
+        app.launch()
+        openSession(in: app)
+        let allow = app.buttons["approval-allow"]
+        let deny = app.buttons["approval-deny"]
+        XCTAssertTrue(allow.waitForExistence(timeout: 10))
+        XCTAssertEqual(allow.label, "Allow once")
+        XCTAssertEqual(deny.label, "Deny")
+        XCTAssertTrue(allow.isHittable)
+        XCTAssertTrue(deny.isHittable)
+        XCTAssertGreaterThanOrEqual(allow.frame.height, 44)
+        XCTAssertGreaterThanOrEqual(deny.frame.height, 44)
+        XCTAssertLessThanOrEqual(deny.frame.maxY, allow.frame.minY)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Chat approval at Accessibility XXXL"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        let chunk = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "chunk 3 of 80")).firstMatch
+        XCTAssertTrue(chunk.waitForExistence(timeout: 10))
     }
 
     @MainActor
@@ -69,6 +100,37 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
+    func testPrimaryActionsStayReachableWithKeyboard() {
+        let app = coreJourneyApp()
+        app.launchArguments = []
+        app.launch()
+        XCTAssertTrue(app.buttons["settings-button"].waitForExistence(timeout: timeout))
+        app.buttons["settings-button"].tap()
+        let scan = app.buttons["settings-scan-pairing"]
+        XCTAssertTrue(scan.waitForExistence(timeout: timeout))
+        scan.tap()
+        let code = app.textFields["K7QP-2M4X"]
+        for _ in 0..<4 where !code.isHittable { app.swipeUp() }
+        XCTAssertTrue(code.waitForExistence(timeout: timeout))
+        code.tap()
+        code.typeText("SAMPLE-CODE")
+        let pair = app.buttons["pairing-submit"]
+        XCTAssertTrue(app.keyboards.firstMatch.exists)
+        XCTAssertTrue(pair.isHittable)
+        XCTAssertLessThanOrEqual(pair.frame.maxY, app.keyboards.firstMatch.frame.minY)
+        app.terminate()
+        app.launch()
+        let launch = app.buttons["launch-button"]
+        XCTAssertTrue(launch.waitForExistence(timeout: timeout))
+        launch.tap()
+        let confirm = app.buttons["launch-confirm-button"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: timeout))
+        XCTAssertTrue(confirm.isHittable)
+        XCTAssertTrue(confirm.isEnabled)
+        XCTAssertTrue(app.frame.contains(confirm.frame))
+    }
+
+    @MainActor
     private func coreJourneyApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
@@ -81,27 +143,32 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
-    private func openFixtureChat(in app: XCUIApplication) {
-        let session = app.buttons["fixture-session"]
-        XCTAssertTrue(session.waitForExistence(timeout: timeout))
-
-        // The pinned status header also contains a scroll view. At XXXL the
-        // session row can be partly below the fleet viewport, where XCTest
-        // still calls it hittable but a center tap targets the next row.
+    private func openSession(in app: XCUIApplication) {
         let fleet = app.scrollViews["fleet-list"]
-        XCTAssertTrue(fleet.exists, "the fleet list should remain scrollable at XXXL")
-        // Short, held drags toward the row rather than swipes: a swipe carries
-        // momentum, and once anything sits below the session (History, the
-        // finished section, analytics) it flings the row past the top.
-        for _ in 0..<8 where !fleet.frame.contains(session.frame) {
-            let rowIsBelow = session.frame.maxY > fleet.frame.maxY
-            let start = fleet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: rowIsBelow ? 0.65 : 0.35))
-            let end = fleet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        XCTAssertTrue(fleet.waitForExistence(timeout: timeout))
+        let session = app.buttons["fixture-session"]
+        for _ in 0..<12 {
+            if session.exists {
+                let visible = session.frame.intersection(fleet.frame)
+                if !visible.isNull, visible.height >= min(160, session.frame.height), session.isHittable {
+                    // Wrapped rows may be taller than the viewport. Tap their
+                    // visible portion, without requiring the whole row to fit.
+                    fleet.coordinate(withNormalizedOffset: .zero)
+                        .withOffset(CGVector(dx: visible.midX - fleet.frame.minX,
+                                             dy: visible.midY - fleet.frame.minY)).tap()
+                    return
+                }
+            }
+            let start = fleet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.7))
+            let end = fleet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45))
             start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
         }
-        XCTAssertTrue(fleet.frame.contains(session.frame), "the session should fit inside the fleet viewport")
-        XCTAssertTrue(session.isHittable, "the fleet session should remain reachable at XXXL")
-        session.tap()
+        XCTFail("the wrapped sample session should be reachable at XXXL")
+    }
+
+    @MainActor
+    private func openFixtureChat(in app: XCUIApplication) {
+        openSession(in: app)
 
         let recap = app.staticTexts["chat-recap-title"]
         let primarySessionLoaded = XCTNSPredicateExpectation(

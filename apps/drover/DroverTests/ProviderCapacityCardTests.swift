@@ -19,7 +19,7 @@ struct ProviderCapacityCardTests {
     /// the strip has to render.
     private static let anthropic = """
     {"snapshot_id":"s1","dedup_key":"k1","provider":"anthropic",
-     "account_label":"arnab.saha@atlan.com","plan_label":"team",
+     "account_label":"sample.team@example.com","plan_label":"team",
      "host_id":"work-laptop","status":"ok","observed_at":"2026-08-09T18:00:00Z",
      "source":"claude-oauth-usage",
      "windows":[{"kind":"extra_usage","used_percent":3.6},

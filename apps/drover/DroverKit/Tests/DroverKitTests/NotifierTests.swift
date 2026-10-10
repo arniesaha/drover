@@ -54,8 +54,8 @@ struct NotifierTests {
 
 @Test func firstCheckNotifiesEachNeedsYouSessionAndSetsBadge() async throws {
     mock.handler = { _ in (200, snapshotData([
-        (id: "sess-approval", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
-        (id: "sess-input", harness: "agy", status: "running", awaiting: "input", cwd: "/Users/arnab/other"),
+        (id: "sess-approval", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/sample-user/project"),
+        (id: "sess-input", harness: "agy", status: "running", awaiting: "input", cwd: "/Users/sample-user/other"),
         (id: "sess-working", harness: "shell", status: "running", awaiting: nil, cwd: "/tmp"),
     ])) }
 
@@ -78,7 +78,7 @@ struct NotifierTests {
 
 @Test func secondIdenticalCheckStaysSilent() async throws {
     let snapshotBytes = snapshotData([
-        (id: "sess-approval", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
+        (id: "sess-approval", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/sample-user/project"),
     ])
     mock.handler = { _ in (200, snapshotBytes) }
 
@@ -98,17 +98,17 @@ struct NotifierTests {
     let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
 
     mock.handler = { _ in (200, snapshotData([
-        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/sample-user/project"),
     ])) }
     await watcher.check(client: client())
 
     mock.handler = { _ in (200, snapshotData([
-        (id: "sess-1", harness: "claude-code", status: "completed", awaiting: nil, cwd: "/Users/arnab/project"),
+        (id: "sess-1", harness: "claude-code", status: "completed", awaiting: nil, cwd: "/Users/sample-user/project"),
     ])) }
     await watcher.check(client: client())
 
     mock.handler = { _ in (200, snapshotData([
-        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/sample-user/project"),
     ])) }
     await watcher.check(client: client())
 
@@ -127,7 +127,7 @@ struct NotifierTests {
         return (500, Data())
     }
     let snapshot = try HarnessSnapshot.decode(from: snapshotData([
-        (id: "sess-input", harness: "agy", status: "running", awaiting: "input", cwd: "/Users/arnab/other"),
+        (id: "sess-input", harness: "agy", status: "running", awaiting: "input", cwd: "/Users/sample-user/other"),
     ]))
     let spy = SpyNotifier()
     let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
@@ -147,7 +147,7 @@ struct NotifierTests {
     let watcher = AttentionWatcher(notifier: spy, seenStore: defaults)
 
     mock.handler = { _ in (200, snapshotData([
-        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/arnab/project"),
+        (id: "sess-1", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/sample-user/project"),
     ])) }
     await watcher.check(client: client())
 

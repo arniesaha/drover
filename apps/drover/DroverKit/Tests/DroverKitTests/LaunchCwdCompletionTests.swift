@@ -16,9 +16,9 @@ private let cwdCompletionSnapshotJSON = Data("""
                     "harnesses": [\(v1Row("claude-code"))]}}],
  "sessions": [],
  "cwd_suggestions": [
-  {"path": "/home/arnab/dev/drover", "source": "favorite"},
-  {"path": "/Users/arnabmac/jenny", "source": "favorite"},
-  {"path": "/home/arnab/nas-only", "source": "recent session", "host_id": "nas"}]}
+  {"path": "/home/sample-user/dev/drover", "source": "favorite"},
+  {"path": "/Users/sample-user/sample-project", "source": "favorite"},
+  {"path": "/home/sample-user/nas-only", "source": "recent session", "host_id": "nas"}]}
 """.utf8)
 
 /// Thread-safe: `MockURLProtocol.handler` runs off the main actor.
@@ -74,25 +74,25 @@ private func testStore() -> HarnessModelCatalogStore {
 
 // MARK: - Host scoping
 
-/// The reported bug: `/Users/arnabmac/jenny` was offered on a Linux laptop
+/// The reported bug: `/Users/sample-user/sample-project` was offered on a Linux laptop
 /// that has no `/Users` at all, because an untagged favorite used to pass on
 /// every host unconditionally.
 @Test @MainActor func anUntaggedSuggestionTheHostLacksIsDropped() async throws {
     let model = try model()
     #expect(model.hostID == "work-laptop")
-    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover", "/Users/arnabmac/jenny"])
+    #expect(model.cwdSuggestions == ["/home/sample-user/dev/drover", "/Users/sample-user/sample-project"])
 
     let log = RequestLog()
     mock.handler = { request in
         log.record(request)
         return (200, Data("""
-        {"exists": {"/home/arnab/dev/drover": true, "/Users/arnabmac/jenny": false}}
+        {"exists": {"/home/sample-user/dev/drover": true, "/Users/sample-user/sample-project": false}}
         """.utf8))
     }
 
     await model.verifyCuratedSuggestions()
 
-    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover"])
+    #expect(model.cwdSuggestions == ["/home/sample-user/dev/drover"])
     // One batched round trip, not one per favorite, and only the ambiguous
     // (untagged) paths are asked about.
     #expect(log.count == 1)
@@ -100,7 +100,7 @@ private func testStore() -> HarnessModelCatalogStore {
     #expect(request.url?.path == "/harness/hosts/work-laptop/fs/exists")
     #expect(request.httpMethod == "POST")
     let body = try JSONSerialization.jsonObject(with: request.bodyStreamData()) as? [String: Any]
-    #expect(body?["paths"] as? [String] == ["/home/arnab/dev/drover", "/Users/arnabmac/jenny"])
+    #expect(body?["paths"] as? [String] == ["/home/sample-user/dev/drover", "/Users/sample-user/sample-project"])
 }
 
 /// Hiding every untagged favorite because the network blinked costs more
@@ -112,7 +112,7 @@ private func testStore() -> HarnessModelCatalogStore {
 
     await model.verifyCuratedSuggestions()
 
-    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover", "/Users/arnabmac/jenny"])
+    #expect(model.cwdSuggestions == ["/home/sample-user/dev/drover", "/Users/sample-user/sample-project"])
 }
 
 /// Regression guard for the half that always worked: a suggestion the server
@@ -120,17 +120,17 @@ private func testStore() -> HarnessModelCatalogStore {
 @Test @MainActor func aSuggestionTaggedToAnotherHostStaysFilteredOut() async throws {
     let model = try model()
     mock.handler = { _ in
-        (200, Data(#"{"exists": {"/home/arnab/dev/drover": true, "/Users/arnabmac/jenny": true}}"#.utf8))
+        (200, Data(#"{"exists": {"/home/sample-user/dev/drover": true, "/Users/sample-user/sample-project": true}}"#.utf8))
     }
     await model.verifyCuratedSuggestions()
 
-    #expect(model.cwdSuggestions.contains("/home/arnab/nas-only") == false)
+    #expect(model.cwdSuggestions.contains("/home/sample-user/nas-only") == false)
 
     // On its own host it is offered, and the previous host's verdicts do not
     // carry over to it.
     model.hostID = "nas"
     #expect(model.cwdSuggestions == [
-        "/home/arnab/dev/drover", "/Users/arnabmac/jenny", "/home/arnab/nas-only",
+        "/home/sample-user/dev/drover", "/Users/sample-user/sample-project", "/home/sample-user/nas-only",
     ])
 }
 
@@ -142,21 +142,21 @@ private func testStore() -> HarnessModelCatalogStore {
     let log = RequestLog()
     mock.handler = { request in
         log.record(request)
-        return (200, completionBody(parent: "/home/arnab", paths: ["/home/arnab/dev"]))
+        return (200, completionBody(parent: "/home/sample-user", paths: ["/home/sample-user/dev"]))
     }
     let model = try model()
 
     model.cwd = "/h"
     model.cwd = "/ho"
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
 
     #expect(log.count == 1)
     let request = try #require(log.all.first)
     #expect(request.url?.path == "/harness/hosts/work-laptop/fs/complete")
     // The one request carries the newest text, not the first keystroke.
-    #expect(request.url?.query == "path=%2Fhome%2Farnab%2Fd")
-    #expect(model.liveCompletions == ["/home/arnab/dev"])
+    #expect(request.url?.query == "path=%2Fhome%2Fsample-user%2Fd")
+    #expect(model.liveCompletions == ["/home/sample-user/dev"])
 }
 
 /// A slow answer is for text the user has already moved past, so it must not
@@ -218,7 +218,7 @@ private func testStore() -> HarnessModelCatalogStore {
 
     #expect(log.count == 0)
     #expect(model.liveCompletions.isEmpty)
-    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover", "/Users/arnabmac/jenny"])
+    #expect(model.cwdSuggestions == ["/home/sample-user/dev/drover", "/Users/sample-user/sample-project"])
 }
 
 // MARK: - Merged ranking
@@ -228,21 +228,21 @@ private func testStore() -> HarnessModelCatalogStore {
 /// directory that is both appears once, in the curated position.
 @Test @MainActor func curatedEntriesRankAboveLiveOnesAndDuplicatesCollapse() async throws {
     mock.handler = { _ in
-        (200, completionBody(parent: "/home/arnab", paths: [
-            "/home/arnab/data", "/home/arnab/dev/drover",
+        (200, completionBody(parent: "/home/sample-user", paths: [
+            "/home/sample-user/data", "/home/sample-user/dev/drover",
         ]))
     }
     let model = try model()
 
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
 
     #expect(model.cwdSuggestions == [
-        "/home/arnab/dev/drover",  // curated + on disk, once, first
-        "/home/arnab/data",
+        "/home/sample-user/dev/drover",  // curated + on disk, once, first
+        "/home/sample-user/data",
     ])
     // The macOS favorite does not match the typed prefix and drops out.
-    #expect(model.cwdSuggestions.contains("/Users/arnabmac/jenny") == false)
+    #expect(model.cwdSuggestions.contains("/Users/sample-user/sample-project") == false)
 }
 
 // MARK: - Offline hint
@@ -253,13 +253,13 @@ private func testStore() -> HarnessModelCatalogStore {
     mock.handler = { _ in (504, Data(#"{"error": "host timed out"}"#.utf8)) }
     let model = try model()
 
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
 
     #expect(model.isCompletionHostUnreachable)
     #expect(model.cwdSuggestionsHint == "Can't reach the host — showing saved paths only")
     // The curated half of the list survives the outage.
-    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover"])
+    #expect(model.cwdSuggestions == ["/home/sample-user/dev/drover"])
 }
 
 @Test @MainActor func aTransportFailureAlsoSetsTheHint() async throws {
@@ -267,7 +267,7 @@ private func testStore() -> HarnessModelCatalogStore {
     defer { mock.transportError = nil }
     let model = try model()
 
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
 
     #expect(model.isCompletionHostUnreachable)
@@ -286,14 +286,14 @@ private let unsupportedHint =
     }
     let model = try model()
 
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
 
     #expect(model.liveCompletions.isEmpty)
     #expect(model.isCompletionUnsupported)
     #expect(model.isCompletionHostUnreachable == false)
     #expect(model.cwdSuggestionsHint == unsupportedHint)
-    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover"])
+    #expect(model.cwdSuggestions == ["/home/sample-user/dev/drover"])
 }
 
 /// A hub from before #232 passes the host's own 404 straight through.
@@ -301,7 +301,7 @@ private let unsupportedHint =
     mock.handler = { _ in (404, Data(#"{"error": "not found"}"#.utf8)) }
     let model = try model()
 
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
 
     #expect(model.isCompletionUnsupported)
@@ -317,7 +317,7 @@ private let unsupportedHint =
     }
     let model = try model()
 
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
 
     #expect(model.isCompletionUnsupported == false)
@@ -333,7 +333,7 @@ private let unsupportedHint =
     }
     let model = try model()
 
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
 
     #expect(model.isCompletionUnsupported == false)
@@ -345,12 +345,12 @@ private let unsupportedHint =
 @Test @MainActor func theUnsupportedHintClearsOnHostChangeAndOnSuccess() async throws {
     mock.handler = { _ in (501, Data(#"{"error": "unsupported"}"#.utf8)) }
     let model = try model()
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
     #expect(model.isCompletionUnsupported)
 
     mock.handler = { _ in
-        (200, completionBody(parent: "/home/arnab", paths: ["/home/arnab/dev"]))
+        (200, completionBody(parent: "/home/sample-user", paths: ["/home/sample-user/dev"]))
     }
     model.hostID = "nas"
     #expect(model.isCompletionUnsupported == false)
@@ -359,7 +359,7 @@ private let unsupportedHint =
     model.hostID = "work-laptop"
     await model.settleCompletion()
     #expect(model.isCompletionUnsupported == false)
-    #expect(model.liveCompletions == ["/home/arnab/dev"])
+    #expect(model.liveCompletions == ["/home/sample-user/dev"])
 }
 
 /// Pins the exists-check side of an unsupported host: nothing it says can
@@ -371,17 +371,17 @@ private let unsupportedHint =
 
     await model.verifyCuratedSuggestions()
 
-    #expect(model.cwdSuggestions == ["/home/arnab/dev/drover", "/Users/arnabmac/jenny"])
+    #expect(model.cwdSuggestions == ["/home/sample-user/dev/drover", "/Users/sample-user/sample-project"])
 }
 
 /// A host that answered "nothing here" is not unreachable — it answered.
 @Test @MainActor func aSuccessfulEmptyResultLeavesTheHintUnset() async throws {
     mock.handler = { _ in
-        (200, Data(#"{"parent": "/home/arnab", "entries": [], "truncated": false}"#.utf8))
+        (200, Data(#"{"parent": "/home/sample-user", "entries": [], "truncated": false}"#.utf8))
     }
     let model = try model()
 
-    model.cwd = "/home/arnab/zz"
+    model.cwd = "/home/sample-user/zz"
     await model.settleCompletion()
 
     #expect(model.liveCompletions.isEmpty)
@@ -408,18 +408,18 @@ private let unsupportedHint =
 @Test @MainActor func aSucceedingRetryClearsTheHint() async throws {
     mock.handler = { _ in (502, Data()) }
     let model = try model()
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
     #expect(model.isCompletionHostUnreachable)
 
     mock.handler = { _ in
-        (200, completionBody(parent: "/home/arnab", paths: ["/home/arnab/dev"]))
+        (200, completionBody(parent: "/home/sample-user", paths: ["/home/sample-user/dev"]))
     }
-    model.cwd = "/home/arnab/de"
+    model.cwd = "/home/sample-user/de"
     await model.settleCompletion()
 
     #expect(model.isCompletionHostUnreachable == false)
-    #expect(model.liveCompletions == ["/home/arnab/dev"])
+    #expect(model.liveCompletions == ["/home/sample-user/dev"])
 }
 
 /// Switching hosts invalidates the previous host's listing immediately —
@@ -427,12 +427,12 @@ private let unsupportedHint =
 /// class of wrongness this whole change is about.
 @Test @MainActor func changingHostDropsTheOtherHostsLiveEntries() async throws {
     mock.handler = { _ in
-        (200, completionBody(parent: "/home/arnab", paths: ["/home/arnab/dev"]))
+        (200, completionBody(parent: "/home/sample-user", paths: ["/home/sample-user/dev"]))
     }
     let model = try model()
-    model.cwd = "/home/arnab/d"
+    model.cwd = "/home/sample-user/d"
     await model.settleCompletion()
-    #expect(model.liveCompletions == ["/home/arnab/dev"])
+    #expect(model.liveCompletions == ["/home/sample-user/dev"])
 
     model.hostID = "nas"
     #expect(model.liveCompletions.isEmpty)

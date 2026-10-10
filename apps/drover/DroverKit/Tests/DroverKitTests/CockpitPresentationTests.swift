@@ -1132,15 +1132,15 @@ private let fourAnthropicWindows = """
     let accounts = try [
         providerAccount(snapshot: "studio", provider: "google", label: "Antigravity", host: "studio",
                         observedAt: "2026-10-01T18:00:00Z", windows: "[{\"kind\":\"five_hour\",\"used_percent\":20}]"),
-        providerAccount(snapshot: "mini", provider: "google", label: "arniesaha@gmail.com", host: "mini", status: "stale",
+        providerAccount(snapshot: "mini", provider: "google", label: "sample.google@example.com", host: "mini", status: "stale",
                         observedAt: "2026-09-29T18:00:00Z", errorCategory: "host_offline",
                         windows: "[{\"kind\":\"five_hour\",\"used_percent\":95}]"),
-        providerAccount(snapshot: "nas", provider: "google", label: "arniesaha@gmail.com", host: "nas", status: "stale",
+        providerAccount(snapshot: "nas", provider: "google", label: "sample.google@example.com", host: "nas", status: "stale",
                         observedAt: "2026-09-26T18:00:00Z", errorCategory: "host_offline"),
     ]
     let groups = ProviderSubscriptionGrouping.group(accounts, now: accounts[0].observedAt)
     #expect(groups.count == 1)
-    #expect(groups[0].accountLabel == "arniesaha@gmail.com")
+    #expect(groups[0].accountLabel == "sample.google@example.com")
     #expect(groups[0].representative.snapshotID == "studio")
     // One chip row: the stale NAS sits alongside the live hosts.
     #expect(groups[0].hosts.map(\.id) == ["mini", "nas", "studio"])
@@ -1228,12 +1228,12 @@ private let fourAnthropicWindows = """
 
 @Test func legacyEmailIdentityIsTrimmedAndCaseInsensitive() throws {
     let accounts = try [
-        providerAccount(snapshot: "a", provider: "google", label: " ArnieSaha@GMAIL.com ", host: "a", observedAt: "2026-10-01T18:00:00Z"),
-        providerAccount(snapshot: "b", provider: "google", label: "arniesaha@gmail.com", host: "b", observedAt: "2026-10-01T18:00:00Z"),
+        providerAccount(snapshot: "a", provider: "google", label: " Sample.Google@EXAMPLE.COM ", host: "a", observedAt: "2026-10-01T18:00:00Z"),
+        providerAccount(snapshot: "b", provider: "google", label: "sample.google@example.com", host: "b", observedAt: "2026-10-01T18:00:00Z"),
     ]
     let groups = ProviderSubscriptionGrouping.group(accounts)
     #expect(groups.count == 1)
-    #expect(groups[0].id == "google|arniesaha@gmail.com")
+    #expect(groups[0].id == "google|sample.google@example.com")
 }
 
 @Test func nullIdentityAndLabelDecodeAsUnknownAccount() throws {

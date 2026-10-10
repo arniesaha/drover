@@ -171,20 +171,23 @@ struct LaunchView: View {
                     Text(launchError).foregroundStyle(.red)
                 }
             }
-
-            Section {
-                Button {
-                    Task { await launch() }
-                } label: {
-                    if isLaunching || model.isFetchingSnapshot {
-                        ProgressView()
-                    } else {
-                        Text("Launch")
-                    }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Button {
+                Task { await launch() }
+            } label: {
+                HStack {
+                    Text(isLaunching ? "Launching..." : "Launch")
+                    if isLaunching || model.isFetchingSnapshot { ProgressView() }
                 }
-                .disabled(!model.canLaunch || isLaunching || model.isFetchingSnapshot)
-                .accessibilityIdentifier("launch-confirm-button")
+                .frame(maxWidth: .infinity, minHeight: 44)
             }
+            .buttonStyle(.bordered)
+            .disabled(!model.canLaunch || isLaunching || model.isFetchingSnapshot)
+            .accessibilityIdentifier("launch-confirm-button")
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(.bar)
         }
         .navigationTitle("New Session")
         .navigationBarTitleDisplayMode(.inline)

@@ -18,7 +18,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
         screenshot("insights-overview", app)
 
         app.tabBars.buttons["Accounts"].tap()
-        let account = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "alex@example.com")).firstMatch
+        let account = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "sample.user@example.com")).firstMatch
         XCTAssertTrue(account.waitForExistence(timeout: 5))
         screenshot("accounts-compact", app)
         account.tap()
@@ -67,7 +67,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
         app.buttons["provider-capacity-navigation"].tap()
         let scroll = app.scrollViews["provider-accounts-scroll"]
         XCTAssertTrue(scroll.waitForExistence(timeout: 5))
-        let account = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "alex@example.com")).firstMatch
+        let account = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "sample.user@example.com")).firstMatch
         XCTAssertTrue(account.isHittable)
         account.tap()
         XCTAssertTrue(app.staticTexts["Five hour"].exists)
@@ -104,7 +104,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(navigation.label.contains("11 accounts"))
         navigation.tap()
         let scroll = app.scrollViews["provider-accounts-scroll"]
-        let googleAccounts = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Google · arniesaha@gmail.com"))
+        let googleAccounts = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Google · sample.google@example.com"))
         let google = googleAccounts.firstMatch
         for _ in 0..<6 where !google.isHittable { scroll.swipeUp() }
         XCTAssertTrue(google.isHittable)
@@ -112,11 +112,11 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Google · Antigravity")).firstMatch.exists)
         // The stale NAS is a chip in the account's host row, with no
         // separate "Stale hosts" list and no "Not reporting on" footer.
-        let nas = app.descendants(matching: .any)["provider-host-google|arniesaha@gmail.com-nas"]
+        let nas = app.descendants(matching: .any)["provider-host-google|sample.google@example.com-nas"]
         XCTAssertTrue(nas.exists)
         // Host titles can fall back to lower-case ids on this path.
         XCTAssertTrue(nas.label.lowercased().hasPrefix("nas, stale, last reported 5 days ago"), nas.label)
-        let mini = app.descendants(matching: .any)["provider-host-google|arniesaha@gmail.com-mini"]
+        let mini = app.descendants(matching: .any)["provider-host-google|sample.google@example.com-mini"]
         XCTAssertTrue(mini.exists)
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Stale hosts")).firstMatch.exists)
         XCTAssertFalse(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", "Not reporting on")).firstMatch.exists)

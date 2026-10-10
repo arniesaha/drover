@@ -13,6 +13,8 @@ import DroverKit
 /// a green Approve beside a red Deny would be the only saturated thing on the
 /// screen and would encode by hue what the layout already says by position.
 struct DecisionBlock: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let approval: HarnessMessage
     /// True while a decision is already in flight — disables both actions so
     /// a slow network can't collect a double-submission.
@@ -50,7 +52,10 @@ struct DecisionBlock: View {
                     }
             }
 
-            HStack(spacing: 9) {
+            let layout = dynamicTypeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(spacing: 9))
+                : AnyLayout(HStackLayout(spacing: 9))
+            layout {
                 action("Deny", tint: DroverColor.line, label: DroverColor.muted, run: onDeny)
                     .accessibilityIdentifier("approval-deny")
                 action("Allow once", tint: DroverColor.accent, label: DroverColor.accentHi, run: onApprove)
@@ -74,10 +79,11 @@ struct DecisionBlock: View {
         _ title: String, tint: PaletteToken, label: PaletteToken, run: @escaping () -> Void
     ) -> some View {
         Button(action: run) {
-            Text(title)
+            Label(title, systemImage: title == "Deny" ? "xmark" : "checkmark")
                 .font(.system(.subheadline, design: .default, weight: .medium))
+                .fixedSize(horizontal: false, vertical: true)
                 .foregroundStyle(label)
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, minHeight: 44)
                 .padding(.vertical, 9)
                 .overlay { Capsule().strokeBorder(tint, lineWidth: 1) }
         }
