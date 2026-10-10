@@ -12,6 +12,8 @@ import pytest
 from drover.hook.client import HookTimeout, call_tool
 from drover.schema import bootstrap
 from drover.server.mcp.server import build_mcp_server
+from drover.server.web.auth import AuthSettings
+from drover.server.web.credentials import CredentialStore
 
 
 def _free_port() -> int:
@@ -21,12 +23,18 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-def live_server(tmp_path: Path):
+def live_server(tmp_path: Path, monkeypatch):
     parquet_dir = tmp_path / "parquet"
     duckdb_path = tmp_path / "nexus.duckdb"
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
     port = _free_port()
-    server = build_mcp_server(duckdb_path=duckdb_path, host="127.0.0.1", port=port)
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, token = store.issue(scope="host", label="Synthetic hook client")
+    monkeypatch.setenv("DROVER_MCP_TOKEN", token)
+    auth = AuthSettings(True, "", credentials=store, legacy_token_enabled=False)
+    server = build_mcp_server(
+        duckdb_path=duckdb_path, host="127.0.0.1", port=port, auth=auth
+    )
 
     def _run():
         try:
@@ -48,7 +56,7 @@ def live_server(tmp_path: Path):
     else:
         pytest.skip("MCP server did not start in time")
 
-    yield {"port": port, "duckdb_path": duckdb_path}
+    yield {"port": port, "duckdb_path": duckdb_path, "token": token}
 
 
 def test_call_tool_returns_tool_result(live_server) -> None:
@@ -78,10 +86,22 @@ def test_call_tool_timeout(live_server) -> None:
 
 def test_call_tool_error_for_unknown_tool(live_server) -> None:
     url = f"http://127.0.0.1:{live_server['port']}/mcp"
-    with pytest.raises(Exception):  # noqa: PT011 — MCP raises a McpError variant
+    with pytest.raises(RuntimeError, match="nonexistent_tool.*returned error"):
         call_tool(
             mcp_url=url,
             tool="nonexistent_tool",
             args={},
             timeout_s=5.0,
         )
+
+
+def test_explicit_credential_overrides_environment(live_server, monkeypatch):
+    monkeypatch.setenv("DROVER_MCP_TOKEN", "invalid-synthetic-token")
+    out = call_tool(
+        mcp_url=f"http://127.0.0.1:{live_server['port']}/mcp",
+        tool="drover_handoff",
+        args={"repo_owner": "nobody", "repo_name": "nothing", "branch": "never"},
+        timeout_s=5.0,
+        token=live_server["token"],
+    )
+    assert out["summaries"] == []

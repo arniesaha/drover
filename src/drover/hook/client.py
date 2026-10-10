@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 from mcp import ClientSession
@@ -23,8 +24,9 @@ class HookTimeout(TimeoutError):
     """The MCP call exceeded the configured budget."""
 
 
-async def _call_async(mcp_url: str, tool: str, args: dict) -> dict:
-    async with streamablehttp_client(mcp_url) as (read, write, _):
+async def _call_async(mcp_url: str, tool: str, args: dict, token: str | None) -> dict:
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    async with streamablehttp_client(mcp_url, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool, args)
@@ -58,11 +60,16 @@ def call_tool(
     tool: str,
     args: dict,
     timeout_s: float = 2.0,
+    token: str | None = None,
 ) -> dict:
-    """Call one MCP tool synchronously with a hard timeout."""
+    """Call one tool with a hard timeout and the configured MCP bearer.
+
+    ``token`` overrides the client environment's ``DROVER_MCP_TOKEN``.
+    """
+    token = token if token is not None else os.environ.get("DROVER_MCP_TOKEN")
     try:
         return asyncio.run(
-            asyncio.wait_for(_call_async(mcp_url, tool, args), timeout=timeout_s)
+            asyncio.wait_for(_call_async(mcp_url, tool, args, token), timeout=timeout_s)
         )
     except asyncio.TimeoutError as e:
         raise HookTimeout(f"MCP {tool} exceeded {timeout_s}s budget") from e

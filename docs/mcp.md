@@ -28,10 +28,14 @@ operator-managed protected tunnel to it. TLS and internet ingress are outside
 this release step. Existing clients need the credential configuration in
 [client integrations](integrations/README.md) before upgrading.
 
-The bundled Python client and `drover mcp tools` / `drover mcp call` read
-`DROVER_MCP_TOKEN` from the client environment. Python callers may instead pass
-`token=` to `call_tool` or `list_tools`. The credential accompanies initialization,
-the initialized notification and every subsequent request. Redirects are refused.
+The bundled Python clients, `drover mcp tools` / `drover mcp call`, and
+`drover-hook` lifecycle commands read `DROVER_MCP_TOKEN` from the client
+environment. Lifecycle hooks need a host/device credential for handoff reads
+and session-close mutations; a profile-only credential cannot authorize them.
+Python callers may instead pass `token=` to `call_tool` or `list_tools` (including
+the hook client's `call_tool`). The credential accompanies initialization,
+the initialized notification and every subsequent request. The server CLI client
+refuses redirects.
 
 ## Read contract
 

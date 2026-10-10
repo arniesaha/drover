@@ -310,8 +310,47 @@ def test_transport_uses_current_request_capability(tmp_path, credentials, monkey
         # A session initialized with broad authority must not retain that authority.
         restricted = {**headers, "Authorization": f"Bearer {profile_token}"}
         response = client.post("/mcp", json=call, headers=restricted)
-        # SDK versions may reject a different principal before dispatch.
-        assert response.status_code == 403 or response.json()["result"]["isError"]
+
+        def assert_scope_denied(response):
+            assert response.status_code == 200
+            payload = response.json()
+            assert "error" not in payload
+            assert payload["result"]["isError"] is True
+            assert payload["result"]["content"] == [
+                {
+                    "type": "text",
+                    "text": "Error executing tool drover_fleet_status: "
+                    "MCP credential does not authorize this capability",
+                }
+            ]
+
+        if response.status_code == 404:
+            # Newer SDKs conceal sessions owned by another credential.
+            payload = response.json()
+            assert "result" not in payload
+            assert payload["error"] == {"code": -32600, "message": "Session not found"}
+        else:
+            # Older supported SDKs dispatch using the current request identity.
+            assert_scope_denied(response)
+
+        # An authenticated profile client in its own session reaches the tool
+        # guard and receives a tool-level scope denial, not a protocol error.
+        profile_headers = {
+            "Authorization": f"Bearer {profile_token}",
+            "Accept": "application/json, text/event-stream",
+        }
+        response = client.post("/mcp", json=init, headers=profile_headers)
+        assert response.status_code == 200
+        profile_headers["Mcp-Session-Id"] = response.headers["mcp-session-id"]
+        assert (
+            client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                headers=profile_headers,
+            ).status_code
+            == 202
+        )
+        assert_scope_denied(client.post("/mcp", json=call, headers=profile_headers))
     assert calls == ["read"]
 
 
