@@ -687,3 +687,76 @@ def test_export_updates_activity_daily_in_its_single_snapshot(
         assert con.execute(
             "SELECT session_id, sum(event_count) FROM lake.activity_daily GROUP BY session_id"
         ).fetchall() == [("export-session", 2)]
+
+
+@pytest.mark.parametrize("failure", ["task_exit", "deadline"])
+def test_supervised_crash_replays_and_drains_without_duplicates(
+    export_lake, postgres_control_store, monkeypatch, failure
+):
+    """Kill the owner after lake commit; its replacement must replay the receipt."""
+    import threading
+    from types import SimpleNamespace
+
+    from drover.server.lake import lifecycle, task_projection
+
+    path, _ = postgres_control_store
+    seed(path)
+    monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: export_lake)
+    monkeypatch.setattr(lifecycle, "_check_export_catalog", lambda *a: None)
+    monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
+    monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "RESTART_BACKOFF_SECONDS", 0.01)
+    original = LakeOutboxExporter._acknowledge
+    calls, replayed = [], []
+    drained = threading.Event()
+    released = []
+    original_exit = LakeOutboxExporter.__exit__
+
+    def exit_owner(self, *args):
+        original_exit(self, *args)
+        released.append(self.owner)
+
+    def acknowledge(self, document, receipt, now):
+        calls.append(self.owner)
+        if len(calls) == 1:
+            if failure == "task_exit":
+                raise SystemExit("test owner killed")
+            raise LakeError("lake_export_deadline")
+        assert released == [calls[0]]
+        original(self, document, receipt, now)
+        drained.set()
+
+    original_publish = LakeOutboxExporter._publish
+
+    def publish(self, document):
+        result = original_publish(self, document)
+        replayed.append(result["replayed"])
+        return result
+
+    monkeypatch.setattr(LakeOutboxExporter, "__exit__", exit_owner)
+    monkeypatch.setattr(LakeOutboxExporter, "_acknowledge", acknowledge)
+    monkeypatch.setattr(LakeOutboxExporter, "_publish", publish)
+    worker = lifecycle.ExporterLifecycle(
+        SimpleNamespace(
+            duckdb_path=path, analytics=SimpleNamespace(retire_legacy_writers=False)
+        )
+    )
+    try:
+        worker.start(shutdown_event=threading.Event())
+        assert drained.wait(15), worker.health()
+        assert worker.health()["running"]
+        assert worker.health()["restart_count"] == 1
+    finally:
+        worker.stop()
+    assert calls[0] != calls[1]
+    assert replayed == [False, True]
+    assert lake_counts(export_lake) == [2, 2, 2, 1]
+    from drover.server.lake.freshness import read_freshness
+
+    health = read_freshness(path)
+    assert health["unacknowledged_batches"] == 0
+    assert health["last_successful_export_at"] is not None
+    with control_plane_connection(path) as con:
+        assert con.execute(
+            "SELECT count(*) FROM control_outbox_events WHERE state='acknowledged'"
+        ).fetchone() == (2,)

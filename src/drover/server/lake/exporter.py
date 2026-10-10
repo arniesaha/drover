@@ -332,7 +332,7 @@ class LakeOutboxExporter:
         if document is None:
             return {"exported": 0, "acknowledged": 0, "replayed": False}
         result = self._publish(document)
-        self._acknowledge(document, result["receipt"], stamp)
+        self._acknowledge(document, result["receipt"], datetime.now(timezone.utc))
         return {
             "exported": result["receipt"]["canonical_rows"],
             "acknowledged": result["receipt"]["raw_rows"],

@@ -624,6 +624,21 @@ public actor DroverClient {
         }
     }
 
+    /// Readiness may return 503 while still carrying useful exporter status.
+    public func exporterHealth() async throws -> ExporterHealth? {
+        guard let url = URL(string: "/readyz", relativeTo: config.baseURL) else {
+            throw DroverError.transport("invalid readiness URL")
+        }
+        var request = URLRequest(url: url.absoluteURL)
+        request.timeoutInterval = 10
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, [200, 503].contains(http.statusCode) else {
+            throw DroverError.transport("readiness unavailable")
+        }
+        return try JSONDecoder().decode(ExporterReadiness.self, from: data).exporter
+    }
+
     public nonisolated func streamRequest(sessionID: String, afterSeq: Int? = nil) -> URLRequest {
         wsRequest(sessionID: sessionID, suffix: "stream", query: afterSeq.map { "after_seq=\($0)" })
     }
@@ -930,4 +945,17 @@ private struct ContentAnalysisConsentBody: Encodable {
         case backend
         case externalDisclosureAccepted = "external_disclosure_accepted"
     }
+}
+
+
+public struct ExporterHealth: Decodable, Sendable {
+    public let state: String
+    public var warningText: String? {
+        ["lagging", "stalled", "stopped"].contains(state)
+            ? "Search and recall may be out of date" : nil
+    }
+}
+
+private struct ExporterReadiness: Decodable {
+    let exporter: ExporterHealth?
 }

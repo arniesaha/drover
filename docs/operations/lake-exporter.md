@@ -123,3 +123,54 @@ were the opt-in full-backup rehearsal and two legacy exporter cases requiring
 an external-DSN environment variable; that variable was explicitly removed so
 this run used the harness-owned disposable cluster. Formatting/import checks
 and `git diff --check` passed. Runtime-pin rejection leaves ingress pending.
+
+## Freshness and supervised recovery
+
+For DuckLake hubs, `/readyz` includes `exporter`: `state`, `running`,
+`last_successful_export_at` (UTC, null until the first acknowledged export),
+`unacknowledged_batches`, `oldest_unacknowledged_age_seconds`,
+`oldest_outstanding_age_seconds`, `last_error`, `restart_count` and
+`recovery_action`. During backoff, `recovery_pending` is true and the action
+reports the scheduled restart. The outstanding age also includes pending ingress that has
+not yet formed a batch. A running idle exporter is `ok` even if its last export
+was hours ago. Outstanding work is `lagging` at 30 seconds and `stalled` at
+120 seconds. An unavailable freshness probe reports `stalled`; an exporter
+without a running owner reports `stopped`. The last error is retained after
+recovery for diagnosis; the verdict uses current running state and backlog.
+
+Freshness is sampled every two seconds from PostgreSQL with a two-second SQL
+timeout. Ages advance between samples. Readiness uses the cached snapshot and
+does not open DuckLake for these fields. `/healthz` remains unchanged. Exporter
+lag is separate from the control API readiness verdict, so fleet management
+can remain available while analytical reads catch up. Split API/analytics
+roles forward the same snapshot through the existing authenticated worker
+health RPC. An unreachable worker is reported as stopped with unknown counts.
+
+`drover doctor` on a DuckLake hub reads the running hub's readiness, including
+503 responses, and prints the same fields, verdict and recovery action. If
+hub status cannot be obtained, it reads durable control-store progress and
+reports stopped with `hub_status_unavailable`; it cannot infer a live owner
+from the database alone. The iOS fleet header polls readiness while active and
+shows "Search and recall may be out of date" for lagging, stalled or stopped.
+
+After a runtime owner failure (including a killed batch process or the existing
+30-second export deadline), the owner releases its fence before replacement.
+The supervisor allows five replacements per hub process lifetime, waiting
+1, 2, 4, 8 and 16 seconds. A replacement reacquires the fence and reuses frozen
+inputs and committed receipts before acknowledging PostgreSQL. Never delete
+outbox rows or receipts to recover a backlog. Startup validation failures still
+fail closed. Shutdown interrupts backoff and prevents replacement.
+
+For lagging work, wait briefly and run doctor again. For stalled or stopped
+work, check exporter error codes and control/catalog connectivity, runtime pins,
+provisioning and disk capacity. Correct the underlying error first. Once the
+replacement budget is exhausted, restart the hub to reset it. Confirm running
+status, decreasing outstanding age and batch count, and a new successful export
+time after synthetic ingestion. Verify that synthetic content is returned by
+recall and search before declaring recovery complete.
+
+Deployment needs no new environment variables, configuration options or schema
+migration. Restart the upgraded hub to load the supervisor. Existing #481
+runtime pins, catalog credentials and provisioning remain required. The broader
+#482 soak, restore and ingest-to-recall release gates remain required separately;
+this slice does not change update draining or terminal creation safety.
