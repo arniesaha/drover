@@ -54,7 +54,9 @@ site/
     layouts/                BaseLayout (chrome), DocsLayout (sidebar + TOC)
     components/
       ArchitectureDiagram.astro   the SVG diagram, generated from data
+      LayerStack.astro            the interactive ecosystem layer stack
       demos/                      the three interactive use cases
+    data/layers.ts          the capability-layer model behind "Where Drover fits"
     data/sessions.ts        synthetic data for the recall demo
     content/docs/*.mdx      the docs pages
     pages/                  landing, features, use cases, architecture, FAQ, contribute
@@ -70,8 +72,12 @@ site/
   sets the sidebar position and `source` names the in-repo document the page
   summarizes.
 - The architecture diagram is data in `src/components/ArchitectureDiagram.astro`.
-  Edit the `boxes`, `edges` and `chips` arrays, then compare against
-  `docs/architecture.md`.
+  Edit the `cards` and `edges` arrays, then compare against
+  `docs/architecture.md` and `docs/drover-architecture.png`.
+- The "Where Drover fits" layer stack renders from `src/data/layers.ts`. Layer
+  names, statuses, examples and boundary interfaces all live in that one file.
+- The theme colours are sampled from `src/assets/drover-hero.png`. Run
+  `node scripts/gen-brand.mjs` to print the palette and regenerate the mark.
 - Demo data is synthetic. Keep it that way: no real hostnames, repositories or
   session content.
 - Write for a stranger. Claim only what the code and docs support today, and
@@ -126,8 +132,9 @@ iOS test suites in the main workflows.
 
 ## Placeholders
 
-These are stand-ins that need a decision before public launch:
+These need a decision before public launch:
 
-- The logo mark and favicon (`src/components/Logo.astro`, `public/favicon.svg`).
+- The header mark and favicon are cropped from the README hero artwork by
+  `scripts/gen-brand.mjs`. Replace them if a dedicated logo is drawn.
 - No social sharing image is set yet.
 - The iOS section says a public beta is coming soon and has no download link.

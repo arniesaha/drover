@@ -9,15 +9,19 @@ const groups = [
     items: [
       {
         q: 'What is Drover?',
-        a: `A self-hosted cockpit and context store for a personal fleet of CLI coding agents. A central hub and a small daemon on each of your machines run agent sessions, record what happens, and expose it to a native iOS app, a web cockpit, an HTTP API and an MCP server.`,
+        a: `One interface above your native coding harnesses. A central hub and a small daemon on each of your machines run Claude Code, Codex, Antigravity and DeepSeek Harness sessions, record what happens, and expose it to a native iOS app, a web cockpit, an HTTP API and an MCP server. The <a href="${LINKS.article}" rel="noopener">launch article</a> tells the story of why.`,
       },
       {
         q: 'What is it not?',
-        a: `It is not a coding agent, a model, or a hosted service. It does not write code itself; it runs and remembers the agents that do. It is also not a team product: there are no user accounts, roles or tenants. It is built for one trusted operator.`,
+        a: `It is not a replacement harness, a model, or a hosted service. It does not flatten the native harnesses into one lowest-common-denominator agent: each keeps its own models, tools, permissions and credentials. It also does not pick the model for you. You still choose the harness and the host. It is also not a team product: there are no user accounts, roles or tenants. It is built for one trusted operator.`,
       },
       {
         q: 'How does it relate to an orchestrator like OpenClaw or Hermes?',
         a: `They sit on top. An orchestrator decides what work to do and whether it is good. Drover gives it somewhere to run that work (launch a session on a host, send turns, read status) and a memory to consult (search, recall, briefs). Drover also collects OpenClaw and Hermes activity as context, but it does not launch or control them. See the <a href="/use-cases/#orchestrator">orchestrator use case</a>.`,
+      },
+      {
+        q: 'How is it different from Herdr or Claude Code remote control?',
+        a: `They are good tools solving different slices of the problem. Herdr keeps real terminal sessions alive and reachable, and its premise is the terminal. Claude Code remote control feels native on a phone, for a Claude Code session that is already running. Drover aims at continuity above the individual harness: one way to start, watch, answer and hand off work across several harnesses and machines. There is a fuller, and hopefully fair, comparison on the <a href="/#how-it-differs">home page</a>.`,
       },
       {
         q: 'Which agents can it run?',

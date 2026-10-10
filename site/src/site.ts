@@ -3,7 +3,7 @@ export const SITE = {
   name: 'Drover',
   tagline: 'Drive your coding-agent fleet from your pocket.',
   description:
-    'Drover is a self-hosted cockpit and memory for your CLI coding agents. Run Claude Code, Codex and friends across your own machines, keep the thread between sessions, and steer it all from your phone.',
+    'Drover is one interface above your native coding harnesses. Start work, see what needs attention, answer a question and move a task to the harness with quota to spare, from your phone, on machines you own.',
   url: 'https://drover.fyi',
   repo: 'https://github.com/arniesaha/drover',
   license: 'Apache-2.0',
@@ -22,6 +22,10 @@ export const LINKS = {
   securityPolicy: `${blob}/SECURITY.md`,
   license: `${blob}/LICENSE`,
   installScript: 'https://raw.githubusercontent.com/arniesaha/drover/main/install.sh',
+  // The launch article this site takes its story from, and the earlier post it builds on.
+  article: 'https://x.com/arniesaha/status/2088854301087289783',
+  shippingOnTheGo: 'https://www.arnabsaha.com/posts/shipping-on-the-go',
+  herdr: 'https://herdr.dev/',
   doc: (path: string) => `${blob}/docs/${path}`,
   file: (path: string) => `${blob}/${path}`,
 };
