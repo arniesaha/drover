@@ -1,0 +1,144 @@
+---
+title: MCP
+description: Connect Claude Code, Codex or any MCP client to the hub so agents can read fleet state and recall past work.
+order: 3
+source: docs/mcp.md
+---
+
+The hub runs a Model Context Protocol server over streamable HTTP at `/mcp`, normally on port `7077`. Its tools all start with `drover_`. Connect an agent to it and that agent can see what the fleet is doing and recall what earlier sessions did.
+
+## Authentication today
+
+Be clear-eyed about this one.
+
+<div class="callout warn">
+
+<strong>The MCP endpoint has no authentication of its own in the current release.</strong> It is protected by where it listens: `127.0.0.1` by default. Anything that can reach the port can call every tool.
+
+</div>
+
+What that means in practice:
+
+- On a single machine, nothing to do. Agents on the hub machine connect to `http://127.0.0.1:7077/mcp`.
+- To let agents on other machines use it, you must start the hub with an explicit `--mcp-host` bind. Only do that on a private LAN or tailnet you fully trust, and restrict the port with a host firewall or Tailscale policy.
+- Never expose it to the public internet.
+- Because the transport cannot tell who is calling, the profile tool always answers at the **general** privacy tier, and profile proposals always start as pending.
+
+<div class="callout road">
+
+<strong>Roadmap.</strong> Credential-based authentication for MCP is planned. When it lands, clients will need to present a credential, and this page will change. Until then there is no credential to configure for MCP, and the bearer credentials described under [HTTP API](/docs/api/) apply to port `7080` only.
+
+</div>
+
+If an agent needs more than the general tier of your profile, give it a read-only profile credential and have it call `GET /profile` over HTTP instead. See [Integrations](/docs/integrations/#profile-at-session-start).
+
+## Connect a client
+
+Use the hub's MCP address everywhere. On the hub machine that is the loopback address below; from another machine, substitute the hub's private address.
+
+**Codex**
+
+```bash
+codex mcp add drover --url http://127.0.0.1:7077/mcp
+```
+
+**Claude Code**
+
+```bash
+claude mcp add --transport http drover http://127.0.0.1:7077/mcp
+```
+
+**Any other client.** Register a streamable HTTP server named `drover` with the URL `http://127.0.0.1:7077/mcp`. No headers are required today.
+
+Check the server from the hub's own CLI:
+
+```bash
+drover-server mcp tools
+```
+
+## One hub, one recall endpoint
+
+Point every agent at the hub, including agents running on other hosts. Hosts collect events and run sessions; the hub answers recall. There is no federation across per-host instances, and a host-local store labels itself as non-authoritative.
+
+## Tools
+
+All of these are read tools unless marked.
+
+### Fleet
+
+| Tool | What it returns |
+| --- | --- |
+| `drover_fleet_status` | Live hosts and sessions. |
+| `drover_active_sessions` | Running and waiting sessions from the fleet registry. |
+| `drover_provider_quota` | Provider quota per account, with a hint about where there is headroom. Email labels are masked. |
+
+### History and recall
+
+| Tool | What it returns |
+| --- | --- |
+| `drover_search` | Case-insensitive search over recorded agent events. |
+| `drover_recall_bundle` | One bounded bundle: keyword matches, summaries, project briefs and open loops. |
+| `drover_recall` | Semantic recall from an embedding you supply, with keyword fallback. |
+| `drover_recent_sessions` | The latest session summaries for a repository. |
+| `drover_session_summary` | The summary for one session. |
+| `drover_session_replay` | The most recent substantive events of one session. |
+| `drover_files_touched` | File paths a task or session worked on. |
+| `drover_project_brief` | The latest project-level brief for a repository. |
+| `drover_project_activity` | Per-project counts, timeline and open items. |
+| `drover_task_status` | Aggregate status for a task. |
+
+### Handoff and continuity
+
+| Tool | What it returns |
+| --- | --- |
+| `drover_handoff` | Recent summaries and active sessions for a task, repository or session. |
+| `drover_active_handoff` | A rolling brief for an open session. May call your summarizer model to refresh it. |
+| `drover_recent_contexts` | Recent context containers. |
+| `drover_context_brief` | One context container by id or label. |
+| `drover_open_loops` | Containers with next actions or open questions. |
+| `drover_resume_context` | A container plus its permitted linked summaries. |
+
+The four context tools read context containers, which are produced by an opt-in worker. See [Configuration](/docs/configuration/#context-containers).
+
+### Profile
+
+| Tool | What it does |
+| --- | --- |
+| `drover_profile` | Returns your portable profile at the general tier, within a 1,500 token ceiling. |
+| `drover_profile_propose` | **Write.** Proposes a profile change. It stays pending until you approve it. |
+
+### Housekeeping
+
+| Tool | What it does |
+| --- | --- |
+| `drover_session_close` | **Write.** Queues summary generation for a session. |
+| `drover_data_quality` | A quality snapshot of the context store. |
+| `drover_pipeline_observatory` | Readiness of the summary and brief pipeline. |
+| `drover_memory_acceptance` | A memory evidence report for a set of sessions. |
+
+The handoff tools return context. They do not move a session. To continue a session on another host or harness, use the [`continue` endpoint](/docs/api/#a-session-from-start-to-finish) of the HTTP API.
+
+## What every answer carries
+
+Read tools follow one contract so an agent can trust, or distrust, what it gets:
+
+- **Bounded size.** Collections are capped per tool, each text field at 4,096 bytes and the whole response at 65,536 bytes. Oversized results set `truncated: true`. You never receive partial JSON.
+- **Deadlines.** Each read has a five second deadline and returns `status: timeout` if it misses. Four reads run at once per server; a fifth returns `status: busy`.
+- **Provenance.** Each envelope names the answering `store` and `host`, and whether that store is authoritative.
+- **Freshness.** Each result has a `data_watermark` with a timestamp and the basis for it, for example when a summary was generated. A missing watermark is stated as unknown. Retrieval time is never passed off as data freshness.
+- **No silent fallback.** When the selected store cannot answer, the tool says `unavailable` instead of quietly answering from older history.
+
+## Teach agents to use it
+
+The repository ships an agent skill that explains how to resume prior work, search history and write grounded handoffs with these tools. Install it from a checkout:
+
+```bash
+mkdir -p ~/.agents/skills
+ln -s "$(pwd)/skills/drover" ~/.agents/skills/drover
+```
+
+Open a new agent session afterwards so its skill catalog refreshes.
+
+## Known limitation
+
+`drover_provider_quota` with `fresh=true` asks hosts to re-probe. On a hub with authentication enabled that probe fails, because the MCP server holds no hub credential. Use the default `fresh=false`.

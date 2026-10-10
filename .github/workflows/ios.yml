@@ -32,10 +32,25 @@ jobs:
       working-directory: .
       env:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      # site/ paths are dropped before classification; see the same step in
+      # ci.yml. The site has its own build check in site.yml.
       run: |
+        if [ -z "$BASE_SHA" ]; then
+          python3 scripts/ci/select_test_scope.py --github-output "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        paths=()
+        while IFS= read -r path; do
+          paths+=("$path")
+        done < <(git diff --name-only "$BASE_SHA"...HEAD \
+          | grep -vE '^(site/|\.github/workflows/site\.yml$)' || true)
+        if [ "${#paths[@]}" -eq 0 ]; then
+          echo "only site paths changed; skipping the iOS suite"
+          printf 'python=false\nios=false\n' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         python3 scripts/ci/select_test_scope.py \
-          --base "$BASE_SHA" \
-          --github-output "$GITHUB_OUTPUT"
+          --github-output "$GITHUB_OUTPUT" "${paths[@]}"
 
     - name: Run lightweight checks
       if: steps.scope.outputs.ios != 'true'

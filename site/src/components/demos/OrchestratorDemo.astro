@@ -1,0 +1,464 @@
+---
+// Use case B: one orchestrator, many workers. The orchestrator (yours) plans,
+// reviews and merges. Drover launches the harness sessions, relays turns and
+// keeps the record. Everything here is synthetic.
+const workers = [
+  { id: 's-41', host: 'studio', harness: 'codex', task: 'Add rate limiting to /export', pr: 212 },
+  { id: 's-42', host: 'laptop', harness: 'claude-code', task: 'Migrate the config loader', pr: 213 },
+  { id: 's-43', host: 'buildbox', harness: 'codex', task: 'Document the export API', pr: 214 },
+];
+---
+
+<drover-orchestrator class="demo">
+  <div class="demo-head">
+    <span class="demo-title">Use case 02 · one orchestrator, many workers</span>
+    <div class="controls">
+      <button class="chip-btn primary" type="button" data-run>Dispatch 3 tasks</button>
+      <button class="chip-btn" type="button" data-reset>Reset</button>
+    </div>
+  </div>
+
+  <div class="demo-body board">
+    <div class="orch">
+      <div class="orch-card">
+        <span class="who">your orchestrator</span>
+        <strong>plan · review · merge</strong>
+        <span class="sub">OpenClaw, Hermes, or a 40-line script</span>
+      </div>
+      <svg class="fan" viewBox="0 0 300 60" preserveAspectRatio="none" aria-hidden="true">
+        <path d="M150 0 C150 34 50 22 50 60"></path>
+        <path d="M150 0 L150 60"></path>
+        <path d="M150 0 C150 34 250 22 250 60"></path>
+      </svg>
+    </div>
+
+    <div class="lanes">
+      {
+        workers.map((w, i) => (
+          <article class="lane" data-worker={i} data-state="idle">
+            <header>
+              <span class="sid">{w.id}</span>
+              <span class="pill" data-pill>
+                queued
+              </span>
+            </header>
+            <p class="task">{w.task}</p>
+            <p class="where">
+              {w.host} · {w.harness}
+            </p>
+            <div class="bar">
+              <i data-bar />
+            </div>
+            <p class="pr" data-pr>
+              PR #{w.pr}
+            </p>
+          </article>
+        ))
+      }
+    </div>
+
+    <div class="wire">
+      <div class="wire-head">
+        <span>wire log</span>
+        <span class="legend"><i class="d"></i>Drover API <i class="o"></i>orchestrator decision</span>
+      </div>
+      <ol data-log aria-live="polite">
+        <li class="hint">Press "Dispatch 3 tasks" to watch the loop run.</li>
+      </ol>
+    </div>
+  </div>
+  <p class="demo-note">
+    Synthetic data. Review and merge policy live in your orchestrator. Drover runs the sessions and remembers them.
+  </p>
+</drover-orchestrator>
+
+<script>
+  const WORKERS = [
+    { id: 's-41', host: 'studio', harness: 'codex', turn: 'add rate limiting to /export', pr: 212 },
+    { id: 's-42', host: 'laptop', harness: 'claude-code', turn: 'migrate the config loader', pr: 213 },
+    { id: 's-43', host: 'buildbox', harness: 'codex', turn: 'document the export API', pr: 214 },
+  ];
+  const LABELS: Record<string, string> = {
+    idle: 'queued',
+    launching: 'launching',
+    running: 'running',
+    review: 'in review',
+    changes: 'changes requested',
+    merged: 'merged',
+  };
+
+  class DroverOrchestrator extends HTMLElement {
+    run = 0;
+
+    connectedCallback() {
+      this.querySelector('[data-run]')?.addEventListener('click', () => this.start());
+      this.querySelector('[data-reset]')?.addEventListener('click', () => this.reset());
+    }
+
+    lane(i: number) {
+      return this.querySelector<HTMLElement>(`[data-worker="${i}"]`)!;
+    }
+
+    set(i: number, state: string, progress?: number) {
+      const lane = this.lane(i);
+      lane.dataset.state = state;
+      lane.querySelector('[data-pill]')!.textContent = LABELS[state];
+      if (progress !== undefined) {
+        lane.querySelector<HTMLElement>('[data-bar]')!.style.width = `${progress}%`;
+      }
+    }
+
+    log(kind: 'd' | 'o', text: string) {
+      const list = this.querySelector('[data-log]')!;
+      list.querySelector('.hint')?.remove();
+      const li = document.createElement('li');
+      li.className = kind;
+      li.textContent = text;
+      list.append(li);
+      list.scrollTop = list.scrollHeight;
+    }
+
+    reset() {
+      this.run++;
+      this.removeAttribute('data-running');
+      WORKERS.forEach((_, i) => this.set(i, 'idle', 0));
+      const list = this.querySelector('[data-log]')!;
+      list.replaceChildren();
+      const hint = document.createElement('li');
+      hint.className = 'hint';
+      hint.textContent = 'Press "Dispatch 3 tasks" to watch the loop run.';
+      list.append(hint);
+      const btn = this.querySelector<HTMLButtonElement>('[data-run]');
+      if (btn) btn.disabled = false;
+    }
+
+    async start() {
+      this.reset();
+      const run = this.run;
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const wait = (ms: number) => new Promise((r) => setTimeout(r, reduced ? 60 : ms));
+      const alive = () => run === this.run;
+      const btn = this.querySelector<HTMLButtonElement>('[data-run]');
+      if (btn) btn.disabled = true;
+      this.setAttribute('data-running', '');
+
+      for (let i = 0; i < WORKERS.length; i++) {
+        const w = WORKERS[i];
+        this.set(i, 'launching', 6);
+        this.log('d', `POST /harness/hosts/${w.host}/sessions  {harness: "${w.harness}"}  -> ${w.id}`);
+        await wait(420);
+        if (!alive()) return;
+        this.set(i, 'running', 18);
+        this.log('d', `POST /harness/sessions/${w.id}/turns  "${w.turn}"`);
+        await wait(380);
+        if (!alive()) return;
+      }
+
+      this.log('d', 'GET /harness  -> 3 sessions running on 3 hosts');
+      for (const p of [38, 61, 84, 100]) {
+        await wait(620);
+        if (!alive()) return;
+        WORKERS.forEach((_, i) => this.set(i, 'running', Math.min(100, p + i * 4)));
+      }
+
+      for (let i = 0; i < WORKERS.length; i++) {
+        const w = WORKERS[i];
+        this.set(i, 'review', 100);
+        this.log('d', `POST /harness/sessions/${w.id}/publications  {pr_number: ${w.pr}}`);
+        await wait(360);
+        if (!alive()) return;
+      }
+
+      this.log('o', 'review #212: looks good');
+      await wait(520);
+      if (!alive()) return;
+      this.log('o', 'review #213: changes requested (empty config case)');
+      this.set(1, 'changes', 70);
+      await wait(700);
+      if (!alive()) return;
+      this.log('d', 'POST /harness/sessions/s-42/turns  "handle the empty config case"');
+      this.set(1, 'running', 82);
+      await wait(900);
+      if (!alive()) return;
+      this.set(1, 'review', 100);
+      this.log('o', 'review #213: looks good');
+      await wait(420);
+      if (!alive()) return;
+      this.log('o', 'review #214: looks good');
+      await wait(520);
+      if (!alive()) return;
+
+      WORKERS.forEach((_, i) => this.set(i, 'merged', 100));
+      this.log('o', 'merge #212, #213, #214. done.');
+      this.removeAttribute('data-running');
+      if (btn) btn.disabled = false;
+    }
+  }
+  customElements.define('drover-orchestrator', DroverOrchestrator);
+</script>
+
+<style>
+  drover-orchestrator {
+    display: block;
+  }
+  .controls {
+    display: flex;
+    gap: 0.4rem;
+  }
+  .board {
+    display: grid;
+    gap: 0;
+  }
+  .orch {
+    display: grid;
+    justify-items: center;
+  }
+  .orch-card {
+    display: grid;
+    justify-items: center;
+    gap: 0.1rem;
+    padding: 0.7rem 1.3rem;
+    border-radius: var(--radius-m);
+    background: var(--text);
+    color: var(--bg);
+    text-align: center;
+  }
+  .orch-card .who {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    opacity: 0.7;
+  }
+  .orch-card strong {
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+  }
+  .orch-card .sub {
+    font-size: 0.76rem;
+    opacity: 0.75;
+  }
+  .fan {
+    width: 100%;
+    max-width: 780px;
+    height: 46px;
+    display: block;
+  }
+  .fan path {
+    fill: none;
+    stroke: var(--line-strong);
+    stroke-width: 1.5;
+    stroke-dasharray: 5 6;
+    vector-effect: non-scaling-stroke;
+  }
+  :global(drover-orchestrator[data-running]) .fan path {
+    stroke: var(--ember);
+    animation: flow 0.7s linear infinite;
+  }
+  @keyframes flow {
+    to {
+      stroke-dashoffset: -22;
+    }
+  }
+  .lanes {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.8rem;
+  }
+  .lane {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    padding: 0.8rem;
+    background: var(--code-bg);
+    transition: border-color 0.3s ease;
+  }
+  .lane header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.5rem;
+  }
+  .sid {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+  .pill {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    font-weight: 600;
+    padding: 0.14rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .task {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1rem;
+    line-height: 1.25;
+    margin: 0 0 0.2rem;
+  }
+  .where {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--muted);
+    margin: 0 0 0.7rem;
+  }
+  .bar {
+    height: 6px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    overflow: hidden;
+  }
+  .bar i {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: 999px;
+    background: var(--teal);
+    transition: width 0.6s ease, background 0.3s ease;
+  }
+  .pr {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin: 0.55rem 0 0;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+  }
+  .lane[data-state='review'] .pr,
+  .lane[data-state='changes'] .pr,
+  .lane[data-state='merged'] .pr {
+    opacity: 1;
+  }
+  .lane[data-state='launching'],
+  .lane[data-state='running'] {
+    border-color: var(--teal);
+  }
+  .lane[data-state='running'] .pill,
+  .lane[data-state='launching'] .pill {
+    color: var(--teal);
+    border-color: var(--teal);
+    background: var(--teal-soft);
+  }
+  .lane[data-state='review'] {
+    border-color: var(--wheat);
+  }
+  .lane[data-state='review'] .pill {
+    color: var(--wheat);
+    border-color: var(--wheat);
+    background: var(--wheat-soft);
+  }
+  .lane[data-state='review'] .bar i {
+    background: var(--wheat);
+  }
+  .lane[data-state='changes'] {
+    border-color: var(--ember);
+  }
+  .lane[data-state='changes'] .pill {
+    color: var(--ember);
+    border-color: var(--ember);
+    background: var(--ember-soft);
+  }
+  .lane[data-state='changes'] .bar i {
+    background: var(--ember);
+  }
+  .lane[data-state='merged'] {
+    border-color: var(--ok);
+  }
+  .lane[data-state='merged'] .pill {
+    color: var(--ok);
+    border-color: var(--ok);
+    background: color-mix(in srgb, var(--ok) 12%, transparent);
+  }
+  .lane[data-state='merged'] .bar i {
+    background: var(--ok);
+  }
+  .wire {
+    margin-top: 1rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    background: var(--code-bg);
+    overflow: hidden;
+  }
+  .wire-head {
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.45rem 0.8rem;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .legend {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .legend i {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    margin-left: 0.5rem;
+  }
+  .legend .d {
+    background: var(--teal);
+  }
+  .legend .o {
+    background: var(--ember);
+  }
+  .wire ol {
+    list-style: none;
+    margin: 0;
+    padding: 0.6rem 0.8rem;
+    height: 168px;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.7;
+  }
+  .wire :global(li) {
+    padding-left: 0.7rem;
+    border-left: 2px solid var(--line);
+    overflow-wrap: anywhere;
+    animation: line-in 0.3s ease both;
+  }
+  .wire :global(li.d) {
+    border-left-color: var(--teal);
+    color: var(--text-2);
+  }
+  .wire :global(li.o) {
+    border-left-color: var(--ember);
+    color: var(--text);
+  }
+  .wire :global(li.hint) {
+    color: var(--muted);
+    border-left-color: transparent;
+  }
+  @keyframes line-in {
+    from {
+      opacity: 0;
+      transform: translateX(-6px);
+    }
+  }
+  @media (max-width: 760px) {
+    .lanes {
+      grid-template-columns: 1fr;
+    }
+    .fan {
+      display: none;
+    }
+    .orch {
+      margin-bottom: 0.8rem;
+    }
+  }
+</style>

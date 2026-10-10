@@ -1,0 +1,439 @@
+---
+// "Where Drover fits": an interactive layer stack rendered from data/layers.ts.
+// Hover, focus or tap a layer (or the side rail) to read what it is and what
+// lives there. Without JavaScript every description is simply listed.
+import { LAYERS, RAIL, STATUS_LABEL } from '../data/layers';
+
+interface Props {
+  /** Smaller variant for the landing page. */
+  compact?: boolean;
+  /** Layer selected on load. */
+  initial?: string;
+}
+const { compact = false, initial = 'continuity' } = Astro.props;
+
+// Lay the stack out on grid rows, slotting boundary rows between layers.
+type Row = { kind: 'layer'; index: number } | { kind: 'boundary'; labels: string[] };
+const rows: Row[] = [];
+LAYERS.forEach((layer, index) => {
+  rows.push({ kind: 'layer', index });
+  if (layer.boundaryBelow) rows.push({ kind: 'boundary', labels: layer.boundaryBelow });
+});
+const rowOf = (id: string) => rows.findIndex((r) => r.kind === 'layer' && LAYERS[r.index].id === id) + 1;
+const railStart = rowOf(RAIL.from);
+const railEnd = rowOf(RAIL.to) + 1;
+
+const droverRows = rows
+  .map((r, i) => (r.kind === 'layer' && LAYERS[r.index].owner === 'drover' ? i + 1 : 0))
+  .filter(Boolean);
+const droverStart = Math.min(...droverRows);
+const droverEnd = Math.max(...droverRows) + 1;
+
+const panels = [...LAYERS, RAIL];
+---
+
+<drover-layers class:list={['layers', { compact }]} data-initial={initial}>
+  <div class="stack" style={`--rows:${rows.length}`}>
+    <div class="drover-group" style={`grid-row:${droverStart} / ${droverEnd}`} aria-hidden="true">
+      <span>Drover</span>
+    </div>
+    {
+      rows.map((row, i) =>
+        row.kind === 'layer' ? (
+          <button
+            type="button"
+            class:list={['layer', LAYERS[row.index].owner, `st-${LAYERS[row.index].status}`]}
+            style={`grid-row:${i + 1}`}
+            data-layer={LAYERS[row.index].id}
+            aria-controls={`layer-panel-${LAYERS[row.index].id}`}
+            aria-pressed={LAYERS[row.index].id === initial ? 'true' : 'false'}
+          >
+            <span class="num">{row.index + 1}</span>
+            <span class="txt">
+              <strong>{LAYERS[row.index].name}</strong>
+              <span class="short">{LAYERS[row.index].short}</span>
+            </span>
+            <span class={`status ${LAYERS[row.index].status}`}>{STATUS_LABEL[LAYERS[row.index].status]}</span>
+          </button>
+        ) : (
+          <div class="boundary" style={`grid-row:${i + 1}`}>
+            {row.labels.map((label) => (
+              <span>{label}</span>
+            ))}
+          </div>
+        ),
+      )
+    }
+    <button
+      type="button"
+      class="rail"
+      style={`grid-row:${railStart} / ${railEnd}`}
+      data-layer={RAIL.id}
+      aria-controls={`layer-panel-${RAIL.id}`}
+      aria-pressed="false"
+    >
+      <span class="rail-name">{RAIL.name}</span>
+    </button>
+  </div>
+
+  <div class="detail" aria-live="polite">
+    {
+      panels.map((p) => (
+        <section class="panel" id={`layer-panel-${p.id}`} data-panel={p.id} data-active={p.id === initial ? '' : undefined}>
+          <header>
+            <h3>{p.name}</h3>
+            <span class={`status ${p.status}`}>{STATUS_LABEL[p.status]}</span>
+          </header>
+          <p>{p.summary}</p>
+          <ul>
+            {p.items.map((item) => (
+              <li>
+                <span>{item.text}</span>
+                {item.status && <span class={`status sm ${item.status}`}>{STATUS_LABEL[item.status]}</span>}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))
+    }
+    <p class="hint">Hover or tap a layer.</p>
+  </div>
+</drover-layers>
+
+<script>
+  class DroverLayers extends HTMLElement {
+    connectedCallback() {
+      this.setAttribute('data-ready', '');
+      const buttons = this.querySelectorAll<HTMLButtonElement>('[data-layer]');
+      const select = (id: string) => {
+        buttons.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.layer === id)));
+        this.querySelectorAll<HTMLElement>('[data-panel]').forEach((p) => {
+          if (p.dataset.panel === id) p.setAttribute('data-active', '');
+          else p.removeAttribute('data-active');
+        });
+      };
+      const canHover = window.matchMedia('(hover: hover)').matches;
+      buttons.forEach((b) => {
+        const id = b.dataset.layer ?? '';
+        b.addEventListener('click', () => select(id));
+        b.addEventListener('focus', () => select(id));
+        if (canHover) b.addEventListener('mouseenter', () => select(id));
+      });
+      select(this.dataset.initial ?? 'continuity');
+    }
+  }
+  customElements.define('drover-layers', DroverLayers);
+</script>
+
+<style>
+  drover-layers {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    gap: 1.4rem;
+    align-items: start;
+  }
+  .stack {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 54px;
+    grid-auto-rows: auto;
+    gap: 6px 8px;
+    position: relative;
+  }
+  .layer {
+    grid-column: 1;
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    width: 100%;
+    text-align: left;
+    font: inherit;
+    color: var(--text);
+    background: var(--surface);
+    border: 1.5px solid var(--line-strong);
+    border-radius: var(--radius-m);
+    padding: 0.7rem 0.85rem;
+    cursor: pointer;
+    transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+  }
+  .layer.ecosystem {
+    border-style: dashed;
+    background: transparent;
+  }
+  .layer.drover {
+    margin-inline: 8px;
+    width: calc(100% - 16px);
+  }
+  .layer.drover.st-shipped {
+    background: var(--teal-soft);
+    border-color: color-mix(in srgb, var(--teal) 60%, transparent);
+  }
+  .layer.drover.st-in-progress {
+    background: var(--ember-soft);
+    border-color: color-mix(in srgb, var(--ember) 60%, transparent);
+  }
+  .layer:hover,
+  .layer[aria-pressed='true'] {
+    transform: translateX(4px);
+    border-style: solid;
+    border-color: var(--text);
+    box-shadow: -4px 4px 0 var(--ember);
+  }
+  .num {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--text);
+    color: var(--bg);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+  }
+  .txt {
+    flex: 1;
+    min-width: 0;
+    display: grid;
+  }
+  .txt strong {
+    font-family: var(--font-display);
+    font-size: 1.05rem;
+    line-height: 1.2;
+    letter-spacing: -0.01em;
+  }
+  .short {
+    font-size: 0.82rem;
+    color: var(--text-2);
+    line-height: 1.35;
+  }
+  .status {
+    flex: none;
+    font-family: var(--font-mono);
+    font-size: 0.64rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 0.16rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    color: var(--muted);
+    background: var(--surface);
+    white-space: nowrap;
+  }
+  .status.sm {
+    font-size: 0.58rem;
+    padding: 0.08rem 0.4rem;
+  }
+  .status.shipped {
+    color: var(--ok);
+    border-color: color-mix(in srgb, var(--ok) 50%, transparent);
+  }
+  .status.in-progress {
+    color: var(--ember);
+    border-color: color-mix(in srgb, var(--ember) 50%, transparent);
+  }
+  .status.roadmap {
+    color: var(--wheat);
+    border-color: color-mix(in srgb, var(--wheat) 50%, transparent);
+  }
+  .boundary {
+    grid-column: 1;
+    position: relative;
+    z-index: 1;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 0.4rem;
+    min-height: 22px;
+  }
+  .boundary::before {
+    content: '';
+    position: absolute;
+    inset: 50% 0 auto 0;
+    border-top: 1.5px dashed var(--line-strong);
+  }
+  .boundary span {
+    position: relative;
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 0.14rem 0.6rem;
+    border-radius: 999px;
+    background: var(--text);
+    color: var(--bg);
+  }
+  .drover-group {
+    grid-column: 1;
+    margin-block: -5px;
+    border: 1.5px solid color-mix(in srgb, var(--teal) 55%, transparent);
+    border-radius: calc(var(--radius-m) + 6px);
+    background: color-mix(in srgb, var(--teal-soft) 35%, transparent);
+    position: relative;
+  }
+  .drover-group span {
+    position: absolute;
+    top: -9px;
+    left: 14px;
+    z-index: 2;
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 0 0.4rem;
+    color: var(--teal);
+    background: var(--bg);
+    border-radius: 4px;
+  }
+  :global(.band) .drover-group span {
+    background: var(--bg-2);
+  }
+  .rail {
+    grid-column: 2;
+    display: grid;
+    place-items: center;
+    font: inherit;
+    color: var(--text);
+    background: var(--wheat-soft);
+    border: 1.5px solid color-mix(in srgb, var(--wheat) 60%, transparent);
+    border-radius: var(--radius-m);
+    cursor: pointer;
+    padding: 0.5rem 0;
+    transition: border-color 0.18s ease, box-shadow 0.18s ease;
+  }
+  .rail:hover,
+  .rail[aria-pressed='true'] {
+    border-color: var(--text);
+    box-shadow: 4px 4px 0 var(--ember);
+  }
+  .rail-name {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  .detail {
+    position: sticky;
+    top: calc(var(--header-h) + 20px);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow);
+    padding: 1.2rem 1.3rem;
+  }
+  .panel + .panel {
+    margin-top: 1.2rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--line);
+  }
+  /* With JavaScript, show one panel at a time. */
+  drover-layers[data-ready] .panel {
+    display: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+  drover-layers[data-ready] .panel[data-active] {
+    display: block;
+    animation: panel-in 0.25s ease both;
+  }
+  @keyframes panel-in {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+  }
+  .panel header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    margin-bottom: 0.5rem;
+  }
+  .panel h3 {
+    margin: 0;
+    font-size: 1.35rem;
+  }
+  .panel p {
+    color: var(--text-2);
+    font-size: 0.97rem;
+    margin-bottom: 0.8rem;
+  }
+  .panel ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.35rem;
+  }
+  .panel li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    font-size: 0.9rem;
+    padding: 0.4rem 0.6rem;
+    border-radius: 9px;
+    background: var(--surface-2);
+  }
+  .hint {
+    display: none;
+    margin: 0.9rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--muted);
+  }
+  drover-layers[data-ready] .hint {
+    display: block;
+  }
+
+  /* Compact variant for the landing page */
+  .compact .layer {
+    padding: 0.5rem 0.7rem;
+  }
+  .compact .txt strong {
+    font-size: 0.98rem;
+  }
+  .compact .short {
+    font-size: 0.78rem;
+  }
+  .compact .panel h3 {
+    font-size: 1.15rem;
+  }
+
+  @media (max-width: 860px) {
+    drover-layers {
+      grid-template-columns: 1fr;
+    }
+    .detail {
+      position: static;
+    }
+    .stack {
+      grid-template-columns: minmax(0, 1fr) 40px;
+    }
+    .layer {
+      padding: 0.55rem 0.65rem;
+      gap: 0.55rem;
+    }
+    .layer .status {
+      font-size: 0.56rem;
+      padding: 0.1rem 0.35rem;
+    }
+    .short {
+      font-size: 0.76rem;
+    }
+    .rail-name {
+      font-size: 0.6rem;
+    }
+  }
+</style>
