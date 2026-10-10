@@ -6,7 +6,9 @@ import DroverKit
 /// strip that says where the herd is, and the provider capacity strip), then
 /// one list of live sessions, over a pinned "New Session" footer.
 ///
-/// Only the list scrolls. The header above it and the action bar below it stay
+/// At standard text sizes only the list scrolls. At accessibility sizes the
+/// status header scrolls with it to leave room for sessions. The action bar stays
+/// available below. At standard sizes the header above it and action bar stay
 /// put, so capacity is always in the first viewport instead of being scrolled
 /// past — and, more importantly, the list is one uninterrupted run. It used to
 /// be two runs with four analytics sections wedged between them, which read as
@@ -67,6 +69,8 @@ struct SessionsView: View {
         _cockpitStore = State(initialValue: CockpitStore(client: client))
     }
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     var body: some View {
         VStack(spacing: 0) {
             chromeRow
@@ -79,14 +83,8 @@ struct SessionsView: View {
                 .padding(.horizontal, 18)
             }
 
-            if store.hasLoadedOnce {
-                InboxStatusHeader(
-                    summary: summary,
-                    hostGroups: store.hostGroups,
-                    onRetry: { Task { await store.refresh() } }
-                ) {
-                    providerCapacity
-                }
+            if !dynamicTypeSize.isAccessibilitySize {
+                statusHeader
             }
 
             if let warning = exporterHealth?.warningText {
@@ -101,6 +99,7 @@ struct SessionsView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
+                    if dynamicTypeSize.isAccessibilitySize { statusHeader }
                     // Action errors (e.g. a failed continueSession) land here.
                     // They are distinct from an unreachable hub: connected, but
                     // the last thing you asked for didn't happen. Refresh
@@ -301,7 +300,8 @@ struct SessionsView: View {
                     recoveryStore: recoveryStore,
                     recoveryWriteGate: recoveryWriteGate,
                     recoveryGeneration: recoveryGeneration,
-                    chatModelFactory: chatModelFactory
+                    chatModelFactory: chatModelFactory,
+                    onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) }
                 )
             } else {
                 TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
@@ -327,6 +327,17 @@ struct SessionsView: View {
         }
         .navigationDestination(isPresented: $showHistory) {
             HistoryView(client: client)
+        }
+    }
+
+    @ViewBuilder
+    private var statusHeader: some View {
+        if store.hasLoadedOnce {
+            InboxStatusHeader(
+                summary: summary, hostGroups: store.hostGroups,
+                onRetry: { Task { await store.refresh() } }
+            ) { providerCapacity }
+            .accessibilityIdentifier("home-status-header")
         }
     }
 
@@ -492,7 +503,8 @@ struct SessionsView: View {
                         recoveryStore: recoveryStore,
                         recoveryWriteGate: recoveryWriteGate,
                         recoveryGeneration: recoveryGeneration,
-                        chatModelFactory: chatModelFactory
+                        chatModelFactory: chatModelFactory,
+                        onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) }
                     )
                 } else {
                     TerminalScreen(client: client, sessionID: session.id, harness: session.harness)

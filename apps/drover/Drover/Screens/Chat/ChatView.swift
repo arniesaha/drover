@@ -43,10 +43,12 @@ struct ChatHeaderContent: View {
 /// calls are delegated to `ChatModel` — this view only renders it.
 struct ChatView: View {
     private let client: DroverClient
+    private let sessionID: String
     private let recoveryStore: (any ChatRecoveryPersisting)?
     private let recoveryWriteGate: ChatRecoveryWriteGate
     private let recoveryGeneration: Int
     private let chatModelFactory: ChatModelFactory?
+    private let onSessionEnded: ((String, Bool) -> Void)?
     @State private var model: ChatModel
     @State private var showTerminateConfirm = false
     @State private var showDiscardPendingConfirm = false
@@ -75,13 +77,16 @@ struct ChatView: View {
         recoveryStore: (any ChatRecoveryPersisting)?,
         recoveryWriteGate: ChatRecoveryWriteGate,
         recoveryGeneration: Int,
-        chatModelFactory: ChatModelFactory? = nil
+        chatModelFactory: ChatModelFactory? = nil,
+        onSessionEnded: ((String, Bool) -> Void)? = nil
     ) {
         self.client = client
+        self.sessionID = sessionID
         self.recoveryStore = recoveryStore
         self.recoveryWriteGate = recoveryWriteGate
         self.recoveryGeneration = recoveryGeneration
         self.chatModelFactory = chatModelFactory
+        self.onSessionEnded = onSessionEnded
         _model = State(initialValue: chatModelFactory?(client, sessionID, harness) ?? ChatModel(
             client: client,
             sessionID: sessionID,
@@ -101,7 +106,7 @@ struct ChatView: View {
             // Only once a connection has existed is a disconnect worth a
             // "Reconnecting…" pill; during the initial connect it would just
             // flash misleading chrome.
-            if model.hasConnectedOnce && !model.isConnected {
+            if !model.isEnded && model.hasConnectedOnce && !model.isConnected {
                 ReconnectingPill(accessibilityID: "chat-reconnecting")
             }
 
@@ -152,7 +157,7 @@ struct ChatView: View {
 
             // Allow/Deny only when the host advertises approvals. Otherwise the
             // request is still shown as pending, with why iOS can't answer it.
-            if let approval = model.pendingApproval {
+            if !model.isEnded, let approval = model.pendingApproval {
                 if model.controls.showsApprovals {
                     DecisionBlock(
                         approval: approval,
@@ -186,10 +191,14 @@ struct ChatView: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
-                if model.hasConnectedOnce, model.isConnected,
-                   model.pendingTurn == nil, model.pendingApproval == nil,
-                   model.activity.phase != .ready {
+                if model.isStopping || (model.hasConnectedOnce && model.isConnected
+                    && model.pendingTurn == nil && model.pendingApproval == nil
+                    && model.activity.phase != .ready) {
                     SessionActivityView(activity: model.activity)
+                }
+                if model.isEnded {
+                    ChatHintBanner(model.endedMessage)
+                        .accessibilityIdentifier("chat-ended")
                 }
                 Composer(text: $model.composerText,
                      attachments: $model.pendingAttachments,
@@ -197,14 +206,16 @@ struct ChatView: View {
                      controls: model.controls,
                      isSending: model.isSending,
                      canSend: model.canSendTurn,
-                     canAddAttachments: !model.isCommittingPendingDeliveryAction,
+                     canAddAttachments: !model.isEnded && !model.isCommittingPendingDeliveryAction,
                      onAddAttachment: { attachment in
                          await model.addAttachmentIfRecoverable(attachment)
                      }) {
                     Task { await model.sendTurn() }
                 }
+                .disabled(model.isEnded)
             }
         }
+        .onChange(of: model.isEnded) { _, ended in onSessionEnded?(sessionID, ended) }
         .background(DroverColor.bg)
         .navigationTitle(model.harnessPresentation.name)
         .navigationBarTitleDisplayMode(.inline)
@@ -269,7 +280,8 @@ struct ChatView: View {
                     recoveryStore: recoveryStore,
                     recoveryWriteGate: recoveryWriteGate,
                     recoveryGeneration: recoveryGeneration,
-                    chatModelFactory: chatModelFactory
+                    chatModelFactory: chatModelFactory,
+                    onSessionEnded: onSessionEnded
                 )
             } else {
                 TerminalScreen(client: client, sessionID: handoff.id, harness: handoff.harness)
@@ -680,6 +692,7 @@ struct ChatView: View {
                     }
                 }
                 .disabled(!model.controls.canInterrupt)
+                .disabled(model.isStopping || model.isEnded)
                 .accessibilityIdentifier("chat-interrupt")
                 // Same-harness handoff also needs an advertised structured target.
                 Button {
