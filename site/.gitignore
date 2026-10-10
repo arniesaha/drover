@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.shots/
 .astro/
 .vercel/
 npm-debug.log*

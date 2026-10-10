@@ -40,6 +40,16 @@ npm run preview    # serve dist/ locally
 | `check-content.mjs` | No em or en dashes, no home-directory paths, private addresses or tailnet hostnames, no third-party resources loaded at runtime, and no words glued to links. |
 | `check-budget.mjs` | A small offline stand-in for a Lighthouse budget: gzipped first-load size per page, client JavaScript per page, fonts and total output. |
 
+Two more scripts are not part of `npm run check`:
+
+| Script | Purpose |
+| --- | --- |
+| `check-overflow.mjs` | Opens each built page in a browser at 320 to 1280 px. Fails on sideways scroll, on an element outside the viewport, or on a hero that is not centred. Needs Playwright: `npm install --no-save playwright`, `npx playwright install chromium-headless-shell`, then `npm run check:overflow`. Add `-- --shots` to write screenshots to `.shots/`. |
+| `word-count.mjs` | Prints the prose word count of each page: `npm run words`. |
+
+`check-content.mjs` also rejects a grid track without a minimum (a bare `1fr`),
+which is the usual cause of sideways scroll on a phone.
+
 Set `ASTRO_TELEMETRY_DISABLED=1` if you do not want the Astro CLI to send its
 own anonymous build telemetry. CI and the Dockerfile set it.
 
@@ -83,6 +93,11 @@ site/
 - Write for a stranger. Claim only what the code and docs support today, and
   label anything else as opt-in or roadmap.
 - House style: no em dashes. `npm run check` enforces it.
+- Docs pages follow Simplified Technical English and the Google developer
+  documentation style guide: short sentences, active voice, present tense,
+  second person, one term for one thing (hub, host, session, harness), numbered
+  steps for procedures, sentence-case headings.
+- Keep marketing pages short. Run `npm run words` before and after an edit.
 
 ## Deploy
 
