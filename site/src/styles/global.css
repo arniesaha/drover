@@ -78,6 +78,8 @@ html {
 
 body {
   margin: 0;
+  /* Long words, URLs and commands wrap instead of pushing the page sideways. */
+  overflow-wrap: break-word;
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-body);
@@ -126,11 +128,11 @@ h4 {
   text-wrap: balance;
 }
 h1 {
-  font-size: clamp(2.6rem, 6.4vw, 4.9rem);
+  font-size: clamp(2.1rem, 1.2rem + 5.2vw, 4.9rem);
   font-variation-settings: 'wdth' 92;
 }
 h2 {
-  font-size: clamp(1.9rem, 3.6vw, 2.8rem);
+  font-size: clamp(1.6rem, 1.1rem + 2.4vw, 2.8rem);
 }
 h3 {
   font-size: 1.3rem;
@@ -158,9 +160,10 @@ samp {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 0.1em 0.38em;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 pre {
+  max-width: 100%;
   background: var(--code-bg) !important;
   border: 1px solid var(--line);
   border-radius: var(--radius-m);
@@ -182,6 +185,18 @@ pre code {
 :root[data-theme='dark'] .astro-code,
 :root[data-theme='dark'] .astro-code span {
   color: var(--shiki-dark);
+}
+
+/* Grid and flex children may shrink below their content width. Without this a
+   long code line inside a one-column grid widens the whole page on a phone. */
+.wrap > *,
+.wrap-narrow > *,
+.grid > *,
+main > * {
+  min-width: 0;
+}
+main {
+  overflow-x: clip;
 }
 
 /* Layout helpers */
@@ -531,7 +546,7 @@ th {
   background: var(--glow);
 }
 .page-hero h1 {
-  font-size: clamp(2.3rem, 5.4vw, 4rem);
+  font-size: clamp(2rem, 1.2rem + 4vw, 4rem);
   max-width: 18ch;
 }
 

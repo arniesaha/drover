@@ -1,29 +1,39 @@
 ---
 title: Integrations
-description: Wire Drover into Claude Code, Codex and orchestrators such as OpenClaw and Hermes.
+description: Connect Drover to Claude Code, Codex and orchestrators such as OpenClaw and Hermes.
 order: 4
 source: docs/integrations.md
 ---
 
-There are three ways a tool can relate to Drover, and most tools use more than one:
+A tool can relate to Drover in three ways:
 
-| Relationship | What it means | How |
+| Relation | Meaning | Method |
 | --- | --- | --- |
-| **Driven** | Drover launches and steers its sessions. | A harness adapter on a host. |
-| **Connected** | It reads fleet state and history. | The [MCP server](/docs/mcp/) or the [HTTP API](/docs/api/). |
-| **Observed** | Its own session logs become part of your history. | `drover-collect` on the machine that has the logs. |
+| **Driven** | Drover starts and controls its sessions. | A harness adapter on a host. |
+| **Connected** | The tool reads fleet state and history. | [MCP](/docs/mcp/) or the [HTTP API](/docs/api/). |
+| **Observed** | Drover collects its session logs. | `drover-collect` on the machine with the logs. |
+
+Each MCP connection needs a bearer credential. See [MCP authentication](/docs/mcp/#authentication).
 
 ## Claude Code
 
-**Driven.** Install the Claude Code CLI on a host and sign in. It then appears as a launch target for that host. Claude Code is the adapter with approval support: when a tool call needs a yes, the request is relayed to the app or the API.
+**Driven.** Install the Claude Code CLI on a host and sign in. Claude Code is the only adapter that supports approvals.
 
-**Connected.** Register the hub's MCP endpoint:
+**Connected.** Add the hub to `.mcp.json`. Set `DROVER_MCP_URL` and `DROVER_MCP_TOKEN` before you start Claude Code:
 
-```bash
-claude mcp add --transport http drover http://127.0.0.1:7077/mcp
+```json
+{
+  "mcpServers": {
+    "drover": {
+      "type": "http",
+      "url": "${DROVER_MCP_URL}",
+      "headers": {"Authorization": "Bearer ${DROVER_MCP_TOKEN}"}
+    }
+  }
+}
 ```
 
-**Profile at start.** To load your portable profile into every session, add a `SessionStart` hook to the project's Claude Code settings. The repository ships a small script for this; copy it from `docs/integrations/claude-session-start.py` and adjust the path:
+**Profile at session start.** Add a `SessionStart` hook to the project settings. Copy the script from `docs/integrations/claude-session-start.py` and adjust the path:
 
 ```json
 {
@@ -44,19 +54,21 @@ claude mcp add --transport http drover http://127.0.0.1:7077/mcp
 }
 ```
 
-Set `DROVER_MCP_URL` to the hub's MCP address in the client environment. The hook makes one profile read and adds the result as context. If Drover is unreachable, the session starts normally without it.
+The hook reads the profile one time and adds it as context. If the hub is not available, the session starts without the profile.
 
 ## Codex
 
-**Driven.** Install the Codex CLI on a host and sign in. When the project is a Git repository, sessions launched by Drover run in their own worktree.
+**Driven.** Install the Codex CLI on a host and sign in. In a Git repository, a session that Drover starts runs in its own worktree.
 
-**Connected.**
+**Connected.** Add this to the Codex configuration. Set `DROVER_MCP_TOKEN` in the environment that starts Codex:
 
-```bash
-codex mcp add drover --url http://127.0.0.1:7077/mcp
+```toml
+[mcp_servers.drover]
+url = "http://localhost:7077/mcp"
+bearer_token_env_var = "DROVER_MCP_TOKEN"
 ```
 
-**Profile at start.** Codex has no startup hook that Drover relies on, so the instruction lives in the project's `AGENTS.md`:
+**Profile at session start.** Add this instruction to the `AGENTS.md` of the project:
 
 ```text
 At the start of each session, before working on the first user request, call
@@ -70,19 +82,23 @@ current request and mention that profile context could not be loaded. Do not
 invent missing content or issue extra reads to reveal withheld items.
 ```
 
-This is an instruction to the model, not a guarantee that every Codex runtime follows it.
+This is an instruction to the model. Not all Codex runtimes follow it.
 
 ## Antigravity and DeepSeek Harness
 
-Both are driven harnesses. Install the CLI (`agy`, or `dsh` for DeepSeek Harness) on the host.
+Both are driven harnesses. Install the CLI on the host: `agy` for Antigravity, `dsh` for DeepSeek Harness.
 
-DeepSeek Harness is driven through its local Web RPC service, which must be listening on loopback. Its file sandbox is rooted at the working directory the session starts in, so launch it in the checkout you want it to change. Drover refuses to launch it against a directory that does not exist.
+For DeepSeek Harness:
+
+- Keep its Web RPC service on loopback.
+- Start the session in the checkout that you want it to change. Its file sandbox is the start directory.
+- Drover refuses a start directory that does not exist.
 
 ## OpenClaw
 
-Drover and OpenClaw meet in three places. None of them lets Drover control OpenClaw.
+Drover does not control OpenClaw.
 
-**Observed: collect OpenClaw conversations.** `drover-collect` reads OpenClaw sessions from the JSONL files used by older releases or the per-agent SQLite store used by current ones. Add this to the collector's config (`~/.drover/collect.toml`):
+**Observed.** `drover-collect` reads OpenClaw sessions from JSONL files or from the SQLite store of each agent. Add this to `~/.drover/collect.toml`:
 
 ```toml
 [sources.openclaw]
@@ -91,9 +107,9 @@ store     = "auto"            # "auto" | "sqlite" | "jsonl"
 state_dir = "~/.openclaw"
 ```
 
-Collection is strictly read-only. The SQLite database is opened in read-only mode, read in small batches, and skipped until the next run if OpenClaw has it locked. Auth profiles, tokens, account and peer identifiers are never read. Transcript content is imported as is.
+The collector opens the SQLite database read-only. It does not read sign-in profiles, tokens or account identifiers.
 
-**Connected: let OpenClaw agents recall.** Add the hub's MCP endpoint to OpenClaw's MCP configuration, then put this note in the session bootstrap instructions:
+**Connected.** Configure the MCP connection of OpenClaw to send the `Authorization` header on each request. Then add this note to the session start instructions:
 
 ```text
 Before the first task in a new agent session, call the connected Drover MCP tool
@@ -106,56 +122,62 @@ Do not loop to fetch omitted or withheld items. If Drover is unavailable, record
 that fact in session context and continue without inventing profile content.
 ```
 
-**Driving Drover from OpenClaw.** An OpenClaw agent, or any orchestrator, can launch and steer Drover sessions through the [HTTP API](/docs/api/) with a bearer credential kept in the orchestrator's secret store, outside model context. After a worker pushes a branch, record it with `POST /harness/sessions/{id}/publications` so the session history shows what it produced.
+**As an orchestrator.** An orchestrator can start and control sessions through the [HTTP API](/docs/api/). Keep the credential in the secret store of the orchestrator. After a worker pushes a branch, record it with `POST /harness/sessions/{id}/publications`.
 
 <div class="callout road">
 
-**Experimental.** The repository also contains a narrow launch bridge for a task-flow controller and an OpenClaw plugin for durable owner hand-back. Both are early, the plugin ships inactive, and neither has been verified against a live OpenClaw gateway. Treat them as work in progress.
+**Experimental.** The repository contains a launch bridge and an OpenClaw plugin for owner hand-back. The plugin is inactive by default. Neither is verified with a live OpenClaw gateway.
 
 </div>
 
 ## Hermes
 
-Hermes sessions are **observed**: enable the `hermes` source in the collector config and they join your history. Hermes agents can be **connected** the same way as OpenClaw, with the MCP endpoint and the bootstrap note above. Hermes is not a launch target.
+Hermes is **observed**: enable the `hermes` source in the collector configuration. Hermes agents can be **connected** with MCP and the note above. You cannot start Hermes from Drover.
 
 ## Profile at session start
 
-Every client follows the same contract: make **one** profile read at session start and add the returned `bundle` to the session context. Drover does not start your agents or edit their prompts; the client owns that.
+Each client reads the profile one time at session start and adds the `bundle` to the session context. Drover does not start your agents or change their prompts.
 
-Over MCP, call `drover_profile` with `{"scope":"first_turn"}`. This always reads at the general tier.
+1. Issue a read-only profile credential for the agent:
 
-For an agent you trust with more, issue it a read-only credential and use HTTP:
+   ```bash
+   drover profile agents issue my-agent --tier trusted
+   ```
 
-```bash
-drover profile agents issue my-agent --tier trusted
-```
+   The command prints the credential one time. The default tier is general.
 
-```bash
-curl --fail --silent --show-error --max-time 5 \
-  -H "Authorization: Bearer $DROVER_PROFILE_TOKEN" \
-  "$DROVER_HTTP_URL/profile?scope=first_turn"
-```
+2. Read the profile with MCP or with HTTP. The tier of the credential applies to both.
 
-The credential is printed once. It can only call `GET /profile`: it cannot write proposals, touch the fleet, pair clients or manage other credentials. Revoke it with `drover profile agents revoke my-agent`.
+   With MCP, call `drover_profile` with `{"scope":"first_turn"}`.
 
-Both transports return the same bounded bundle with `withheld_count`, `truncated`, `data_watermark` and `oldest_item_age_seconds`. Treat profile text as data, not as authorization, and do not block session start if the read fails.
+   With HTTP:
 
-## The collector
+   ```bash
+   curl --fail --silent --show-error --max-time 5 \
+     -H "Authorization: Bearer $DROVER_PROFILE_TOKEN" \
+     "$DROVER_HTTP_URL/profile?scope=first_turn"
+   ```
 
-`drover-collect` runs on any machine that has agent logs worth keeping. It parses them, attributes them to a repository, and ships normalized events to the hub.
+A profile credential can read only the profile. To revoke it, run `drover profile agents revoke my-agent`.
+
+Use profile text as data, not as authorization. Do not stop the session start if the read fails.
+
+## Collector
+
+`drover-collect` runs on a machine that has agent logs. It parses the logs and sends events to the hub.
 
 ```bash
 drover-collect init      # writes ~/.drover/collect.toml
-drover-collect run       # one pass over the enabled sources
+drover-collect run       # reads the enabled sources one time
 drover-collect status
 ```
 
-Repository identity comes from the log metadata or the local Git checkout. When logs were written on a machine with a different directory layout, map the prefix explicitly:
+If the logs come from a machine with a different directory layout, map the path prefix:
 
 ```bash
 export DROVER_REPO_ROOTS_JSON='{ "/srv/projects/example": "acme/example" }'
 ```
 
-## Optional: OpenTelemetry spans
+## OpenTelemetry spans
 
-Drover can accept OTLP spans from an external producer. This is a legacy integration, off by default, and no core feature depends on it. Token and cache numbers come from the harness event stream instead. See [the span integration note](https://github.com/arniesaha/drover/blob/main/docs/optional-span-integration.md) if you need it.
+Drover can accept OpenTelemetry Protocol (OTLP) spans. This integration is off by default, and no core feature needs it. See the [span integration note](https://github.com/arniesaha/drover/blob/main/docs/optional-span-integration.md).

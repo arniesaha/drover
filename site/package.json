@@ -15,6 +15,8 @@
     "check:links": "node scripts/check-links.mjs",
     "check:content": "node scripts/check-content.mjs",
     "check:budget": "node scripts/check-budget.mjs",
+    "check:overflow": "node scripts/check-overflow.mjs",
+    "words": "node scripts/word-count.mjs",
     "check": "npm run check:links && npm run check:content && npm run check:budget",
     "test": "npm run build && npm run check"
   },

@@ -63,12 +63,12 @@ const workers = [
         <span class="legend"><i class="d"></i>Drover API <i class="o"></i>orchestrator decision</span>
       </div>
       <ol data-log aria-live="polite">
-        <li class="hint">Press "Dispatch 3 tasks" to watch the loop run.</li>
+        <li class="hint">Select "Dispatch 3 tasks".</li>
       </ol>
     </div>
   </div>
   <p class="demo-note">
-    Synthetic data. Review and merge policy live in your orchestrator. Drover runs the sessions and remembers them.
+    Synthetic data.
   </p>
 </drover-orchestrator>
 
@@ -126,7 +126,7 @@ const workers = [
       list.replaceChildren();
       const hint = document.createElement('li');
       hint.className = 'hint';
-      hint.textContent = 'Press "Dispatch 3 tasks" to watch the loop run.';
+      hint.textContent = 'Select "Dispatch 3 tasks".';
       list.append(hint);
       const btn = this.querySelector<HTMLButtonElement>('[data-run]');
       if (btn) btn.disabled = false;
@@ -262,7 +262,7 @@ const workers = [
   }
   .lanes {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 0.8rem;
   }
   .lane {
@@ -452,7 +452,7 @@ const workers = [
   }
   @media (max-width: 760px) {
     .lanes {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
     .fan {
       display: none;

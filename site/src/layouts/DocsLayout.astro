@@ -54,7 +54,7 @@ const toc = headings.filter((h) => h.depth === 2);
       {
         source && (
           <p class="source">
-            This page is the public summary. The in-repo reference is{' '}
+            This page is a summary. The reference is{' '}
             <a href={LINKS.file(source)} rel="noopener">
               {source}
             </a>
@@ -164,7 +164,7 @@ const toc = headings.filter((h) => h.depth === 2);
   }
   .pager {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 1rem;
     margin-top: 2rem;
     max-width: 74ch;
@@ -226,7 +226,7 @@ const toc = headings.filter((h) => h.depth === 2);
   }
   @media (max-width: 760px) {
     .docs {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
       gap: 1.5rem;
       padding-top: 1.5rem;
     }
@@ -234,7 +234,7 @@ const toc = headings.filter((h) => h.depth === 2);
       position: static;
     }
     .sidebar nav {
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 </style>

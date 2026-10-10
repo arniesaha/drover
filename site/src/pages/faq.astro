@@ -9,40 +9,40 @@ const groups = [
     items: [
       {
         q: 'What is Drover?',
-        a: `One interface above your native coding harnesses. A central hub and a small daemon on each of your machines run Claude Code, Codex, Antigravity and DeepSeek Harness sessions, record what happens, and expose it to a native iOS app, a web cockpit, an HTTP API and an MCP server. The <a href="${LINKS.article}" rel="noopener">launch article</a> tells the story of why.`,
+        a: `One interface above your native coding harnesses. A hub and a daemon on each host run sessions and record them. You control them from an iOS app, a web cockpit, an HTTP API and an MCP server. Read the <a href="${LINKS.article}" rel="noopener">launch article</a>.`,
       },
       {
-        q: 'What is it not?',
-        a: `It is not a replacement harness, a model, or a hosted service. It does not flatten the native harnesses into one lowest-common-denominator agent: each keeps its own models, tools, permissions and credentials. It also does not pick the model for you. You still choose the harness and the host. It is also not a team product: there are no user accounts, roles or tenants. It is built for one trusted operator.`,
+        q: 'What is Drover not?',
+        a: `Drover is not a replacement harness, a model or a hosted service. It does not select the model for you. It has no user accounts.`,
       },
       {
-        q: 'How does it relate to an orchestrator like OpenClaw or Hermes?',
-        a: `They sit on top. An orchestrator decides what work to do and whether it is good. Drover gives it somewhere to run that work (launch a session on a host, send turns, read status) and a memory to consult (search, recall, briefs). Drover also collects OpenClaw and Hermes activity as context, but it does not launch or control them. See the <a href="/use-cases/#orchestrator">orchestrator use case</a>.`,
+        q: 'How does Drover relate to an orchestrator such as OpenClaw or Hermes?',
+        a: `The orchestrator plans the work. Drover runs the sessions and keeps the history. Drover also collects OpenClaw and Hermes activity, but it does not control them. See the <a href="/use-cases/#orchestrator">orchestrator use case</a>.`,
       },
       {
-        q: 'How is it different from Herdr or Claude Code remote control?',
-        a: `They are good tools solving different slices of the problem. Herdr keeps real terminal sessions alive and reachable, and its premise is the terminal. Claude Code remote control feels native on a phone, for a Claude Code session that is already running. Drover aims at continuity above the individual harness: one way to start, watch, answer and hand off work across several harnesses and machines. There is a fuller, and hopefully fair, comparison on the <a href="/#how-it-differs">home page</a>.`,
+        q: 'How does Drover differ from Herdr or Claude Code remote control?',
+        a: `They are good tools for different parts of the problem. See the <a href="/#how-it-differs">comparison on the home page</a>.`,
       },
       {
-        q: 'Which agents can it run?',
-        a: `Today Drover launches and drives Claude Code, Codex, Antigravity (agy) and DeepSeek Harness, plus a plain shell terminal. A harness appears as a launch target on a host only when its CLI is installed there. OpenClaw and Hermes are observe-only.`,
+        q: 'Which harnesses can Drover drive?',
+        a: `Claude Code, Codex, Antigravity (agy) and DeepSeek Harness, and a shell terminal. A harness is available on a host when its CLI is installed there.`,
       },
     ],
   },
   {
-    title: 'Cost and licensing',
+    title: 'Cost and license',
     items: [
       {
-        q: 'What does it cost?',
-        a: `Nothing. Drover is free and open source. You bring your own agent CLIs, model accounts and API keys, and you pay those providers whatever you already pay them. Drover adds no subscription and takes no cut.`,
+        q: 'What does Drover cost?',
+        a: `Nothing. You bring your own harnesses, model accounts and API keys.`,
       },
       {
         q: 'What is the license?',
-        a: `<a href="${LINKS.license}" rel="noopener">Apache-2.0</a>. Use it, change it, ship it, within the terms of that license.`,
+        a: `<a href="${LINKS.license}" rel="noopener">Apache-2.0</a>.`,
       },
       {
-        q: 'Is the iOS app free too?',
-        a: `Yes. It is a free developer tool that you build from source with Xcode today. It is not on the App Store. A public beta is coming soon.`,
+        q: 'Is the iOS app free?',
+        a: `Yes. You build it from source with Xcode. It is not on the App Store. A public beta is coming soon.`,
       },
     ],
   },
@@ -50,57 +50,59 @@ const groups = [
     title: 'Data and privacy',
     items: [
       {
-        q: 'Where does my data live?',
-        a: `On your machines. By default under <code>~/.drover/</code>, in a PostgreSQL database you operate, and, if you select it, a DuckLake lake on your disk. There is no Drover cloud, no Drover account, and no analytics or usage telemetry sent to the project. By default the hub does make a periodic check for new releases on GitHub, which you can pin or turn off in <a href="/docs/configuration/#updates">configuration</a>.`,
+        q: 'Where is my data stored?',
+        a: `On your machines: in <code>~/.drover/</code>, in your PostgreSQL database and, if you select it, in a DuckLake lake. There is no Drover cloud and no Drover account.`,
       },
       {
-        q: 'Does anything ever leave my machines?',
-        a: `Only through things you configure or already use. The agent CLIs talk to their own model providers as usual. If you enable summaries or embeddings with an external provider, that provider receives the text it processes. If you enable push notifications, alerts travel through Apple and can include a short response preview. Everything else stays put. Details are in <a href="/docs/security-privacy/">Security and privacy</a>.`,
+        q: 'Does data leave my machines?',
+        a: `Only through integrations you configure or already use. Examples are a model provider for summaries, Apple push notifications and the update check on GitHub. See <a href="/docs/security-privacy/#when-data-leaves-your-machines">Security and privacy</a>.`,
       },
       {
-        q: 'Can I keep summaries fully local?',
-        a: `Embeddings can run on a local Ollama backend. Summaries and briefs currently use the Claude Code CLI or an Anthropic API key, and both send transcript text to Anthropic. If that is not acceptable, leave the summarizer unconfigured: ingest, search, replay and fleet control work without it.`,
+        q: 'Can summaries stay local?',
+        a: `No. Summaries use the Claude Code CLI or the Anthropic API, and both send transcript text to Anthropic. Embeddings can use a local Ollama backend. Drover works without summaries.`,
       },
       {
-        q: 'Is it safe to expose to the internet?',
-        a: `No. The supported boundary is localhost, a trusted private LAN, or a private Tailscale network. The built-in listeners do not provide TLS, the MCP endpoint has no authentication of its own yet, and any credential is equivalent to interactive access to your hosts. Do not use Tailscale Funnel or a public reverse proxy.`,
+        q: 'Can I expose Drover to the internet?',
+        a: `No. Use localhost, a private LAN or a private Tailscale network. The listeners do not provide TLS. A device or host credential gives shell access to your hosts.`,
       },
     ],
   },
   {
-    title: 'Platforms and behaviour',
+    title: 'Platforms and behavior',
     items: [
       {
-        q: 'What platforms are supported?',
-        a: `The hub and host daemon run on macOS and Linux with Python 3.11 or later. The phone app needs iOS 18 or later and Xcode 16 to build. Windows is not supported.`,
+        q: 'Which platforms does Drover support?',
+        a: `The hub and the host daemon run on macOS and Linux with Python 3.11 or later. The app needs iOS 18 or later. Windows is not supported.`,
       },
       {
         q: 'Do I need PostgreSQL?',
-        a: `For a new central hub, yes: PostgreSQL is the default control store. Use one you already run, or let the installer manage a local PostgreSQL 17 container if you have a Docker-compatible CLI running. Existing single-machine installs can stay on the DuckDB compatibility backend, without the features that require PostgreSQL such as the portable profile.`,
+        a: `Yes, for a new hub. Use your own PostgreSQL, or let the installer manage a local container. Existing single-machine installs can stay on DuckDB.`,
       },
       {
         q: 'What happens when I am offline?',
-        a: `Drover's own traffic stays on your private network: the hub, hosts and phone talk to each other directly, apart from the optional release check and any integrations you configure. Your agents still need to reach their model providers unless you run local models. If a host drops off the network, its sessions keep running on that machine, and a stop request is held and confirmed when the host reconnects. The phone app keeps unsent drafts and pending turns until it can deliver them.`,
+        a: `The hub, the hosts and the phone communicate on your private network. Your agents still need their model providers. If a host disconnects, the hub holds a stop request until the host confirms it.`,
       },
       {
         q: 'What happens when the hub restarts?',
-        a: `Agent processes belong to the host daemons, not the hub. Hosts re-register on their next heartbeat, recorded history is already durable in the control store, and outstanding pairing codes are invalidated because they only ever lived in memory.`,
+        a: `The host daemons own the agent processes, so the sessions continue. The history is already in the control store. Pairing codes that you did not use become invalid.`,
       },
       {
-        q: 'How mature is it?',
-        a: `It is source-distributed software for technical users with a fast-moving release line. Expect rough edges and read the <a href="${LINKS.changelog}" rel="noopener">changelog</a> before upgrading. Known limits are listed on the <a href="/features/#roadmap">roadmap</a>.`,
+        q: 'How mature is Drover?',
+        a: `Drover is for technical users and its releases are frequent. Read the <a href="${LINKS.changelog}" rel="noopener">changelog</a> before you upgrade. See the known gaps on the <a href="/features/#roadmap">roadmap</a>.`,
       },
     ],
   },
 ];
 ---
 
-<BaseLayout title="FAQ" description="What Drover is and is not, what it costs, where your data lives, and what platforms it supports.">
+<BaseLayout title="FAQ" description="What Drover is, what it costs, where your data is stored and which platforms it supports.">
   <section class="page-hero">
     <div class="wrap">
       <span class="eyebrow">FAQ</span>
-      <h1>Fair questions.</h1>
-      <p class="lede">Short answers. If yours is not here, open an issue on <a href={LINKS.issues} rel="noopener">GitHub</a>.</p>
+      <h1>Questions and answers.</h1>
+      <p class="lede">
+        For other questions, open an issue on <a href={LINKS.issues} rel="noopener">GitHub</a>.
+      </p>
     </div>
   </section>
 
