@@ -15,11 +15,13 @@ import click
 
 from drover.collect import tempo_relay
 from drover.collect.cursor import CursorLocked, CursorStore
+from drover.collect.openclaw_sqlite import DEFAULT_STATE_DIR, OpenClawSqliteSource
 from drover.collect.shipper import ShipError, ship_staging
 from drover.collect.sources import (
     ClaudeCodeSource,
     ClaudeMacMiniSource,
     HermesSource,
+    IncrementalSource,
     OpenClawSource,
     OpenClawTaskFlowSource,
     PiMonoSource,
@@ -60,9 +62,14 @@ root    = "{home}/Library/Application Support/Claude/local-agent-mode-sessions"
 enabled = false
 root    = "{home}/.hermes/profiles/jenny/sessions"
 
+# OpenClaw sessions. store = "auto" reads the per-agent SQLite stores under
+# state_dir when present (current releases) and JSONL files under root (older
+# installs); "sqlite" or "jsonl" forces one. SQLite is opened read-only.
 [sources.openclaw]
-enabled = false
-root    = "{home}/.openclaw/agents/main/sessions"
+enabled   = false
+store     = "auto"
+state_dir = "{home}/.openclaw"
+root      = "{home}/.openclaw/agents/main/sessions"
 
 [sources.pi_mono]
 enabled = false
@@ -102,8 +109,53 @@ def _load_config(path: Optional[str]) -> dict:
         return tomllib.load(f)
 
 
-def _build_sources(cfg: dict) -> list[Source]:
-    sources: list[Source] = []
+_OPENCLAW_STORES = ("auto", "jsonl", "sqlite")
+_OPENCLAW_SQLITE_TUNING = ("batch_size", "max_events_per_run", "busy_timeout_ms")
+
+
+def _openclaw_state_dir(oc_cfg: dict, root: Optional[Path]) -> Path:
+    if oc_cfg.get("state_dir"):
+        return Path(oc_cfg["state_dir"]).expanduser()
+    # Configs written before the SQLite store only carry the JSONL root,
+    # ``<state dir>/agents/<agentId>/sessions``; follow it to the state dir.
+    if (
+        root is not None
+        and root.name == "sessions"
+        and root.parent.parent.name == "agents"
+    ):
+        return root.parent.parent.parent
+    return Path(DEFAULT_STATE_DIR).expanduser()
+
+
+def _build_openclaw_sources(oc_cfg: dict) -> list[Source | IncrementalSource]:
+    store = str(oc_cfg.get("store", "auto")).lower()
+    if store not in _OPENCLAW_STORES:
+        raise click.ClickException(
+            f"[sources.openclaw] store must be one of {', '.join(_OPENCLAW_STORES)}"
+        )
+    root = Path(oc_cfg["root"]).expanduser() if oc_cfg.get("root") else None
+    if store == "jsonl" and root is None:
+        raise click.ClickException('[sources.openclaw] store = "jsonl" needs root')
+
+    tuning = {k: int(oc_cfg[k]) for k in _OPENCLAW_SQLITE_TUNING if k in oc_cfg}
+    sqlite_source = OpenClawSqliteSource(
+        state_dir=_openclaw_state_dir(oc_cfg, root),
+        agents=tuple(str(a) for a in oc_cfg.get("agents") or ()),
+        **tuning,
+    )
+
+    out: list[Source | IncrementalSource] = []
+    if root is not None and store in ("auto", "jsonl"):
+        out.append(OpenClawSource(root=root))
+    # "auto" only adds the SQLite reader once a store exists, so older installs
+    # keep a quiet log; an explicit "sqlite" reports a missing store instead.
+    if store == "sqlite" or (store == "auto" and sqlite_source.databases()):
+        out.append(sqlite_source)
+    return out
+
+
+def _build_sources(cfg: dict) -> list[Source | IncrementalSource]:
+    sources: list[Source | IncrementalSource] = []
     src_cfg = cfg.get("sources", {})
     # The host_id is the canonical agent_id for this machine's Claude Code
     # sessions. Per-source overrides (rare) win over the host default.
@@ -126,9 +178,7 @@ def _build_sources(cfg: dict) -> list[Source]:
     if src_cfg.get("hermes", {}).get("enabled"):
         sources.append(HermesSource(root=Path(src_cfg["hermes"]["root"]).expanduser()))
     if src_cfg.get("openclaw", {}).get("enabled"):
-        sources.append(
-            OpenClawSource(root=Path(src_cfg["openclaw"]["root"]).expanduser())
-        )
+        sources.extend(_build_openclaw_sources(src_cfg["openclaw"]))
     if src_cfg.get("pi_mono", {}).get("enabled"):
         sources.append(
             PiMonoSource(db_path=Path(src_cfg["pi_mono"]["db_path"]).expanduser())
@@ -213,35 +263,49 @@ def run(ctx: click.Context, source_filter: Optional[str], dry_run: bool) -> None
             with state.lock(src.id):
                 cursor = state.read(src.id)
                 watermark = _parse_iso(cursor.get("watermark_iso"))
-                files = src.list_files_since(watermark)
-                if not files:
-                    log.info("[%s] no new files (watermark=%s)", src.id, watermark)
-                    successes += 1
-                    continue
-
+                # Keyed sources resume from their own cursor state; for them
+                # watermark_iso is only the newest event time, for `status`.
+                keyed_cursor: Optional[dict] = None
                 events: list[AgentEvent] = []
-                for f in files:
-                    try:
-                        events.extend(src.parse(f))
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("[%s] parse failed for %s: %s", src.id, f, exc)
+                if isinstance(src, IncrementalSource):
+                    batch = src.collect(cursor)
+                    for message in batch.diagnostics:
+                        log.warning("[%s] %s", src.id, message)
+                    events = batch.events
+                    keyed_cursor = batch.cursor
+                else:
+                    files = src.list_files_since(watermark)
+                    if not files:
+                        log.info("[%s] no new files (watermark=%s)", src.id, watermark)
+                        successes += 1
+                        continue
 
-                # Filter to events strictly after the watermark to avoid reshipping
-                if watermark is not None:
-                    events = [
-                        e for e in events if _normalize_ts(e.timestamp) > watermark
-                    ]
+                    for f in files:
+                        try:
+                            events.extend(src.parse(f))
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("[%s] parse failed for %s: %s", src.id, f, exc)
+
+                    # Filter to events strictly after the watermark to avoid reshipping
+                    if watermark is not None:
+                        events = [
+                            e for e in events if _normalize_ts(e.timestamp) > watermark
+                        ]
 
                 out = write_events_jsonl(
                     events, staging_dir, run_id=run_id, source_id=src.id
                 )
                 if out is None:
                     log.info("[%s] no new events", src.id)
+                    if keyed_cursor is not None:
+                        state.write(src.id, _cursor_payload(keyed_cursor, watermark))
                     successes += 1
                     continue
 
                 log.info("[%s] staged %d events to %s", src.id, len(events), out.name)
                 new_watermark = latest_event_timestamp(events) or watermark
+                if keyed_cursor is not None and watermark is not None:
+                    new_watermark = max(new_watermark, watermark)
 
                 if not dry_run:
                     try:
@@ -263,13 +327,7 @@ def run(ctx: click.Context, source_filter: Optional[str], dry_run: bool) -> None
 
                 # Advance cursor only after a successful (or dry-run) write
                 if new_watermark is not None:
-                    state.write(
-                        src.id,
-                        {
-                            "watermark_iso": new_watermark.isoformat(),
-                            "last_run_iso": datetime.now(tz=timezone.utc).isoformat(),
-                        },
-                    )
+                    state.write(src.id, _cursor_payload(keyed_cursor, new_watermark))
                 successes += 1
         except CursorLocked as exc:
             log.warning("[%s] %s; skipping", src.id, exc)
@@ -463,6 +521,16 @@ def status(ctx: click.Context) -> None:
             f"  {tempo_relay.CURSOR_KEY:18s} window_end={wm}  last_run={lr}  "
             f"(target={t_cfg.get('target_otlp_endpoint')})"
         )
+
+
+def _cursor_payload(
+    keyed_cursor: Optional[dict], watermark: Optional[datetime]
+) -> dict:
+    payload = dict(keyed_cursor or {})
+    if watermark is not None:
+        payload["watermark_iso"] = watermark.isoformat()
+    payload["last_run_iso"] = datetime.now(tz=timezone.utc).isoformat()
+    return payload
 
 
 def _parse_iso(s: Optional[str]) -> Optional[datetime]:

@@ -1158,6 +1158,7 @@ class MetricsCollector:
     # fleet/control API from a load balancer.
     include_analytical_readiness: bool = True
     analytics_worker_state: str | Callable[[], str] | None = None
+    exporter_health: Callable[[], dict] | None = None
     # The API role injects the bounded worker RPC resolver.  It is intentionally
     # absent in legacy/all mode until retained history is configured there.
     archive_resolver: Any | None = None
@@ -1217,6 +1218,35 @@ class MetricsCollector:
             probe = self._readiness
         status, body = probe.check().as_response(include_detail=include_detail)
         body = _with_push_status(body, include_detail=include_detail)
+        payload = json.loads(body)
+        if self.exporter_health is not None:
+            from drover.server.lake.freshness import freshness_status
+
+            try:
+                report = self.exporter_health()
+                if "running" in report or "exporter" in report:
+                    payload["exporter"] = report.get("exporter", report)
+                elif report.get("state") == "unavailable":
+                    payload["exporter"] = freshness_status(
+                        {}, running=False, last_error="analytics_worker_unavailable"
+                    )
+                if "running" not in report and report.get("state") in {
+                    "ok",
+                    "degraded",
+                    "unavailable",
+                }:
+                    payload.setdefault("stores", []).append(
+                        {
+                            "store": "analytics_worker",
+                            "state": report["state"],
+                            "detail": "reported separately" if include_detail else "",
+                        }
+                    )
+            except Exception:
+                payload["exporter"] = freshness_status(
+                    {}, running=False, last_error="lake_export_unavailable"
+                )
+            body = json.dumps(payload, sort_keys=True) + "\n"
         if self.analytics_worker_state is None:
             return status, body
         try:

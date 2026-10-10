@@ -3,9 +3,11 @@
 import logging
 import os
 import threading
+import time
 
 from .export_guard import GUARD_SCHEMA
 from .exporter import LakeOutboxExporter
+from .freshness import freshness_status, read_freshness
 from .runtime import LakeError, sanitize_detail
 from .serving import HistoryConnection, lake_spec, selected_config
 from .serving_proof import catalog_identity
@@ -15,6 +17,10 @@ log = logging.getLogger(__name__)
 # Exports between serving-proof checkpoints: ~45 min at prod's peak rate of
 # ~11/min, so a serving child re-checks at most a few hundred exports.
 CHECKPOINT_EVERY_EXPORTS = 500
+MAX_RESTARTS = 5
+RESTART_BACKOFF_SECONDS = 1
+FRESHNESS_POLL_SECONDS = 10
+CANCELLATION_GRACE_SECONDS = 35
 
 # SQLSTATEs for a missing schema (3F000) or function (42883).
 _MISSING_GUARD_SQLSTATES = {"3F000", "42883"}
@@ -52,23 +58,109 @@ class ExporterLifecycle:
         self._error = None
         self._running = False
         self._exports_since_checkpoint = 0
+        self._restarts = 0
+        self._snapshot = {"freshness_error": "lake_freshness_unavailable"}
+        self._monitor = None
+        self._started = False
+        self._recovering = False
+        self._owner_lock = threading.Lock()
+        self._owner = None
+        self._batch_started_at = None
+        self._cancel_requested_at = None
+        self._cancellation_stuck = False
+        self._batch_deadline = (
+            getattr(config.analytics, "exporter_recovery_deadline_seconds", 120)
+            if hasattr(config, "analytics")
+            else 120
+        )
 
     def start(self, *, shutdown_event):
         if self._thread is not None:
             raise LakeError("lake_exporter_already_started")
         self._thread = threading.Thread(
-            target=self._run,
+            target=self._supervise,
             args=(shutdown_event,),
             name="ducklake-exporter",
             daemon=True,
         )
+        self._monitor = threading.Thread(
+            target=self._watch_freshness,
+            args=(shutdown_event,),
+            name="ducklake-freshness",
+            daemon=True,
+        )
+        self._monitor.start()
         self._thread.start()
         if not self._ready.wait(10):
             self._stop.set()
             raise LakeError("lake_exporter_start_deadline")
-        if self._error:
+        if self._error and not self._started:
             self.stop()
             raise LakeError(self._error)
+
+    def _watch_batch(self):
+        now = time.monotonic()
+        with self._owner_lock:
+            owner = self._owner
+            started = self._batch_started_at
+            if owner is None or self._stop.is_set():
+                return
+            if self._cancel_requested_at is not None:
+                if now - self._cancel_requested_at >= CANCELLATION_GRACE_SECONDS:
+                    # Python threads cannot be force-killed safely. Fail closed
+                    # if cancellation cannot unwind; never overlap fence owners.
+                    self._cancellation_stuck = True
+                    self._error = "lake_export_cancellation_stuck"
+                    self._stop.set()
+                return
+            if started is None or now - started < self._batch_deadline:
+                return
+            self._cancel_requested_at = now
+        log.warning("DuckLake batch recovery deadline exceeded; cancelling owner")
+        # Older libpq cancellation can block despite the supplied timeout.
+        # Keep the watchdog responsive while the captured owner pins its borrow
+        # until cancellation returns. No replacement can enter before it exits.
+        threading.Thread(
+            target=self._cancel_owner,
+            args=(owner,),
+            name="ducklake-export-cancel",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _cancel_owner(owner):
+        try:
+            owner.cancel()
+        except Exception:
+            log.warning("DuckLake exporter cancellation request failed")
+
+    def _watch_freshness(self, shutdown):
+        while not self._stop.is_set() and not shutdown.is_set():
+            self._watch_batch()
+            try:
+                self._snapshot = read_freshness(self.config.duckdb_path)
+            except Exception:
+                self._snapshot = {
+                    **self._snapshot,
+                    "freshness_error": "lake_freshness_unavailable",
+                }
+            self._stop.wait(FRESHNESS_POLL_SECONDS)
+
+    def _supervise(self, shutdown):
+        while not self._stop.is_set() and not shutdown.is_set():
+            self._run(shutdown)
+            if not self._started or self._stop.is_set() or shutdown.is_set():
+                return
+            if self._restarts >= MAX_RESTARTS:
+                return
+            self._recovering = True
+            self._restarts += 1
+            # Ownership has exited before a replacement acquires a new fence.
+            delay = min(30, RESTART_BACKOFF_SECONDS * 2 ** (self._restarts - 1))
+            if self._stop.wait(delay) or shutdown.is_set():
+                self._recovering = False
+                return
+            self._recovering = False
 
     def _run(self, shutdown):
         try:
@@ -94,6 +186,10 @@ class ExporterLifecycle:
                 refresh_if_provisioned(
                     self.config.duckdb_path, lake_fence=getattr(exporter, "fence", None)
                 )
+                with self._owner_lock:
+                    self._owner = exporter
+                    self._cancel_requested_at = None
+                self._started = True
                 self._running = True
                 self._ready.set()
                 # A restart after a long run must not wait 500 exports to bound
@@ -111,7 +207,7 @@ class ExporterLifecycle:
                                 raise LakeError("lake_retirement_config_mismatch")
                             if allowed:
                                 raise LakeError("lake_retirement_lost")
-                            result = exporter.run_once()
+                            result = self._export_batch(exporter)
                             if result and (
                                 result.get("exported") or result.get("acknowledged")
                             ):
@@ -120,7 +216,7 @@ class ExporterLifecycle:
                                     lake_fence=getattr(exporter, "fence", None),
                                 )
                     else:
-                        result = exporter.run_once()
+                        result = self._export_batch(exporter)
                         if result and (
                             result.get("exported") or result.get("acknowledged")
                         ):
@@ -133,8 +229,12 @@ class ExporterLifecycle:
                         if self._exports_since_checkpoint >= CHECKPOINT_EVERY_EXPORTS:
                             self._checkpoint(exporter)
                     self._stop.wait(0.25)
-        except Exception as exc:
-            if isinstance(exc, LakeError):
+        except BaseException as exc:
+            if self._cancellation_stuck:
+                self._error = "lake_export_cancellation_stuck"
+            elif self._cancel_requested_at is not None:
+                self._error = "lake_export_recovery_deadline"
+            elif isinstance(exc, LakeError):
                 self._error = exc.code
             elif _guard_missing(exc):
                 self._error = "lake_export_not_provisioned"
@@ -146,8 +246,31 @@ class ExporterLifecycle:
                 _cause(exc, self.config),
             )
         finally:
+            with self._owner_lock:
+                self._owner = None
+                self._batch_started_at = None
+                self._cancel_requested_at = None
             self._running = False
             self._ready.set()
+
+    def _export_batch(self, exporter):
+        # Only this operation owns the registered cancellable control borrow
+        # and isolated publisher. Projection/checkpoint have separate deadlines.
+        with self._owner_lock:
+            self._batch_started_at = time.monotonic()
+        try:
+            result = exporter.run_once()
+            with self._owner_lock:
+                cancelled = self._cancel_requested_at is not None
+                self._batch_started_at = None
+            if cancelled:
+                # Cancellation may race a completed acknowledgement. The
+                # durable ack is retained, but this owner must still unwind.
+                raise LakeError("lake_export_recovery_deadline")
+            return result
+        finally:
+            with self._owner_lock:
+                self._batch_started_at = None
 
     def _checkpoint(self, exporter):
         """Advance the serving checkpoint; a failure leaves serving to the
@@ -182,8 +305,25 @@ class ExporterLifecycle:
             if self._thread.is_alive():
                 raise LakeError("lake_exporter_stop_deadline")
 
+        if self._monitor is not None:
+            self._monitor.join(5)
+
     def health(self):
-        return {"enabled": self._running, "last_error": self._error}
+        health = freshness_status(
+            self._snapshot,
+            running=self._running and not self._cancellation_stuck,
+            last_error=self._error,
+            restarts=self._restarts,
+        )
+        health["recovery_deadline_seconds"] = self._batch_deadline
+        health["recovery_pending"] = self._recovering or (
+            self._cancel_requested_at is not None and not self._cancellation_stuck
+        )
+        if health["recovery_pending"]:
+            health["recovery_action"] = (
+                "Supervised restart scheduled; check exporter logs and connectivity."
+            )
+        return health
 
 
 def selected_exporter(config):

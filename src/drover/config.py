@@ -337,6 +337,7 @@ class AnalyticsConfig:
 
     backend: str = "legacy"
     exporter_enabled: bool = False
+    exporter_recovery_deadline_seconds: float = 120
     retire_legacy_writers: bool = False
     catalog_dsn_env: str = ""
     exporter_dsn_env: str = ""
@@ -347,6 +348,15 @@ class AnalyticsConfig:
     epoch: str = ""
 
     def __post_init__(self):
+        deadline = self.exporter_recovery_deadline_seconds
+        if (
+            type(deadline) not in (int, float)
+            or not math.isfinite(deadline)
+            or deadline <= 0
+        ):
+            raise ValueError(
+                "analytics.exporter_recovery_deadline_seconds must be a finite positive number"
+            )
         if self.backend not in {"legacy", "ducklake"}:
             raise ValueError("analytics.backend must be legacy or ducklake")
         if type(self.exporter_enabled) is not bool:

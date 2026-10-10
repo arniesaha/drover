@@ -27,6 +27,28 @@ class Source(Protocol):
     def parse(self, path: Path) -> Iterator[AgentEvent]: ...
 
 
+@dataclass
+class IncrementalBatch:
+    """One keyed read from a store that is not file/mtime shaped.
+
+    ``cursor`` is the source's complete resume state. It only becomes durable
+    once the caller has staged and shipped ``events``.
+    """
+
+    events: list[AgentEvent]
+    cursor: dict
+    diagnostics: list[str]
+
+
+@runtime_checkable
+class IncrementalSource(Protocol):
+    """Source which resumes from its own stable key instead of a timestamp."""
+
+    id: str
+
+    def collect(self, cursor: dict) -> IncrementalBatch: ...
+
+
 def _files_modified_after(
     root: Path, pattern: str, watermark: Optional[datetime]
 ) -> list[Path]:

@@ -324,6 +324,26 @@ struct ClientTests {
     #expect(ok == false)
 }
 
+@Test func exporterReadinessReportsWarningEvenOn503() async throws {
+    mock.handler = { request in
+        #expect(request.url?.path == "/readyz")
+        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+        return (503, Data(#"{"exporter":{"state":"stalled","running":true}}"#.utf8))
+    }
+    let health = try await client().exporterHealth()
+    #expect(health?.warningText == "Search and recall may be out of date")
+}
+
+@Test func exporterReadinessIdleHasNoWarning() async throws {
+    mock.handler = { _ in (200, Data(#"{"exporter":{"state":"ok"}}"#.utf8)) }
+    #expect(try await client().exporterHealth()?.warningText == nil)
+}
+
+@Test func exporterReadinessOlderHubIsOptional() async throws {
+    mock.handler = { _ in (200, Data(#"{"stores":[]}"#.utf8)) }
+    #expect(try await client().exporterHealth() == nil)
+}
+
 @Test func sessionIDIsPercentEncodedInPath() async throws {
     mock.handler = { request in
         // A session id containing characters that need escaping in a URL path:

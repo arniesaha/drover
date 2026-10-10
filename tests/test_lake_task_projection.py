@@ -429,7 +429,7 @@ def test_zero_winner_ack_still_refreshes_and_refresh_error_releases_lifecycle(
     )
     worker._run(threading.Event())
     assert calls == [1, 1] and released.is_set()
-    assert worker.health() == {
+    assert {key: worker.health()[key] for key in ("enabled", "last_error")} == {
         "enabled": False,
         "last_error": "analytics_task_projection_changed",
     }
