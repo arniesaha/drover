@@ -40,15 +40,30 @@ jobs:
         fi
         echo "every workflow uses GitHub-hosted runners"
 
+    # The static site under site/ has its own build check in site.yml. Its
+    # paths are dropped before classification, so a pull request that only
+    # touches the site runs the lightweight checks here instead of the Python
+    # suite. Anything else in the same pull request is classified as usual,
+    # and a push (no base) still runs everything.
     - name: Select test scope
       id: scope
       env:
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: |
+        if [ -z "$BASE_SHA" ]; then
+          python scripts/ci/select_test_scope.py --github-output "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        mapfile -t paths < <(git diff --name-only "$BASE_SHA"...HEAD \
+          | grep -vE '^(site/|\.github/workflows/site\.yml$)' || true)
+        if [ "${#paths[@]}" -eq 0 ]; then
+          echo "only site paths changed; skipping the Python and iOS suites"
+          printf 'python=false\nios=false\n' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         python scripts/ci/select_test_scope.py \
-          --base "$BASE_SHA" \
-          --github-output "$GITHUB_OUTPUT"
-    
+          --github-output "$GITHUB_OUTPUT" "${paths[@]}"
+
     - name: Set up Python
       if: steps.scope.outputs.python == 'true'
       uses: actions/setup-python@v5

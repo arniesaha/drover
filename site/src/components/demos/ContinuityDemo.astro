@@ -1,0 +1,475 @@
+---
+// Use case A: pick up where you left off. A piece of work moves from a laptop
+// session to a desktop session to a phone approval, with the hub carrying the
+// thread. Everything here is synthetic.
+const steps = [
+  {
+    title: 'Start on the laptop',
+    body: 'A Codex session works on a flaky test. Every turn and tool call streams to your hub as it happens.',
+  },
+  {
+    title: 'Walk away',
+    body: 'You leave the laptop. The hub already holds the session history, and with a summarizer configured, a summary and the loop you left open.',
+  },
+  {
+    title: 'Hand off to the desktop',
+    body: 'Continue the session on another host and another harness. Drover briefs the new Claude Code session from the old one, and it can pull more with a recall bundle.',
+  },
+  {
+    title: 'Approve from your phone',
+    body: 'Claude Code asks before it pushes. The prompt lands in the iOS app. One tap and it carries on.',
+  },
+];
+---
+
+<drover-continuity class="demo" data-step="1">
+  <div class="demo-head">
+    <span class="demo-title">Use case 01 · pick up where you left off</span>
+    <div class="controls">
+      <button class="chip-btn primary" type="button" data-play>Play</button>
+      <button class="chip-btn" type="button" data-next>Next step</button>
+    </div>
+  </div>
+
+  <div class="demo-body stage">
+    <div class="devices">
+      <article class="device" data-device="laptop">
+        <header><span class="dot"></span>laptop <em>codex</em></header>
+        <div class="screen">
+          <div class="on s1">
+            <p class="p">&gt; fix the flaky retry test</p>
+            <p>edit src/retry.py</p>
+            <p>run pytest tests/test_retry.py</p>
+            <p class="warn">2 passed, 1 failing</p>
+          </div>
+          <div class="on s2 off-note">you stepped away<br />history is on the hub</div>
+          <div class="on s3 s4 off-note">handed off</div>
+        </div>
+      </article>
+
+      <article class="device" data-device="studio">
+        <header><span class="dot"></span>studio <em>claude-code</em></header>
+        <div class="screen">
+          <div class="on s1 s2 off-note">idle</div>
+          <div class="on s3">
+            <p class="p">handoff brief from laptop/codex</p>
+            <p class="tool">drover_recall_bundle("retry test")</p>
+            <p class="good">summary + 1 open loop + 3 files</p>
+            <p>resuming at tests/test_retry.py</p>
+          </div>
+          <div class="on s4">
+            <p class="good">3 passed</p>
+            <p class="warn" data-wait>waiting for approval:</p>
+            <p>git push origin fix/retry-jitter</p>
+            <p class="good" data-approved hidden>approved. pushing...</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="device phone" data-device="phone">
+        <header><span class="dot"></span>phone <em>Drover app</em></header>
+        <div class="screen">
+          <div class="on s1 row"><b>1 live</b><span>laptop · codex</span></div>
+          <div class="on s2 row"><b>1 idle</b><span>laptop · codex</span></div>
+          <div class="on s3 row"><b>1 live</b><span>studio · claude-code</span></div>
+          <div class="on s4 approve">
+            <span>claude-code wants to run</span>
+            <code>git push origin fix/retry-jitter</code>
+            <button type="button" class="chip-btn primary" data-approve>Approve</button>
+          </div>
+        </div>
+      </article>
+    </div>
+
+    <div class="hub" aria-hidden="true">
+      <span class="hub-label">hub</span>
+      <div class="hub-track">
+        <span class="pulse on s1">events streaming in</span>
+        <span class="thread on s2 s3 s4">summary</span>
+        <span class="thread on s2 s3 s4">open loop: jitter is not seeded in the test</span>
+        <span class="thread on s2 s3 s4">3 files</span>
+        <span class="pulse on s3">handed to studio</span>
+        <span class="pulse on s4">approval routed to phone</span>
+      </div>
+    </div>
+
+    <ol class="steps">
+      {
+        steps.map((step, i) => (
+          <li>
+            <button type="button" data-goto={i + 1} aria-current={i === 0 ? 'step' : undefined}>
+              <span class="n">{i + 1}</span>
+              <span>
+                <strong>{step.title}</strong>
+                <span class="b">{step.body}</span>
+              </span>
+            </button>
+          </li>
+        ))
+      }
+    </ol>
+  </div>
+  <p class="demo-note">Synthetic data. Session context travels through your own hub and nowhere else.</p>
+</drover-continuity>
+
+<script>
+  class DroverContinuity extends HTMLElement {
+    step = 1;
+    timer: number | undefined;
+
+    connectedCallback() {
+      this.querySelectorAll<HTMLButtonElement>('[data-goto]').forEach((btn) =>
+        btn.addEventListener('click', () => {
+          this.stop();
+          this.go(Number(btn.dataset.goto));
+        }),
+      );
+      this.querySelector('[data-next]')?.addEventListener('click', () => {
+        this.stop();
+        this.go((this.step % 4) + 1);
+      });
+      this.querySelector('[data-play]')?.addEventListener('click', () => (this.timer ? this.stop() : this.play()));
+      this.querySelector('[data-approve]')?.addEventListener('click', () => this.approve());
+    }
+
+    go(step: number) {
+      this.step = step;
+      this.dataset.step = String(step);
+      this.querySelectorAll<HTMLButtonElement>('[data-goto]').forEach((btn) => {
+        if (Number(btn.dataset.goto) === step) btn.setAttribute('aria-current', 'step');
+        else btn.removeAttribute('aria-current');
+      });
+      if (step !== 4) this.resetApproval();
+    }
+
+    play() {
+      const btn = this.querySelector('[data-play]');
+      if (btn) btn.textContent = 'Pause';
+      this.go(1);
+      this.timer = window.setInterval(() => {
+        if (this.step >= 4) {
+          this.approve();
+          this.stop();
+          return;
+        }
+        this.go(this.step + 1);
+      }, 2600);
+    }
+
+    stop() {
+      window.clearInterval(this.timer);
+      this.timer = undefined;
+      const btn = this.querySelector('[data-play]');
+      if (btn) btn.textContent = 'Play';
+    }
+
+    approve() {
+      const btn = this.querySelector<HTMLButtonElement>('[data-approve]');
+      if (btn) {
+        btn.textContent = 'Approved';
+        btn.disabled = true;
+      }
+      this.querySelector('[data-approved]')?.removeAttribute('hidden');
+      this.querySelector('[data-wait]')?.setAttribute('hidden', '');
+    }
+
+    resetApproval() {
+      const btn = this.querySelector<HTMLButtonElement>('[data-approve]');
+      if (btn) {
+        btn.textContent = 'Approve';
+        btn.disabled = false;
+      }
+      this.querySelector('[data-approved]')?.setAttribute('hidden', '');
+      this.querySelector('[data-wait]')?.removeAttribute('hidden');
+    }
+  }
+  customElements.define('drover-continuity', DroverContinuity);
+</script>
+
+<style>
+  drover-continuity {
+    display: block;
+  }
+  .controls {
+    display: flex;
+    gap: 0.4rem;
+  }
+  .stage {
+    display: grid;
+    gap: 1rem;
+  }
+  .devices {
+    display: grid;
+    grid-template-columns: 1fr 1fr 0.8fr;
+    gap: 0.8rem;
+  }
+  .device {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    background: var(--code-bg);
+    overflow: hidden;
+    opacity: 0.55;
+    transition: opacity 0.4s ease, border-color 0.4s ease, transform 0.4s ease;
+  }
+  .device.phone {
+    border-radius: 22px;
+  }
+  .device header {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    font-weight: 600;
+  }
+  .device header em {
+    margin-left: auto;
+    font-style: normal;
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--line-strong);
+  }
+  .screen {
+    min-height: 132px;
+    padding: 0.75rem;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    line-height: 1.55;
+  }
+  .screen p {
+    margin: 0;
+    color: var(--text-2);
+    overflow-wrap: anywhere;
+  }
+  .screen .p {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .screen .tool {
+    color: var(--teal);
+  }
+  .screen .good {
+    color: var(--ok);
+  }
+  .screen .warn {
+    color: var(--ember);
+  }
+  .off-note {
+    color: var(--muted);
+    text-align: center;
+    padding-top: 2rem;
+  }
+  .row b {
+    display: block;
+    font-family: var(--font-display);
+    font-size: 1.5rem;
+    line-height: 1.1;
+  }
+  .row span {
+    color: var(--muted);
+  }
+  .approve {
+    gap: 0.5rem;
+  }
+  .approve code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    font-size: 0.7rem;
+  }
+  .approve span {
+    color: var(--muted);
+  }
+
+  /* Step switching: every .on block is hidden unless it carries the class for
+     the active step. */
+  .on {
+    display: none;
+  }
+  [data-step='1'] .on.s1,
+  [data-step='2'] .on.s2,
+  [data-step='3'] .on.s3,
+  [data-step='4'] .on.s4 {
+    display: block;
+    animation: pop 0.45s ease both;
+  }
+  [data-step='4'] .on.s4.approve {
+    display: grid;
+  }
+  [data-step] .hub-track .on {
+    display: none;
+  }
+  [data-step='1'] .hub-track .s1,
+  [data-step='2'] .hub-track .s2,
+  [data-step='3'] .hub-track .s3,
+  [data-step='4'] .hub-track .s4 {
+    display: inline-flex;
+  }
+  [data-step='1'] [data-device='laptop'],
+  [data-step='3'] [data-device='studio'],
+  [data-step='4'] [data-device='studio'],
+  [data-step='4'] [data-device='phone'] {
+    opacity: 1;
+    border-color: var(--ember);
+    transform: translateY(-2px);
+  }
+  [data-step='1'] [data-device='laptop'] .dot,
+  [data-step='3'] [data-device='studio'] .dot,
+  [data-step='4'] [data-device='studio'] .dot,
+  [data-step='4'] [data-device='phone'] .dot {
+    background: var(--ok);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 25%, transparent);
+  }
+  [data-step='1'] [data-device='phone'],
+  [data-step='2'] [data-device='phone'],
+  [data-step='3'] [data-device='phone'] {
+    opacity: 0.85;
+  }
+
+  .hub {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--radius-m);
+    padding: 0.6rem 0.8rem;
+    min-height: 54px;
+  }
+  .hub-label {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--teal);
+  }
+  .hub-track {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .thread,
+  .pulse {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 0.22rem 0.6rem;
+    border-radius: 999px;
+    animation: pop 0.45s ease both;
+  }
+  .thread {
+    background: var(--teal-soft);
+    color: var(--teal);
+    border: 1px solid color-mix(in srgb, var(--teal) 40%, transparent);
+  }
+  .pulse {
+    color: var(--muted);
+    border: 1px solid var(--line);
+  }
+  .pulse::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    margin: auto 0.4rem auto 0;
+    border-radius: 50%;
+    background: var(--ember);
+    animation: blink 1.1s ease-in-out infinite;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0.25;
+    }
+  }
+  @keyframes pop {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  .steps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.6rem;
+  }
+  .steps button {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    padding: 0.7rem;
+    cursor: pointer;
+    transition: border-color 0.2s ease, background 0.2s ease;
+  }
+  .steps button:hover {
+    border-color: var(--line-strong);
+  }
+  .steps button[aria-current='step'] {
+    border-color: var(--ember);
+    background: var(--ember-soft);
+  }
+  .steps .n {
+    flex: none;
+    width: 22px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--text);
+    color: var(--bg);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+  }
+  .steps strong {
+    display: block;
+    font-family: var(--font-display);
+    font-size: 0.98rem;
+    line-height: 1.2;
+    margin-bottom: 0.25rem;
+  }
+  .steps .b {
+    display: block;
+    font-size: 0.82rem;
+    line-height: 1.45;
+    color: var(--text-2);
+  }
+  @media (max-width: 860px) {
+    .devices {
+      grid-template-columns: 1fr;
+    }
+    .steps {
+      grid-template-columns: 1fr 1fr;
+    }
+    .screen {
+      min-height: 96px;
+    }
+    .off-note {
+      padding-top: 1rem;
+    }
+  }
+  @media (max-width: 520px) {
+    .steps {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

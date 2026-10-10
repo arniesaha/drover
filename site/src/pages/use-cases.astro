@@ -1,0 +1,172 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import ContinuityDemo from '../components/demos/ContinuityDemo.astro';
+import OrchestratorDemo from '../components/demos/OrchestratorDemo.astro';
+import RecallDemo from '../components/demos/RecallDemo.astro';
+---
+
+<BaseLayout
+  title="Use cases"
+  description="Three interactive walk-throughs: continue work across machines, run many workers from one orchestrator, and ask your session history."
+>
+  <section class="page-hero">
+    <div class="wrap">
+      <span class="eyebrow">Use cases</span>
+      <h1>Three things it is good at.</h1>
+      <p class="lede">
+        Each of these is a small simulation you can poke at. The data is invented and nothing leaves this page, but the
+        endpoints and tool names are the real ones.
+      </p>
+    </div>
+  </section>
+
+  <section class="section-tight" id="continuity">
+    <div class="wrap">
+      <div class="uc-head">
+        <span class="uc-n">01</span>
+        <div>
+          <h2>Pick up where you left off</h2>
+          <p class="lede">
+            Work rarely finishes on the machine it started on. Drover keeps the session history on the hub, so you can
+            continue on another host, in another harness, and say yes to a prompt from wherever you are.
+          </p>
+        </div>
+      </div>
+      <ContinuityDemo />
+      <div class="uc-notes">
+        <div>
+          <h4>What is real</h4>
+          <p>
+            <code>POST /harness/sessions/&#123;id&#125;/continue</code> starts a new session on a target host and harness, briefed from the
+            source session. Approvals are relayed for Claude Code sessions. The iOS app shows and answers them.
+          </p>
+        </div>
+        <div>
+          <h4>Good to know</h4>
+          <p>
+            A handoff reuses the same working directory path, so the project should live at the same path on both
+            machines. Summaries and open loops need a summarizer backend; plain history does not.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-tight band" id="orchestrator">
+    <div class="wrap">
+      <div class="uc-head">
+        <span class="uc-n">02</span>
+        <div>
+          <h2>One orchestrator, many workers</h2>
+          <p class="lede">
+            You already have something that plans work: OpenClaw, Hermes, or a script you wrote on a Sunday. Point it at
+            Drover and it gets a fleet. It launches sessions on any host, sends turns, watches status, and keeps its own
+            review and merge loop.
+          </p>
+        </div>
+      </div>
+      <OrchestratorDemo />
+      <div class="uc-notes">
+        <div>
+          <h4>What is real</h4>
+          <p>
+            Session launch, turns, fleet status and publication records are all part of the authenticated{' '}
+            <a href="/docs/api/">HTTP API</a>. Publication records note which branch and pull request a session produced.
+          </p>
+        </div>
+        <div>
+          <h4>Good to know</h4>
+          <p>
+            Drover does not open, review or merge pull requests. That judgement belongs to your orchestrator. Drover
+            runs the workers and remembers what they did.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-tight" id="recall">
+    <div class="wrap">
+      <div class="uc-head">
+        <span class="uc-n">03</span>
+        <div>
+          <h2>Ask your history</h2>
+          <p class="lede">
+            "Why did we drop that cache?" is a question with an answer, and the answer is in a session from two weeks ago.
+            Any agent connected to the hub's MCP endpoint can ask. Type your own query or pick one.
+          </p>
+        </div>
+      </div>
+      <RecallDemo />
+      <div class="uc-notes">
+        <div>
+          <h4>What is real</h4>
+          <p>
+            <code>drover_search</code>, <code>drover_recall_bundle</code>, <code>drover_open_loops</code> and{' '}
+            <code>drover_files_touched</code> are real <a href="/docs/mcp/">MCP tools</a>. Results carry the answering store and a data
+            watermark.
+          </p>
+        </div>
+        <div>
+          <h4>Good to know</h4>
+          <p>
+            The ranking in this demo is a toy keyword scorer in your browser. Real recall is keyword search by default,
+            with semantic recall when you configure an embeddings backend.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section center">
+    <div class="wrap-narrow">
+      <h2>Want to try it on real sessions?</h2>
+      <div class="btn-row" style="justify-content:center;margin-top:1.4rem">
+        <a class="btn" href="/docs/getting-started/">Get started</a>
+        <a class="btn ghost" href="/architecture/">How it works</a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .uc-head {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 1.4rem;
+    align-items: start;
+    margin-bottom: 1.6rem;
+  }
+  .uc-n {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: clamp(2.6rem, 6vw, 4.5rem);
+    line-height: 0.9;
+    color: transparent;
+    -webkit-text-stroke: 1.5px var(--ember);
+  }
+  .uc-head h2 {
+    margin-bottom: 0.5rem;
+  }
+  .uc-notes {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+    gap: 1rem 2.5rem;
+    margin-top: 1.4rem;
+  }
+  .uc-notes h4 {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.4rem;
+  }
+  .uc-notes p {
+    font-size: 0.95rem;
+    color: var(--text-2);
+  }
+  .uc-notes code {
+    white-space: normal;
+  }
+</style>

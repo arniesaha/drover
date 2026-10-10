@@ -1,0 +1,876 @@
+---
+import { Image } from 'astro:assets';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
+import LayerStack from '../components/LayerStack.astro';
+import RecallDemo from '../components/demos/RecallDemo.astro';
+import hero from '../assets/drover-hero.png';
+import shotFleet from '../assets/screenshots/ios-fleet.png';
+import shotLaunch from '../assets/screenshots/ios-launch.png';
+import shotCockpit from '../assets/screenshots/ios-cockpit.png';
+import shotAnalytics from '../assets/screenshots/ios-analytics.png';
+import { LINKS } from '../site';
+
+// The story on this page follows the author's launch article (LINKS.article).
+const tax = [
+  {
+    title: 'Every harness is its own world',
+    body: 'Claude Code, Codex, Antigravity, DeepSeek Harness. Each has its own process, transcript, permissions, authentication, controls and way of resuming work. The native tools are good. The tax comes from changing your interaction model every time you change the harness.',
+  },
+  {
+    title: 'The operating model lives in your head',
+    body: 'Which machine holds the work. Which pane contains the session. Which provider has capacity. Which terminal is waiting on an approval. SSH and tmux keep sessions alive, but you are still the index.',
+  },
+  {
+    title: 'A routing decision costs an afternoon',
+    body: 'One quota window is running down with a task still on it. Another subscription has room. Getting from one to the other takes a terminal, the right machine, a different harness, and the whole story retold.',
+  },
+];
+
+const questions = [
+  'Which sessions need attention?',
+  'Which provider still has quota?',
+  'What question or approval is blocking progress?',
+  'Can I start the task on the right machine and working directory?',
+  'Can another harness continue without me retelling the whole story?',
+];
+
+const features = [
+  { icon: 'terminal', title: 'Native harnesses', body: 'Claude Code, Codex, Antigravity (agy) and DeepSeek Harness, each behind a structured adapter, each still itself.' },
+  { icon: 'fleet', title: 'Hub and hosts', body: 'One hub routes intent. A daemon on each machine owns the processes. Direct or relay, LAN or tailnet.' },
+  { icon: 'phone', title: 'iOS cockpit', body: 'See the fleet, start a session, answer the question that is blocking it, attach to the terminal.' },
+  { icon: 'chart', title: 'Quota in view', body: 'Provider-reported capacity windows beside observed activity, so the next piece of work goes where there is room.' },
+  { icon: 'hand', title: 'Handoff', body: 'Continue a session on another host or another harness, briefed from the one before it.' },
+  { icon: 'search', title: 'Recall and search', body: 'Ordered event history, search, recall bundles and project briefs, linked to the sessions that produced them.' },
+  { icon: 'plug', title: 'MCP server', body: 'About two dozen drover_* tools hand that history back to agents and orchestrators.' },
+  { icon: 'profile', title: 'Portable profile', body: 'Your preferences and standing rules, served to each new session in three privacy tiers.' },
+] as const;
+
+const shots = [
+  { src: shotFleet, alt: 'Drover iOS fleet view listing three running sessions across two hosts with provider capacity', label: 'Fleet' },
+  { src: shotLaunch, alt: 'Drover iOS new session sheet with host, harness, model and reasoning controls', label: 'Launch' },
+  { src: shotCockpit, alt: 'Drover iOS cockpit showing observed sessions, token totals and busiest projects', label: 'Cockpit' },
+  { src: shotAnalytics, alt: 'Drover iOS analytics view with provider quota windows and usage distributions', label: 'Analytics' },
+];
+---
+
+<BaseLayout>
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <span class="eyebrow">Self-hosted · open source · free</span>
+        <h1>Drive your coding-agent fleet <span class="hl">from your pocket.</span></h1>
+        <p class="lede">
+          One familiar way to start work, see what needs attention, answer a question, and move a task to the harness
+          with quota to spare, without retelling the whole story. Drover sits above Claude Code, Codex, Antigravity and
+          DeepSeek Harness on machines you own.
+        </p>
+        <div class="btn-row">
+          <a class="btn" href="/docs/getting-started/">Get started</a>
+          <a class="btn ghost" href={LINKS.repo} rel="noopener">Star on GitHub</a>
+          <a class="text-link" href={LINKS.article} rel="noopener">Read the launch article</a>
+        </div>
+        <div class="term install">
+          <div class="term-bar"><i></i><i></i><i></i><span>install on macOS or Linux</span></div>
+          <pre><code><span class="c"># a fresh hub with a managed local PostgreSQL (needs a running Docker CLI)</span>
+curl -fsSL {LINKS.installScript} \
+  | bash -s -- --control-store managed</code></pre>
+        </div>
+        <p class="fine">
+          Add <code>--dry-run</code> to preview every action first. Already run PostgreSQL? See the{' '}
+          <a href="/docs/getting-started/">install guide</a>.
+        </p>
+      </div>
+
+      <div class="hero-art">
+        <Image src={hero} alt="Drover, a white dog, standing watch over three small glowing terminals in a mountain landscape" widths={[420, 640, 900]} sizes="(max-width: 900px) 80vw, 520px" loading="eager" fetchpriority="high" />
+        <span class="float f1"><i></i>studio · codex · running</span>
+        <span class="float f2"><i class="w"></i>laptop · claude-code · needs you</span>
+        <span class="float f3"><i></i>buildbox · agy · running</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="wrap">
+      <span class="eyebrow">The mental tax of switching</span>
+      <h2>Thought to action should not wait<br />until you are back at your desk.</h2>
+      <p class="lede">
+        Coding agents collapsed{' '}
+        <a href={LINKS.shippingOnTheGo} rel="noopener">the distance between an idea and its execution</a>. Have the idea
+        on a walk, send it from your phone, answer a follow-up, keep moving. Then the work spread across native harnesses,
+        and the short path got long again.
+      </p>
+      <div class="grid cols-3 probs">
+        {
+          tax.map((p, i) => (
+            <div class="prob reveal">
+              <span class="num">0{i + 1}</span>
+              <h3>{p.title}</h3>
+              <p>{p.body}</p>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap one">
+      <div>
+        <span class="eyebrow">What Drover is</span>
+        <h2>One interface, not one harness.</h2>
+        <p class="lede">
+          Drover is not a replacement harness. It does not flatten Claude Code, Codex, Antigravity and DeepSeek into a
+          lowest-common-denominator agent. Each native harness keeps its own models, tools, permissions, credentials,
+          session behaviour and filesystem access.
+        </p>
+        <p class="pull">The common interface is for you.</p>
+        <p class="lede">On a phone, the questions are usually the same:</p>
+        <ol class="questions">
+          {questions.map((q) => <li>{q}</li>)}
+        </ol>
+        <p class="muted">
+          Drover keeps those actions consistent. The provider-specific process still runs underneath, with its own
+          credentials, models, tools and files. The raw terminal is still there when you need it. It is just no longer
+          the only control surface.
+        </p>
+      </div>
+      <figure class="phone-frame one-phone reveal">
+        <Image src={shotFleet} alt={shots[0].alt} widths={[300, 480, 720]} sizes="(max-width: 900px) 70vw, 320px" />
+      </figure>
+    </div>
+  </section>
+
+  <section class="section band" id="where-drover-fits">
+    <div class="wrap">
+      <span class="eyebrow">Where Drover fits</span>
+      <h2>Continuity above the harness, below the plan.</h2>
+      <p class="lede">
+        Orchestrators plan. Harnesses do. Drover is the part in between that runs the work, remembers it, and keeps it
+        alive when the process, the machine or the harness changes.
+      </p>
+      <div class="fit">
+        <LayerStack compact />
+      </div>
+      <p class="more"><a href="/architecture/#where-drover-fits">The full model, and how Drover is built</a></p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="split-head">
+        <div>
+          <span class="eyebrow">Routing state</span>
+          <h2>Quota and context are routing state.</h2>
+        </div>
+        <p class="lede">
+          Moving the buttons into one app is not enough. A session is still an island if its identity, history and
+          limits disappear when the process restarts.
+        </p>
+      </div>
+      <div class="grid cols-3">
+        <div class="card reveal">
+          <div class="icon"><Icon name="loop" /></div>
+          <h3>Sessions that survive</h3>
+          <p>
+            Drover preserves the provider's native session identity and its ordered events. When a daemon restarts, a
+            structured session is recovered instead of presented as lost.
+          </p>
+        </div>
+        <div class="card reveal">
+          <div class="icon ember"><Icon name="hand" /></div>
+          <h3>Handoffs with receipts</h3>
+          <p>
+            Handoff briefs and project context keep links to the sessions and events that produced them, so another
+            harness can pick up the work without relying on a vague generated summary.
+          </p>
+        </div>
+        <div class="card reveal">
+          <div class="icon wheat"><Icon name="chart" /></div>
+          <h3>Capacity you can see</h3>
+          <p>
+            Provider-reported quota windows sit beside observed activity, and measured API cost is kept apart from
+            subscription usage where no cost was reported.
+          </p>
+        </div>
+      </div>
+      <p class="aside">
+        You still choose the harness and the host. Drover does not let a heuristic pick the model. It removes the
+        context-reconstruction and interaction tax that used to make that choice expensive.
+      </p>
+    </div>
+  </section>
+
+  <section class="section band" id="try">
+    <div class="wrap">
+      <div class="split-head">
+        <div>
+          <span class="eyebrow">Try it</span>
+          <h2>Ask your history a question.</h2>
+        </div>
+        <p class="lede">
+          MCP tools expose the history back to coding agents when they need to recall a decision or continue earlier
+          work. Here is the shape of an answer, with made-up data.
+        </p>
+      </div>
+      <RecallDemo />
+      <p class="more"><a href="/use-cases/">See all three interactive use cases</a></p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <span class="eyebrow">Two planes</span>
+      <h2>A command plane and a context plane.</h2>
+      <div class="grid cols-2 planes">
+        <div class="plane teal">
+          <span class="plane-tag">Command plane · live control</span>
+          <h3>The host remains authoritative.</h3>
+          <p>
+            The iOS app or another authenticated client talks to a central <code>drover-server</code> that knows the fleet
+            and routes operations. A <code>drover-harnessd</code> daemon on each machine owns the local agent processes.
+          </p>
+          <p>
+            A Codex session on Linux uses that machine's checkout and credentials. The server routes intent and
+            aggregates state. It does not pretend to own remote processes or files.
+          </p>
+        </div>
+        <div class="plane ember">
+          <span class="plane-tag">Context plane · durable memory</span>
+          <h3>Facts first, then what is derived from them.</h3>
+          <p>
+            Every event goes through one ingest path into a PostgreSQL control store. A fenced exporter publishes
+            append-only facts to a DuckLake lake of Parquet files.
+          </p>
+          <p>
+            Summaries, briefs and recall are derived from those facts and served through reads that verify what they are
+            reading, or refuse.
+          </p>
+        </div>
+      </div>
+      <p class="more"><a href="/architecture/">See the architecture</a></p>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="wrap">
+      <span class="eyebrow">Features</span>
+      <h2>Everything a small fleet needs.</h2>
+      <div class="grid cols-4 feats">
+        {
+          features.map((f) => (
+            <div class="feat reveal">
+              <div class="ficon">
+                <Icon name={f.icon} />
+              </div>
+              <h3>{f.title}</h3>
+              <p>{f.body}</p>
+            </div>
+          ))
+        }
+      </div>
+      <p class="more"><a href="/features/">Full feature list, with what is opt-in and what is still roadmap</a></p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap caps">
+      <div>
+        <span class="eyebrow">Capabilities</span>
+        <h2>Drive four harnesses. Listen to more.</h2>
+        <p class="lede">
+          Structured adapters normalize the parts that should look familiar: assistant messages, tool calls, results,
+          approvals, questions, cancellation and lifecycle events. A terminal path remains, because not every
+          interaction fits a stable schema.
+        </p>
+      </div>
+      <div class="cap-table">
+        <div class="cap-row head"><span>Harness</span><span>Launch and drive</span><span>Lands in your history</span></div>
+        <div class="cap-row"><span>Claude Code</span><span class="y">yes, with approvals</span><span class="y">yes</span></div>
+        <div class="cap-row"><span>Codex</span><span class="y">yes</span><span class="y">yes</span></div>
+        <div class="cap-row"><span>Antigravity (agy)</span><span class="y">yes</span><span class="y">yes</span></div>
+        <div class="cap-row"><span>DeepSeek Harness</span><span class="y">yes</span><span class="y">yes</span></div>
+        <div class="cap-row"><span>OpenClaw</span><span class="n">observe only</span><span class="y">yes, via the collector</span></div>
+        <div class="cap-row"><span>Hermes</span><span class="n">observe only</span><span class="y">yes, via the collector</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="wrap">
+      <span class="eyebrow">Use cases</span>
+      <h2>What people do with it.</h2>
+      <div class="grid cols-3">
+        <a class="card" href="/use-cases/#continuity">
+          <div class="icon"><Icon name="hand" /></div>
+          <h3>Pick up where you left off</h3>
+          <p>Start on the laptop, hand off to the desktop, approve the push from your phone.</p>
+        </a>
+        <a class="card" href="/use-cases/#orchestrator">
+          <div class="icon ember"><Icon name="fleet" /></div>
+          <h3>One orchestrator, many workers</h3>
+          <p>Fan tasks out to harness sessions on several hosts and keep a review loop running.</p>
+        </a>
+        <a class="card" href="/use-cases/#recall">
+          <div class="icon wheat"><Icon name="search" /></div>
+          <h3>Ask your history</h3>
+          <p>Give any agent the last month of decisions, open loops and touched files in one call.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="how-it-differs">
+    <div class="wrap">
+      <span class="eyebrow">How it differs</span>
+      <h2>Good tools, different slices.</h2>
+      <p class="lede">
+        Drover grew out of using these, not out of disliking them. They solve real parts of the problem, and you may well
+        want them alongside it.
+      </p>
+      <div class="grid cols-3 differs">
+        <div class="card">
+          <h3>Terminal-native: SSH, tmux, <a href={LINKS.herdr} rel="noopener">Herdr</a></h3>
+          <p>
+            Herdr is a much better version of the terminal-native experience, and it was used while building Drover. It
+            keeps real terminal sessions alive, gives coding agents one place to run, and lets you reconnect from another
+            device.
+          </p>
+          <p class="where">The premise is still the terminal. You can reach it from a phone; the interaction is not designed around one.</p>
+        </div>
+        <div class="card">
+          <h3>Claude Code remote control</h3>
+          <p>
+            It approaches the problem from the other direction. It feels native on the phone and brings back the short
+            path from thought to action.
+          </p>
+          <p class="where">
+            It depends on a native Claude Code session already running with remote control enabled, and it covers one
+            harness, not the other subscriptions and machines in a mixed workflow.
+          </p>
+        </div>
+        <div class="card mine">
+          <h3>Drover</h3>
+          <p>
+            Continuity above all of them: one way to start work, see what needs attention, answer a question, and move a
+            task to another harness, across the machines you own.
+          </p>
+          <p class="where">
+            The trade: you host it yourself, it is built for one trusted operator, and it is younger and rougher than
+            either.
+          </p>
+        </div>
+      </div>
+      <p class="fine">
+        These descriptions reflect the author's experience at the time of the{' '}
+        <a href={LINKS.article} rel="noopener">launch article</a>. Other tools move quickly; check their own docs for what
+        they do today.
+      </p>
+    </div>
+  </section>
+
+  <section class="section band" id="data-residency">
+    <div class="wrap hood">
+      <div>
+        <span class="eyebrow">Local-first</span>
+        <h2>Data residency is part of the design.</h2>
+        <p class="lede">
+          Local-first does not mean every component must live under your desk forever. The boundary that matters is
+          control: you choose where execution happens, where the session data is stored, and how machines join the
+          fleet.
+        </p>
+        <p class="pull">The data residency is yours.</p>
+      </div>
+      <ul class="hood-list">
+        <li><Icon name="cloudoff" /><span><strong>No Drover cloud.</strong> Daemons, hub and data store run on hardware you choose.</span></li>
+        <li><Icon name="shield" /><span><strong>Private networks only.</strong> Localhost, a private LAN or Tailscale. It has shell and filesystem authority, so it is never exposed through public ingress.</span></li>
+        <li><Icon name="profile" /><span><strong>One trusted operator.</strong> Not a hosted multi-tenant control plane. That keeps it honest about who owns the credentials, processes and history.</span></li>
+        <li><Icon name="db" /><span><strong>Your stores.</strong> A PostgreSQL control store and a DuckLake lake, on your disks.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" id="ios">
+    <div class="wrap">
+      <div class="split-head">
+        <div>
+          <span class="eyebrow">iOS app</span>
+          <h2>The phone is where the next decision gets made.</h2>
+        </div>
+        <div>
+          <p class="lede">
+            Fleet, launch, cockpit and analytics in a native app for iOS 18 and later. Pair with a QR code, watch live
+            sessions grouped by host, start a new one, and answer the agent when it asks.
+          </p>
+          <p class="ios-status">
+            <span class="tag beta">Beta</span>
+            <span>Free developer tool. Build it from source today; a public beta is coming soon.</span>
+          </p>
+        </div>
+      </div>
+      <div class="shots">
+        {
+          shots.map((s) => (
+            <div class="shot reveal">
+              <figure class="phone-frame">
+                <Image src={s.src} alt={s.alt} widths={[260, 400, 600]} sizes="(max-width: 700px) 44vw, 250px" />
+              </figure>
+              <span class="shot-label">{s.label}</span>
+            </div>
+          ))
+        }
+      </div>
+      <p class="fine center">Real screenshots of the app, showing demo data.</p>
+    </div>
+  </section>
+
+  <section class="section cta">
+    <div class="wrap-narrow center">
+      <h2>Keep the thought-to-action barrier small.</h2>
+      <p class="lede">
+        When the interaction model, continuity and routing state live above the individual harness, you do not have to
+        remember every operational nuance before you can act on an idea.
+      </p>
+      <div class="btn-row cta-row">
+        <a class="btn" href="/docs/getting-started/">Read the getting started guide</a>
+        <a class="btn ghost" href={LINKS.repo} rel="noopener">GitHub</a>
+        <a class="btn ghost" href={LINKS.article} rel="noopener">Launch article</a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .hero {
+    background: var(--glow);
+    padding-block: clamp(2.5rem, 6vw, 5rem) clamp(3rem, 6vw, 5rem);
+    overflow: hidden;
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+    gap: clamp(1.5rem, 4vw, 4rem);
+    align-items: center;
+  }
+  .hl {
+    color: var(--ember);
+    font-style: italic;
+    font-variation-settings: 'wdth' 84;
+  }
+  .hero .lede {
+    margin-bottom: 1.6rem;
+  }
+  .text-link {
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .install {
+    margin-top: 2rem;
+    max-width: 640px;
+  }
+  .install pre {
+    font-size: 0.8rem;
+  }
+  .install .c {
+    color: var(--muted);
+  }
+  .fine {
+    font-size: 0.86rem;
+    color: var(--muted);
+    margin-top: 0.8rem;
+  }
+  .hero-art {
+    position: relative;
+    justify-self: center;
+    max-width: 520px;
+  }
+  .hero-art :global(img) {
+    display: block;
+    width: 100%;
+    filter: drop-shadow(0 30px 40px rgba(0, 0, 0, 0.35));
+    animation: bob 7s ease-in-out infinite;
+  }
+  .float {
+    position: absolute;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.4rem 0.7rem;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    box-shadow: var(--shadow);
+    white-space: nowrap;
+    animation: bob 6s ease-in-out infinite;
+  }
+  .float i {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--ok);
+  }
+  .float i.w {
+    background: var(--ember);
+    animation: ping 1.4s ease-in-out infinite;
+  }
+  .f1 {
+    top: 9%;
+    right: -4%;
+    animation-delay: -1s;
+  }
+  .f2 {
+    top: 46%;
+    left: -10%;
+    animation-delay: -3s;
+  }
+  .f3 {
+    bottom: 6%;
+    right: 2%;
+    animation-delay: -5s;
+  }
+  @keyframes bob {
+    50% {
+      transform: translateY(-9px);
+    }
+  }
+  @keyframes ping {
+    50% {
+      box-shadow: 0 0 0 6px color-mix(in srgb, var(--ember) 25%, transparent);
+    }
+  }
+
+  .probs {
+    margin-top: 2.2rem;
+  }
+  .prob {
+    border-top: 2px solid var(--text);
+    padding-top: 1rem;
+  }
+  .prob .num {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--ember);
+  }
+  .prob h3 {
+    font-size: 1.5rem;
+    margin: 0.3rem 0 0.5rem;
+  }
+  .prob p {
+    color: var(--text-2);
+  }
+
+  .one {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.75fr);
+    gap: clamp(2rem, 5vw, 5rem);
+    align-items: center;
+  }
+  .one-phone {
+    max-width: 320px;
+    justify-self: center;
+    transform: rotate(2deg);
+  }
+  .pull {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(1.5rem, 2.8vw, 2.1rem);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    color: var(--ember);
+    margin: 1.2rem 0;
+  }
+  .questions {
+    list-style: none;
+    counter-reset: q;
+    margin: 0 0 1.4rem;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+  }
+  .questions li {
+    counter-increment: q;
+    display: flex;
+    gap: 0.8rem;
+    align-items: baseline;
+    padding: 0.7rem 1rem;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 1.08rem;
+    letter-spacing: -0.01em;
+  }
+  .questions li::before {
+    content: counter(q);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--teal);
+  }
+
+  .fit {
+    margin-top: 2rem;
+  }
+  .aside {
+    margin: 1.6rem 0 0;
+    padding-left: 1rem;
+    border-left: 3px solid var(--ember);
+    color: var(--text-2);
+    max-width: 70ch;
+  }
+
+  .split-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 1.5rem 3rem;
+    align-items: end;
+    margin-bottom: 2rem;
+  }
+  .split-head h2 {
+    margin-bottom: 0;
+  }
+  .more {
+    margin-top: 1.4rem;
+    font-weight: 600;
+  }
+  .more a::after {
+    content: ' ->';
+    font-family: var(--font-mono);
+  }
+
+  .planes {
+    margin-top: 1.6rem;
+  }
+  .plane {
+    border-radius: var(--radius-l);
+    padding: 1.5rem;
+    border: 1.5px solid;
+  }
+  .plane.teal {
+    background: color-mix(in srgb, var(--teal-soft) 60%, var(--surface));
+    border-color: color-mix(in srgb, var(--teal) 55%, transparent);
+  }
+  .plane.ember {
+    background: color-mix(in srgb, var(--ember-soft) 55%, var(--surface));
+    border-color: color-mix(in srgb, var(--ember) 50%, transparent);
+  }
+  .plane-tag {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .plane.teal .plane-tag {
+    color: var(--teal);
+  }
+  .plane.ember .plane-tag {
+    color: var(--ember);
+  }
+  .plane h3 {
+    font-size: 1.5rem;
+    margin: 0.5rem 0 0.7rem;
+  }
+  .plane p {
+    color: var(--text-2);
+    font-size: 0.98rem;
+  }
+  .plane p:last-child {
+    margin-bottom: 0;
+  }
+
+  .feats {
+    margin-top: 2rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    overflow: hidden;
+    background: var(--line);
+    gap: 1px;
+  }
+  .feat {
+    background: var(--surface);
+    padding: 1.3rem;
+  }
+  .feat h3 {
+    font-size: 1.1rem;
+    margin-bottom: 0.3rem;
+  }
+  .feat p {
+    font-size: 0.92rem;
+    color: var(--text-2);
+    margin: 0;
+  }
+  .ficon {
+    width: 26px;
+    height: 26px;
+    color: var(--ember);
+    margin-bottom: 0.7rem;
+  }
+
+  .caps {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    gap: 2.5rem;
+    align-items: center;
+  }
+  .cap-table {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    background: var(--surface);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  .cap-row {
+    display: grid;
+    grid-template-columns: 1.1fr 1.1fr 1fr;
+    gap: 0.5rem;
+    padding: 0.65rem 1.1rem;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.93rem;
+  }
+  .cap-row:last-child {
+    border-bottom: 0;
+  }
+  .cap-row.head {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    background: var(--surface-2);
+  }
+  .cap-row span:first-child {
+    font-weight: 600;
+  }
+  .cap-row .y {
+    color: var(--ok);
+  }
+  .cap-row .n {
+    color: var(--muted);
+  }
+
+  .differs {
+    margin-top: 2rem;
+  }
+  .differs h3 a {
+    color: inherit;
+  }
+  .differs .where {
+    padding-top: 0.7rem;
+    border-top: 1px dashed var(--line-strong);
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
+  .differs .mine {
+    border-color: var(--ember);
+    background: color-mix(in srgb, var(--ember-soft) 45%, var(--surface));
+  }
+
+  .hood {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+    gap: 2.5rem;
+    align-items: center;
+  }
+  .hood-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.7rem;
+  }
+  .hood-list li {
+    display: flex;
+    gap: 0.8rem;
+    align-items: flex-start;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    background: var(--surface);
+    font-size: 0.95rem;
+    color: var(--text-2);
+  }
+  .hood-list :global(svg) {
+    flex: none;
+    width: 22px;
+    height: 22px;
+    color: var(--teal);
+    margin-top: 2px;
+  }
+  .hood-list strong {
+    color: var(--text);
+  }
+
+  .ios-status {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+    font-size: 0.95rem;
+    color: var(--text-2);
+  }
+  .shots {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1.4rem;
+    margin-top: 1rem;
+  }
+  .shot {
+    display: grid;
+    gap: 0.7rem;
+    justify-items: center;
+  }
+  .shot:nth-child(even) {
+    transform: translateY(22px);
+  }
+  .shot-label {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .shots + .fine {
+    margin-top: 2.5rem;
+  }
+
+  .cta {
+    background: var(--glow);
+  }
+  .cta-row {
+    justify-content: center;
+    margin-top: 1.6rem;
+  }
+
+  @media (max-width: 900px) {
+    .hero-grid,
+    .caps,
+    .hood,
+    .one,
+    .split-head {
+      grid-template-columns: 1fr;
+    }
+    .hero-art {
+      order: -1;
+      max-width: 300px;
+    }
+    .float {
+      display: none;
+    }
+    .one-phone {
+      max-width: 260px;
+    }
+    .shots {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .shot:nth-child(even) {
+      transform: none;
+    }
+  }
+</style>

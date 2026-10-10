@@ -171,6 +171,7 @@ device signing, and server configuration.
 - [Security](docs/security.md)
 - [GitHub Actions Runner](docs/github-actions-runner.md)
 - [Agent Skills](skills/README.md)
+- [Product and docs site source](site/README.md)
 
 ## Status and limitations
 

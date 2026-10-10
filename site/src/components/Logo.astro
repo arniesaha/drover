@@ -1,0 +1,38 @@
+---
+// The mascot mark is cropped from the README hero artwork by
+// scripts/gen-brand.mjs, so the site and the repository share one identity.
+import { Image } from 'astro:assets';
+import mark from '../assets/drover-mark.png';
+
+interface Props {
+  size?: number;
+  withText?: boolean;
+}
+const { size = 32, withText = true } = Astro.props;
+---
+
+<span class="logo">
+  <Image src={mark} alt="" width={size} height={size} densities={[1, 2, 3]} loading="eager" />
+  {withText && <span class="logo-text">drover</span>}
+</span>
+
+<style>
+  .logo {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+  .logo :global(img) {
+    display: block;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1.5px var(--line-strong);
+  }
+  .logo-text {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 1.32rem;
+    letter-spacing: -0.04em;
+    font-variation-settings: 'wdth' 88;
+    color: var(--text);
+  }
+</style>

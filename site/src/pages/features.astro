@@ -1,0 +1,341 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
+import { LINKS } from '../site';
+
+type Status = 'today' | 'optin' | 'beta' | 'roadmap';
+const statusLabel: Record<Status, string> = {
+  today: 'Works today',
+  optin: 'Opt-in',
+  beta: 'Beta',
+  roadmap: 'Roadmap',
+};
+
+interface Feature {
+  id: string;
+  icon: any;
+  title: string;
+  status: Status;
+  lede: string;
+  points: string[];
+  more?: { href: string; label: string };
+}
+
+const features: Feature[] = [
+  {
+    id: 'harnesses',
+    icon: 'terminal',
+    title: 'Multi-harness sessions',
+    status: 'today',
+    lede: 'One way to start, steer and stop a session, whichever agent CLI is doing the work.',
+    points: [
+      'Launch and drive Claude Code, Codex, Antigravity (agy) and DeepSeek Harness through a registered adapter contract.',
+      'Structured chat with interrupt and native resume, plus a real PTY terminal stream when you want to watch.',
+      'Tool approvals are relayed for Claude Code, the one adapter that supports them today.',
+      'Pick the model and reasoning effort per session from the catalog each host reports.',
+      'OpenClaw and Hermes are observed as context. They are not launch targets.',
+    ],
+    more: { href: LINKS.doc('harness-adapter-architecture.md'), label: 'Harness adapter architecture' },
+  },
+  {
+    id: 'fleet',
+    icon: 'fleet',
+    title: 'Hub and hosts',
+    status: 'today',
+    lede: 'One central hub, and a small daemon on every machine that runs agents.',
+    points: [
+      'drover-server keeps the fleet registry and routes each request. It never runs remote commands itself.',
+      'drover-harnessd owns the agent processes, terminals and filesystem access on its own machine.',
+      'Direct hosts accept private inbound connections. Relay hosts dial out, so no inbound port is needed.',
+      'Add a machine with a single pasted command and a pairing code that expires in fifteen minutes.',
+      'Runs on macOS and Linux with Python 3.11 or later.',
+    ],
+    more: { href: '/docs/getting-started/#add-another-machine', label: 'Add another machine' },
+  },
+  {
+    id: 'ios',
+    icon: 'phone',
+    title: 'iOS cockpit',
+    status: 'beta',
+    lede: 'A native app that treats your fleet like something you can hold.',
+    points: [
+      'Live sessions grouped by host, with provider capacity within reach.',
+      'Start a session: choose host, harness, project, model and reasoning effort.',
+      'Send turns, answer prompts, hand a session off, attach to its terminal.',
+      'Pairs by QR code. The credential lives in the iOS Keychain and is revocable from the hub.',
+      'Push notifications when a session needs you, if you configure your own APNs key. Otherwise best-effort local notifications.',
+      'Built from source with Xcode 16 for iOS 18 and later. Not on the App Store; a public beta is coming soon.',
+    ],
+    more: { href: LINKS.file('apps/drover/README.md'), label: 'iOS build guide' },
+  },
+  {
+    id: 'recall',
+    icon: 'search',
+    title: 'Recall, search and handoffs',
+    status: 'today',
+    lede: 'The history of every session, queryable by the next one.',
+    points: [
+      'Keyword search and session replay over everything the hub has ingested.',
+      'Recall bundles: keyword matches, summaries, project briefs and open loops in one bounded response.',
+      'Semantic recall when you configure an embeddings backend, with keyword fallback.',
+      'Continue a session on another host or another harness. Drover briefs the new session from the old one, or reopens it natively when the harness supports that.',
+      'Every result says which store answered and how fresh the data is. No silent stale answers.',
+    ],
+    more: { href: '/docs/mcp/', label: 'MCP tools' },
+  },
+  {
+    id: 'summaries',
+    icon: 'notes',
+    title: 'Session summaries and project briefs',
+    status: 'optin',
+    lede: 'Optional workers that turn raw transcripts into something a person or an agent can read in a minute.',
+    points: [
+      'Per-session summaries, rolling project briefs and live recaps of long-running sessions.',
+      'Runs on a model you choose: the Claude Code CLI on a host, or an Anthropic API key.',
+      'Workers stay idle until a backend is configured. Ingest and fleet control work without them.',
+      'Whatever provider you pick receives the transcript text it summarizes, under your account and their terms.',
+    ],
+    more: { href: '/docs/configuration/#models-for-summaries-and-embeddings', label: 'Configure model backends' },
+  },
+  {
+    id: 'profile',
+    icon: 'profile',
+    title: 'Portable profile with privacy tiers',
+    status: 'today',
+    lede: 'Your preferences and standing rules, handed to each new session in under 1,500 tokens.',
+    points: [
+      'Three tiers: general, trusted and private. Unknown agents get general. Hidden items show up only as a count.',
+      'Agents can propose changes. Nothing is accepted until you approve it, and every change can be reverted.',
+      'Import from Markdown with a dry run by default. Everything imports as private unless you say otherwise.',
+      'Trusted reads use a read-only credential over HTTP. The MCP transport always reads as general.',
+      'Requires the PostgreSQL control store.',
+    ],
+    more: { href: LINKS.doc('portable-profile.md'), label: 'Portable profile guide' },
+  },
+  {
+    id: 'analytics',
+    icon: 'chart',
+    title: 'Lake analytics',
+    status: 'optin',
+    lede: 'Usage, projects and quota, computed from facts you can audit.',
+    points: [
+      'Tokens and cache numbers per session, busiest projects, activity timelines.',
+      'Provider quota windows across accounts and hosts, with a routing hint for where there is headroom.',
+      'A DuckLake lake (PostgreSQL catalog plus Parquet files) holds the canonical facts. You select it explicitly; it is not enabled by default.',
+      'Reads run in a disposable child process with a five second deadline and a memory cap.',
+    ],
+    more: { href: '/architecture/#storage', label: 'How storage works' },
+  },
+  {
+    id: 'mcp',
+    icon: 'plug',
+    title: 'MCP server',
+    status: 'today',
+    lede: 'Your fleet and its memory as tools any MCP client can call.',
+    points: [
+      'Streamable HTTP at /mcp with drover_* tools for fleet status, search, replay, recall, briefs, handoff context and profile.',
+      'Bounded by contract: capped rows, capped bytes, five second deadline, explicit busy and timeout answers.',
+      'One hub is the single recall endpoint for every agent on every host.',
+      'Binds to localhost by default and has no authentication of its own yet. Keep it on loopback or a network you trust.',
+    ],
+    more: { href: '/docs/mcp/', label: 'MCP setup' },
+  },
+  {
+    id: 'continuity',
+    icon: 'loop',
+    title: 'Continuity across restarts',
+    status: 'today',
+    lede: 'Restarts, crashes and closed lids should cost you nothing.',
+    points: [
+      'Event, payload and export intent commit in one transaction, so a crash cannot half-record a turn.',
+      'Sessions keep their native resume identity, so a harness that supports resume can be reopened.',
+      'A stop request to an offline host is remembered and confirmed when the host returns, instead of pretending it worked.',
+      'The iOS app keeps unsent drafts and pending turns in protected local storage until they can be delivered.',
+      'Context containers that track next actions and open loops per project are available as an opt-in worker.',
+    ],
+    more: { href: LINKS.doc('session-lifecycle.md'), label: 'Session lifecycle' },
+  },
+];
+
+const roadmap = [
+  { title: 'Authenticated MCP', body: 'Credentials for the MCP endpoint so it can be shared beyond loopback with the same confidence as the HTTP API.' },
+  { title: 'Host-bound credentials', body: 'Today a host credential can act as any host. Binding credentials to a host identity is tracked in the public issue tracker.' },
+  { title: 'Lifecycle enforcement', body: 'Lifecycle scans report idle sessions and stale worktrees. They do not stop, archive or clean anything yet.' },
+  { title: 'Off-site backup', body: 'A verified backup of the lake and control store to object storage is designed and rehearsed, not shipped.' },
+  { title: 'Public iOS beta', body: 'The app is source-built today. A public beta is planned.' },
+  { title: 'Packaging', body: 'Drover is distributed as source and a release wheel. Native packages are future work.' },
+];
+---
+
+<BaseLayout title="Features" description="What Drover does today, what is opt-in, and what is still on the roadmap.">
+  <section class="page-hero">
+    <div class="wrap">
+      <span class="eyebrow">Features and capabilities</span>
+      <h1>What it does, and how sure we are.</h1>
+      <p class="lede">
+        Every item below is labelled. <strong>Works today</strong> is on by default in a current release.{' '}
+        <strong>Opt-in</strong> ships in the code but needs you to configure something. <strong>Roadmap</strong> is not
+        built yet.
+      </p>
+      <nav class="jump" aria-label="Features on this page">
+        {features.map((f) => <a href={`#${f.id}`}>{f.title}</a>)}
+        <a href="#roadmap">Roadmap</a>
+      </nav>
+    </div>
+  </section>
+
+  <section class="section-tight">
+    <div class="wrap list">
+      {
+        features.map((f) => (
+          <article class="feature" id={f.id}>
+            <div class="f-head">
+              <div class="f-icon">
+                <Icon name={f.icon} />
+              </div>
+              <span class={`tag ${f.status}`}>{statusLabel[f.status]}</span>
+              <h2>{f.title}</h2>
+              <p class="f-lede">{f.lede}</p>
+              {f.more && (
+                <a class="f-more" href={f.more.href} rel={f.more.href.startsWith('http') ? 'noopener' : undefined}>
+                  {f.more.label}
+                </a>
+              )}
+            </div>
+            <ul class="f-points">
+              {f.points.map((p) => <li>{p}</li>)}
+            </ul>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section band" id="roadmap">
+    <div class="wrap">
+      <span class="eyebrow">Roadmap</span>
+      <h2>Not built yet. Said plainly.</h2>
+      <p class="lede">
+        These are known gaps and planned work, not promises with dates. Follow the{' '}
+        <a href={LINKS.issues} rel="noopener">issue tracker</a> and the{' '}
+        <a href={LINKS.changelog} rel="noopener">changelog</a> for what actually lands.
+      </p>
+      <div class="grid cols-3 road">
+        {
+          roadmap.map((r) => (
+            <div class="card">
+              <span class="tag roadmap">Roadmap</span>
+              <h3>{r.title}</h3>
+              <p>{r.body}</p>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .jump {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 1.6rem;
+  }
+  .jump a {
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    padding: 0.3rem 0.7rem;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    color: var(--text-2);
+    text-decoration: none;
+    background: var(--surface);
+  }
+  .jump a:hover {
+    border-color: var(--ember);
+    color: var(--ember);
+  }
+  .list {
+    display: grid;
+  }
+  .feature {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    gap: 1.5rem 3rem;
+    padding-block: 2.6rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .feature:last-child {
+    border-bottom: 0;
+  }
+  .f-icon {
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    border-radius: 13px;
+    background: var(--ember-soft);
+    color: var(--ember);
+    margin-bottom: 1rem;
+  }
+  .f-icon :global(svg) {
+    width: 24px;
+    height: 24px;
+  }
+  .feature h2 {
+    font-size: clamp(1.6rem, 2.6vw, 2.1rem);
+    margin: 0.7rem 0 0.5rem;
+  }
+  .f-lede {
+    color: var(--text-2);
+    font-size: 1.05rem;
+  }
+  .f-more {
+    font-weight: 600;
+    font-size: 0.93rem;
+  }
+  .f-more::after {
+    content: ' ->';
+    font-family: var(--font-mono);
+  }
+  .f-points {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.6rem;
+    align-content: start;
+  }
+  .f-points li {
+    position: relative;
+    padding: 0.75rem 1rem 0.75rem 2.3rem;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    font-size: 0.96rem;
+    color: var(--text-2);
+  }
+  .f-points li::before {
+    content: '';
+    position: absolute;
+    left: 1rem;
+    top: 1.2rem;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: var(--teal);
+    transform: rotate(45deg);
+  }
+  .road {
+    margin-top: 2rem;
+  }
+  .road h3 {
+    margin-top: 0.7rem;
+  }
+  @media (max-width: 860px) {
+    .feature {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
