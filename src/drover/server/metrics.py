@@ -2651,13 +2651,19 @@ class MetricsCollector:
                 if sessions
                 else {}
             )
-            turn_kinds = registry.completed_turn_kinds(
-                [
-                    session.session_id
-                    for session in sessions
-                    if session.effective_awaiting == "input"
-                ]
-            )
+            try:
+                turn_kinds = registry.completed_turn_kinds(
+                    [
+                        session.session_id
+                        for session in sessions
+                        if session.effective_awaiting == "input"
+                    ]
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Optional enrichment must not hide the fleet when an older
+                # registry lacks it or its lookup temporarily fails.
+                log.warning("failed to load completed turn kinds: %s", exc)
+                turn_kinds = {}
             previews = registry.latest_session_previews(
                 [session.session_id for session in sessions]
             )

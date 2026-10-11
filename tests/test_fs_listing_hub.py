@@ -110,9 +110,12 @@ def test_hub_filter_and_path_are_forwarded_without_host_override(
         assert [entry["name"] for entry in body["entries"]] == ["project & tools"]
 
 
-def test_hub_preserves_folder_policy_reason(tmp_path, base_url, root):  # noqa: F811 - imported pytest fixtures
+def test_hub_preserves_folder_policy_reason(
+    tmp_path, base_url, root
+):  # noqa: F811 - imported pytest fixtures
     with hub(tmp_path, base_url) as (url, _):
         params = urlencode({"path": "/tmp"})
         assert get(f"{url}/harness/hosts/test-host/fs/list?{params}") == (
-            403, {"error": "outside_allowed_folders"}
+            403,
+            {"error": "outside_allowed_folders"},
         )
