@@ -5,10 +5,10 @@
 ``/harness/events`` ingest route. Delivery is at-least-once: a batch that
 fails is retried, and a batch that outlives its retry attempts is *kept* and
 re-offered on the next cycle rather than discarded (central is the idempotent
-side, keyed by ``event_id``). Queue overflow, an exhausted shutdown flush, and a permanent 403 refusal
-all bump ``record_undelivered_events``. Authorization-refused batches are skipped
-with one warning; their local ledger records remain available for repair. Never log event text or the bearer token --
-only counts.
+side, keyed by ``event_id``). Queue overflow and an exhausted shutdown flush
+bump ``record_undelivered_events``. Authorization failures also bump the metric,
+but retain events and back off until credentials recover. Never log event text
+or the bearer token, only counts and retry delays.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import logging
 import sys
 import threading
 from queue import Empty, SimpleQueue
+from time import monotonic
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -27,6 +28,8 @@ log = logging.getLogger("drover.event_pusher")
 _MAX_QUEUE = 5000
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 5.0
+_AUTH_BACKOFF_SECONDS = 30.0
+_AUTH_MAX_BACKOFF_SECONDS = 300.0
 _POST_TIMEOUT_SECONDS = 10.0
 # stop() must outlast one in-flight HTTP attempt (10 s) so the worker can
 # hand back an undelivered batch instead of being orphaned mid-retry.
@@ -72,9 +75,10 @@ class EventPusher:
         # away) and prepended to the next drain, so a central that is down
         # longer than one cycle's attempts costs latency, not history.
         self._unsent: list[dict[str, Any]] = []
-        # Permanent authorization refusals have a terminal disposition for
-        # this process. The durable local ledger remains available for repair.
-        self._rejected_event_ids: set[str] = set()
+        # Shared cooldown prevents the live worker and durable reconciliation
+        # from independently hammering central while a credential is repaired.
+        self._authorization_retry_at = 0.0
+        self._authorization_backoff = _AUTH_BACKOFF_SECONDS
 
     def start(self) -> None:
         if self._thread is not None:
@@ -91,7 +95,7 @@ class EventPusher:
         return self._stop.is_set()
 
     def post_batch(self, batch: list[dict[str, Any]]) -> bool:
-        """POST a batch; True means accepted or permanently skipped."""
+        """POST a batch; True only for a 2xx response."""
         return self._post(batch)
 
     def reconcile(
@@ -161,6 +165,9 @@ class EventPusher:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            cooldown = self._authorization_retry_at - monotonic()
+            if cooldown > 0 and self._stop.wait(cooldown):
+                break
             self._wake.wait(self._batch_interval)
             self._wake.clear()
             batch = self._drain()
@@ -211,6 +218,11 @@ class EventPusher:
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             if self._post(batch):
                 return
+            if self._authorization_retry_at > monotonic():
+                # One authorization attempt per backoff step. Re-offer this
+                # batch next cycle instead of spending the normal short retries.
+                self._retain(batch)
+                return
             if self._stop.is_set():
                 # Shutdown in progress: hand the batch to stop()'s final
                 # flush instead of burning the remaining attempts here.
@@ -228,19 +240,10 @@ class EventPusher:
         self._retain(batch)
 
     def _post(self, batch: list[dict[str, Any]]) -> bool:
-        """POST one batch, skipping permanent 403 refusals.
-
-        Network and server failures remain retryable. Authorization-refused
-        events stay in the local ledger but are not offered again this run.
-        """
+        """POST once unless authorization recovery is still backing off."""
         with self._post_lock:
-            batch = [
-                event
-                for event in batch
-                if str(event.get("event_id")) not in self._rejected_event_ids
-            ]
-            if not batch:
-                return True
+            if self._authorization_retry_at > monotonic():
+                return False
             request = Request(
                 f"{self._central_url}/harness/events",
                 data=json.dumps({"events": batch}).encode("utf-8"),
@@ -252,19 +255,25 @@ class EventPusher:
             )
             try:
                 with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
-                    return 200 <= response.status < 300
+                    accepted = 200 <= response.status < 300
+                    if accepted:
+                        self._authorization_retry_at = 0.0
+                        self._authorization_backoff = _AUTH_BACKOFF_SECONDS
+                    return accepted
             except HTTPError as exc:
                 if exc.code == 403:
-                    self._rejected_event_ids.update(
-                        str(event.get("event_id")) for event in batch
+                    delay = self._authorization_backoff
+                    self._authorization_retry_at = monotonic() + delay
+                    self._authorization_backoff = min(
+                        delay * 2, _AUTH_MAX_BACKOFF_SECONDS
                     )
                     _record_undelivered(len(batch))
                     log.warning(
-                        "structured events skipped after permanent 403: "
-                        "route=/harness/events events=%d; local ledger retained",
+                        "structured event authorization backoff: "
+                        "events=%d retry_seconds=%.0f",
                         len(batch),
+                        delay,
                     )
-                    return True
                 return False
             except (OSError, URLError):
                 return False
