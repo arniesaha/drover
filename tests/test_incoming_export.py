@@ -24,7 +24,11 @@ def test_incoming_export_selects_backend_and_checks_canonical_keys(
     monkeypatch.setattr(lifecycle, "LakeOutboxExporter", lake)
     monkeypatch.setattr(lifecycle, "lake_spec", lambda *_args, **_kwargs: "test-spec")
     monkeypatch.setattr(lifecycle, "catalog_identity", lambda _: "same-catalog")
-    monkeypatch.setattr(lifecycle, "HistoryConnection", lambda _: nullcontext(Mock()))
+    history = Mock()
+    history_connection = Mock(
+        side_effect=lambda _, *, exporter_check=False: nullcontext(history)
+    )
+    monkeypatch.setattr(lifecycle, "HistoryConnection", history_connection)
     control = Mock()
     control.execute.return_value.fetchall.side_effect = [
         [("pending", None)],
@@ -43,11 +47,16 @@ def test_incoming_export_selects_backend_and_checks_canonical_keys(
         lake.assert_not_called()
         exporter.run_once.assert_called_with(force_flush=True)
         refresh.assert_not_called()
+        history_connection.assert_not_called()
     else:
         lake.assert_called_once_with(control_path="isolated-test", spec="test-spec")
         legacy.assert_not_called()
         exporter.run_once.assert_called_with()
         refresh.assert_called_once_with("isolated-test", lake_fence=exporter.fence)
+        history_connection.assert_called_once_with(
+            config.analytics, exporter_check=True
+        )
+        history.execute.assert_called_once_with("SELECT 1")
 
 
 @pytest.mark.parametrize("limits", [{"max_passes": 1}, {"timeout_seconds": 0}])

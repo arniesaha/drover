@@ -55,9 +55,10 @@ def lake_spec(config: AnalyticsConfig, *, exporter=False) -> LakeSpec:
 class HistoryConnection:
     """Small read-only cursor facade; every execution has independent hard caps."""
 
-    def __init__(self, config, *, identities=()):
+    def __init__(self, config, *, identities=(), exporter_check=False):
         self.config = config
         self.identities = list(identities)
+        self.exporter_check = exporter_check
         self.description = []
         self.rows = []
 
@@ -74,6 +75,7 @@ class HistoryConnection:
             serving={
                 "verification_sha256": self.config.verification_sha256,
                 "identities": self.identities,
+                **({"exporter_check": True} if self.exporter_check else {}),
             },
             limits=limits or QueryLimits(),
         )

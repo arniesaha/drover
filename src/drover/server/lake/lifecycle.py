@@ -46,7 +46,10 @@ def _cause(exc: BaseException, config) -> str:
         for name in ("exporter_dsn_env", "reader_dsn_env", "catalog_dsn_env")
         if isinstance(value := getattr(config.analytics, name, None), str)
     ]
-    return sanitize_detail(exc, *secrets)
+    cause = (
+        RuntimeError(exc.detail) if isinstance(exc, LakeError) and exc.detail else exc
+    )
+    return sanitize_detail(cause, *secrets)
 
 
 class ExporterLifecycle:
@@ -107,8 +110,8 @@ class ExporterLifecycle:
                 return
             if self._cancel_requested_at is not None:
                 if now - self._cancel_requested_at >= CANCELLATION_GRACE_SECONDS:
-                    # Python threads cannot be force-killed safely. Fail closed
-                    # if cancellation cannot unwind; never overlap fence owners.
+                    # Python threads cannot be force-killed safely. Request a
+                    # process restart; never overlap fence owners.
                     self._cancellation_stuck = True
                     self._error = "lake_export_cancellation_stuck"
                     self._stop.set()
@@ -137,6 +140,9 @@ class ExporterLifecycle:
     def _watch_freshness(self, shutdown):
         while not self._stop.is_set() and not shutdown.is_set():
             self._watch_batch()
+            if self._cancellation_stuck:
+                self._request_restart(shutdown)
+                return
             try:
                 self._snapshot = read_freshness(self.config.duckdb_path)
             except Exception:
@@ -152,6 +158,7 @@ class ExporterLifecycle:
             if not self._started or self._stop.is_set() or shutdown.is_set():
                 return
             if self._restarts >= MAX_RESTARTS:
+                self._request_restart(shutdown)
                 return
             self._recovering = True
             self._restarts += 1
@@ -161,6 +168,15 @@ class ExporterLifecycle:
                 self._recovering = False
                 return
             self._recovering = False
+
+    def _request_restart(self, shutdown):
+        log.error(
+            "DuckLake recovery exhausted: error=%s restarts=%s; "
+            "requesting server shutdown for service-manager restart",
+            self._error,
+            self._restarts,
+        )
+        shutdown.set()
 
     def _run(self, shutdown):
         try:
@@ -346,7 +362,7 @@ def _check_export_catalog(config, exporter):
     reader = lake_spec(config.analytics)
     if catalog_identity(reader) != catalog_identity(exporter.spec):
         raise LakeError("lake_export_catalog_mismatch")
-    with HistoryConnection(config.analytics) as history:
+    with HistoryConnection(config.analytics, exporter_check=True) as history:
         history.execute("SELECT 1")
 
 

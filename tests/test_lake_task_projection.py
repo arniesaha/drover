@@ -403,8 +403,8 @@ def test_zero_winner_ack_still_refreshes_and_refresh_error_releases_lifecycle(
             return {"exported": 0, "acknowledged": 1}
 
     class History:
-        def __init__(self, *args):
-            pass
+        def __init__(self, *args, exporter_check=False):
+            assert exporter_check
 
         def __enter__(self):
             return self

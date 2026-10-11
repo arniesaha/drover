@@ -158,6 +158,16 @@ def query(
     serving: dict | None = None,
 ) -> dict:
     started_at = time.monotonic()
+    # Exporter prerequisites must not queue behind cockpit reads. Both lanes
+    # still admit only one disposable child and retain the same hard limits.
+    maintenance = bool(
+        serving
+        and (
+            serving.get("exporter_check")
+            or serving.get("checkpoint")
+            or serving.get("task_projection")
+        )
+    )
     with tempfile.TemporaryDirectory(prefix="drover-lake-query-") as scratch:
         root = Path(scratch)
         request = root / "request.json"
@@ -186,7 +196,7 @@ def query(
             / f"drover-lake-{os.getuid()}"
             / (
                 hashlib.sha256(str(spec.data_root.resolve()).encode()).hexdigest()
-                + ".lock"
+                + (".maintenance.lock" if maintenance else ".lock")
             ),
             limits=limits,
             cwd=root,

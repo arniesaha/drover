@@ -872,3 +872,47 @@ def test_exporter_cancel_interrupts_borrowed_postgres_query(
             task.join(12)
     with control_plane_connection(path) as con:
         assert con.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_export_deadline_reports_phase_and_reaps_child(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from drover.server.lake import exporter as module
+    from drover.server.lake.runtime import LakeSpec
+
+    monkeypatch.setattr(module, "is_postgres_control_store", lambda path: True)
+    monkeypatch.setattr(LakeSpec, "dsn", lambda self: "dbname=private_test")
+    worker = LakeOutboxExporter(
+        control_path=tmp_path,
+        spec=LakeSpec("UNUSED_TEST_DSN", tmp_path, tmp_path, "unused"),
+    )
+    worker.token = "test-token"
+    monkeypatch.setattr(worker, "_check", lambda: None)
+    child = SimpleNamespace(pid=123, returncode=None)
+    child.poll = lambda: child.returncode
+    reaped = []
+    child.wait = lambda: reaped.append(True)
+
+    def spawn(command, **kwargs):
+        request = json.loads(__import__("pathlib").Path(command[-1]).read_text())
+        __import__("pathlib").Path(request["progress"]).write_text("activity_daily")
+        return child
+
+    def kill(pid, sig):
+        assert pid == 123
+        child.returncode = -9
+
+    ticks = iter([0, 0.01, 31])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(module, "_rss", lambda pid: 123456)
+    monkeypatch.setattr(module.subprocess, "Popen", spawn)
+    monkeypatch.setattr(module.os, "killpg", kill)
+    with pytest.raises(LakeError, match="lake_export_deadline") as failure:
+        worker._publish({"event_ids": ["private-event"]})
+    assert "phase=activity_daily rows=1 input_bytes=" in failure.value.detail
+    assert "peak_rss_bytes=123456" in failure.value.detail
+    assert "private-event" not in failure.value.detail
+    assert child.returncode == -9 and reaped == [True]
+    assert list(tmp_path.iterdir()) == []

@@ -176,7 +176,7 @@ def _merge_events(con):
     )
 
 
-def export(spec, document, *, before_commit=None):
+def export(spec, document, *, before_commit=None, report_phase=lambda phase: None):
     spill = spec.data_root / "spill"
     spill.mkdir(exist_ok=True)
     with duckdb.connect(
@@ -189,8 +189,11 @@ def export(spec, document, *, before_commit=None):
         }
     ) as con:
         con.execute("SET TimeZone='UTC'")
+        report_phase("prepare")
         expected = prepare(con, document)
+        report_phase("attach")
         attach_lake(con, spec, read_only=False)
+        report_phase("receipt")
         con.execute("BEGIN")
         try:
             cur = con.execute(
@@ -236,9 +239,12 @@ def export(spec, document, *, before_commit=None):
                     != expected["canonical_sha256"]
                 ):
                     raise LakeError("lake_export_receipt_content_mismatch")
+                report_phase("commit")
                 con.execute("COMMIT")
                 return {"receipt": expected, "replayed": True}
+            report_phase("merge")
             _merge_events(con)
+            report_phase("activity_daily")
             refresh_activity_daily(
                 con,
                 [
@@ -248,6 +254,7 @@ def export(spec, document, *, before_commit=None):
                     ).fetchall()
                 ],
             )
+            report_phase("append")
             con.execute(
                 "INSERT INTO lake.export_event_versions BY NAME SELECT * FROM export_events"
             )
@@ -264,6 +271,7 @@ def export(spec, document, *, before_commit=None):
             )
             if before_commit:
                 before_commit()
+            report_phase("commit")
             con.execute("COMMIT")
             return {"receipt": expected, "replayed": False}
         except BaseException:
@@ -286,7 +294,12 @@ if __name__ == "__main__":
                 "extension_dir": Path(request["spec"]["extension_dir"]),
             }
         )
-        result = export(spec, request["document"])
+
+        def report_phase(phase):
+            if request.get("progress"):
+                Path(request["progress"]).write_text(phase)
+
+        result = export(spec, request["document"], report_phase=report_phase)
     except LakeError as exc:
         result = {"error": exc.code}
     except Exception:

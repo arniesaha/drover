@@ -254,6 +254,7 @@ class LakeOutboxExporter:
         ) as directory:
             root = Path(directory)
             reply = root / "reply.json"
+            progress = root / "progress"
             request = root / "request.json"
             request.write_text(
                 json.dumps(
@@ -265,6 +266,7 @@ class LakeOutboxExporter:
                         },
                         "document": document,
                         "reply": str(reply),
+                        "progress": str(progress),
                     }
                 )
             )
@@ -276,6 +278,7 @@ class LakeOutboxExporter:
                 ),
             }
             started = time.monotonic()
+            peak_rss = 0
             with (root / "error.log").open("wb") as errors:
                 child = subprocess.Popen(
                     [
@@ -293,9 +296,30 @@ class LakeOutboxExporter:
                     while child.poll() is None:
                         self._check()
                         if time.monotonic() - started > 30:
-                            raise LakeError("lake_export_deadline")
+                            try:
+                                phase = progress.read_text()[:32]
+                            except OSError:
+                                phase = "startup"
+                            if phase not in {
+                                "startup",
+                                "prepare",
+                                "attach",
+                                "receipt",
+                                "merge",
+                                "activity_daily",
+                                "append",
+                                "commit",
+                            }:
+                                phase = "unknown"
+                            raise LakeError(
+                                "lake_export_deadline",
+                                f"phase={phase} rows={len(document['event_ids'])} "
+                                f"input_bytes={request.stat().st_size} "
+                                f"peak_rss_bytes={peak_rss}",
+                            )
                         try:
-                            if _rss(child.pid) > 2 * 1024**3:
+                            peak_rss = max(peak_rss, _rss(child.pid))
+                            if peak_rss > 2 * 1024**3:
                                 raise LakeError("lake_export_rss_limit")
                         except LakeError as exc:
                             if exc.code != "analytics_rss_monitor_unavailable":

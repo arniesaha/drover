@@ -175,12 +175,25 @@ outbox rows or receipts to recover a backlog. Startup validation failures still
 fail closed. Shutdown interrupts backoff and prevents replacement. If an owner
 cannot unwind within the 35-second cancellation grace, the exporter reports
 `lake_export_cancellation_stuck` and stopped; no overlapping owner is started.
-A hub restart is then needed to clear the unresponsive thread.
+The watchdog requests server shutdown to clear the unresponsive thread.
+After the fifth replacement fails, the supervisor also requests server shutdown.
+The existing server cleanup runs and launchd's KeepAlive job restarts the process.
+An unmanaged foreground server exits and must be started by its operator.
+
+Exporter catalog checks, serving checkpoints and task projection children use
+a separate file-backed admission lane from cockpit/analytics reads. Each lane
+admits one fresh disposable child with the same five-second, 2 GiB ceiling.
+The exporter still checks the full serving proof; isolation does not relax
+verification. This permits at most two query children concurrently, in addition
+to an export child. Shared catalog, disk and host memory pressure remain possible.
+An export deadline now logs only its last phase, input row/byte counts and peak
+child RSS, without event content or credentials. Phases distinguish preparation,
+attachment, receipt validation, merge, daily rollup, append and commit.
 
 For lagging work, wait briefly and run doctor again. For stalled or stopped
 work, check exporter error codes and control/catalog connectivity, runtime pins,
 provisioning and disk capacity. Correct the underlying error first. Once the
-replacement budget is exhausted, restart the hub to reset it. Confirm running
+replacement budget is exhausted, the managed hub restarts automatically. Confirm running
 status, decreasing outstanding age and batch count, and a new successful export
 time after synthetic ingestion. Verify that synthetic content is returned by
 recall and search before declaring recovery complete.
