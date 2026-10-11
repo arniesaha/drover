@@ -79,6 +79,9 @@ class EventPusher:
         # from independently hammering central while a credential is repaired.
         self._authorization_retry_at = 0.0
         self._authorization_backoff = _AUTH_BACKOFF_SECONDS
+        # Ownership races delay only their own session, including durable replay.
+        # Each entry holds (next attempt time, next exponential delay).
+        self._pending_sessions: dict[str, tuple[float, float]] = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -95,8 +98,18 @@ class EventPusher:
         return self._stop.is_set()
 
     def post_batch(self, batch: list[dict[str, Any]]) -> bool:
-        """POST a batch; True only for a 2xx response."""
+        """Return True only when every event is acknowledged."""
         return self._post(batch)
+
+    def post_batch_pending(
+        self, batch: list[dict[str, Any]]
+    ) -> list[dict[str, Any]] | None:
+        """Return unacknowledged ownership events, or None on request failure.
+
+        Reconciliation keeps pending events in its durable ledger and can
+        continue offering later pages without copying them into the live queue.
+        """
+        return self._post_pending(batch)
 
     def reconcile(
         self,
@@ -152,8 +165,8 @@ class EventPusher:
             remaining = self._drain()
             if not remaining:
                 break
-            if not self._post(remaining):
-                self._retain(remaining)
+            pending = self._post_pending(remaining)
+            self._retain(remaining if pending is None else pending)
         lost = self._drain()
         if lost:
             _record_undelivered(len(lost))
@@ -216,7 +229,9 @@ class EventPusher:
 
     def _deliver_with_retries(self, batch: list[dict[str, Any]]) -> None:
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            if self._post(batch):
+            pending = self._post_pending(batch)
+            if pending is not None:
+                self._retain(pending)
                 return
             if self._authorization_retry_at > monotonic():
                 # One authorization attempt per backoff step. Re-offer this
@@ -240,13 +255,24 @@ class EventPusher:
         self._retain(batch)
 
     def _post(self, batch: list[dict[str, Any]]) -> bool:
-        """POST once unless authorization recovery is still backing off."""
+        return self._post_pending(batch) == []
+
+    def _post_pending(self, batch: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        """POST eligible sessions once, preserving the input order for retries."""
         with self._post_lock:
             if self._authorization_retry_at > monotonic():
-                return False
+                return None
+            held_sessions = {
+                session_id
+                for session_id, (retry_at, _) in self._pending_sessions.items()
+                if retry_at > monotonic()
+            }
+            offered = [e for e in batch if e.get("session_id") not in held_sessions]
+            if not offered:
+                return list(batch)
             request = Request(
                 f"{self._central_url}/harness/events",
-                data=json.dumps({"events": batch}).encode("utf-8"),
+                data=json.dumps({"events": offered}).encode("utf-8"),
                 method="POST",
                 headers={
                     "Content-Type": "application/json",
@@ -255,28 +281,78 @@ class EventPusher:
             )
             try:
                 with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
-                    accepted = 200 <= response.status < 300
-                    if accepted:
-                        self._authorization_retry_at = 0.0
-                        self._authorization_backoff = _AUTH_BACKOFF_SECONDS
-                    return accepted
+                    if not 200 <= response.status < 300:
+                        return None
+                    pending_sessions = self._read_pending(response)
+                    self._authorization_retry_at = 0.0
+                    self._authorization_backoff = _AUTH_BACKOFF_SECONDS
             except HTTPError as exc:
-                if exc.code == 403:
+                if exc.code != 403:
+                    return None
+                try:
+                    pending_sessions = self._read_pending(exc)
+                except (OSError, ValueError):
+                    pending_sessions = set()
+                # Only the explicit all-pending ownership response is a
+                # partial acknowledgement on 403. Other failures retain all.
+                if pending_sessions != {e.get("session_id") for e in offered}:
+                    pending_sessions = set()
+                if not pending_sessions:
                     delay = self._authorization_backoff
                     self._authorization_retry_at = monotonic() + delay
                     self._authorization_backoff = min(
                         delay * 2, _AUTH_MAX_BACKOFF_SECONDS
                     )
-                    _record_undelivered(len(batch))
+                    _record_undelivered(len(offered))
                     log.warning(
                         "structured event authorization backoff: "
                         "events=%d retry_seconds=%.0f",
-                        len(batch),
+                        len(offered),
                         delay,
                     )
-                return False
-            except (OSError, URLError):
-                return False
+                    return None
+            except (OSError, URLError, ValueError):
+                return None
+            offered_sessions = {e.get("session_id") for e in offered}
+            if not pending_sessions <= offered_sessions:
+                return None
+            for session_id in offered_sessions - pending_sessions:
+                self._pending_sessions.pop(session_id, None)
+            for session_id in pending_sessions:
+                _, delay = self._pending_sessions.get(
+                    session_id, (0.0, _AUTH_BACKOFF_SECONDS)
+                )
+                self._pending_sessions[session_id] = (
+                    monotonic() + delay,
+                    min(delay * 2, _AUTH_MAX_BACKOFF_SECONDS),
+                )
+                count = sum(e.get("session_id") == session_id for e in offered)
+                _record_undelivered(count)
+                log.warning(
+                    "structured event ownership backoff: events=%d retry_seconds=%.0f",
+                    count,
+                    delay,
+                )
+            return [
+                e
+                for e in batch
+                if e.get("session_id") in held_sessions | pending_sessions
+            ]
+
+    @staticmethod
+    def _read_pending(response: Any) -> set[str]:
+        raw = response.read()
+        if not raw:
+            return set()
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("invalid event acknowledgement")
+        pending = body.get("pending", [])
+        if not isinstance(pending, list) or not all(
+            isinstance(s, str) for s in pending
+        ):
+            raise ValueError("invalid pending session acknowledgement")
+        return set(pending)
 
 
 def _is_flush_now_event(event: dict[str, Any]) -> bool:
@@ -304,7 +380,9 @@ def reconcile_unsent_events(
     Returns the number of events offered after a complete pass, or ``None``
     when the pass could not finish. Failed pages stay only in DuckDB: copying
     them into EventPusher's bounded in-memory retry buffer would recreate the
-    restart-loss problem this reconciliation path exists to repair.
+    restart-loss problem this reconciliation path exists to repair. Pending
+    ownership pages do not stop later pages, but keep the pass incomplete so
+    the daemon will revisit them after registration or orphan expiry.
     """
     # Imported lazily: registry pulls this module in at call time, so a
     # module-level import here would close the cycle.
@@ -318,6 +396,7 @@ def reconcile_unsent_events(
     after_created_at = None
     after_event_id = None
     reconciled_count = 0
+    ownership_pending = False
     while True:
         if getattr(pusher, "is_stopping", lambda: False)():
             return None
@@ -331,7 +410,7 @@ def reconcile_unsent_events(
         except Exception:
             return None
         if not events:
-            return reconciled_count
+            return None if ownership_pending else reconciled_count
 
         records: list[dict[str, Any]] = []
         for event in events:
@@ -355,7 +434,13 @@ def reconcile_unsent_events(
 
         if getattr(pusher, "is_stopping", lambda: False)():
             return None
-        if not pusher.post_batch(records):
+        partial_post = getattr(pusher, "post_batch_pending", None)
+        if partial_post is not None:
+            pending = partial_post(records)
+            if pending is None:
+                return None
+            ownership_pending = ownership_pending or bool(pending)
+        elif not pusher.post_batch(records):
             return None
         reconciled_count += len(records)
         final_event = events[-1]

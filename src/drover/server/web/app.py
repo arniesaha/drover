@@ -2452,17 +2452,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         registry = self._harness_registry()
         skipped = 0
+        pending_sessions: list[str] = []
         if self.auth.enabled:
             credential = bearer_credential(self.auth, self.headers)
             if not self._authorize_host(credential.host_id if credential else ""):
                 return
             if "host_id" in body and not self._authorize_host(str(body["host_id"])):
                 return
-            # Validate before any write. Missing ownership can be a create
-            # race; refuse it until repeated hub observations expire the window.
-            # Only then skip the orphan, without trusting its claimed owner.
+            # Validate owners before any write. Pending ownership holds back
+            # only that session; expired orphans are skipped without trusting
+            # their claimed owner.
             known_events = []
-            pending_session_id = ""
             skipped = 0
             for event in events:
                 session_id = str(event["session_id"])
@@ -2475,7 +2475,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     if not self.unknown_session_retries.expired(
                         credential.host_id, session_id
                     ):
-                        pending_session_id = pending_session_id or session_id
+                        if session_id not in pending_sessions:
+                            pending_sessions.append(session_id)
                         continue
                     skipped += 1
                     log.debug(
@@ -2489,17 +2490,25 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     return
                 self.unknown_session_retries.forget(credential.host_id, session_id)
                 known_events.append(event)
-            if pending_session_id:
+            # Preserve the single-session pre-registration error contract.
+            # Mixed batches acknowledge writes/skips and list only held sessions.
+            if pending_sessions and not known_events and not skipped:
                 log.warning(
                     "structured event ownership pending: route=/harness/events "
                     "session_id=%s credential_host_id=%s",
-                    pending_session_id,
+                    pending_sessions[0],
                     credential.host_id,
                 )
                 self._send(
                     403,
                     "application/json",
-                    json.dumps({"error": "session ownership not registered"}) + "\n",
+                    json.dumps(
+                        {
+                            "error": "session ownership not registered",
+                            "pending": pending_sessions,
+                        }
+                    )
+                    + "\n",
                 )
                 return
             events = known_events
@@ -2538,6 +2547,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
         ingested = registry.ingest_structured_events(prepared)
         result = {"ingested": ingested}
+        if pending_sessions:
+            result["pending"] = pending_sessions
         if skipped:
             result["skipped"] = skipped
         self._send(200, "application/json", json.dumps(result) + "\n")

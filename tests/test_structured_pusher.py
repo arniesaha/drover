@@ -38,8 +38,7 @@ class _FakeCentralHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        if status < 300:
-            self.wfile.write(payload)
+        self.wfile.write(payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
@@ -127,6 +126,9 @@ def test_pusher_serializes_reconciliation_and_live_posts(monkeypatch):
 
     class _Response:
         status = 200
+
+        def read(self):
+            return b"{}"
 
         def __enter__(self):
             return self
@@ -543,4 +545,68 @@ def test_live_worker_waits_through_authorization_backoff(monkeypatch, caplog):
         pusher.stop()
         server.shutdown()
         server.server_close()
+        reset_undelivered_event_count()
+
+
+def test_pending_session_backoff_does_not_block_other_sessions(monkeypatch, caplog):
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    now = [100.0]
+    monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0])
+    calls = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ingested": 1}'
+
+    def post(request, *, timeout):
+        events = json.loads(request.data)["events"]
+        calls.append(events)
+        if events[0]["session_id"] == "pending-session":
+            raise HTTPError(
+                request.full_url,
+                403,
+                "pending",
+                {},
+                BytesIO(b'{"pending": ["pending-session"]}'),
+            )
+        return Response()
+
+    monkeypatch.setattr(pusher_module, "urlopen", post)
+    pusher = EventPusher("http://central.invalid", "private-token")
+    pending = [
+        {
+            "session_id": "pending-session",
+            "event_id": "pending-event",
+            "seq": 1,
+            "text": "private-text",
+        }
+    ]
+    live = [{"session_id": "live-session", "event_id": "live-event", "seq": 1}]
+    reset_undelivered_event_count()
+    try:
+        for delay in (30, 60, 120, 240, 300, 300):
+            count = len(calls)
+            assert pusher.post_batch_pending(pending) == pending
+            assert len(calls) == count + 1
+            assert pusher._pending_sessions["pending-session"][0] == now[0] + delay
+            assert pusher.post_batch_pending(pending + live) == pending
+            assert calls[-1] == live
+            assert pusher.post_batch_pending(pending) == pending
+            assert len(calls) == count + 2  # cooldown sends only the live session
+            now[0] += delay
+        assert undelivered_event_count() == 6
+        assert caplog.text.count("ownership backoff") == 6
+        for private in ("private-token", "private-text", "pending-session"):
+            assert private not in caplog.text
+    finally:
         reset_undelivered_event_count()
