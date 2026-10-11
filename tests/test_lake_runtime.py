@@ -827,3 +827,78 @@ def test_preflight_skipped_for_dry_run(lake_spec, tmp_path, monkeypatch):
         dry_run=True,
     )
     assert report["dry_run"]
+
+
+@pytest.mark.parametrize(
+    "serving",
+    [{"exporter_check": True}, {"checkpoint": True}, {"task_projection": "token"}],
+)
+def test_exporter_checks_have_capacity_during_slow_analytics_read(
+    tmp_path, monkeypatch, serving
+):
+    import threading
+    import time
+
+    from drover.server.lake import query_process
+
+    spec = LakeSpec("UNUSED_TEST_DSN", tmp_path, tmp_path, "unused")
+    admission = (
+        Path(query_process.tempfile.gettempdir())
+        / f"drover-lake-{os.getuid()}"
+        / (hashlib.sha256(str(tmp_path.resolve()).encode()).hexdigest() + ".lock")
+    )
+    ready = tmp_path / "reader-started"
+    failures = []
+
+    def slow_read():
+        try:
+            run_disposable(
+                [
+                    sys.executable,
+                    "-c",
+                    "import pathlib,time; "
+                    f"pathlib.Path({str(ready)!r}).touch(); time.sleep(10)",
+                ],
+                admission_path=admission,
+                limits=QueryLimits(deadline_seconds=1),
+                cwd=tmp_path,
+            )
+        except LakeError as exc:
+            failures.append(exc.code)
+
+    reader = threading.Thread(target=slow_read)
+    reader.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+
+        def fake_sql(command, **kwargs):
+            return run_disposable(
+                [sys.executable, "-c", "print('{\"rows\": []}')"], **kwargs
+            )
+
+        monkeypatch.setattr(query_process, "run_disposable", fake_sql)
+        # An ordinary query cannot get admission while the fake read holds it.
+        with pytest.raises(LakeError, match="analytics_admission_deadline"):
+            query_process.query(
+                spec, "SELECT 1", limits=QueryLimits(deadline_seconds=0.1)
+            )
+        # Exporter prerequisites use fresh, bounded children in a separate lane.
+        assert (
+            query_process.query(
+                spec,
+                "SELECT 1",
+                serving=serving,
+                limits=QueryLimits(deadline_seconds=0.5),
+            )["rows"]
+            == []
+        )
+        assert reader.is_alive()
+    finally:
+        reader.join(3)
+    assert not reader.is_alive()
+    assert failures == ["analytics_deadline_exceeded"]
+    # Killing the slow reader releases its lane, too.
+    assert query_process.query(spec, "SELECT 1")["rows"] == []

@@ -87,11 +87,13 @@ def test_supervisor_cap_and_backoff(monkeypatch):
         worker._error = "lake_export_deadline"
 
     monkeypatch.setattr(worker, "_run", die)
-    worker._supervise(threading.Event())
+    shutdown = threading.Event()
+    worker._supervise(shutdown)
     assert len(attempts) == 6
     assert waits == [1, 2, 4, 8, 16]
     assert worker.health()["state"] == "stopped"
     assert worker.health()["restart_count"] == 5
+    assert shutdown.is_set()
 
 
 def test_readyz_exporter_status_is_separate(monkeypatch, tmp_path):
@@ -389,3 +391,80 @@ def test_blocking_cancel_request_does_not_block_watchdog(monkeypatch):
     finally:
         release.set()
         task.join(3)
+
+
+def test_restart_uses_fresh_owner_and_exporter_read_lane(monkeypatch, tmp_path):
+    from drover.server.lake import task_projection
+
+    shutdown = threading.Event()
+    owners, lanes, published = [], [], []
+    monkeypatch.setattr(lifecycle, "RESTART_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "catalog_identity", lambda *a: "same-catalog")
+    monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
+
+    class SlowAnalyticsHistory:
+        def __init__(self, config, *, exporter_check=False):
+            lanes.append(exporter_check)
+            self.exporter_check = exporter_check
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, sql):
+            if not self.exporter_check:
+                raise LakeError("analytics_deadline_exceeded")
+
+    class Exporter:
+        spec = None
+
+        def __init__(self, **kwargs):
+            owners.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.closed = True
+
+        def run_once(self):
+            if len(owners) == 1:
+                raise LakeError("lake_export_deadline")
+            assert owners[0].closed
+            published.append(True)
+            shutdown.set()
+            return {"acknowledged": 1}
+
+    monkeypatch.setattr(lifecycle, "HistoryConnection", SlowAnalyticsHistory)
+    monkeypatch.setattr(lifecycle, "LakeOutboxExporter", Exporter)
+    worker = lifecycle.ExporterLifecycle(
+        SimpleNamespace(
+            duckdb_path=tmp_path, analytics=SimpleNamespace(retire_legacy_writers=False)
+        )
+    )
+    worker._supervise(shutdown)
+    assert len(owners) == 2 and owners[0] is not owners[1]
+    assert all(owner.closed for owner in owners)
+    assert lanes == [True, True]
+    assert published == [True]
+    assert worker._error == "lake_export_deadline"
+    assert worker._restarts == 1
+
+
+def test_stuck_cancellation_requests_server_shutdown(monkeypatch):
+    shutdown = threading.Event()
+    worker = lifecycle.ExporterLifecycle(SimpleNamespace())
+
+    def stuck():
+        worker._cancellation_stuck = True
+        worker._error = "lake_export_cancellation_stuck"
+        worker._stop.set()
+
+    monkeypatch.setattr(worker, "_watch_batch", stuck)
+    worker._watch_freshness(shutdown)
+    assert shutdown.is_set()
+    assert worker._owner is None
