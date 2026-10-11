@@ -43,7 +43,9 @@ public struct ContextGauge: Sendable, Equatable {
     /// per-request total, not a per-call one.
     private static func latestClaudePromptTokens(_ messages: [HarnessMessage]) -> Int? {
         for message in messages.reversed() {
-            guard message.type == .assistantOutput,
+            let isPerMessageUsage = message.type == .assistantOutput ||
+                (message.type == .status && message.payload["usage_message_id"]?.stringValue != nil)
+            guard isPerMessageUsage,
                   message.payload["result"] == nil,
                   let usage = message.payload["usage"]?.objectValue else { continue }
             let input = usage["input_tokens"]?.numberValue ?? 0

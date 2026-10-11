@@ -428,3 +428,276 @@ def test_event_ingress_requires_host_credential_even_for_empty_batch(metrics_ser
         == 403
     )
     assert _post(metrics_server, "/harness/events", {"events": []}) == 200
+
+
+def test_unknown_session_is_skipped_only_after_observed_retry_window(
+    metrics_server, monkeypatch
+):
+    from drover.server.harness.registry import HarnessRegistry
+
+    now = [100.0]
+    monkeypatch.setattr(
+        app_module, "_ownership_retry_clock", lambda: now[0], raising=False
+    )
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    batch = {
+        "events": [
+            {
+                "event_id": "orphan-event",
+                "session_id": "absent-session",
+                "type": "status",
+                "ts": "2020-01-01T00:00:00+00:00",
+            }
+        ]
+    }
+    # Event age cannot establish an orphan; the hub must observe failed retries.
+    assert _post(metrics_server, "/harness/events", batch) == 403
+    now[0] += 24 * 60 * 60 - 1
+    assert _post(metrics_server, "/harness/events", batch) == 403
+    now[0] += 1
+    assert _post(metrics_server, "/harness/events", batch) == 200
+    assert registry.list_events_after("absent-session", 0) == []
+
+
+def test_rejection_log_identifies_route_and_session_owner(metrics_server, caplog):
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    registry.register_host(host_id="host-b", display_name="B", kind="linux")
+    registry.create_session(
+        session_id="other-session",
+        host_id="host-b",
+        harness="claude",
+        command="synthetic",
+    )
+    assert (
+        _post(
+            metrics_server,
+            "/harness/events",
+            {
+                "events": [
+                    {
+                        "event_id": "other-event",
+                        "session_id": "other-session",
+                        "type": "status",
+                    }
+                ]
+            },
+        )
+        == 403
+    )
+    assert "route=/harness/events" in caplog.text
+    assert "session_id=other-session" in caplog.text
+    assert "expected_host_id=host-b" in caplog.text
+    assert "credential_host_id=host-a" in caplog.text
+    assert metrics_server.token not in caplog.text
+
+
+def test_expired_orphan_does_not_block_known_owner_in_same_batch(
+    metrics_server, monkeypatch
+):
+    from drover.server.harness.registry import HarnessRegistry
+
+    now = [100.0]
+    monkeypatch.setattr(
+        app_module, "_ownership_retry_clock", lambda: now[0], raising=False
+    )
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    registry.register_host(host_id="host-a", display_name="A", kind="linux")
+    registry.create_session(
+        session_id="known", host_id="host-a", harness="claude", command="synthetic"
+    )
+    events = [
+        {"event_id": "old-event", "session_id": "absent", "type": "status", "seq": 1},
+        {
+            "event_id": "new-event",
+            "session_id": "known",
+            "type": "assistant_output",
+            "seq": 1,
+            "text": "Hello",
+        },
+    ]
+    events.insert(
+        1,
+        {
+            "event_id": "another-old-event",
+            "session_id": "also-absent",
+            "type": "status",
+            "seq": 1,
+        },
+    )
+    assert _post(metrics_server, "/harness/events", {"events": events}) == 200
+    assert [e.event_id for e in registry.list_events_after("known", 0)] == ["new-event"]
+    now[0] += 24 * 60 * 60
+    assert _post(metrics_server, "/harness/events", {"events": events}) == 200
+    assert [e.event_id for e in registry.list_events_after("known", 0)] == ["new-event"]
+    assert registry.list_events_after("absent", 0) == []
+    # Even an unknown session may not claim another host in its envelope.
+    assert (
+        _post(
+            metrics_server,
+            "/harness/events",
+            {"events": [dict(events[0], host_id="host-b")]},
+        )
+        == 403
+    )
+
+
+def test_pusher_retains_early_events_until_hub_registers_ownership(
+    metrics_server, monkeypatch
+):
+    from drover.server.harness.daemon import reset_undelivered_event_count
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.structured import pusher as pusher_module
+    from drover.server.harness.structured.pusher import EventPusher
+
+    now = [100.0]
+    monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0])
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    pusher = EventPusher(
+        f"http://{metrics_server.host}:{metrics_server.port}", metrics_server.token
+    )
+    batch = [
+        {
+            "event_id": "early-event",
+            "session_id": "early-session",
+            "type": "assistant_output",
+            "seq": 1,
+            "text": "Hello",
+        }
+    ]
+    reset_undelivered_event_count()
+    try:
+        pusher._deliver_with_retries(batch)
+        retained = pusher._drain()
+        assert retained == batch
+        assert registry.list_events_after("early-session", 0) == []
+        registry.register_host(host_id="host-a", display_name="A", kind="linux")
+        registry.create_session(
+            session_id="early-session",
+            host_id="host-a",
+            harness="claude-code",
+            command="claude",
+        )
+        # Registration does not bypass the client's per-session ownership backoff.
+        assert not pusher.post_batch(retained)
+        now[0] += 30
+        pusher._deliver_with_retries(retained)
+        assert pusher._drain() == []
+        assert [e.event_id for e in registry.list_events_after("early-session", 0)] == [
+            "early-event"
+        ]
+    finally:
+        reset_undelivered_event_count()
+
+
+def test_orphan_window_is_host_scoped_and_eviction_extends_retries(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(app_module, "_ownership_retry_clock", lambda: now[0])
+    monkeypatch.setattr(app_module, "_MAX_UNKNOWN_SESSION_RETRIES", 2)
+    retries = app_module._UnknownSessionRetries()
+    assert not retries.expired("host-a", "s1")
+    now[0] += 24 * 60 * 60
+    assert retries.expired("host-a", "s1")
+    assert not retries.expired("host-b", "s1")
+    assert not retries.expired("host-a", "s2")
+    # Capacity eviction starts a fresh retry window, never an immediate skip.
+    assert not retries.expired("host-a", "s1")
+    now[0] += 24 * 60 * 60
+    assert retries.expired("host-a", "s1")
+    retries.forget("host-a", "s1")
+    assert not retries.expired("host-a", "s1")
+
+
+def test_mixed_batch_retains_only_pending_session_and_delivers_after_registration(
+    metrics_server, monkeypatch
+):
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.structured import pusher as pusher_module
+    from drover.server.harness.structured.pusher import EventPusher
+
+    now = [100.0]
+    monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0])
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    registry.register_host(host_id="host-a", display_name="A", kind="linux")
+    registry.create_session(
+        session_id="live", host_id="host-a", harness="claude", command="synthetic"
+    )
+    pusher = EventPusher(
+        f"http://{metrics_server.host}:{metrics_server.port}", metrics_server.token
+    )
+
+    def event(session, seq):
+        return dict(
+            event_id=f"{session}-{seq}",
+            session_id=session,
+            type="assistant_output",
+            seq=seq,
+            ts="2026-10-11T00:00:00+00:00",
+            text="Hello",
+        )
+
+    batch = [
+        event("live", 1),
+        event("pending", 1),
+        event("live", 2),
+        event("pending", 2),
+    ]
+    pusher._deliver_with_retries(batch)
+    retained = pusher._drain()
+    assert retained == [batch[1], batch[3]]
+    assert [e.seq for e in registry.list_events_after("live", 0)] == [1, 2]
+    assert registry.list_events_after("pending", 0) == []
+    # A new live event goes through even while the pending session backs off.
+    pusher._deliver_with_retries(retained + [event("live", 3)])
+    retained = pusher._drain()
+    assert retained == [batch[1], batch[3]]
+    assert [e.seq for e in registry.list_events_after("live", 0)] == [1, 2, 3]
+    registry.create_session(
+        session_id="pending", host_id="host-a", harness="claude", command="synthetic"
+    )
+    now[0] += 30
+    pusher._deliver_with_retries(retained)
+    assert pusher._drain() == []
+    assert [e.seq for e in registry.list_events_after("pending", 0)] == [1, 2]
+    # Canonical replays with a different event_id are also fenced.
+    assert pusher.post_batch(batch + [dict(batch[0], event_id="alternate-id")])
+    assert [e.seq for e in registry.list_events_after("live", 0)] == [1, 2, 3]
+    assert [e.seq for e in registry.list_events_after("pending", 0)] == [1, 2]
+
+
+def test_reconciliation_continues_past_pending_session_page(metrics_server, tmp_path):
+    from drover.schema import bootstrap
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.structured.pusher import EventPusher
+
+    central = HarnessRegistry(metrics_server.collector.duckdb_path)
+    central.register_host(host_id="host-a", display_name="A", kind="linux")
+    central.create_session(
+        session_id="live", host_id="host-a", harness="claude", command="synthetic"
+    )
+    local_path = tmp_path / "local.duckdb"
+    bootstrap(parquet_dir=tmp_path / "local-parquet", duckdb_path=local_path)
+    local = HarnessRegistry(local_path)
+    for session_id in ("orphan", "live"):
+        local.create_session(
+            session_id=session_id,
+            host_id="host-a",
+            harness="claude",
+            command="synthetic",
+        )
+        local.append_event(
+            session_id=session_id,
+            event_type="assistant_output",
+            seq=1,
+            payload={"text": "Hello"},
+        )
+    pusher = EventPusher(
+        f"http://{metrics_server.host}:{metrics_server.port}", metrics_server.token
+    )
+    assert pusher.reconcile(local, host_id="host-a", batch_size=1) is None
+    assert len(central.list_events_after("live", 0)) == 1
+    assert central.list_events_after("orphan", 0) == []
+    assert pusher._drain() == []  # pending durable pages stay in the ledger
+    assert pusher.reconcile(local, host_id="host-a", batch_size=1) is None
+    assert len(central.list_events_after("live", 0)) == 1

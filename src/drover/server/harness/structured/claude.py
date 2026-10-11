@@ -43,6 +43,7 @@ def default_command(binary: str | None = None) -> list[str]:
             "--output-format",
             "stream-json",
             "--verbose",
+            "--include-partial-messages",
             # M5: structured sessions run headless — without an answered
             # control_request channel, any gated tool call fails outright
             # ("requested permissions ... but you haven't granted it"), so the
@@ -112,10 +113,15 @@ class ClaudeDriver(ProcessDriver):
         # originating tool's name for display (iOS card titles). Unbounded
         # but tiny: one short string pair per tool call in the session.
         self._tool_names: dict[str, str] = {}
+        self._stream_message_id: str | None = None
+        self._streamed_blocks: set[int] = set()
+        self._stream_model: str | None = None
 
     def parse_line(self, line: str) -> list[StructuredMessage]:
         obj = json.loads(line)
         kind = obj.get("type")
+        if kind == "stream_event":
+            return self._from_stream_event(obj)
         if kind == "system":
             return [
                 StructuredMessage(
@@ -171,6 +177,56 @@ class ClaudeDriver(ProcessDriver):
             )
         ]
 
+    def _from_stream_event(self, obj: dict[str, Any]) -> list[StructuredMessage]:
+        event = obj.get("event") or {}
+        if event.get("type") == "message_start":
+            message = event.get("message") or {}
+            self._stream_message_id = message.get("id")
+            self._stream_model = message.get("model")
+            self._streamed_blocks.clear()
+        elif event.get("type") == "content_block_delta":
+            delta = event.get("delta") or {}
+            thinking = delta.get("type") == "thinking_delta"
+            if delta.get("type") == "text_delta" or thinking:
+                text = delta.get("thinking" if thinking else "text") or ""
+                if text:
+                    self._streamed_blocks.add(event["index"])
+                    payload = _metadata_payload(obj, {})
+                    payload["model"] = self._stream_model
+                    if self._stream_message_id:
+                        payload["text_stream_id"] = (
+                            f"{self._stream_message_id}:{event['index']}"
+                        )
+                    if thinking:
+                        payload["thinking"] = True
+                    return [
+                        StructuredMessage(
+                            type="assistant_output",
+                            role="assistant",
+                            text=text,
+                            payload=payload,
+                        )
+                    ]
+        elif event.get("type") == "message_delta" and event.get("usage"):
+            return [
+                StructuredMessage(
+                    type="status",
+                    role="system",
+                    text="usage",
+                    payload=_metadata_payload(
+                        obj,
+                        {
+                            "id": self._stream_message_id,
+                            "model": self._stream_model,
+                            "usage": event["usage"],
+                        },
+                    ),
+                )
+            ]
+        # Tool JSON is handled by the complete assistant snapshot. Lifecycle
+        # envelopes have no transcript text and must not flood the app feed.
+        return []
+
     def _from_content(
         self, obj: dict[str, Any], *, role: str
     ) -> list[StructuredMessage]:
@@ -178,8 +234,17 @@ class ClaudeDriver(ProcessDriver):
         message = obj.get("message") or {}
         base_payload = _metadata_payload(obj, message)
         content = message.get("content") or []
-        for block in content:
+        for index, block in enumerate(content):
             block_type = block.get("type")
+            if (
+                role == "assistant"
+                and message.get("id") == self._stream_message_id
+                and index in self._streamed_blocks
+                and block_type in ("text", "thinking")
+            ):
+                # Partials already emitted the text. Keep snapshot accounting
+                # metadata without appending the entire answer a second time.
+                continue
             if block_type == "text":
                 messages.append(
                     StructuredMessage(

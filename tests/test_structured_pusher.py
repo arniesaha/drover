@@ -38,8 +38,7 @@ class _FakeCentralHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        if status < 300:
-            self.wfile.write(payload)
+        self.wfile.write(payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
@@ -127,6 +126,9 @@ def test_pusher_serializes_reconciliation_and_live_posts(monkeypatch):
 
     class _Response:
         status = 200
+
+        def read(self):
+            return b"{}"
 
         def __enter__(self):
             return self
@@ -383,3 +385,228 @@ def test_pusher_reconcile_unsent_events():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_forbidden_batch_delivers_after_credential_recovery(monkeypatch, caplog):
+    server = _start_fake_central()
+    _FakeCentralHandler.status_sequence = [403, 200]
+    now = [100.0]
+    monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0], raising=False)
+    pusher = EventPusher(f"http://127.0.0.1:{server.server_port}", "old-token")
+    batch = [
+        {
+            "event_id": "e1",
+            "session_id": "s1",
+            "type": "assistant_output",
+            "text": "private text",
+        }
+    ]
+    reset_undelivered_event_count()
+    try:
+        pusher._deliver_with_retries(batch)
+        retained = pusher._drain()
+        assert retained == batch
+        assert len(_FakeCentralHandler.requests) == 1
+        assert undelivered_event_count() == 1
+        pusher._token = "fixed-token"
+        now[0] += 301
+        pusher._deliver_with_retries(retained)
+        assert pusher._drain() == []
+        assert len(_FakeCentralHandler.requests) == 2
+        assert _FakeCentralHandler.requests[-1]["body"]["events"] == batch
+        assert _FakeCentralHandler.requests[-1]["authorization"] == "Bearer fixed-token"
+        # Recovery resets the next authorization delay to the initial step.
+        _FakeCentralHandler.status_sequence = [403, 200]
+        assert not pusher.post_batch(batch)
+        now[0] += 29
+        assert not pusher.post_batch(batch)
+        assert len(_FakeCentralHandler.requests) == 3
+        now[0] += 1
+        assert pusher.post_batch(batch)
+        assert len(_FakeCentralHandler.requests) == 4
+        assert "private text" not in caplog.text
+        assert "old-token" not in caplog.text and "fixed-token" not in caplog.text
+    finally:
+        server.shutdown()
+        server.server_close()
+        reset_undelivered_event_count()
+
+
+def test_repeated_forbidden_responses_back_off_and_cap(monkeypatch, caplog):
+    server = _start_fake_central()
+    _FakeCentralHandler.status_sequence = [403] * 7
+    now = [100.0]
+    monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0], raising=False)
+    pusher = EventPusher(f"http://127.0.0.1:{server.server_port}", "test-token")
+    batch = [{"event_id": "e1", "session_id": "s1", "type": "status"}]
+    try:
+        for step, delay in enumerate([30, 60, 120, 240, 300, 300], start=1):
+            assert not pusher.post_batch(batch)
+            assert len(_FakeCentralHandler.requests) == step
+            now[0] += delay - 1
+            for _ in range(5):
+                assert not pusher.post_batch(batch)
+            assert len(_FakeCentralHandler.requests) == step
+            now[0] += 1
+        assert caplog.text.count("authorization backoff") == 6
+    finally:
+        server.shutdown()
+        server.server_close()
+        reset_undelivered_event_count()
+
+
+def test_reconciliation_retries_forbidden_page_and_preserves_local_ledger(
+    tmp_path, caplog, monkeypatch
+):
+    from drover.schema import bootstrap
+    from drover.server.harness.registry import HarnessRegistry
+
+    path = tmp_path / "local.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+    registry = HarnessRegistry(path)
+    registry.create_session(
+        session_id="s1",
+        host_id="h1",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id="s1",
+        event_type="user_input",
+        payload={"text": "hello"},
+        seq=1,
+        event_id="e1",
+        normalized_source="structured",
+    )
+    server = _start_fake_central()
+    _FakeCentralHandler.status_sequence = [403]
+    pusher = EventPusher(f"http://127.0.0.1:{server.server_port}", "test-token")
+    try:
+        now = [100.0]
+        monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0], raising=False)
+        assert reconcile_unsent_events(registry, pusher, host_id="h1") is None
+        assert reconcile_unsent_events(registry, pusher, host_id="h1") is None
+        assert len(_FakeCentralHandler.requests) == 1
+        now[0] += 301
+        assert reconcile_unsent_events(registry, pusher, host_id="h1") == 1
+        assert len(_FakeCentralHandler.requests) == 2
+        assert [event.event_id for event in registry.list_events_after("s1", 0)] == [
+            "e1"
+        ]
+        assert caplog.text.count("authorization backoff") == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        reset_undelivered_event_count()
+
+
+def test_live_worker_waits_through_authorization_backoff(monkeypatch, caplog):
+    monkeypatch.setattr(pusher_module, "_AUTH_BACKOFF_SECONDS", 0.15)
+    monkeypatch.setattr(pusher_module, "_AUTH_MAX_BACKOFF_SECONDS", 0.3)
+    server = _start_fake_central()
+    _FakeCentralHandler.status_sequence = [403, 403, 403, 200]
+    pusher = EventPusher(
+        f"http://127.0.0.1:{server.server_port}", "test-token", batch_interval=0.01
+    )
+    timestamps = []
+    real_urlopen = pusher_module.urlopen
+
+    def timed_urlopen(*args, **kwargs):
+        timestamps.append(monotonic())
+        return real_urlopen(*args, **kwargs)
+
+    monkeypatch.setattr(pusher_module, "urlopen", timed_urlopen)
+    batch = {
+        "event_id": "e1",
+        "session_id": "s1",
+        "type": "status",
+        "payload": {"turn_complete": True},
+    }
+    reset_undelivered_event_count()
+    try:
+        pusher.start()
+        pusher.push("s1", batch)
+        assert _wait_until(lambda: len(_FakeCentralHandler.requests) == 1, timeout=2)
+        # New completion events must not bypass the shared cooldown.
+        pusher.push("s1", dict(batch, event_id="e2"))
+        assert _wait_until(lambda: len(_FakeCentralHandler.requests) >= 4, timeout=3)
+        pusher.stop()
+        assert len(timestamps) == 4
+        assert timestamps[1] - timestamps[0] >= 0.15
+        assert timestamps[2] - timestamps[1] >= 0.3
+        assert timestamps[3] - timestamps[2] >= 0.3
+        assert [
+            event["event_id"]
+            for event in _FakeCentralHandler.requests[-1]["body"]["events"]
+        ] == ["e1", "e2"]
+        assert caplog.text.count("authorization backoff") == 3
+    finally:
+        pusher.stop()
+        server.shutdown()
+        server.server_close()
+        reset_undelivered_event_count()
+
+
+def test_pending_session_backoff_does_not_block_other_sessions(monkeypatch, caplog):
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    now = [100.0]
+    monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0])
+    calls = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ingested": 1}'
+
+    def post(request, *, timeout):
+        events = json.loads(request.data)["events"]
+        calls.append(events)
+        if events[0]["session_id"] == "pending-session":
+            raise HTTPError(
+                request.full_url,
+                403,
+                "pending",
+                {},
+                BytesIO(b'{"pending": ["pending-session"]}'),
+            )
+        return Response()
+
+    monkeypatch.setattr(pusher_module, "urlopen", post)
+    pusher = EventPusher("http://central.invalid", "private-token")
+    pending = [
+        {
+            "session_id": "pending-session",
+            "event_id": "pending-event",
+            "seq": 1,
+            "text": "private-text",
+        }
+    ]
+    live = [{"session_id": "live-session", "event_id": "live-event", "seq": 1}]
+    reset_undelivered_event_count()
+    try:
+        for delay in (30, 60, 120, 240, 300, 300):
+            count = len(calls)
+            assert pusher.post_batch_pending(pending) == pending
+            assert len(calls) == count + 1
+            assert pusher._pending_sessions["pending-session"][0] == now[0] + delay
+            assert pusher.post_batch_pending(pending + live) == pending
+            assert calls[-1] == live
+            assert pusher.post_batch_pending(pending) == pending
+            assert len(calls) == count + 2  # cooldown sends only the live session
+            now[0] += delay
+        assert undelivered_event_count() == 6
+        assert caplog.text.count("ownership backoff") == 6
+        for private in ("private-token", "private-text", "pending-session"):
+            assert private not in caplog.text
+    finally:
+        reset_undelivered_event_count()

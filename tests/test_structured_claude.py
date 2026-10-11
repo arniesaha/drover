@@ -413,3 +413,103 @@ def test_block_fanout_preserves_provider_usage_identity():
     messages = _driver([]).parse_line(line)
     assert len(messages) == 2
     assert all(m.payload["usage_message_id"] == "message-1" for m in messages)
+
+
+def test_default_command_requests_partial_messages():
+    assert "--include-partial-messages" in default_command("claude")
+
+
+def test_recorded_partial_stream_emits_before_completion_without_duplicate_text():
+    driver = _driver([])
+    outputs = []
+    all_messages = []
+    for line in (
+        (FIXTURES_DIR / "claude_partial_capture.ndjson").read_text().splitlines()
+    ):
+        obj = json.loads(line)
+        if obj.get("type") == "assistant":
+            # The completed snapshot must arrive after multiple emitted chunks.
+            assert outputs == ["One two three four five six seven", " eight nine ten."]
+        messages = driver.parse_line(line)
+        all_messages.extend(messages)
+        outputs.extend(m.text for m in messages if m.type == "assistant_output")
+    assert outputs == ["One two three four five six seven", " eight nine ten."]
+    assert all_messages[-1].payload["turn_complete"] is True
+    assert any(m.payload.get("usage_message_id") == "message-1" for m in all_messages)
+
+
+def test_partial_thinking_preserves_tools_and_resets_for_next_message():
+    driver = _driver([])
+
+    def parse(obj):
+        return driver.parse_line(json.dumps(obj))
+
+    parse(
+        {
+            "type": "stream_event",
+            "event": {"type": "message_start", "message": {"id": "m1"}},
+        }
+    )
+    [thinking] = parse(
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Checking"},
+            },
+        }
+    )
+    assert thinking.text == "Checking" and thinking.payload["thinking"]
+    messages = parse(
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m1",
+                "content": [
+                    {"type": "thinking", "thinking": "Checking"},
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Read",
+                        "input": {"path": "test.py"},
+                    },
+                    {"type": "text", "text": "Unstreamed block"},
+                ],
+            },
+        }
+    )
+    assert [m.type for m in messages] == ["tool_action", "assistant_output"]
+    assert messages[-1].text == "Unstreamed block"
+    parse(
+        {
+            "type": "stream_event",
+            "event": {"type": "message_start", "message": {"id": "m2"}},
+        }
+    )
+    [message] = parse(
+        {
+            "type": "assistant",
+            "message": {
+                "id": "m2",
+                "content": [
+                    {"type": "text", "text": "Next answer"},
+                ],
+            },
+        }
+    )
+    assert message.text == "Next answer"
+
+
+def test_partial_stream_preserves_final_token_usage():
+    from drover.server.harness.usage import session_totals
+
+    driver = _driver([])
+    messages = [
+        message.to_payload()
+        for line in (FIXTURES_DIR / "claude_partial_capture.ndjson")
+        .read_text()
+        .splitlines()
+        for message in driver.parse_line(line)
+    ]
+    assert session_totals("claude-code", messages).output_tokens == 17

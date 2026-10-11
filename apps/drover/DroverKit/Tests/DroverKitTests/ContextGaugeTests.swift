@@ -225,3 +225,16 @@ import Testing
         #expect(gauge?.text == "ctx 1000000000000M / 1")
     }
 }
+
+@Suite struct ClaudeStreamingContextGaugeTests {
+    @Test func acceptsPerMessageUsageStatusAfterTextDeltas() {
+        let chunk = HarnessMessage.fixture(seq: 1, type: .assistantOutput, text: "Hello",
+                                           payload: ["text_stream_id": .string("m1:0")])
+        let usage = HarnessMessage.fixture(seq: 2, type: .status, text: "usage",
+            payload: ["usage_message_id": .string("m1"), "usage": .object([
+                "input_tokens": .number(2), "cache_read_input_tokens": .number(535),
+                "cache_creation_input_tokens": .number(3529), "output_tokens": .number(17),
+            ])])
+        #expect(ContextGauge(messages: [chunk, usage], harness: "claude-code")?.usedTokens == 4066)
+    }
+}

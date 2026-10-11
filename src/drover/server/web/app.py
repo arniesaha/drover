@@ -87,6 +87,40 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("drover.metrics")
 
+# Event timestamps can predate registration by years during replay. Only
+# elapsed hub-observed retries can establish a missing session as an orphan.
+_UNKNOWN_SESSION_RETRY_WINDOW_SECONDS = 24 * 60 * 60
+_MAX_UNKNOWN_SESSION_RETRIES = 4096
+_ownership_retry_clock = time.monotonic
+
+
+class _UnknownSessionRetries:
+    """Bounded, host-scoped observation window, shared by request threads.
+
+    Restart or eviction resets the window conservatively, extending retries
+    instead of risking a fresh session's events. No event content is retained.
+    """
+
+    def __init__(self) -> None:
+        self._first_seen: dict[tuple[str, str], float] = {}
+        self._lock = threading.Lock()
+
+    def expired(self, host_id: str, session_id: str) -> bool:
+        key = (host_id, session_id)
+        now = _ownership_retry_clock()
+        with self._lock:
+            if key not in self._first_seen:
+                if len(self._first_seen) >= _MAX_UNKNOWN_SESSION_RETRIES:
+                    self._first_seen.pop(next(iter(self._first_seen)))
+                self._first_seen[key] = now
+                return False
+            return now - self._first_seen[key] >= _UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
+
+    def forget(self, host_id: str, session_id: str) -> None:
+        with self._lock:
+            self._first_seen.pop((host_id, session_id), None)
+
+
 # /auth/pair is the one public write in the system: a device that has no
 # credential yet is exactly the caller it exists for. It is hardened inside
 # _redeem_pairing_code (single-use codes, TTL, per-source throttle) rather
@@ -829,6 +863,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     pairing: PairingCodes | None = None
     analytics_boundary: AnalyticsBoundaryClient | None = None
     host_data_bridge_token: str = ""
+    unknown_session_retries: _UnknownSessionRetries
     analytical_slots: threading.BoundedSemaphore
     fleet_slots: threading.BoundedSemaphore
     history_slots: threading.BoundedSemaphore
@@ -860,7 +895,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 path.removeprefix("/harness/sessions/").split("/", 1)[0]
             )
             session = self._harness_registry().get_session(session_id)
-            if not self._authorize_host(session.host_id if session else ""):
+            if not self._authorize_host(
+                session.host_id if session else "", session_id=session_id
+            ):
                 return False
         if request_authorized(self.auth, self.headers, method=self.command, path=path):
             return True
@@ -875,7 +912,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
         return False
 
-    def _authorize_host(self, host_id: str) -> bool:
+    def _authorize_host(self, host_id: str, *, session_id: str = "") -> bool:
         if not self.auth.enabled:
             return True
         credential = bearer_credential(self.auth, self.headers)
@@ -886,7 +923,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if credential and credential.scope == "host" and credential.host_id
             else "bound host credential required"
         )
-        log.warning("host authorization rejected: %s", reason)
+        log.warning(
+            "host authorization rejected: %s route=%s session_id=%s "
+            "expected_host_id=%s credential_host_id=%s",
+            reason,
+            urlparse(self.path).path,
+            session_id,
+            host_id,
+            credential.host_id if credential else "",
+        )
         self._send(403, "application/json", json.dumps({"error": reason}) + "\n")
         return False
 
@@ -2406,21 +2451,74 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
         registry = self._harness_registry()
+        skipped = 0
+        pending_sessions: list[str] = []
         if self.auth.enabled:
             credential = bearer_credential(self.auth, self.headers)
             if not self._authorize_host(credential.host_id if credential else ""):
                 return
             if "host_id" in body and not self._authorize_host(str(body["host_id"])):
                 return
-            # Validate the entire batch before any write, using persisted ownership.
+            # Validate owners before any write. Pending ownership holds back
+            # only that session; expired orphans are skipped without trusting
+            # their claimed owner.
+            known_events = []
+            skipped = 0
             for event in events:
-                session = registry.get_session(str(event["session_id"]))
-                if not self._authorize_host(session.host_id if session else ""):
-                    return
+                session_id = str(event["session_id"])
                 if "host_id" in event and not self._authorize_host(
-                    str(event["host_id"])
+                    str(event["host_id"]), session_id=session_id
                 ):
                     return
+                session = registry.get_session(session_id)
+                if session is None:
+                    if not self.unknown_session_retries.expired(
+                        credential.host_id, session_id
+                    ):
+                        if session_id not in pending_sessions:
+                            pending_sessions.append(session_id)
+                        continue
+                    skipped += 1
+                    log.debug(
+                        "skipping expired orphan event route=/harness/events "
+                        "session_id=%s credential_host_id=%s",
+                        session_id,
+                        credential.host_id,
+                    )
+                    continue
+                if not self._authorize_host(session.host_id, session_id=session_id):
+                    return
+                self.unknown_session_retries.forget(credential.host_id, session_id)
+                known_events.append(event)
+            # Preserve the single-session pre-registration error contract.
+            # Mixed batches acknowledge writes/skips and list only held sessions.
+            if pending_sessions and not known_events and not skipped:
+                log.warning(
+                    "structured event ownership pending: route=/harness/events "
+                    "session_id=%s credential_host_id=%s",
+                    pending_sessions[0],
+                    credential.host_id,
+                )
+                self._send(
+                    403,
+                    "application/json",
+                    json.dumps(
+                        {
+                            "error": "session ownership not registered",
+                            "pending": pending_sessions,
+                        }
+                    )
+                    + "\n",
+                )
+                return
+            events = known_events
+            if skipped:
+                log.warning(
+                    "structured event ingest skipped expired orphan sessions: "
+                    "route=/harness/events events=%d credential_host_id=%s",
+                    skipped,
+                    credential.host_id,
+                )
         ingested = 0
         # Sort defensively by seq: the derivation rules are order-sensitive
         # (e.g. approval_prompt then approval_response must land as "not
@@ -2448,7 +2546,12 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 }
             )
         ingested = registry.ingest_structured_events(prepared)
-        self._send(200, "application/json", json.dumps({"ingested": ingested}) + "\n")
+        result = {"ingested": ingested}
+        if pending_sessions:
+            result["pending"] = pending_sessions
+        if skipped:
+            result["skipped"] = skipped
+        self._send(200, "application/json", json.dumps(result) + "\n")
 
     def _handle_login(self) -> None:
         length = int(self.headers.get("Content-Length") or "0")
@@ -3287,6 +3390,7 @@ def _metrics_handler(
             "pairing": pairing,
             "analytics_boundary": analytics_boundary,
             "host_data_bridge_token": host_data_bridge_token,
+            "unknown_session_retries": _UnknownSessionRetries(),
             "analytical_slots": _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1),
             "metrics_slots": threading.BoundedSemaphore(ANALYTICS_METRICS_CONCURRENCY),
             "mutation_slots": threading.BoundedSemaphore(

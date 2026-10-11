@@ -39,6 +39,13 @@ def recap_store(
         content_preview="Fix the recap cards.",
         seq=completion_seq - 1,
     )
+    registry.append_event(
+        session_id=session_id,
+        event_type="assistant_output",
+        payload={"text": "Investigating the recap cards."},
+        content_preview="Investigating the recap cards.",
+        seq=completion_seq - 2,
+    )
     complete(registry, session_id, completion_seq)
     return registry
 
@@ -403,3 +410,79 @@ def test_job_arriving_at_idle_cap_is_claimed_on_next_poll(pg_control_path, monke
     assert backend.calls == 1
     assert recap_row(pg_control_path, "s1")[:2] == ("Picked up after idle.", 8)
     assert jobs(pg_control_path, "s1") == [("8", "succeeded", 0, None)]
+
+
+@pytest.mark.parametrize(
+    "events, prompt, expected",
+    [
+        ([], "", "Agent session"),
+        ([{"event_type": "user_input", "content_preview": " hi "}], " hi ", "hi"),
+        (
+            [{"event_type": "user_input", "content_preview": "new prompt"}],
+            "  First\nuser prompt  ",
+            "First user prompt",
+        ),
+    ],
+)
+def test_sparse_recap_falls_back_without_model(events, prompt, expected, tmp_path):
+    worker = LiveRecapWorker(duckdb_path=tmp_path / "unused.duckdb")
+    assert worker._generate_recap(events, prompt) == (expected, "fallback:user-prompt")
+
+
+def test_complaint_recap_falls_back_to_first_prompt(tmp_path):
+    worker = LiveRecapWorker(
+        duckdb_path=tmp_path / "unused.duckdb",
+        backend=StubBackend(
+            {
+                "recap": "Lacking coding session events to summarize",
+            }
+        ),
+    )
+    events = [
+        {"event_type": "assistant_output", "content_preview": "Investigating tests"}
+    ]
+    assert worker._generate_recap(events, "Repair the tests") == (
+        "Repair the tests",
+        "fallback:user-prompt",
+    )
+
+
+@pytest.mark.parametrize("prompt, expected", [("", "Agent session"), ("  hi  ", "hi")])
+def test_sparse_session_persists_neutral_recap(pg_control_path, prompt, expected):
+    registry = HarnessRegistry(pg_control_path)
+    registry.create_session(
+        session_id="sparse",
+        host_id="laptop",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+    )
+    if prompt:
+        registry.append_event(
+            session_id="sparse",
+            event_type="user_input",
+            payload={"text": prompt},
+            content_preview=prompt,
+            seq=1,
+        )
+    complete(registry, "sparse", 2)
+    assert LiveRecapWorker(duckdb_path=pg_control_path).drain_once() == 1
+    row = recap_row(pg_control_path, "sparse")
+    assert row[0] == expected
+    assert row[2] == "fallback:user-prompt"
+    assert jobs(pg_control_path, "sparse") == [("2", "succeeded", 0, None)]
+
+
+@pytest.mark.parametrize("output", ["", "Lacking coding session events to summarize"])
+def test_rejected_model_recap_persists_first_prompt(pg_control_path, output):
+    recap_store(pg_control_path)
+    worker = LiveRecapWorker(
+        duckdb_path=pg_control_path, backend=StubBackend({"recap": output})
+    )
+    assert worker.drain_once() == 1
+    assert recap_row(pg_control_path, "s1") == (
+        "Fix the recap cards.",
+        8,
+        "fallback:user-prompt",
+        "live",
+    )

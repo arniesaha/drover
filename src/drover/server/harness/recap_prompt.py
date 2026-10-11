@@ -30,6 +30,26 @@ _USER_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Stored in generator_model to distinguish trusted prompt text from LLM output.
+FALLBACK_RECAP_SOURCE = "fallback:user-prompt"
+
+# Reject statements about the model's inability to summarize, rather than
+# presenting them as the user's goal. Keep actual coding failures valid.
+_META_RECAP_RE = re.compile(
+    r"\b(?:as an ai|i (?:cannot|can't|am unable|don't have access)|"
+    r"(?:lacking|insufficient|not enough|no) (?:coding )?(?:session )?"
+    r"(?:context|information|events|content|transcript)|"
+    r"(?:please |need |requires? )(?:provide (?:a )?|more |a )"
+    r"(?:session |coding )?(?:context|information|events|transcript))\b",
+    re.IGNORECASE,
+)
+
+
+def fallback_live_recap(first_prompt: str, *, max_chars: int = 160) -> str:
+    """Use trusted input as a neutral title, preserving short prompts."""
+    text = " ".join(redact_auth_text(first_prompt).split())
+    return text[:max_chars].rstrip() or "Agent session"
+
 
 def load_live_recap_template() -> str:
     """Return the versioned live-recap prompt template."""
@@ -83,6 +103,8 @@ def normalize_live_recap(value: Any, *, max_chars: int = 160) -> str:
         return ""
 
     text = _WHITESPACE_RE.sub(" ", _MARKDOWN_RE.sub("", value)).strip()
+    if _META_RECAP_RE.search(text):
+        return ""
     # Before the length cap, so the budget is spent on the recap and not on
     # its subject.
     text = drop_user_subject(text)
