@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-10-11
+
+### Added
+
+- Tapping a `drover://` pairing link now opens a confirmation sheet before it
+  pairs a device. The iOS app also has a larger, easier-to-reach send control
+  for long messages (#573, #577).
+- iOS notification categories and banner handling are clearer, and Recall now
+  briefly shows when its results are being refreshed (#575).
+
+### Fixed
+
+- UAT fixes improve counts, interrupt handling, opaque bars, history, token
+  counts, worktree names and large-text layouts. Folder-picker errors are
+  clearer, and launch errors are shown in plain language (#573, #575).
+- Claude Code replies now stream as they arrive. Recap titles no longer expose
+  summarizer complaints, orphan-session events cannot block another host's
+  batch, and refused authentication retries with backoff (#576).
+- Exporter recovery isolates its reads and exits the process after all recovery
+  retries are exhausted, rather than continuing in an unsafe state (#578,
+  #579).
+
+### Upgrade notes
+
+- Restart the hub after upgrading.
+- Upgrade harnessd hosts, including Studio and NAS, for the streaming and
+  orphan-replay fixes.
+
 ## [0.6.5] - 2026-10-10
 
 ### Added
