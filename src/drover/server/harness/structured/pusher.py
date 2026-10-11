@@ -5,21 +5,24 @@
 ``/harness/events`` ingest route. Delivery is at-least-once: a batch that
 fails is retried, and a batch that outlives its retry attempts is *kept* and
 re-offered on the next cycle rather than discarded (central is the idempotent
-side, keyed by ``event_id``). Only two things lose an event -- a queue that
-overflows and a shutdown central never comes back from -- and both bump
-``record_undelivered_events``. Never log event text or the bearer token --
+side, keyed by ``event_id``). Queue overflow, an exhausted shutdown flush, and a permanent 403 refusal
+all bump ``record_undelivered_events``. Authorization-refused batches are skipped
+with one warning; their local ledger records remain available for repair. Never log event text or the bearer token --
 only counts.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
 from queue import Empty, SimpleQueue
 from typing import Any
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+log = logging.getLogger("drover.event_pusher")
 
 _MAX_QUEUE = 5000
 _MAX_ATTEMPTS = 3
@@ -69,6 +72,9 @@ class EventPusher:
         # away) and prepended to the next drain, so a central that is down
         # longer than one cycle's attempts costs latency, not history.
         self._unsent: list[dict[str, Any]] = []
+        # Permanent authorization refusals have a terminal disposition for
+        # this process. The durable local ledger remains available for repair.
+        self._rejected_event_ids: set[str] = set()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -85,7 +91,7 @@ class EventPusher:
         return self._stop.is_set()
 
     def post_batch(self, batch: list[dict[str, Any]]) -> bool:
-        """POST one batch; True only for a 2xx response."""
+        """POST a batch; True means accepted or permanently skipped."""
         return self._post(batch)
 
     def reconcile(
@@ -222,25 +228,44 @@ class EventPusher:
         self._retain(batch)
 
     def _post(self, batch: list[dict[str, Any]]) -> bool:
-        """POST one batch; True only for a 2xx response.
+        """POST one batch, skipping permanent 403 refusals.
 
-        urllib raises HTTPError for 4xx/5xx and OSError/URLError for network
-        failures, so every non-success surfaces as an exception -> False.
+        Network and server failures remain retryable. Authorization-refused
+        events stay in the local ledger but are not offered again this run.
         """
-        data = json.dumps({"events": batch}).encode("utf-8")
-        request = Request(
-            f"{self._central_url}/harness/events",
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self._token}",
-            },
-        )
         with self._post_lock:
+            batch = [
+                event
+                for event in batch
+                if str(event.get("event_id")) not in self._rejected_event_ids
+            ]
+            if not batch:
+                return True
+            request = Request(
+                f"{self._central_url}/harness/events",
+                data=json.dumps({"events": batch}).encode("utf-8"),
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._token}",
+                },
+            )
             try:
                 with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
                     return 200 <= response.status < 300
+            except HTTPError as exc:
+                if exc.code == 403:
+                    self._rejected_event_ids.update(
+                        str(event.get("event_id")) for event in batch
+                    )
+                    _record_undelivered(len(batch))
+                    log.warning(
+                        "structured events skipped after permanent 403: "
+                        "route=/harness/events events=%d; local ledger retained",
+                        len(batch),
+                    )
+                    return True
+                return False
             except (OSError, URLError):
                 return False
 

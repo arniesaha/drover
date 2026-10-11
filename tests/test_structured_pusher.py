@@ -383,3 +383,61 @@ def test_pusher_reconcile_unsent_events():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_permanent_forbidden_batch_is_skipped_once(caplog):
+    server = _start_fake_central()
+    _FakeCentralHandler.status_sequence = [403, 403]
+    pusher = EventPusher(f"http://127.0.0.1:{server.server_port}", "test-token")
+    batch = [{"event_id": "rejected-event", "session_id": "s1", "type": "status"}]
+    try:
+        pusher._deliver_with_retries(batch)
+        # Reconciliation re-offers durable events too; skip known rejects.
+        assert pusher.post_batch(batch)
+        assert len(_FakeCentralHandler.requests) == 1
+        assert pusher._drain() == []
+        assert caplog.text.count("permanent 403") == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_reconciliation_skips_forbidden_page_and_preserves_local_ledger(
+    tmp_path, caplog
+):
+    from drover.schema import bootstrap
+    from drover.server.harness.registry import HarnessRegistry
+
+    path = tmp_path / "local.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+    registry = HarnessRegistry(path)
+    registry.create_session(
+        session_id="s1",
+        host_id="h1",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id="s1",
+        event_type="user_input",
+        payload={"text": "hello"},
+        seq=1,
+        event_id="e1",
+        normalized_source="structured",
+    )
+    server = _start_fake_central()
+    _FakeCentralHandler.status_sequence = [403]
+    pusher = EventPusher(f"http://127.0.0.1:{server.server_port}", "test-token")
+    try:
+        assert reconcile_unsent_events(registry, pusher, host_id="h1") == 1
+        assert reconcile_unsent_events(registry, pusher, host_id="h1") == 1
+        assert len(_FakeCentralHandler.requests) == 1
+        assert [event.event_id for event in registry.list_events_after("s1", 0)] == [
+            "e1"
+        ]
+        assert caplog.text.count("permanent 403") == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        reset_undelivered_event_count()

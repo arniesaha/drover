@@ -428,3 +428,92 @@ def test_event_ingress_requires_host_credential_even_for_empty_batch(metrics_ser
         == 403
     )
     assert _post(metrics_server, "/harness/events", {"events": []}) == 200
+
+
+def test_unknown_session_events_are_skipped_without_claiming_ownership(metrics_server):
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    assert (
+        _post(
+            metrics_server,
+            "/harness/events",
+            {
+                "events": [
+                    {
+                        "event_id": "orphan-event",
+                        "session_id": "absent-session",
+                        "type": "status",
+                    }
+                ]
+            },
+        )
+        == 200
+    )
+    assert registry.list_events_after("absent-session", 0) == []
+
+
+def test_rejection_log_identifies_route_and_session_owner(metrics_server, caplog):
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    registry.register_host(host_id="host-b", display_name="B", kind="linux")
+    registry.create_session(
+        session_id="other-session",
+        host_id="host-b",
+        harness="claude",
+        command="synthetic",
+    )
+    assert (
+        _post(
+            metrics_server,
+            "/harness/events",
+            {
+                "events": [
+                    {
+                        "event_id": "other-event",
+                        "session_id": "other-session",
+                        "type": "status",
+                    }
+                ]
+            },
+        )
+        == 403
+    )
+    assert "route=/harness/events" in caplog.text
+    assert "session_id=other-session" in caplog.text
+    assert "expected_host_id=host-b" in caplog.text
+    assert "credential_host_id=host-a" in caplog.text
+    assert metrics_server.token not in caplog.text
+
+
+def test_unknown_session_does_not_block_known_owner_in_same_batch(metrics_server):
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    registry.register_host(host_id="host-a", display_name="A", kind="linux")
+    registry.create_session(
+        session_id="known", host_id="host-a", harness="claude", command="synthetic"
+    )
+    events = [
+        {"event_id": "old-event", "session_id": "absent", "type": "status", "seq": 1},
+        {
+            "event_id": "new-event",
+            "session_id": "known",
+            "type": "assistant_output",
+            "seq": 1,
+            "text": "Hello",
+        },
+    ]
+    assert _post(metrics_server, "/harness/events", {"events": events}) == 200
+    assert [e.event_id for e in registry.list_events_after("known", 0)] == ["new-event"]
+    assert registry.list_events_after("absent", 0) == []
+    # Even an unknown session may not claim another host in its envelope.
+    assert (
+        _post(
+            metrics_server,
+            "/harness/events",
+            {"events": [dict(events[0], host_id="host-b")]},
+        )
+        == 403
+    )

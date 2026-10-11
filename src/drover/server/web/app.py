@@ -860,7 +860,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 path.removeprefix("/harness/sessions/").split("/", 1)[0]
             )
             session = self._harness_registry().get_session(session_id)
-            if not self._authorize_host(session.host_id if session else ""):
+            if not self._authorize_host(
+                session.host_id if session else "", session_id=session_id
+            ):
                 return False
         if request_authorized(self.auth, self.headers, method=self.command, path=path):
             return True
@@ -875,7 +877,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
         return False
 
-    def _authorize_host(self, host_id: str) -> bool:
+    def _authorize_host(self, host_id: str, *, session_id: str = "") -> bool:
         if not self.auth.enabled:
             return True
         credential = bearer_credential(self.auth, self.headers)
@@ -886,7 +888,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if credential and credential.scope == "host" and credential.host_id
             else "bound host credential required"
         )
-        log.warning("host authorization rejected: %s", reason)
+        log.warning(
+            "host authorization rejected: %s route=%s session_id=%s "
+            "expected_host_id=%s credential_host_id=%s",
+            reason,
+            urlparse(self.path).path,
+            session_id,
+            host_id,
+            credential.host_id if credential else "",
+        )
         self._send(403, "application/json", json.dumps({"error": reason}) + "\n")
         return False
 
@@ -2406,21 +2416,45 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             )
             return
         registry = self._harness_registry()
+        skipped = 0
         if self.auth.enabled:
             credential = bearer_credential(self.auth, self.headers)
             if not self._authorize_host(credential.host_id if credential else ""):
                 return
             if "host_id" in body and not self._authorize_host(str(body["host_id"])):
                 return
-            # Validate the entire batch before any write, using persisted ownership.
+            # Validate known owners before any write. A missing session is
+            # not an identity mismatch: old local ledgers can outlive the hub
+            # registry. Skip those events without trusting their claimed owner.
+            known_events = []
+            skipped = 0
             for event in events:
-                session = registry.get_session(str(event["session_id"]))
-                if not self._authorize_host(session.host_id if session else ""):
-                    return
+                session_id = str(event["session_id"])
                 if "host_id" in event and not self._authorize_host(
-                    str(event["host_id"])
+                    str(event["host_id"]), session_id=session_id
                 ):
                     return
+                session = registry.get_session(session_id)
+                if session is None:
+                    skipped += 1
+                    log.debug(
+                        "skipping unknown session event route=/harness/events "
+                        "session_id=%s credential_host_id=%s",
+                        session_id,
+                        credential.host_id,
+                    )
+                    continue
+                if not self._authorize_host(session.host_id, session_id=session_id):
+                    return
+                known_events.append(event)
+            events = known_events
+            if skipped:
+                log.warning(
+                    "structured event ingest skipped unknown sessions: "
+                    "route=/harness/events events=%d credential_host_id=%s",
+                    skipped,
+                    credential.host_id,
+                )
         ingested = 0
         # Sort defensively by seq: the derivation rules are order-sensitive
         # (e.g. approval_prompt then approval_response must land as "not
@@ -2448,7 +2482,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 }
             )
         ingested = registry.ingest_structured_events(prepared)
-        self._send(200, "application/json", json.dumps({"ingested": ingested}) + "\n")
+        self._send(
+            200,
+            "application/json",
+            json.dumps({"ingested": ingested, "skipped": skipped}) + "\n",
+        )
 
     def _handle_login(self) -> None:
         length = int(self.headers.get("Content-Length") or "0")
