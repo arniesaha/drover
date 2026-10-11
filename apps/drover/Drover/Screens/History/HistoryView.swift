@@ -97,7 +97,7 @@ struct HistoryView: View {
             }
             .listRowBackground(Color.clear)
         } else if model.hasLoadedOnce, !model.pager.hasMore, !model.pager.rows.isEmpty {
-            Text("\(model.pager.rowCount) sessions — that's everything")
+            Text(HistoryPresentation.footer(model.pager.rowCount))
                 .droverText(.subtitle)
                 .frame(maxWidth: .infinity)
                 .listRowBackground(Color.clear)
@@ -353,9 +353,9 @@ struct HistoryTranscriptView: View {
                     Text("Showing the latest \(HistoryTranscriptModel.maxMessages) messages.")
                         .droverText(.subtitle)
                 }
-                ForEach(model.messages.filter { !$0.text.isEmpty }) { message in
+                ForEach(model.messages.filter(HistoryPresentation.isReadable)) { message in
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(message.role.isEmpty ? message.type.rawValue : message.role)
+                        Text(HistoryPresentation.speaker(for: message))
                             .droverText(.marker)
                         Text(message.displayText)
                             .droverText(.body)
@@ -368,7 +368,7 @@ struct HistoryTranscriptView: View {
                         .droverText(.nested, accented: true)
                 } else if model.isLoading {
                     ProgressView().frame(maxWidth: .infinity)
-                } else if model.hasLoadedOnce, model.messages.isEmpty {
+                } else if model.hasLoadedOnce, !model.messages.contains(where: HistoryPresentation.isReadable) {
                     Text(item.hasTranscript ? "No readable messages." : "No transcript recorded for this session.")
                         .droverText(.subtitle)
                 }
@@ -376,7 +376,9 @@ struct HistoryTranscriptView: View {
             .padding(14)
         }
         .defaultScrollAnchor(.bottom)
-        .background(DroverColor.bg)
+        .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
+        .toolbarBackground(DroverColor.bg, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .navigationTitle(item.title)
         .navigationBarTitleDisplayMode(.inline)
         .task { await model.loadNewest() }

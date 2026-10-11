@@ -6,6 +6,7 @@ struct FolderBrowserSheet: View {
     let hostID: String
     let hostLabel: String
     let savedPaths: [String]
+    var sessions: [SessionSummary] = []
     let onSelect: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var navigation: [String] = []
@@ -22,7 +23,7 @@ struct FolderBrowserSheet: View {
     private func screen(path: String) -> some View {
         FolderBrowserScreen(
             client: client, hostID: hostID, hostLabel: hostLabel,
-            path: path, savedPaths: savedPaths,
+            path: path, savedPaths: savedPaths, sessions: sessions,
             navigate: { destination in
                 if let index = navigation.firstIndex(of: destination) {
                     navigation = Array(navigation.prefix(index + 1))
@@ -48,15 +49,17 @@ private struct FolderBrowserScreen: View {
     @State private var model: FolderBrowserModel
     let hostLabel: String
     let savedPaths: [String]
+    let sessions: [SessionSummary]
     let navigate: (String) -> Void
     let onSelect: (String) -> Void
 
     init(client: DroverClient, hostID: String, hostLabel: String, path: String,
-         savedPaths: [String], navigate: @escaping (String) -> Void,
+         savedPaths: [String], sessions: [SessionSummary] = [], navigate: @escaping (String) -> Void,
          onSelect: @escaping (String) -> Void) {
         _model = State(initialValue: FolderBrowserModel(client: client, hostID: hostID, path: path))
         self.hostLabel = hostLabel
         self.savedPaths = savedPaths
+        self.sessions = sessions
         self.navigate = navigate
         self.onSelect = onSelect
     }
@@ -104,7 +107,7 @@ private struct FolderBrowserScreen: View {
             if model.path.isEmpty, !savedPaths.isEmpty {
                 Section("Recent and favorite folders") {
                     ForEach(savedPaths, id: \.self) { path in
-                        folderLink(name: (path as NSString).lastPathComponent,
+                        folderLink(name: FolderRecentPresentation.name(path: path, sessions: sessions),
                                    path: path, icon: "clock", isGit: false, showsPath: true)
                     }
                 }

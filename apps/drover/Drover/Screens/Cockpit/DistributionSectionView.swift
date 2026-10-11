@@ -95,7 +95,7 @@ struct DistributionRow: View {
                 )
 
                 HStack(spacing: 6) {
-                    Text(row.tokensUnreported ? "— \(row.detailText)" : row.detailText)
+                    Text(row.tokensUnreported ? "· \(row.detailText)" : row.detailText)
                         .droverText(.subtitle)
                         .fixedSize(horizontal: false, vertical: true)
                     // A row only carries its own age when it disagrees with

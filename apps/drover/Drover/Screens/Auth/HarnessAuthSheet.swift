@@ -109,7 +109,7 @@ struct HarnessAuthSheet: View {
             terminalError = nil
             terminalSession = TerminalSession(id: sessionID)
         } catch {
-            terminalError = "Could not open a terminal session — \(error)"
+            terminalError = "Could not open a terminal session · \(error)"
         }
     }
 

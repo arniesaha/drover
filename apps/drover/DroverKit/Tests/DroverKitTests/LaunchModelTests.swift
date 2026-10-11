@@ -356,7 +356,7 @@ private func catalog(
 
     await model.refreshSnapshot()
 
-    #expect(model.snapshotError == "token rejected — check Settings")
+    #expect(model.snapshotError == "token rejected · check Settings")
     #expect(model.launchError == nil)
     #expect(model.snapshot == nil)
     #expect(model.isFetchingSnapshot == false)

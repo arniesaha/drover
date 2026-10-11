@@ -228,6 +228,7 @@ struct LaunchView: View {
                 client: client, hostID: model.hostID,
                 hostLabel: model.selectedHost?.title ?? "Selected host",
                 savedPaths: model.savedCwdSuggestions,
+                sessions: (model.snapshot?.sessions ?? []).filter { $0.hostID == model.hostID },
                 onSelect: { model.cwd = $0 }
             )
         }

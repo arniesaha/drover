@@ -57,7 +57,7 @@ extension DroverError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .unauthorized:
-            return "Token rejected — check Settings"
+            return "Token rejected · check Settings"
         case .conflict(let message), .badRequest(let message):
             return message
         case .unavailable(let message):

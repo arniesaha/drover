@@ -416,3 +416,28 @@ public struct HistoryPager: Sendable, Equatable {
         }
     }
 }
+
+public enum HistoryPresentation {
+    public static func isReadable(_ message: HarnessMessage) -> Bool {
+        guard !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        switch message.type {
+        case .userInput: return true
+        case .assistantOutput:
+            return (message.role.isEmpty || message.role == "assistant")
+                && message.payload["thinking"]?.boolValue != true
+        default: return false
+        }
+    }
+
+    public static func speaker(for message: HarnessMessage) -> String {
+        message.type == .userInput ? "You" : "Assistant"
+    }
+
+    public static func dayRange(_ count: Int) -> String {
+        "\(count) day\(count == 1 ? "" : "s")"
+    }
+
+    public static func footer(_ count: Int) -> String {
+        "\(count) session\(count == 1 ? "" : "s") · All loaded"
+    }
+}

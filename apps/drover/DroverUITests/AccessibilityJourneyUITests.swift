@@ -13,6 +13,38 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
+    func testComposerActionsFitAtLargestTextSize() {
+        checkComposerLargestText(dark: false)
+    }
+
+    @MainActor
+    func testComposerActionsFitAtLargestTextSizeInDarkMode() {
+        checkComposerLargestText(dark: true)
+    }
+
+    @MainActor
+    private func checkComposerLargestText(dark: Bool) {
+        let app = coreJourneyApp()
+        if dark { app.launchArguments += ["-drover.appearance", "dark"] }
+        app.launch()
+        openFixtureChat(in: app)
+        let send = app.buttons["composer-send"]
+        let attach = app.buttons["composer-attach"]
+        let scroll = app.scrollViews["composer-scroll"]
+        if scroll.exists && !send.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(send.waitForExistence(timeout: timeout))
+        XCTAssertTrue(send.isHittable)
+        XCTAssertTrue(attach.isHittable)
+        XCTAssertTrue(app.frame.contains(send.frame))
+        XCTAssertTrue(app.frame.contains(attach.frame))
+        XCTAssertFalse(send.frame.intersects(attach.frame))
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = dark ? "Composer largest text dark" : "Composer largest text light"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    @MainActor
     func testHomeHeaderScrollsAwayAtAccessibilityXXXL() {
         let app = coreJourneyApp()
         app.launch()

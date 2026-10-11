@@ -99,10 +99,10 @@ import Testing
     let unauthorized = FleetSummaryPresentation(
         snapshot: snapshot,
         isReachable: false,
-        error: "Token rejected — check Settings",
+        error: "Token rejected · check Settings",
         isTailscaleTransportFailure: false
     )
-    #expect(unauthorized.fleetLine == "Token rejected — check Settings")
+    #expect(unauthorized.fleetLine == "Token rejected · check Settings")
 
     let malformedResponse = FleetSummaryPresentation(
         snapshot: snapshot,
@@ -123,11 +123,11 @@ import Testing
     let repeatedCancellation = FleetSummaryPresentation(
         snapshot: snapshot,
         isReachable: false,
-        error: "The first load kept being interrupted before it landed — the hub may be busy.",
+        error: "The first load kept being interrupted before it landed · the hub may be busy.",
         isTailscaleTransportFailure: false
     )
     #expect(repeatedCancellation.fleetLine
-            == "The first load kept being interrupted before it landed — the hub may be busy.")
+            == "The first load kept being interrupted before it landed · the hub may be busy.")
 
     let success = FleetSummaryPresentation(
         snapshot: snapshot,

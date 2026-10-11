@@ -836,7 +836,7 @@ struct ChatModelTests {
     // Rejected turn is queued, not lost — composer clears, soft hint shows.
     #expect(model.queuedTurn == "follow-up question")
     #expect(model.composerText.isEmpty)
-    #expect(model.hint == "Queued — sends when the current response finishes.")
+    #expect(model.hint == "Queued · sends when the current response finishes.")
 
     // The harness finishing its turn (status event with turn_complete)
     // dispatches the queued text automatically.
@@ -1271,13 +1271,32 @@ struct ChatModelTests {
     #expect(model.hint == "codex exec has no approval channel")
 }
 
+@Test @MainActor func idleInterruptDoesNotSendARequest() async {
+    mock.handler = { _ in
+        Issue.record("Idle interrupt must not reach the hub")
+        return (200, Data())
+    }
+    let model = recoveryChatModel(client: client(), sessionID: "s1")
+    model.controls = .everythingAdvertised
+    model.ingest(.connection(true))
+    #expect(!model.isTurnRunning)
+    await model.interrupt()
+    #expect(!model.isStopping)
+    model.ingest(.message(.fixture(seq: 1, type: .userInput)))
+    #expect(model.isTurnRunning)
+    model.ingest(.message(.fixture(seq: 2, type: .status, payload: ["turn_complete": .bool(true)])))
+    #expect(!model.isTurnRunning)
+    await model.interrupt()
+}
+
 @Test @MainActor func interruptAndTerminatePostToRoutes() async throws {
     nonisolated(unsafe) var paths: [String] = []
     mock.handler = { request in
         paths.append(request.url?.path ?? "")
         return (200, Data())
     }
-    let model = recoveryChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1", initialMessages: [.fixture(seq: 1, type: .userInput)])
+    model.ingest(.connection(true))
     model.controls = .everythingAdvertised
     await model.interrupt()
     await model.terminate()
@@ -1286,10 +1305,11 @@ struct ChatModelTests {
 
 @Test @MainActor func transportFailureGetsGenericRetryHint() async throws {
     mock.handler = { _ in (500, Data(#"{"error": "boom"}"#.utf8)) }
-    let model = recoveryChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1", initialMessages: [.fixture(seq: 1, type: .userInput)])
+    model.ingest(.connection(true))
     model.controls = .everythingAdvertised
     await model.interrupt()
-    #expect(model.hint == "Could not interrupt — try again.")
+    #expect(model.hint == "Could not interrupt · try again.")
 }
 
 // A hub that gave up waiting is not a hub that refused. The host answers the
@@ -1301,12 +1321,13 @@ struct ChatModelTests {
     mock.handler = { _ in
         (504, Data(#"{"error": "harness host did not answer within 120s"}"#.utf8))
     }
-    let model = recoveryChatModel(client: client(), sessionID: "s1")
+    let model = recoveryChatModel(client: client(), sessionID: "s1", initialMessages: [.fixture(seq: 1, type: .userInput)])
+    model.ingest(.connection(true))
     model.controls = .everythingAdvertised
 
     await model.interrupt()
 
-    #expect(model.hint == "The host is still working on it — check your sessions before trying again.")
+    #expect(model.hint == "The host is still working on it · check your sessions before trying again.")
 }
 
 // MARK: - Stream lifecycle (fix round 1)
@@ -1500,7 +1521,7 @@ struct ChatModelTests {
 
     #expect(didLoad == false)
     #expect(model.messages.map(\.seq) == [4, 5])
-    #expect(model.hint == "Could not load earlier messages — try again.")
+    #expect(model.hint == "Could not load earlier messages · try again.")
     model.stop()
 }
 
@@ -1520,7 +1541,7 @@ struct ChatModelTests {
     })
 
     model.start()
-    try await waitUntil { model.hint == "Token rejected — check Settings." }
+    try await waitUntil { model.hint == "Token rejected · check Settings." }
     // Give any errant reconnect loop a moment to fire before asserting it
     // didn't: a spinning loop would have issued a second REST call by now.
     try await Task.sleep(for: .milliseconds(50))

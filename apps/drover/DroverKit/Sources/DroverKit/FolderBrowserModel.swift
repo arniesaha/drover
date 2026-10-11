@@ -143,3 +143,19 @@ public final class FolderBrowserModel {
         isLoading = false
     }
 }
+
+/// A saved location's path remains the selection value; its label describes the project.
+public enum FolderRecentPresentation {
+    public static func name(path: String, sessions: [SessionSummary] = []) -> String {
+        if let repo = sessions.first(where: { $0.cwd == path })?.repoName,
+           !repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return repo
+        }
+        let parts = path.split(separator: "/").map(String.init)
+        if let index = parts.lastIndex(where: { [".worktrees", "worktrees"].contains($0) }), index > 0 {
+            let parent = parts[index - 1]
+            return parent == ".drover" ? "Project worktree" : parent
+        }
+        return parts.last ?? "/"
+    }
+}

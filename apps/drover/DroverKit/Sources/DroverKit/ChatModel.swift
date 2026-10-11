@@ -562,14 +562,14 @@ public final class ChatModel {
             guard let page = try await stream.loadOlderHistory() else { return false }
             mergeHistory(page.messages)
             hasOlderHistory = page.hasOlder
-            if hint == "Could not load earlier messages — try again." {
+            if hint == "Could not load earlier messages · try again." {
                 hint = nil
             }
             return true
         } catch is CancellationError {
             return false
         } catch {
-            hint = "Could not load earlier messages — try again."
+            hint = "Could not load earlier messages · try again."
             return false
         }
     }
@@ -616,7 +616,7 @@ public final class ChatModel {
             // the generic "Reconnecting…" pill so the user knows to fix the
             // token rather than wait forever.
             isConnected = false
-            hint = "Token rejected — check Settings."
+            hint = "Token rejected · check Settings."
         }
     }
 
@@ -1116,7 +1116,7 @@ public final class ChatModel {
             queuedTurn = queuedTurn.map { "\($0)\n\(turn.text)" } ?? turn.text
         }
         queuedAttachments.append(contentsOf: turn.attachments)
-        hint = "Queued — sends when the current response finishes."
+        hint = "Queued · sends when the current response finishes."
         scheduleRecoveryCheckpoint()
     }
 
@@ -1690,8 +1690,12 @@ public final class ChatModel {
         }
     }
 
+    public var isTurnRunning: Bool {
+        activity.isActive || activity.phase == .approval
+    }
+
     public func interrupt() async {
-        guard !isStopping, !isEnded else { return }
+        guard isTurnRunning, !isStopping, !isEnded else { return }
         if let reason = controls.interruptUnavailableReason {
             hint = reason
             return
@@ -1739,9 +1743,9 @@ public final class ChatModel {
             // worktree, and the session may then exist with only the hub's
             // copy missing. "Try again" is the one instruction that turns
             // that into two sessions, so this says the opposite.
-            hint = "The host is still working on it — check your sessions before trying again."
+            hint = "The host is still working on it · check your sessions before trying again."
         default:
-            hint = "Could not \(action) — try again."
+            hint = "Could not \(action) · try again."
         }
     }
 }

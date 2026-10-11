@@ -216,7 +216,7 @@ struct ChatView: View {
             }
         }
         .onChange(of: model.isEnded) { _, ended in onSessionEnded?(sessionID, ended) }
-        .background(DroverColor.bg)
+        .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
         .navigationTitle(model.harnessPresentation.name)
         .navigationBarTitleDisplayMode(.inline)
         // Without an explicit bar background the transcript scrolls under a
@@ -678,22 +678,24 @@ struct ChatView: View {
 
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
-                // Disabled rather than hidden, so the menu says why: the
-                // host does not advertise interrupt for this harness (or has
-                // not been heard from yet).
-                Button {
-                    Task { await model.interrupt() }
-                } label: {
-                    // A trailing Text is the menu item's subtitle, which the
-                    // system also speaks with the title.
-                    Label("Interrupt", systemImage: "stop.circle")
-                    if let reason = model.controls.interruptUnavailableReason {
-                        Text(reason)
+                if model.isTurnRunning {
+                    // Disabled rather than hidden, so the menu says why: the
+                    // host does not advertise interrupt for this harness (or has
+                    // not been heard from yet).
+                    Button {
+                        Task { await model.interrupt() }
+                    } label: {
+                        // A trailing Text is the menu item's subtitle, which the
+                        // system also speaks with the title.
+                        Label("Interrupt", systemImage: "stop.circle")
+                        if let reason = model.controls.interruptUnavailableReason {
+                            Text(reason)
+                        }
                     }
+                    .disabled(!model.controls.canInterrupt)
+                    .disabled(model.isStopping || model.isEnded)
+                    .accessibilityIdentifier("chat-interrupt")
                 }
-                .disabled(!model.controls.canInterrupt)
-                .disabled(model.isStopping || model.isEnded)
-                .accessibilityIdentifier("chat-interrupt")
                 // Same-harness handoff also needs an advertised structured target.
                 Button {
                     Task { await handOff(to: nil) }

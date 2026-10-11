@@ -153,3 +153,36 @@ def test_usage_turn_count_counts_usage_bearing_records_only():
     ]
     assert usage_turn_count(events) == 2
     assert usage_turn_count([]) == 0
+
+
+def test_provider_message_usage_is_counted_once_across_block_events():
+    from drover.server.harness.usage import usage_turn_count
+
+    events = [
+        {
+            "seq": seq,
+            "payload": {
+                "native_event_id": f"event-{seq}",
+                "usage_message_id": message,
+                "usage": {
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "cache_read_input_tokens": cache,
+                },
+            },
+        }
+        for seq, message, inp, out, cache in [
+            (1, "message-a", 100, 2, 1000),
+            (2, "message-a", 100, 20, 1000),
+            (3, "message-b", 200, 30, 2000),
+            (4, "message-b", 200, 30, 2000),
+            (5, "message-a", 100, 2, 1000),  # replay of the early partial block
+        ]
+    ]
+    totals = session_totals("claude-code", events)
+    assert totals.input_tokens == 300
+    assert totals.output_tokens == 50
+    assert totals.cache_read_tokens == 3000
+    assert totals.billable_input == 3300
+    assert usage_turn_count(events) == 2
+    assert totals.exact

@@ -17,7 +17,7 @@ struct HarnessPreferenceControls: View {
             selectedEffort: runPreferences.thinkingEffort
         )
 
-        HStack(spacing: 8) {
+        FlowLayout(spacing: 8) {
             Button {
                 showsModelPicker = true
             } label: {
@@ -82,9 +82,7 @@ private struct PreferenceChip: View {
             Image(systemName: systemImage)
                 .imageScale(.medium)
             Text(title)
-                .lineLimit(1)
-                .minimumScaleFactor(0.82)
-                .allowsTightening(true)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .font(.callout.weight(.medium))
         .padding(.horizontal, 10)

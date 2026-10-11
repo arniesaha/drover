@@ -66,10 +66,10 @@ struct NotifierTests {
     let notifications = await spy.notifications
     #expect(notifications.count == 2)
     #expect(notifications.contains {
-        $0.id == "sess-approval" && $0.title == "claude-code needs you" && $0.body == "project — approval required"
+        $0.id == "sess-approval" && $0.title == "claude-code needs you" && $0.body == "project · approval required"
     })
     #expect(notifications.contains {
-        $0.id == "sess-input" && $0.title == "agy needs you" && $0.body == "other — your turn"
+        $0.id == "sess-input" && $0.title == "agy needs you" && $0.body == "other · your turn"
     })
 
     let badges = await spy.badgeCounts
@@ -136,7 +136,7 @@ struct NotifierTests {
     let notifications = await spy.notifications
     #expect(notifications.count == 1)
     #expect(notifications[0].id == "sess-input")
-    #expect(notifications[0].body == "other — your turn")
+    #expect(notifications[0].body == "other · your turn")
     let badges = await spy.badgeCounts
     #expect(badges == [1])
 }

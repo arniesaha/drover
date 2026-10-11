@@ -97,9 +97,7 @@ public final class SessionStore {
     /// Sessions that need the user's attention, approval requests first,
     /// then by most-recent activity.
     public var needsYou: [SessionSummary] {
-        let sessions = (snapshot?.sessions ?? []).filter {
-            $0.attention == .needsApproval || $0.attention == .needsInput
-        }
+        let sessions = SessionBuckets(sessions: snapshot?.sessions ?? []).needsYou
         return sessions.sorted(by: Self.needsYouOrdering)
     }
 
@@ -147,8 +145,7 @@ public final class SessionStore {
     }
 
     public var finished: [SessionSummary] {
-        (snapshot?.sessions ?? [])
-            .filter { $0.attention == .done || $0.attention == .errored }
+        SessionBuckets(sessions: snapshot?.sessions ?? []).finished
             .sorted(by: Self.byActivityDescending)
     }
 
@@ -369,7 +366,7 @@ public final class SessionStore {
         guard cancelledFirstLoads >= Self.cancelledFirstLoadLimit else { return }
         isReachable = false
         lastRefreshFailure = .cancellation
-        lastError = "The first load kept being interrupted before it landed — the hub may be busy."
+        lastError = "The first load kept being interrupted before it landed · the hub may be busy."
     }
 
     private static let cancelledOutcome = "request cancelled"
@@ -407,7 +404,7 @@ public final class SessionStore {
             case DroverError.conflict(let message), DroverError.badRequest(let message):
                 lastError = message
             default:
-                lastError = "Couldn't start handoff — is the host online?"
+                lastError = "Couldn't start handoff · is the host online?"
             }
             lastRefreshFailure = nil
             return nil

@@ -184,6 +184,9 @@ private struct RootView: View {
     var environment: AppEnvironment
     let notifier: Notifying
     @State private var showSettings = false
+    @State private var pairingLink: PairingPayload?
+    @State private var showPairingLink = false
+    @State private var invalidPairingLink = false
     @State private var appearance: AppearanceStore
     private let defaults: UserDefaults
     private let chatModelFactory: ChatModelFactory?
@@ -229,6 +232,30 @@ private struct RootView: View {
                 }
             }
         }
+        .onOpenURL { url in
+            guard let payload = PairingPayload(scanned: url.absoluteString) else {
+                invalidPairingLink = true
+                return
+            }
+            pairingLink = payload
+            showPairingLink = true
+        }
+        .sheet(isPresented: $showPairingLink, onDismiss: { pairingLink = nil }) {
+            NavigationStack {
+                PairingView(environment: environment, initialPayload: pairingLink)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Cancel") { showPairingLink = false }
+                        }
+                    }
+            }
+        }
+        .alert("Invalid pairing link", isPresented: $invalidPairingLink) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Ask your server for a new pairing link.")
+        }
+        .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea())
         .environment(appearance)
         .preferredColorScheme(appearance.appearance.colorScheme)
         .droverTint()

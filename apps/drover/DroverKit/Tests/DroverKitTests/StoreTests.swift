@@ -263,7 +263,7 @@ private final class LockedCount: @unchecked Sendable {
 }
 
 @Test func droverErrorDescriptionsAreHumanReadable() {
-    #expect(DroverError.unauthorized.localizedDescription == "Token rejected — check Settings")
+    #expect(DroverError.unauthorized.localizedDescription == "Token rejected · check Settings")
     #expect(DroverError.conflict("turn in flight").localizedDescription == "turn in flight")
     #expect(DroverError.transport("cancelled").localizedDescription == "Request cancelled")
     #expect(DroverError.transport("offline").localizedDescription == "Can't reach the hub")
@@ -382,7 +382,7 @@ private final class LockedCount: @unchecked Sendable {
     await store.refresh()
     let newID = await store.continueSession("harness-1")
     #expect(newID == nil)
-    #expect(store.lastError == "Couldn't start handoff — is the host online?")
+    #expect(store.lastError == "Couldn't start handoff · is the host online?")
 }
 
 @Test @MainActor func hasLoadedOnceFlipsOnFirstSuccessfulRefresh() async throws {
@@ -420,7 +420,7 @@ private final class LockedCount: @unchecked Sendable {
     mock.handler = { _ in (500, Data()) }
     await store.refresh()
 
-    #expect(store.snapshot != nil, "the cached snapshot must survive — that behaviour stays")
+    #expect(store.snapshot != nil, "the cached snapshot must survive · that behaviour stays")
     #expect(store.lastSuccessfulRefresh == landed, "a failure must not restamp the snapshot")
     let freshness = store.freshness(now: landed.addingTimeInterval(247))
     #expect(freshness.isStale)
@@ -695,7 +695,7 @@ private final class LockedCount: @unchecked Sendable {
     #expect(DroverError.connectionFailureReason(URLError(.cannotConnectToHost), isTailscale: true) == "Can't reach the hub over Tailscale")
     #expect(DroverError.transport("offline").localizedDescription(isTailscale: true) == "Can't reach the hub over Tailscale")
     #expect(DroverError.transport(DroverError.cancellationDetail).localizedDescription(isTailscale: true) == "Request cancelled")
-    #expect(DroverError.unauthorized.localizedDescription(isTailscale: true) == "Token rejected — check Settings")
+    #expect(DroverError.unauthorized.localizedDescription(isTailscale: true) == "Token rejected · check Settings")
 }
 
 @Test @MainActor func refreshErrorOnTailscaleReflectsTailscaleContext() async throws {
@@ -736,7 +736,7 @@ private final class LockedCount: @unchecked Sendable {
     }
     await store.refresh()
     #expect(store.lastRefreshFailure == .authentication)
-    #expect(store.lastError == "Token rejected — check Settings")
+    #expect(store.lastError == "Token rejected · check Settings")
     #expect(!store.isTailscaleTransportFailure)
 
     mock.handler = { _ in (200, Data("not json".utf8))
@@ -765,7 +765,7 @@ private final class LockedCount: @unchecked Sendable {
     for _ in 0..<3 { await store.refresh() }
 
     #expect(store.lastRefreshFailure == .cancellation)
-    #expect(store.lastError == "The first load kept being interrupted before it landed — the hub may be busy.")
+    #expect(store.lastError == "The first load kept being interrupted before it landed · the hub may be busy.")
     #expect(!store.isTailscaleTransportFailure)
 }
 
@@ -795,7 +795,7 @@ private final class LockedCount: @unchecked Sendable {
 
     await store.refresh()
     #expect(store.lastRefreshFailure == .cancellation)
-    #expect(store.lastError == "The first load kept being interrupted before it landed — the hub may be busy.")
+    #expect(store.lastError == "The first load kept being interrupted before it landed · the hub may be busy.")
     #expect(!store.isTailscaleTransportFailure)
 }
 

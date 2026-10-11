@@ -563,3 +563,19 @@ def test_harness_usage_rollup_progresses_during_analytical_build(tmp_path):
     assert report.rolled == 1
     with duckdb.connect(str(control_plane_path(db))) as con:
         assert usage_row(con, "c1")[:2] == (7, 3)
+
+
+def test_provider_message_fanout_rolls_up_once_and_stays_idempotent(tmp_path):
+    con = registry(tmp_path)
+    add_session(con, "fanout", "claude-code")
+    for seq, output in [(1, 2), (2, 20), (3, 2)]:
+        payload = claude_usage(f"event-{seq}", inp=100, out=output, cache_read=1000)
+        payload["usage_message_id"] = "message-a"
+        add_event(con, "fanout", seq, payload)
+    report = rollup_pending_sessions(con)
+    assert report.rolled == 1
+    row = usage_row(con, "fanout")
+    assert row[:5] == (100, 20, 1000, 0, 1)
+    assert rollup_pending_sessions(con).rolled == 0
+    assert usage_row(con, "fanout") == row
+    con.close()

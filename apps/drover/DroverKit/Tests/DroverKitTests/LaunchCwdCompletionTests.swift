@@ -257,7 +257,7 @@ private func testStore() -> HarnessModelCatalogStore {
     await model.settleCompletion()
 
     #expect(model.isCompletionHostUnreachable)
-    #expect(model.cwdSuggestionsHint == "Can't reach the host — showing saved paths only")
+    #expect(model.cwdSuggestionsHint == "Can't reach the host · showing saved paths only")
     // The curated half of the list survives the outage.
     #expect(model.cwdSuggestions == ["/home/sample-user/dev/drover"])
 }
@@ -274,7 +274,7 @@ private func testStore() -> HarnessModelCatalogStore {
 }
 
 private let unsupportedHint =
-    "This host doesn't support path completion yet — showing saved paths only"
+    "This host doesn't support path completion yet · showing saved paths only"
 
 /// A host on a release older than the completion routes never completes
 /// anything, on any keystroke. Silence reads as "no such directory", and
@@ -322,7 +322,7 @@ private let unsupportedHint =
 
     #expect(model.isCompletionUnsupported == false)
     #expect(model.isCompletionHostUnreachable)
-    #expect(model.cwdSuggestionsHint == "Can't reach the host — showing saved paths only")
+    #expect(model.cwdSuggestionsHint == "Can't reach the host · showing saved paths only")
 }
 
 /// The hub's registry failing to read is transient and the hub's fault;
