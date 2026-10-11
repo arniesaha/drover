@@ -655,6 +655,9 @@ class APNsSender:
             thread = "session-summary"
         aps = {
             "alert": alert,
+            "category": (
+                "input" if any(state.needs_user for state in states) else states[0].kind
+            ),
             "sound": "default",
             "thread-id": thread,
             "interruption-level": (

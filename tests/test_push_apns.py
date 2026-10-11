@@ -905,3 +905,24 @@ def test_repeated_urgent_states_do_not_extend_short_window(tmp_path, config):
     sender.flush_due()
     assert len(client.posts) == 1
     sender.close()
+
+
+@pytest.mark.parametrize(
+    "status,awaiting,category",
+    [
+        ("running", "approval", "input"),
+        ("running", "input", "input"),
+        ("completed", "input", "finished"),
+        ("failed", "input", "failed"),
+    ],
+)
+def test_notification_category_matches_actual_prompt_or_completion(
+    tmp_path, config, status, awaiting, category
+):
+    store, _ = _paired_device(tmp_path)
+    sender, _, _ = _batch_sender(config, store)
+    payload = json.loads(
+        sender._payload(_transition(status=status, awaiting=awaiting), None)
+    )
+    assert payload["aps"]["category"] == category
+    sender.close()

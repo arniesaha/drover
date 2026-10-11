@@ -56,7 +56,7 @@ def _directory(path: Path):
                 if stat.S_ISLNK(
                     os.stat(component, dir_fd=fd, follow_symlinks=False).st_mode
                 ):
-                    raise FolderError(403, "permission_denied") from None
+                    raise FolderError(403, "symlink_not_allowed") from None
                 raise
             os.close(fd)
             fd = next_fd
@@ -88,7 +88,7 @@ def list_folders(typed: str, query: str = "") -> dict:
         os.path.expanduser(typed) if typed == "~" or typed.startswith("~/") else typed
     )
     if ".." in expanded.split("/"):
-        raise FolderError(403, "permission_denied")
+        raise FolderError(403, "outside_allowed_folders")
     path = Path(expanded)
     if not path.is_absolute():
         raise FolderError(400, "invalid_path")
@@ -100,10 +100,10 @@ def list_folders(typed: str, query: str = "") -> dict:
         ),
         None,
     )
-    if root is None or any(
-        part.startswith(".") for part in path.relative_to(root).parts
-    ):
-        raise FolderError(403, "permission_denied")
+    if root is None:
+        raise FolderError(403, "outside_allowed_folders")
+    if any(part.startswith(".") for part in path.relative_to(root).parts):
+        raise FolderError(403, "hidden_folder_not_allowed")
     entries = []
     truncated = False
     try:

@@ -60,14 +60,14 @@ def test_allowed_root_directories_only_and_git_metadata(base_url, root):
 def test_traversal_refused(base_url, root, suffix):
     status, body = listing(base_url, str(root) + suffix)
     assert status == 403
-    assert body["error"] == "permission_denied"
+    assert body["error"] == "outside_allowed_folders"
 
 
 def test_outside_and_sibling_prefix_refused(base_url, root):
     sibling = root.parent / "root-extra"
     sibling.mkdir()
     for path in [root.parent, sibling]:
-        assert listing(base_url, str(path))[0] == 403
+        assert listing(base_url, str(path)) == (403, {"error": "outside_allowed_folders"})
 
 
 def test_symlinks_refused_even_inside_root(base_url, root):
@@ -75,7 +75,7 @@ def test_symlinks_refused_even_inside_root(base_url, root):
     (root / "escape").symlink_to(root.parent, target_is_directory=True)
     (root / "alias").symlink_to(root / "safe", target_is_directory=True)
     for name in ["escape", "alias"]:
-        assert listing(base_url, str(root / name))[0] == 403
+        assert listing(base_url, str(root / name)) == (403, {"error": "symlink_not_allowed"})
     _, body = listing(base_url, str(root))
     assert [entry["name"] for entry in body["entries"]] == ["safe"]
 
@@ -232,3 +232,16 @@ def test_child_deleted_during_scan_does_not_fail_parent(base_url, root, monkeypa
     status, body = listing(base_url, str(root))
     assert status == 200
     assert body["entries"] == []
+
+
+def test_tmp_alias_is_outside_home_policy(base_url, root):  # noqa: F811 - imported pytest fixtures
+    # macOS /tmp is a symlink. Reject by policy before opening any components.
+    assert listing(base_url, "/tmp") == (403, {"error": "outside_allowed_folders"})
+
+
+def test_symlinked_ancestor_has_specific_error(base_url, root):  # noqa: F811 - imported pytest fixtures
+    (root / "safe" / "child").mkdir(parents=True)
+    (root / "alias").symlink_to(root / "safe", target_is_directory=True)
+    assert listing(base_url, str(root / "alias" / "child")) == (
+        403, {"error": "symlink_not_allowed"}
+    )

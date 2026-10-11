@@ -508,14 +508,25 @@ public final class LaunchModel {
         )
     }
 
-    private static func errorMessage(for error: Error) -> String {
+    static func errorMessage(for error: Error) -> String {
         switch error {
         case DroverError.badRequest(let message), DroverError.conflict(let message):
-            return message
+            if message.hasPrefix("cwd does not exist:") {
+                return "That folder no longer exists. Pick another folder."
+            }
+            if message.lowercased().contains("host offline") {
+                return "The host is offline. Wait for it to reconnect, then try again."
+            }
+            if message.hasPrefix("cwd is not a directory:") {
+                return "That path is not a folder. Pick another folder."
+            }
+            return "The session could not start. Check your selections and try again."
         case DroverError.unauthorized:
-            return "token rejected · check Settings"
+            return "Check the connection credential in Settings."
+        case DroverError.transport, DroverError.busy:
+            return "Could not reach the host. Check the connection and try again."
         default:
-            return "\(error)"
+            return "The session could not start. Try again."
         }
     }
 }

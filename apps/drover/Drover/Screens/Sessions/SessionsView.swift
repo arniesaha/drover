@@ -37,7 +37,7 @@ struct SessionsView: View {
     private let onOpenSettings: () -> Void
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
-    @State private var exporterHealth: ExporterHealth?
+    @State private var exporterFreshness = ExporterFreshnessGate()
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
     @State private var showFinished = false
@@ -87,7 +87,7 @@ struct SessionsView: View {
                 statusHeader
             }
 
-            if let warning = exporterHealth?.warningText {
+            if let warning = exporterFreshness.warningText {
                 Label(warning, systemImage: "exclamationmark.triangle")
                     .font(.footnote)
                     .foregroundStyle(.orange)
@@ -222,7 +222,11 @@ struct SessionsView: View {
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             while !Task.isCancelled {
-                do { exporterHealth = try await client.exporterHealth() }
+                do {
+                    let health = try await client.exporterHealth()
+                    guard !Task.isCancelled else { return }
+                    exporterFreshness.fetched(health)
+                }
                 catch { /* Keep the last known warning during transient failures. */ }
                 do { try await Task.sleep(for: .seconds(15)) }
                 catch { return }
