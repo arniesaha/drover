@@ -87,6 +87,40 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("drover.metrics")
 
+# Event timestamps can predate registration by years during replay. Only
+# elapsed hub-observed retries can establish a missing session as an orphan.
+_UNKNOWN_SESSION_RETRY_WINDOW_SECONDS = 24 * 60 * 60
+_MAX_UNKNOWN_SESSION_RETRIES = 4096
+_ownership_retry_clock = time.monotonic
+
+
+class _UnknownSessionRetries:
+    """Bounded, host-scoped observation window, shared by request threads.
+
+    Restart or eviction resets the window conservatively, extending retries
+    instead of risking a fresh session's events. No event content is retained.
+    """
+
+    def __init__(self) -> None:
+        self._first_seen: dict[tuple[str, str], float] = {}
+        self._lock = threading.Lock()
+
+    def expired(self, host_id: str, session_id: str) -> bool:
+        key = (host_id, session_id)
+        now = _ownership_retry_clock()
+        with self._lock:
+            if key not in self._first_seen:
+                if len(self._first_seen) >= _MAX_UNKNOWN_SESSION_RETRIES:
+                    self._first_seen.pop(next(iter(self._first_seen)))
+                self._first_seen[key] = now
+                return False
+            return now - self._first_seen[key] >= _UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
+
+    def forget(self, host_id: str, session_id: str) -> None:
+        with self._lock:
+            self._first_seen.pop((host_id, session_id), None)
+
+
 # /auth/pair is the one public write in the system: a device that has no
 # credential yet is exactly the caller it exists for. It is hardened inside
 # _redeem_pairing_code (single-use codes, TTL, per-source throttle) rather
@@ -829,6 +863,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     pairing: PairingCodes | None = None
     analytics_boundary: AnalyticsBoundaryClient | None = None
     host_data_bridge_token: str = ""
+    unknown_session_retries: _UnknownSessionRetries
     analytical_slots: threading.BoundedSemaphore
     fleet_slots: threading.BoundedSemaphore
     history_slots: threading.BoundedSemaphore
@@ -2423,10 +2458,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 return
             if "host_id" in body and not self._authorize_host(str(body["host_id"])):
                 return
-            # Validate known owners before any write. A missing session is
-            # not an identity mismatch: old local ledgers can outlive the hub
-            # registry. Skip those events without trusting their claimed owner.
+            # Validate before any write. Missing ownership can be a create
+            # race; refuse it until repeated hub observations expire the window.
+            # Only then skip the orphan, without trusting its claimed owner.
             known_events = []
+            pending_session_id = ""
             skipped = 0
             for event in events:
                 session_id = str(event["session_id"])
@@ -2436,9 +2472,14 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     return
                 session = registry.get_session(session_id)
                 if session is None:
+                    if not self.unknown_session_retries.expired(
+                        credential.host_id, session_id
+                    ):
+                        pending_session_id = pending_session_id or session_id
+                        continue
                     skipped += 1
                     log.debug(
-                        "skipping unknown session event route=/harness/events "
+                        "skipping expired orphan event route=/harness/events "
                         "session_id=%s credential_host_id=%s",
                         session_id,
                         credential.host_id,
@@ -2446,11 +2487,25 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     continue
                 if not self._authorize_host(session.host_id, session_id=session_id):
                     return
+                self.unknown_session_retries.forget(credential.host_id, session_id)
                 known_events.append(event)
+            if pending_session_id:
+                log.warning(
+                    "structured event ownership pending: route=/harness/events "
+                    "session_id=%s credential_host_id=%s",
+                    pending_session_id,
+                    credential.host_id,
+                )
+                self._send(
+                    403,
+                    "application/json",
+                    json.dumps({"error": "session ownership not registered"}) + "\n",
+                )
+                return
             events = known_events
             if skipped:
                 log.warning(
-                    "structured event ingest skipped unknown sessions: "
+                    "structured event ingest skipped expired orphan sessions: "
                     "route=/harness/events events=%d credential_host_id=%s",
                     skipped,
                     credential.host_id,
@@ -2482,11 +2537,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 }
             )
         ingested = registry.ingest_structured_events(prepared)
-        self._send(
-            200,
-            "application/json",
-            json.dumps({"ingested": ingested, "skipped": skipped}) + "\n",
-        )
+        result = {"ingested": ingested}
+        if skipped:
+            result["skipped"] = skipped
+        self._send(200, "application/json", json.dumps(result) + "\n")
 
     def _handle_login(self) -> None:
         length = int(self.headers.get("Content-Length") or "0")
@@ -3325,6 +3379,7 @@ def _metrics_handler(
             "pairing": pairing,
             "analytics_boundary": analytics_boundary,
             "host_data_bridge_token": host_data_bridge_token,
+            "unknown_session_retries": _UnknownSessionRetries(),
             "analytical_slots": _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1),
             "metrics_slots": threading.BoundedSemaphore(ANALYTICS_METRICS_CONCURRENCY),
             "mutation_slots": threading.BoundedSemaphore(

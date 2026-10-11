@@ -3807,6 +3807,15 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
             ]
         )
         assert inserted == 2
+        # Content is required to exercise missing-backend retry. Status-only
+        # sessions intentionally produce a neutral recap without a model.
+        registry.append_event(
+            session_id="harness-race",
+            event_type="assistant_output",
+            payload={"text": "Investigating the recap queue."},
+            content_preview="Investigating the recap queue.",
+            seq=22,
+        )
         assert _live_recap_jobs(pg_control_path, "harness-race") == []
 
         response_body = json.dumps(
