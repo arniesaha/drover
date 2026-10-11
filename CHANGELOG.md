@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-10-10
+
 ### Added
 
+- The product and documentation site now has a clearer landing page, tighter copy
+  and fixes for narrow mobile screens (#567, #570).
+- Push notifications are grouped by session, and delivery preferences can be set
+  in the hub. This adds hub settings migration 17; restart the hub after upgrade
+  so it can apply the migration (#568).
+- Pairing now returns the host identifier bound to the credential, and the
+  installer passes it with `--host-id` so host credentials cannot be used by a
+  different host (#569).
 - `drover-collect` reads OpenClaw sessions from the per-agent SQLite transcript
   store used by current OpenClaw releases (source id `openclaw_sqlite`). The
   store is opened read-only, read in small batches, watermarked per session by
@@ -27,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Control-schema migration 16 adds freshness indexes; exporter sampling now
   runs every ten seconds and avoids scanning acknowledged history.
 
+### Fixed
+
+- The iOS app keeps your place in a detached transcript and provides a jump to
+  the latest event when new activity arrives (#565).
+- iOS UAT round 4 fixes improve folder browsing and make session-stop feedback
+  clearer (#571).
+
 ### Security
 
 - MCP now requires active bearer credentials for every protocol request and tool,
@@ -35,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused; disabling authentication prevents MCP startup. Client integrations
   must configure credentials before upgrading. The bundled MCP client reads
   `DROVER_MCP_TOKEN` and refuses redirects. Profile import defaults are unchanged.
+
+### Upgrade notes
+
+- MCP clients must send `Authorization: Bearer <token>` using a dedicated host
+  credential.
+- Reissue host/device profile-agent bindings after upgrading.
+- On its first run, the collector re-imports its source data.
 
 ## [0.6.4] - 2026-10-08
 
