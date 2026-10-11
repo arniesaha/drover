@@ -45,6 +45,27 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
+    func testWrappingDraftKeepsFocusAndSendReachableAtAccessibilityXXXL() {
+        let app = coreJourneyApp()
+        app.launch()
+        openFixtureChat(in: app)
+
+        let composer = app.textFields["composer-input"]
+        let draft = "A wrapping accessibility draft keeps every word while the input grows and the model preferences remain available for review."
+        composer.tap()
+        composer.typeText(draft)
+
+        XCTAssertEqual(composer.value as? String, draft, "wrapping must not replace the focused input")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "wrapping must preserve keyboard focus")
+        let send = app.buttons["composer-send"]
+        XCTAssertTrue(send.isHittable, "Send must stay reachable while the draft wraps")
+        XCTAssertTrue(app.frame.contains(send.frame))
+        XCTAssertLessThanOrEqual(send.frame.maxY, app.keyboards.firstMatch.frame.minY)
+        send.tap()
+        XCTAssertTrue(app.staticTexts["chat-delivery-awaiting"].waitForExistence(timeout: timeout))
+    }
+
+    @MainActor
     func testHomeHeaderScrollsAwayAtAccessibilityXXXL() {
         let app = coreJourneyApp()
         app.launch()

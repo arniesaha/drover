@@ -17,6 +17,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     let isSending: Bool
     let canSend: Bool
     let showsSendButton: Bool
+    let scrollsInput: Bool
     let attachmentAccessibilityIdentifier: String
     let attachmentButton: AttachmentButton
     let onSend: () -> Void
@@ -36,6 +37,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         isSending: Bool = false,
         canSend: Bool = true,
         showsSendButton: Bool = true,
+        scrollsInput: Bool = false,
         attachmentAccessibilityIdentifier: String,
         @ViewBuilder attachmentButton: () -> AttachmentButton,
         onSend: @escaping () -> Void = {}
@@ -51,12 +53,43 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         self.isSending = isSending
         self.canSend = canSend
         self.showsSendButton = showsSendButton
+        self.scrollsInput = scrollsInput
         self.attachmentAccessibilityIdentifier = attachmentAccessibilityIdentifier
         self.attachmentButton = attachmentButton()
         self.onSend = onSend
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if scrollsInput {
+                // Keep one focused input as its height changes. Swapping
+                // ViewThatFits candidates mid-entry used to drop keystrokes.
+                ScrollView {
+                    inputContent
+                }
+                .accessibilityIdentifier("composer-scroll")
+            } else {
+                inputContent
+            }
+
+            actionControls
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, attachments.isEmpty ? 16 : 14)
+        .padding(.bottom, 14)
+        // Nocturne separates surfaces by ramp step and a hairline, not by
+        // material and drop shadow: the composer is `sheet` lifted off `bg`,
+        // outlined in `line`. Dropping the shadow also drops this view's last
+        // reason to know which theme it is in.
+        .background(DroverColor.sheet, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .strokeBorder(DroverColor.line, lineWidth: 1)
+        }
+    }
+
+    private var inputContent: some View {
         VStack(alignment: .leading, spacing: 12) {
             if !attachments.isEmpty {
                 attachmentStrip
@@ -87,49 +120,39 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
             if showsPreferences && dynamicTypeSize.isAccessibilitySize {
                 preferenceControls
             }
-
-            HStack(spacing: 12) {
-                attachmentButton
-                    .frame(width: 32, height: 32)
-
-                if showsPreferences && !dynamicTypeSize.isAccessibilitySize {
-                    preferenceControls
-                }
-
-                Spacer(minLength: 8)
-
-                if showsSendButton {
-                    Button(action: onSend) {
-                        if isSending {
-                            ProgressView()
-                                .frame(width: 38, height: 38)
-                        } else {
-                            Image(systemName: sendSystemImage)
-                                .font(.system(size: 18, weight: .bold))
-                                .foregroundStyle(.white)
-                                .frame(width: 38, height: 38)
-                                .background(sendFill, in: Circle())
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSend || isSending)
-                    .opacity(canSend || isSending ? 1 : 0.45)
-                    .accessibilityLabel(isSending ? "Sending" : "Send")
-                    .accessibilityIdentifier("composer-send")
-                }
-            }
         }
-        .padding(.horizontal, 18)
-        .padding(.top, attachments.isEmpty ? 16 : 14)
-        .padding(.bottom, 14)
-        // Nocturne separates surfaces by ramp step and a hairline, not by
-        // material and drop shadow: the composer is `sheet` lifted off `bg`,
-        // outlined in `line`. Dropping the shadow also drops this view's last
-        // reason to know which theme it is in.
-        .background(DroverColor.sheet, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 30, style: .continuous)
-                .strokeBorder(DroverColor.line, lineWidth: 1)
+    }
+
+    private var actionControls: some View {
+        HStack(spacing: 12) {
+            attachmentButton
+                .frame(width: 32, height: 32)
+
+            if showsPreferences && !dynamicTypeSize.isAccessibilitySize {
+                preferenceControls
+            }
+
+            Spacer(minLength: 8)
+
+            if showsSendButton {
+                Button(action: onSend) {
+                    if isSending {
+                        ProgressView()
+                            .frame(width: 38, height: 38)
+                    } else {
+                        Image(systemName: sendSystemImage)
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 38, height: 38)
+                            .background(sendFill, in: Circle())
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSend || isSending)
+                .opacity(canSend || isSending ? 1 : 0.45)
+                .accessibilityLabel(isSending ? "Sending" : "Send")
+                .accessibilityIdentifier("composer-send")
+            }
         }
     }
 
