@@ -26,27 +26,17 @@ struct Composer: View {
     private static let maxCombinedBytes = 6 * 1024 * 1024
 
     var body: some View {
-        Group {
-            if dynamicTypeSize.isAccessibilitySize {
-                ViewThatFits(in: .vertical) {
-                    promptSurface
-                    ScrollView { promptSurface }
-                        .accessibilityIdentifier("composer-scroll")
-                }
-                .frame(maxHeight: 300)
-            } else {
-                promptSurface
+        promptSurface
+            .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 300 : nil)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 10)
+            .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .bottom))
+            .onChange(of: pickerItems) { _, items in
+                guard !items.isEmpty else { return }
+                pickerItems = []
+                Task { await load(items) }
             }
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 8)
-        .padding(.bottom, 10)
-        .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .bottom))
-        .onChange(of: pickerItems) { _, items in
-            guard !items.isEmpty else { return }
-            pickerItems = []
-            Task { await load(items) }
-        }
     }
 
     private var promptSurface: some View {
@@ -60,6 +50,7 @@ struct Composer: View {
             placeholder: "Add feedback...",
             isSending: isSending,
             canSend: !isEmpty && canSend,
+            scrollsInput: dynamicTypeSize.isAccessibilitySize,
             attachmentAccessibilityIdentifier: "composer-attachment"
         ) {
             PhotosPicker(selection: $pickerItems, maxSelectionCount: 4,

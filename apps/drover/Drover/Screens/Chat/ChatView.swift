@@ -183,7 +183,19 @@ struct ChatView: View {
                 }
             } else if let pendingTurn = model.pendingTurn,
                       pendingTurn.deliveryState == .needsManualReview {
-                pendingDeliveryReview(pendingTurn)
+                if dynamicTypeSize.isAccessibilitySize {
+                    // The review copy and actions can exceed the remaining
+                    // viewport. Keep the composer visible and scroll the
+                    // review, starting at its actionable controls.
+                    ScrollView {
+                        pendingDeliveryReview(pendingTurn)
+                    }
+                    .defaultScrollAnchor(.bottom)
+                    .layoutPriority(1)
+                    .accessibilityIdentifier("chat-delivery-review-scroll")
+                } else {
+                    pendingDeliveryReview(pendingTurn)
+                }
             } else if let recoveryStatusMessage = model.recoveryStatusMessage {
                 recoveryStatusBanner(recoveryStatusMessage)
             } else if let hint = model.hint {
