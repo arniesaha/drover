@@ -539,3 +539,98 @@ def test_reconciliation_does_not_store_a_second_copy(tmp_path):
         daemon_server.server_close()
         central_server.shutdown()
         central_server.server_close()
+
+
+def test_recorded_claude_deltas_reach_app_feed_before_turn_completion(tmp_path):
+    import socket
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    from drover.server.harness.websocket import client_handshake, client_recv_json
+
+    central, central_url = _start_central(tmp_path)
+    daemon, state, pusher, base_url = _start_daemon(
+        tmp_path, name="daemon", central_url=central_url
+    )
+    stream = None
+    release = tmp_path / "complete"
+    fixture = Path("tests/fixtures/structured/claude_partial_capture.ndjson").resolve()
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys,time,pathlib\n"
+            "sys.stdin.readline()\n"
+            "lines=pathlib.Path(sys.argv[1]).read_text().splitlines()\n"
+            "for line in lines[:-1]: print(line,flush=True)\n"
+            "while not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.02)\n"
+            "print(lines[-1],flush=True)\n"
+            "sys.stdin.read()\n"
+        ),
+        str(fixture),
+        str(release),
+    ]
+    try:
+        _, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "command": command,
+                "cwd": str(tmp_path),
+            },
+        )
+        sid = body["session_id"]
+        central.RequestHandlerClass.collector._sync_created_harness_session(
+            state.host_id, {}, json.dumps(body)
+        )
+        endpoint = urlparse(central_url)
+        stream = socket.create_connection(
+            (endpoint.hostname, endpoint.port), timeout=10
+        )
+        client_handshake(
+            stream,
+            host=endpoint.netloc,
+            path=f"/harness/sessions/{sid}/stream",
+            headers=_AUTH_HEADERS,
+        )
+        stream.settimeout(10)
+        _json_request(f"{base_url}/sessions/{sid}/turns", payload={"text": "count"})
+
+        def feed():
+            with _authed_get(f"{central_url}/harness/sessions/{sid}/messages") as res:
+                return json.loads(res.read())["messages"]
+
+        _wait_until(
+            lambda: len([m for m in feed() if m["type"] == "assistant_output"]) == 2
+        )
+        before = feed()
+        assert [m["text"] for m in before if m["type"] == "assistant_output"] == [
+            "One two three four five six seven",
+            " eight nine ten.",
+        ]
+        assert not any(m.get("payload", {}).get("turn_complete") for m in before)
+        streamed = []
+        while len(streamed) < 2:
+            message = client_recv_json(stream)
+            if message is None:
+                continue
+            assert not message.get("payload", {}).get("turn_complete")
+            if message["type"] == "assistant_output":
+                streamed.append(message["text"])
+        assert streamed == ["One two three four five six seven", " eight nine ten."]
+        release.touch()
+        _wait_until(
+            lambda: any(m.get("payload", {}).get("turn_complete") for m in feed())
+        )
+        assert len([m for m in feed() if m["type"] == "assistant_output"]) == 2
+    finally:
+        if stream is not None:
+            stream.close()
+        release.touch()
+        _close_structured_sessions(state)
+        pusher.stop()
+        state.pty.close_all()
+        daemon.shutdown()
+        daemon.server_close()
+        central.shutdown()

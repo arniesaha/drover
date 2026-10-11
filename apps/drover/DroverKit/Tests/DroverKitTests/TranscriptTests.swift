@@ -234,3 +234,38 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
         #expect(TranscriptItem.latestRowID(of: [a, out, r]) == a.id)
     }
 }
+
+@Suite struct TextDeltaGroupingTests {
+    private func delta(_ id: String, seq: Int, text: String, stream: String = "m1:0") -> HarnessMessage {
+        HarnessMessage(id: id, seq: seq, type: .assistantOutput, text: text,
+                       payload: ["text_stream_id": .string(stream)])
+    }
+
+    @Test func joinsDeltasWithWhitespaceAndStableRowIdentity() {
+        let first = delta("e1", seq: 1, text: "Hello")
+        let second = delta("e2", seq: 2, text: " world")
+        let before = TranscriptItem.group([first])
+        let after = TranscriptItem.group([first, second])
+        #expect(after.count == 1)
+        #expect(after[0].id == before[0].id)
+        #expect(TranscriptItem.latestRowID(of: [first, second]) == "e1")
+        guard case .message(let message) = after[0] else { Issue.record("Expected text message"); return }
+        #expect(message.text == "Hello world")
+        #expect(String(message.displayText.characters) == "Hello world")
+    }
+
+    @Test func parsesMarkdownAcrossDeltaBoundaries() {
+        let chunks = [delta("e1", seq: 1, text: "**Hel"), delta("e2", seq: 2, text: "lo**")]
+        let items = TranscriptItem.group(chunks)
+        #expect(items.count == 1)
+        guard case .message(let message) = items[0] else { Issue.record("Expected text message"); return }
+        #expect(message.text == "**Hello**")
+        #expect(String(message.displayText.characters) == "Hello")
+    }
+
+    @Test func keepsSeparateBlocksAndUnmarkedOutputsSeparate() {
+        let chunks = [delta("e1", seq: 1, text: "A"), delta("e2", seq: 2, text: "B", stream: "m1:1"),
+                      output("e3", seq: 3), delta("e4", seq: 4, text: "C", stream: "m2:0")]
+        #expect(TranscriptItem.group(chunks).count == 4)
+    }
+}

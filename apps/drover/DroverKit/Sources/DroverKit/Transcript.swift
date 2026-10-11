@@ -114,6 +114,18 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         var lastRenderedID: String?
 
         var statusRun: [HarnessMessage] = []
+        var textRun: [HarnessMessage] = []
+
+        func flushText() {
+            guard let first = textRun.first else { return }
+            let combined = HarnessMessage(
+                id: first.id, seq: first.seq, type: first.type, role: first.role,
+                text: textRun.map(\.text).joined(), turnID: first.turnID,
+                timestamp: first.timestamp, payload: first.payload
+            )
+            items.append(.message(combined))
+            textRun = []
+        }
 
         func flushRun() {
             guard !run.isEmpty else { return }
@@ -141,6 +153,20 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         }
 
         for message in messages {
+            if message.type == .assistantOutput, !message.isThinking,
+               let streamID = message.payload["text_stream_id"]?.stringValue {
+                flushRun()
+                flushStatus()
+                openStepRun = nil
+                if let first = textRun.first,
+                   first.payload["text_stream_id"]?.stringValue != streamID {
+                    flushText()
+                }
+                textRun.append(message)
+                lastRenderedID = textRun[0].id
+                continue
+            }
+            flushText()
             // First branch on purpose: these are consumed into a run, and
             // must never flush a buffer or break the run they describe.
             if message.isThinkingTokens {
@@ -200,6 +226,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
             items.append(.message(message))
             lastRenderedID = message.id
         }
+        flushText()
         flushRun()
         flushStatus()
         return (items, lastRenderedID)
