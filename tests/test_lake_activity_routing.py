@@ -352,8 +352,9 @@ def test_retirement_lifecycle_rechecks_and_stops_on_error(
                 activate_retirement(path)
 
     class History:
-        def __init__(self, *args):
-            pass
+        def __init__(self, analytics, *, exporter_check=False):
+            assert analytics is config
+            assert exporter_check is True
 
         def __enter__(self):
             return self
@@ -361,8 +362,8 @@ def test_retirement_lifecycle_rechecks_and_stops_on_error(
         def __exit__(self, *args):
             pass
 
-        def execute(self, *args):
-            pass
+        def execute(self, sql):
+            assert sql == "SELECT 1"
 
     monkeypatch.setattr(writer_gate, "check_selected", verify)
     monkeypatch.setattr(lifecycle, "LakeOutboxExporter", Exporter)
