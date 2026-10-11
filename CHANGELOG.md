@@ -12,16 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Tapping a `drover://` pairing link now opens a confirmation sheet before it
-  pairs a device. The iOS app also has a larger, easier-to-reach send control
-  for long messages (#573, #577).
-- iOS notification categories and banner handling are clearer, and Recall now
-  briefly shows when its results are being refreshed (#575).
+  pairs a device (#573).
 
 ### Fixed
 
 - UAT fixes improve counts, interrupt handling, opaque bars, history, token
   counts, worktree names and large-text layouts. Folder-picker errors are
   clearer, and launch errors are shown in plain language (#573, #575).
+- A finished reply no longer arrives as a "Needs your input" notification,
+  banners for the chat you are viewing are suppressed consistently, and the
+  "recall may be out of date" warning no longer flashes on first load (#575).
+- The send control stays reachable at the largest accessibility text size
+  (#577).
 - Claude Code replies now stream as they arrive. Recap titles no longer expose
   summarizer complaints, orphan-session events cannot block another host's
   batch, and refused authentication retries with backoff (#576).
