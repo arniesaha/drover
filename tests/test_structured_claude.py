@@ -392,3 +392,16 @@ def test_golden_fixture_parses_without_raw_fallback(fixture: Path):
     assert "raw" not in types  # every real line must map to a typed message
     if "assistant" in fixture.read_text():
         assert "assistant_output" in types
+
+
+def test_block_fanout_preserves_provider_usage_identity():
+    line = json.dumps({
+        "type": "assistant", "uuid": "event-1",
+        "message": {"id": "message-1", "role": "assistant",
+                    "content": [{"type": "text", "text": "Hello"},
+                                {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}}],
+                    "usage": {"input_tokens": 100, "output_tokens": 20}},
+    })
+    messages = _driver([]).parse_line(line)
+    assert len(messages) == 2
+    assert all(m.payload["usage_message_id"] == "message-1" for m in messages)

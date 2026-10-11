@@ -149,7 +149,7 @@ public struct AttentionWatcher: Sendable {
             for session in fresh {
                 await notifier.notify(
                     title: "\(session.harness) needs you",
-                    body: "\(Self.cwdBasename(session)) — \(Self.bodySuffix(session))",
+                    body: "\(Self.cwdBasename(session)) · \(Self.bodySuffix(session))",
                     id: session.id
                 )
             }

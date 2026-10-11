@@ -183,7 +183,7 @@ import Testing
                            payload: ["description": .string("indexed \($0) files")])
         }
 
-        #expect(FoldSummary.status(run: run) == "3 status updates · last: event — indexed 3 files")
-        #expect(FoldSummary.status(run: [run[0]]) == "event — indexed 1 files")
+        #expect(FoldSummary.status(run: run) == "3 status updates · last: event · indexed 3 files")
+        #expect(FoldSummary.status(run: [run[0]]) == "event · indexed 1 files")
     }
 }

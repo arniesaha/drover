@@ -489,6 +489,8 @@ struct CapabilityDrivenChatTests {
             Issue.record("an unadvertised interrupt must not reach the hub")
             return (500, Data())
         }
+        lab.ingest(.message(.fixture(seq: 100, type: .userInput)))
+        lab.ingest(.connection(true))
         await lab.interrupt()
         #expect(lab.hint == HarnessCapabilityCopy.interruptUnsupported)
     }

@@ -16,18 +16,18 @@ public enum SessionEventSummary {
         let kind = name(message)
         if let hook = message.payload["hook_name"]?.stringValue {
             let outcome = message.payload["outcome"]?.stringValue ?? "ran"
-            return "\(hook) — \(outcome)"
+            return "\(hook) · \(outcome)"
         }
         if let description = message.payload["description"]?.stringValue {
-            return "\(kind) — \(description)"
+            return "\(kind) · \(description)"
         }
         if let summary = message.payload["summary"]?.stringValue {
             let state = message.payload["status"]?.stringValue ?? ""
-            return state.isEmpty ? "\(kind) — \(summary)" : "\(kind) — \(summary) (\(state))"
+            return state.isEmpty ? "\(kind) · \(summary)" : "\(kind) · \(summary) (\(state))"
         }
         if let elapsed = message.payload["elapsed_time_seconds"]?.numberValue {
             let tool = message.payload["tool_name"]?.stringValue ?? "tool"
-            return "\(tool) running — \(Int(elapsed))s"
+            return "\(tool) running · \(Int(elapsed))s"
         }
         return kind
     }

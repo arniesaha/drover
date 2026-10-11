@@ -20,10 +20,19 @@ public struct PairingPayload: Equatable, Sendable {
         let trimmed = scanned.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let components = URLComponents(string: trimmed),
               components.scheme == "drover",
-              let host = components.host, !host.isEmpty
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              components.path.isEmpty || components.path == "/",
+              components.fragment == nil,
+              components.port.map({ (1...65535).contains($0) }) ?? true
         else { return nil }
 
         let items = components.queryItems ?? []
+        let allowed = Set(["v", "code", "tls", "n"])
+        guard items.allSatisfy({ allowed.contains($0.name) }),
+              Set(items.map(\.name)).count == items.count,
+              items.first(where: { $0.name == "tls" }).map({ ["0", "1"].contains($0.value ?? "") }) ?? true
+        else { return nil }
         func value(_ name: String) -> String? {
             guard let found = items.first(where: { $0.name == name })?.value,
                   !found.isEmpty
@@ -35,7 +44,7 @@ public struct PairingPayload: Equatable, Sendable {
         guard let code = value("code") else { return nil }
 
         let scheme = value("tls") == "1" ? "https" : "http"
-        var authority = host
+        var authority = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
         if let port = components.port {
             authority += ":\(port)"
         }

@@ -305,6 +305,8 @@ def _metadata_payload(event: dict[str, Any], message: dict[str, Any]) -> dict[st
     payload: dict[str, Any] = {}
     if message.get("usage") is not None:
         payload["usage"] = message.get("usage")
+        if message.get("id"):
+            payload["usage_message_id"] = message["id"]
     if message.get("model") is not None:
         payload["model"] = message.get("model")
     if event.get("session_id") is not None:

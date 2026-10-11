@@ -218,10 +218,10 @@ public final class LaunchModel {
     /// answered with no matches — an empty answer is an answer.
     public var cwdSuggestionsHint: String? {
         if isCompletionHostUnreachable {
-            return "Can't reach the host — showing saved paths only"
+            return "Can't reach the host · showing saved paths only"
         }
         if isCompletionUnsupported {
-            return "This host doesn't support path completion yet — showing saved paths only"
+            return "This host doesn't support path completion yet · showing saved paths only"
         }
         return nil
     }
@@ -513,7 +513,7 @@ public final class LaunchModel {
         case DroverError.badRequest(let message), DroverError.conflict(let message):
             return message
         case DroverError.unauthorized:
-            return "token rejected — check Settings"
+            return "token rejected · check Settings"
         default:
             return "\(error)"
         }

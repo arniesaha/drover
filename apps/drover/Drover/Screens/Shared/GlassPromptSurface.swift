@@ -21,6 +21,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     let attachmentButton: AttachmentButton
     let onSend: () -> Void
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @FocusState private var isTextFocused: Bool
 
     init(
@@ -62,8 +63,9 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
             }
 
             HStack(alignment: .top, spacing: 8) {
-                TextField(placeholder, text: $text, axis: .vertical)
-                    .font(.system(size: 22, weight: .regular, design: .default))
+                TextField(dynamicTypeSize.isAccessibilitySize ? "Message" : placeholder, text: $text, axis: .vertical)
+                    .accessibilityLabel(placeholder)
+                    .font(.title3)
                     .lineLimit(1...5)
                     .textFieldStyle(.plain)
                     .accessibilityIdentifier("composer-input")
@@ -82,16 +84,16 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
             }
             .animation(.snappy(duration: 0.2), value: isTextFocused)
 
+            if showsPreferences && dynamicTypeSize.isAccessibilitySize {
+                preferenceControls
+            }
+
             HStack(spacing: 12) {
                 attachmentButton
                     .frame(width: 32, height: 32)
 
-                if showsPreferences {
-                    HarnessPreferenceControls(
-                        runPreferences: runPreferences,
-                        isEditable: arePreferencesEditable,
-                        lockedReason: preferencesLockedReason
-                    )
+                if showsPreferences && !dynamicTypeSize.isAccessibilitySize {
+                    preferenceControls
                 }
 
                 Spacer(minLength: 8)
@@ -145,6 +147,14 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     /// The text line, meanwhile, is empty to the right of a short prompt at
     /// every width. Top-aligned, so it stays on the first line as the field
     /// grows to five.
+    private var preferenceControls: some View {
+        HarnessPreferenceControls(
+            runPreferences: runPreferences,
+            isEditable: arePreferencesEditable,
+            lockedReason: preferencesLockedReason
+        )
+    }
+
     private var dismissKeyboardButton: some View {
         Button {
             isTextFocused = false

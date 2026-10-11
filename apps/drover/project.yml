@@ -70,6 +70,10 @@ targets:
         # only HTTPS/TLS through the system frameworks, which is exempt.
         ITSAppUsesNonExemptEncryption: false
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleURLTypes:
+          - CFBundleURLName: com.arnab.drover.pairing
+            CFBundleURLSchemes: [drover]
+            CFBundleTypeRole: Editor
         # App Store validation requires all four orientations for iPad multitasking.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

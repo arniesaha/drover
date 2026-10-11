@@ -57,7 +57,9 @@ struct AnalyticsView: View {
             }
             .padding(14)
         }
-        .background(DroverColor.bg)
+        .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
+        .toolbarBackground(DroverColor.bg, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .navigationTitle("Analytics")
         .navigationBarTitleDisplayMode(.inline)
         .task { await reload() }
@@ -69,13 +71,12 @@ struct AnalyticsView: View {
     /// chips can already exceed the screen width on their own.
     private var filterStrip: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Menu("\(days) days") {
+            FlowLayout(spacing: 12) {
+                Menu(HistoryPresentation.dayRange(days)) {
                     ForEach([1, 7, 14, 30, 90, 365], id: \.self) { value in
-                        Button("\(value) days") { days = value; Task { await reload() } }
+                        Button(HistoryPresentation.dayRange(value)) { days = value; Task { await reload() } }
                     }
                 }
-                Spacer()
                 Button {
                     filtersExpanded.toggle()
                 } label: {
@@ -370,7 +371,10 @@ struct AnalyticsView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(value).droverText(.h2).monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
             Text(label).droverText(.subtitle)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         // Combined rather than left as two elements: VoiceOver otherwise reads

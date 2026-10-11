@@ -31,9 +31,8 @@ public struct FleetSummaryPresentation: Sendable, Equatable {
         let sessions = snapshot?.sessions ?? []
         let hosts = snapshot?.hosts ?? []
 
-        needsCount = sessions.filter {
-            $0.attention == .needsApproval || $0.attention == .needsInput
-        }.count
+        let buckets = SessionBuckets(sessions: sessions)
+        needsCount = buckets.needsYou.count
         headline = needsCount > 0 ? "\(needsCount) need\(needsCount == 1 ? "s" : "") you" : nil
         isStale = !isReachable
 
@@ -48,7 +47,7 @@ public struct FleetSummaryPresentation: Sendable, Equatable {
 
         let running = sessions.filter { $0.attention == .working && $0.isStructured }.count
         let attached = sessions.filter { $0.attention == .working && !$0.isStructured }.count
-        let finished = sessions.filter { $0.attention == .done || $0.attention == .errored }.count
+        let finished = buckets.finished.count
         let live = hosts.filter { $0.presence == .online }.count
 
         var parts: [String] = []
@@ -61,5 +60,16 @@ public struct FleetSummaryPresentation: Sendable, Equatable {
 
     private static func pluralize(_ count: Int, _ singular: String, _ plural: String) -> String {
         "\(count) \(count == 1 ? singular : plural)"
+    }
+}
+
+/// Shared membership for fleet counts and the rows they describe.
+public struct SessionBuckets: Sendable {
+    public let needsYou: [SessionSummary]
+    public let finished: [SessionSummary]
+
+    public init(sessions: [SessionSummary]) {
+        needsYou = sessions.filter { $0.attention == .needsApproval || $0.attention == .needsInput }
+        finished = sessions.filter { $0.attention == .done || $0.attention == .errored }
     }
 }

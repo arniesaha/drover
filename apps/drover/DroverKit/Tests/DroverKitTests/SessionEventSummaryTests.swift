@@ -26,7 +26,7 @@ import Testing
             "outcome": .string("success"),
         ])
         #expect(SessionEventSummary.detail(for: message)
-                == "SessionStart:startup — success")
+                == "SessionStart:startup · success")
     }
 
     @Test func taskDetailShowsItsDescription() {
@@ -34,7 +34,7 @@ import Testing
             "description": .string("Phase 0 over Tailscale"),
         ])
         #expect(SessionEventSummary.detail(for: message)
-                == "task_started — Phase 0 over Tailscale")
+                == "task_started · Phase 0 over Tailscale")
     }
 
     @Test func notificationDetailShowsSummaryAndState() {
@@ -43,7 +43,7 @@ import Testing
             "status": .string("completed"),
         ])
         #expect(SessionEventSummary.detail(for: message)
-                == "task_notification — Read NAS output (completed)")
+                == "task_notification · Read NAS output (completed)")
     }
 
     @Test func progressDetailShowsElapsedSeconds() {
@@ -51,7 +51,7 @@ import Testing
             "tool_name": .string("Bash"),
             "elapsed_time_seconds": .number(30),
         ])
-        #expect(SessionEventSummary.detail(for: message) == "Bash running — 30s")
+        #expect(SessionEventSummary.detail(for: message) == "Bash running · 30s")
     }
 
     @Test func detailFallsBackToTheBareKind() {

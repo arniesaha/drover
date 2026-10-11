@@ -183,7 +183,7 @@ struct TerminalScreen: View {
             try? await Task.sleep(for: .seconds(2))
             if !sessionEnded { dismiss() }
         } catch {
-            terminateHint = "Could not terminate — try again."
+            terminateHint = "Could not terminate · try again."
         }
     }
 }

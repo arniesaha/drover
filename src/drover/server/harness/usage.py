@@ -14,16 +14,13 @@ live store on 2026-08-27:
                       the event, which makes the sum idempotent under
                       re-delivery -- the case drover#280 made routine.
 
-                      One message can still fan out across several events
+                      One message can fan out across several events
                       carrying identical usage; measured at 121 of 8,817
                       output tokens (1.4%) in a 1,637-record session. Those
-                      events share the first four groups of the synthesized
-                      `native_event_id` and differ only in its trailing
-                      counter, but truncating to that prefix would merge
-                      genuinely distinct messages the moment the format
-                      changes. The bias is left in and named here instead.
-                      For a budget cap it errs in the safe direction: a cap
-                      that overcounts stops early.
+                      events now carry usage_message_id from the provider's
+                      message.id, so the usage is counted once even when each
+                      block has a different event UUID. Legacy events without
+                      that identity retain event-level deduplication.
 
     deepseek-harness  per request, `inputTokens`/`outputTokens`, and the
                       payload carries no message identity at all -- the same
@@ -172,6 +169,7 @@ def _usage_records(
     not a provider echoing one request across two sequence numbers.
     """
     records: list[tuple[str, bool, dict]] = []
+    message_positions: dict[str, int] = {}
     for event in events:
         payload = _usage_holder(event)
         if payload is None:
@@ -183,6 +181,30 @@ def _usage_records(
             # Either the subagent shape or something we do not recognize.
             continue
         if set(usage) <= _SUBAGENT_KEYS:
+            continue
+        # Provider message identity survives block fan-out with distinct event UUIDs.
+        message_id = payload.get("usage_message_id")
+        if message_id:
+            identity = f"message:{message_id}"
+            record = (identity, True, dict(usage))
+            if identity in message_positions:
+                # A provider message can finish its counters in later blocks.
+                # Retain the largest counter if an earlier block is replayed.
+                index = message_positions[identity]
+                merged = dict(records[index][2])
+                for key in _ALL_KEYS:
+                    value = usage.get(key)
+                    previous = merged.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        merged[key] = (
+                            max(previous, value)
+                            if isinstance(previous, (int, float))
+                            else value
+                        )
+                records[index] = (identity, True, merged)
+            else:
+                message_positions[identity] = len(records)
+                records.append(record)
             continue
         native_id = payload.get("native_event_id")
         if native_id:

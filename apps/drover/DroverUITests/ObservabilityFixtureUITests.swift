@@ -31,6 +31,40 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testAnalyticsFiltersAndMetricsAtLargestTextSize() {
+        checkAnalyticsLargestText(dark: false)
+    }
+
+    @MainActor
+    func testAnalyticsFiltersAndMetricsAtLargestTextSizeInDarkMode() {
+        checkAnalyticsLargestText(dark: true)
+    }
+
+    @MainActor
+    private func checkAnalyticsLargestText(dark: Bool) {
+        let app = launch(large: true, dark: dark)
+        let filters = app.descendants(matching: .any)["analytics-filters"].firstMatch
+        XCTAssertTrue(filters.waitForExistence(timeout: 8))
+        let days = app.buttons["7 days"].firstMatch
+        let toggle = app.buttons["Filters"].firstMatch
+        XCTAssertTrue(days.isHittable)
+        XCTAssertTrue(toggle.isHittable)
+        XCTAssertTrue(app.frame.contains(days.frame))
+        XCTAssertTrue(app.frame.contains(toggle.frame))
+        XCTAssertFalse(days.frame.intersects(toggle.frame))
+        toggle.tap()
+        let scroll = app.scrollViews.firstMatch
+        for _ in 0..<8 {
+            if app.buttons["analytics-dimension-models"].isHittable { break }
+            scroll.swipeUp()
+        }
+        let models = app.buttons["analytics-dimension-models"]
+        XCTAssertTrue(models.isHittable, "Analytics must scroll through expanded filters and totals")
+        XCTAssertTrue(app.frame.contains(models.frame))
+        screenshot(dark ? "analytics-largest-text-dark" : "analytics-largest-text-light", app)
+    }
+
+    @MainActor
     func testLongHostNamesRemainOnScreenAtAccessibilitySize() {
         let app = launch(large: true)
         app.tabBars.buttons["Accounts"].tap()

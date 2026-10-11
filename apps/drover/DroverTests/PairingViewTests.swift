@@ -10,6 +10,22 @@ import Testing
 /// these tests pin that convergence.
 @MainActor
 final class PairingViewTests: XCTestCase {
+    func testPairingURLSchemeIsRegistered() throws {
+        let types = try XCTUnwrap(Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]])
+        XCTAssertTrue(types.contains { ($0["CFBundleURLSchemes"] as? [String])?.contains("drover") == true })
+    }
+
+    func testPairingLinkOnlyPrefillsUntilUserSubmits() throws {
+        let payload = try XCTUnwrap(PairingPayload(scanned: "drover://example.test?v=1&code=sample"))
+        let model = PairingModel()
+        model.prefill(payload)
+        XCTAssertEqual(model.serverURLString, "http://example.test")
+        XCTAssertEqual(model.manualCode, "sample")
+        XCTAssertFalse(model.isPairing)
+        XCTAssertNil(model.statusMessage)
+        XCTAssertEqual(model.manualPayload(), payload)
+    }
+
     func testCameraUsageDescriptionIsDeclared() throws {
         let description = Bundle.main.object(
             forInfoDictionaryKey: "NSCameraUsageDescription"

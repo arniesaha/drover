@@ -20,6 +20,11 @@ final class PairingModel: ObservableObject {
         self.serverURLString = serverURLString
     }
 
+    func prefill(_ payload: PairingPayload) {
+        serverURLString = payload.serverURL.absoluteString
+        manualCode = payload.code
+    }
+
     var canSubmitManualCode: Bool {
         manualPayload() != nil
     }
@@ -52,32 +57,42 @@ struct PairingView: View {
     var environment: AppEnvironment
     var onPaired: () -> Void = {}
 
+    var initialPayload: PairingPayload? = nil
+    @State private var pendingPayload: PairingPayload?
+    @State private var showPairConfirmation = false
+    @State private var scanGeneration = 0
     @StateObject private var model = PairingModel()
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                QRScannerView { scanned in
-                    guard let payload = PairingPayload(scanned: scanned) else { return }
-                    Task { await pair(payload) }
-                }
-                .frame(height: 260)
-                .frame(maxWidth: .infinity)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(DroverColor.line, lineWidth: 1)
-                }
+                if initialPayload == nil {
+                    QRScannerView { scanned in
+                        guard !model.isPairing, let payload = PairingPayload(scanned: scanned) else { return }
+                        model.prefill(payload)
+                        pendingPayload = payload
+                        showPairConfirmation = true
+                    }
+                    .id(scanGeneration)
+                    .frame(height: 260)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(DroverColor.line, lineWidth: 1)
+                    }
 
-                Text("Run `drover-server pair` on your Drover machine, then scan the code it prints.")
-                    .droverText(.subtitle)
-                    .foregroundStyle(DroverColor.faint)
-                    .fixedSize(horizontal: false, vertical: true)
+                    Text("Run `drover-server pair` on your Drover machine, then scan the code it prints.")
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                }
 
                 Divider().overlay(DroverColor.line)
 
-                Text("Or enter it by hand").droverText(.h3)
+                Text(initialPayload == nil ? "Or enter it by hand" : "Review pairing details").droverText(.h3)
 
                 field("http://host:7080", text: $model.serverURLString)
                     .keyboardType(.URL)
@@ -94,7 +109,8 @@ struct PairingView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             Button {
                 guard let payload = model.manualPayload() else { return }
-                Task { await pair(payload) }
+                pendingPayload = payload
+                showPairConfirmation = true
             } label: {
                 Text(model.isPairing ? "Pairing..." : "Pair")
                     .droverText(.h3)
@@ -118,7 +134,30 @@ struct PairingView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(DroverColor.bg, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
+        .confirmationDialog("Pair with this server?", isPresented: $showPairConfirmation,
+                            titleVisibility: .visible) {
+            Button("Pair") {
+                guard let payload = pendingPayload else { return }
+                pendingPayload = nil
+                Task { await pair(payload) }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingPayload = nil
+                scanGeneration += 1
+            }
+        } message: {
+            Text(pendingPayload?.serverURL.absoluteString ?? "")
+        }
+        .onChange(of: initialPayload) { _, payload in
+            guard !model.isPairing, let payload else { return }
+            pendingPayload = nil
+            showPairConfirmation = false
+            model.prefill(payload)
+        }
         .onAppear {
+            if let initialPayload {
+                model.prefill(initialPayload)
+            }
             if model.serverURLString.isEmpty, let config = environment.config {
                 model.serverURLString = config.baseURL.absoluteString
             }

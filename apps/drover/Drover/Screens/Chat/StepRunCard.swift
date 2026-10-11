@@ -88,7 +88,7 @@ private struct StepLine: View {
     }
 
     private var mark: String {
-        if step.isRunning { return isActive ? "·" : "—" }
+        if step.isRunning { return isActive ? "·" : "·" }
         return step.isFailed ? "✗" : "✓"
     }
 

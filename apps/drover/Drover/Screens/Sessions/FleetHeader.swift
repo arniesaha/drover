@@ -74,7 +74,7 @@ private struct HostChip: View {
                 .font(.system(.caption, design: .default))
                 .foregroundStyle(isStale ? DroverColor.faint : DroverColor.text)
                 .lineLimit(1)
-            Text(isStale ? "—" : "\(group.sessions.count)")
+            Text(isStale ? "·" : "\(group.sessions.count)")
                 .droverText(.marker)
                 .foregroundStyle(countStyle)
         }

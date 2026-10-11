@@ -37,7 +37,7 @@ struct DroverColorTests {
                 let rgb = token.rgb(for: scheme)
                 let (red, green, blue) = channels(rgb)
                 #expect(green > red && blue > red,
-                        "\(name) in \(scheme) leads with red — that is the retired purple")
+                        "\(name) in \(scheme) leads with red · that is the retired purple")
             }
         }
     }
@@ -51,7 +51,7 @@ struct DroverColorTests {
                 let (red, green, blue) = channels(token.rgb(for: scheme))
                 let spread = max(red, green, blue) - min(red, green, blue)
                 #expect(spread <= 12,
-                        "\(name) in \(scheme) spreads \(spread) across channels — it is tinted, not neutral")
+                        "\(name) in \(scheme) spreads \(spread) across channels · it is tinted, not neutral")
             }
         }
     }
@@ -153,7 +153,7 @@ struct DroverColorTests {
 
         let orange = contrast(systemOrange, ground)
         #expect(orange < 2.0,
-                "system orange measures \(rounded(orange)):1 on the light ground — if that changed, this test no longer describes the bug")
+                "system orange measures \(rounded(orange)):1 on the light ground · if that changed, this test no longer describes the bug")
 
         let warn = contrast(DroverColor.warn.rgb(for: .light), ground)
         #expect(warn >= 4.5, "warn on the light ground is \(rounded(warn)):1")

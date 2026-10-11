@@ -18,6 +18,7 @@ struct Composer: View {
     let onAddAttachment: (TurnAttachment) async -> Bool
     let onSend: () -> Void
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var pickerItems: [PhotosPickerItem] = []
 
     /// Combined attachment budget: relay hosts cap websocket frames at
@@ -25,6 +26,30 @@ struct Composer: View {
     private static let maxCombinedBytes = 6 * 1024 * 1024
 
     var body: some View {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                ViewThatFits(in: .vertical) {
+                    promptSurface
+                    ScrollView { promptSurface }
+                        .accessibilityIdentifier("composer-scroll")
+                }
+                .frame(maxHeight: 300)
+            } else {
+                promptSurface
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .bottom))
+        .onChange(of: pickerItems) { _, items in
+            guard !items.isEmpty else { return }
+            pickerItems = []
+            Task { await load(items) }
+        }
+    }
+
+    private var promptSurface: some View {
         GlassPromptSurface(
             text: $text,
             attachments: $attachments,
@@ -52,14 +77,6 @@ struct Composer: View {
             .opacity(canAddAttachments && controls.acceptsImageAttachments ? 1 : 0.45)
         } onSend: {
             onSend()
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 8)
-        .padding(.bottom, 10)
-        .onChange(of: pickerItems) { _, items in
-            guard !items.isEmpty else { return }
-            pickerItems = []
-            Task { await load(items) }
         }
     }
 
