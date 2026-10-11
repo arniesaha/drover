@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from pathlib import Path
+from urllib.parse import unquote
 
 from drover.config import DroverConfig, config_home, resolve_api_token_env
 from drover.server.web.credentials import (
@@ -138,7 +139,27 @@ def credential_allows_request(credential, *, method=None, path=None):
     """Deny unknown scopes; route-limited scopes cannot grant general access."""
     if credential.scope in CREDENTIAL_ROUTE_ALLOWLISTS:
         return (method, path) in CREDENTIAL_ROUTE_ALLOWLISTS[credential.scope]
-    return credential.scope in {"device", "host"}
+    if credential.scope == "host":
+        if not credential.host_id:
+            return False
+        if path and path.startswith("/auth/") and method != "GET":
+            return False
+        if path and path.startswith("/harness/hosts/"):
+            host_id = unquote(path.removeprefix("/harness/hosts/").split("/", 1)[0])
+            return credential_matches_host(credential, host_id)
+        return True
+    return credential.scope == "device"
+
+
+def credential_matches_host(credential: Credential | None, host_id: str) -> bool:
+    """Host ingress requires an active credential with an explicit binding."""
+    return bool(
+        credential is not None
+        and credential.is_active
+        and credential.scope == "host"
+        and credential.host_id
+        and credential.host_id == host_id
+    )
 
 
 def token_matches(auth: AuthSettings, candidate: str) -> bool:

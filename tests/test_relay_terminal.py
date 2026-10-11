@@ -32,6 +32,7 @@ from drover.server.metrics import MetricsCollector
 from drover.server.web import app as app_module
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import AuthSettings
+from drover.server.web.credentials import CredentialStore
 
 
 @dataclass
@@ -78,13 +79,15 @@ def metrics_server_with_relay_host(tmp_path):
         incoming_dir=tmp_path / "incoming",
         summarizer_report={},
     )
-    token = "test-token"
-    collector.api_token = token
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = store.issue(scope="host", label="Laptop", host_id="laptop")
+    _, token = store.issue(scope="device", label="Terminal client")
+    collector.api_token = host_token
     server = start_metrics_server(
         host="127.0.0.1",
         port=0,
         collector=collector,
-        auth=AuthSettings(enabled=True, api_token=token),
+        auth=AuthSettings(enabled=True, api_token="operator-token", credentials=store),
     )
     host, port = server.server_address
 
@@ -93,7 +96,10 @@ def metrics_server_with_relay_host(tmp_path):
         spoke,
         host=f"{host}:{port}",
         path="/harness/relay",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={
+            "Authorization": f"Bearer {host_token}",
+            "X-Drover-Host-ID": "laptop",
+        },
     )
     client_send_json(spoke, hello_frame("laptop"))
     deadline = time.monotonic() + 5

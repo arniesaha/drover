@@ -132,7 +132,7 @@ printf '%s\n' \
   '    exit 22' \
   '    ;;' \
   '  */harness/probe) printf "{\"reachable\":false}" ;;' \
-  '  */auth/pair) printf "{\"token\":\"test-token\"}" ;;' \
+  '  */auth/pair) printf "{\"token\":\"test-token\",\"host_id\":\"enrolled-host\"}" ;;' \
   '  *) exit 1 ;;' \
   'esac' > "$FAKE_BIN/curl"
 chmod +x "$FAKE_BIN/curl"
@@ -534,6 +534,8 @@ check_event_absent "join does not probe the hub health endpoint" "$EVENT_LOG" 'h
 check_contains "join starts only its harness" "$EVENT_LOG" 'harness-start'
 check_contains "join writes a harness service unit" "$HOME_DIR/.config/systemd/user/drover-harnessd.service" \
   'Drover harnessd'
+check_contains "join uses the host identity bound by the hub" "$HOME_DIR/.config/systemd/user/drover-harnessd.service" \
+  '--host-id enrolled-host'
 check_contains "join keeps the hub URL as central-url" "$HOME_DIR/.config/systemd/user/drover-harnessd.service" \
   '--central-url http://100.64.0.10:7099'
 check_contains "join stores the paired credential in the token file only" "$HOME_DIR/.drover/api_token" \

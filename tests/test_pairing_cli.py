@@ -5,10 +5,26 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from drover.config import default_config
 from drover.server.__main__ import _advertised_host_port, _local_api_host, main
+
+
+@pytest.fixture(autouse=True)
+def isolated_config(monkeypatch, tmp_path):
+    import drover.server.__main__ as server_main
+
+    resolve = server_main._resolve_config
+    monkeypatch.setattr(
+        server_main,
+        "_resolve_config",
+        lambda path, **kwargs: (
+            default_config() if path is None else resolve(path, **kwargs)
+        ),
+    )
+
 
 # -- reaching the hub this machine is actually running ---------------------
 #
@@ -243,3 +259,24 @@ def test_pair_rejects_an_explicit_missing_config(tmp_path: Path):
 
     assert result.exit_code != 0
     assert "config does not exist" in result.output
+
+
+@pytest.mark.parametrize("command", ["issue-host", "rotate-host"])
+def test_host_credential_cli_uses_running_hub(monkeypatch, command):
+    import drover.server.__main__ as server_main
+
+    sent = {}
+
+    def capture(cfg, method, path, payload=None):
+        sent.update(method=method, path=path, payload=payload)
+        return {"token": "synthetic-new-token"}
+
+    monkeypatch.setattr(server_main, "_local_api_request", capture)
+    result = CliRunner().invoke(main, ["credentials", command, "--host-id", "host-a"])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "synthetic-new-token"
+    assert sent == {
+        "method": "POST",
+        "path": "/auth/credentials",
+        "payload": {"scope": "host", "host_id": "host-a", "label": "host-a"},
+    }

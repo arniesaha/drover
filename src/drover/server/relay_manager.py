@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Callable
 
 from drover.server.harness.relay_protocol import (
     FRAMED_RESPONSES_CAPABILITY,
@@ -198,6 +198,7 @@ class _Connection:
         self.host_id = host_id
         self.sock = sock
         self.capabilities = capabilities
+        self.authorized: Callable[[], bool] | None = None
         self.write_lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.pending: dict[str, queue.Queue[Any]] = {}
@@ -320,6 +321,7 @@ class RelayManager:
         sock: socket.socket,
         *,
         capabilities: set[str] | frozenset[str] = frozenset(),
+        authorized: Callable[[], bool] | None = None,
     ) -> None:
         """Take ownership of an already-upgraded server-role socket.
 
@@ -333,6 +335,7 @@ class RelayManager:
         with contextlib.suppress(OSError):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         connection = _Connection(self, host_id, sock, frozenset(capabilities))
+        connection.authorized = authorized
         with self._lock:
             previous = self._connections.get(host_id)
             self._connections[host_id] = connection
@@ -409,7 +412,11 @@ class RelayManager:
     def live_host_ids(self) -> set[str]:
         with self._lock:
             items = list(self._connections.items())
-        return {host_id for host_id, conn in items if conn.alive.is_set()}
+        return {
+            host_id
+            for host_id, conn in items
+            if conn.alive.is_set() and self._authorized(conn)
+        }
 
     # -- request/response ----------------------------------------------
 
@@ -543,7 +550,21 @@ class RelayManager:
             connection = self._connections.get(host_id)
         if connection is None or not connection.alive.is_set():
             return None
+        if not self._authorized(connection):
+            return None
         return connection
+
+    def _authorized(self, connection: _Connection) -> bool:
+        check = connection.authorized
+        if check is not None:
+            try:
+                allowed = check()
+            except Exception:
+                allowed = False
+            if not allowed:
+                self._teardown(connection, "bound host credential revoked or replaced")
+                return False
+        return True
 
     def _read_forever(self, connection: _Connection) -> None:
         try:
@@ -568,6 +589,8 @@ class RelayManager:
                 else None
             )
             frame = recv_frame(connection.sock, max_frame_bytes=control_cap)
+            if not self._authorized(connection):
+                return
             # Every frame counts as proof of life, pongs included - see
             # SILENCE_TIMEOUT_S.
             connection.last_rx = time.monotonic()
@@ -680,6 +703,8 @@ class RelayManager:
         unblocks the reader, which is parked in a blocking ``recv``.
         """
         while True:
+            if not self._authorized(connection):
+                return
             # Ping before the first wait, not after it. Until a frame comes
             # back the connection is attached but unproven and presence reports
             # it offline (see is_responsive); a healthy spoke should clear that

@@ -29,7 +29,9 @@ def live_server(tmp_path: Path, monkeypatch):
     bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
     port = _free_port()
     store = CredentialStore(tmp_path / "credentials.json")
-    _, token = store.issue(scope="host", label="Synthetic hook client")
+    _, token = store.issue(
+        scope="host", label="Synthetic hook client", host_id="synthetic-hook-host"
+    )
     monkeypatch.setenv("DROVER_MCP_TOKEN", token)
     auth = AuthSettings(True, "", credentials=store, legacy_token_enabled=False)
     server = build_mcp_server(

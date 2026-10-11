@@ -24,6 +24,7 @@ from drover.server.metrics import MetricsCollector
 from drover.server.web import app as app_module
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import AuthSettings
+from drover.server.web.credentials import CredentialStore
 
 
 @dataclass
@@ -44,13 +45,14 @@ def metrics_server(tmp_path):
         incoming_dir=tmp_path / "incoming",
         summarizer_report={},
     )
-    token = "test-token"
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, token = store.issue(scope="host", label="host-a", host_id="host-a")
     collector.api_token = token
     server = start_metrics_server(
         host="127.0.0.1",
         port=0,
         collector=collector,
-        auth=AuthSettings(enabled=True, api_token=token),
+        auth=AuthSettings(enabled=True, api_token="operator", credentials=store),
     )
     host, port = server.server_address
     try:
@@ -66,12 +68,15 @@ def _connect_and_hello(
     metrics_server, host_id: str, *, capabilities: list[str] | None = None
 ) -> socket.socket:
     host, port, token = metrics_server.host, metrics_server.port, metrics_server.token
+    _, token = metrics_server.server.RequestHandlerClass.auth.credentials.issue(
+        scope="host", label=host_id, host_id=host_id
+    )
     sock = socket.create_connection((host, port), timeout=5)
     client_handshake(
         sock,
         host=f"{host}:{port}",
         path="/harness/relay",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {token}", "X-Drover-Host-ID": host_id},
     )
     client_send_json(sock, hello_frame(host_id, capabilities=capabilities))
     return sock
@@ -255,3 +260,171 @@ def test_hello_budget_is_total_not_per_recv(metrics_server, monkeypatch):
         assert metrics_server.collector.relay_manager.live_host_ids() == set()
     finally:
         sock.close()
+
+
+def test_relay_bound_credential_cannot_declare_another_host(metrics_server, caplog):
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"http://{metrics_server.host}:{metrics_server.port}/harness/relay",
+        headers={
+            "Authorization": f"Bearer {metrics_server.token}",
+            "X-Drover-Host-ID": "host-b",
+            "Upgrade": "websocket",
+            "Sec-WebSocket-Key": "test",
+        },
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(request)
+    assert exc.value.code == 403
+    assert "host credential identity mismatch" in caplog.text
+    assert not metrics_server.collector.relay_manager.is_live("host-b")
+
+
+def test_relay_hello_cannot_override_binding(metrics_server, caplog):
+    sock = socket.create_connection(
+        (metrics_server.host, metrics_server.port), timeout=5
+    )
+    try:
+        client_handshake(
+            sock,
+            host=f"{metrics_server.host}:{metrics_server.port}",
+            path="/harness/relay",
+            headers={"Authorization": f"Bearer {metrics_server.token}"},
+        )
+        client_send_json(sock, hello_frame("host-b"))
+        with pytest.raises(WebSocketClosed):
+            _spoke_recv(sock)
+        assert not metrics_server.collector.relay_manager.is_live("host-b")
+        assert "relay hello host credential identity mismatch" in caplog.text
+    finally:
+        sock.close()
+
+
+def test_rotation_invalidates_attached_relay(metrics_server):
+    sock = _connect_and_hello(metrics_server, "host-a")
+    try:
+        deadline = time.monotonic() + 5
+        while (
+            not metrics_server.collector.relay_manager.is_live("host-a")
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert metrics_server.collector.relay_manager.is_live("host-a")
+        metrics_server.server.RequestHandlerClass.auth.credentials.issue(
+            scope="host", label="host-a", host_id="host-a"
+        )
+        assert not metrics_server.collector.relay_manager.is_live("host-a")
+    finally:
+        sock.close()
+
+
+def _post(metrics_server, path, payload, token=None):
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"http://{metrics_server.host}:{metrics_server.port}" + path,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {token or metrics_server.token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+@pytest.mark.parametrize("path", ["/harness/hosts", "/harness/hosts/host-b/heartbeat"])
+def test_host_cannot_register_or_heartbeat_another_host(metrics_server, path, caplog):
+    assert _post(metrics_server, path, {"host_id": "host-b"}) == 403
+    assert "host credential identity mismatch" in caplog.text
+
+
+def test_matching_registration_and_revocation(metrics_server):
+    assert _post(metrics_server, "/harness/hosts", {"host_id": "host-a"}) == 200
+    assert _post(metrics_server, "/harness/hosts/host-a/heartbeat", {}) == 200
+    store = metrics_server.server.RequestHandlerClass.auth.credentials
+    store.revoke(store.find_active(metrics_server.token).id)
+    assert _post(metrics_server, "/harness/hosts", {"host_id": "host-a"}) == 401
+
+
+def test_event_batch_rejects_cross_host_sessions_before_writing(metrics_server):
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    for host_id in ("host-a", "host-b"):
+        registry.register_host(host_id=host_id, display_name=host_id, kind="linux")
+        registry.create_session(
+            session_id=host_id + "-session",
+            host_id=host_id,
+            harness="claude",
+            command="synthetic",
+            cwd="/synthetic",
+        )
+    events = [
+        {
+            "event_id": host + "-event",
+            "session_id": host + "-session",
+            "type": "text",
+            "text": "synthetic",
+        }
+        for host in ("host-a", "host-b")
+    ]
+    assert _post(metrics_server, "/harness/events", {"events": events}) == 403
+    assert registry.list_events_after("host-a-session", 0) == []
+    assert _post(metrics_server, "/harness/events", {"events": events[:1]}) == 200
+    assert (
+        _post(
+            metrics_server,
+            "/harness/events",
+            {"events": [dict(events[0], host_id="host-b")]},
+        )
+        == 403
+    )
+
+
+def test_shared_operator_token_cannot_ingest_as_host(metrics_server):
+    assert (
+        _post(metrics_server, "/harness/hosts", {"host_id": "host-a"}, token="operator")
+        == 403
+    )
+
+
+def test_heartbeat_body_cannot_override_credential(metrics_server):
+    assert (
+        _post(metrics_server, "/harness/hosts/host-a/heartbeat", {"host_id": "host-b"})
+        == 403
+    )
+
+
+def test_revoked_host_cannot_upgrade_relay(metrics_server):
+    import urllib.error
+    import urllib.request
+
+    store = metrics_server.server.RequestHandlerClass.auth.credentials
+    store.revoke(store.find_active(metrics_server.token).id)
+    request = urllib.request.Request(
+        f"http://{metrics_server.host}:{metrics_server.port}/harness/relay",
+        headers={
+            "Authorization": f"Bearer {metrics_server.token}",
+            "X-Drover-Host-ID": "host-a",
+            "Upgrade": "websocket",
+            "Sec-WebSocket-Key": "test",
+        },
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(request)
+    assert exc.value.code == 401
+
+
+def test_event_ingress_requires_host_credential_even_for_empty_batch(metrics_server):
+    assert (
+        _post(metrics_server, "/harness/events", {"events": []}, token="operator")
+        == 403
+    )
+    assert _post(metrics_server, "/harness/events", {"events": []}) == 200

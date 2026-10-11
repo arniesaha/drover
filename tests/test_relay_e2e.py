@@ -51,6 +51,7 @@ from drover.server.harness.websocket import (
 from drover.server.metrics import MetricsCollector
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import AuthSettings
+from drover.server.web.credentials import CredentialStore
 
 TOKEN = "e2e-relay-token"
 HOST_ID = "laptop"
@@ -147,7 +148,10 @@ class _RelayEnv:
 
 
 @pytest.fixture
-def relay_env(tmp_path):
+def relay_env(tmp_path, monkeypatch):
+    store = CredentialStore(tmp_path / "credentials.json")
+    _, token = store.issue(scope="host", label=HOST_ID, host_id=HOST_ID)
+    monkeypatch.setitem(globals(), "TOKEN", token)
     # -- hub: its own duckdb -------------------------------------------
     hub_duckdb_path = tmp_path / "hub" / "drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "hub" / "parquet", duckdb_path=hub_duckdb_path)
@@ -164,7 +168,7 @@ def relay_env(tmp_path):
         host="127.0.0.1",
         port=0,
         collector=hub_collector,
-        auth=AuthSettings(enabled=True, api_token=TOKEN),
+        auth=AuthSettings(enabled=True, api_token="operator", credentials=store),
     )
     _, hub_port = hub_server.server_address
 
@@ -478,4 +482,5 @@ def test_host_registration_rejects_duplicate_json_keys_and_identity_mismatch(rel
         )
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(request, timeout=10)
-        assert error.value.code == 400
+        expected = 403 if raw == b'{"host_id":"other"}' else 400
+        assert error.value.code == expected
