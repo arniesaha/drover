@@ -1,6 +1,17 @@
 import Foundation
 import UserNotifications
 
+public enum SessionNotificationKind: String, Codable, Sendable {
+    case input, finished, failed
+    public var body: String {
+        switch self {
+        case .input: "Needs your input: open the session"
+        case .finished: "Finished: ready for review"
+        case .failed: "Failed: open the session for details"
+        }
+    }
+}
+
 // MARK: - Notifying
 
 /// Abstraction over "tell the user" so `AttentionWatcher` stays pure and
@@ -9,6 +20,13 @@ import UserNotifications
 public protocol Notifying: Sendable {
     func notify(title: String, body: String, id: String) async
     func setBadge(_ count: Int) async
+    func notify(kind: SessionNotificationKind, id: String) async
+}
+
+extension Notifying {
+    public func notify(kind: SessionNotificationKind, id: String) async {
+        await notify(title: "Session", body: kind.body, id: id)
+    }
 }
 
 // MARK: - LocalNotifier
@@ -22,22 +40,32 @@ public struct LocalNotifier: Notifying {
     public init() {}
 
     public func notify(title: String, body: String, id: String) async {
-        let content = UNMutableNotificationContent()
+        await notify(kind: .input, id: id)
+    }
+
+    public func notify(kind: SessionNotificationKind, id: String) async {
+        let content = Self.content(kind: kind, id: id)
         guard NotificationMode.saved() != .digest else { return }
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    static func content(kind: SessionNotificationKind, id: String) -> UNMutableNotificationContent {
+        let content = UNMutableNotificationContent()
+        content.categoryIdentifier = kind.rawValue
         content.title = "Session"
-        content.body = "Needs your input: open the session"
+        content.body = kind.body
         content.threadIdentifier = id
         content.sound = .default
         // "Needs you" is exactly the time-sensitive case: the harness is
         // blocked on the user. Breaks through Focus modes and lock-screen
         // deferral (requires the time-sensitive entitlement; without it iOS
         // silently downgrades to .active, so this is safe either way).
-        content.interruptionLevel = .timeSensitive
+        content.interruptionLevel = kind == .input ? .timeSensitive : .active
         // Same key the push payload carries, so tapping either kind of alert
         // opens the session by exactly one code path.
         content.userInfo[NotificationPayloadKey.sessionID] = id
-        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
-        try? await UNUserNotificationCenter.current().add(request)
+        return content
     }
 
     public func setBadge(_ count: Int) async {
@@ -66,6 +94,7 @@ public struct LocalNotifier: Notifying {
 public struct AttentionWatcher: Sendable {
     public static let seenKey = "drover.needsyou.seen"
     public static let readKey = "drover.needsyou.read"
+    public static let finishedKey = "drover.finished.seen"
 
     private let notifier: Notifying
     // Holds both the seen-set and the read receipts. `UserDefaults` isn't
@@ -123,6 +152,14 @@ public struct AttentionWatcher: Sendable {
         let needsYou = Self.needingUser(snapshot.sessions)
         await notifier.setBadge(needsYou.count)
         seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)
+        seenStore.set(Self.completionReceipts(snapshot), forKey: Self.finishedKey)
+    }
+
+    private static func completionReceipts(_ snapshot: HarnessSnapshot) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: snapshot.sessions.compactMap { session in
+            guard session.notificationKind == .finished || session.notificationKind == .failed else { return nil }
+            return (session.id, "\(session.notificationKind!.rawValue):\(session.activityDate?.timeIntervalSince1970 ?? 0)")
+        })
     }
 
     static func needingUser(_ sessions: [SessionSummary]) -> [SessionSummary] {
@@ -145,7 +182,13 @@ public struct AttentionWatcher: Sendable {
         let previousIDs = Set(seenStore.stringArray(forKey: Self.seenKey) ?? [])
         let fresh = SessionStore.newlyNeedsYou(current: snapshot.sessions, previousIDs: previousIDs)
 
+        let completions = Self.completionReceipts(snapshot)
+        let previousCompletions = seenStore.dictionary(forKey: Self.finishedKey) as? [String: String] ?? [:]
         if announcesLocally {
+            for session in snapshot.sessions where completions[session.id] != nil
+                && completions[session.id] != previousCompletions[session.id] {
+                await notifier.notify(kind: session.notificationKind!, id: session.id)
+            }
             for session in fresh {
                 await notifier.notify(
                     title: "\(session.harness) needs you",
@@ -155,6 +198,7 @@ public struct AttentionWatcher: Sendable {
             }
         }
 
+        seenStore.set(completions, forKey: Self.finishedKey)
         let read = prunedRead(against: needsYou)
         await notifier.setBadge(needsYou.filter { !read.contains($0.id) }.count)
         seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)

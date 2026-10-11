@@ -390,6 +390,7 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
     public var mode: String?
     public var status: String
     public var awaiting: String?
+    public var notificationKind: SessionNotificationKind? = nil
     public var cwd: String?
     public var repoName: String?
     public var lastActivity: Date?
@@ -449,6 +450,7 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         case mode
         case status
         case awaiting
+        case notificationKind = "notification_kind"
         case cwd
         case repoName = "repo_name"
         case lastActivity = "last_activity"
@@ -472,6 +474,7 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
         mode = try? container.decode(String.self, forKey: .mode)
         status = (try? container.decode(String.self, forKey: .status)) ?? ""
         awaiting = try? container.decode(String.self, forKey: .awaiting)
+        notificationKind = try? container.decode(SessionNotificationKind.self, forKey: .notificationKind)
         cwd = try? container.decode(String.self, forKey: .cwd)
         repoName = try? container.decode(String.self, forKey: .repoName)
         let rawDate = try? container.decode(String.self, forKey: .lastActivity)
@@ -499,6 +502,8 @@ public struct SessionSummary: Sendable, Identifiable, Decodable, Equatable {
             if awaiting == "approval" {
                 return .needsApproval
             } else if awaiting == "input" {
+                if notificationKind == .finished { return .done }
+                if notificationKind == .failed { return .errored }
                 return .needsInput
             } else {
                 return .working

@@ -968,8 +968,11 @@ def _harness_session_dict(
     preview: str | None = None,
     recap: LiveRecap | None = None,
     host: Any | None = None,
+    notification_kind: str | None = None,
 ) -> dict[str, Any]:
     item = dict(session.__dict__)
+    if notification_kind is not None:
+        item["notification_kind"] = notification_kind
     item["awaiting"] = effective_awaiting(item.get("status", ""), item.get("awaiting"))
     if host is not None:
         item["host_display_name"] = host.display_name
@@ -2648,6 +2651,19 @@ class MetricsCollector:
                 if sessions
                 else {}
             )
+            try:
+                turn_kinds = registry.completed_turn_kinds(
+                    [
+                        session.session_id
+                        for session in sessions
+                        if session.effective_awaiting == "input"
+                    ]
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Optional enrichment must not hide the fleet when an older
+                # registry lacks it or its lookup temporarily fails.
+                log.warning("failed to load completed turn kinds: %s", exc)
+                turn_kinds = {}
             previews = registry.latest_session_previews(
                 [session.session_id for session in sessions]
             )
@@ -2671,6 +2687,7 @@ class MetricsCollector:
                         previews.get(session.session_id),
                         recaps.get(session.session_id),
                         session_hosts.get(session.host_id),
+                        turn_kinds.get(session.session_id),
                     )
                     for session in sessions
                 ],

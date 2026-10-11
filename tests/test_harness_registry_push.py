@@ -448,3 +448,55 @@ def test_completed_turn_is_normal_even_though_session_accepts_input(
     assert sender.sent[0].kind == kind
     assert not sender.sent[0].needs_user
     assert registry.get_session("sess-1").status == "running"
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("is_error,kind", [(False, "finished"), (True, "failed")])
+def test_snapshot_turn_kind_distinguishes_completion_from_question(
+    registry, nested, is_error, kind
+):
+    inner = {
+        "turn_complete": True,
+        "awaiting": "input",
+        "result": {"is_error": is_error},
+    }
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        seq=1,
+        payload={"payload": inner} if nested else inner,
+    )
+    assert registry.completed_turn_kinds(["sess-1"]) == {"sess-1": kind}
+    from drover.server.metrics import _harness_session_dict
+
+    item = _harness_session_dict(registry.get_session("sess-1"), notification_kind=kind)
+    assert item["notification_kind"] == kind
+    assert item["status"] == "running"
+    registry.append_event(
+        session_id="sess-1", event_type="status", seq=2, payload={"awaiting": "input"}
+    )
+    assert registry.completed_turn_kinds(["sess-1"]) == {}
+    assert registry.completed_turn_kinds([]) == {}
+
+
+def test_completed_turn_kind_reads_postgres_payload_relation(pg_control_path):
+    registry = HarnessRegistry(pg_control_path)
+    registry.register_host(
+        host_id="fixture", display_name="Fixture", kind="macos", capabilities={}
+    )
+    registry.create_session(
+        session_id="fixture-session",
+        host_id="fixture",
+        harness="codex",
+        command="codex",
+        status="running",
+    )
+    registry.append_event(
+        session_id="fixture-session",
+        event_type="status",
+        seq=1,
+        payload={"payload": {"turn_complete": True, "awaiting": "input"}},
+    )
+    assert registry.completed_turn_kinds(["fixture-session"]) == {
+        "fixture-session": "finished"
+    }

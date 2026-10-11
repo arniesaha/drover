@@ -24,6 +24,9 @@ struct FolderBrowserTests {
             (.unavailable("unknown harness host: fixture"), .hostUnavailable),
             (.unauthorized, .authentication), (.httpStatus(401, ""), .authentication),
             (.httpStatus(403, ""), .permissionDenied),
+            (.httpStatus(403, "outside_allowed_folders"), .outsideAllowedFolders),
+            (.httpStatus(403, "symlink_not_allowed"), .symlinkNotAllowed),
+            (.httpStatus(403, "hidden_folder_not_allowed"), .hiddenFolderNotAllowed),
             (.transport("offline"), .offline), (.transport("timed out"), .offline),
             (.httpStatus(504, ""), .offline), (.busy(until: .now), .offline),
             (.badRequest("invalid path"), .unavailable),
@@ -31,7 +34,7 @@ struct FolderBrowserTests {
             (.unavailable("not_found"), .unavailable),
             (.unavailable("not_directory"), .unavailable),
             (.unavailable("not a directory"), .unavailable),
-            (.unavailable("outside allowed roots"), .permissionDenied),
+            (.unavailable("outside allowed roots"), .outsideAllowedFolders),
             (.decoding("malformed"), .invalidResponse),
         ]
         for (error, expected) in cases { #expect(FolderBrowserFailure.classify(error) == expected) }

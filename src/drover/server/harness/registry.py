@@ -2241,6 +2241,40 @@ class HarnessRegistry:
                 turn_ids.append(turn_id)
         return turn_ids
 
+    def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
+        """Classify idle turns without changing the session's resumable state.
+
+        Rank lightweight event IDs first, then fetch only the winning payloads.
+        Callers pass only sessions currently awaiting input.
+        """
+        if not session_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in session_ids)
+        with self._connect() as con:
+            rows = con.execute(
+                f"""SELECT session_id, event_id FROM (
+                    SELECT session_id, event_id,
+                           ROW_NUMBER() OVER (PARTITION BY session_id
+                               ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC) AS rank
+                    FROM harness_events
+                    WHERE event_type = 'status' AND session_id IN ({placeholders})
+                ) latest WHERE rank = 1""",
+                session_ids,
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[1]) for row in rows])
+        kinds = {}
+        for session_id, event_id in rows:
+            payload = json.loads(payloads.get(str(event_id)) or "{}")
+            inner = payload.get("payload", payload)
+            if isinstance(inner, dict) and inner.get("turn_complete") is True:
+                result = inner.get("result") or {}
+                kinds[session_id] = (
+                    "failed"
+                    if isinstance(result, dict) and result.get("is_error")
+                    else "finished"
+                )
+        return kinds
+
     def latest_session_previews(self, session_ids: list[str]) -> dict[str, str]:
         """The preview line for each session, cheapest source first.
 

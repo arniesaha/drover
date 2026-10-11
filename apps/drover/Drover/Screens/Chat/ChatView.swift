@@ -49,6 +49,7 @@ struct ChatView: View {
     private let recoveryGeneration: Int
     private let chatModelFactory: ChatModelFactory?
     private let onSessionEnded: ((String, Bool) -> Void)?
+    @State private var visibilityOwner = UUID()
     @State private var model: ChatModel
     @State private var showTerminateConfirm = false
     @State private var showDiscardPendingConfirm = false
@@ -260,7 +261,11 @@ struct ChatView: View {
             guard !Task.isCancelled else { return }
             coldOpenIsSlow = true
         }
+        .onAppear {
+            NotificationVisibility.shared.show(sessionID: sessionID, owner: visibilityOwner)
+        }
         .onDisappear {
+            NotificationVisibility.shared.hide(owner: visibilityOwner)
             Task { await model.prepareForDeparture() }
         }
         .onChange(of: scenePhase) { _, phase in

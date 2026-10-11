@@ -37,19 +37,26 @@ public struct FolderListing: Decodable, Sendable, Equatable {
 }
 
 public enum FolderBrowserFailure: Sendable, Equatable {
-    case permissionDenied, authentication, offline, unsupported, hostUnavailable, unavailable, invalidResponse
+    case outsideAllowedFolders, symlinkNotAllowed, hiddenFolderNotAllowed, permissionDenied, authentication, offline, unsupported, hostUnavailable, unavailable, invalidResponse
 
     public static func classify(_ error: Error) -> Self {
         switch error as? DroverError {
         case .unauthorized, .httpStatus(401, _): return .authentication
-        case .httpStatus(403, _): return .permissionDenied
+        case .httpStatus(403, let detail):
+            switch detail {
+            case "outside_allowed_folders": return .outsideAllowedFolders
+            case "symlink_not_allowed": return .symlinkNotAllowed
+            case "hidden_folder_not_allowed": return .hiddenFolderNotAllowed
+            default: return .permissionDenied
+            }
         case .httpStatus(408, _), .httpStatus(502, _), .httpStatus(503, _),
              .httpStatus(504, _), .transport, .busy: return .offline
         case .httpStatus(405, _), .httpStatus(501, _): return .unsupported
         case .unavailable(let detail):
             let detail = detail.lowercased()
             if detail.contains("unknown harness host") { return .hostUnavailable }
-            if detail.contains("permission") || detail.contains("outside") { return .permissionDenied }
+            if detail.contains("outside") { return .outsideAllowedFolders }
+            if detail.contains("permission") { return .permissionDenied }
             if detail.contains("offline") || detail.contains("unreachable") { return .offline }
             if ["not_found", "not_directory", "invalid_path", "unavailable"].contains(detail)
                 || detail.contains("not a directory") || detail.contains("not a folder")
@@ -64,6 +71,9 @@ public enum FolderBrowserFailure: Sendable, Equatable {
 
     public var message: String {
         switch self {
+        case .outsideAllowedFolders: "This folder is outside the host’s allowed folders. Choose a folder from the listed locations."
+        case .symlinkNotAllowed: "This folder uses a symbolic link, which this host does not allow for browsing."
+        case .hiddenFolderNotAllowed: "This host does not allow browsing hidden folders."
         case .permissionDenied: "You do not have permission to browse this folder."
         case .authentication: "Check the connection credential in Settings."
         case .offline: "Host offline or unreachable. Try again when it reconnects."

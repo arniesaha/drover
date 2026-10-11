@@ -243,7 +243,7 @@ private func catalog(
 
     let sessionID = await model.launch()
     #expect(sessionID == nil)
-    #expect(model.launchError == "host offline")
+    #expect(model.launchError == "The host is offline. Wait for it to reconnect, then try again.")
 }
 
 // MARK: - Snapshot loading
@@ -356,7 +356,7 @@ private func catalog(
 
     await model.refreshSnapshot()
 
-    #expect(model.snapshotError == "token rejected · check Settings")
+    #expect(model.snapshotError == "Check the connection credential in Settings.")
     #expect(model.launchError == nil)
     #expect(model.snapshot == nil)
     #expect(model.isFetchingSnapshot == false)
