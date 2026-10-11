@@ -25,7 +25,14 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
             UNNotificationPresentationOptions
         ) -> Void
     ) {
-        completionHandler([.banner, .sound, .badge])
+        let request = notification.request
+        let sessionID = NotificationRoute.sessionID(
+            userInfo: request.content.userInfo, requestIdentifier: request.identifier
+        )
+        let suppress = MainActor.assumeIsolated {
+            NotificationVisibility.shared.shouldSuppress(sessionID: sessionID)
+        }
+        completionHandler(suppress ? [.badge] : [.banner, .sound, .badge])
     }
 
     /// A "needs you" alert is about one session, so tapping it should land on
@@ -121,7 +128,8 @@ struct DroverApp: App {
             RootView(environment: environment, notifier: notifier)
 #endif
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            NotificationVisibility.shared.isForeground = phase == .active
 #if DEBUG
             guard testScenario == nil else { return }
 #endif

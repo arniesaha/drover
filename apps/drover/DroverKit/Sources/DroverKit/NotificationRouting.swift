@@ -129,3 +129,36 @@ public final class NotificationRoute {
         return identifier.isEmpty ? nil : identifier
     }
 }
+
+/// Foreground banners are redundant only while their own chat is visible.
+@MainActor @Observable
+public final class NotificationVisibility {
+    public static let shared = NotificationVisibility()
+    public var isForeground = false
+    public private(set) var visibleSessionID: String?
+    private var owner: UUID?
+
+    public init() {}
+
+    public func show(sessionID: String, owner: UUID) {
+        self.owner = owner
+        visibleSessionID = sessionID
+    }
+
+    public func hide(owner: UUID) {
+        guard self.owner == owner else { return }
+        self.owner = nil
+        visibleSessionID = nil
+    }
+
+    public nonisolated static func shouldSuppress(
+        sessionID: String?, visibleSessionID: String?, isForeground: Bool
+    ) -> Bool {
+        isForeground && sessionID != nil && sessionID == visibleSessionID
+    }
+
+    public func shouldSuppress(sessionID: String?) -> Bool {
+        Self.shouldSuppress(sessionID: sessionID, visibleSessionID: visibleSessionID,
+                            isForeground: isForeground)
+    }
+}

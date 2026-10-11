@@ -52,6 +52,22 @@ struct NotifierTests {
     let mock = MockNetwork()
     private func client() -> DroverClient { mock.client() }
 
+@Test func completedTurnUsesFinishedFallbackOnceWithoutNeedsInputBadge() async throws {
+    let snapshot = try HarnessSnapshot.decode(from: Data("""
+    {"hosts":[],"sessions":[{"session_id":"fixture","host_id":"host-1",
+     "harness":"codex","mode":"structured","status":"running","awaiting":"input",
+     "notification_kind":"finished","last_activity":"2026-10-11T12:00:00Z"}],"cwd_suggestions":[]}
+    """.utf8))
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    await watcher.evaluate(snapshot)
+    await watcher.evaluate(snapshot)
+    let notifications = await spy.notifications
+    #expect(notifications.count == 1)
+    #expect(notifications.first?.body == "Finished: ready for review")
+    #expect(await spy.badgeCounts == [0, 0])
+}
+
 @Test func firstCheckNotifiesEachNeedsYouSessionAndSetsBadge() async throws {
     mock.handler = { _ in (200, snapshotData([
         (id: "sess-approval", harness: "claude-code", status: "running", awaiting: "approval", cwd: "/Users/sample-user/project"),

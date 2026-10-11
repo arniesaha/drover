@@ -348,8 +348,9 @@ def test_analytics_boundary_maps_bad_worker_results_to_one_unavailable_response(
     }
 
 
+@pytest.mark.parametrize("turn_kind_enrichment", ["missing", "available", "failed"])
 def test_harness_snapshot_uses_registered_control_store_without_lake_file(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, turn_kind_enrichment: str
 ) -> None:
     class FakeHost:
         def __init__(self) -> None:
@@ -376,6 +377,16 @@ def test_harness_snapshot_uses_registered_control_store_without_lake_file(
 
         def latest_live_recaps(self, _ids: list[str]):
             return {}
+
+    if turn_kind_enrichment != "missing":
+
+        def completed_turn_kinds(self, ids: list[str]):
+            assert ids == []
+            if turn_kind_enrichment == "failed":
+                raise RuntimeError("enrichment unavailable")
+            return {}
+
+        Registry.completed_turn_kinds = completed_turn_kinds
 
     monkeypatch.setattr("drover.server.metrics.HarnessRegistry", Registry)
     collector = MetricsCollector(

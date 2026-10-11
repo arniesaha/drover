@@ -192,28 +192,32 @@ struct LaunchView: View {
                     .accessibilityIdentifier("launch-snapshot-retry")
                 }
             }
-
-            if let launchError = model.launchError {
-                Section {
-                    Text(launchError).foregroundStyle(.red)
-                }
-            }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            Button {
-                Task { await launch() }
-            } label: {
-                HStack {
-                    Text(isLaunching ? "Launching..." : "Launch")
-                    if isLaunching || model.isFetchingSnapshot { ProgressView() }
+            VStack(spacing: 8) {
+                if let launchError = model.launchError {
+                    Text(launchError)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("launch-error")
+                        .padding(.horizontal, 16)
+                        .padding(.top, 10)
                 }
-                .frame(maxWidth: .infinity, minHeight: 44)
+                Button {
+                    Task { await launch() }
+                } label: {
+                    HStack {
+                        Text(isLaunching ? "Launching..." : "Launch")
+                        if isLaunching || model.isFetchingSnapshot { ProgressView() }
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!model.canLaunch || isLaunching || model.isFetchingSnapshot)
+                .accessibilityIdentifier("launch-confirm-button")
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
             }
-            .buttonStyle(.bordered)
-            .disabled(!model.canLaunch || isLaunching || model.isFetchingSnapshot)
-            .accessibilityIdentifier("launch-confirm-button")
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
             .background(.bar)
         }
         .navigationTitle("New Session")
@@ -299,7 +303,12 @@ struct LaunchView: View {
     private func launch() async {
         isLaunching = true
         defer { isLaunching = false }
-        guard let sessionID = await model.launch() else { return }
+        guard let sessionID = await model.launch() else {
+            if let error = model.launchError {
+                AccessibilityNotification.Announcement(error).post()
+            }
+            return
+        }
         onLaunched(sessionID, model.isStructured, model.harness)
         dismiss()
     }

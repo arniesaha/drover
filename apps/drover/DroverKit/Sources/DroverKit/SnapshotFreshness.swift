@@ -87,3 +87,22 @@ public struct SnapshotFreshness: Sendable, Equatable {
         }
     }
 }
+
+/// A first health response can observe startup lag before the initial sync.
+/// Confirm it on the next successful fetch; failures cannot establish staleness.
+public struct ExporterFreshnessGate: Sendable {
+    private var staleFetches = 0
+    public private(set) var warningText: String?
+    public init() {}
+
+    public mutating func fetched(_ health: ExporterHealth?) {
+        guard let health else { return }
+        if let warning = health.warningText {
+            staleFetches += 1
+            warningText = staleFetches >= 2 ? warning : nil
+        } else {
+            staleFetches = 0
+            warningText = nil
+        }
+    }
+}
