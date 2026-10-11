@@ -23,7 +23,9 @@ from typing import Any
 
 from drover.server.db import control_plane_connection
 from drover.server.harness.recap_prompt import (
+    FALLBACK_RECAP_SOURCE,
     build_live_recap_prompt,
+    fallback_live_recap,
     normalize_live_recap,
 )
 from drover.server.harness.registry import HarnessRegistry
@@ -142,14 +144,9 @@ class LiveRecapWorker:
         source_seq = self._source_seq(job)
 
         try:
-            backend = self._resolve_backend()
-            prompt = build_live_recap_prompt(self._load_events(session_id))
-            result = backend.summarize(prompt)
-            recap = normalize_live_recap(
-                result.get("recap") if isinstance(result, dict) else None
+            recap, model = self._generate_recap(
+                self._load_events(session_id), self._first_user_prompt(session_id)
             )
-            if not recap:
-                raise BackendError("live recap backend returned an empty recap")
         except _NoBackend as exc:
             ledger.release(
                 job, delay_seconds=_NO_BACKEND_RELEASE_SECONDS, reason=str(exc)
@@ -162,13 +159,42 @@ class LiveRecapWorker:
             self._fail(ledger, job, str(exc), type(exc).__name__)
             return 1
 
-        if not self._complete(ledger, job, recap, backend.model, source_seq):
+        if not self._complete(ledger, job, recap, model, source_seq):
             log.info(
                 "discarded stale live recap result for %s at sequence %s",
                 session_id,
                 source_seq,
             )
         return 1
+
+    def _generate_recap(
+        self, events: list[dict[str, Any]], first_prompt: str
+    ) -> tuple[str, str | None]:
+        fallback = fallback_live_recap(first_prompt)
+        if not any(
+            event.get("event_type")
+            in ("assistant_output", "tool_action", "tool_result")
+            and str(event.get("content_preview") or "").strip()
+            for event in events
+        ):
+            return fallback, FALLBACK_RECAP_SOURCE
+        backend = self._resolve_backend()
+        result = backend.summarize(build_live_recap_prompt(events))
+        recap = normalize_live_recap(
+            result.get("recap") if isinstance(result, dict) else None
+        )
+        return (recap, backend.model) if recap else (fallback, FALLBACK_RECAP_SOURCE)
+
+    def _first_user_prompt(self, session_id: str) -> str:
+        with control_plane_connection(self.duckdb_path) as con:
+            row = con.execute(
+                """SELECT content_preview FROM harness_events
+                   WHERE session_id=? AND event_type='user_input'
+                     AND content_preview IS NOT NULL AND content_preview <> ''
+                   ORDER BY seq, created_at, event_id LIMIT 1""",
+                [session_id],
+            ).fetchone()
+            return str(row[0]) if row else ""
 
     @staticmethod
     def _source_seq(job: ClaimedJob) -> int:

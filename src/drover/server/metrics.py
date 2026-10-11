@@ -36,7 +36,11 @@ from drover.server.harness.model_catalog import (
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
 from drover.server.harness.models import effective_awaiting
 from drover.server.harness.recap_jobs import LiveRecap
-from drover.server.harness.recap_prompt import drop_user_subject
+from drover.server.harness.recap_prompt import (
+    FALLBACK_RECAP_SOURCE,
+    fallback_live_recap,
+    normalize_live_recap,
+)
 from drover.server.harness.registry import (
     HarnessRegistry,
     HostBusyError,
@@ -991,7 +995,13 @@ def _harness_session_dict(
     # subject was dropped do not keep narrating "The user is ..." until every
     # session happens to be re-recapped.
     item["recap"] = _optional_str(
-        drop_user_subject(recap.text) if recap and recap.text else None
+        (
+            fallback_live_recap(recap.text)
+            if recap.generator_model == FALLBACK_RECAP_SOURCE
+            else normalize_live_recap(recap.text)
+        )
+        if recap and recap.text
+        else None
     )
     item["recap_source_seq"] = recap.source_seq if recap else None
     return item

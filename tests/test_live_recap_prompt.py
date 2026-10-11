@@ -195,3 +195,67 @@ def test_stored_recaps_are_cleaned_when_served(tmp_path) -> None:
     )
 
     assert item["recap"] == "Repairing harness authentication sign-in flows"
+
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Lacking coding session events to summarize",
+        "Not enough context to generate a summary.",
+        "I cannot summarize this session without more information.",
+        "No coding events were provided.",
+        "Please provide a session transcript.",
+        "As an AI, I don't have access to the session.",
+    ],
+)
+def test_normalize_recap_rejects_model_complaints(text):
+    assert normalize_live_recap(text) == ""
+
+
+def test_served_complaint_recap_uses_prompt_preview():
+    from datetime import datetime, timezone
+
+    from drover.server.harness.recap_jobs import LiveRecap
+    from drover.server.metrics import _harness_session_dict
+
+    class Session:
+        session_id = "s1"
+        started_at = updated_at = ended_at = last_activity = None
+
+    item = _harness_session_dict(
+        Session(),
+        preview="Fix the login bug",
+        recap=LiveRecap(
+            session_id="s1",
+            text="Lacking coding session events to summarize",
+            source_seq=1,
+            generated_at=datetime.now(timezone.utc),
+            generator_model=None,
+        ),
+    )
+    assert item["recap"] is None
+    assert item["preview"] == "Fix the login bug"
+
+
+@pytest.mark.parametrize("prompt", ["I cannot run tests", "Hi. Fix tests"])
+def test_trusted_prompt_fallback_is_preserved_on_read(prompt):
+    from datetime import datetime, timezone
+
+    from drover.server.harness.recap_jobs import LiveRecap
+    from drover.server.metrics import _harness_session_dict
+
+    class Session:
+        session_id = "s1"
+        started_at = updated_at = ended_at = last_activity = None
+
+    recap = LiveRecap(
+        session_id="s1",
+        text=prompt,
+        source_seq=1,
+        generated_at=datetime.now(timezone.utc),
+        generator_model="fallback:user-prompt",
+    )
+    assert _harness_session_dict(Session(), recap=recap)["recap"] == prompt
