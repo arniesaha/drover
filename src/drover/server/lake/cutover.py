@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -344,9 +343,10 @@ class ServiceView:
 
     @classmethod
     def load(cls, plist_path: Path | str) -> "ServiceView":
+        from drover.server.service_units import validate_launchd
+
         path = Path(plist_path).expanduser()
-        with path.open("rb") as stream:
-            data = plistlib.load(stream)
+        data = validate_launchd(path.read_bytes())
         program = [str(a) for a in data.get("ProgramArguments") or []]
         if not program and data.get("Program"):
             program = [str(data["Program"])]
