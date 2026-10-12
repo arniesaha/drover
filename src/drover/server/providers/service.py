@@ -20,6 +20,7 @@ import pyarrow.parquet as pq
 from drover.server.compact import compact_partition
 from drover.server.db import open_duckdb_connection
 from drover.server.parquet_io import atomic_write_table
+from drover.server.providers.quota import is_public_window
 from drover.server.providers.types import (
     ProviderAccountSnapshot,
     ProviderStatus,
@@ -319,6 +320,9 @@ class ProviderUsageService:
             )
             base = replace(
                 base,
+                windows=tuple(
+                    w for w in base.windows if is_public_window(base.provider, w.kind)
+                ),
                 observed_at=effective_observed_at,
                 provider_observed_at=provider_observed_at,
                 freshness_age_seconds=freshness_age_seconds,

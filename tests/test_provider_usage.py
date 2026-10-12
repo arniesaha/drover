@@ -1278,3 +1278,25 @@ for line in sys.stdin:
         assert "status=timeout" in caplog.text
     else:
         assert "phase=account/rateLimits/read" in caplog.text
+
+
+def test_latest_accounts_filters_historical_unsupported_anthropic_windows(
+    provider_service, provider_host
+):
+    payload = {
+        "accounts": [
+            {
+                **GOOD_PAYLOAD["accounts"][0],
+                "provider": "anthropic",
+                "windows": [
+                    {"kind": "five_hour", "used_percent": 20, "window_minutes": 300},
+                    {"kind": "extra_usage", "used_percent": 100},
+                    {"kind": "iguana_necktie", "used_percent": 100},
+                    {"kind": "nimbus_quill", "used_percent": 100},
+                ],
+            }
+        ]
+    }
+    provider_service.refresh_host(provider_host, fetch=lambda host: payload)
+    account = provider_service.latest_accounts()[0]
+    assert {w.kind for w in account.windows} == {"five_hour", "extra_usage"}

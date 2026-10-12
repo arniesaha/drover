@@ -24,6 +24,7 @@ from drover.server.providers.claude_credentials import (
     _load_account_metadata,
     load_claude_credential,
 )
+from drover.server.providers.quota import ANTHROPIC_WINDOW_MINUTES, is_public_window
 from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 
 log = logging.getLogger(__name__)
@@ -31,15 +32,6 @@ log = logging.getLogger(__name__)
 _USAGE_PATH = "/api/oauth/usage"
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
 _SOURCE = "claude-oauth-usage"
-# Only the windows whose duration is actually known. Anything else passes
-# through with window_minutes=None; inferring a duration from the key would
-# be inventing data.
-_WINDOW_MINUTES = {
-    "five_hour": 300,
-    "seven_day": 10080,
-    "seven_day_opus": 10080,
-    "seven_day_sonnet": 10080,
-}
 
 
 class _ProbeFailure(RuntimeError):
@@ -178,6 +170,8 @@ class ClaudeUsageProbe:
 def _windows(payload: Mapping[str, Any]) -> tuple[ProviderUsageWindow, ...]:
     windows: list[ProviderUsageWindow] = []
     for key, value in payload.items():
+        if not is_public_window("anthropic", str(key)):
+            continue
         if not isinstance(value, Mapping):
             continue
         utilization = value.get("utilization")
@@ -187,7 +181,7 @@ def _windows(payload: Mapping[str, Any]) -> tuple[ProviderUsageWindow, ...]:
             ProviderUsageWindow(
                 kind=str(key),
                 used_percent=float(utilization),
-                window_minutes=_WINDOW_MINUTES.get(str(key)),
+                window_minutes=ANTHROPIC_WINDOW_MINUTES[str(key)],
                 resets_at=_timestamp(value.get("resets_at")),
             )
         )

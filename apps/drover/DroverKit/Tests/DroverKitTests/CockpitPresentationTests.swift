@@ -1263,3 +1263,52 @@ private let fourAnthropicWindows = """
         #expect(headline.isCritical == false)
     }
 }
+
+@Test func quotaWindowTitlesUseReportedDurationAndKeepNativeKinds() throws {
+    let cases: [(String, Int?, String)] = [
+        ("primary", 10080, "Weekly"),
+        ("primary", 300, "5-hour"),
+        ("secondary", 10080, "Weekly"),
+        ("primary", nil, "Primary"),
+        ("secondary", 42, "Secondary"),
+        ("seven_day_opus", 10080, "Weekly · Opus"),
+        ("seven_day_sonnet", 10080, "Weekly · Sonnet"),
+        ("extra_usage", nil, "Extra usage"),
+    ]
+    for (kind, minutes, title) in cases {
+        let duration = minutes.map(String.init) ?? "null"
+        let window = try JSONDecoder().decode(ProviderWindow.self, from: Data(
+            "{\"kind\":\"\(kind)\",\"window_minutes\":\(duration)}".utf8
+        ))
+        #expect(ProviderWindowTitle.display(window) == title)
+        #expect(window.kind == kind)
+    }
+}
+
+@Test func quotaCodexCardsHandleWeeklyOnlyAndTwoWindows() throws {
+    for windows in [
+        #"[{"kind":"primary","window_minutes":10080,"used_percent":9}]"#,
+        #"[{"kind":"primary","window_minutes":300,"used_percent":4},{"kind":"secondary","window_minutes":10080,"used_percent":9}]"#,
+    ] {
+        let account = try providerAccount(
+            snapshot: "duration-test", provider: "openai", label: "Test", host: "test-host",
+            observedAt: "2026-10-12T18:00:00Z", windows: windows
+        )
+        let group = try #require(ProviderSubscriptionGrouping.group([account], now: account.observedAt).first)
+        #expect(group.headline.windowTitle == "Weekly")
+        #expect(group.headline.usedText == "9% used")
+        #expect(group.windows.map(ProviderWindowTitle.display) == (group.windows.count == 1 ? ["Weekly"] : ["5-hour", "Weekly"]))
+    }
+}
+
+@Test func quotaAnthropicUnknownFieldsAndBillingCannotLeadTheCard() throws {
+    let account = try providerAccount(
+        snapshot: "known-test", provider: "anthropic", label: "Test", host: "test-host",
+        observedAt: "2026-10-12T18:00:00Z",
+        windows: #"[{"kind":"five_hour","window_minutes":300,"used_percent":20},{"kind":"extra_usage","used_percent":100},{"kind":"iguana_necktie","used_percent":100},{"kind":"nimbus_quill","used_percent":100}]"#
+    )
+    let group = try #require(ProviderSubscriptionGrouping.group([account], now: account.observedAt).first)
+    #expect(group.windows.map(\.kind) == ["five_hour", "extra_usage"])
+    #expect(group.headline.windowTitle == "5-hour")
+    #expect(group.headline.usedText == "20% used")
+}
