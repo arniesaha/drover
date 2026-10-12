@@ -965,32 +965,37 @@ private let fourAnthropicWindows = """
 @Test func equalFractionsTieBreakOnWindowKind() throws {
     func headline(_ windows: String) throws -> ProviderHeadline {
         let account = try providerAccount(
-            snapshot: "s1", provider: "anthropic", label: "me@example.com",
-            host: "mac-mini", observedAt: "2026-08-09T18:00:00Z", windows: windows
+            snapshot: "s1", provider: "anthropic", label: "Test",
+            host: "test-host", observedAt: "2026-08-09T18:00:00Z", windows: windows
         )
+        #expect(account.windows.count == 2)
+        #expect(ProviderHeadline.leadingWindow(account.windows)?.kind == "five_hour")
         return ProviderSubscriptionGrouping.group([account], now: account.observedAt)[0].headline
     }
 
-    let forward = #"[{"kind":"alpha","used_percent":50},{"kind":"beta","used_percent":50}]"#
-    let reversed = #"[{"kind":"beta","used_percent":50},{"kind":"alpha","used_percent":50}]"#
+    let forward = #"[{"kind":"five_hour","window_minutes":300,"used_percent":50},{"kind":"seven_day","window_minutes":10080,"used_percent":50}]"#
+    let reversed = #"[{"kind":"seven_day","window_minutes":10080,"used_percent":50},{"kind":"five_hour","window_minutes":300,"used_percent":50}]"#
 
-    #expect(try headline(forward).windowTitle == "Alpha")
-    #expect(try headline(reversed).windowTitle == "Alpha")
+    #expect(try headline(forward).windowTitle == "5-hour")
+    #expect(try headline(reversed).windowTitle == "5-hour")
 }
 
 /// A window nobody can put a number on tells you nothing about how full the
 /// account is, so it must never outrank one that can.
 @Test func aWindowWithoutAFractionRanksBehindOneThatHasIt() throws {
     let account = try providerAccount(
-        snapshot: "s1", provider: "anthropic", label: "me@example.com",
-        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
-        windows: #"[{"kind":"alpha"},{"kind":"beta","used_percent":2}]"#
+        snapshot: "s1", provider: "anthropic", label: "Test",
+        host: "test-host", observedAt: "2026-08-09T18:00:00Z",
+        windows: #"[{"kind":"five_hour","window_minutes":300},{"kind":"seven_day","window_minutes":10080,"used_percent":2}]"#
     )
 
+    #expect(account.windows.count == 2)
+    #expect(ProviderHeadline.leadingWindow(account.windows)?.kind == "seven_day")
     let headline = ProviderSubscriptionGrouping
         .group([account], now: account.observedAt)[0].headline
 
-    #expect(headline.windowTitle == "Beta")
+    #expect(headline.windowTitle == "Weekly")
+    #expect(headline.fraction == 0.02)
 }
 
 /// Freshness hangs off the subscription, not off a window — an unavailable
