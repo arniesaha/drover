@@ -38,6 +38,8 @@ class IncrementalBatch:
     events: list[AgentEvent]
     cursor: dict
     diagnostics: list[str]
+    successful: bool = True
+    caught_up: bool = True
 
 
 @runtime_checkable

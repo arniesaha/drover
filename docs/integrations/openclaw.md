@@ -48,10 +48,12 @@ Only these tables are read, and only the listed columns:
 | `session_conversations` | `conversation_id`, `role` |
 | `conversations` | `channel`, `kind` |
 | `schema_meta` | `app_version` |
+| `transcript_rewrite_watermarks` | `session_id`, `generation` |
+| `session_transcript_archives` | `session_id`, `generation`, `encoding`, `archive_blob`, `archive_sha256`, `created_at` |
+| `session_transcript_cold_archives` | `session_id`, `generation`, `archive_name`, `archive_sha256`, `storage`, `archive_blob`, `archive_bytes` |
 
 Auth profiles, dispatch tokens, account ids, peer ids, delivery targets,
-session entry JSON, caches, memory indexes and transcript archives are never
-selected. Transcript content itself is imported unchanged, as it is from JSONL.
+session entry JSON, caches and memory indexes are never selected. Transcript content itself is imported unchanged, as it is from JSONL.
 
 The schema is discovered at run time. `transcript_events` with `session_id`,
 `seq`, `created_at` and at least one payload column is required; every other
@@ -71,10 +73,46 @@ restart, a failed ship or a skipped database resumes from the stored position.
 `watermark_iso` in that cursor is the newest event time seen and is shown by
 `drover-collect status`; it does not decide what is read.
 
-If a session's stored transcript ends before its watermark, OpenClaw rewrote
-that transcript. The session is read again from its first row and ingest
-dedupes the unchanged events. Watermarks of sessions that OpenClaw deleted are
-dropped.
+The cursor also records OpenClaw's rewrite generation and a hash of the last
+read row. A generation change or changed/missing row triggers a replay, even
+when a shortened transcript has already grown past the old sequence number.
+Ingest dedupes unchanged events. An older cursor replays once to establish its
+identity evidence. Stores without generation markers use the row hash, which
+cannot detect changes confined to earlier rows when the checkpoint row is
+unchanged. Watermarks of sessions that OpenClaw deleted are dropped.
+
+## Archived transcripts
+
+Registered reset/deleted generations in `session_transcript_archives` are read
+from identity or zstd blobs. Cold transcripts in
+`session_transcript_cold_archives` are read from SQLite blobs or the registered
+`sessions/cold/<hash>.jsonl.zst` file. The collector verifies stored hashes,
+file sizes and archive header identity before importing transcript records.
+Cold storage indexes and identity records are not imported.
+
+Each archive generation has its own resume position and shares the configured
+event budget with live rows. Moving a previously collected session to cold
+storage may replay its events; the existing ingest dedup key collapses repeats.
+Unavailable, corrupt or undecodable archives retain their cursor for retry.
+Archive checkpoint entries are removed after their registry entry disappears.
+No archive is restored, published, rewritten or materialized by Drover.
+
+## Collector health
+
+Successful non-dry-run collection and event shipping update
+`last_successful_collect_at`, including idle runs with no new events. The
+collector ships a separate `.collector-<source>.json` heartbeat containing only
+progress metadata. Failed source reads and failed shipments preserve the last
+successful time. Dry runs do not claim successful delivery.
+
+`drover doctor`, runtime audit and quality freshness checks report per-host,
+per-source collector lag in seconds since the last successful collect. This is
+separate from the latest event timestamp. Prometheus quality output includes
+`drover_collector_lag_seconds` and
+`drover_collector_last_success_timestamp_seconds`. A collector reaching its event budget
+reports that it is still catching up. Lag of 10 minutes warns; one hour is
+critical. Missing or invalid metadata is explicitly unknown, and older
+collectors without heartbeats remain unknown until upgraded.
 
 ## Event mapping
 
@@ -111,8 +149,8 @@ Warnings are logged as `[openclaw_sqlite] ...` by `drover-collect run`.
 
 ## Limits
 
-- Transcripts that OpenClaw moved to cold archive files or archive blobs are
-  not read.
-- A transcript that is rewritten and then grows past the old watermark before
-  the next run is not detected as rewritten.
+- Only registered archives are read; unregistered legacy archive files are
+  outside this SQLite source.
+- Archive bytes and decoded content are capped at 64 MiB per generation, with
+  an 8 MiB record limit. Larger archives are reported unavailable for retry.
 - zstd payloads compressed with a custom dictionary are not supported.
