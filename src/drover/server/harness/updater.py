@@ -449,6 +449,17 @@ class HostUpdater:
             return False
 
         previous = self._layout.active_version() or ""
+        # A target may wait for hours while an operator rolls out a newer
+        # runtime. Recheck after smoke/quiesce, before either activation mode.
+        with self._lock:
+            superseded = self._pending != target
+            if previous and compare_versions(target, previous) <= 0:
+                if self._pending == target:
+                    self._clear_locked()
+                superseded = True
+        if superseded:
+            end_drain(self._state)
+            return False
         # Marker first: if the flip or the restart goes wrong, the next start
         # needs to know what to fall back to.
         self._layout.write_marker(previous, target)
@@ -532,6 +543,11 @@ def verify_after_restart(
     if marker is None:
         return True
     previous, target = marker
+    active = layout.active_version()
+    if active and compare_versions(active, target) > 0:
+        log.warning("discarding recovery marker superseded by a newer runtime")
+        layout.clear_marker()
+        return True
     if registered:
         layout.clear_marker()
         layout.prune(keep=2)
