@@ -227,3 +227,106 @@ def test_provider_quota_registered_hub_preserves_source_identity(
         "timestamp": observed.isoformat(),
         "basis": "control_state_updated_at",
     }
+
+
+@pytest.mark.parametrize("connection_kind", ["direct", "relay", "relay_disconnected"])
+def test_provider_quota_fresh_uses_hub_transport(
+    tmp_path, monkeypatch, connection_kind
+):
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import Mock
+
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.metrics import MetricsCollector
+    from drover.server.providers.service import ProviderUsageService
+
+    path = tmp_path / "nexus.duckdb"
+    parquet = tmp_path / "parquet"
+    bootstrap(parquet_dir=parquet, duckdb_path=path)
+    HarnessRegistry(path).register_host(
+        host_id="quota-host",
+        display_name="Quota host",
+        kind="mac",
+        connection_kind="direct" if connection_kind == "direct" else "relay",
+        local_url="http://127.0.0.1:7081" if connection_kind == "direct" else "",
+    )
+    now = datetime.now(timezone.utc)
+    observed = now - timedelta(minutes=20)
+    payload = {
+        "accounts": [
+            {
+                "snapshot_id": "quota-good",
+                "dedup_key": "quota-good",
+                "provider": "openai",
+                "account_label": "Synthetic subscription",
+                "host_id": "quota-host",
+                "status": "ok",
+                "usage_status": "supported",
+                "observed_at": observed.isoformat(),
+                "source": "codex-app-server",
+                "windows": [{"kind": "primary", "used_percent": 25}],
+            }
+        ]
+    }
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        api_token="synthetic-host-token",
+        summarizer_report={},
+    )
+    connection = Mock()
+    connection.getresponse.return_value.status = 200
+    connection.getresponse.return_value.read.return_value = json.dumps(payload).encode()
+    dial = Mock(return_value=connection)
+    monkeypatch.setattr("drover.server.metrics.http.client.HTTPConnection", dial)
+    relay = Mock()
+    relay.is_live.return_value = connection_kind != "relay_disconnected"
+    relay.request.return_value = (200, json.dumps(payload))
+    if connection_kind != "direct":
+        collector.relay_manager = relay
+    service = ProviderUsageService(
+        path, parquet, freshness_threshold_seconds=3600, clock=lambda: now
+    )
+    if connection_kind == "relay_disconnected":
+        host = HarnessRegistry(path).get_host("quota-host")
+        service.refresh_host(host, fetch=lambda host: payload)
+        before = service.latest_accounts()
+    server = build_mcp_server(
+        duckdb_path=path,
+        provider_usage=service,
+        provider_fetch=collector.fetch_harness_provider_usage,
+    )
+    result = _call_registered_tool(server, "drover_provider_quota", {"fresh": True})
+    if connection_kind == "relay_disconnected":
+        assert result["refresh_errors"] == [
+            {"host_id": "quota-host", "error_category": "unavailable"}
+        ]
+        assert service.latest_accounts() == before
+        dial.assert_not_called()
+        relay.request.assert_not_called()
+        assert result["accounts"][0]["status"] == "ok"
+        return
+    assert result["refresh_errors"] == []
+    assert result["accounts"][0]["status"] == "ok"
+    assert result["accounts"][0]["windows"][0]["used_percent"] == 25
+    if connection_kind == "relay":
+        dial.assert_not_called()
+        relay.request.assert_called_once_with(
+            "quota-host",
+            "GET",
+            "/providers/usage",
+            {},
+            timeout_s=10.0,
+        )
+    else:
+        relay.request.assert_not_called()
+        dial.assert_called_once_with("127.0.0.1", 7081, timeout=10.0)
+        connection.request.assert_called_once_with(
+            "GET",
+            "/providers/usage",
+            body=None,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer synthetic-host-token",
+            },
+        )

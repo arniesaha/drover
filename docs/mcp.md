@@ -99,6 +99,16 @@ Omitting it asserts that the vector uses the configured model.
 `drover_provider_quota` shows provider quota for every account across hosts. It
 is a read tool (v0.5.7, #528).
 
+With `fresh=true`, the hub uses the same authenticated direct or relay
+transport as scheduled probes and keeps its configured freshness threshold.
+Optional refresh failures preserve saved quota and connector freshness.
+`refresh_errors` lists each failed host's `host_id` and sanitized
+`error_category`, including `timeout` when the response deadline expires.
+A probe still running at that deadline can save a successful result later;
+a later failure also leaves saved state intact. Without a configured hub
+transport, refresh reports `transport_unavailable` instead of dialing a host.
+Scheduled probes continue recording connector failures normally.
+
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `provider` | string | all providers | Filter by provider: `google`, `openai`, or `anthropic`. |
