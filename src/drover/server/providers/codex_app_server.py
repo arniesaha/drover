@@ -28,11 +28,18 @@ class CodexAppServerError(RuntimeError):
 class CodexAppServerSession:
     """A bounded session with a local Codex app-server process."""
 
-    def __init__(self, command: Sequence[str], timeout_s: float):
+    def __init__(
+        self,
+        command: Sequence[str],
+        timeout_s: float,
+        *,
+        env: Mapping[str, str] | None = None,
+    ):
         from drover.server.staging_credentials import codex_command
 
         self.command = tuple(codex_command(command))
         self.timeout_s = timeout_s
+        self.env = env
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
@@ -70,7 +77,20 @@ class CodexAppServerSession:
     ) -> Mapping[str, Any]:
         request_id = self._next_request_id
         self._next_request_id += 1
-        return self._request_with_id(request_id, method, params)
+        started = monotonic()
+        category = "ok"
+        try:
+            return self._request_with_id(request_id, method, params)
+        except CodexAppServerError as exc:
+            category = exc.category
+            raise
+        finally:
+            log.info(
+                "codex app-server phase=%s elapsed_s=%.3f status=%s",
+                method,
+                monotonic() - started,
+                category,
+            )
 
     def notify(self, method: str, params: Mapping[str, Any]) -> None:
         self._write({"method": method, "params": params})
@@ -79,6 +99,7 @@ class CodexAppServerSession:
         if self.timeout_s <= 0:
             raise CodexAppServerError("timeout")
         self._deadline = monotonic() + self.timeout_s
+        started = monotonic()
         try:
             process = subprocess.Popen(
                 self.command,
@@ -88,12 +109,17 @@ class CodexAppServerSession:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=self.env,
             )
         except FileNotFoundError:
             raise CodexAppServerError("cli_not_found") from None
         except OSError:
             raise CodexAppServerError("unavailable") from None
 
+        log.info(
+            "codex app-server phase=startup elapsed_s=%.3f status=ok",
+            monotonic() - started,
+        )
         self._process = process
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise CodexAppServerError("process_error")

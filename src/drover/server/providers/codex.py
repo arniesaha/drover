@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
@@ -25,26 +28,60 @@ class _ProbeFailure(RuntimeError):
         self.category = category
 
 
+DEFAULT_CODEX_USAGE_TIMEOUT_S = 20.0
+CODEX_USAGE_TIMEOUT_ENV = "DROVER_CODEX_USAGE_TIMEOUT_SECONDS"
+
+
+def codex_usage_timeout() -> float:
+    """A finite, positive total RPC budget, configurable in the daemon env."""
+    raw = os.environ.get(CODEX_USAGE_TIMEOUT_ENV)
+    if raw is None:
+        return DEFAULT_CODEX_USAGE_TIMEOUT_S
+    try:
+        value = float(raw)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    log.warning(
+        "invalid %s; using %.1fs",
+        CODEX_USAGE_TIMEOUT_ENV,
+        DEFAULT_CODEX_USAGE_TIMEOUT_S,
+    )
+    return DEFAULT_CODEX_USAGE_TIMEOUT_S
+
+
 class CodexUsageProbe:
     """Read the authenticated Codex account's native ChatGPT rate limits."""
 
     def __init__(
         self,
         command: Sequence[str] | None = None,
-        timeout_s: float = 5.0,
+        timeout_s: float | None = None,
     ):
         # No default command: the caller resolves the CLI through the user's
         # login shell. Spawning a bare "codex" would search this process's PATH,
         # which under launchd omits the prefix the CLI is installed in.
         self.command = tuple(command) if command else None
-        self.timeout_s = timeout_s
+        self.timeout_s = codex_usage_timeout() if timeout_s is None else timeout_s
+        self.env = None
+        self._logged_binary = False
+        if self.command:
+            from drover.server.harness.auth import executable_path_prefix
+
+            if prefix := executable_path_prefix(self.command[0]):
+                self.env = dict(os.environ)
+                self.env["PATH"] = prefix + os.pathsep + self.env.get("PATH", "")
 
     def read(self, *, host_id: str = "local") -> ProviderAccountSnapshot:
         observed_at = datetime.now(timezone.utc)
         if self.command is None:
             return _error_snapshot(host_id, observed_at, "cli_not_found")
+        self._log_binary()
         try:
-            with CodexAppServerSession(self.command, self.timeout_s) as client:
+            with CodexAppServerSession(
+                self.command, self.timeout_s, env=self.env
+            ) as client:
                 account_response = client.request(
                     "account/read", {"refreshToken": False}
                 )
@@ -61,6 +98,38 @@ class CodexUsageProbe:
             return _error_snapshot(host_id, observed_at, exc.category)
         except (TypeError, ValueError, OverflowError):
             return _error_snapshot(host_id, observed_at, "protocol_error")
+
+    def _log_binary(self) -> None:
+        if self._logged_binary or not self.command:
+            return
+        self._logged_binary = True
+        from drover.server.harness.auth import redact_auth_text
+        from drover.server.harness.model_catalog.agy import _run_bounded
+        from drover.server.harness.model_catalog.service import CatalogDiscoveryError
+
+        version = "unavailable"
+        try:
+            code, output = _run_bounded(
+                (self.command[0], "--version"),
+                timeout_s=min(self.timeout_s, 3.0),
+                missing_category="cli_not_found",
+                env=self.env,
+            )
+            # Accept only the CLI version, never arbitrary subprocess output.
+            match = re.fullmatch(
+                rb"codex-cli ([0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?)",
+                output.strip(),
+            )
+            if code == 0 and match:
+                version = match[1].decode("ascii")
+        except CatalogDiscoveryError:
+            pass
+        log.info(
+            "codex usage probe executable=%s version=%s timeout_s=%.3f",
+            redact_auth_text(self.command[0]),
+            version,
+            self.timeout_s,
+        )
 
 
 def _snapshot_from_responses(

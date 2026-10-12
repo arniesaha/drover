@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .models import MAX_MODELS, DiscoveredCatalog, ModelOption
 from .service import CatalogDiscoveryError
@@ -161,12 +161,14 @@ def _run_bounded(
     timeout_s: float,
     missing_category: str,
     os_error_category: str = "protocol_error",
+    env: Mapping[str, str] | None = None,
 ) -> tuple[int, bytes]:
     try:
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=env,
         )
     except FileNotFoundError:
         raise CatalogDiscoveryError(missing_category) from None

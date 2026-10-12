@@ -486,7 +486,7 @@ def resolve_executable(binary: str, *, login_shell: str) -> str | None:
             timeout=3,
         )
     except Exception:
-        return None
+        return _resolve_known_versioned_cli(binary)
     executable = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
     if result.returncode != 0 or not executable:
         return _resolve_known_versioned_cli(binary)
