@@ -340,11 +340,17 @@ public actor DroverClient {
     }
 
     /// List directories inside the selected host's allowed roots.
-    public func listFolders(hostID: String, path: String = "", filter: String = "") async throws -> FolderListing {
+    public func listFolders(hostID: String, path: String = "", filter: String = "", cursor: String = "", limit: Int = 100) async throws -> FolderListing {
         let basePath = "/harness/hosts/\(encodePathComponent(hostID))/fs/list"
-        let url = try queryURL(path: basePath, items: [("path", path), ("filter", filter)])
+        let url = try queryURL(path: basePath, items: [("path", path), ("filter", filter), ("cursor", cursor), ("limit", String(limit))])
         let data = try await request(url: url, method: "GET", body: nil, timeout: Self.pathRequestTimeout)
         return try decode(FolderListing.self, from: data)
+    }
+
+    public func createFolder(hostID: String, path: String, name: String) async throws -> FolderLocation {
+        let body = try JSONSerialization.data(withJSONObject: ["path": path, "name": name])
+        let data = try await request(path: "/harness/hosts/\(encodePathComponent(hostID))/fs/create", method: "POST", body: body)
+        return try decode(FolderLocation.self, from: data)
     }
 
     /// Complete a half-typed directory path; missing parents return an empty list.

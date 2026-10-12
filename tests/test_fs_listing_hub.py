@@ -119,3 +119,70 @@ def test_hub_preserves_folder_policy_reason(
             403,
             {"error": "outside_allowed_folders"},
         )
+
+
+def post_create(url, root, *, token="operator-token", host="test-host"):
+    request = urllib.request.Request(
+        f"{url}/harness/hosts/{host}/fs/create",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
+        data=json.dumps(
+            {"path": str(root), "name": "new", "host_id": "override"}
+        ).encode(),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as response:
+        return response.code, json.load(response)
+
+
+@pytest.mark.parametrize(
+    "scope,host_id,expected",
+    [
+        ("host", "test-host", 201),
+        ("host", "other-host", 403),
+        ("device", None, 201),
+        ("profile", None, 401),
+        ("preflight", None, 401),
+    ],
+)
+def test_hub_create_scopes_and_selected_host(
+    tmp_path, base_url, root, scope, host_id, expected
+):
+    with hub(tmp_path, base_url) as (url, store):
+        _, token = store.issue(scope=scope, label="test", host_id=host_id)
+        assert post_create(url, root, token=token)[0] == expected
+        assert (root / "new").exists() == (expected == 201)
+
+
+def test_hub_create_auth_disabled_and_host_mismatch(tmp_path, base_url, root):
+    with hub(tmp_path, base_url, enabled=False) as (url, _):
+        assert post_create(url, root, token=None)[0] == 401
+    with hub(tmp_path, base_url) as (url, _):
+        assert post_create(url, root, token=None)[0] == 401
+        assert post_create(url, root, host="other-host")[0] == 403
+        assert post_create(url, root)[0] == 201
+        assert post_create(url, root)[0] == 409
+
+
+def test_hub_forwards_paging_cursor_and_limit(tmp_path, base_url, root):
+    for index in range(5):
+        (root / f"project{index}").mkdir()
+    with hub(tmp_path, base_url) as (url, _):
+        params = {"path": str(root), "limit": 2}
+        found = []
+        for _ in range(4):
+            status, body = get(
+                f"{url}/harness/hosts/test-host/fs/list?{urlencode(params)}"
+            )
+            assert status == 200
+            assert len(body["entries"]) <= 2
+            found.extend(entry["name"] for entry in body["entries"])
+            if not body["next_cursor"]:
+                break
+            params["cursor"] = body["next_cursor"]
+        assert sorted(found) == [f"project{index}" for index in range(5)]

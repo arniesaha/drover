@@ -256,3 +256,202 @@ def test_symlinked_ancestor_has_specific_error(
         403,
         {"error": "symlink_not_allowed"},
     )
+
+
+def create(base_url, path, name, *, token=TOKEN, host_id="test-host"):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"{base_url}/fs/create",
+        method="POST",
+        headers=headers,
+        data=json.dumps({"path": path, "name": name, "host_id": host_id}).encode(),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as response:
+        return response.code, json.load(response)
+
+
+def test_create_folder_and_selectable_listing(base_url, root):
+    status, body = create(base_url, str(root), "new project")
+    assert (status, body) == (
+        201,
+        {"name": "new project", "path": str(root / "new project")},
+    )
+    assert listing(base_url, body["path"])[0] == 200
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        ".",
+        "..",
+        ".hidden",
+        "a/b",
+        "a\\b",
+        " spaced",
+        "spaced ",
+        "\x00",
+        "\n",
+        "a" * 256,
+        "\ud800",
+        "\x85",
+        None,
+        42,
+    ],
+)
+def test_create_invalid_name(base_url, root, name):
+    assert create(base_url, str(root), name) == (400, {"error": "invalid_name"})
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ["folder", "file", "symlink"])
+def test_create_never_overwrites(base_url, root, kind):
+    target = root / "existing"
+    if kind == "folder":
+        target.mkdir()
+    elif kind == "file":
+        target.write_text("fixture")
+    else:
+        target.symlink_to(root.parent, target_is_directory=True)
+    assert create(base_url, str(root), "existing") == (409, {"error": "folder_exists"})
+    if kind == "file":
+        assert target.read_text() == "fixture"
+    if kind == "symlink":
+        assert target.is_symlink()
+
+
+def test_create_policy_and_host_auth(base_url, root):
+    (root / "alias").symlink_to(root.parent, target_is_directory=True)
+    (root / ".hidden").mkdir()
+    for parent in [
+        str(root.parent),
+        str(root) + "/..",
+        str(root / "alias"),
+        str(root / ".hidden"),
+    ]:
+        assert create(base_url, parent, "new")[0] == 403
+    for token in [None, "invalid"]:
+        assert create(base_url, str(root), "new", token=token)[0] == 401
+    assert create(base_url, str(root), "new", host_id="other-host")[0] == 403
+    assert not (root / "new").exists()
+
+
+def page(base_url, root, *, cursor="", limit=2, query=""):
+    params = urlencode(
+        {
+            "path": str(root),
+            "host_id": "test-host",
+            "cursor": cursor,
+            "limit": limit,
+            "filter": query,
+        }
+    )
+    request = urllib.request.Request(
+        f"{base_url}/fs/list?{params}", headers={"Authorization": f"Bearer {TOKEN}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as response:
+        return response.code, json.load(response)
+
+
+def test_pages_cover_directory_beyond_scan_budget(base_url, root, monkeypatch):
+    from drover.server.harness import folders
+
+    monkeypatch.setattr(folders, "MAX_SCANNED", 3)
+    for index in range(13):
+        (root / f"project{index}").mkdir()
+        (root / f"file{index}").write_text("fixture")
+    cursor = ""
+    found = []
+    for _ in range(30):
+        status, body = page(base_url, root, cursor=cursor)
+        assert status == 200
+        assert len(body["entries"]) <= 2
+        found.extend(entry["name"] for entry in body["entries"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    assert cursor is None
+    assert sorted(found) == sorted(f"project{index}" for index in range(13))
+
+
+def test_cursor_bound_to_directory_filter_and_mutation(base_url, root):
+    for index in range(4):
+        (root / f"project{index}").mkdir()
+    _, first = page(base_url, root)
+    cursor = first["next_cursor"]
+    assert cursor
+    assert page(base_url, root, cursor=cursor, query="other")[0] == 400
+    assert page(base_url, root / "project0", cursor=cursor)[0] == 400
+    (root / "new").mkdir()
+    assert page(base_url, root, cursor=cursor)[0] == 400
+
+
+@pytest.mark.parametrize("limit", [0, -1, 101, "invalid"])
+def test_invalid_page_limit(base_url, root, limit):
+    assert page(base_url, root, limit=limit)[0] == 400
+
+
+@pytest.mark.parametrize("cursor", ["invalid", "!", "e30=", "a" * 2049])
+def test_invalid_page_cursor(base_url, root, cursor):
+    assert page(base_url, root, cursor=cursor)[0] == 400
+
+
+def test_create_symlink_swap_never_writes_outside(base_url, root, monkeypatch):
+    from drover.server.harness import folders
+
+    (root / "target").mkdir()
+    outside = root.parent / "outside"
+    outside.mkdir()
+    original_open = folders.os.open
+    swapped = False
+
+    def swap_then_open(path, flags, **kwargs):
+        nonlocal swapped
+        if path == "target" and not swapped:
+            swapped = True
+            (root / "target").rmdir()
+            (root / "target").symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, **kwargs)
+
+    monkeypatch.setattr(folders.os, "open", swap_then_open)
+    assert create(base_url, str(root / "target"), "new")[0] == 403
+    assert not (outside / "new").exists()
+
+
+def test_tokenless_daemon_refuses_creation(base_url, root, monkeypatch):
+    from drover.server.harness.daemon import HarnessRequestHandler
+
+    monkeypatch.setattr(HarnessRequestHandler, "_authorized", lambda self: True)
+    original = HarnessRequestHandler._fs_create
+
+    def without_token(self):
+        monkeypatch.setattr(self.server.state, "api_token", "")
+        original(self)
+
+    monkeypatch.setattr(HarnessRequestHandler, "_fs_create", without_token)
+    assert create(base_url, str(root), "new")[0] == 401
+    assert not (root / "new").exists()
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root permissions"
+)
+def test_create_permission_denied(base_url, root):
+    locked = root / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        assert create(base_url, str(locked), "new") == (
+            403,
+            {"error": "permission_denied"},
+        )
+    finally:
+        locked.chmod(0o700)
