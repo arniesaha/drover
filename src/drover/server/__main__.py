@@ -743,6 +743,8 @@ def _build_runtime_mcp_server(
     cfg: DroverConfig,
     host: str,
     backend_config: SummarizerBackendConfig,
+    provider_usage: ProviderUsageService | None = None,
+    provider_fetch: Any | None = None,
 ) -> FastMCP:
     """Inject resolved runtime dependencies into the FastMCP server."""
     return build_mcp_server(
@@ -753,6 +755,8 @@ def _build_runtime_mcp_server(
         spans_enabled=cfg.spans_enabled,
         embedding_model=_configured_embedding_model(cfg),
         auth=load_auth(cfg),
+        provider_usage=provider_usage,
+        provider_fetch=provider_fetch,
     )
 
 
@@ -2949,6 +2953,20 @@ def run(
             log.exception("OTLP receiver failed to start; continuing with watcher only")
             receiver = None
 
+    metrics_collector: MetricsCollector | None = None
+    provider_usage = ProviderUsageService(
+        duckdb_path=cfg.duckdb_path,
+        parquet_dir=cfg.parquet_dir,
+        freshness_threshold_seconds=cfg.provider_freshness_threshold_seconds,
+    )
+
+    def fetch_provider_usage(host):
+        if host_bridge is not None:
+            return host_bridge.fetch_provider_usage(host.host_id)
+        if metrics_collector is None:
+            raise RuntimeError("unavailable")
+        return metrics_collector.fetch_harness_provider_usage(host)
+
     mcp_thread: threading.Thread | None = None
     if not no_mcp:
         try:
@@ -2966,6 +2984,8 @@ def run(
                 cfg=cfg,
                 host=mcp_host,
                 backend_config=mcp_backend_cfg,
+                provider_usage=provider_usage,
+                provider_fetch=fetch_provider_usage,
             )
 
             def _run_mcp() -> None:
@@ -3006,7 +3026,6 @@ def run(
     ).start()
 
     metrics_server = None
-    metrics_collector: MetricsCollector | None = None
     provider_refresh: ProviderRefreshLoop | None = None
     with _startup_phase("embeddings_configuration"):
         embeddings_state = _embeddings_state(cfg, enabled=not no_embeddings)
@@ -3060,12 +3079,6 @@ def run(
                         else None
                     ),
                     archive_resolver=worker_archive_resolver,
-                )
-                provider_usage = ProviderUsageService(
-                    duckdb_path=cfg.duckdb_path,
-                    parquet_dir=cfg.parquet_dir,
-                    api_token=auth.api_token if auth.enabled else None,
-                    freshness_threshold_seconds=cfg.provider_freshness_threshold_seconds,
                 )
                 metrics_collector.spans_enabled = cfg.spans_enabled
                 metrics_collector.cockpit_service = CockpitService(
@@ -3136,13 +3149,7 @@ def run(
                 provider_usage=provider_usage,
                 registry=HarnessRegistry(cfg.duckdb_path),
                 shutdown_event=stop,
-                fetch=(
-                    lambda host: (
-                        host_bridge.fetch_provider_usage(host.host_id)
-                        if host_bridge is not None
-                        else metrics_collector.fetch_harness_provider_usage(host)
-                    )
-                ),
+                fetch=fetch_provider_usage,
                 operational_source_version=provider_usage.operational_source_version,
                 on_operational_change=lambda host_id, source_version: enqueue_operational_checks(
                     cfg.duckdb_path,

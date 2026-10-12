@@ -120,8 +120,13 @@ class ProviderUsageService:
         host: Any,
         *,
         fetch: FetchProviderUsage | None = None,
+        record_failures: bool = True,
     ) -> tuple[ProviderAccountSnapshot, ...]:
-        """Fetch and persist one host observation without propagating failures."""
+        """Persist observations; scheduled failures overlay connector state.
+
+        With ``record_failures=False``, reject failed observations before
+        writing and raise a sanitized category for the optional caller.
+        """
         attempted_at = self.clock()
         host_id = _host_value(host, "host_id")
         if not host_id:
@@ -130,18 +135,31 @@ class ProviderUsageService:
             payload = (fetch or self._fetch_host)(host)
             snapshots = _snapshots_from_payload(payload, host_id=host_id)
             if not snapshots:
+                if not record_failures:
+                    raise RuntimeError("empty_inventory")
                 self._record_host_failure(
                     host_id,
                     attempted_at=attempted_at,
                     error_category="empty_inventory",
                 )
                 return ()
+            if not record_failures and any(
+                snapshot.status not in _SUCCESS_STATUSES for snapshot in snapshots
+            ):
+                raise RuntimeError("provider_error")
             snapshots = self._scope_connector_errors(snapshots)
             self._persist_new_snapshots(snapshots, host_id=host_id)
             self._record_snapshot_attempts(snapshots, attempted_at=attempted_at)
             self._retire_unreported_accounts(snapshots, host_id=host_id)
             return snapshots
         except Exception as exc:  # A connector failure must not stop refresh loops.
+            if not record_failures:
+                category = (
+                    str(exc)
+                    if str(exc) in {"empty_inventory", "provider_error"}
+                    else _error_category(exc)
+                )
+                raise RuntimeError(category) from None
             self._record_host_failure(
                 host_id,
                 attempted_at=attempted_at,

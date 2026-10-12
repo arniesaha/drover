@@ -378,3 +378,26 @@ def test_runtime_injects_shared_http_auth(tmp_path, monkeypatch):
     cli._build_runtime_mcp_server(cfg=cfg, host="localhost", backend_config=None)
     assert seen["auth"] is auth
     assert seen["duckdb_path"] == cfg.duckdb_path
+
+
+def test_runtime_injects_provider_refresh_dependencies(tmp_path, monkeypatch):
+    from drover.config import default_config
+    from drover.server import __main__ as cli
+
+    cfg = default_config()
+    service = object()
+    fetch = lambda host: {}
+    seen = {}
+    monkeypatch.setattr(
+        cli, "load_auth", lambda cfg: AuthSettings(True, "synthetic-operator")
+    )
+    monkeypatch.setattr(cli, "build_mcp_server", lambda **kwargs: seen.update(kwargs))
+    cli._build_runtime_mcp_server(
+        cfg=cfg,
+        host="localhost",
+        backend_config=None,
+        provider_usage=service,
+        provider_fetch=fetch,
+    )
+    assert seen["provider_usage"] is service
+    assert seen["provider_fetch"] is fetch
