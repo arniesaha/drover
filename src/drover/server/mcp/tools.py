@@ -1691,102 +1691,134 @@ def _account_identity_key(snapshot: Any) -> str:
 
 
 def _build_routing_hint(accounts: list[dict[str, Any]], now: datetime) -> str:
-    """Build compact headroom routing hint across pools (gemini, codex, agy-claude, claude)."""
+    """Choose the best usable subscription for each harness, preserving uncertainty."""
+    import math
+
     from drover.server.mcp.freshness import _instant
 
-    pools: dict[str, list[dict[str, Any]]] = {}
-
-    for account in accounts:
-        prov = account.get("provider", "")
-        for w in account.get("windows", []):
-            kind = str(w.get("kind") or "")
-            if prov == "google":
-                if "claude_gpt" in kind or "3p" in kind:
-                    pool_name = "agy-claude"
-                else:
-                    pool_name = "gemini"
-            elif prov == "openai":
-                pool_name = "codex"
-            elif prov == "anthropic":
-                pool_name = "claude"
-            else:
-                pool_name = prov or "other"
-            pools.setdefault(pool_name, []).append(w)
-
-    if not pools:
+    if not accounts:
         return "no provider accounts configured"
 
-    priority = ["gemini", "codex", "agy-claude", "claude"]
-    ordered_keys = sorted(
-        pools.keys(),
-        key=lambda k: (priority.index(k) if k in priority else 99, k),
-    )
+    known_kinds = {
+        "openai": {"primary", "secondary"},
+        "anthropic": {"five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"},
+        "google": {
+            "five_hour",
+            "seven_day",
+            "five_hour_claude_gpt",
+            "seven_day_claude_gpt",
+        },
+    }
+    default_pools = {
+        "openai": ("codex",),
+        "anthropic": ("claude",),
+        "google": ("gemini", "agy-claude"),
+    }
+    # Each candidate is (state, binding utilization, recovery instant).
+    pools: dict[str, list[tuple[str, float | None, datetime | None]]] = {}
+    for account in accounts:
+        provider = account.get("provider", "")
+        defaults = default_pools.get(provider, (provider or "other",))
+        windows_by_pool: dict[str, list[dict[str, Any]]] = {}
+        unknown_kind = False
+        for window in account.get("windows", []):
+            kind = window.get("kind")
+            if kind not in known_kinds.get(provider, set()):
+                unknown_kind = True
+                continue
+            pool = defaults[0]
+            if provider == "google" and kind in {
+                "five_hour_claude_gpt",
+                "seven_day_claude_gpt",
+            }:
+                pool = "agy-claude"
+            windows_by_pool.setdefault(pool, []).append(window)
+        # Missing or unsupported windows must never imply an absent account.
+        # An unknown Google window could constrain either harness.
+        if not windows_by_pool or unknown_kind:
+            for pool in defaults:
+                windows_by_pool.setdefault(pool, [])
 
-    hints: list[str] = []
-    for pool in ordered_keys:
-        windows = pools[pool]
-        # 1. Observed exhaustion takes priority
-        obs_resets = [
-            _instant(w.get("resets_at"))
-            for w in windows
-            if w.get("status") == "observed_exhausted" and w.get("resets_at")
-        ]
-        if obs_resets:
-            valid_resets = [r for r in obs_resets if r is not None]
-            until_str = (
-                _format_routing_reset_time(max(valid_resets), now=now)
-                if valid_resets
-                else ""
-            )
-            hints.append(
-                f"{pool}: observed exhausted until {until_str}"
-                if until_str
-                else f"{pool}: observed exhausted"
-            )
-            continue
-
-        # 2. Complete exhaustion
-        exhausted_resets = [
-            _instant(w.get("resets_at"))
-            for w in windows
-            if (
-                w.get("status") == "exhausted"
-                or (
-                    w.get("used_percent") is not None and w.get("used_percent") >= 100.0
+        for pool, windows in windows_by_pool.items():
+            state = account.get("status")
+            candidate: tuple[str, float | None, datetime | None]
+            resets = [_instant(w.get("resets_at")) for w in windows]
+            if state == "stale" or any(w.get("status") == "stale" for w in windows):
+                candidate = ("stale", None, None)
+            elif state not in {"ok", "observed_exhausted"}:
+                label = (
+                    "configured, usage unknown"
+                    if state == "usage_unavailable"
+                    else "unavailable"
                 )
-            )
-            and w.get("resets_at")
-        ]
-        all_exhausted = windows and all(
-            w.get("status") == "exhausted"
-            or (w.get("used_percent") is not None and w.get("used_percent") >= 100.0)
-            for w in windows
-        )
-        if exhausted_resets and all_exhausted:
-            valid_resets = [r for r in exhausted_resets if r is not None]
-            until_str = (
-                _format_routing_reset_time(min(valid_resets), now=now)
-                if valid_resets
-                else ""
-            )
-            hints.append(
-                f"{pool}: out until {until_str}" if until_str else f"{pool}: out"
-            )
-            continue
+                candidate = (label, None, None)
+            elif any(r is not None and r <= now for r in resets):
+                # A reset invalidates the old reading, including observed 429s.
+                candidate = ("stale", None, None)
+            elif unknown_kind or not windows:
+                candidate = ("configured, usage unknown", None, None)
+            else:
+                blocked = [
+                    (w, r)
+                    for w, r in zip(windows, resets)
+                    if w.get("status") in {"exhausted", "observed_exhausted"}
+                    or (
+                        isinstance(w.get("used_percent"), (int, float))
+                        and w["used_percent"] >= 100
+                    )
+                ]
+                if blocked:
+                    # Every binding constraint on this account must recover.
+                    recovery = (
+                        max(r for _, r in blocked)
+                        if all(r is not None for _, r in blocked)
+                        else None
+                    )
+                    label = (
+                        "observed exhausted"
+                        if any(
+                            w.get("status") == "observed_exhausted" for w, _ in blocked
+                        )
+                        else "out"
+                    )
+                    candidate = (label, None, recovery)
+                elif all(
+                    w.get("status") == "ok"
+                    and isinstance(w.get("used_percent"), (int, float))
+                    and not isinstance(w["used_percent"], bool)
+                    and math.isfinite(w["used_percent"])
+                    and 0 <= w["used_percent"] < 100
+                    for w in windows
+                ):
+                    candidate = (
+                        "usable",
+                        max(w["used_percent"] for w in windows),
+                        None,
+                    )
+                else:
+                    candidate = ("configured, usage unknown", None, None)
+            pools.setdefault(pool, []).append(candidate)
 
-        # 3. Available headroom: show used % of the tightest window
-        used_percents = [
-            w.get("used_percent")
-            for w in windows
-            if isinstance(w.get("used_percent"), (int, float))
-        ]
-        if used_percents:
-            tightest = max(used_percents)
-            hints.append(f"{pool}: {int(round(tightest))}%")
-            continue
-
-        hints.append(f"{pool}: unavailable")
-
+    priority = ["gemini", "codex", "agy-claude", "claude"]
+    hints: list[str] = []
+    for pool in sorted(
+        pools, key=lambda k: (priority.index(k) if k in priority else 99, k)
+    ):
+        candidates = pools[pool]
+        usable = [used for state, used, _ in candidates if state == "usable"]
+        if usable:
+            hints.append(f"{pool}: {int(round(min(usable)))}%")
+        elif all(state in {"out", "observed exhausted"} for state, _, _ in candidates):
+            # Alternative subscriptions recover independently: choose the first.
+            timed = [c for c in candidates if c[2] is not None]
+            state, _, reset = min(timed, key=lambda c: c[2]) if timed else candidates[0]
+            until = (
+                f" until {_format_routing_reset_time(reset, now=now)}" if reset else ""
+            )
+            hints.append(f"{pool}: {state}{until}")
+        else:
+            labels = sorted({state for state, _, _ in candidates})
+            hints.append(f"{pool}: {', '.join(labels)}")
     return "; ".join(hints)
 
 
@@ -1907,6 +1939,11 @@ def drover_provider_quota(
 
         def member_sort_key(s: Any):
             status = getattr(s, "status", "")
+            if status in {"ok", "observed_exhausted"} and any(
+                w.resets_at is not None and w.resets_at <= current_now
+                for w in s.windows
+            ):
+                status = "stale"
             status_priority = {
                 "observed_exhausted": 4,
                 "ok": 3,
@@ -1942,7 +1979,13 @@ def drover_provider_quota(
         windows_list: list[dict[str, Any]] = []
         for w in representative.windows:
             w_status: str
-            if (
+            if representative.status not in {"ok", "observed_exhausted"}:
+                w_status = representative.status
+                w_source = representative.source
+            elif w.resets_at is not None and w.resets_at <= current_now:
+                w_status = "stale"
+                w_source = representative.source
+            elif (
                 representative.status == "observed_exhausted"
                 or representative.source == "observed_429"
             ) and (w.used_percent == 100.0 or "claude_gpt" in w.kind):
