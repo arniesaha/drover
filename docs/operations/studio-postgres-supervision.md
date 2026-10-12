@@ -10,18 +10,18 @@ live hub plist. The scratch cluster on port 55432 is outside this operation.
 | Property | Verified value |
 | --- | --- |
 | Owner | `arnab`, data directory mode 0700 |
-| Data directory | `/Users/arnab/.drover-postgres-fresh-test` |
+| Data directory | `$HOME/.drover-postgres-fresh-test` |
 | Live postmaster | PID 16988, parent PID 1 |
 | Start time | September 26, 2026, 17:05:24 America/Vancouver |
 | Running binary | `/opt/homebrew/Cellar/postgresql@17/17.11/bin/postgres` |
 | Stable binary | `/opt/homebrew/opt/postgresql@17/bin/postgres`, resolves to the same binary |
-| Startup arguments | `-D /Users/arnab/.drover-postgres-fresh-test`, confirmed by process and `postmaster.opts` |
+| Startup arguments | `-D $HOME/.drover-postgres-fresh-test`, confirmed by process and `postmaster.opts` |
 | Version | PostgreSQL 17.11 (Homebrew) |
 | Port/listen address | 15432, `127.0.0.1` |
-| Unix socket directory | `/Users/arnab/.drover-postgres-fresh-test` |
+| Unix socket directory | `$HOME/.drover-postgres-fresh-test` |
 | Configuration | `postgresql.conf` in the data directory |
 | Authentication/ident | `pg_hba.conf` and `pg_ident.conf` in the data directory |
-| Current stdout/stderr | `/Users/arnab/.drover-postgres-fresh-test/postgres.log`, confirmed with `lsof` |
+| Current stdout/stderr | `$HOME/.drover-postgres-fresh-test/postgres.log`, confirmed with `lsof` |
 | Logging | Collector off; destination stderr; configured log directory `log` and filename `postgresql-%Y-%m-%d_%H%M%S.log` are inactive |
 | Supervision before switch | Manually started orphaned postmaster; matching `pg_ctl status` confirms running; no loaded Postgres agent |
 | Administrator access | Local socket, role `arnab`, superuser; no password or DSN in command arguments |
@@ -63,9 +63,11 @@ run`. During switchover, Python backs up its original bytes, parses the plist,
 and changes exactly this dictionary entry:
 
 ```python
+from pathlib import Path
+
 patched = dict(original)
 patched["ProgramArguments"] = [
-    "/Users/arnab/.drover/maintenance/wait-for-postgres.sh",
+    str(Path.home() / ".drover/maintenance/wait-for-postgres.sh"),
     *original["ProgramArguments"],
 ]
 ```
@@ -81,7 +83,8 @@ startup order. Installer updates can overwrite this host-specific hub change;
 recheck it after any installer run.
 
 The repository maintains the helper and entry scripts under
-`scripts/operations/`. The installed helper is pinned to this host, owner,
+`scripts/operations/`, with home paths resolved at runtime. The staged host
+files retain their verified absolute paths and are unchanged by this repo cleanup. The installed helper is pinned to this host, owner,
 cluster, binary version and port. Preparation pins SHA-256 hashes of the hub
 plist, PostgreSQL plist, wait wrapper, soak probe and three configuration files.
 Changed artifacts cause preflight to refuse execution. Included PostgreSQL

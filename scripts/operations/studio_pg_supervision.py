@@ -10,16 +10,17 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import plistlib
+import pwd
 import re
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
-HOME = Path("/Users/arnab")
+HOME = Path.home()
 ROOT = HOME / ".drover/maintenance"
 DATA = HOME / ".drover-postgres-fresh-test"
 BIN = Path("/opt/homebrew/opt/postgresql@17/bin")
@@ -238,7 +239,7 @@ set -eu
 deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
   if /opt/homebrew/opt/postgresql@17/bin/pg_isready -q -t 1 -h 127.0.0.1 -p 15432 &&
-     /opt/homebrew/opt/postgresql@17/bin/pg_isready -q -t 1 -h /Users/arnab/.drover-postgres-fresh-test -p 15432; then
+     /opt/homebrew/opt/postgresql@17/bin/pg_isready -q -t 1 -h "$HOME/.drover-postgres-fresh-test" -p 15432; then
     exec "$@"
   fi
   sleep 1
@@ -613,7 +614,9 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     require(
-        Path.home() == HOME and os.getuid() == DATA.stat().st_uid,
+        pwd.getpwuid(os.getuid()).pw_name == "arnab"
+        and Path(pwd.getpwuid(os.getuid()).pw_dir) == HOME
+        and os.getuid() == DATA.stat().st_uid,
         "Run as the verified Studio cluster owner",
     )
     require(socket.gethostname() == "Arnabs-Mac-Studio.local", "Wrong host")
