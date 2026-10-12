@@ -96,17 +96,27 @@ separate from the R2 rehearsal design above. It runs as `com.drover.backup` at
 The target is read from private `~/.drover/maintenance/backup-config.json`,
 containing `{"nas": "backup-user@nas-host"}` with the actual user and hostname.
 Keep this file mode 600.
-The NAS requires `python3` and `rsync`. The Studio requires Homebrew GNU rsync
+The NAS requires `python3` and `rsync`, plus a `drover-studio` SSH alias in its
+`~/.ssh/config` with unattended key access back to the Studio. The Studio must
+allow incoming SSH for this account. Transfers run on the NAS, pulling from the
+Studio: UGOS-patched rsync 3.4.1 rejects home-directory paths with `invalid path`
+when used as the receiving server. Local staging still uses Studio rsync.
+The Studio requires Homebrew GNU rsync
 at `/opt/homebrew/bin/rsync`; the built-in openrsync did not apply private
 permissions in the local snapshot check. PostgreSQL 17 clients run on the Studio,
 using its owner-authenticated Unix socket on port 15432.
 
-Successful generations live at `/volume1/backups/drover/<hostname>/<YYYY-MM-DD>/`.
+Successful generations live at
+`/home/<nas-user>/backups/drover/<hostname>/<YYYY-MM-DD>/`, using the configured
+NAS username. This is the approved NAS home-directory target.
 Unverified generations remain under `.pending-<date>` and never update the local
 freshness receipt. An existing generation or pending directory blocks a second
 run for the same date. Inspect failed pending directories before removing them
 and retrying. A nonblocking local lock prevents concurrent jobs. Every command
-failure exits nonzero; logs omit child diagnostics to protect credentials.
+failure exits nonzero; the FAILURE line includes the failed command's exit code,
+while logs omit child diagnostics to protect credentials. Each run starts
+`caffeinate -i -w <pid>` to prevent idle sleep until the backup process exits;
+the Studio's idle sleep setting is one minute.
 
 Contents:
 
@@ -128,9 +138,14 @@ Contents:
   not guaranteed while writers and garbage collection remain active. This job
   does not prove that every catalog reference can be restored.
 
-Files are mode 600 and directories mode 700. Rsync `--link-dest` shares unchanged
-files with the previous successful generation. Do not edit published snapshots
-or recursively chmod them, because hard links share inode metadata. All current
+Rsync requests file mode 600 and directory mode 700. After each successful NAS pull,
+`chmod -R go=` removes group and other access from the pulled subtree because
+the NAS home ACL otherwise leaves files mode 0777. Owner permissions, including
+any owner execute bit left by the ACL, are retained; verification enforces that
+group and other access are absent.
+Rsync `--link-dest` shares unchanged files with the previous successful generation.
+This permission cleanup also removes group and other access from any shared
+inodes; do not edit published snapshots or add access to them. All current
 source data files and staged metadata are checked for size and SHA-256 on the
 NAS. The manifest permits extra data files retained from the first pass.
 Published generations include private `MANIFEST.json`, `SUCCESS.json`, and a
@@ -144,8 +159,12 @@ passes verification. Incomplete generations are retained for investigation.
 Install both Python files under `~/.drover/maintenance/`, mode 700. Render
 `scripts/launchd/com.drover.backup.plist.template` by replacing `__HOME__` with the
 home directory, install it in `~/Library/LaunchAgents/`, validate with `plutil
--lint`, and load using `launchctl bootstrap gui/$(id -u) <plist-path>`. A foreground
-manual run is `/opt/homebrew/bin/python3 ~/.drover/maintenance/studio_backup.py`.
+-lint`, and load using `launchctl bootstrap gui/$(id -u) <plist-path>`. The plist
+must use `~/.drover/runtime/current/bin/python`. macOS Local Network permission
+is per binary; Homebrew Python gets `No route to host` under launchd, while the
+Drover runtime Python has the required permission. Confirm that this runtime
+exists and has Local Network access before loading the agent. A foreground manual
+run is `~/.drover/runtime/current/bin/python ~/.drover/maintenance/studio_backup.py`.
 Logs live in `~/Library/Logs/drover/backup.log`. The successful local receipt is
 `~/.drover/backup-state/last-success.json`; `soak-probe.sh` reports its
 `backup_age_h`. Missing evidence is informational before the first success;

@@ -42,6 +42,7 @@ SSH = [
     str(HOME / ".ssh/id_ed25519_mac_mini_migration"),
 ]
 RSYNC = "/opt/homebrew/bin/rsync"
+STUDIO_FROM_NAS = "drover-studio"  # NAS ~/.ssh/config alias for this Mac
 DATA = {
     "drover-data": Path("/Volumes/M2 1/drover-data"),
     "drover-lakes": Path("/Volumes/M2 1/drover-lakes"),
@@ -91,6 +92,36 @@ def remote(helper, action, root, payload):
 
 
 def sync(source, destination, previous=None, excludes=()):
+    # UGOS ships a patched rsync that refuses non-shared-folder paths when it
+    # runs as the receiving server, so for NAS targets the NAS pulls instead.
+    if destination.startswith(NAS + ":"):
+        remote_dest = destination[len(NAS) + 1 :]
+        args = [
+            "rsync",
+            "-a",
+            "--no-owner",
+            "--no-group",
+            "--chmod=Du=rwx,Dgo=,Fu=rw,Fgo=",
+            "--rsync-path=" + RSYNC,
+        ]
+        if previous:
+            args.append("--link-dest=" + previous)
+        args.extend("--exclude=" + item for item in excludes)
+        args += [STUDIO_FROM_NAS + ":" + str(source) + "/", remote_dest + "/"]
+        # The NAS home ACL leaves pulled files 0777; make the tree private again.
+        run(
+            SSH
+            + [
+                NAS,
+                "umask 077; mkdir -p "
+                + shlex.quote(remote_dest)
+                + " && "
+                + shlex.join(args)
+                + " && chmod -R go= "
+                + shlex.quote(remote_dest),
+            ]
+        )
+        return
     args = [
         RSYNC,
         "-a",
@@ -100,8 +131,6 @@ def sync(source, destination, previous=None, excludes=()):
         "-e",
         shlex.join(SSH),
     ]
-    if destination.startswith(NAS + ":"):
-        args.append("--rsync-path=umask 077; rsync")
     if previous:
         args.append("--link-dest=" + previous)
     args.extend("--exclude=" + item for item in excludes)
@@ -169,7 +198,8 @@ def backup():
     started = time.monotonic()
     date = dt.date.today().isoformat()
     host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())
-    root = "/volume1/backups/drover/" + host
+    # Derive the approved NAS home root from the private account configuration.
+    root = str(Path("/home") / NAS.split("@", 1)[0] / "backups/drover" / host)
     helper = Path(__file__).with_name("nas_snapshot.py").read_text()
     for source in DATA.values():
         if not source.is_dir():
@@ -297,6 +327,8 @@ def backup():
 
 def main():
     os.umask(0o077)
+    # Keep the Mac awake for the run; the Studio sleeps after 1 min idle.
+    subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())])
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     LOG.parent.mkdir(parents=True, exist_ok=True)
     LOG.touch(mode=0o600, exist_ok=True)
@@ -314,6 +346,11 @@ def main():
             log(
                 "FAILURE type="
                 + type(error).__name__
+                + (
+                    " (" + str(error) + ")"
+                    if str(error).startswith("command failed (exit")
+                    else ""
+                )
                 + "; generation unpublished; inspect NAS pending directory"
             )
             return 1
