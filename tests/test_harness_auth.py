@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import json
 import shlex
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1207,3 +1209,38 @@ def test_agy_auth_status_with_current_credential(monkeypatch, tmp_path, store):
             )
         )["email"]
     )
+
+
+@pytest.mark.parametrize("shell_result", ["found", "missing", "timeout"])
+def test_codex_resolution_order_absolute_login_path_then_newest_nvm(
+    monkeypatch, tmp_path, shell_result
+):
+    from drover.server.harness.auth import resolve_executable
+
+    paths = []
+    for version in ("v24.9.0", "v24.13.0", "v24.19.0"):
+        binary = tmp_path / ".nvm/versions/node" / version / "bin/codex"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/usr/bin/env node\n")
+        binary.chmod(0o755)
+        paths.append(binary)
+    # Higher Node version with no executable must not hide the installed CLI.
+    (tmp_path / ".nvm/versions/node/v25.0.0/bin").mkdir(parents=True)
+    login_binary = paths[1]
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        if shell_result == "timeout":
+            raise subprocess.TimeoutExpired("shell", 3)
+        return SimpleNamespace(
+            returncode=0 if shell_result == "found" else 1,
+            stdout=str(login_binary) if shell_result == "found" else "",
+        )
+
+    monkeypatch.setattr("drover.server.harness.auth.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("drover.server.harness.auth.subprocess.run", run)
+    assert resolve_executable(str(paths[0]), login_shell="/bin/sh") == str(paths[0])
+    assert not calls
+    expected = login_binary if shell_result == "found" else paths[-1]
+    assert resolve_executable("codex", login_shell="/bin/sh") == str(expected)

@@ -1443,7 +1443,10 @@ def test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card(
     assert claude["plan_label"] == "max"
 
 
-def test_harnessd_provider_usage_probes_codex_at_its_resolved_executable(tmp_path):
+def test_harnessd_provider_usage_probes_codex_at_its_resolved_executable(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DROVER_CODEX_USAGE_TIMEOUT_SECONDS", "35")
     # harnessd inherits a launchd PATH that omits the CLI's install prefix, so a
     # probe spawning a bare "codex" cannot find it. The preset already resolved
     # the absolute path through the login shell; the probe must reuse it.
@@ -1493,6 +1496,8 @@ for line in sys.stdin:
         server.shutdown()
         server.server_close()
 
+    assert state.provider_usage_probe.command == (str(codex), "app-server", "--stdio")
+    assert state.provider_usage_probe.timeout_s == 35.0
     assert [account["provider"] for account in body["accounts"]] == ["openai"]
     account = body["accounts"][0]
     assert account["status"] == "ok"
