@@ -131,5 +131,151 @@ struct FolderBrowserTests {
         await model.refresh()
         #expect(model.failure == .authentication)
     }
+
+    @Test @MainActor func creationUsesSelectedHostAndCurrentDirectory() async throws {
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        mock.handler = { _ in (200, listingJSON) }
+        await model.refresh()
+        mock.handler = { request in
+            #expect(request.httpMethod == "POST")
+            #expect(request.url?.path == "/harness/hosts/test-host/fs/create")
+            let data = request.httpBody ?? request.bodyStreamData()
+            let body = try! JSONSerialization.jsonObject(with: data) as! [String: String]
+            #expect(body == ["path": "/workspace/project", "name": "new & tools"])
+            return (201, Data("{\"name\":\"new & tools\",\"path\":\"/workspace/project/new & tools\"}".utf8))
+        }
+        #expect(await model.createFolder(name: "new & tools") == "/workspace/project/new & tools")
+        #expect(!model.isCreating)
+        #expect(model.creationFailure == nil)
+    }
+
+    @Test @MainActor func creationFailuresKeepPickerOpenAndCanRetry() async {
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        mock.handler = { _ in (200, listingJSON) }
+        await model.refresh()
+        for (status, code, expected) in [(400, "invalid_name", FolderBrowserFailure.invalidName),
+                                          (409, "folder_exists", .folderExists), (403, "permission_denied", .permissionDenied)] {
+            mock.handler = { _ in (status, Data("{\"error\":\"\(code)\"}".utf8)) }
+            #expect(await model.createFolder(name: "new") == nil)
+            #expect(model.creationFailure == expected)
+            #expect(model.canSelect)
+        }
+        mock.handler = { _ in (201, Data("{\"name\":\"new\",\"path\":\"/workspace/project/new\"}".utf8)) }
+        #expect(await model.createFolder(name: "new") != nil)
+        #expect(model.creationFailure == nil)
+    }
+
+    @Test @MainActor func creationCannotSelectUnexpectedDestinationOrUnloadedFolder() async {
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        #expect(await model.createFolder(name: "new") == nil)
+        mock.handler = { _ in (200, listingJSON) }
+        await model.refresh()
+        mock.handler = { _ in (201, Data("{\"name\":\"new\",\"path\":\"/other/new\"}".utf8)) }
+        #expect(await model.createFolder(name: "new") == nil)
+        #expect(model.creationFailure == .invalidResponse)
+    }
+
+    @Test @MainActor func pagingAppendsDeduplicatesAndStopsAtEnd() async {
+        let first = Data(String(decoding: listingJSON, as: UTF8.self)
+            .replacingOccurrences(of: "\"truncated\":false", with: "\"truncated\":true,\"next_cursor\":\"page & 2\"").utf8)
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        mock.handler = { _ in (200, first) }
+        await model.refresh()
+        mock.handler = { request in
+            let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!
+            #expect(items.contains(URLQueryItem(name: "cursor", value: "page & 2")))
+            #expect(items.contains(URLQueryItem(name: "limit", value: "100")))
+            return (200, Data("""
+            {"roots":[{"name":"Home","path":"/workspace"}],"path":"/workspace/project",
+             "parent":"/workspace","entries":[
+             {"name":"tools","path":"/workspace/project/tools","is_dir":true,"is_git_repo":true,"hidden":false},
+             {"name":"next","path":"/workspace/project/next","is_dir":true,"is_git_repo":false,"hidden":false}],
+             "truncated":false,"next_cursor":null}
+            """.utf8))
+        }
+        await model.loadMore()
+        #expect(model.filteredEntries.map(\.name) == ["Sources", "tools", "next"])
+        #expect(model.listing?.nextCursor == nil)
+        mock.handler = { _ in Issue.record("No request after last page"); return (500, Data()) }
+        await model.loadMore()
+    }
+
+    @Test @MainActor func pagingFailurePreservesEntriesAndFilterRefreshResetsPages() async {
+        let first = Data(String(decoding: listingJSON, as: UTF8.self)
+            .replacingOccurrences(of: "\"truncated\":false", with: "\"truncated\":true,\"next_cursor\":\"page2\"").utf8)
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        mock.handler = { _ in (200, first) }
+        await model.refresh()
+        mock.handler = { _ in (502, Data("{\"error\":\"offline\"}".utf8)) }
+        await model.loadMore()
+        #expect(model.pageFailure == .offline)
+        #expect(model.listing?.entries.count == 2)
+        #expect(model.canSelect)
+        model.filter = "SOURCE"
+        mock.handler = { _ in Issue.record("No page request for changed filter"); return (500, Data()) }
+        await model.loadMore()
+        mock.handler = { request in
+            let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!
+            #expect(items.contains(URLQueryItem(name: "cursor", value: "")))
+            #expect(items.contains(URLQueryItem(name: "filter", value: "SOURCE")))
+            return (200, listingJSON)
+        }
+        await model.refresh()
+        #expect(model.pageFailure == nil)
+        #expect(model.listing?.nextCursor == nil)
+        #expect(model.filteredEntries.map(\.name) == ["Sources"])
+    }
+
+
+    @Test @MainActor func refreshDiscardsAnInFlightPageAndPreventsDuplicateLoads() async throws {
+        let first = Data(String(decoding: listingJSON, as: UTF8.self)
+            .replacingOccurrences(of: "\"truncated\":false", with: "\"truncated\":true,\"next_cursor\":\"page2\"").utf8)
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        mock.handler = { _ in (200, first) }
+        await model.refresh()
+        let started = MockFlag()
+        mock.responseDelay = { request in
+            let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!
+            if items.contains(URLQueryItem(name: "cursor", value: "page2")) {
+                #expect(!started.isRaised)
+                started.raise()
+                return 0.1
+            }
+            return nil
+        }
+        mock.handler = { request in
+            let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!
+            if items.contains(URLQueryItem(name: "cursor", value: "page2")) {
+                return (200, first)
+            }
+            return (200, listingJSON)
+        }
+        let page = Task { await model.loadMore() }
+        for _ in 0..<100 where !started.isRaised { try await Task.sleep(for: .milliseconds(1)) }
+        #expect(started.isRaised)
+        await model.loadMore()
+        model.filter = "tools"
+        await model.refresh()
+        await page.value
+        #expect(model.listing?.nextCursor == nil)
+        #expect(model.listing?.entries.count == 2)
+        #expect(!model.isLoadingMore)
+        #expect(model.pageFailure == nil)
+    }
+
+    @Test @MainActor func staleCursorExplainsReloadAndPreservesSelection() async {
+        let first = Data(String(decoding: listingJSON, as: UTF8.self)
+            .replacingOccurrences(of: "\"truncated\":false", with: "\"truncated\":true,\"next_cursor\":\"page2\"").utf8)
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        mock.handler = { _ in (200, first) }
+        await model.refresh()
+        mock.handler = { _ in (400, Data("{\"error\":\"invalid_cursor\"}".utf8)) }
+        await model.loadMore()
+        #expect(model.pageFailure == .staleListing)
+        #expect(model.pageFailure?.message.contains("Reload folders") == true)
+        #expect(model.canSelect)
+        #expect(model.listing?.entries.count == 2)
+    }
+
 }
 }

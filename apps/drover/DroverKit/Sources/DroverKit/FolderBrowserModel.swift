@@ -34,13 +34,21 @@ public struct FolderListing: Decodable, Sendable, Equatable {
     public let parent: String?
     public let entries: [FolderEntry]
     public let truncated: Bool
+    public let nextCursor: String?
+    private enum CodingKeys: String, CodingKey {
+        case roots, path, parent, entries, truncated
+        case nextCursor = "next_cursor"
+    }
 }
 
 public enum FolderBrowserFailure: Sendable, Equatable {
-    case outsideAllowedFolders, symlinkNotAllowed, hiddenFolderNotAllowed, permissionDenied, authentication, offline, unsupported, hostUnavailable, unavailable, invalidResponse
+    case staleListing, invalidName, folderExists, outsideAllowedFolders, symlinkNotAllowed, hiddenFolderNotAllowed, permissionDenied, authentication, offline, unsupported, hostUnavailable, unavailable, invalidResponse
 
     public static func classify(_ error: Error) -> Self {
         switch error as? DroverError {
+        case .conflict, .httpStatus(409, _): return .folderExists
+        case .badRequest("invalid_cursor"): return .staleListing
+        case .badRequest("invalid_name"): return .invalidName
         case .unauthorized, .httpStatus(401, _): return .authentication
         case .httpStatus(403, let detail):
             switch detail {
@@ -71,6 +79,9 @@ public enum FolderBrowserFailure: Sendable, Equatable {
 
     public var message: String {
         switch self {
+        case .staleListing: "This folder changed while browsing. Reload folders to continue."
+        case .invalidName: "Enter a folder name without slashes, a leading dot, or surrounding spaces."
+        case .folderExists: "A folder or file with this name already exists. Choose another name."
         case .outsideAllowedFolders: "This folder is outside the host’s allowed folders. Choose a folder from the listed locations."
         case .symlinkNotAllowed: "This folder uses a symbolic link, which this host does not allow for browsing."
         case .hiddenFolderNotAllowed: "This host does not allow browsing hidden folders."
@@ -96,6 +107,11 @@ public final class FolderBrowserModel {
     public private(set) var listing: FolderListing?
     public private(set) var failure: FolderBrowserFailure?
     public private(set) var isLoading = false
+    public private(set) var isLoadingMore = false
+    public private(set) var pageFailure: FolderBrowserFailure?
+    public private(set) var isCreating = false
+    public private(set) var creationFailure: FolderBrowserFailure?
+    private var loadedFilter = ""
     private var generation = 0
 
     public init(client: DroverClient, hostID: String, path: String) {
@@ -105,7 +121,7 @@ public final class FolderBrowserModel {
     }
 
     public var canSelect: Bool {
-        !path.isEmpty && listing?.path != nil && !isLoading && failure == nil
+        !path.isEmpty && listing?.path != nil && !isLoading && !isCreating && failure == nil
     }
 
     public var filteredEntries: [FolderEntry] {
@@ -133,15 +149,19 @@ public final class FolderBrowserModel {
         generation &+= 1
         let requestGeneration = generation
         isLoading = true
+        isLoadingMore = false
+        pageFailure = nil
         failure = nil
+        let requestedFilter = filter
         do {
-            let response = try await client.listFolders(hostID: hostID, path: path, filter: filter)
+            let response = try await client.listFolders(hostID: hostID, path: path, filter: requestedFilter)
             guard requestGeneration == generation else { return }
             if Task.isCancelled {
                 isLoading = false
                 return
             }
             listing = response
+            loadedFilter = requestedFilter
         } catch {
             guard requestGeneration == generation else { return }
             if Task.isCancelled || (error as? DroverError)?.isCancellation == true {
@@ -152,6 +172,54 @@ public final class FolderBrowserModel {
         }
         isLoading = false
     }
+
+    public func loadMore() async {
+        guard !isLoading, !isLoadingMore, filter == loadedFilter,
+              let previous = listing, let cursor = previous.nextCursor else { return }
+        let requestGeneration = generation
+        let requestedFilter = loadedFilter
+        isLoadingMore = true
+        pageFailure = nil
+        do {
+            let response = try await client.listFolders(hostID: hostID, path: path, filter: requestedFilter, cursor: cursor)
+            guard generation == requestGeneration, filter == requestedFilter, !Task.isCancelled else {
+                if generation == requestGeneration { isLoadingMore = false }
+                return
+            }
+            guard response.path == previous.path, response.roots == previous.roots else {
+                throw DroverError.decoding("Page destination changed")
+            }
+            let ids = Set(previous.entries.map(\.id))
+            listing = FolderListing(roots: response.roots, path: response.path, parent: response.parent,
+                                    entries: previous.entries + response.entries.filter { !ids.contains($0.id) },
+                                    truncated: response.truncated, nextCursor: response.nextCursor)
+        } catch {
+            guard generation == requestGeneration else { return }
+            if filter == requestedFilter && !Task.isCancelled && (error as? DroverError)?.isCancellation != true {
+                pageFailure = FolderBrowserFailure.classify(error)
+            }
+        }
+        isLoadingMore = false
+    }
+
+    public func prepareCreation() { creationFailure = nil }
+
+    public func createFolder(name: String) async -> String? {
+        guard canSelect, !isCreating, let parent = listing?.path else { return nil }
+        isCreating = true
+        creationFailure = nil
+        defer { isCreating = false }
+        do {
+            let folder = try await client.createFolder(hostID: hostID, path: parent, name: name)
+            let expected = (parent == "/" ? "" : parent) + "/" + name
+            guard folder.path == expected else { throw DroverError.decoding("Created folder destination changed") }
+            return folder.path
+        } catch {
+            creationFailure = FolderBrowserFailure.classify(error)
+            return nil
+        }
+    }
+
 }
 
 /// A saved location's path remains the selection value; its label describes the project.

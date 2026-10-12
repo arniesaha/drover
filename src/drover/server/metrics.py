@@ -2133,15 +2133,42 @@ class MetricsCollector:
         )
 
     def proxy_harness_fs_list(
-        self, host_id: str, path_text: str, query: str = ""
+        self,
+        host_id: str,
+        path_text: str,
+        query: str = "",
+        cursor: str = "",
+        limit: str = "100",
     ) -> tuple[int, str]:
         """Browse bounded directory metadata on the selected host."""
         return self._proxy_harness_fs(
             host_id,
             "/fs/list?"
-            + urlencode({"host_id": host_id, "path": path_text, "filter": query}),
+            + urlencode(
+                {
+                    "host_id": host_id,
+                    "path": path_text,
+                    "filter": query,
+                    "cursor": cursor,
+                    "limit": limit,
+                }
+            ),
             method="GET",
             payload={},
+        )
+
+    def proxy_harness_fs_create(
+        self, host_id: str, payload: Mapping[str, Any]
+    ) -> tuple[int, str]:
+        return self._proxy_harness_fs(
+            host_id,
+            "/fs/create",
+            method="POST",
+            payload={
+                "host_id": host_id,
+                "path": payload.get("path"),
+                "name": payload.get("name"),
+            },
         )
 
     def proxy_harness_fs_complete(
