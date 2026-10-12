@@ -87,3 +87,89 @@ catalog references and verified generation dependencies. Incomplete generations
 need explicit cleanup, and operators must review R2 lifecycle and cost settings.
 No production R2 backup, restore, receipt, or automated retention workflow
 described here is available yet.
+
+## Studio NAS snapshots
+
+The operator-authorized machine backup in `scripts/backup/studio_backup.py` is
+separate from the R2 rehearsal design above. It runs as `com.drover.backup` at
+03:30 local time and uses SSH key authentication to the configured NAS account.
+The target is read from private `~/.drover/maintenance/backup-config.json`,
+containing `{"nas": "backup-user@nas-host"}` with the actual user and hostname.
+Keep this file mode 600.
+The NAS requires `python3` and `rsync`, plus a `drover-studio` SSH alias in its
+`~/.ssh/config` with unattended key access back to the Studio. The Studio must
+allow incoming SSH for this account. Transfers run on the NAS, pulling from the
+Studio: UGOS-patched rsync 3.4.1 rejects home-directory paths with `invalid path`
+when used as the receiving server. Local staging still uses Studio rsync.
+The Studio requires Homebrew GNU rsync
+at `/opt/homebrew/bin/rsync`; the built-in openrsync did not apply private
+permissions in the local snapshot check. PostgreSQL 17 clients run on the Studio,
+using its owner-authenticated Unix socket on port 15432.
+
+Successful generations live at
+`/home/<nas-user>/backups/drover/<hostname>/<YYYY-MM-DD>/`, using the configured
+NAS username. This is the approved NAS home-directory target.
+Unverified generations remain under `.pending-<date>` and never update the local
+freshness receipt. An existing generation or pending directory blocks a second
+run for the same date. Inspect failed pending directories before removing them
+and retrying. A nonblocking local lock prevents concurrent jobs. Every command
+failure exits nonzero; the FAILURE line includes the failed command's exit code,
+while logs omit child diagnostics to protect credentials. Each run starts
+`caffeinate -i -w <pid>` to prevent idle sleep until the backup process exits;
+the Studio's idle sleep setting is one minute.
+
+Contents:
+
+- `metadata/postgres`: globals, custom-format dumps of every non-template database,
+  local archive lists, database filename mapping, and cluster configuration files.
+  Each dump is listed locally before transfer, hashed, checked on the NAS, read
+  back from the NAS, and listed again with the Studio's `pg_restore`.
+- `metadata/configs`: `~/.drover`, including env files, credentials, config,
+  maintenance scripts, and historical operational artifacts. Exclusions are
+  rebuildable `runtime`, `worktrees`, `rollout-worktrees`, the `incoming` symlink,
+  backup scratch state, sockets, and DuckDB files. Symlinks are preserved.
+- `metadata/launchagents`: the user's LaunchAgents, including their historical copies.
+- `metadata/registry`: a live copy of `drover.registry.duckdb` and its WAL if present.
+  Metadata stability is checked and the copy retried up to three times. This is
+  **not a transactional DuckDB export**, and consistency is not guaranteed.
+- `drover-data` and `drover-lakes`: the two `/Volumes/M2 1/` data roots. Both are
+  copied before and after the Postgres dumps. The second pass does not delete
+  files retained by the first. Cross-database and catalog-to-file atomicity are
+  not guaranteed while writers and garbage collection remain active. This job
+  does not prove that every catalog reference can be restored.
+
+Rsync requests file mode 600 and directory mode 700. After each successful NAS pull,
+`chmod -R go=` removes group and other access from the pulled subtree because
+the NAS home ACL otherwise leaves files mode 0777. Owner permissions, including
+any owner execute bit left by the ACL, are retained; verification enforces that
+group and other access are absent.
+Rsync `--link-dest` shares unchanged files with the previous successful generation.
+This permission cleanup also removes group and other access from any shared
+inodes; do not edit published snapshots or add access to them. All current
+source data files and staged metadata are checked for size and SHA-256 on the
+NAS. The manifest permits extra data files retained from the first pass.
+Published generations include private `MANIFEST.json`, `SUCCESS.json`, and a
+consistency warning. Archive listing checks structure, not a complete restore.
+
+Retention preserves the newest seven successful daily generations and the newest
+representative from each of the latest four ISO calendar weeks. These sets can
+overlap. Other successful date directories are pruned only after a new generation
+passes verification. Incomplete generations are retained for investigation.
+
+Install both Python files under `~/.drover/maintenance/`, mode 700. Render
+`scripts/launchd/com.drover.backup.plist.template` by replacing `__HOME__` with the
+home directory, install it in `~/Library/LaunchAgents/`, validate with `plutil
+-lint`, and load using `launchctl bootstrap gui/$(id -u) <plist-path>`. The plist
+must use `~/.drover/runtime/current/bin/python`. macOS Local Network permission
+is per binary; Homebrew Python gets `No route to host` under launchd, while the
+Drover runtime Python has the required permission. Confirm that this runtime
+exists and has Local Network access before loading the agent. A foreground manual
+run is `~/.drover/runtime/current/bin/python ~/.drover/maintenance/studio_backup.py`.
+Logs live in `~/Library/Logs/drover/backup.log`. The successful local receipt is
+`~/.drover/backup-state/last-success.json`; `soak-probe.sh` reports its
+`backup_age_h`. Missing evidence is informational before the first success;
+once present, evidence older than 36 hours or invalid evidence fails the probe.
+
+WAL/PITR instructions belong in `~/.drover/maintenance/pg-wal-archiving.md`.
+They are a deferred maintenance plan, with no cluster restart or WAL changes
+performed by this job.
