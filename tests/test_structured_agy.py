@@ -591,7 +591,8 @@ def test_probe_never_raises_when_the_transport_explodes(tmp_path: Path):
         opener=open_,
     ).read()
 
-    assert snapshot.status in ("usage_unavailable", "error")
+    assert snapshot.status == "error"
+    assert snapshot.error_category == "unavailable"
     assert snapshot.windows == ()
 
 
@@ -790,8 +791,8 @@ def test_model_group_from_model():
     assert model_group_from_model("custom-model") == "gemini"
 
 
-def test_sliding_response_omits_untracked_buckets(tmp_path: Path):
-    """Buckets whose resetTime slides with fetch_time + window are omitted."""
+def test_sliding_response_keeps_untouched_usage_without_resets(tmp_path: Path):
+    """Mixed usage preserves fixed resets and hides sliding untouched resets."""
     accounts = tmp_path / "google_accounts.json"
     accounts.write_text(json.dumps({"active": "someone@example.com"}))
 
@@ -848,52 +849,81 @@ def test_sliding_response_omits_untracked_buckets(tmp_path: Path):
     ).read()
 
     assert snapshot.status == "ok"
-    # Sliding 3p buckets must be omitted, never reported as 100% remaining (0% used)
     kinds = {w.kind: w for w in snapshot.windows}
     assert "seven_day" in kinds
-    assert "seven_day_claude_gpt" not in kinds
-    assert "five_hour_claude_gpt" not in kinds
+    assert len(kinds) == 3
+    assert snapshot.error_category is None
     assert kinds["seven_day"].used_percent == pytest.approx(15.0)
+    assert kinds["seven_day"].resets_at == fixed_gemini_reset
+    for kind in ("seven_day_claude_gpt", "five_hour_claude_gpt"):
+        assert kinds[kind].used_percent == 0.0
+        assert kinds[kind].resets_at is None
 
 
-def test_sliding_response_with_no_fixed_buckets_is_usage_unavailable(tmp_path: Path):
-    """When all buckets in response slide, status is usage_unavailable."""
-    accounts = tmp_path / "google_accounts.json"
-    accounts.write_text(json.dumps({"active": "someone@example.com"}))
-
-    fetch_time = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
-    sliding_weekly_reset = fetch_time + timedelta(days=7)
-
+@pytest.mark.parametrize("offset_seconds", [-120, 0, 120])
+def test_all_untouched_buckets_report_zero_usage_without_sliding_resets(
+    tmp_path: Path, offset_seconds: int
+):
+    fetch_time = datetime(2026, 8, 10, 10, tzinfo=timezone.utc)
     payload = {
         "groups": [
             {
-                "displayName": "Claude and GPT models",
                 "buckets": [
                     {
-                        "bucketId": "3p-weekly",
-                        "window": "weekly",
-                        "resetTime": sliding_weekly_reset.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ"
-                        ),
+                        "bucketId": f"{group}-{window}",
+                        "window": window,
                         "remainingFraction": 1,
+                        "resetTime": (
+                            fetch_time + duration + timedelta(seconds=offset_seconds)
+                        ).isoformat(),
                     }
-                ],
+                    for window, duration in (
+                        ("weekly", timedelta(days=7)),
+                        ("5h", timedelta(hours=5)),
+                    )
+                ]
             }
+            for group in ("gemini", "3p")
         ]
     }
-
-    calls: list = []
     snapshot = AgyUsageProbe(
-        accounts_path=accounts,
+        accounts_path=tmp_path / "missing.json",
         state_dir=tmp_path,
         keychain_reader=lambda: _cred(),
-        opener=_opener(calls, payload=payload),
+        opener=_opener([], payload=payload),
         now=lambda: fetch_time,
     ).read()
 
-    assert snapshot.status == "usage_unavailable"
+    assert snapshot.status == "ok"
+    assert snapshot.error_category is None
+    assert len(snapshot.windows) == 4
+    assert {w.kind for w in snapshot.windows} == {
+        "seven_day",
+        "five_hour",
+        "seven_day_claude_gpt",
+        "five_hour_claude_gpt",
+    }
+    assert all(w.used_percent == 0.0 for w in snapshot.windows)
+    assert all(w.resets_at is None for w in snapshot.windows)
+    assert sorted(w.window_minutes for w in snapshot.windows) == [
+        300,
+        300,
+        10080,
+        10080,
+    ]
+
+
+def test_successful_empty_quota_response_is_not_unreachable(tmp_path: Path):
+    snapshot = AgyUsageProbe(
+        accounts_path=tmp_path / "missing.json",
+        state_dir=tmp_path,
+        keychain_reader=lambda: _cred(),
+        opener=_opener([], payload={"groups": []}),
+    ).read()
+
+    assert snapshot.status == "ok"
+    assert snapshot.error_category is None
     assert snapshot.windows == ()
-    assert snapshot.error_category == "quota_api_unreachable"
 
 
 def test_observed_exhaustion_snapshot_and_expiry(tmp_path: Path):
@@ -934,13 +964,13 @@ def test_observed_exhaustion_snapshot_and_expiry(tmp_path: Path):
 
         # Another host is unaffected
         snap_other = probe.read(host_id="other-host")
-        assert snap_other.status == "usage_unavailable"
+        assert snap_other.status == "ok"
         assert snap_other.source == "agy-usage"
 
         # After reset passes: status reverts to normal probe status
         probe.now = lambda: t0 + timedelta(hours=2, minutes=1)
         snap2 = probe.read(host_id="test-host")
-        assert snap2.status == "usage_unavailable"
+        assert snap2.status == "ok"
         assert snap2.source == "agy-usage"
     finally:
         clear_observed_exhaustions()
@@ -1056,6 +1086,7 @@ def test_consumed_bucket_with_fresh_window_is_kept(tmp_path: Path):
     ).read()
     kinds = {w.kind: w for w in snapshot.windows}
     assert kinds["five_hour"].used_percent == pytest.approx(2.0)
+    assert kinds["five_hour"].resets_at == fetch_time + timedelta(hours=5)
 
 
 def test_model_group_falls_back_to_429_text():

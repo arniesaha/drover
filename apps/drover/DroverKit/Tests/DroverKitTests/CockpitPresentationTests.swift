@@ -909,7 +909,7 @@ private let fourAnthropicWindows = """
 
     #expect(headline.fraction == 0.75)
     #expect(headline.usedText == "750 credits used")
-    #expect(headline.detailText == "250 credits remaining · Reset unavailable")
+    #expect(headline.detailText == "250 credits remaining")
 }
 
 /// A provider reporting a zero limit would divide by zero into an infinite bar.
@@ -1240,4 +1240,26 @@ private let fourAnthropicWindows = """
     let account = try JSONDecoder().decode(ProviderAccount.self, from: Data(#"{"snapshot_id":"a","dedup_key":"a","provider":"google","account_label":null,"account_identity":null,"host_id":"studio","status":"ok","observed_at":"2026-10-01T18:00:00Z","source":"agy-usage","windows":[]}"#.utf8))
     #expect(account.accountIdentity == nil)
     #expect(ProviderSubscriptionGrouping.group([account])[0].accountLabel == "Unknown account")
+}
+
+@Test func untouchedGoogleWindowsShowZeroUsageWithoutResetTextAndHealthyHost() throws {
+    let account = try providerAccount(
+        snapshot: "s1", provider: "google", label: "Antigravity",
+        host: "test-host", observedAt: "2026-08-09T18:00:00Z",
+        windows: #"[{"kind":"seven_day","used_percent":0,"resets_at":null},{"kind":"five_hour","used_percent":0,"resets_at":null},{"kind":"seven_day_claude_gpt","used_percent":0,"resets_at":null},{"kind":"five_hour_claude_gpt","used_percent":0,"resets_at":null}]"#
+    )
+    let subscription = try #require(ProviderSubscriptionGrouping
+        .group([account], now: account.observedAt).first)
+
+    #expect(subscription.status == .ok)
+    #expect(subscription.windows.count == 4)
+    #expect(subscription.hosts.first?.symbol == "checkmark.circle.fill")
+    #expect(subscription.headline.remainingText == "100% remaining")
+    for window in subscription.windows {
+        let headline = ProviderHeadline(account: account, window: window, now: account.observedAt)
+        #expect(headline.usedText == "0% used")
+        #expect(headline.fraction == 0)
+        #expect(headline.detailText == "100% remaining")
+        #expect(headline.isCritical == false)
+    }
 }
