@@ -1187,3 +1187,94 @@ def test_optional_quota_refresh_background_failure_preserves_prior_state(
         release.set()
     assert finished.wait(5)
     assert provider_service.latest_accounts() == before
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, 20.0),
+        ("35.5", 35.5),
+        ("0", 20.0),
+        ("-1", 20.0),
+        ("nan", 20.0),
+        ("inf", 20.0),
+        ("invalid", 20.0),
+    ],
+)
+def test_codex_probe_timeout_environment(monkeypatch, raw, expected):
+    from drover.server.providers.codex import CODEX_USAGE_TIMEOUT_ENV
+
+    monkeypatch.delenv(CODEX_USAGE_TIMEOUT_ENV, raising=False)
+    if raw is not None:
+        monkeypatch.setenv(CODEX_USAGE_TIMEOUT_ENV, raw)
+    assert CodexUsageProbe().timeout_s == expected
+    assert CodexUsageProbe(timeout_s=0.25).timeout_s == 0.25
+
+
+def test_codex_probe_uses_selected_nvm_node_and_logs_version(
+    tmp_path, monkeypatch, caplog
+):
+    nvm_bin = tmp_path / ".nvm/versions/node/v24.19.0/bin"
+    nvm_bin.mkdir(parents=True)
+    node = nvm_bin / "node"
+    node.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    node.chmod(0o755)
+    codex = nvm_bin / "codex"
+    codex.write_text("""#!/usr/bin/env node
+import json
+import sys
+if "--version" in sys.argv:
+    print("codex-cli 0.160.1")
+    sys.exit(0)
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    result = {}
+    if request["method"] == "account/read":
+        assert request["params"] == {"refreshToken": False}
+        result = {"account": {"email": "private@example.invalid", "planType": "plus"}}
+    elif request["method"] == "account/rateLimits/read":
+        result = {"rateLimits": {"primary": {"usedPercent": 25}}}
+    print(json.dumps({"id": request["id"], "result": result}), flush=True)
+""")
+    codex.chmod(0o755)
+    # The daemon has no Node on PATH. The chosen CLI must carry its own runtime.
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    probe = CodexUsageProbe((str(codex), "app-server", "--stdio"))
+    with caplog.at_level(logging.INFO):
+        assert probe.read().status == "ok"
+        assert probe.read().status == "ok"
+    assert caplog.text.count("version=0.160.1") == 1
+    assert f"executable={codex}" in caplog.text
+    for phase in ("startup", "initialize", "account/read", "account/rateLimits/read"):
+        assert f"phase={phase}" in caplog.text
+    assert "private@example.invalid" not in caplog.text
+
+
+@pytest.mark.parametrize("timeout_s, expected", [(0.5, "timeout"), (2.0, None)])
+def test_codex_probe_timeout_is_one_total_budget(tmp_path, caplog, timeout_s, expected):
+    script = tmp_path / "slow.py"
+    script.write_text("""import json
+import sys
+import time
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    time.sleep(0.2)
+    result = {"account": {"planType": "plus"}, "rateLimits": {"primary": {"usedPercent": 25}}}
+    print(json.dumps({"id": request["id"], "result": result}), flush=True)
+""")
+    from time import monotonic
+
+    probe = CodexUsageProbe((sys.executable, "-u", str(script)), timeout_s=timeout_s)
+    started = monotonic()
+    with caplog.at_level(logging.INFO):
+        snapshot = probe.read()
+    assert monotonic() - started < 2
+    assert snapshot.error_category == expected
+    if expected:
+        assert "status=timeout" in caplog.text
+    else:
+        assert "phase=account/rateLimits/read" in caplog.text
