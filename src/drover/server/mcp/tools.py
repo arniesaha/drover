@@ -1798,6 +1798,7 @@ def drover_provider_quota(
     fresh: bool = False,
     timeout_s: float = 3.0,
     service: Any | None = None,
+    fetch: Any | None = None,
     now: datetime | None = None,
 ) -> dict:
     """Read-only provider quota for every account across hosts with routing hint."""
@@ -1817,6 +1818,7 @@ def drover_provider_quota(
         clock=lambda: current_now,
     )
 
+    refresh_errors: list[dict[str, str]] = []
     if fresh:
         try:
             registry = HarnessRegistry(db_path)
@@ -1834,17 +1836,44 @@ def drover_provider_quota(
                     max_workers=min(8, len(online_hosts))
                 )
                 try:
-                    futures = [
-                        executor.submit(usage_service.refresh_host, host)
+
+                    def refresh(host):
+                        if fetch is None:
+                            raise RuntimeError("transport_unavailable")
+                        return usage_service.refresh_host(
+                            host, fetch=fetch, record_failures=False
+                        )
+
+                    futures = {
+                        executor.submit(refresh, host): host.host_id
                         for host in online_hosts
-                    ]
-                    concurrent.futures.wait(futures, timeout=timeout_s)
+                    }
+                    done, pending = concurrent.futures.wait(futures, timeout=timeout_s)
+                    for future in done:
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            category = str(exc)
+                            if category not in {
+                                "timeout",
+                                "unavailable",
+                                "protocol_error",
+                                "empty_inventory",
+                                "provider_error",
+                                "transport_unavailable",
+                            }:
+                                category = "unavailable"
+                            refresh_errors.append(
+                                {"host_id": futures[future], "error_category": category}
+                            )
+                    refresh_errors.extend(
+                        {"host_id": futures[future], "error_category": "timeout"}
+                        for future in pending
+                    )
                 finally:
                     executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
-            logging.getLogger(__name__).debug(
-                "fresh provider quota refresh encountered an error", exc_info=True
-            )
+            refresh_errors.append({"host_id": "", "error_category": "unavailable"})
 
     try:
         raw_snapshots = usage_service.latest_accounts()
@@ -1854,6 +1883,9 @@ def drover_provider_quota(
             "accounts": [],
             "routing_hint": "no provider accounts configured",
             "updated_at": None,
+            "refresh_errors": sorted(
+                refresh_errors, key=lambda error: error["host_id"]
+            ),
         }
 
     if provider:
@@ -1959,6 +1991,7 @@ def drover_provider_quota(
         "accounts": account_records,
         "routing_hint": routing_hint,
         "updated_at": overall_updated_at,
+        "refresh_errors": sorted(refresh_errors, key=lambda error: error["host_id"]),
     }
 
 

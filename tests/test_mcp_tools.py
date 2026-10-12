@@ -1499,7 +1499,8 @@ def test_provider_quota_fresh_probes_online_hosts(tmp_path: Path):
     refreshed: list[str] = []
 
     class MockService:
-        def refresh_host(self, host):
+        def refresh_host(self, host, *, fetch, record_failures):
+            assert record_failures is False
             refreshed.append(host.host_id)
 
         def latest_accounts(self):
@@ -1518,6 +1519,7 @@ def test_provider_quota_fresh_probes_online_hosts(tmp_path: Path):
         duckdb_path=path,
         fresh=True,
         service=MockService(),
+        fetch=lambda host: {},
     )
     assert refreshed == ["host-online"]
 
@@ -1534,7 +1536,7 @@ def test_provider_quota_fresh_returns_within_timeout(tmp_path: Path):
     )
 
     class SlowService:
-        def refresh_host(self, host):
+        def refresh_host(self, host, *, fetch, record_failures):
             time.sleep(2.0)
 
         def latest_accounts(self):
@@ -1542,6 +1544,10 @@ def test_provider_quota_fresh_returns_within_timeout(tmp_path: Path):
 
     started = time.monotonic()
     mcp_tools.drover_provider_quota(
-        duckdb_path=path, fresh=True, timeout_s=0.2, service=SlowService()
+        duckdb_path=path,
+        fresh=True,
+        timeout_s=0.2,
+        service=SlowService(),
+        fetch=lambda host: {},
     )
     assert time.monotonic() - started < 1.5

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.auth.settings import AuthSettings as MCPAuthSettings
 from mcp.server.fastmcp import FastMCP
@@ -35,6 +35,8 @@ def build_mcp_server(
     spans_enabled: bool = False,
     embedding_model: Optional[str] = None,
     auth: AuthSettings | None = None,
+    provider_usage: Any | None = None,
+    provider_fetch: Any | None = None,
 ) -> FastMCP:
     """Construct a FastMCP server with all Drover tools registered.
 
@@ -496,11 +498,16 @@ def build_mcp_server(
         Optional args:
         - provider: filter to a specific provider ('google', 'openai', 'anthropic')
         - fresh: force a re-probe of online hosts bounded by a timeout
+
+        Refresh failures preserve saved quota and appear in refresh_errors,
+        keyed by host_id with a sanitized error_category.
         """
         return t.drover_provider_quota(
             duckdb_path=db,
             provider=provider,
             fresh=fresh,
+            service=provider_usage,
+            fetch=provider_fetch,
         )
 
     return mcp

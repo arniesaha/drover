@@ -1080,3 +1080,110 @@ def test_observed_exhausted_persists_in_latest_accounts_until_reset_passes(tmp_p
     assert len(accounts) == 1
     assert accounts[0].status == "stale"
     assert accounts[0].error_category == "provider_window_expired"
+
+
+@pytest.mark.parametrize(
+    "failure", ["transport", "protocol", "empty", "provider", "missing_transport"]
+)
+def test_optional_quota_refresh_preserves_prior_state(
+    provider_service, provider_host, failure
+):
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.mcp.tools import drover_provider_quota
+
+    now = datetime.fromisoformat(GOOD_PAYLOAD["observed_at"])
+    provider_service.clock = lambda: now
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    HarnessRegistry(provider_service.duckdb_path).register_host(
+        host_id=provider_host.host_id,
+        display_name="Synthetic host",
+        kind="mac",
+    )
+    before = provider_service.latest_accounts()
+    con = duckdb.connect(str(provider_service.duckdb_path))
+    connections_before = con.execute("SELECT * FROM provider_connections").fetchall()
+    con.close()
+
+    def fetch(host):
+        if failure == "transport":
+            raise TimeoutError("private diagnostic must not escape")
+        if failure == "protocol":
+            return {"accounts": "invalid"}
+        if failure == "empty":
+            return {"accounts": []}
+        return CODEX_ERROR_PAYLOAD
+
+    result = drover_provider_quota(
+        duckdb_path=provider_service.duckdb_path,
+        service=provider_service,
+        fresh=True,
+        fetch=None if failure == "missing_transport" else fetch,
+        now=now,
+    )
+    category = {
+        "transport": "timeout",
+        "protocol": "protocol_error",
+        "empty": "empty_inventory",
+        "provider": "provider_error",
+        "missing_transport": "transport_unavailable",
+    }[failure]
+    assert result["refresh_errors"] == [
+        {"host_id": provider_host.host_id, "error_category": category}
+    ]
+    assert result["accounts"][0]["status"] == "ok"
+    assert provider_service.latest_accounts() == before
+    con = duckdb.connect(str(provider_service.duckdb_path))
+    assert (
+        con.execute("SELECT * FROM provider_connections").fetchall()
+        == connections_before
+    )
+    con.close()
+
+
+def test_optional_quota_refresh_background_failure_preserves_prior_state(
+    provider_service, provider_host
+):
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.mcp.tools import drover_provider_quota
+
+    now = datetime.fromisoformat(GOOD_PAYLOAD["observed_at"])
+    provider_service.clock = lambda: now
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    HarnessRegistry(provider_service.duckdb_path).register_host(
+        host_id=provider_host.host_id,
+        display_name="Synthetic host",
+        kind="mac",
+    )
+    before = provider_service.latest_accounts()
+    release = threading.Event()
+    finished = threading.Event()
+    original = provider_service.refresh_host
+
+    def tracked_refresh(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+
+    provider_service.refresh_host = tracked_refresh
+
+    def fetch(host):
+        release.wait(5)
+        raise TimeoutError()
+
+    try:
+        result = drover_provider_quota(
+            duckdb_path=provider_service.duckdb_path,
+            service=provider_service,
+            fresh=True,
+            fetch=fetch,
+            timeout_s=0.01,
+            now=now,
+        )
+        assert result["refresh_errors"] == [
+            {"host_id": provider_host.host_id, "error_category": "timeout"}
+        ]
+    finally:
+        release.set()
+    assert finished.wait(5)
+    assert provider_service.latest_accounts() == before
