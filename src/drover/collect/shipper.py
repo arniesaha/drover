@@ -1,4 +1,4 @@
-"""rsync-based shipper that moves staging JSONL into the server's incoming dir.
+"""rsync-based shipper that moves staging JSONL and collector health into the server's incoming dir.
 
 Runs ``rsync -a --remove-source-files <staging>/*.jsonl <host>:<remote_root>/<host_id>/``
 and returns a structured result. Caller injects ``_runner`` for tests.
@@ -42,7 +42,7 @@ def ship_staging(
     extra_args: Optional[list[str]] = None,
     _runner: Optional[Callable] = None,
 ) -> ShipResult:
-    """Ship every ``*.jsonl`` in ``staging_dir`` to the destination.
+    """Ship ``*.jsonl`` and atomic ``.collector-*.json`` health files.
 
     When ``host`` is empty, the destination is local — we still use rsync
     (for atomic moves and ``--remove-source-files``) but skip the ssh
@@ -50,10 +50,12 @@ def ship_staging(
     the shipper run on the same machine (e.g. the mac-mini).
 
     Returns ``ShipResult(files=0, command=None)`` without invoking rsync when
-    no ``.jsonl`` is present.
+    neither events nor collector health are present.
     """
     runner = _runner or _default_runner
-    files = sorted(staging_dir.glob("*.jsonl"))
+    files = sorted(staging_dir.glob("*.jsonl")) + sorted(
+        staging_dir.glob(".collector-*.json")
+    )
     if not files:
         return ShipResult(files=0, returncode=0, command=None)
 

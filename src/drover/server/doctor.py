@@ -1372,7 +1372,10 @@ def runtime_audit(
     diagnostic_db_path = Path(diagnostic_db_path) if diagnostic_db_path else None
     store_path = Path(memory_store_path) if memory_store_path else source_duckdb_path
     hours = max(1, int(hours))
+    from drover.collect.health import read_collector_health
+
     report: dict = {
+        "collectors": read_collector_health(incoming_dir, now=now),
         "duckdb_path": str(duckdb_path),
         "source_duckdb_path": str(source_duckdb_path),
         "diagnostic_duckdb_path": (
@@ -1652,8 +1655,12 @@ def format_runtime_audit(report: dict) -> str:
         f"diagnostic_db : {report.get('diagnostic_duckdb_path') or 'none'}",
         f"incoming_dir  : {report.get('incoming_dir') or '-'}",
         "",
-        "table counts:",
     ]
+    from drover.collect.health import format_collector_health
+
+    lines.extend(
+        [format_collector_health(report.get("collectors", [])), "", "table counts:"]
+    )
     spans_off = report.get("span_integration") == "disabled"
     for name, count in report.get("table_counts", {}).items():
         value = "missing" if count is None else str(count)

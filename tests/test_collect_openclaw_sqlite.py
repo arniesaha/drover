@@ -864,3 +864,360 @@ def test_cli_does_not_advance_the_cursor_when_shipping_fails(
     result = CliRunner().invoke(collect_main, ["--config", str(cfg), "run"])
     assert result.exit_code == 2, result.output
     assert not (tmp_path / "state" / "openclaw_sqlite.cursor").exists()
+
+
+# --- review #562: archive and rewrite regressions ---
+
+
+def _event_keys(events):
+    return {
+        make_dedup_key(
+            e.timestamp.isoformat(),
+            e.agent_id,
+            e.session_id,
+            e.event_type,
+            json.dumps(e.message.content if e.message else None),
+        )
+        for e in events
+    }
+
+
+def _add_archive(
+    path, *, cold=False, storage="sqlite", encoding="identity", generation="g1"
+):
+    records = _records("a")
+    records[0]["id"] = SESSION_A
+    conn = sqlite3.connect(path)
+    if cold:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_transcript_cold_archives (session_id TEXT PRIMARY KEY, generation TEXT, archive_name TEXT, archive_sha256 TEXT, storage TEXT, archive_blob BLOB, archive_bytes INTEGER)"
+        )
+        content = [
+            {
+                "kind": "header",
+                "version": 1,
+                "sessionId": SESSION_A,
+                "generation": generation,
+            },
+            *[
+                {
+                    "kind": "event",
+                    "row": {
+                        "seq": i,
+                        "created_at": BASE_MS + i * 1000,
+                        "event_json": json.dumps(r),
+                    },
+                }
+                for i, r in enumerate(records, 1)
+            ],
+            {"kind": "identity", "row": {"unused": SECRET_MARKER}},
+        ]
+    else:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_transcript_archives (session_id TEXT, generation TEXT, encoding TEXT, archive_blob BLOB, archive_sha256 TEXT, created_at INTEGER, PRIMARY KEY(session_id, generation))"
+        )
+        content = records
+    data = ("\n".join(json.dumps(r) for r in content) + "\n").encode()
+    if cold or encoding == "zstd":
+        from compression import zstd
+
+        data = zstd.compress(data)
+    digest = hashlib.sha256(data).hexdigest()
+    if cold:
+        name = f"{digest}.jsonl.zst"
+        if storage == "file":
+            root = path.parent.parent / "sessions" / "cold"
+            root.mkdir(parents=True, exist_ok=True)
+            (root / name).write_bytes(data)
+        conn.execute(
+            "INSERT INTO session_transcript_cold_archives VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                SESSION_A,
+                generation,
+                name,
+                digest,
+                storage,
+                data if storage == "sqlite" else None,
+                len(data),
+            ),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO session_transcript_archives VALUES (?, ?, ?, ?, ?, ?)",
+            (SESSION_A, generation, encoding, data, digest, BASE_MS),
+        )
+    conn.execute("DELETE FROM transcript_events WHERE session_id = ?", (SESSION_A,))
+    conn.commit()
+    conn.close()
+    return data
+
+
+@pytest.mark.parametrize("kind", ["reset", "reset-zstd", "cold-sqlite", "cold-file"])
+def test_archives_resume_and_dedupe_live_events(state_dir, kind):
+    if kind != "reset":
+        pytest.importorskip("compression.zstd")
+    original = _source(state_dir).collect({})
+    path = _db_path(state_dir)
+    _add_archive(
+        path,
+        cold=kind.startswith("cold"),
+        storage="file" if kind == "cold-file" else "sqlite",
+        encoding="zstd" if kind == "reset-zstd" else "identity",
+    )
+    # Limit below a whole archive; JSON round trips exercise durable resume.
+    source = _source(state_dir, max_events_per_run=2, batch_size=1)
+    cursor = {}
+    collected = []
+    for _ in range(8):
+        batch = source.collect(json.loads(json.dumps(cursor)))
+        assert batch.successful, batch.diagnostics
+        assert len(batch.events) <= 2
+        collected.extend(batch.events)
+        cursor = batch.cursor
+        if not batch.events:
+            break
+    assert [e.id for e in collected] == ["a-1", "a-2", "a-3", "b-1", "b-2", "b-3"]
+    assert _event_keys(original.events) == _event_keys(collected)
+    assert SECRET_MARKER not in "\n".join(e.model_dump_json() for e in collected)
+    assert source.collect(cursor).events == []
+
+
+def test_archive_failure_retries_without_advancing(state_dir, monkeypatch):
+    from drover.collect import openclaw_archives
+
+    pytest.importorskip("compression.zstd")
+    _add_archive(_db_path(state_dir), encoding="zstd")
+    source = _source(state_dir)
+    decoder = openclaw_archives._decompress
+    monkeypatch.setattr(openclaw_archives, "_decompress", None)
+    failed = source.collect({})
+    assert not failed.successful
+    assert failed.cursor["agents"]["main"]["archives"] == {}
+    monkeypatch.setattr(openclaw_archives, "_decompress", decoder)
+    recovered = source.collect(failed.cursor)
+    assert [e.id for e in recovered.events] == ["a-1", "a-2", "a-3"]
+    assert recovered.successful
+
+
+@pytest.mark.parametrize("failure", ["hash", "missing-file", "path", "header"])
+def test_invalid_archives_fail_soft_and_preserve_live_sessions(state_dir, failure):
+    if failure != "header":
+        pytest.importorskip("compression.zstd")
+    path = _db_path(state_dir)
+    _add_archive(
+        path,
+        cold=failure != "header",
+        storage="file" if failure in {"path", "missing-file"} else "sqlite",
+    )
+    conn = sqlite3.connect(path)
+    if failure == "hash":
+        conn.execute(
+            "UPDATE session_transcript_cold_archives SET archive_sha256 = ?",
+            ("0" * 64,),
+        )
+    elif failure == "path":
+        conn.execute(
+            "UPDATE session_transcript_cold_archives SET archive_name = '../outside.jsonl.zst'"
+        )
+    elif failure == "missing-file":
+        for artifact in (path.parent.parent / "sessions" / "cold").iterdir():
+            artifact.unlink()
+    else:
+        data = b'{"type":"session","id":"wrong-session"}\n'
+        conn.execute(
+            "UPDATE session_transcript_archives SET archive_blob = ?, archive_sha256 = ?",
+            (data, hashlib.sha256(data).hexdigest()),
+        )
+    conn.commit()
+    conn.close()
+    batch = _source(state_dir).collect({})
+    assert not batch.successful
+    assert [e.id for e in batch.events] == ["b-1", "b-2", "b-3"]
+    assert batch.cursor["agents"]["main"]["archives"] == {}
+
+
+@pytest.mark.parametrize("use_generation", [True, False])
+def test_rewrite_then_grow_rereads_replaced_events(state_dir, use_generation):
+    path = _db_path(state_dir)
+    conn = sqlite3.connect(path)
+    if use_generation:
+        conn.execute(
+            "CREATE TABLE transcript_rewrite_watermarks (session_id TEXT PRIMARY KEY, generation TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO transcript_rewrite_watermarks VALUES (?, 'before')",
+            (SESSION_A,),
+        )
+        conn.commit()
+    source = _source(state_dir, batch_size=1)
+    first = source.collect({})
+    conn.execute(
+        "DELETE FROM transcript_events WHERE session_id = ? AND seq > 2", (SESSION_A,)
+    )
+    if use_generation:
+        conn.execute("UPDATE transcript_rewrite_watermarks SET generation = 'after'")
+    conn.commit()
+    conn.close()
+    replacement = _records("replacement")[1:] + [_records("tail")[1]]
+    for record in replacement:
+        record["message"]["content"][0]["text"] = record["id"]
+    _append(path, SESSION_A, replacement)
+    second = source.collect(first.cursor)
+    assert [e.id for e in second.events] == [
+        "a-1",
+        "replacement-1",
+        "replacement-2",
+        "replacement-3",
+        "tail-1",
+    ]
+    assert _sessions(second.cursor)[SESSION_A] == 6
+    assert len(_event_keys(first.events + second.events)) == 10
+    assert source.collect(second.cursor).events == []
+
+
+def test_generation_detects_changed_prefix_with_unchanged_anchor(state_dir):
+    path = _db_path(state_dir)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE transcript_rewrite_watermarks (session_id TEXT PRIMARY KEY, generation TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO transcript_rewrite_watermarks VALUES (?, 'before')", (SESSION_A,)
+    )
+    conn.commit()
+    source = _source(state_dir)
+    first = source.collect({})
+    conn.execute(
+        "UPDATE transcript_events SET event_json = ? WHERE session_id = ? AND seq = 2",
+        (json.dumps(_records("changed")[1]), SESSION_A),
+    )
+    conn.execute("UPDATE transcript_rewrite_watermarks SET generation = 'after'")
+    conn.commit()
+    conn.close()
+    second = source.collect(first.cursor)
+    assert [e.id for e in second.events] == ["changed-1", "a-2", "a-3"]
+    assert len(_event_keys(first.events + second.events)) == 7
+
+
+def test_legacy_cursor_replays_once_to_establish_identity(state_dir):
+    source = _source(state_dir)
+    old = {"version": 1, "agents": {"main": {"sessions": {SESSION_A: 4, SESSION_B: 4}}}}
+    migrated = source.collect(old)
+    assert len(migrated.events) == 6
+    assert migrated.cursor["version"] == 2
+    assert source.collect(json.loads(json.dumps(migrated.cursor))).events == []
+
+
+@pytest.mark.parametrize(
+    "failure", ["none", "missing-store", "ship", "health-ship", "dry-run"]
+)
+def test_cli_last_successful_collect_tracks_idle_runs_and_failures(
+    state_dir, tmp_path, monkeypatch, failure
+):
+    import drover.collect.__main__ as cli
+    from drover.collect.shipper import ShipError, ShipResult
+
+    cfg = tmp_path / "collect.toml"
+    _write_cli_config(cfg, state_dir=state_dir, tmp_path=tmp_path)
+    staging = tmp_path / "staging"
+    cursor_file = tmp_path / "state" / "openclaw_sqlite.cursor"
+    delivered = []
+    calls = 0
+
+    def ship(**kwargs):
+        nonlocal calls
+        calls += 1
+        if failure == "ship" and calls > 2 or failure == "health-ship" and calls == 4:
+            raise ShipError("synthetic transport failure")
+        for path in staging.glob(".collector-*.json"):
+            delivered.append(json.loads(path.read_text()))
+            path.unlink()
+        for path in staging.glob("*.jsonl"):
+            path.unlink()
+        return ShipResult(files=1, returncode=0, command=None)
+
+    monkeypatch.setattr(cli, "ship_staging", ship)
+
+    class Clock(cli.datetime):
+        tick = "2026-10-12T00:00:01"
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromisoformat(cls.tick).replace(tzinfo=tz)
+
+    monkeypatch.setattr(cli, "datetime", Clock)
+    runner = CliRunner()
+    first = runner.invoke(collect_main, ["--config", str(cfg), "run"])
+    assert first.exit_code == 0, first.output
+    original = json.loads(cursor_file.read_text())
+    assert original["last_successful_collect_at"].startswith(Clock.tick)
+    Clock.tick = "2026-10-12T00:00:02"
+    if failure == "missing-store":
+        _db_path(state_dir).unlink()
+    args = ["--config", str(cfg), "run"] + (
+        ["--dry-run"] if failure == "dry-run" else []
+    )
+    second = runner.invoke(collect_main, args)
+    current = json.loads(cursor_file.read_text())
+    if failure == "none":
+        assert second.exit_code == 0, second.output
+        assert current["last_successful_collect_at"].startswith(Clock.tick)
+        assert len(delivered) == 2
+    else:
+        assert (
+            current["last_successful_collect_at"]
+            == original["last_successful_collect_at"]
+        )
+        if failure in {"ship", "health-ship"}:
+            assert current == original
+            assert second.exit_code == 2
+            assert not list(staging.glob(".collector-*.json"))
+        elif failure == "missing-store":
+            assert not current["collect_successful"]
+            assert not delivered[-1]["collect_successful"]
+        else:
+            assert len(delivered) == 1
+
+
+def test_deleted_archive_preserves_registered_session_key(state_dir):
+    path = _db_path(state_dir)
+    _add_archive(path)
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE session_transcript_archives ADD COLUMN session_key TEXT")
+    conn.execute(
+        "UPDATE session_transcript_archives SET session_key = 'agent:main:archived'"
+    )
+    conn.execute("DELETE FROM session_windows WHERE session_id = ?", (SESSION_A,))
+    conn.commit()
+    conn.close()
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    batch = _source(state_dir).collect({})
+    assert batch.successful
+    assert batch.events[0].raw_data["session_key"] == "agent:main:archived"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_retired_archive_checkpoints_are_pruned(state_dir):
+    path = _db_path(state_dir)
+    _add_archive(path)
+    source = _source(state_dir)
+    first = source.collect({})
+    assert first.cursor["agents"]["main"]["archives"]
+    conn = sqlite3.connect(path)
+    conn.execute("DELETE FROM session_transcript_archives")
+    conn.commit()
+    conn.close()
+    assert source.collect(first.cursor).cursor["agents"]["main"]["archives"] == {}
+
+
+def test_unfamiliar_archive_schema_reports_failure_but_collects_live_rows(state_dir):
+    conn = sqlite3.connect(_db_path(state_dir))
+    conn.execute(
+        "CREATE TABLE session_transcript_cold_archives (session_id TEXT PRIMARY KEY, generation TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    batch = _source(state_dir).collect({})
+    assert len(batch.events) == 6
+    assert not batch.successful
+    assert any("unfamiliar schema" in d for d in batch.diagnostics)
