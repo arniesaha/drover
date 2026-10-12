@@ -640,7 +640,7 @@ install_units() {
     "$central_url" "$extra" "$server_env_file" <<'PY'
 import sys
 from pathlib import Path
-from drover.server.service_units import render_launchd, render_systemd, runtime_bin
+from drover.server.service_units import render_launchd, render_systemd, runtime_bin, write_launchd
 
 os_name = sys.argv[1]
 home = Path(sys.argv[2])
@@ -678,7 +678,8 @@ if os_name == "darwin":
     (home / "Library" / "Logs" / "drover").mkdir(parents=True, exist_ok=True)
     for short, program, args, environment_file in jobs:
         label = f"com.drover.{short}"
-        (target / f"{label}.plist").write_text(
+        write_launchd(
+            target / f"{label}.plist",
             render_launchd(
                 label,
                 program,

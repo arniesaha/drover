@@ -261,3 +261,116 @@ def test_keep_alive_can_be_turned_off_for_one_shots():
         keep_alive=False,
     )
     assert plistlib.loads(rendered.encode("utf-8"))["KeepAlive"] is False
+
+
+def _complete_job():
+    return render_launchd(
+        "com.drover.server",
+        "/example/bin/drover-server",
+        ["run"],
+        home=Path("/example"),
+        path_entries=["/usr/bin"],
+    )
+
+
+def test_array_extraction_cannot_replace_a_job(tmp_path):
+    import pytest
+
+    from drover.server.service_units import write_launchd
+
+    path = tmp_path / "com.drover.server.plist"
+    path.write_text(_complete_job())
+    before = path.read_bytes()
+    argv = plistlib.loads(before)["ProgramArguments"]
+    with pytest.raises(ValueError, match="dictionary"):
+        write_launchd(path, plistlib.dumps(argv))
+    assert path.read_bytes() == before
+
+
+def test_incomplete_dict_cannot_replace_a_job(tmp_path):
+    import pytest
+
+    from drover.server.service_units import write_launchd
+
+    path = tmp_path / "com.drover.server.plist"
+    path.write_text(_complete_job())
+    before = path.read_bytes()
+    job = plistlib.loads(before)
+    for key in ("Label", "EnvironmentVariables", "KeepAlive", "RunAtLoad"):
+        broken = dict(job)
+        del broken[key]
+        with pytest.raises(ValueError):
+            write_launchd(path, plistlib.dumps(broken))
+        assert path.read_bytes() == before
+
+
+def test_launchd_replace_is_atomic_and_preserves_permissions(tmp_path, monkeypatch):
+    import os
+
+    from drover.server.service_units import write_launchd
+
+    path = tmp_path / "com.drover.server.plist"
+    path.write_text(_complete_job())
+    path.chmod(0o600)
+    before = path.read_bytes()
+    job = plistlib.loads(before)
+    job["ProgramArguments"] = ["/new/bin/drover-server", "run"]
+    original = os.replace
+
+    def replace(source, destination):
+        assert path.read_bytes() == before
+        assert plistlib.loads(Path(source).read_bytes())["Label"] == "com.drover.server"
+        original(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace)
+    write_launchd(path, plistlib.dumps(job))
+    assert (
+        plistlib.loads(path.read_bytes())["ProgramArguments"][0]
+        == "/new/bin/drover-server"
+    )
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_failed_atomic_replace_keeps_original_and_cleans_staging(tmp_path, monkeypatch):
+    import os
+
+    import pytest
+
+    from drover.server.service_units import write_launchd
+
+    path = tmp_path / "com.drover.server.plist"
+    path.write_text(_complete_job())
+    before = path.read_bytes()
+
+    def fail(*args):
+        raise OSError("replacement failed")
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(OSError):
+        write_launchd(path, _complete_job())
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_plutil_xml_extraction_overwrites_input_without_stdout_option(tmp_path):
+    import shutil
+
+    import pytest
+
+    if sys.platform != "darwin" or not shutil.which("plutil"):
+        pytest.skip("macOS plutil characterization")
+    path = tmp_path / "com.drover.server.plist"
+    path.write_text(_complete_job())
+    before = path.read_bytes()
+    safe = subprocess.run(
+        ["plutil", "-extract", "ProgramArguments", "xml1", "-o", "-", str(path)],
+        capture_output=True,
+        check=True,
+    )
+    assert path.read_bytes() == before
+    assert isinstance(plistlib.loads(safe.stdout), list)
+    subprocess.run(
+        ["plutil", "-extract", "ProgramArguments", "xml1", str(path)], check=True
+    )
+    assert isinstance(plistlib.loads(path.read_bytes()), list)

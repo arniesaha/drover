@@ -159,3 +159,12 @@ def test_disabling_updates_does_retract_a_target(tmp_path):
     planner._cfg = dataclasses.replace(default_config(), update_enabled=False)
     planner.refresh()
     assert planner.target() is None
+
+
+def test_old_pin_does_not_publish_a_downgrade(tmp_path):
+    cfg = dataclasses.replace(default_config(), update_pinned_version="0.6.4")
+    layout = RuntimeLayout(tmp_path)
+    layout.flip("0.6.5")
+    planner = UpdatePlanner(cfg, layout, fetcher=lambda repo: _artifact("0.6.6"))
+    planner.refresh()
+    assert planner.as_heartbeat_payload() == {}

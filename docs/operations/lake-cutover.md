@@ -61,6 +61,11 @@ $DS lake import --since "$(date -u -v-60d +%F)" --data-root "$DROVER_LAKE_ROOT/$
 Add the reader and exporter DSNs to the service plist's `EnvironmentVariables`.
 Leave `[analytics]` on legacy; the switch flips it.
 
+For an ordinary release with no lake schema or migration change, use the
+[point-release rollout](point-release-rollout.md). The gate below validates a
+lake schema cutover and intentionally requires the release already installed,
+full runtime pins and cutover target paths.
+
 ## 1. Preflight (read-only)
 
 ```sh
