@@ -5,14 +5,14 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shlex
-import socket
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 
 HOME = Path.home()
 STATE = HOME / ".drover/backup-state"
