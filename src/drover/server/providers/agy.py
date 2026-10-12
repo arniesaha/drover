@@ -296,8 +296,8 @@ class AgyUsageProbe:
         )
         try:
             windows = self._fetch_windows(observed_at=observed_at)
-            status = "ok" if windows else "usage_unavailable"
-            error_category = None if windows else "quota_api_unreachable"
+            status = "ok"
+            error_category = None
         except _ProbeFailure as exc:
             windows = ()
             status = exc.status
@@ -617,9 +617,9 @@ def _windows(
         remaining = bucket.get("remainingFraction")
         # An untouched bucket whose resetTime is within ~2 min of (fetch time +
         # window length) slides with every call: it is not tracking the real
-        # individual quota (drover#522). Omit it rather than report 0% used.
+        # individual reset (drover#522). Keep its usage, but hide that reset.
         # A bucket with consumption has a fixed reset, even if the window
-        # started moments ago, so it is kept.
+        # started moments ago, so its reset is kept.
         untouched = not (
             isinstance(remaining, (int, float))
             and not isinstance(remaining, bool)
@@ -636,7 +636,7 @@ def _windows(
                 abs((resets_at - expected_sliding).total_seconds())
                 <= _SLIDING_WINDOW_TOLERANCE_SECONDS
             ):
-                continue
+                resets_at = None
 
         used_percent: float | None = None
         if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):

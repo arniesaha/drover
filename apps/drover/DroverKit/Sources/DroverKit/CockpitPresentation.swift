@@ -524,7 +524,8 @@ public struct ProviderHeadline: Sendable, Equatable {
     /// "26% used", "750 credits used", or "Usage unavailable".
     public let usedText: String
     public let remainingText: String
-    /// "74% remaining · Resets in 14h". Nil when there is no window.
+    /// "74% remaining · Resets in 14h". Omits reset text without a reset time.
+    /// Nil when there is no window.
     public let detailText: String?
     /// Used, 0...1. Nil when no fraction can be derived, which the bar draws
     /// as an empty track rather than as zero — "unknown" and "none used" are
@@ -555,7 +556,9 @@ public struct ProviderHeadline: Sendable, Equatable {
         windowTitle = ProviderWindowTitle.display(window.kind)
         usedText = value.usedText
         remainingText = value.remainingText
-        detailText = "\(value.remainingText) · \(value.resetText)"
+        detailText = window.resetsAt == nil
+            ? value.remainingText
+            : "\(value.remainingText) · \(value.resetText)"
 
         let used = Self.usedFraction(window)
         fraction = used
