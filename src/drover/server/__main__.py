@@ -3519,6 +3519,13 @@ def _dir_size(path: Path) -> int:
 def doctor(ctx: click.Context) -> None:
     """Report DuckLake exporter recovery or audit legacy lakehouse counts."""
     cfg = _resolve_config(ctx.obj["config_path"])
+    from drover.collect.health import format_collector_health, read_collector_health
+
+    click.echo(
+        format_collector_health(
+            read_collector_health(getattr(cfg, "incoming_dir", None))
+        )
+    )
     if cfg.analytics.backend == "ducklake":
         from drover.server.doctor import format_exporter_health
         from drover.server.lake.freshness import freshness_status, read_freshness
