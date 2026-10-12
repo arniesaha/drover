@@ -1331,6 +1331,8 @@ def test_provider_quota_groups_hosts_and_formats_windows(tmp_path: Path):
     assert google_acc["status"] == "ok"
     assert len(google_acc["windows"]) == 2
     kinds = {w["kind"]: w for w in google_acc["windows"]}
+    assert kinds["five_hour"]["window_minutes"] == 300
+    assert kinds["seven_day"]["window_minutes"] == 10080
     assert kinds["five_hour"]["used_percent"] == 30.0
     assert kinds["five_hour"]["status"] == "ok"
     assert kinds["five_hour"]["source"] == "provider_api"
@@ -1551,3 +1553,77 @@ def test_provider_quota_fresh_returns_within_timeout(tmp_path: Path):
         fetch=lambda host: {},
     )
     assert time.monotonic() - started < 1.5
+
+
+@pytest.mark.parametrize("durations", [(10080,), (300, 10080), (None,)])
+def test_provider_quota_preserves_native_codex_durations(tmp_path, durations):
+    from drover.server.providers.types import (
+        ProviderAccountSnapshot,
+        ProviderUsageWindow,
+    )
+
+    now = datetime(2026, 10, 12, tzinfo=timezone.utc)
+    snapshot = ProviderAccountSnapshot(
+        snapshot_id="duration-test",
+        dedup_key="duration-test",
+        provider="openai",
+        account_label="Test",
+        plan_label=None,
+        host_id="test-host",
+        status="ok",
+        observed_at=now,
+        source="codex-app-server",
+        windows=tuple(
+            ProviderUsageWindow(kind=kind, used_percent=9, window_minutes=minutes)
+            for kind, minutes in zip(("primary", "secondary"), durations)
+        ),
+    )
+    from types import SimpleNamespace
+
+    service = SimpleNamespace(latest_accounts=lambda: [snapshot])
+    result = mcp_tools.drover_provider_quota(
+        duckdb_path=tmp_path / "unused.duckdb", service=service, now=now
+    )
+    windows = result["accounts"][0]["windows"]
+    assert [w["window_minutes"] for w in windows] == list(durations)
+    assert [w["kind"] for w in windows] == [w.kind for w in snapshot.windows]
+
+
+def test_provider_quota_excludes_unknown_and_billing_windows_from_routing(tmp_path):
+    from drover.server.providers.types import (
+        ProviderAccountSnapshot,
+        ProviderUsageWindow,
+    )
+
+    now = datetime(2026, 10, 12, tzinfo=timezone.utc)
+    snapshot = ProviderAccountSnapshot(
+        snapshot_id="known-test",
+        dedup_key="known-test",
+        provider="anthropic",
+        account_label="Test",
+        plan_label=None,
+        host_id="test-host",
+        status="ok",
+        observed_at=now,
+        source="claude-oauth-usage",
+        windows=tuple(
+            ProviderUsageWindow(kind=kind, used_percent=percent)
+            for kind, percent in [
+                ("five_hour", 20),
+                ("extra_usage", 100),
+                ("iguana_necktie", 100),
+                ("nimbus_quill", 100),
+            ]
+        ),
+    )
+    from types import SimpleNamespace
+
+    service = SimpleNamespace(latest_accounts=lambda: [snapshot])
+    result = mcp_tools.drover_provider_quota(
+        duckdb_path=tmp_path / "unused.duckdb", service=service, now=now
+    )
+    assert [w["kind"] for w in result["accounts"][0]["windows"]] == [
+        "five_hour",
+        "extra_usage",
+    ]
+    assert result["routing_hint"] == "claude: 20%"

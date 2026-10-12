@@ -497,10 +497,24 @@ public struct ProviderCapacityPresentation: Sendable, Equatable {
     }
 }
 
-/// A quota window's kind, in prose. `seven_day` reads as "Seven day" — one
-/// capital, because `.capitalized` turns it into a title ("Seven Day") and
-/// leaves an untouched underscore behind when the caller forgets to strip it.
+/// Duration labels preserve the native kind on the underlying window.
 public enum ProviderWindowTitle {
+    public static func display(_ window: ProviderWindow) -> String {
+        if window.kind == "extra_usage" { return "Extra usage" }
+        let suffix: String
+        switch window.kind {
+        case "seven_day_opus": suffix = " · Opus"
+        case "seven_day_sonnet": suffix = " · Sonnet"
+        case "five_hour_claude_gpt", "seven_day_claude_gpt": suffix = " · Claude/GPT"
+        default: suffix = ""
+        }
+        switch window.windowMinutes {
+        case 300: return "5-hour" + suffix
+        case 10080: return "Weekly" + suffix
+        default: return display(window.kind)
+        }
+    }
+
     public static func display(_ kind: String) -> String {
         let spaced = kind.replacingOccurrences(of: "_", with: " ")
         guard let first = spaced.first else { return spaced }
@@ -553,7 +567,7 @@ public struct ProviderHeadline: Sendable, Equatable {
         // Wording comes from the presentation that already ships, so a card's
         // bar can never disagree with the text printed beside it.
         let value = ProviderCapacityPresentation(account: account, window: window, now: now)
-        windowTitle = ProviderWindowTitle.display(window.kind)
+        windowTitle = ProviderWindowTitle.display(window)
         usedText = value.usedText
         remainingText = value.remainingText
         detailText = window.resetsAt == nil
@@ -593,7 +607,7 @@ public struct ProviderHeadline: Sendable, Equatable {
     /// window that can; ties break on `kind` so the card does not reshuffle
     /// between refreshes.
     static func leadingWindow(_ windows: [ProviderWindow]) -> ProviderWindow? {
-        windows.sorted { lhs, rhs in
+        windows.filter { $0.kind != "extra_usage" }.sorted { lhs, rhs in
             let left = usedFraction(lhs) ?? -1
             let right = usedFraction(rhs) ?? -1
             if left != right { return left > right }

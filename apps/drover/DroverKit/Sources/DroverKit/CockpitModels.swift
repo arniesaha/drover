@@ -170,7 +170,10 @@ public struct ProviderAccount: Decodable, Sendable, Equatable {
         hostID = try container.decodeRequiredIdentity(forKey: .hostID)
         status = try container.decode(ProviderAccountStatus.self, forKey: .status)
         observedAt = try container.decodeRequiredWireDate(forKey: .observedAt)
-        windows = try container.decodeIfPresent([ProviderWindow].self, forKey: .windows) ?? []
+        let reportedWindows = try container.decodeIfPresent([ProviderWindow].self, forKey: .windows) ?? []
+        let anthropicKinds: Set<String> = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "extra_usage"]
+        windows = provider == "anthropic"
+            ? reportedWindows.filter { anthropicKinds.contains($0.kind) } : reportedWindows
         source = try container.decodeRequiredIdentity(forKey: .source)
         errorCategory = try? container.decode(String.self, forKey: .errorCategory)
     }

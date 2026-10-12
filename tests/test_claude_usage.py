@@ -88,10 +88,19 @@ def test_usage_response_becomes_windows(tmp_path, monkeypatch):
     assert timeout == 5.0
 
 
-def test_unknown_window_passes_through_without_a_guessed_duration(tmp_path):
+@pytest.mark.parametrize(
+    "unknown", ["iguana_necktie", "nimbus_quill", "seven_day_something_new"]
+)
+def test_unknown_windows_are_dropped_and_only_keys_are_logged(
+    tmp_path, caplog, unknown
+):
     body = json.dumps(
         {
-            "seven_day_something_new": {"utilization": 5.0, "resets_at": None},
+            "five_hour": {"utilization": 34.5, "resets_at": None},
+            "seven_day_opus": {"utilization": 12},
+            "seven_day_sonnet": {"utilization": 8},
+            "extra_usage": {"utilization": 100, "is_enabled": True},
+            unknown: {"utilization": 100, "private_detail": "private-payload-marker"},
         }
     ).encode()
     probe = ClaudeUsageProbe(
@@ -99,13 +108,34 @@ def test_unknown_window_passes_through_without_a_guessed_duration(tmp_path):
         opener=lambda url, headers, timeout: (200, body),
         keychain_reader=lambda: None,
     )
+    with caplog.at_level("DEBUG", logger="drover.server.providers.quota"):
+        snapshot = probe.read(host_id="test-host")
 
-    snapshot = probe.read(host_id="nas")
+    assert snapshot.status == "ok"
+    kinds = {w.kind: w for w in snapshot.windows}
+    assert set(kinds) == {
+        "five_hour",
+        "seven_day_opus",
+        "seven_day_sonnet",
+        "extra_usage",
+    }
+    assert kinds["seven_day_opus"].window_minutes == 10080
+    assert kinds["seven_day_sonnet"].window_minutes == 10080
+    assert kinds["extra_usage"].window_minutes is None
+    assert unknown in caplog.text
+    assert "private-payload-marker" not in caplog.text
+    assert "sk-test-token" not in caplog.text
 
-    window = snapshot.windows[0]
-    assert window.kind == "seven_day_something_new"
-    assert window.used_percent == 5.0
-    assert window.window_minutes is None
+
+def test_unknown_only_usage_is_unavailable(tmp_path):
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(tmp_path),
+        opener=lambda *args: (200, b'{"iguana_necktie":{"utilization":100}}'),
+        keychain_reader=lambda: None,
+    )
+    snapshot = probe.read(host_id="test-host")
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.windows == ()
 
 
 def test_the_access_token_never_appears_in_the_snapshot(tmp_path):

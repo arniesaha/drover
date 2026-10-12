@@ -965,32 +965,37 @@ private let fourAnthropicWindows = """
 @Test func equalFractionsTieBreakOnWindowKind() throws {
     func headline(_ windows: String) throws -> ProviderHeadline {
         let account = try providerAccount(
-            snapshot: "s1", provider: "anthropic", label: "me@example.com",
-            host: "mac-mini", observedAt: "2026-08-09T18:00:00Z", windows: windows
+            snapshot: "s1", provider: "anthropic", label: "Test",
+            host: "test-host", observedAt: "2026-08-09T18:00:00Z", windows: windows
         )
+        #expect(account.windows.count == 2)
+        #expect(ProviderHeadline.leadingWindow(account.windows)?.kind == "five_hour")
         return ProviderSubscriptionGrouping.group([account], now: account.observedAt)[0].headline
     }
 
-    let forward = #"[{"kind":"alpha","used_percent":50},{"kind":"beta","used_percent":50}]"#
-    let reversed = #"[{"kind":"beta","used_percent":50},{"kind":"alpha","used_percent":50}]"#
+    let forward = #"[{"kind":"five_hour","window_minutes":300,"used_percent":50},{"kind":"seven_day","window_minutes":10080,"used_percent":50}]"#
+    let reversed = #"[{"kind":"seven_day","window_minutes":10080,"used_percent":50},{"kind":"five_hour","window_minutes":300,"used_percent":50}]"#
 
-    #expect(try headline(forward).windowTitle == "Alpha")
-    #expect(try headline(reversed).windowTitle == "Alpha")
+    #expect(try headline(forward).windowTitle == "5-hour")
+    #expect(try headline(reversed).windowTitle == "5-hour")
 }
 
 /// A window nobody can put a number on tells you nothing about how full the
 /// account is, so it must never outrank one that can.
 @Test func aWindowWithoutAFractionRanksBehindOneThatHasIt() throws {
     let account = try providerAccount(
-        snapshot: "s1", provider: "anthropic", label: "me@example.com",
-        host: "mac-mini", observedAt: "2026-08-09T18:00:00Z",
-        windows: #"[{"kind":"alpha"},{"kind":"beta","used_percent":2}]"#
+        snapshot: "s1", provider: "anthropic", label: "Test",
+        host: "test-host", observedAt: "2026-08-09T18:00:00Z",
+        windows: #"[{"kind":"five_hour","window_minutes":300},{"kind":"seven_day","window_minutes":10080,"used_percent":2}]"#
     )
 
+    #expect(account.windows.count == 2)
+    #expect(ProviderHeadline.leadingWindow(account.windows)?.kind == "seven_day")
     let headline = ProviderSubscriptionGrouping
         .group([account], now: account.observedAt)[0].headline
 
-    #expect(headline.windowTitle == "Beta")
+    #expect(headline.windowTitle == "Weekly")
+    #expect(headline.fraction == 0.02)
 }
 
 /// Freshness hangs off the subscription, not off a window — an unavailable
@@ -1262,4 +1267,53 @@ private let fourAnthropicWindows = """
         #expect(headline.detailText == "100% remaining")
         #expect(headline.isCritical == false)
     }
+}
+
+@Test func quotaWindowTitlesUseReportedDurationAndKeepNativeKinds() throws {
+    let cases: [(String, Int?, String)] = [
+        ("primary", 10080, "Weekly"),
+        ("primary", 300, "5-hour"),
+        ("secondary", 10080, "Weekly"),
+        ("primary", nil, "Primary"),
+        ("secondary", 42, "Secondary"),
+        ("seven_day_opus", 10080, "Weekly · Opus"),
+        ("seven_day_sonnet", 10080, "Weekly · Sonnet"),
+        ("extra_usage", nil, "Extra usage"),
+    ]
+    for (kind, minutes, title) in cases {
+        let duration = minutes.map(String.init) ?? "null"
+        let window = try JSONDecoder().decode(ProviderWindow.self, from: Data(
+            "{\"kind\":\"\(kind)\",\"window_minutes\":\(duration)}".utf8
+        ))
+        #expect(ProviderWindowTitle.display(window) == title)
+        #expect(window.kind == kind)
+    }
+}
+
+@Test func quotaCodexCardsHandleWeeklyOnlyAndTwoWindows() throws {
+    for windows in [
+        #"[{"kind":"primary","window_minutes":10080,"used_percent":9}]"#,
+        #"[{"kind":"primary","window_minutes":300,"used_percent":4},{"kind":"secondary","window_minutes":10080,"used_percent":9}]"#,
+    ] {
+        let account = try providerAccount(
+            snapshot: "duration-test", provider: "openai", label: "Test", host: "test-host",
+            observedAt: "2026-10-12T18:00:00Z", windows: windows
+        )
+        let group = try #require(ProviderSubscriptionGrouping.group([account], now: account.observedAt).first)
+        #expect(group.headline.windowTitle == "Weekly")
+        #expect(group.headline.usedText == "9% used")
+        #expect(group.windows.map(ProviderWindowTitle.display) == (group.windows.count == 1 ? ["Weekly"] : ["5-hour", "Weekly"]))
+    }
+}
+
+@Test func quotaAnthropicUnknownFieldsAndBillingCannotLeadTheCard() throws {
+    let account = try providerAccount(
+        snapshot: "known-test", provider: "anthropic", label: "Test", host: "test-host",
+        observedAt: "2026-10-12T18:00:00Z",
+        windows: #"[{"kind":"five_hour","window_minutes":300,"used_percent":20},{"kind":"extra_usage","used_percent":100},{"kind":"iguana_necktie","used_percent":100},{"kind":"nimbus_quill","used_percent":100}]"#
+    )
+    let group = try #require(ProviderSubscriptionGrouping.group([account], now: account.observedAt).first)
+    #expect(group.windows.map(\.kind) == ["five_hour", "extra_usage"])
+    #expect(group.headline.windowTitle == "5-hour")
+    #expect(group.headline.usedText == "20% used")
 }

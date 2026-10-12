@@ -42,6 +42,7 @@ from drover.server.memory_store import (
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.project_activity import MAX_DAYS as PROJECT_ACTIVITY_MAX_DAYS
 from drover.server.project_activity import project_activity
+from drover.server.providers.quota import is_public_window, is_routing_window
 from drover.server.quality import quality_snapshot
 from drover.server.summarizer.jobs import (
     enqueue_summary_generation,
@@ -1699,16 +1700,6 @@ def _build_routing_hint(accounts: list[dict[str, Any]], now: datetime) -> str:
     if not accounts:
         return "no provider accounts configured"
 
-    known_kinds = {
-        "openai": {"primary", "secondary"},
-        "anthropic": {"five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"},
-        "google": {
-            "five_hour",
-            "seven_day",
-            "five_hour_claude_gpt",
-            "seven_day_claude_gpt",
-        },
-    }
     default_pools = {
         "openai": ("codex",),
         "anthropic": ("claude",),
@@ -1723,8 +1714,11 @@ def _build_routing_hint(accounts: list[dict[str, Any]], now: datetime) -> str:
         unknown_kind = False
         for window in account.get("windows", []):
             kind = window.get("kind")
-            if kind not in known_kinds.get(provider, set()):
-                unknown_kind = True
+            if not is_routing_window(provider, kind):
+                # Known Anthropic billing allowances do not constrain routing.
+                # Unsupported kinds still preserve main's uncertainty handling.
+                if provider != "anthropic" or not is_public_window(provider, kind):
+                    unknown_kind = True
                 continue
             pool = defaults[0]
             if provider == "google" and kind in {
@@ -1978,6 +1972,8 @@ def drover_provider_quota(
         # Build windows
         windows_list: list[dict[str, Any]] = []
         for w in representative.windows:
+            if not is_public_window(rep_provider, w.kind):
+                continue
             w_status: str
             if representative.status not in {"ok", "observed_exhausted"}:
                 w_status = representative.status
@@ -2004,6 +2000,7 @@ def drover_provider_quota(
             windows_list.append(
                 {
                     "kind": w.kind,
+                    "window_minutes": w.window_minutes,
                     "used_percent": w.used_percent,
                     "resets_at": w.resets_at.isoformat() if w.resets_at else None,
                     "status": w_status,
