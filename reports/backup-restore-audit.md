@@ -303,6 +303,30 @@ Studio. None of these print secrets if run as written.
 | Where is the registry DuckDB, and how big? | `ls -la ~/.drover/*.duckdb` |
 | Which plist keys exist beyond the template? | Step D2 above, keys only |
 
+### 6a. Live results (run 2026-10-12 00:1x PT, read-only, by Nix over SSH)
+
+The checklist above was run on the Studio. Nothing was written or restarted.
+These results replace the [UNVERIFIED] tags where they apply.
+
+| Question | Result |
+|---|---|
+| Backup-like jobs | None. LaunchAgents hold `com.drover.server`, `com.drover.harnessd`, `com.drover.collect`, `com.drover.mac-ollama-embeddings` and unrelated apps. No backup, dump, rsync or restic job in `launchctl list`. No crontab. |
+| Time Machine | **No destination configured.** `tmutil latestbackup` fails to mount a destination. `~/.drover` is not excluded, `/Volumes/M2 1` is excluded, so even with a destination the lake would not be covered. |
+| PostgreSQL on 15432 | Homebrew `postgresql@17` 17.11, data directory `~/.drover-postgres-fresh-test` (2.9G, internal disk). **Hand-started on 2026-09-26 and reparented to launchd, with no LaunchAgent or brew service.** It will not come back after a reboot on its own. The data directory and the control database name still carry "test" names from the migration. |
+| Control store and lake catalog in one cluster | Yes. Control DSN, lake v1 reader/exporter/admin and lake v2 DSNs all point at 127.0.0.1:15432. One cluster loss takes out both. |
+| WAL archiving / base backups | `archive_mode=off`, `archive_command` disabled, `wal_level=replica`. No point-in-time recovery is possible today. |
+| Existing hand-made backups | `~/.drover/cutover-backups/` (2 from 2026-10-04), `~/.drover/rollout-backups/` (14 entries, newest `v066-flip-20261012T065526Z` with a custom-format control `pg_dump`), `/Volumes/M2 1/drover-data/backups/pre-ducklake-20261001`. No `.cutover-backups/v2/` under the lake root. All sit on the same machine as the data. |
+| Legacy parquet root | `~/.drover/parquet` exists (stub dirs from 2026-09-27); the real root is `/Volumes/M2 1/drover-data/parquet`. |
+| Lake size | `/Volumes/M2 1/drover-data` 14G total; `parquet` 1.7G in 15,615 files; `incoming` 515M in 811 files. |
+| Volume | `M2 1`: APFS, external PCI-Express, 1 TB, SMART verified. No second "M2" volume mounted. |
+| Registry DuckDB | `~/.drover/drover.duckdb` (8.4M) and `drover.registry.duckdb` (7.1M), both last modified 2026-09-27; copies also under `/Volumes/M2 1/drover-data/`. |
+
+Net effect on section 1: the "no backup automation" finding holds on the
+machine too, and two gaps rank higher than the repo-side audit could show:
+the PostgreSQL cluster holding both the control store and the lake catalog is
+unsupervised (no restart after reboot) and has no off-machine copy at all.
+The only recoverable points are the ad hoc `pg_dump`s taken during rollouts.
+
 ## 7. Suggested order of work for the week
 
 1. Run section 6 (15 minutes) and correct this report where it is wrong.
