@@ -1585,6 +1585,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if auth_route and auth_route[2] == "input":
             self._auth_input(auth_route[0], auth_route[1] or "")
             return
+        if parsed.path == "/fs/create":
+            self._fs_create()
+            return
         if parsed.path == "/fs/exists":
             self._fs_exists()
             return
@@ -1654,11 +1657,33 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             result = list_folders(
                 (params.get("path") or [""])[-1],
                 (params.get("filter") or [""])[-1],
+                (params.get("cursor") or [""])[-1],
+                int((params.get("limit") or ["100"])[-1]),
             )
+        except ValueError:
+            self._write_json({"error": "invalid_limit"}, status=400)
+            return
         except FolderError as exc:
             self._write_json({"error": exc.code}, status=exc.status)
             return
         self._write_json(result)
+
+    def _fs_create(self) -> None:
+        from drover.server.harness.folders import FolderError, create_folder
+
+        if not self.server.state.api_token or not self._authorized():
+            self._write_json({"error": "authentication required"}, status=401)
+            return
+        body = self._read_json() or {}
+        if body.get("host_id") != self.server.state.host_id:
+            self._write_json({"error": "host mismatch"}, status=403)
+            return
+        try:
+            result = create_folder(body.get("path"), body.get("name"))
+        except FolderError as exc:
+            self._write_json({"error": exc.code}, status=exc.status)
+            return
+        self._write_json(result, status=201)
 
     def _fs_complete(self, query: str) -> None:
         """Complete a working directory against this host's real filesystem.

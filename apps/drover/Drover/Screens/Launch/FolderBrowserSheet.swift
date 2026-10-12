@@ -47,6 +47,8 @@ struct FolderBrowserSheet: View {
 
 private struct FolderBrowserScreen: View {
     @State private var model: FolderBrowserModel
+    @State private var showsCreation = false
+    @State private var folderName = ""
     let hostLabel: String
     let savedPaths: [String]
     let sessions: [SessionSummary]
@@ -141,26 +143,43 @@ private struct FolderBrowserScreen: View {
                         ForEach(model.filteredEntries) { entry in
                             folderLink(name: entry.name, path: entry.path, icon: "folder", isGit: entry.isGitRepo)
                         }
-                        if model.filteredEntries.isEmpty && !model.isLoading {
+                        if model.filteredEntries.isEmpty && !model.isLoading && listing.nextCursor == nil {
                             Text(model.filter.isEmpty ? "No folders" : "No matching folders")
                                 .foregroundStyle(.secondary)
                                 .accessibilityIdentifier("folder-browser-empty")
                         }
-                        if listing.truncated {
-                            Text("Listing limited. Filter to narrow the results. Very large folders may omit matches.")
+                        if let failure = model.pageFailure {
+                            Text(failure.message)
+                            Button("Retry loading more") { Task { await model.loadMore() } }
+                                .frame(minHeight: 44)
+                            Button("Reload folders") { Task { await model.refresh() } }
+                                .frame(minHeight: 44)
+                        } else if listing.nextCursor != nil {
+                            ProgressView("Loading more folders...")
+                                .frame(minHeight: 44)
+                                .task(id: listing.nextCursor) { await model.loadMore() }
+                        } else if listing.truncated {
+                            Text("This host limits folder listings. Filter to narrow the results.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
             }
 
-            Section {
-                Button {} label: {
-                    Label("New folder (coming later)", systemImage: "folder.badge.plus")
-                        .foregroundStyle(.secondary)
+            if !model.path.isEmpty {
+                Section {
+                    Button {
+                        folderName = ""
+                        model.prepareCreation()
+                        showsCreation = true
+                    } label: {
+                        Label("New folder", systemImage: "folder.badge.plus")
+                            .frame(minHeight: 44)
+                    }
+                    .disabled(!model.canSelect)
+                    .accessibilityLabel("Create a folder in this directory")
+                    .accessibilityIdentifier("folder-browser-create")
                 }
-                .disabled(true)
-                .accessibilityHint("Folder creation is not available yet")
             }
         }
         .navigationTitle("Choose folder")
@@ -177,6 +196,43 @@ private struct FolderBrowserScreen: View {
                 .background(.bar)
                 .disabled(!model.canSelect)
                 .accessibilityIdentifier("folder-browser-use")
+            }
+        }
+        .sheet(isPresented: $showsCreation) {
+            NavigationStack {
+                Form {
+                    TextField("Folder name", text: $folderName)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .frame(minHeight: 44)
+                        .accessibilityLabel("New folder name")
+                    if let failure = model.creationFailure {
+                        Text(failure.message).accessibilityLabel("Folder creation failed: \(failure.message)")
+                    }
+                    Button {
+                        Task {
+                            if let created = await model.createFolder(name: folderName) {
+                                showsCreation = false
+                                onSelect(created)
+                            }
+                        }
+                    } label: {
+                        if model.isCreating { ProgressView("Creating folder...") }
+                        else { Text("Create and use folder") }
+                    }
+                    .frame(minHeight: 44)
+                    .disabled(folderName.isEmpty || model.isCreating)
+                    .accessibilityLabel("Create and use folder")
+                }
+                .navigationTitle("New folder")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showsCreation = false }
+                            .frame(minHeight: 44)
+                            .disabled(model.isCreating)
+                    }
+                }
+                .interactiveDismissDisabled(model.isCreating)
             }
         }
         .refreshable { await model.refresh() }

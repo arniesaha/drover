@@ -1,10 +1,14 @@
-"""Read-only, descriptor-relative folder browsing within operator allowed roots."""
+"""Descriptor-relative folder operations within operator allowed roots."""
 
 from __future__ import annotations
 
+import base64
 import errno
+import hashlib
+import json
 import os
 import stat
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -65,23 +69,9 @@ def _directory(path: Path):
         os.close(fd)
 
 
-def list_folders(typed: str, query: str = "") -> dict:
-    roots = allowed_roots()
-    locations = [
-        {
-            "name": "Home" if root == Path.home() else root.name or "Root",
-            "path": str(root),
-        }
-        for root in roots
-    ]
-    if not typed:
-        return {
-            "roots": locations,
-            "path": None,
-            "parent": None,
-            "entries": [],
-            "truncated": False,
-        }
+def _authorized_path(
+    typed: str, roots: list[Path], query: str = ""
+) -> tuple[Path, Path]:
     if len(typed) > 4096 or "\x00" in typed or len(query) > 256:
         raise FolderError(400, "invalid_path")
     expanded = (
@@ -104,13 +94,67 @@ def list_folders(typed: str, query: str = "") -> dict:
         raise FolderError(403, "outside_allowed_folders")
     if any(part.startswith(".") for part in path.relative_to(root).parts):
         raise FolderError(403, "hidden_folder_not_allowed")
+    return path, root
+
+
+def list_folders(
+    typed: str, query: str = "", cursor: str = "", limit: int = MAX_ENTRIES
+) -> dict:
+    if not isinstance(limit, int) or not 1 <= limit <= MAX_ENTRIES:
+        raise FolderError(400, "invalid_limit")
+    if len(cursor) > 2048:
+        raise FolderError(400, "invalid_cursor")
+    roots = allowed_roots()
+    locations = [
+        {
+            "name": "Home" if root == Path.home() else root.name or "Root",
+            "path": str(root),
+        }
+        for root in roots
+    ]
+    if not typed:
+        return {
+            "roots": locations,
+            "path": None,
+            "parent": None,
+            "entries": [],
+            "truncated": False,
+            "next_cursor": None,
+        }
+    path, root = _authorized_path(typed, roots, query)
     entries = []
     truncated = False
+    next_cursor = None
     try:
         with _directory(path) as fd, os.scandir(fd) as children:
+            info = os.fstat(fd)
+            identity = [info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns]
+            binding = hashlib.sha256(
+                json.dumps([str(path), query, identity]).encode()
+            ).hexdigest()
+            offset = 0
+            if cursor:
+                try:
+                    data = json.loads(base64.urlsafe_b64decode(cursor))
+                    offset = data["offset"]
+                    if (
+                        type(offset) is not int
+                        or offset < 0
+                        or data["binding"] != binding
+                    ):
+                        raise ValueError()
+                except (ValueError, KeyError, TypeError):
+                    raise FolderError(400, "invalid_cursor") from None
+            # Resume enumeration without storing the entire directory. Earlier
+            # names are skipped without stat calls; only this page gets metadata.
             for index, child in enumerate(children):
-                if index >= MAX_SCANNED:
+                if index < offset:
+                    continue
+                if index - offset >= MAX_SCANNED or len(entries) >= limit:
                     truncated = True
+                    next_cursor = base64.urlsafe_b64encode(
+                        json.dumps({"offset": index, "binding": binding}).encode()
+                    ).decode()
                     break
                 name = child.name
                 if name.startswith(".") or query.casefold() not in name.casefold():
@@ -163,6 +207,37 @@ def list_folders(typed: str, query: str = "") -> dict:
         "roots": locations,
         "path": str(path),
         "parent": str(path.parent) if path != root else None,
-        "entries": entries[:MAX_ENTRIES],
-        "truncated": truncated or len(entries) > MAX_ENTRIES,
+        "entries": entries,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
     }
+
+
+def create_folder(typed: str, name: str) -> dict:
+    if (
+        not isinstance(typed, str)
+        or not isinstance(name, str)
+        or not name
+        or name != name.strip()
+        or name.startswith(".")
+        or "/" in name
+        or "\\" in name
+        or any(unicodedata.category(char) in {"Cc", "Cs"} for char in name)
+        or len(name.encode("utf-8")) > 255
+    ):
+        raise FolderError(400, "invalid_name")
+    path, _ = _authorized_path(typed, allowed_roots())
+    try:
+        with _directory(path) as fd:
+            # mkdir is atomic and never replaces a file, directory, or link.
+            os.mkdir(name, mode=0o700, dir_fd=fd)
+    except FolderError:
+        raise
+    except FileExistsError:
+        raise FolderError(409, "folder_exists") from None
+    except PermissionError:
+        raise FolderError(403, "permission_denied") from None
+    except OSError as exc:
+        code = "not_found" if exc.errno == errno.ENOENT else "unavailable"
+        raise FolderError(400, code) from None
+    return {"name": name, "path": str(path / name)}

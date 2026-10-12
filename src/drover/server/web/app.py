@@ -1329,6 +1329,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 host_id,
                 (params.get("path") or [""])[-1],
                 (params.get("filter") or [""])[-1],
+                (params.get("cursor") or [""])[-1],
+                (params.get("limit") or ["100"])[-1],
             )
             self._send(status, "application/json", body)
             return
@@ -1709,6 +1711,27 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 payload=payload,
             )
             self._send(status, "application/json", body)
+            return
+        if path.startswith("/harness/hosts/") and path.endswith("/fs/create"):
+            if not self.auth.enabled:
+                self._send(
+                    401, "application/json", '{"error": "authentication required"}\n'
+                )
+                return
+            host_id = unquote(
+                path.removeprefix("/harness/hosts/")
+                .removesuffix("/fs/create")
+                .strip("/")
+            )
+            if not host_id or "/" in host_id:
+                self._send(400, "application/json", '{"error": "invalid host_id"}\n')
+                return
+            body = self._read_json()
+            if body is None:
+                self._send(400, "application/json", '{"error": "invalid body"}\n')
+                return
+            status, response = self.collector.proxy_harness_fs_create(host_id, body)
+            self._send(status, "application/json", response)
             return
         if path.startswith("/harness/hosts/") and path.endswith("/fs/exists"):
             host_id = unquote(
