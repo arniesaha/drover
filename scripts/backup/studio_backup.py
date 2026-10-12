@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Private nightly Studio snapshots. No service restarts; fail on any failed step."""
+
 import datetime as dt
 import fcntl
 import hashlib
@@ -18,20 +19,49 @@ HOME = Path.home()
 STATE = HOME / ".drover/backup-state"
 LOG = HOME / "Library/Logs/drover/backup.log"
 PG = Path("/opt/homebrew/opt/postgresql@17/bin")
-PG_ARGS = ["-h", str(HOME / ".drover-postgres-fresh-test"), "-p", "15432", "-U", "arnab"]
+PG_ARGS = [
+    "-h",
+    str(HOME / ".drover-postgres-fresh-test"),
+    "-p",
+    "15432",
+    "-U",
+    "arnab",
+]
 NAS = ""  # Loaded from private machine configuration when a backup starts.
-SSH = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
-       "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
-       "-i", str(HOME / ".ssh/id_ed25519_mac_mini_migration")]
+SSH = [
+    "/usr/bin/ssh",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=15",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+    "-i",
+    str(HOME / ".ssh/id_ed25519_mac_mini_migration"),
+]
 RSYNC = "/opt/homebrew/bin/rsync"
-DATA = {"drover-data": Path("/Volumes/M2 1/drover-data"),
-        "drover-lakes": Path("/Volumes/M2 1/drover-lakes")}
-EXCLUDES = ["/worktrees", "/rollout-worktrees", "/runtime", "/incoming",
-            "/backup-state", "*.duckdb", "*.duckdb.wal", "*.sock"]
-RISK = ("Registry DuckDB and WAL are live file copies, not transactional exports. "
-        "Postgres databases have separate consistent dump snapshots. Live lake copies "
-        "are taken before and after dumps without deleting the first pass; cross-store "
-        "atomicity and DuckLake catalog reference completeness are not proven.")
+DATA = {
+    "drover-data": Path("/Volumes/M2 1/drover-data"),
+    "drover-lakes": Path("/Volumes/M2 1/drover-lakes"),
+}
+EXCLUDES = [
+    "/worktrees",
+    "/rollout-worktrees",
+    "/runtime",
+    "/incoming",
+    "/backup-state",
+    "*.duckdb",
+    "*.duckdb.wal",
+    "*.sock",
+]
+RISK = (
+    "Registry DuckDB and WAL are live file copies, not transactional exports. "
+    "Postgres databases have separate consistent dump snapshots. Live lake copies "
+    "are taken before and after dumps without deleting the first pass; cross-store "
+    "atomicity and DuckLake catalog reference completeness are not proven."
+)
 
 
 def log(message):
@@ -41,8 +71,13 @@ def log(message):
 
 def run(args, *, input_data=None, output=None):
     # Child diagnostics may contain private configuration. Never emit them in logs.
-    result = subprocess.run(args, input=input_data, stdout=output or subprocess.PIPE,
-                            stderr=subprocess.PIPE, umask=0o077)
+    result = subprocess.run(
+        args,
+        input=input_data,
+        stdout=output or subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        umask=0o077,
+    )
     if result.returncode:
         raise RuntimeError("command failed (exit %d)" % result.returncode)
     return result.stdout
@@ -50,12 +85,21 @@ def run(args, *, input_data=None, output=None):
 
 def remote(helper, action, root, payload):
     command = "python3 -c %s %s %s" % tuple(map(shlex.quote, (helper, action, root)))
-    return json.loads(run(SSH + [NAS, command], input_data=json.dumps(payload).encode()))
+    return json.loads(
+        run(SSH + [NAS, command], input_data=json.dumps(payload).encode())
+    )
 
 
 def sync(source, destination, previous=None, excludes=()):
-    args = [RSYNC, "-a", "--no-owner", "--no-group",
-            "--chmod=Du=rwx,Dgo=,Fu=rw,Fgo=", "-e", shlex.join(SSH)]
+    args = [
+        RSYNC,
+        "-a",
+        "--no-owner",
+        "--no-group",
+        "--chmod=Du=rwx,Dgo=,Fu=rw,Fgo=",
+        "-e",
+        shlex.join(SSH),
+    ]
     if destination.startswith(NAS + ":"):
         args.append("--rsync-path=umask 077; rsync")
     if previous:
@@ -77,8 +121,13 @@ def file_entries(root, prefix):
         after = path.stat()
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise RuntimeError("source changed during hashing")
-        entries.append({"path": prefix + "/" + path.relative_to(root).as_posix(),
-                        "size": after.st_size, "sha256": h.hexdigest()})
+        entries.append(
+            {
+                "path": prefix + "/" + path.relative_to(root).as_posix(),
+                "size": after.st_size,
+                "sha256": h.hexdigest(),
+            }
+        )
     return entries
 
 
@@ -89,8 +138,14 @@ def copy_registry(destination):
     if not source.is_file():
         raise RuntimeError("registry missing")
     paths = [source, Path(str(source) + ".wal")]
+
     def signature():
-        return [(p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in paths if p.exists()]
+        return [
+            (p.name, p.stat().st_size, p.stat().st_mtime_ns)
+            for p in paths
+            if p.exists()
+        ]
+
     for _ in range(3):
         before = signature()
         for p in destination.iterdir():
@@ -106,7 +161,9 @@ def copy_registry(destination):
 
 def backup():
     global NAS
-    NAS = json.loads((HOME / ".drover/maintenance/backup-config.json").read_text())["nas"]
+    NAS = json.loads((HOME / ".drover/maintenance/backup-config.json").read_text())[
+        "nas"
+    ]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", NAS):
         raise RuntimeError("invalid NAS SSH target")
     started = time.monotonic()
@@ -127,12 +184,29 @@ def backup():
             (stage / name).mkdir(mode=0o700)
         log("stage=lake_first_pass")
         for name, source in DATA.items():
-            sync(source, NAS + ":" + pending + "/" + name,
-                 previous + "/" + name if previous else None)
+            sync(
+                source,
+                NAS + ":" + pending + "/" + name,
+                previous + "/" + name if previous else None,
+            )
         log("stage=postgres_dumps")
-        databases = run([str(PG / "psql")] + PG_ARGS + ["-d", "postgres", "-XAt",
-                        "-v", "ON_ERROR_STOP=1", "-c",
-                        "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname"]).decode().splitlines()
+        databases = (
+            run(
+                [str(PG / "psql")]
+                + PG_ARGS
+                + [
+                    "-d",
+                    "postgres",
+                    "-XAt",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-c",
+                    "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname",
+                ]
+            )
+            .decode()
+            .splitlines()
+        )
         if not databases:
             raise RuntimeError("no databases found")
         with (stage / "postgres/globals.sql").open("wb") as f:
@@ -140,12 +214,23 @@ def backup():
         database_files = []
         for index, database in enumerate(databases):
             dump = stage / ("postgres/db-%02d.dump" % index)
-            run([str(PG / "pg_dump")] + PG_ARGS + ["-Fc", "-d", database, "-f", str(dump)])
+            run(
+                [str(PG / "pg_dump")]
+                + PG_ARGS
+                + ["-Fc", "-d", database, "-f", str(dump)]
+            )
             with dump.with_suffix(".list").open("wb") as f:
                 run([str(PG / "pg_restore"), "--list", str(dump)], output=f)
             database_files.append({"database": database, "file": dump.name})
-        (stage / "postgres/databases.json").write_text(json.dumps(database_files, indent=2))
-        for name in ("postgresql.conf", "postgresql.auto.conf", "pg_hba.conf", "pg_ident.conf"):
+        (stage / "postgres/databases.json").write_text(
+            json.dumps(database_files, indent=2)
+        )
+        for name in (
+            "postgresql.conf",
+            "postgresql.auto.conf",
+            "pg_hba.conf",
+            "pg_ident.conf",
+        ):
             source = HOME / ".drover-postgres-fresh-test" / name
             if source.is_file():
                 shutil.copyfile(source, stage / "postgres" / name)
@@ -159,12 +244,18 @@ def backup():
                 path.chmod(0o700 if path.is_dir() else 0o600)
         entries = file_entries(stage, "metadata")
         # Every dump and copied configuration is hashed before transfer.
-        sync(stage, NAS + ":" + pending + "/metadata",
-             previous + "/metadata" if previous else None)
+        sync(
+            stage,
+            NAS + ":" + pending + "/metadata",
+            previous + "/metadata" if previous else None,
+        )
         log("stage=lake_second_pass_and_hashes")
         for name, source in DATA.items():
-            sync(source, NAS + ":" + pending + "/" + name,
-                 previous + "/" + name if previous else None)
+            sync(
+                source,
+                NAS + ":" + pending + "/" + name,
+                previous + "/" + name if previous else None,
+            )
             entries.extend(file_entries(source, name))
         log("stage=NAS_checksum_verification")
         verification = remote(helper, "verify", root, {"date": date, "files": entries})
@@ -174,14 +265,29 @@ def backup():
         for item in database_files:
             returned = stage / "nas-readback.dump"
             with returned.open("wb") as f:
-                run(SSH + [NAS, "cat " + shlex.quote(pending + "/metadata/postgres/" + item["file"])], output=f)
+                run(
+                    SSH
+                    + [
+                        NAS,
+                        "cat "
+                        + shlex.quote(pending + "/metadata/postgres/" + item["file"]),
+                    ],
+                    output=f,
+                )
             run([str(PG / "pg_restore"), "--list", str(returned)])
             returned.unlink()
-        receipt = {"date": date, "host": host, "nas_path": root + "/" + date,
-                   "completed_at": dt.datetime.now().astimezone().isoformat(),
-                   "completed_epoch": time.time(), "duration_s": round(time.monotonic() - started, 2),
-                   "databases": len(databases), "nas_pg_restore_list": True,
-                   "consistency_risk": RISK, **verification}
+        receipt = {
+            "date": date,
+            "host": host,
+            "nas_path": root + "/" + date,
+            "completed_at": dt.datetime.now().astimezone().isoformat(),
+            "completed_epoch": time.time(),
+            "duration_s": round(time.monotonic() - started, 2),
+            "databases": len(databases),
+            "nas_pg_restore_list": True,
+            "consistency_risk": RISK,
+            **verification,
+        }
         retention = remote(helper, "publish", root, receipt)
         temporary = STATE / "last-success.json.tmp"
         temporary.write_text(json.dumps(receipt, indent=2))
@@ -205,7 +311,11 @@ def main():
             backup()
         except Exception as error:
             # Do not print exception strings, paths, DSNs, or child diagnostics.
-            log("FAILURE type=" + type(error).__name__ + "; generation unpublished; inspect NAS pending directory")
+            log(
+                "FAILURE type="
+                + type(error).__name__
+                + "; generation unpublished; inspect NAS pending directory"
+            )
             return 1
     return 0
 

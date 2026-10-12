@@ -15,36 +15,69 @@ spec.loader.exec_module(nas)
 
 class BackupTests(unittest.TestCase):
     def remote(self, action, root, payload):
-        return subprocess.run([sys.executable, str(HELPER), action, str(root)],
-                              input=json.dumps(payload), text=True, capture_output=True)
+        return subprocess.run(
+            [sys.executable, str(HELPER), action, str(root)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+        )
 
     def test_retention_spans_year_and_keeps_seven_daily_four_weekly(self):
         import datetime as dt
-        dates = [(dt.date(2026, 1, 9) - dt.timedelta(days=i)).isoformat() for i in range(50)]
+
+        dates = [
+            (dt.date(2026, 1, 9) - dt.timedelta(days=i)).isoformat() for i in range(50)
+        ]
         keep = nas.retained_dates(dates + [".pending-2026-01-10", "unrelated"])
         self.assertTrue(set(dates[:7]) <= keep)
-        self.assertEqual(len({dt.date.fromisoformat(n).isocalendar()[:2] for n in keep}), 4)
+        self.assertEqual(
+            len({dt.date.fromisoformat(n).isocalendar()[:2] for n in keep}), 4
+        )
         self.assertEqual(keep, set(dates[:7] + ["2025-12-28", "2025-12-21"]))
 
     def test_verify_publish_and_detect_tamper(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            self.assertEqual(self.remote("prepare", root, {"date": "2026-10-12"}).returncode, 0)
+            self.assertEqual(
+                self.remote("prepare", root, {"date": "2026-10-12"}).returncode, 0
+            )
             pending = root / ".pending-2026-10-12"
             artifact = pending / "sample.dump"
             artifact.write_bytes(b"test archive")
             artifact.chmod(0o600)
-            payload = {"date": "2026-10-12", "files": [
-                {"path": artifact.name, "size": artifact.stat().st_size, "sha256": nas.digest(artifact)}]}
+            payload = {
+                "date": "2026-10-12",
+                "files": [
+                    {
+                        "path": artifact.name,
+                        "size": artifact.stat().st_size,
+                        "sha256": nas.digest(artifact),
+                    }
+                ],
+            }
             artifact.write_bytes(b"bad archive!")
             self.assertNotEqual(self.remote("verify", root, payload).returncode, 0)
             self.assertFalse((pending / "MANIFEST.json").exists())
             artifact.write_bytes(b"test archive")
             self.assertEqual(self.remote("verify", root, payload).returncode, 0)
-            self.assertNotEqual(self.remote("publish", root, {"date": "2026-10-12", "nas_pg_restore_list": False}).returncode, 0)
-            self.assertEqual(self.remote("publish", root, {"date": "2026-10-12", "nas_pg_restore_list": True}).returncode, 0)
+            self.assertNotEqual(
+                self.remote(
+                    "publish",
+                    root,
+                    {"date": "2026-10-12", "nas_pg_restore_list": False},
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                self.remote(
+                    "publish", root, {"date": "2026-10-12", "nas_pg_restore_list": True}
+                ).returncode,
+                0,
+            )
             self.assertTrue((root / "2026-10-12/SUCCESS.json").exists())
-            self.assertNotEqual(self.remote("prepare", root, {"date": "2026-10-12"}).returncode, 0)
+            self.assertNotEqual(
+                self.remote("prepare", root, {"date": "2026-10-12"}).returncode, 0
+            )
 
     def test_rsync_uses_hardlinks_private_modes_and_preserves_previous(self):
         backup_path = ROOT / "scripts/backup/studio_backup.py"
@@ -79,10 +112,24 @@ class BackupTests(unittest.TestCase):
             artifact = root / ".pending-2026-10-12/file"
             artifact.write_bytes(b"secret placeholder")
             artifact.chmod(0o644)
-            entry = {"path": "file", "size": artifact.stat().st_size, "sha256": nas.digest(artifact)}
-            self.assertNotEqual(self.remote("verify", root, {"date": "2026-10-12", "files": [entry]}).returncode, 0)
+            entry = {
+                "path": "file",
+                "size": artifact.stat().st_size,
+                "sha256": nas.digest(artifact),
+            }
+            self.assertNotEqual(
+                self.remote(
+                    "verify", root, {"date": "2026-10-12", "files": [entry]}
+                ).returncode,
+                0,
+            )
             entry["path"] = "../file"
-            self.assertNotEqual(self.remote("verify", root, {"date": "2026-10-12", "files": [entry]}).returncode, 0)
+            self.assertNotEqual(
+                self.remote(
+                    "verify", root, {"date": "2026-10-12", "files": [entry]}
+                ).returncode,
+                0,
+            )
 
 
 if __name__ == "__main__":

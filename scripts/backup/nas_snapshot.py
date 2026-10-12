@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """NAS-side verification and retention. Uploaded by studio_backup.py over SSH."""
+
 import datetime as dt
 import hashlib
 import json
@@ -49,9 +50,13 @@ def main():
         if final.exists() or pending.exists():
             raise ValueError("generation already exists; inspect it before retry")
         pending.mkdir(mode=0o700)
-        previous = sorted(p.name for p in root.iterdir()
-                          if DATE.fullmatch(p.name) and not p.is_symlink()
-                          and (p / "SUCCESS.json").is_file())
+        previous = sorted(
+            p.name
+            for p in root.iterdir()
+            if DATE.fullmatch(p.name)
+            and not p.is_symlink()
+            and (p / "SUCCESS.json").is_file()
+        )
         print(json.dumps({"previous": previous[-1] if previous else None}))
     elif action == "verify":
         request = json.load(sys.stdin)
@@ -71,19 +76,30 @@ def main():
             total += entry["size"]
         with (pending / "MANIFEST.json").open("w") as f:
             json.dump(request, f, indent=2)
-        print(json.dumps({"verified_files": len(request["files"]), "verified_bytes": total}))
+        print(
+            json.dumps(
+                {"verified_files": len(request["files"]), "verified_bytes": total}
+            )
+        )
     elif action == "publish":
         receipt = json.load(sys.stdin)
         pending = root / (".pending-" + receipt["date"])
         # Only the caller's successful read-back pg_restore permits publication.
-        if not receipt["nas_pg_restore_list"] or not (pending / "MANIFEST.json").is_file():
+        if (
+            not receipt["nas_pg_restore_list"]
+            or not (pending / "MANIFEST.json").is_file()
+        ):
             raise ValueError("verification incomplete")
         with (pending / "SUCCESS.json").open("w") as f:
             json.dump(receipt, f, indent=2)
         pending.rename(root / receipt["date"])
-        dates = [p.name for p in root.iterdir()
-                 if DATE.fullmatch(p.name) and not p.is_symlink()
-                 and (p / "SUCCESS.json").is_file()]
+        dates = [
+            p.name
+            for p in root.iterdir()
+            if DATE.fullmatch(p.name)
+            and not p.is_symlink()
+            and (p / "SUCCESS.json").is_file()
+        ]
         keep = retained_dates(dates)
         pruned = []
         for date in dates:
