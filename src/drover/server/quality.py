@@ -176,6 +176,15 @@ def _freshness_category(
     elif latest_span_age > FRESH_SPAN_WARN_HOURS:
         statuses.append("warn")
 
+    collectors = audit.get("collectors", [])
+    for collector in collectors:
+        status = collector.get("status", "unknown")
+        if status != "ok":
+            statuses.append(status)
+            warnings.append(
+                f"collector {collector.get('host_id')}/{collector.get('source_id')}: {status}"
+            )
+
     if unprocessed:
         statuses.append("warn")
         warnings.append(f"{unprocessed} incoming jsonl files are unprocessed")
@@ -183,6 +192,12 @@ def _freshness_category(
     return _category(
         _worst_status(*statuses, "ok"),
         {
+            "collectors": collectors,
+            "collector_health_status": (
+                _worst_status(*(c["status"] for c in collectors))
+                if collectors
+                else "unknown"
+            ),
             "latest_event_age_hours": oldest_latest_event_age,
             "latest_event_age_hours_by_agent": event_ages,
             "oldest_latest_event_age_hours": oldest_latest_event_age,
@@ -983,6 +998,29 @@ def format_prometheus(snapshot: dict) -> str:
             ),
         ]
     )
+
+    lines.extend(
+        [
+            "# HELP drover_collector_lag_seconds Seconds since last successful collect.",
+            "# TYPE drover_collector_lag_seconds gauge",
+            "# HELP drover_collector_last_success_timestamp_seconds Last successful collect Unix time.",
+            "# TYPE drover_collector_last_success_timestamp_seconds gauge",
+        ]
+    )
+    for collector in freshness.get("collectors", []):
+        labels = {"host_id": collector["host_id"], "source_id": collector["source_id"]}
+        lag = collector.get("collector_lag_seconds")
+        if lag is not None:
+            lines.append(_metric("drover_collector_lag_seconds", lag, **labels))
+        last = _parse_timestamp(collector.get("last_successful_collect_at"))
+        if last is not None:
+            lines.append(
+                _metric(
+                    "drover_collector_last_success_timestamp_seconds",
+                    last.timestamp(),
+                    **labels,
+                )
+            )
 
     attribution = snapshot["categories"]["attribution"]["details"]
     lines.extend(
