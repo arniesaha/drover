@@ -52,6 +52,12 @@ class UpdatePlanner:
 
         pinned = self._cfg.update_pinned_version.strip().lstrip("v")
         if pinned:
+            active = self._layout.active_version()
+            if active and compare_versions(pinned, active) < 0:
+                log.warning("ignoring updater pin older than the active runtime")
+                with self._lock:
+                    self._target = None
+                return
             # A pinned fleet never needs the network. The pin may also predate
             # the feed's latest, so there is no artifact to hand out; a host
             # converges to it only if it already has that version installed.

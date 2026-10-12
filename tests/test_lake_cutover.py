@@ -127,6 +127,7 @@ def write_service(tmp_path, *, env=None, config_extra="", analytics=""):
     plist = tmp_path / "com.drover.server.plist"
     environment = {
         "HOME": str(tmp_path / "home"),
+        "PATH": "/usr/bin:/bin",
         "DROVER_CONTROL_DSN": "host=/tmp port=5 dbname=prod user=hub",
         "DROVER_LAKE_BLUE_READER_DSN": "host=/tmp dbname=drover_lake_blue user=r",
         "DROVER_LAKE_BLUE_EXPORTER_DSN": "host=/tmp dbname=drover_lake_blue user=e",
@@ -137,6 +138,11 @@ def write_service(tmp_path, *, env=None, config_extra="", analytics=""):
         plistlib.dump(
             {
                 "Label": "com.drover.server",
+                "KeepAlive": True,
+                "RunAtLoad": True,
+                "ExitTimeOut": 300,
+                "StandardOutPath": str(tmp_path / "server.out.log"),
+                "StandardErrorPath": str(tmp_path / "server.err.log"),
                 "ProgramArguments": [
                     "/runtime/current/bin/drover-server",
                     "--config",
