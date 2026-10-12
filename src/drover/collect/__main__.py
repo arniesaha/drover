@@ -267,23 +267,26 @@ def run(ctx: click.Context, source_filter: Optional[str], dry_run: bool) -> None
                 # watermark_iso is only the newest event time, for `status`.
                 keyed_cursor: Optional[dict] = None
                 events: list[AgentEvent] = []
+                collect_successful = True
+                caught_up = True
                 if isinstance(src, IncrementalSource):
                     batch = src.collect(cursor)
                     for message in batch.diagnostics:
                         log.warning("[%s] %s", src.id, message)
                     events = batch.events
                     keyed_cursor = batch.cursor
+                    collect_successful = batch.successful
+                    caught_up = batch.caught_up
                 else:
                     files = src.list_files_since(watermark)
                     if not files:
                         log.info("[%s] no new files (watermark=%s)", src.id, watermark)
-                        successes += 1
-                        continue
 
                     for f in files:
                         try:
                             events.extend(src.parse(f))
                         except Exception as exc:  # noqa: BLE001
+                            collect_successful = False
                             log.warning("[%s] parse failed for %s: %s", src.id, f, exc)
 
                     # Filter to events strictly after the watermark to avoid reshipping
@@ -297,12 +300,10 @@ def run(ctx: click.Context, source_filter: Optional[str], dry_run: bool) -> None
                 )
                 if out is None:
                     log.info("[%s] no new events", src.id)
-                    if keyed_cursor is not None:
-                        state.write(src.id, _cursor_payload(keyed_cursor, watermark))
-                    successes += 1
-                    continue
-
-                log.info("[%s] staged %d events to %s", src.id, len(events), out.name)
+                else:
+                    log.info(
+                        "[%s] staged %d events to %s", src.id, len(events), out.name
+                    )
                 new_watermark = latest_event_timestamp(events) or watermark
                 if keyed_cursor is not None and watermark is not None:
                     new_watermark = max(new_watermark, watermark)
@@ -325,10 +326,34 @@ def run(ctx: click.Context, source_filter: Optional[str], dry_run: bool) -> None
                         failures += 1
                         continue
 
-                # Advance cursor only after a successful (or dry-run) write
-                if new_watermark is not None:
-                    state.write(src.id, _cursor_payload(keyed_cursor, new_watermark))
-                successes += 1
+                payload = _cursor_payload(keyed_cursor or cursor, new_watermark)
+                payload["collect_successful"] = collect_successful
+                payload["caught_up"] = caught_up
+                payload["last_successful_collect_at"] = cursor.get(
+                    "last_successful_collect_at"
+                )
+                if not dry_run:
+                    if collect_successful:
+                        payload["last_successful_collect_at"] = payload["last_run_iso"]
+                    from drover.collect.health import stage_health
+
+                    stage_health(staging_dir, src.id, payload)
+                    try:
+                        ship_staging(
+                            staging_dir=staging_dir, host=remote_target, host_id=host_id
+                        )
+                    except ShipError:
+                        # Retry telemetry from a fresh collection, not a failed shipment.
+                        (staging_dir / f".collector-{src.id}.json").unlink(
+                            missing_ok=True
+                        )
+                        failures += 1
+                        continue
+                state.write(src.id, payload)
+                if collect_successful:
+                    successes += 1
+                else:
+                    failures += 1
         except CursorLocked as exc:
             log.warning("[%s] %s; skipping", src.id, exc)
             failures += 1
@@ -508,9 +533,12 @@ def status(ctx: click.Context) -> None:
     click.echo("sources:")
     for s in sources:
         cur = state.read(s.id)
-        wm = cur.get("watermark_iso", "—")
-        lr = cur.get("last_run_iso", "—")
-        click.echo(f"  {s.id:18s} watermark={wm}  last_run={lr}")
+        wm = cur.get("watermark_iso", "unknown")
+        lr = cur.get("last_run_iso", "unknown")
+        last = cur.get("last_successful_collect_at") or "unknown"
+        click.echo(
+            f"  {s.id:18s} watermark={wm}  last_run={lr}  last_successful_collect={last}"
+        )
 
     t_cfg = cfg.get("tempo") or {}
     if t_cfg.get("enabled"):

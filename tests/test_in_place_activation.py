@@ -919,3 +919,22 @@ def test_this_service_is_skipped_if_named_in_restart_units(monkeypatch):
     )
 
     assert ran == [["systemctl", "--user", "restart", "drover-server.service"]]
+
+
+def test_pending_activation_cannot_undo_a_newer_manual_rollout(tmp_path):
+    layout, updater = _updater(tmp_path, cfg=default_config())
+    updater.observe({"target_version": "0.1.4"})
+    _installed(layout, "0.1.5")
+    layout.flip("0.1.5")
+    assert updater.maybe_activate() is False
+    assert layout.active_version() == "0.1.5"
+    assert layout.read_marker() is None
+
+
+def test_stale_recovery_marker_cannot_undo_a_newer_manual_rollout(tmp_path):
+    layout = RuntimeLayout(tmp_path)
+    layout.flip("0.1.5")
+    layout.write_marker("0.1.3", "0.1.4")
+    assert verify_after_restart(layout, registered=False) is True
+    assert layout.active_version() == "0.1.5"
+    assert layout.read_marker() is None

@@ -18,6 +18,8 @@ The watermark is ``(session_id, seq)``, the table's primary key: one last
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import logging
 import sqlite3
@@ -35,7 +37,7 @@ log = logging.getLogger("drover.collect.openclaw_sqlite")
 
 AGENT_DB_GLOB = "agents/*/agent/openclaw-agent.sqlite"
 DEFAULT_STATE_DIR = "~/.openclaw"
-CURSOR_VERSION = 1
+CURSOR_VERSION = 2
 
 _EVENTS_TABLE = "transcript_events"
 _EVENTS_REQUIRED = ("session_id", "seq", "created_at")
@@ -80,7 +82,7 @@ _MIN_SEQ = -(2**63)
 _MAX_EVENT_BYTES = 8 * 1024 * 1024
 
 
-def _load_zstd() -> Optional[Callable[[bytes], bytes]]:
+def _load_zstd(max_bytes: int = _MAX_EVENT_BYTES) -> Optional[Callable[[bytes], bytes]]:
     try:
         from compression import zstd  # Python 3.14+
     except ImportError:
@@ -89,7 +91,7 @@ def _load_zstd() -> Optional[Callable[[bytes], bytes]]:
 
         def _stdlib(blob: bytes) -> bytes:
             decoder = zstd.ZstdDecompressor()
-            out = decoder.decompress(blob, max_length=_MAX_EVENT_BYTES)
+            out = decoder.decompress(blob, max_length=max_bytes)
             if not decoder.eof:
                 raise ValueError("zstd frame is truncated or too large")
             return out
@@ -101,9 +103,11 @@ def _load_zstd() -> Optional[Callable[[bytes], bytes]]:
         return None
 
     def _third_party(blob: bytes) -> bytes:
-        return zstandard.ZstdDecompressor().decompress(
-            blob, max_output_size=_MAX_EVENT_BYTES
-        )
+        with zstandard.ZstdDecompressor().stream_reader(io.BytesIO(blob)) as stream:
+            out = stream.read(max_bytes + 1)
+        if len(out) > max_bytes:
+            raise ValueError("zstd frame is too large")
+        return out
 
     return _third_party
 
@@ -176,6 +180,7 @@ class _Reader:
     retry_delay_s: float
     payloads: tuple[str, ...] = ()
     tables: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    schema_diagnostics: list[str] = field(default_factory=list)
 
     def query(self, sql: str, params: tuple = ()) -> list[tuple]:
         attempt = 0
@@ -222,6 +227,35 @@ class _Reader:
                 continue
             wanted = _SESSION_COLUMNS.get(table, ())
             self.tables[table] = tuple(c for c in wanted if c in present)
+        for table, columns in {
+            "transcript_rewrite_watermarks": ("session_id", "generation"),
+            "session_transcript_archives": (
+                "session_id",
+                "generation",
+                "encoding",
+                "archive_blob",
+                "archive_sha256",
+                "created_at",
+            ),
+            "session_transcript_cold_archives": (
+                "session_id",
+                "generation",
+                "archive_name",
+                "archive_sha256",
+                "storage",
+                "archive_blob",
+                "archive_bytes",
+            ),
+        }.items():
+            present = self._columns(table)
+            if present and not set(columns) <= present:
+                self.schema_diagnostics.append(
+                    f"{table}: unfamiliar schema, retry with a supported archive schema"
+                )
+            if set(columns) <= present:
+                self.tables[table] = columns
+                if table == "session_transcript_archives" and "session_key" in present:
+                    self.tables[table] += ("session_key",)
         meta = self._columns("schema_meta")
         self.tables["schema_meta"] = tuple(
             c for c in _SESSION_COLUMNS["schema_meta"] if c in meta
@@ -295,6 +329,30 @@ class _Reader:
         value = rows[0][0] if rows else None
         return value if isinstance(value, str) else None
 
+    def rewrite_token(self, session_id: str, seq: int) -> dict:
+        generation = None
+        if "transcript_rewrite_watermarks" in self.tables:
+            rows = self.query(
+                "SELECT generation FROM transcript_rewrite_watermarks WHERE session_id = ?",
+                (session_id,),
+            )
+            generation = rows[0][0] if rows else None
+        rows = self.query(
+            f"SELECT created_at, {', '.join(self.payloads)} FROM transcript_events "
+            "WHERE session_id = ? AND seq = ?",
+            (session_id, seq),
+        )
+        digest = hashlib.sha256()
+        for value in rows[0] if rows else ():
+            digest.update(
+                str(value).encode() if not isinstance(value, bytes) else value
+            )
+            digest.update(b"\0")
+        return {
+            "generation": generation,
+            "anchor": digest.hexdigest() if rows else None,
+        }
+
     def max_seq(self, session_id: str) -> Optional[int]:
         rows = self.query(
             f"SELECT MAX(seq) FROM {_EVENTS_TABLE} WHERE session_id = ?",
@@ -359,6 +417,7 @@ class OpenClawSqliteSource:
         diagnostics: list[str] = []
 
         databases = self.databases()
+        successful = bool(databases)
         if not databases:
             diagnostics.append(
                 f"no OpenClaw agent database matches {AGENT_DB_GLOB} under the "
@@ -369,15 +428,27 @@ class OpenClawSqliteSource:
             if budget <= 0:
                 break
             sessions = dict(agents_state.get(agent_id, {}).get("sessions", {}))
-            self._collect_database(
-                agent_id, db_path, sessions, budget, events, diagnostics
+            state = agents_state.setdefault(agent_id, {"sessions": sessions})
+            tokens = state.setdefault("tokens", {})
+            archives = state.setdefault("archives", {})
+            successful &= self._collect_database(
+                agent_id,
+                db_path,
+                sessions,
+                tokens,
+                archives,
+                budget,
+                events,
+                diagnostics,
             )
-            agents_state[agent_id] = {"sessions": sessions}
+            state["sessions"] = sessions
 
         return IncrementalBatch(
             events=events,
             cursor={"version": CURSOR_VERSION, "agents": agents_state},
             diagnostics=diagnostics,
+            successful=successful,
+            caught_up=len(events) < self.max_events_per_run,
         )
 
     def _collect_database(
@@ -385,10 +456,12 @@ class OpenClawSqliteSource:
         agent_id: str,
         db_path: Path,
         sessions: dict[str, int],
+        tokens: dict,
+        archives: dict,
         budget: int,
         events: list[AgentEvent],
         diagnostics: list[str],
-    ) -> None:
+    ) -> bool:
         """Advance ``sessions`` in place; whatever was read before a failure stays."""
         label = f"agent {agent_id!r}"
         conn: Optional[sqlite3.Connection] = None
@@ -400,7 +473,25 @@ class OpenClawSqliteSource:
                 retry_delay_s=self.retry_delay_s,
             )
             reader.discover_schema()
-            self._read_sessions(agent_id, reader, sessions, budget, events, diagnostics)
+            diagnostics.extend(
+                f"{label}: {message}" for message in reader.schema_diagnostics
+            )
+            from drover.collect.openclaw_archives import collect_archives
+
+            before = len(events)
+            ok = collect_archives(
+                self, agent_id, db_path, reader, archives, budget, events, diagnostics
+            )
+            ok &= self._read_sessions(
+                agent_id,
+                reader,
+                sessions,
+                tokens,
+                budget - (len(events) - before),
+                events,
+                diagnostics,
+            )
+            return ok and not reader.schema_diagnostics
         except _SchemaUnknown as exc:
             diagnostics.append(
                 f"{label}: unknown OpenClaw schema, skipped ({exc}); this "
@@ -417,16 +508,18 @@ class OpenClawSqliteSource:
         finally:
             if conn is not None:
                 conn.close()
+        return False
 
     def _read_sessions(
         self,
         agent_id: str,
         reader: _Reader,
         sessions: dict[str, int],
+        tokens: dict,
         budget: int,
         events: list[AgentEvent],
         diagnostics: list[str],
-    ) -> None:
+    ) -> bool:
         label = f"agent {agent_id!r}"
         app_version = reader.app_version()
         seen: set[str] = set()
@@ -446,6 +539,17 @@ class OpenClawSqliteSource:
             seen.add(session_id)
 
             last_seq = sessions.get(session_id)
+            initial_token = reader.rewrite_token(
+                session_id, last_seq if last_seq is not None else _MIN_SEQ
+            )
+            if last_seq is not None:
+                token = initial_token
+                # Old cursors have no identity evidence. Replay once to establish it.
+                if tokens.get(session_id) != token:
+                    rewound += 1
+                    last_seq = None
+                    sessions.pop(session_id, None)
+                    tokens.pop(session_id, None)
             mapper: Optional[OpenClawRecordMapper] = None
             extra: dict[str, Any] = {}
             while remaining > 0:
@@ -461,6 +565,7 @@ class OpenClawSqliteSource:
                         rewound += 1
                         last_seq = None
                         del sessions[session_id]
+                        tokens.pop(session_id, None)
                         continue
                 if not rows:
                     break
@@ -489,6 +594,18 @@ class OpenClawSqliteSource:
                         skipped += 1
                     last_seq = seq
                     sessions[session_id] = seq
+                    digest = hashlib.sha256()
+                    for value in (created_at, *(payload[c] for c in reader.payloads)):
+                        digest.update(
+                            str(value).encode()
+                            if not isinstance(value, bytes)
+                            else value
+                        )
+                        digest.update(b"\0")
+                    tokens[session_id] = {
+                        "generation": initial_token["generation"],
+                        "anchor": digest.hexdigest(),
+                    }
                     if event is not None:
                         events.append(event)
                         remaining -= 1
@@ -500,6 +617,7 @@ class OpenClawSqliteSource:
             for session_id in [s for s in sessions if s not in seen]:
                 if not reader.session_exists(session_id):
                     del sessions[session_id]
+                    tokens.pop(session_id, None)
         if blocked:
             diagnostics.append(
                 f"{label}: {blocked} session(s) paused at zstd-compressed events; "
@@ -516,6 +634,8 @@ class OpenClawSqliteSource:
                 "decodable event records"
             )
 
+        return not (blocked or skipped)
+
     def _session_mapper(
         self,
         agent_id: str,
@@ -523,8 +643,11 @@ class OpenClawSqliteSource:
         session_id: str,
         app_version: Optional[str],
         last_seq: Optional[int],
+        archive_meta: Optional[dict] = None,
     ) -> tuple[OpenClawRecordMapper, dict[str, Any]]:
         meta = reader.session_metadata(session_id)
+        if archive_meta and not meta.get("session_key"):
+            meta["session_key"] = archive_meta.get("session_key")
         defaults = {
             "agent_id": agent_id,
             "session_key": meta.get("session_key"),
@@ -596,10 +719,20 @@ def _agents_state(cursor: dict) -> dict[str, dict[str, dict[str, int]]]:
         if not isinstance(sessions, dict):
             continue
         out[str(agent_id)] = {
+            "tokens": (
+                dict(state.get("tokens", {}))
+                if isinstance(state.get("tokens"), dict)
+                else {}
+            ),
+            "archives": (
+                dict(state.get("archives", {}))
+                if isinstance(state.get("archives"), dict)
+                else {}
+            ),
             "sessions": {
                 str(session_id): seq
                 for session_id, seq in sessions.items()
                 if isinstance(seq, int) and not isinstance(seq, bool)
-            }
+            },
         }
     return out

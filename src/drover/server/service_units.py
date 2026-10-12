@@ -13,14 +13,87 @@ that have silently broken hosts before are actually testable:
 
 from __future__ import annotations
 
+import os
 import plistlib
+import tempfile
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 # Seconds launchd waits after SIGTERM before SIGKILL. The server checkpoints
 # on SIGTERM; killing it mid-checkpoint makes the next open pay for recovery
 # (#307: a 4.5-minute first DuckDB open). Generous enough for a clean
 # checkpoint, short enough that a genuinely wedged unit still gets reclaimed.
 EXIT_TIMEOUT_SECONDS = 300
+
+
+def validate_launchd(content: str | bytes) -> dict:
+    """Load a complete daemon job, never an extracted plist fragment.
+
+    Do not include values in errors: environments may contain credentials.
+    ``plutil -lint`` alone accepts arrays and incomplete job dictionaries.
+    """
+    try:
+        data = plistlib.loads(content.encode() if isinstance(content, str) else content)
+    except (ValueError, TypeError, ExpatError):
+        raise ValueError("launchd job plist is malformed") from None
+    if not isinstance(data, dict):
+        raise ValueError("launchd job must be a dictionary")
+    for key in ("Label", "StandardOutPath", "StandardErrorPath"):
+        if not isinstance(data.get(key), str) or not data[key].strip():
+            raise ValueError(f"launchd job requires {key}")
+    args = data.get("ProgramArguments")
+    if (
+        not isinstance(args, list)
+        or not args
+        or not all(isinstance(arg, str) and arg for arg in args)
+    ):
+        raise ValueError("launchd job requires nonempty ProgramArguments")
+    env = data.get("EnvironmentVariables")
+    if (
+        not isinstance(env, dict)
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
+        or not env.get("HOME")
+        or not env.get("PATH")
+    ):
+        raise ValueError("launchd job requires EnvironmentVariables with HOME and PATH")
+    for key in ("KeepAlive", "RunAtLoad"):
+        if type(data.get(key)) is not bool:
+            raise ValueError(f"launchd job requires boolean {key}")
+    if type(data.get("ExitTimeOut")) is not int or data["ExitTimeOut"] <= 0:
+        raise ValueError("launchd job requires positive ExitTimeOut")
+    return data
+
+
+def write_launchd(path: Path, content: str | bytes) -> None:
+    """Validate, round-trip and atomically replace a complete job.
+
+    Existing file permissions survive; staging is private until validation.
+    All writers and operator edits should use this boundary.
+    """
+    path = Path(path)
+    job = validate_launchd(content)
+    if path.stem != job["Label"]:
+        raise ValueError("launchd job Label must match destination filename")
+    serialized = plistlib.dumps(job)
+    if validate_launchd(serialized) != job:
+        raise ValueError("launchd job round-trip mismatch")
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
+    staging = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=".launchd-", delete=False
+        ) as stream:
+            staging = Path(stream.name)
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if validate_launchd(staging.read_bytes()) != job:
+            raise ValueError("launchd staged job round-trip mismatch")
+        staging.chmod(mode)
+        os.replace(staging, path)
+    finally:
+        if staging is not None:
+            staging.unlink(missing_ok=True)
 
 
 def runtime_bin(home: Path) -> Path:
@@ -87,7 +160,9 @@ def render_launchd(
         "StandardOutPath": str(log_dir / f"{short}.out.log"),
         "StandardErrorPath": str(log_dir / f"{short}.err.log"),
     }
-    return plistlib.dumps(payload).decode("utf-8")
+    rendered = plistlib.dumps(payload)
+    validate_launchd(rendered)
+    return rendered.decode("utf-8")
 
 
 def render_systemd(

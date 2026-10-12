@@ -240,6 +240,64 @@ def backup_cmd(lake, lake_root, gate_root, backup_root, plist, pg_bin, dry_run):
     click.echo(json.dumps(receipt, indent=2))
 
 
+@cutover_cmd.command("release-preflight")
+@_plan_options
+@click.option("--plist", type=click.Path(path_type=Path), default=str(DEFAULT_PLIST))
+@click.option("--release", required=True)
+@click.option("--wheel-sha256", required=True, help="Published release wheel digest.")
+@click.option("--lock-sha256", required=True, help="Published release lock digest.")
+@click.option("--backup", required=True, type=click.Path(path_type=Path))
+@click.option(
+    "--min-free-gb", type=click.FloatRange(min=0), default=5, show_default=True
+)
+@click.option(
+    "--max-backup-age-hours",
+    type=click.FloatRange(min=0, min_open=True),
+    default=24,
+    show_default=True,
+)
+@click.option("--pg-bin", type=click.Path(path_type=Path))
+def release_preflight_cmd(
+    lake,
+    lake_root,
+    gate_root,
+    backup_root,
+    plist,
+    release,
+    wheel_sha256,
+    lock_sha256,
+    backup,
+    min_free_gb,
+    max_backup_age_hours,
+    pg_bin,
+):
+    """Read-only staged release checks; schema changes require the full gate."""
+    from .rollout import run_release_preflight
+
+    plan = _plan(lake, lake_root, gate_root, backup_root)
+    try:
+        service = ServiceView.load(plist)
+        checks = run_release_preflight(
+            plan,
+            service,
+            release=release,
+            wheel_sha256=wheel_sha256,
+            lock_sha256=lock_sha256,
+            backup=backup,
+            min_free_bytes=int(min_free_gb * 1024**3),
+            max_backup_age_hours=max_backup_age_hours,
+            pg_bin=pg_bin,
+        )
+    except (OSError, ValueError, CutoverError):
+        _emit(
+            verdict(
+                "release-preflight", plan, [], error="release preflight input invalid"
+            )
+        )
+        return
+    _emit(verdict("release-preflight", plan, checks))
+
+
 @cutover_cmd.command("switch")
 @_plan_options
 @_service_options

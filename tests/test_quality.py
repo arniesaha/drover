@@ -962,7 +962,11 @@ def test_quality_prometheus_output_has_stable_metric_names(
     assert "drover_quality_unprocessed_incoming_files 1" in text
 
 
-def test_cli_quality_emits_json_and_prometheus(tmp_path: Path) -> None:
+def test_cli_quality_emits_json_and_prometheus(tmp_path: Path, monkeypatch) -> None:
+    # Keep this synthetic CLI check independent of the workstation config.
+    monkeypatch.setattr(
+        "drover.server.__main__._DEFAULT_CONFIG_PATH", tmp_path / "absent-config.toml"
+    )
     # The CLI registers no PostgreSQL store for --db: memory is unavailable,
     # and the snapshot still renders.
     duckdb_path, incoming = _seed_lakehouse_without_memory(tmp_path)
@@ -995,3 +999,30 @@ def test_cli_quality_emits_json_and_prometheus(tmp_path: Path) -> None:
     assert json.loads(json_res.output)["categories"]["freshness"]["status"] == "ok"
     assert prometheus_res.exit_code == 0, prometheus_res.output
     assert "drover_quality_score" in prometheus_res.output
+
+
+def test_quality_prometheus_reports_collector_lag_and_success(tmp_path, monkeypatch):
+    now = datetime(2026, 10, 12, tzinfo=timezone.utc)
+    audit = _quality_audit_stub(now)
+    audit["collectors"] = [
+        {
+            "host_id": "fixture-host",
+            "source_id": "openclaw_sqlite",
+            "status": "warn",
+            "collector_lag_seconds": 1200,
+            "last_successful_collect_at": (now - timedelta(seconds=1200)).isoformat(),
+        }
+    ]
+    monkeypatch.setattr("drover.server.quality.runtime_audit", lambda **_: audit)
+    snapshot = quality_snapshot(duckdb_path=tmp_path / "test.duckdb", now=now)
+    freshness = snapshot["categories"]["freshness"]
+    assert freshness["status"] == "warn"
+    text = format_prometheus(snapshot)
+    assert (
+        'drover_collector_lag_seconds{host_id="fixture-host",source_id="openclaw_sqlite"} 1200'
+        in text
+    )
+    assert (
+        'drover_collector_last_success_timestamp_seconds{host_id="fixture-host",source_id="openclaw_sqlite"}'
+        in text
+    )
