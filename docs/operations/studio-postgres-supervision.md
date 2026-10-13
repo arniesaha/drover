@@ -138,10 +138,35 @@ The command performs these steps in order, under a nonblocking exclusive lock:
    run counts. Suppress raw probe output; print only fixed pass/fail messages.
    Mark complete only after both probes pass.
 
+The generated Postgres LaunchAgent explicitly sets both `LC_ALL` and `LANG` to
+`en_US.UTF-8`. launchd does not inherit the interactive shell's locale. Without
+these values the Studio postmaster exited with `postmaster became multithreaded
+during startup`. Keep both variables in the generated plist; the scoped test
+checks the serialized plist dictionary.
+
 The agent is never bootstrapped until the manual postmaster is confirmed gone.
 The helper never uses immediate shutdown or process kills. On failure after a
 stop it prints the rollback command and retains progress; it does not perform
 an automatic data restore or automatic service rollback.
+
+To inspect a retry without changing services, rerun `pg-switchover.sh` without
+`--execute`. During the scheduled window, rerun `pg-switchover.sh --execute` to
+resume the saved stage. Resume verifies original hub bytes, staged files, binary,
+configuration and backup checksums before service actions. It accepts the original
+or exactly wrapped hub at `applying-hub-wrapper`, then writes the wrapper from the
+saved original, so a retry never adds a second prefix. At
+`starting-supervised-postgres`, it reuses an already loaded job only after readiness
+and postmaster ownership checks, or bootstraps after confirming the manual server
+is gone. `starting-hub` similarly skips an already successful bootstrap. Soak
+checks repeat after an interrupted soak. A completed switch is a no-op.
+
+A backup-stage retry runs preflight and creates fresh dumps under the attempt's
+`backups/` directory before any stop. Interrupted, unverified dumps are replaced;
+the original hub backup stays intact. Older attempts with checksums directly in
+the attempt directory are also accepted. Rollback stages cannot resume switching;
+continue with the rollback command instead. Resume never silently accepts altered
+prepared hashes: review and explicitly reconcile previously staged files if they
+need a locale correction before retrying.
 
 Backups precede downtime. Estimate 1 to 3 minutes for a healthy restart, with
 30 seconds between soak probes. This is an unmeasured estimate. Hub checkpoint,
@@ -183,8 +208,8 @@ or committed. These logical backups are individually consistent, not a
 coordinated cross-database recovery point, and do not include external DuckLake
 data files. Restoring dumps is separate coordinated recovery work. Keep the
 original plist, manifests, checksums and backups. Archive the active-state file
-only after operator review before preparing a new attempt; another switch
-refuses to overwrite an existing attempt.
+only after operator review before preparing a new attempt. Repeating switch
+resumes the existing attempt and never creates a replacement attempt.
 
 ## Validation and remaining gates
 

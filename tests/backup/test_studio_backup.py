@@ -232,13 +232,13 @@ class LiveBackupTests(unittest.TestCase):
             # The execution fixture did not replace the production wrapper.
             self.assertIs(backup.run, real_run)
 
-    def test_default_root_uses_nas_home_and_sanitized_host(self):
+    def test_default_root_is_independent_of_ssh_login_and_sanitizes_host(self):
         backup = self.backup
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             config = home / ".drover/maintenance/backup-config.json"
             config.parent.mkdir(parents=True)
-            config.write_text(json.dumps({"nas": "Arnab@nas-host"}))
+            config.write_text(json.dumps({"nas": "backup-user@nas-host"}))
             with (
                 mock.patch.object(backup, "HOME", home),
                 mock.patch.object(backup, "NAS", ""),
@@ -258,6 +258,37 @@ class LiveBackupTests(unittest.TestCase):
                     remote.call_args.args[2],
                     "/home/Arnab/backups/drover/Studio_test.local",
                 )
+
+    def test_configurable_target_root_and_invalid_roots(self):
+        backup = self.backup
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            config = home / ".drover/maintenance/backup-config.json"
+            config.parent.mkdir(parents=True)
+            for target in ("/volume/backups", "relative", "/home/../escape", 42):
+                config.write_text(
+                    json.dumps({"nas": "backup-user@nas-host", "target_root": target})
+                )
+                with (
+                    mock.patch.object(backup, "HOME", home),
+                    mock.patch.object(backup, "NAS", ""),
+                    mock.patch.object(backup, "DATA", {}),
+                    mock.patch.object(
+                        backup.socket, "gethostname", return_value="Studio"
+                    ),
+                    mock.patch.object(backup, "log"),
+                    mock.patch.object(
+                        backup, "remote", side_effect=RuntimeError("preflight")
+                    ) as remote,
+                ):
+                    with self.assertRaises(RuntimeError):
+                        backup.backup()
+                    if target == "/volume/backups":
+                        self.assertEqual(
+                            remote.call_args.args[2], "/volume/backups/Studio"
+                        )
+                    else:
+                        remote.assert_not_called()
 
     def test_failure_log_includes_command_exit_code_and_caffeinate_tracks_pid(self):
         backup = self.backup
@@ -296,7 +327,9 @@ class LiveBackupTests(unittest.TestCase):
                 mock.patch.object(backup.os, "umask"),
                 mock.patch.object(backup.subprocess, "Popen"),
                 mock.patch.object(
-                    backup, "backup", side_effect=ValueError("private placeholder")
+                    backup,
+                    "backup",
+                    side_effect=ValueError("command failed (exit private placeholder)"),
                 ),
                 mock.patch.object(backup, "log") as log,
             ):
@@ -305,12 +338,12 @@ class LiveBackupTests(unittest.TestCase):
                     "FAILURE type=ValueError; generation unpublished; inspect NAS pending directory"
                 )
 
-    def test_launchagent_uses_drover_runtime_python(self):
+    def test_launchagent_uses_stable_dedicated_python(self):
         template = ROOT / "scripts/launchd/com.drover.backup.plist.template"
         plist = plistlib.loads(template.read_bytes())
         self.assertEqual(
             plist["ProgramArguments"][0],
-            "__HOME__/.drover/runtime/current/bin/python",
+            "__HOME__/.drover/maintenance/backup-python/bin/python",
         )
 
 
