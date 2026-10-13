@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-10-13
+
+### Added
+
+- Backups now include live DuckDB stores and verify the frozen copies made on the NAS (#611).
+- PostgreSQL setup can resume an interrupted switchover, and the Studio backup script now matches the documented backup flow (#602).
+
+### Changed
+
+- Claude replies finalize streamed thinking and text blocks in place, without adding duplicate messages (#600, #612).
+- The iOS chat screen is lighter and stays compact at accessibility text sizes; preferences fit on one row (#601, #613).
+- Push classification reads split turn payloads correctly (#610).
+
+### Fixed
+
+- iOS recovers its first folder read and prevents overlapping session launches (#614).
+- The PostgreSQL LaunchAgent now starts with the expected locale (#602).
+
+### Upgrade notes
+
+- Restart the hub after upgrading.
+- Upgrade harnessd hosts, including Studio and NAS.
+- Reinstall the updated Studio backup script and set `backup.target_root` in the backup configuration; see the backup documentation.
+
 ## [0.6.7] - 2026-10-12
 
 ### Added
