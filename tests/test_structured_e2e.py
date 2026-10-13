@@ -673,3 +673,75 @@ def test_recorded_claude_deltas_reach_app_feed_before_turn_completion(tmp_path):
         daemon.shutdown()
         daemon.server_close()
         central.shutdown()
+
+
+def test_thinking_singleton_snapshots_persist_matching_stream_ids_on_hub(tmp_path):
+    from pathlib import Path
+
+    central, central_url = _start_central(tmp_path)
+    daemon, state, pusher, base_url = _start_daemon(
+        tmp_path, name="daemon", central_url=central_url
+    )
+    fixture = Path("tests/fixtures/structured/claude_thinking_partial.ndjson").resolve()
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys,pathlib\n"
+            "sys.stdin.readline()\n"
+            "for line in pathlib.Path(sys.argv[1]).read_text().splitlines(): print(line,flush=True)\n"
+            "sys.stdin.read()\n"
+        ),
+        str(fixture),
+    ]
+    try:
+        _, body = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "command": command,
+                "cwd": str(tmp_path),
+            },
+        )
+        sid = body["session_id"]
+        central.RequestHandlerClass.collector._sync_created_harness_session(
+            state.host_id, {}, json.dumps(body)
+        )
+        _json_request(f"{base_url}/sessions/{sid}/turns", payload={"text": "pong"})
+
+        def feed():
+            with _authed_get(f"{central_url}/harness/sessions/{sid}/messages") as res:
+                return json.loads(res.read())["messages"]
+
+        _wait_until(
+            lambda: any(m.get("payload", {}).get("turn_complete") for m in feed())
+        )
+        completed = feed()
+        assistant = [m for m in completed if m["type"] == "assistant_output"]
+        assert len(assistant) == 5
+        assert [m["payload"]["text_stream_id"] for m in assistant] == [
+            "thinking-message:0",
+            "thinking-message:0",
+            "thinking-message:1",
+            "thinking-message:1",
+            "thinking-message:1",
+        ]
+        assert len({m["event_id"] for m in completed}) == len(completed)
+        assert feed() == completed
+        # Each content kind has one final row; deltas can replace in place
+        # after reload because the durable hub bytes preserve the wire index.
+        assert [
+            m["text"] for m in assistant if m["payload"].get("text_stream_final")
+        ] == [
+            "Checking the request.",
+            "pong",
+        ]
+    finally:
+        _close_structured_sessions(state)
+        pusher.stop()
+        state.pty.close_all()
+        daemon.shutdown()
+        daemon.server_close()
+        central.shutdown()
+        central.server_close()

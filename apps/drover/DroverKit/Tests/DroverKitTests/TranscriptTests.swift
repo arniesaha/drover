@@ -316,6 +316,57 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
         }.count == 1)
     }
 
+    @Test(arguments: [false, true]) func thinkingTurnFinalizesLiveAndOnReload(legacy: Bool) throws {
+        let url = try #require(droverKitFixtureURL("claude-thinking-projection"))
+        var messages = try JSONDecoder().decode([HarnessMessage].self, from: Data(contentsOf: url))
+        if legacy {
+            // Persisted 0.6.7 text snapshot has the thinking block's index.
+            let index = try #require(messages.firstIndex {
+                !$0.isThinking && $0.payload["text_stream_final"]?.boolValue == true
+            })
+            messages[index].payload["text_stream_id"] = .string("thinking-message:0")
+        }
+        let live = recoveryChatModel(client: MockNetwork().client(), sessionID: "fixture-session", harness: "claude-code")
+        var textID: String?
+        for message in messages {
+            live.ingest(.message(message))
+            let rows = assistantRows(live)
+            #expect(rows.count <= 1)
+            if let row = rows.first {
+                if let textID { #expect(row.id == textID) } else { textID = row.id }
+            }
+        }
+        let rows = assistantRows(live)
+        #expect(rows.count == 1)
+        #expect(rows.first?.text == "pong")
+        #expect(rows.first?.payload["usage"]?.objectValue?["output_tokens"]?.numberValue == 244)
+        #expect(rows.first?.payload["text_stream_delta"] == nil)
+        let thinking = TranscriptItem.group(live.messages).compactMap { item -> [HarnessMessage]? in
+            if case .thinkingRun(let run, _) = item { return run }; return nil
+        }
+        #expect(thinking.count == 1)
+        #expect(thinking.first?.first?.text == "Checking the request.")
+        let final = try #require(messages.first { !$0.isThinking && $0.payload["text_stream_final"]?.boolValue == true })
+        #expect(TranscriptItem.rowID(containing: final.id, in: messages) == textID)
+        #expect(TranscriptItem.latestRowID(of: Array(messages.prefix(5))) == textID)
+
+        let reload = recoveryChatModel(client: MockNetwork().client(), sessionID: "fixture-session", harness: "claude-code")
+        reload.ingest(.history(messages, decodeIssues: []))
+        #expect(TranscriptItem.group(reload.messages) == TranscriptItem.group(live.messages))
+        #expect(TranscriptItem.group([final]).count == 1)
+    }
+
+    @Test func ambiguousLegacySnapshotDoesNotCollapseSeparateTextBlocksOrMessages() {
+        func message(_ id: String, _ seq: Int, _ stream: String, final: Bool = false) -> HarnessMessage {
+            HarnessMessage(id: id, seq: seq, type: .assistantOutput, text: "same",
+                           payload: ["text_stream_id": .string(stream),
+                                     final ? "text_stream_final" : "text_stream_delta": .bool(true)])
+        }
+        let messages = [message("a", 1, "m:1"), message("b", 2, "m:2"),
+                        message("c", 3, "m:0", final: true), message("d", 4, "other:0", final: true)]
+        #expect(TranscriptItem.group(messages).count == 4)
+    }
+
     @Test func snapshotReplacesPartialTextAcrossStatusesAndCodexRemainsSeparate() {
         let delta = HarnessMessage(id: "delta", seq: 1, type: .assistantOutput, text: "partial",
                                    payload: ["text_stream_id": .string("m:0"), "text_stream_delta": .bool(true)])

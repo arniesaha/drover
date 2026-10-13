@@ -601,3 +601,124 @@ def test_recorded_partial_wire_uses_old_ios_assistant_type_with_delta_marker():
         False,
     ]
     assert assistant[-1]["payload"]["text_stream_final"] is True
+
+
+def test_thinking_singleton_snapshots_project_matching_block_ids():
+    from drover.server.harness.models import HarnessEvent
+
+    driver = _driver([])
+    rows = []
+    for line in (
+        (FIXTURES_DIR / "claude_thinking_partial.ndjson").read_text().splitlines()
+    ):
+        for message in driver.parse_line(line):
+            seq = len(rows) + 1
+            row = HarnessEvent(
+                event_id=f"e{seq}",
+                session_id="fixture-session",
+                event_type=message.type,
+                seq=seq,
+                payload=message.to_payload(),
+            ).wire_payload()
+            row.pop("ts", None)
+            rows.append(row)
+    assistant = [r for r in rows if r["type"] == "assistant_output"]
+    assert [r["payload"]["text_stream_id"] for r in assistant] == [
+        "thinking-message:0",
+        "thinking-message:0",
+        "thinking-message:1",
+        "thinking-message:1",
+        "thinking-message:1",
+    ]
+    assert [r["text"] for r in assistant if r["payload"].get("text_stream_final")] == [
+        "Checking the request.",
+        "pong",
+    ]
+    fixture = Path(
+        "apps/drover/DroverKit/Tests/DroverKitTests/Fixtures/claude-thinking-projection.json"
+    )
+    assert rows == json.loads(fixture.read_text())
+
+
+def test_singleton_snapshots_keep_repeated_text_blocks_and_delayed_message_separate():
+    driver = _driver([])
+
+    def parse(obj):
+        return driver.parse_line(json.dumps(obj))
+
+    parse(
+        {
+            "type": "stream_event",
+            "event": {"type": "message_start", "message": {"id": "m1"}},
+        }
+    )
+    for index, kind in enumerate(["thinking", "tool_use", "text", "text"]):
+        parse(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": kind},
+                },
+            }
+        )
+    parse(
+        {
+            "type": "stream_event",
+            "event": {"type": "message_start", "message": {"id": "m2"}},
+        }
+    )
+    for expected in [2, 3]:
+        [final] = parse(
+            {
+                "type": "assistant",
+                "message": {"id": "m1", "content": [{"type": "text", "text": "same"}]},
+            }
+        )
+        assert final.payload["text_stream_id"] == f"m1:{expected}"
+    [next_final] = parse(
+        {
+            "type": "assistant",
+            "message": {"id": "m2", "content": [{"type": "text", "text": "same"}]},
+        }
+    )
+    assert next_final.payload["text_stream_id"] == "m2:0"
+
+
+def test_stream_block_tracking_is_bounded():
+    driver = _driver([])
+    for index in range(40):
+        driver.parse_line(
+            json.dumps(
+                {
+                    "type": "stream_event",
+                    "event": {"type": "message_start", "message": {"id": f"m{index}"}},
+                }
+            )
+        )
+        driver.parse_line(
+            json.dumps(
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text"},
+                    },
+                }
+            )
+        )
+        driver.parse_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": f"m{index}",
+                        "content": [{"type": "text", "text": "done"}],
+                    },
+                }
+            )
+        )
+    assert len(driver._stream_blocks) == 32
+    assert len(driver._finalized_blocks) == 32
