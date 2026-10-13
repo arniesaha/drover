@@ -78,6 +78,19 @@ public final class LaunchModel {
     public var prompt: String = ""
     public var promptAttachments: [TurnAttachment] = []
     public private(set) var launchError: String?
+    public private(set) var isLaunching = false
+    private var completedSessionID: String?
+    // Reuse the key after a lost response; edits represent a new launch intent.
+    private var launchIntent: LaunchIntent?
+    private var clientSessionID = UUID().uuidString
+
+    private struct LaunchIntent: Equatable {
+        let hostID, harness, mode: String
+        let prompt: String?
+        let cwd: String
+        let images: [TurnAttachment]
+        let model, thinkingEffort: String?
+    }
 
     public init(
         client: DroverClient,
@@ -132,11 +145,12 @@ public final class LaunchModel {
         return nil
     }
 
-    /// True when the selected host is not offline and advertises a launch
-    /// mode for the selected harness.
+    /// Requires a directory and an advertised launch mode on a reachable host.
+    /// Fetching, an in-flight launch, and a completed launch disable submission.
     public var canLaunch: Bool {
         selectedHost != nil && !hostID.isEmpty && !harness.isEmpty && !isHostOffline
-            && controls.launchMode != nil
+            && controls.launchMode != nil && !cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isLaunching && completedSessionID == nil && !isFetchingSnapshot
     }
 
     /// The selected host's launchable harnesses, structured-capable ones first.
@@ -253,6 +267,12 @@ public final class LaunchModel {
     /// the new session id; on failure sets `launchError` (server-authored
     /// text when available) and returns nil.
     public func launch() async -> String? {
+        guard !isLaunching else { return nil }
+        if let completedSessionID { return completedSessionID }
+        guard !cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            launchError = "Choose a working directory before launching."
+            return nil
+        }
         // Fail closed: never ask a host for a mode it did not advertise.
         guard canLaunch, let launchMode = controls.launchMode else {
             launchError = harnessUnavailableReason ?? HarnessCapabilityCopy.noLaunchableHarness
@@ -267,14 +287,23 @@ public final class LaunchModel {
         let effectiveModel = showsRunPreferences ? runPreferences.modelOverride : nil
         let effectiveThinking = showsRunPreferences ? runPreferences.thinkingEffortOverride : nil
 
+        let intent = LaunchIntent(hostID: hostID, harness: harness, mode: launchMode.rawValue,
+                                  prompt: effectivePrompt, cwd: trimmedCwd, images: effectiveImages,
+                                  model: effectiveModel, thinkingEffort: effectiveThinking)
+        if let launchIntent, launchIntent != intent { clientSessionID = UUID().uuidString }
+        launchIntent = intent
+        isLaunching = true
+        defer { isLaunching = false }
         do {
             let sessionID = try await client.createSession(
                 hostID: hostID, harness: harness, mode: launchMode.rawValue,
                 prompt: effectivePrompt, cwd: effectiveCwd,
                 images: effectiveImages,
                 model: effectiveModel,
-                thinkingEffort: effectiveThinking)
+                thinkingEffort: effectiveThinking,
+                clientSessionID: clientSessionID)
             launchError = nil
+            completedSessionID = sessionID
             return sessionID
         } catch {
             launchError = Self.errorMessage(for: error)

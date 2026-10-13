@@ -129,6 +129,8 @@ RELAY_PROOF_TIMEOUT_S = 2.0
 # not CREATE_SESSION_TIMEOUT_S: 120s of held connection per keystroke is how a
 # suggestion list turns into an outage.
 FS_COMPLETE_TIMEOUT_S = 3.0
+# Listing opens child directories and checks Git metadata, unlike completion.
+FS_LIST_TIMEOUT_S = 15.0
 _MAX_CONTENT_BUNDLE_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_CONTENT_VERSION_RESPONSE_BYTES = 256 * 1024
 
@@ -2224,7 +2226,11 @@ class MetricsCollector:
             path,
             method=method,
             payload=payload,
-            timeout_s=FS_COMPLETE_TIMEOUT_S,
+            timeout_s=(
+                FS_LIST_TIMEOUT_S
+                if path.startswith("/fs/list?")
+                else FS_COMPLETE_TIMEOUT_S
+            ),
             **(
                 {"max_response_bytes": 1024 * 1024}
                 if path.startswith("/fs/list?")
