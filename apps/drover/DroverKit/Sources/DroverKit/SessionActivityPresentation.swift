@@ -49,7 +49,7 @@ public struct SessionActivityPresentation: Sendable, Equatable {
                     completedSteps = completed.count
                     if isActive { phase = activeToolIDs.isEmpty ? .working : .tool }
                 }
-            case .assistantOutput, .assistantDelta:
+            case .assistantOutput:
                 if isActive {
                     phase = activeToolIDs.isEmpty ? .working : .tool
                 }

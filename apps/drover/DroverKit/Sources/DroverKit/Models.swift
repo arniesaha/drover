@@ -593,7 +593,6 @@ public struct HarnessSnapshot: Sendable, Decodable {
 
 public enum MessageType: String, Sendable, Equatable {
     case assistantOutput = "assistant_output"
-    case assistantDelta = "assistant_delta"
     case userInput = "user_input"
     case toolAction = "tool_action"
     case toolResult = "tool_result"

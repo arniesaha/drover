@@ -121,7 +121,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         var streams: [String: Int] = [:]
         var usageRows: [String: [Int]] = [:]
         for message in messages {
-            if (message.type == .assistantOutput || message.type == .assistantDelta),
+            if message.type == .assistantOutput,
                let streamID = message.payload["text_stream_id"]?.stringValue {
                 if let index = streams[streamID] {
                     if message.payload["text_stream_final"]?.boolValue == true {
@@ -130,6 +130,9 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
                         result[index].text += message.text
                     }
                     result[index].payload.merge(message.payload) { _, new in new }
+                    if message.payload["text_stream_final"]?.boolValue == true {
+                        result[index].payload.removeValue(forKey: "text_stream_delta")
+                    }
                 } else {
                     streams[streamID] = result.count
                     if let separator = streamID.lastIndex(of: ":") {
@@ -274,7 +277,7 @@ extension HarnessMessage {
     /// A thinking chunk: assistant output flagged `thinking: true` by the
     /// harness driver.
     public var isThinking: Bool {
-        (type == .assistantOutput || type == .assistantDelta) && payload["thinking"]?.boolValue == true
+        type == .assistantOutput && payload["thinking"]?.boolValue == true
     }
 
     /// Telemetry about the adjacent thinking run, not an event in its own

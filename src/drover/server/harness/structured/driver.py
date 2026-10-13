@@ -22,7 +22,6 @@ from uuid import uuid4
 MESSAGE_TYPES = frozenset(
     {
         "assistant_output",
-        "assistant_delta",
         "user_input",
         "tool_action",
         "tool_result",

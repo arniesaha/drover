@@ -1421,3 +1421,56 @@ def test_dependency_protected_events_do_not_starve_prunable_ones(
             ).fetchall()
         }
     assert remaining == {"stuck-event"}
+
+
+def test_postgres_marked_deltas_preserve_completed_message_consumers(
+    postgres_control_store,
+):
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.recap_worker import LiveRecapWorker
+    from drover.server.harness.registry import HarnessRegistry
+
+    path, _ = postgres_control_store
+    registry = HarnessRegistry(path)
+    sid = "stream-compat"
+    registry.create_session(
+        session_id=sid,
+        host_id="test",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id=sid,
+        event_type="assistant_output",
+        seq=1,
+        payload={"text": "Complete reply."},
+    )
+    for seq in range(2, 42):
+        registry.append_event(
+            session_id=sid,
+            event_type="assistant_output",
+            seq=seq,
+            normalized_type="assistant_output",
+            payload={
+                "text": "Partial fragment",
+                "payload": {"text_stream_delta": True},
+            },
+        )
+    assert registry.latest_session_previews([sid]) == {sid: "Complete reply."}
+    with control_plane_connection(path) as con:
+        assert registry._attention_preview(con, sid) == "Complete reply."
+        assert con.execute(
+            "SELECT content_preview FROM harness_session_previews WHERE session_id=?",
+            [sid],
+        ).fetchone() == ("Complete reply.",)
+        # Deltas remain durable for reconnect and reload despite exclusion from previews.
+        assert con.execute("SELECT COUNT(*) FROM control_outbox_events").fetchone() == (
+            41,
+        )
+        assert con.execute(
+            "SELECT COUNT(*) FROM harness_event_payloads"
+        ).fetchone() == (41,)
+    assert registry.transcript_text(sid, limit=1) == "[assistant] Complete reply."
+    events = LiveRecapWorker(duckdb_path=path)._load_events(sid)
+    assert [event["content_preview"] for event in events] == ["Complete reply."]

@@ -25,7 +25,6 @@ def test_message_defaults_and_payload_roundtrip():
 def test_vocabulary_is_exact():
     assert MESSAGE_TYPES == {
         "assistant_output",
-        "assistant_delta",
         "user_input",
         "tool_action",
         "tool_result",

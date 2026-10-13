@@ -1243,6 +1243,7 @@ class HarnessRegistry:
               FROM harness_events
              WHERE session_id = ?
                AND event_type = 'assistant_output'
+               AND COALESCE(normalized_type, '') <> 'assistant_delta'
              ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC
              LIMIT ?
             """,
@@ -2355,6 +2356,7 @@ class HarnessRegistry:
                   FROM harness_events
                   WHERE session_id IN ({placeholders})
                     AND event_type IN ('user_input', 'assistant_output', 'terminal.input')
+                    AND COALESCE(normalized_type, '') <> 'assistant_delta'
                 )
                 WHERE rn <= ?
                 ORDER BY session_id, rn
@@ -2493,6 +2495,7 @@ class HarnessRegistry:
                      WHERE e.session_id = ? AND e.event_type IN
                            ('user_input', 'assistant_output', 'tool_action',
                             'tool_result', 'terminal.output')
+                       AND COALESCE(e.normalized_type, '') <> 'assistant_delta'
                      ORDER BY COALESCE(e.seq, 0), e.created_at, e.event_id
                     """,
                     [session_id],
@@ -2506,6 +2509,7 @@ class HarnessRegistry:
                     WHERE session_id = ? AND event_type IN
                           ('user_input', 'assistant_output', 'tool_action',
                            'tool_result', 'terminal.output')
+                      AND COALESCE(normalized_type, '') <> 'assistant_delta'
                     ORDER BY COALESCE(seq, 0), created_at, event_id
                     """,
                     [session_id],

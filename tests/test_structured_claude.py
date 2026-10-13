@@ -432,9 +432,11 @@ def test_recorded_partial_stream_emits_before_completion_without_duplicate_text(
             assert outputs == ["One two three four five six seven", " eight nine ten."]
         messages = driver.parse_line(line)
         all_messages.extend(messages)
-        outputs.extend(m.text for m in messages if m.type == "assistant_delta")
+        outputs.extend(
+            m.text for m in messages if m.payload.get("text_stream_delta") is True
+        )
     assert outputs == ["One two three four five six seven", " eight nine ten."]
-    finals = [m for m in all_messages if m.type == "assistant_output"]
+    finals = [m for m in all_messages if m.payload.get("text_stream_final") is True]
     assert len(finals) == 1
     assert finals[0].text == "".join(outputs)
     assert finals[0].payload["text_stream_id"] == "message-1:0"
@@ -549,8 +551,8 @@ def test_recorded_partial_hub_projection_matches_ios_fixture():
     )
     assert projected == json.loads(fixture.read_text())
     assert [row["type"] for row in projected] == [
-        "assistant_delta",
-        "assistant_delta",
+        "assistant_output",
+        "assistant_output",
         "assistant_output",
         "status",
         "status",
@@ -580,3 +582,22 @@ def test_final_snapshot_identity_survives_a_later_message_start():
     assert final.payload["text_stream_final"] is True
     assert final.payload["text_stream_id"] == deltas[0].payload["text_stream_id"]
     assert final.text == "".join(m.text for m in deltas)
+
+
+def test_recorded_partial_wire_uses_old_ios_assistant_type_with_delta_marker():
+    driver = _driver([])
+    rows = [
+        message.to_payload()
+        for line in (FIXTURES_DIR / "claude_partial_capture.ndjson")
+        .read_text()
+        .splitlines()
+        for message in driver.parse_line(line)
+    ]
+    assistant = [row for row in rows if row["role"] == "assistant"]
+    assert [row["type"] for row in assistant] == ["assistant_output"] * 3
+    assert [row["payload"].get("text_stream_delta", False) for row in assistant] == [
+        True,
+        True,
+        False,
+    ]
+    assert assistant[-1]["payload"]["text_stream_final"] is True

@@ -285,6 +285,9 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
 
     @Test func recordedMultiDeltaTurnFinalizesInPlaceInLiveAndReloadReducers() throws {
         let messages = try recordedTurn()
+        // This is the released wire type set: old clients never see raw deltas.
+        #expect(messages.prefix(3).allSatisfy { $0.type == .assistantOutput })
+        #expect(messages.prefix(2).allSatisfy { $0.payload["text_stream_delta"]?.boolValue == true })
         let live = recoveryChatModel(client: MockNetwork().client(), sessionID: "fixture-session", harness: "claude-code")
         live.ingest(.message(messages[0]))
         let firstID = try #require(assistantRows(live).first?.id)
@@ -296,6 +299,7 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
         #expect(rows.count == 1)
         #expect(rows[0].id == firstID)
         #expect(rows[0].payload["text_stream_final"]?.boolValue == true)
+        #expect(rows[0].payload["text_stream_delta"] == nil)
         #expect(rows[0].payload["usage"]?.objectValue?["output_tokens"]?.numberValue == 17)
         #expect(TokenUsageSummary(message: rows[0]) != nil)
         #expect(String(rows[0].displayText.characters) == rows[0].text)
@@ -313,8 +317,8 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
     }
 
     @Test func snapshotReplacesPartialTextAcrossStatusesAndCodexRemainsSeparate() {
-        let delta = HarnessMessage(id: "delta", seq: 1, type: .assistantDelta, text: "partial",
-                                   payload: ["text_stream_id": .string("m:0")])
+        let delta = HarnessMessage(id: "delta", seq: 1, type: .assistantOutput, text: "partial",
+                                   payload: ["text_stream_id": .string("m:0"), "text_stream_delta": .bool(true)])
         let status = HarnessMessage(seq: 2, type: .status, text: "usage")
         let final = HarnessMessage(id: "final", seq: 3, type: .assistantOutput, text: "complete",
                                    payload: ["text_stream_id": .string("m:0"), "text_stream_final": .bool(true)])

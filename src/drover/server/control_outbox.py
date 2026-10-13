@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from uuid import uuid4
 
+from drover.server.harness.events import is_text_stream_delta
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -189,7 +191,10 @@ def record_event_side_effects(
         """,
         [event_id, payload_json, payload_sha256(payload_json)],
     )
-    if event_type in {"user_input", "assistant_output", "terminal.input"}:
+    if event_type in {"user_input", "assistant_output", "terminal.input"} and not (
+        event_type == "assistant_output"
+        and is_text_stream_delta(json.loads(payload_json))
+    ):
         # The `WHERE` clause is the materialized equivalent of the legacy
         # ORDER BY: lower event-type priority wins; ties use coalesced seq,
         # timestamp, then event id.  A late lower-ranked event cannot clobber

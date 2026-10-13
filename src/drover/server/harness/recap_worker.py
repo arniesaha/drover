@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from drover.server.db import control_plane_connection
+from drover.server.harness.events import is_text_stream_delta
 from drover.server.harness.recap_prompt import (
     FALLBACK_RECAP_SOURCE,
     build_live_recap_prompt,
@@ -174,6 +175,8 @@ class LiveRecapWorker:
         if not any(
             event.get("event_type")
             in ("assistant_output", "tool_action", "tool_result")
+            and event.get("normalized_type") != "assistant_delta"
+            and not is_text_stream_delta(event.get("payload"))
             and str(event.get("content_preview") or "").strip()
             for event in events
         ):
@@ -230,6 +233,7 @@ class LiveRecapWorker:
                     FROM harness_events
                    WHERE session_id=? AND seq IS NOT NULL
                      AND event_type IN ({placeholders})
+                     AND COALESCE(normalized_type, '') <> 'assistant_delta'
                      AND content_preview IS NOT NULL AND content_preview <> ''
                    ORDER BY seq DESC
                    LIMIT 30""",

@@ -7,6 +7,7 @@ from importlib.resources import files
 from typing import Any, Iterable
 
 from drover.server.harness.auth import redact_auth_text
+from drover.server.harness.events import is_text_stream_delta
 
 _CONTENT_EVENT_TYPES = {
     "user_input",
@@ -64,6 +65,8 @@ def build_live_recap_prompt(
         event
         for event in events
         if event.get("event_type") in _CONTENT_EVENT_TYPES
+        and event.get("normalized_type") != "assistant_delta"
+        and not is_text_stream_delta(event.get("payload"))
         and isinstance(event.get("content_preview"), str)
         and event["content_preview"]
     ]

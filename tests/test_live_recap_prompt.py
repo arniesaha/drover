@@ -259,3 +259,23 @@ def test_trusted_prompt_fallback_is_preserved_on_read(prompt):
         generator_model="fallback:user-prompt",
     )
     assert _harness_session_dict(Session(), recap=recap)["recap"] == prompt
+
+
+def test_prompt_skips_marked_deltas_before_bounding():
+    events = [
+        {
+            "event_type": "assistant_output",
+            "seq": 1,
+            "content_preview": "Complete reply.",
+        }
+    ]
+    events += [
+        {
+            "event_type": "assistant_output",
+            "seq": seq,
+            "content_preview": "Partial fragment",
+            "payload": {"payload": {"text_stream_delta": True}},
+        }
+        for seq in range(2, 42)
+    ]
+    assert build_live_recap_prompt(events, template="{turns}") == "Complete reply."

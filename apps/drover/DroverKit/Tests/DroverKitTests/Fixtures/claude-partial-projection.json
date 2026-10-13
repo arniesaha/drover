@@ -1,12 +1,13 @@
 [
   {
     "event_id": "e1",
-    "type": "assistant_delta",
+    "type": "assistant_output",
     "role": "assistant",
     "text": "One two three four five six seven",
     "payload": {
       "model": "claude-opus-5-5",
-      "text_stream_id": "message-1:0"
+      "text_stream_id": "message-1:0",
+      "text_stream_delta": true
     },
     "turn_id": null,
     "session_id": "fixture-session",
@@ -14,12 +15,13 @@
   },
   {
     "event_id": "e2",
-    "type": "assistant_delta",
+    "type": "assistant_output",
     "role": "assistant",
     "text": " eight nine ten.",
     "payload": {
       "model": "claude-opus-5-5",
-      "text_stream_id": "message-1:0"
+      "text_stream_id": "message-1:0",
+      "text_stream_delta": true
     },
     "turn_id": null,
     "session_id": "fixture-session",

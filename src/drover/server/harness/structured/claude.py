@@ -190,6 +190,7 @@ class ClaudeDriver(ProcessDriver):
                 if text:
                     payload = _metadata_payload(obj, {})
                     payload["model"] = self._stream_model
+                    payload["text_stream_delta"] = True
                     if self._stream_message_id:
                         payload["text_stream_id"] = (
                             f"{self._stream_message_id}:{event['index']}"
@@ -198,7 +199,7 @@ class ClaudeDriver(ProcessDriver):
                         payload["thinking"] = True
                     return [
                         StructuredMessage(
-                            type="assistant_delta",
+                            type="assistant_output",
                             role="assistant",
                             text=text,
                             payload=payload,
