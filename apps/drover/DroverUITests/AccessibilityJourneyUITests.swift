@@ -78,10 +78,14 @@ final class AccessibilityJourneyUITests: XCTestCase {
             app.launchEnvironment["DROVER_UI_TEST_CHAT_ACTIVITY"] = state
             app.launch()
             openFixtureChat(in: app)
-            let title = app.staticTexts[state == "completed" ? "Turn complete" : "Preparing"]
-            XCTAssertTrue(title.waitForExistence(timeout: timeout))
             let activity = app.descendants(matching: .any)["chat-activity"].firstMatch
-            XCTAssertTrue(activity.exists)
+            XCTAssertTrue(activity.waitForExistence(timeout: timeout))
+            let title = state == "completed" ? "Turn complete" : "Preparing"
+            if largestText {
+                XCTAssertTrue(activity.label.contains(title))
+            } else {
+                XCTAssertTrue(app.staticTexts[title].exists)
+            }
             if largestText {
                 // Large labels may need the available width to wrap.
                 XCTAssertLessThanOrEqual(activity.frame.width, app.frame.width - 32)
@@ -97,6 +101,59 @@ final class AccessibilityJourneyUITests: XCTestCase {
             add(screenshot)
             app.terminate()
         }
+    }
+
+    @MainActor
+    func testDetachedRunningChatChromeAtLargestTextSizeInLightMode() {
+        checkDetachedRunningChatChrome(dark: false)
+    }
+
+    @MainActor
+    func testDetachedRunningChatChromeAtLargestTextSizeInDarkMode() {
+        checkDetachedRunningChatChrome(dark: true)
+    }
+
+    @MainActor
+    private func checkDetachedRunningChatChrome(dark: Bool) {
+        let app = coreJourneyApp()
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_ACTIVITY"] = "active"
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_PREFERENCES"] = "1"
+        app.launchEnvironment["DROVER_UI_TEST_TRANSCRIPT_STREAM"] = "1"
+        if dark { app.launchArguments += ["-drover.appearance", "dark"] }
+        app.launch()
+        openFixtureChat(in: app)
+        let transcript = app.scrollViews.firstMatch
+        transcript.swipeDown()
+        transcript.swipeDown()
+        let jump = app.buttons["chat-scroll-to-bottom"]
+        XCTAssertTrue(jump.waitForExistence(timeout: timeout))
+        let activity = app.buttons["chat-activity"]
+        let inputScroll = app.scrollViews["composer-scroll"]
+        let send = app.buttons["composer-send"]
+        XCTAssertTrue(activity.exists)
+        XCTAssertTrue(inputScroll.exists)
+        XCTAssertLessThanOrEqual(jump.frame.width, 100)
+        XCTAssertLessThanOrEqual(jump.frame.height, 70)
+        XCTAssertGreaterThanOrEqual(jump.frame.height, 44)
+        XCTAssertEqual(jump.label, "Jump to latest")
+        XCTAssertLessThanOrEqual(activity.frame.height, 130)
+        XCTAssertLessThanOrEqual(send.frame.maxY - inputScroll.frame.minY, 170)
+        XCTAssertLessThanOrEqual(jump.frame.maxY, activity.frame.minY)
+        XCTAssertLessThanOrEqual(activity.frame.maxY, inputScroll.frame.minY)
+        XCTAssertTrue(jump.isHittable)
+        XCTAssertTrue(app.buttons["composer-send"].isHittable)
+        XCTAssertTrue(app.buttons["composer-attach"].isHittable)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Detached running chat XXXL \(dark ? "dark" : "light")"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        activity.tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Elapsed time:")).firstMatch
+            .waitForExistence(timeout: timeout))
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.buttons["composer-send"].isHittable)
+        jump.tap()
+        XCTAssertTrue(jump.waitForNonExistence(timeout: timeout))
     }
 
     @MainActor
