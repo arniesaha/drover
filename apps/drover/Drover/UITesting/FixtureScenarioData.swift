@@ -252,6 +252,14 @@ enum FixtureScenarioData {
                 ]
             }
         }
+        if let status = ProcessInfo.processInfo.environment["DROVER_UI_TEST_CHAT_ACTIVITY"] {
+            messages.append([
+                "event_id": "fixture-chat-activity", "seq": messages.count + 1,
+                "type": "status", "role": "system",
+                "text": status == "completed" ? "turn.completed" : "turn.started",
+                "payload": status == "completed" ? ["turn_complete": true] : [:],
+            ])
+        }
         // Capability sessions wait on a tool approval, so the journey can
         // see who may answer it from iOS.
         if sessionID == labSessionID || sessionID == codexApprovalSessionID {
@@ -290,7 +298,12 @@ enum FixtureScenarioData {
     }
 
     static func modelCatalogData() -> Data {
-        jsonData([
+        let models: [[String: Any]] = ProcessInfo.processInfo.environment["DROVER_UI_TEST_CHAT_PREFERENCES"] == "1" ? [[
+            "id": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol",
+            "is_default": true,
+            "reasoning": ["supported": ["low", "medium", "high"], "default": "medium"],
+        ]] : []
+        return jsonData([
             "schema_version": 1,
             "host_id": coreJourney.hostID,
             "harness": "codex",
@@ -299,7 +312,7 @@ enum FixtureScenarioData {
             "discovered_at": "2026-09-04T00:00:00Z",
             "stale": false,
             "stale_reason": NSNull(),
-            "models": [],
+            "models": models,
         ])
     }
 

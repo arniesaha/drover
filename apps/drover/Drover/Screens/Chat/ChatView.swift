@@ -208,6 +208,8 @@ struct ChatView: View {
                     && model.pendingTurn == nil && model.pendingApproval == nil
                     && model.activity.phase != .ready) {
                     SessionActivityView(activity: model.activity)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 4)
                 }
                 if model.isEnded {
                     ChatHintBanner(model.endedMessage)
@@ -587,13 +589,10 @@ struct ChatView: View {
                     cancelFollowingScroll()
                     cancelPrependScroll()
                 }
-                if !followState.isFollowing {
-                    // A sibling outside the scroll viewport cannot cover transcript text.
-                    HStack {
-                        Spacer()
+                .overlay(alignment: .bottomTrailing) {
+                    if !followState.isFollowing {
                         scrollToBottomButton(proxy)
                     }
-                    .padding(.top, 8)
                 }
             }
         }
@@ -640,15 +639,18 @@ struct ChatView: View {
                     Circle().frame(width: 6, height: 6).accessibilityHidden(true)
                 }
             }
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(DroverColor.accentHi)
-                .padding(10)
-                .background(DroverColor.surface, in: Capsule())
-                .overlay(Capsule().strokeBorder(DroverColor.accent.opacity(0.4), lineWidth: 1))
-                .shadow(color: .black.opacity(0.3), radius: 6, y: 3)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .frame(minHeight: 44)
+                .background(.ultraThinMaterial.opacity(0.75), in: Capsule())
+                .overlay(Capsule().strokeBorder(.secondary.opacity(0.18), lineWidth: 1))
+                .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
         }
-        .padding(.trailing, 16)
-        .padding(.bottom, 16)
+        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
         .transition(.opacity.combined(with: .scale(scale: 0.8)))
         .accessibilityLabel("Jump to latest")
         .accessibilityValue(followState.newEventCount > 0 ? "\(followState.newEventCount) new events" : "")

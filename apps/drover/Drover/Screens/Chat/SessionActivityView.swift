@@ -11,18 +11,23 @@ struct SessionActivityView: View {
                 Image(systemName: activity.isActive ? "circle.dotted" : "circle")
                     .symbolEffect(.pulse, isActive: activity.isActive && !reduceMotion)
                     .accessibilityHidden(true)
-                Text(activity.title).droverText(.nested, accented: activity.isActive)
-                Spacer(minLength: 4)
+                Text(activity.title)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.primary)
                 if activity.isActive, let start = activity.startedAt, start <= Date.now {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
-                        Text(start, style: .timer).droverText(.mono).monospacedDigit()
+                        Text(start, style: .timer)
+                            .font(.caption.monospaced()).foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .fixedSize(horizontal: true, vertical: true)
                             .accessibilityLabel("Elapsed time")
                             .accessibilityValue(FoldSummary.duration(max(0, context.date.timeIntervalSince(start))))
                     }
                 }
             }
             if let detail = activity.detail, !detail.isEmpty {
-                Text(detail).droverText(.mono).lineLimit(1).truncationMode(.middle)
+                Text(detail).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
             }
             if activity.isActive {
                 FlowLayout(spacing: 8, lineSpacing: 4) {
@@ -36,13 +41,18 @@ struct SessionActivityView: View {
                         }
                     }
                 }
-                .droverText(.subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DroverColor.surface)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(.ultraThinMaterial.opacity(0.75), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(.secondary.opacity(0.18), lineWidth: 1)
+        }
         .accessibilityIdentifier("chat-activity")
     }
 }
