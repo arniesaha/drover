@@ -94,13 +94,14 @@ The operator-authorized machine backup in `scripts/backup/studio_backup.py` is
 separate from the R2 rehearsal design above. It runs as `com.drover.backup` at
 03:30 local time and uses SSH key authentication to the configured NAS account.
 The target is read from private `~/.drover/maintenance/backup-config.json`,
-containing `{"nas": "backup-user@nas-host"}` with the actual user and hostname.
-An optional `target_root` sets the absolute NAS directory above the host folder,
-for example `{"nas": "backup-user@nas-host", "target_root": "/home/Arnab/backups/drover"}`.
-The default is `/home/Arnab/backups/drover`; it is independent of the SSH login
-account because UGOS storage homes can differ from login names. Relative roots
-and roots containing `..` are rejected before contacting the NAS. Keep this file
-mode 600.
+containing `{"nas": "backup-user@nas-host", "target_root": "/srv/backups/drover"}`
+with the actual SSH account and approved NAS destination supplied locally.
+The required `target_root` sets the absolute NAS directory above the host folder.
+It is independent of the SSH login account because UGOS storage homes can differ
+from login names. There is no built-in personal destination. Missing roots,
+relative roots and roots containing `..` are rejected before contacting the NAS.
+Existing configs containing only `nas` must add their approved `target_root`
+before running the updated script. Keep this file mode 600.
 The NAS requires `python3` and `rsync`, plus a `drover-studio` SSH alias in its
 `~/.ssh/config` with unattended key access back to the Studio. The Studio must
 allow incoming SSH for this account. Transfers run on the NAS, pulling from the
@@ -113,7 +114,7 @@ using its owner-authenticated Unix socket on port 15432.
 
 Successful generations live at
 `<target_root>/<hostname>/<YYYY-MM-DD>/`. The hostname is sanitized for a path
-component. The default uses the approved NAS home-directory target.
+component. Use the approved NAS home-directory target in the private config.
 Unverified generations remain under `.pending-<date>` and never update the local
 freshness receipt. An existing generation or pending directory blocks a second
 run for the same date. Inspect failed pending directories before removing them

@@ -198,7 +198,7 @@ def backup():
     date = dt.date.today().isoformat()
     host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())
     # The storage home can differ from the SSH login account on UGOS.
-    target = config.get("target_root", "/home/Arnab/backups/drover")
+    target = config.get("target_root")
     if (
         not isinstance(target, str)
         or not target.startswith("/")

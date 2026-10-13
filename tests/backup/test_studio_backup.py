@@ -147,10 +147,8 @@ class LiveBackupTests(unittest.TestCase):
     def test_nas_pulls_from_studio_with_link_dest_excludes_and_quoted_paths(self):
         backup = self.backup
         target = "backup-user@nas-host"
-        destination = (
-            "/home/Arnab/backups/drover/Studio/.pending-2026-10-12/data's files"
-        )
-        previous = "/home/Arnab/backups/drover/Studio/2026-10-11/data's files"
+        destination = "/srv/backups/drover/Studio/.pending-2026-10-12/data's files"
+        previous = "/srv/backups/drover/Studio/2026-10-11/data's files"
         source = Path("/Volumes/M2 1/drover-data")
         with (
             mock.patch.object(backup, "NAS", target),
@@ -232,7 +230,7 @@ class LiveBackupTests(unittest.TestCase):
             # The execution fixture did not replace the production wrapper.
             self.assertIs(backup.run, real_run)
 
-    def test_default_root_is_independent_of_ssh_login_and_sanitizes_host(self):
+    def test_missing_target_root_fails_before_contacting_nas(self):
         backup = self.backup
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -251,13 +249,9 @@ class LiveBackupTests(unittest.TestCase):
                     backup, "remote", side_effect=RuntimeError("stop at preflight")
                 ) as remote,
             ):
-                with self.assertRaisesRegex(RuntimeError, "stop at preflight"):
+                with self.assertRaisesRegex(RuntimeError, "invalid NAS backup root"):
                     backup.backup()
-                self.assertEqual(remote.call_args.args[1], "prepare")
-                self.assertEqual(
-                    remote.call_args.args[2],
-                    "/home/Arnab/backups/drover/Studio_test.local",
-                )
+                remote.assert_not_called()
 
     def test_configurable_target_root_and_invalid_roots(self):
         backup = self.backup
@@ -274,7 +268,7 @@ class LiveBackupTests(unittest.TestCase):
                     mock.patch.object(backup, "NAS", ""),
                     mock.patch.object(backup, "DATA", {}),
                     mock.patch.object(
-                        backup.socket, "gethostname", return_value="Studio"
+                        backup.socket, "gethostname", return_value="backup host.local"
                     ),
                     mock.patch.object(backup, "log"),
                     mock.patch.object(
@@ -285,7 +279,8 @@ class LiveBackupTests(unittest.TestCase):
                         backup.backup()
                     if target == "/volume/backups":
                         self.assertEqual(
-                            remote.call_args.args[2], "/volume/backups/Studio"
+                            remote.call_args.args[2],
+                            "/volume/backups/backup_host.local",
                         )
                     else:
                         remote.assert_not_called()
