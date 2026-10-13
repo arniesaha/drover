@@ -190,16 +190,22 @@ def copy_registry(destination):
 
 def backup():
     global NAS
-    NAS = json.loads((HOME / ".drover/maintenance/backup-config.json").read_text())[
-        "nas"
-    ]
+    config = json.loads((HOME / ".drover/maintenance/backup-config.json").read_text())
+    NAS = config["nas"]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", NAS):
         raise RuntimeError("invalid NAS SSH target")
     started = time.monotonic()
     date = dt.date.today().isoformat()
     host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())
-    # Derive the approved NAS home root from the private account configuration.
-    root = str(Path("/home") / NAS.split("@", 1)[0] / "backups/drover" / host)
+    # The storage home can differ from the SSH login account on UGOS.
+    target = config.get("target_root")
+    if (
+        not isinstance(target, str)
+        or not target.startswith("/")
+        or ".." in Path(target).parts
+    ):
+        raise RuntimeError("invalid NAS backup root")
+    root = str(Path(target) / host)
     helper = Path(__file__).with_name("nas_snapshot.py").read_text()
     for source in DATA.values():
         if not source.is_dir():
@@ -348,7 +354,7 @@ def main():
                 + type(error).__name__
                 + (
                     " (" + str(error) + ")"
-                    if str(error).startswith("command failed (exit")
+                    if re.fullmatch(r"command failed \(exit -?\d+\)", str(error))
                     else ""
                 )
                 + "; generation unpublished; inspect NAS pending directory"

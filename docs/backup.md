@@ -94,8 +94,14 @@ The operator-authorized machine backup in `scripts/backup/studio_backup.py` is
 separate from the R2 rehearsal design above. It runs as `com.drover.backup` at
 03:30 local time and uses SSH key authentication to the configured NAS account.
 The target is read from private `~/.drover/maintenance/backup-config.json`,
-containing `{"nas": "backup-user@nas-host"}` with the actual user and hostname.
-Keep this file mode 600.
+containing `{"nas": "backup-user@nas-host", "target_root": "/srv/backups/drover"}`
+with the actual SSH account and approved NAS destination supplied locally.
+The required `target_root` sets the absolute NAS directory above the host folder.
+It is independent of the SSH login account because UGOS storage homes can differ
+from login names. There is no built-in personal destination. Missing roots,
+relative roots and roots containing `..` are rejected before contacting the NAS.
+Existing configs containing only `nas` must add their approved `target_root`
+before running the updated script. Keep this file mode 600.
 The NAS requires `python3` and `rsync`, plus a `drover-studio` SSH alias in its
 `~/.ssh/config` with unattended key access back to the Studio. The Studio must
 allow incoming SSH for this account. Transfers run on the NAS, pulling from the
@@ -107,8 +113,8 @@ permissions in the local snapshot check. PostgreSQL 17 clients run on the Studio
 using its owner-authenticated Unix socket on port 15432.
 
 Successful generations live at
-`/home/<nas-user>/backups/drover/<hostname>/<YYYY-MM-DD>/`, using the configured
-NAS username. This is the approved NAS home-directory target.
+`<target_root>/<hostname>/<YYYY-MM-DD>/`. The hostname is sanitized for a path
+component. Use the approved NAS home-directory target in the private config.
 Unverified generations remain under `.pending-<date>` and never update the local
 freshness receipt. An existing generation or pending directory blocks a second
 run for the same date. Inspect failed pending directories before removing them
@@ -160,11 +166,24 @@ Install both Python files under `~/.drover/maintenance/`, mode 700. Render
 `scripts/launchd/com.drover.backup.plist.template` by replacing `__HOME__` with the
 home directory, install it in `~/Library/LaunchAgents/`, validate with `plutil
 -lint`, and load using `launchctl bootstrap gui/$(id -u) <plist-path>`. The plist
-must use `~/.drover/runtime/current/bin/python`. macOS Local Network permission
-is per binary; Homebrew Python gets `No route to host` under launchd, while the
-Drover runtime Python has the required permission. Confirm that this runtime
-exists and has Local Network access before loading the agent. A foreground manual
-run is `~/.drover/runtime/current/bin/python ~/.drover/maintenance/studio_backup.py`.
+uses `~/.drover/maintenance/backup-python/bin/python`, a dedicated interpreter
+with macOS Local Network permission. The live fix used Drover runtime Python:
+Homebrew Python failed with `No route to host` under launchd, while the runtime
+interpreter had access. Permission follows the executable, so a stable spelling
+such as `runtime/current` alone does not preserve access when a release replaces
+the underlying binary.
+
+Before loading this template, provision the dedicated interpreter outside the
+release tree. For example, use an existing authorized runtime interpreter to
+create `~/.drover/maintenance/backup-python` with `python -m venv --copies`.
+Grant Local Network access to the resulting dedicated Python executable in
+System Settings and verify NAS connectivity under launchd. Copying an executable
+does not copy its permission grant. Keep this interpreter in place across Drover
+releases; recheck permission whenever Python itself is replaced. Until it is
+provisioned and authorized, retain the working live interpreter. Rendering the
+template does not install Python or grant permission. A foreground manual run is
+`~/.drover/maintenance/backup-python/bin/python ~/.drover/maintenance/studio_backup.py`.
+
 Logs live in `~/Library/Logs/drover/backup.log`. The successful local receipt is
 `~/.drover/backup-state/last-success.json`; `soak-probe.sh` reports its
 `backup_age_h`. Missing evidence is informational before the first success;

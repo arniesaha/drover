@@ -13,9 +13,11 @@ import os
 import plistlib
 import pwd
 import re
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -54,11 +56,18 @@ def run(args, timeout=30, stdout=subprocess.PIPE):
 
 
 def atomic(path, data, mode=0o600):
-    tmp = path.with_name(path.name + ".new")
-    with tmp.open("xb") as f:
-        f.write(data)
-    tmp.chmod(mode)
-    os.replace(tmp, path)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, prefix=path.name + ".", delete=False
+    ) as f:
+        tmp = Path(f.name)
+        try:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+            tmp.chmod(mode)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def save(path, value):
@@ -227,6 +236,8 @@ def pg_dict():
         "EnvironmentVariables": {
             "HOME": str(HOME),
             "PATH": "/opt/homebrew/bin:/usr/bin:/bin",
+            "LC_ALL": "en_US.UTF-8",
+            "LANG": "en_US.UTF-8",
         },
         "StandardOutPath": str(HOME / "Library/Logs/drover/postgres.out.log"),
         "StandardErrorPath": str(HOME / "Library/Logs/drover/postgres.err.log"),
@@ -460,61 +471,168 @@ def soak_twice():
         )
 
 
-def switch():
-    require(not ACTIVE.exists(), "Attempt exists; use rollback or inspect saved state")
-    preflight()
-    out = ROOT / ("pg-switch-" + time.strftime("%Y%m%dT%H%M%S"))
-    out.mkdir(mode=0o700)
-    atomic(out / "server.original.plist", HUB.read_bytes())
-    state = {
-        "directory": str(out),
-        "stage": "created",
-        "original_pid": live_pid(),
-        "original_hub_sha256": digest(HUB),
-        "postgres_sha256": digest(PG),
-        "config_hashes": json.loads(EXPECTED.read_text())["config_hashes"],
-    }
-    mark(state, "backing-up")
-    backup(out)
-    mark(state, "backup-verified")
-    # Recheck everything after potentially long backups, before any stop.
-    preflight()
-    state["downtime_start_epoch"] = time.time()
-    mark(state, "stopping-hub")
-    stop_hub()
-    mark(state, "stopping-manual-postgres")
-    run(
-        [BIN / "pg_ctl", "-D", DATA, "stop", "-m", "fast", "-w", "-t", "300"],
-        timeout=310,
-    )
-    wait(
-        lambda: not alive(state["original_pid"]) and not tcp_open() and not live_pid(),
-        30,
-        "Original PostgreSQL shutdown not verified",
-    )
-    mark(state, "starting-supervised-postgres")
-    run(["launchctl", "bootstrap", DOMAIN, PG])
-    wait(pg_ready, 120, "Supervised PostgreSQL not ready")
+SWITCH_STAGES = (
+    "created",
+    "backing-up",
+    "backup-verified",
+    "stopping-hub",
+    "stopping-manual-postgres",
+    "starting-supervised-postgres",
+    "applying-hub-wrapper",
+    "starting-hub",
+    "soaking",
+    "complete",
+)
+
+
+def resume_state():
+    state = json.loads(ACTIVE.read_text())
     require(
-        (loaded("com.drover.postgres") or {}).get("PID") == live_pid(),
-        "Agent does not own postmaster",
+        state["stage"] in SWITCH_STAGES, "Attempt cannot resume switching; use rollback"
     )
+    out = Path(state["directory"])
+    require(
+        out.parent == ROOT
+        and out.name.startswith("pg-switch-")
+        and not out.is_symlink(),
+        "Unsafe state directory",
+    )
+    require(
+        digest(out / "server.original.plist") == state["original_hub_sha256"],
+        "Saved hub checksum mismatch",
+    )
+    validate()
+    require(digest(PG) == state["postgres_sha256"], "Staged Postgres plist changed")
+    require(os.path.samefile(BIN / "postgres", CELLAR), "Stable binary changed")
+    for name, value in state["config_hashes"].items():
+        require(
+            digest(DATA / name) == value, "Postgres config changed since switchover"
+        )
     original = plistlib.loads((out / "server.original.plist").read_bytes())
     patched = dict(original)
     patched["ProgramArguments"] = [str(WAIT), *original["ProgramArguments"]]
-    require(
-        {k: v for k, v in patched.items() if k != "ProgramArguments"}
-        == {k: v for k, v in original.items() if k != "ProgramArguments"},
-        "Hub dictionary changed",
+    hub = plistlib.loads(HUB.read_bytes())
+    allowed = (
+        (original, patched)
+        if state["stage"] == "applying-hub-wrapper"
+        else (
+            (patched,)
+            if state["stage"] in ("starting-hub", "soaking", "complete")
+            else (original,)
+        )
     )
-    mark(state, "applying-hub-wrapper")
-    atomic(HUB, plistlib.dumps(patched))
-    run(["plutil", "-lint", HUB])
-    mark(state, "starting-hub")
-    run(["launchctl", "bootstrap", DOMAIN, HUB])
-    wait(http_ready, 300, "Hub readiness timed out")
-    state["downtime_end_epoch"] = time.time()
-    mark(state, "soaking")
+    require(hub in allowed, "Hub plist changed")
+    if SWITCH_STAGES.index(state["stage"]) >= SWITCH_STAGES.index("backup-verified"):
+        backups = Path(state.get("backup_directory", str(out)))
+        require(
+            backups in (out, out / "backups") and not backups.is_symlink(),
+            "Unsafe backup directory",
+        )
+        sums = json.loads((backups / "sha256.json").read_text())
+        require(
+            bool(sums)
+            and all(
+                Path(name).name == name and digest(backups / name) == value
+                for name, value in sums.items()
+            ),
+            "Backup checksum mismatch",
+        )
+    return state
+
+
+def switch():
+    if ACTIVE.exists():
+        state = resume_state()
+        if state["stage"] == "complete":
+            print("Switchover already complete; saved state retained for rollback")
+            return
+        out = Path(state["directory"])
+    else:
+        preflight()
+        out = ROOT / ("pg-switch-" + time.strftime("%Y%m%dT%H%M%S"))
+        out.mkdir(mode=0o700)
+        atomic(out / "server.original.plist", HUB.read_bytes())
+        state = {
+            "directory": str(out),
+            "stage": "created",
+            "original_pid": live_pid(),
+            "original_hub_sha256": digest(HUB),
+            "postgres_sha256": digest(PG),
+            "config_hashes": json.loads(EXPECTED.read_text())["config_hashes"],
+        }
+        mark(state, "created")
+    if state["stage"] in ("created", "backing-up"):
+        preflight()
+        mark(state, "backing-up")
+        # A retry gets clean dump files without altering the original hub backup.
+        if (out / "backups").exists():
+            shutil.rmtree(out / "backups")
+        with tempfile.TemporaryDirectory(prefix="backup-", dir=out) as temporary:
+            backup(Path(temporary))
+            os.replace(temporary, out / "backups")
+        state["backup_directory"] = str(out / "backups")
+        mark(state, "backup-verified")
+    if state["stage"] == "backup-verified":
+        preflight()
+        state["downtime_start_epoch"] = time.time()
+        mark(state, "stopping-hub")
+    if state["stage"] == "stopping-hub":
+        stop_hub()
+        mark(state, "stopping-manual-postgres")
+    if state["stage"] == "stopping-manual-postgres":
+        if live_pid():
+            require(
+                live_pid() == state["original_pid"],
+                "Unexpected manual postmaster; refusing",
+            )
+            identity()
+            run(
+                [BIN / "pg_ctl", "-D", DATA, "stop", "-m", "fast", "-w", "-t", "300"],
+                timeout=310,
+            )
+        wait(
+            lambda: (
+                not alive(state["original_pid"]) and not tcp_open() and not live_pid()
+            ),
+            30,
+            "Original PostgreSQL shutdown not verified",
+        )
+        mark(state, "starting-supervised-postgres")
+    if state["stage"] == "starting-supervised-postgres":
+        if not loaded("com.drover.postgres"):
+            require(
+                not alive(state["original_pid"]) and not live_pid() and not tcp_open(),
+                "Postgres still running; refusing supervised start",
+            )
+            run(["launchctl", "bootstrap", DOMAIN, PG])
+        wait(pg_ready, 120, "Supervised PostgreSQL not ready")
+        require(
+            (loaded("com.drover.postgres") or {}).get("PID") == live_pid(),
+            "Agent does not own postmaster",
+        )
+        mark(state, "applying-hub-wrapper")
+    if state["stage"] in ("applying-hub-wrapper", "starting-hub", "soaking"):
+        require(
+            pg_ready()
+            and (loaded("com.drover.postgres") or {}).get("PID") == live_pid(),
+            "Supervised PostgreSQL ownership or readiness failed",
+        )
+    if state["stage"] == "applying-hub-wrapper":
+        original = plistlib.loads((out / "server.original.plist").read_bytes())
+        patched = dict(original)
+        patched["ProgramArguments"] = [str(WAIT), *original["ProgramArguments"]]
+        require(
+            not loaded("com.drover.server"), "Hub unexpectedly loaded before wrapping"
+        )
+        atomic(HUB, plistlib.dumps(patched))
+        run(["plutil", "-lint", HUB])
+        mark(state, "starting-hub")
+    if state["stage"] == "starting-hub":
+        if not loaded("com.drover.server"):
+            run(["launchctl", "bootstrap", DOMAIN, HUB])
+        wait(http_ready, 300, "Hub readiness timed out")
+        state["downtime_end_epoch"] = time.time()
+        mark(state, "soaking")
     soak_twice()
     mark(state, "complete")
     print("Switchover complete; saved state retained for rollback")
@@ -569,10 +687,12 @@ def rollback(execute):
         pid = pg_job.get("PID")
         run(["launchctl", "bootout", DOMAIN + "/com.drover.postgres"], timeout=360)
         wait(
-            lambda: not alive(pid)
-            and not loaded("com.drover.postgres")
-            and not live_pid()
-            and not tcp_open(),
+            lambda: (
+                not alive(pid)
+                and not loaded("com.drover.postgres")
+                and not live_pid()
+                and not tcp_open()
+            ),
             360,
             "Supervised PostgreSQL did not exit cleanly",
         )
@@ -633,6 +753,9 @@ def main():
             rollback(args.execute)
         elif args.execute:
             switch()
+        elif ACTIVE.exists():
+            state = resume_state()
+            print("Resume dry-run PASS; saved stage:", state["stage"])
         else:
             preflight()
 

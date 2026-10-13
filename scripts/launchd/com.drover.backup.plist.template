@@ -20,8 +20,9 @@
 	<key>ProgramArguments</key>
 	<array>
 		<!-- macOS Local Network permission is per binary. Use the authorized Drover
-		     runtime Python; Homebrew Python gets No route to host under launchd. -->
-		<string>__HOME__/.drover/runtime/current/bin/python</string>
+		     dedicated Python with Local Network permission. Keep its binary stable
+		     across Drover releases; Homebrew Python failed under launchd. -->
+		<string>__HOME__/.drover/maintenance/backup-python/bin/python</string>
 		<string>__HOME__/.drover/maintenance/studio_backup.py</string>
 	</array>
 	<key>StandardErrorPath</key>
