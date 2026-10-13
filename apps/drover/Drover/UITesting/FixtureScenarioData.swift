@@ -255,6 +255,7 @@ enum FixtureScenarioData {
         if let status = ProcessInfo.processInfo.environment["DROVER_UI_TEST_CHAT_ACTIVITY"] {
             messages.append([
                 "event_id": "fixture-chat-activity", "seq": messages.count + 1,
+                "ts": Date.now.addingTimeInterval(-126).ISO8601Format(),
                 "type": "status", "role": "system",
                 "text": status == "completed" ? "turn.completed" : "turn.started",
                 "payload": status == "completed" ? ["turn_complete": true] : [:],

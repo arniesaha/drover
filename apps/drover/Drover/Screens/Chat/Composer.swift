@@ -26,8 +26,10 @@ struct Composer: View {
     private static let maxCombinedBytes = 6 * 1024 * 1024
 
     var body: some View {
+        // Bound the scrollable input, not the fixed action row. XXXL chips
+        // can reflow inside it without consuming the transcript viewport.
         promptSurface
-            .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 300 : nil)
+            .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 200 : nil)
             .padding(.horizontal, 16)
             .padding(.top, 8)
             .padding(.bottom, 10)
