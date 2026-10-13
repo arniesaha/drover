@@ -1109,12 +1109,15 @@ class HarnessRegistry:
                     and notification_status not in ARCHIVED_SESSION_STATUSES
                 ):
                     latest = con.execute(
-                        "SELECT payload_json FROM harness_events WHERE session_id = ? AND event_type = 'status' "
+                        "SELECT event_id FROM harness_events WHERE session_id = ? AND event_type = 'status' "
                         "ORDER BY COALESCE(seq, 0) DESC, created_at DESC, event_id DESC LIMIT 1",
                         [session_id],
                     ).fetchone()
                     if latest:
-                        payload = json.loads(latest[0] or "{}")
+                        # PostgreSQL keeps hot payloads in the side relation;
+                        # the legacy inline column is NULL after migration.
+                        payloads = self._event_payloads(con, [str(latest[0])])
+                        payload = json.loads(payloads.get(str(latest[0])) or "{}")
                         inner = payload.get("payload", payload)
                         if (
                             isinstance(inner, dict)
