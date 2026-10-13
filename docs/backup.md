@@ -115,10 +115,11 @@ using its owner-authenticated Unix socket on port 15432.
 Successful generations live at
 `<target_root>/<hostname>/<YYYY-MM-DD>/`. The hostname is sanitized for a path
 component. Use the approved NAS home-directory target in the private config.
-Unverified generations remain under `.pending-<date>` and never update the local
-freshness receipt. An existing generation or pending directory blocks a second
-run for the same date. Inspect failed pending directories before removing them
-and retrying. A nonblocking local lock prevents concurrent jobs. Every command
+Unverified generations never update the local freshness receipt. A failed run
+renames `.pending-<date>` to `.failed-<date>-<time>-<nanoseconds>` and retains its
+evidence. Preparation also preserves leftover pending trees from interrupted
+runs, allowing a retry on the same date. A successful date still blocks reuse.
+A nonblocking local lock prevents concurrent jobs. Every command
 failure exits nonzero; the FAILURE line includes the failed command's exit code,
 while logs omit child diagnostics to protect credentials. Each run starts
 `caffeinate -i -w <pid>` to prevent idle sleep until the backup process exits;
@@ -135,12 +136,20 @@ Contents:
   rebuildable `runtime`, `worktrees`, `rollout-worktrees`, the `incoming` symlink,
   backup scratch state, sockets, and DuckDB files. Symlinks are preserved.
 - `metadata/launchagents`: the user's LaunchAgents, including their historical copies.
-- `metadata/registry`: a live copy of `drover.registry.duckdb` and its WAL if present.
-  Metadata stability is checked and the copy retried up to three times. This is
-  **not a transactional DuckDB export**, and consistency is not guaranteed.
+- `metadata/registry`: a standalone checkpointed snapshot of the home registry.
+- `metadata/duckdb/<data-root>/<relative-path>`: standalone checkpointed snapshots
+  of DuckDB stores in both data roots. The job atomically clones each DB and WAL
+  on the source volume, checks inode, size, mtime and ctime before and after the
+  pair, and retries up to four times if either file changes. DuckDB replays the
+  captured WAL and checkpoints only the isolated clone. The live stores are
+  never opened or checkpointed. A busy source or unavailable atomic clone fails
+  the run; streamed database copies are never a fallback.
 - `drover-data` and `drover-lakes`: the two `/Volumes/M2 1/` data roots. Both are
-  copied before and after the Postgres dumps. The second pass does not delete
-  files retained by the first. Cross-database and catalog-to-file atomicity are
+  copied before and after the Postgres dumps. Both raw passes exclude DuckDB,
+  WAL, socket and lock files, plus `.drover-snapshots` and
+  `.drover-backup-snapshots` scratch directories. Dependency `uv.lock` files are
+  preserved. The second pass does not delete files retained by the first.
+  Cross-database and catalog-to-file atomicity are
   not guaranteed while writers and garbage collection remain active. This job
   does not prove that every catalog reference can be restored.
 
@@ -151,11 +160,19 @@ any owner execute bit left by the ACL, are retained; verification enforces that
 group and other access are absent.
 Rsync `--link-dest` shares unchanged files with the previous successful generation.
 This permission cleanup also removes group and other access from any shared
-inodes; do not edit published snapshots or add access to them. All current
-source data files and staged metadata are checked for size and SHA-256 on the
-NAS. The manifest permits extra data files retained from the first pass.
-Published generations include private `MANIFEST.json`, `SUCCESS.json`, and a
-consistency warning. Archive listing checks structure, not a complete restore.
+inodes; do not edit published snapshots or add access to them. Staged metadata
+is hashed before transfer and checked for size and SHA-256 on the NAS. Once the
+final raw pass finishes, the frozen NAS lake trees are inventoried and hashed,
+including files retained from the first pass. Verification rereads those files;
+it never compares the copy against a subsequently changing live source. This
+binds the manifest to the copied bytes, without proving transactional consistency
+of arbitrary exporter outputs or catalog reference completeness. Expected hashes
+are saved in private `MANIFEST.json` before verification, and `VERIFICATION.json`
+records every missing, changed, mismatched or non-private artifact. Failure logs
+contain escaped relative artifact paths and reasons, without file contents or
+child diagnostics. Publication requires a successful verification report.
+Published generations also include private `SUCCESS.json` and a consistency
+warning. Archive listing checks structure, not a complete restore.
 
 Retention preserves the newest seven successful daily generations and the newest
 representative from each of the latest four ISO calendar weeks. These sets can
@@ -176,6 +193,9 @@ the underlying binary.
 Before loading this template, provision the dedicated interpreter outside the
 release tree. For example, use an existing authorized runtime interpreter to
 create `~/.drover/maintenance/backup-python` with `python -m venv --copies`.
+Install the runtime's pinned `duckdb==1.5.5` into that interpreter for isolated
+snapshot checkpointing. Atomic snapshots require macOS and a clone-capable
+source volume, with scratch directories located beside each source store.
 Grant Local Network access to the resulting dedicated Python executable in
 System Settings and verify NAS connectivity under launchd. Copying an executable
 does not copy its permission grant. Keep this interpreter in place across Drover
