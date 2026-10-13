@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-10-12
+
+### Added
+
+- Release rollout tooling now validates launchd jobs, runs a point-release
+  preflight, and guards the updater pin (#581).
+- The collector can read OpenClaw archives, handles transcripts that are
+  rewritten before growing, and reports its health in `drover doctor` (#582).
+- A backup and restore audit document explains how to check recovery readiness
+  (#583), and a nightly Studio-to-NAS backup job is available (#584).
+- A PostgreSQL LaunchAgent can be prepared for installation without loading it
+  automatically (#585).
+- The folder picker can create folders and page through results with a cursor
+  (#586).
+- Routing hints now take the account and quota freshness into account (#594,
+  #592).
+
+### Fixed
+
+- An untouched Antigravity quota is shown as 0% used instead of unavailable
+  (#588, #587).
+- Unknown provider quota fields are ignored, quota window durations are kept,
+  and iOS labels five-hour and weekly windows correctly (#595, #590, #591).
+- MCP quota refresh uses the hub transport and keeps saved quota state if a
+  refresh fails (#596, #589).
+- The Codex quota probe resolves the same Codex runtime and supports a
+  configurable timeout (#597, #593).
+
+### Upgrade notes
+
+- Restart the hub after upgrading.
+- Upgrade harnessd hosts, including Studio and NAS, for the quota probe fixes.
+- Install the backup job and PostgreSQL LaunchAgent separately; see the backup
+  and restore documentation.
+
 ## [0.6.6] - 2026-10-11
 
 ### Added
