@@ -7,6 +7,7 @@ struct HarnessPreferenceControls: View {
     /// Spoken by VoiceOver on the lock: why these can't change right now.
     var lockedReason: String? = nil
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showsModelPicker = false
 
     var body: some View {
@@ -17,7 +18,12 @@ struct HarnessPreferenceControls: View {
             selectedEffort: runPreferences.thinkingEffort
         )
 
-        FlowLayout(spacing: 8) {
+        // Normal text keeps both choices on one row. Accessibility sizes
+        // may wrap inside the scrollable input, leaving Send in its own row.
+        let layout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(FlowLayout(spacing: 8))
+            : AnyLayout(HStackLayout(spacing: 8))
+        layout {
             Button {
                 showsModelPicker = true
             } label: {
@@ -27,10 +33,12 @@ struct HarnessPreferenceControls: View {
                         catalog: runPreferences.catalog
                     ),
                     systemImage: "cpu",
-                    kind: "Model"
+                    kind: "Model",
+                    wraps: dynamicTypeSize.isAccessibilitySize
                 )
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("composer-model")
 
             if let effort {
                 Menu {
@@ -43,10 +51,12 @@ struct HarnessPreferenceControls: View {
                     PreferenceChip(
                         title: effort.title,
                         systemImage: "brain",
-                        kind: "Thinking effort"
+                        kind: "Thinking effort",
+                        wraps: dynamicTypeSize.isAccessibilitySize
                     )
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("composer-effort")
             }
 
             if !isEditable {
@@ -76,12 +86,15 @@ private struct PreferenceChip: View {
     let title: String
     let systemImage: String
     let kind: String
+    let wraps: Bool
 
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: systemImage)
                 .imageScale(.medium)
             Text(title)
+                .lineLimit(wraps ? nil : 1)
+                .truncationMode(.tail)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .font(.callout.weight(.medium))

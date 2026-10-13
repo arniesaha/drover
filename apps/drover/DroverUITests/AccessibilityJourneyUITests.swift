@@ -25,6 +25,7 @@ final class AccessibilityJourneyUITests: XCTestCase {
     @MainActor
     private func checkComposerLargestText(dark: Bool) {
         let app = coreJourneyApp()
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_PREFERENCES"] = "1"
         if dark { app.launchArguments += ["-drover.appearance", "dark"] }
         app.launch()
         openFixtureChat(in: app)
@@ -38,8 +39,82 @@ final class AccessibilityJourneyUITests: XCTestCase {
         XCTAssertTrue(app.frame.contains(send.frame))
         XCTAssertTrue(app.frame.contains(attach.frame))
         XCTAssertFalse(send.frame.intersects(attach.frame))
+        let model = app.buttons["composer-model"]
+        let effort = app.buttons["composer-effort"]
+        XCTAssertTrue(model.exists)
+        XCTAssertTrue(effort.exists)
+        XCTAssertTrue(model.isHittable)
+        XCTAssertTrue(app.frame.contains(model.frame))
+        // At XXXL the preferences wrap inside the scrollable input. Reach
+        // the second chip there while Send stays outside that scroll view.
+        for _ in 0..<3 where !effort.isHittable { scroll.swipeUp() }
+        XCTAssertTrue(effort.isHittable)
+        XCTAssertTrue(app.frame.contains(effort.frame))
+        XCTAssertFalse(model.frame.intersects(effort.frame))
+        XCTAssertTrue(send.isHittable)
+        XCTAssertTrue(attach.isHittable)
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = dark ? "Composer largest text dark" : "Composer largest text light"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    @MainActor
+    func testCompactActivityInLightMode() {
+        checkCompactActivity(dark: false, largestText: false)
+    }
+
+    @MainActor
+    func testCompactActivityAtLargestTextSizeInDarkMode() {
+        checkCompactActivity(dark: true, largestText: true)
+    }
+
+    @MainActor
+    private func checkCompactActivity(dark: Bool, largestText: Bool) {
+        for state in ["active", "completed"] {
+            let app = coreJourneyApp()
+            if !largestText { app.launchArguments = [] }
+            if dark { app.launchArguments += ["-drover.appearance", "dark"] }
+            app.launchEnvironment["DROVER_UI_TEST_CHAT_ACTIVITY"] = state
+            app.launch()
+            openFixtureChat(in: app)
+            let title = app.staticTexts[state == "completed" ? "Turn complete" : "Preparing"]
+            XCTAssertTrue(title.waitForExistence(timeout: timeout))
+            let activity = app.descendants(matching: .any)["chat-activity"].firstMatch
+            XCTAssertTrue(activity.exists)
+            if largestText {
+                // Large labels may need the available width to wrap.
+                XCTAssertLessThanOrEqual(activity.frame.width, app.frame.width - 32)
+            } else {
+                XCTAssertLessThan(activity.frame.width, app.frame.width * 0.9)
+            }
+            XCTAssertTrue(app.frame.contains(activity.frame))
+            XCTAssertLessThanOrEqual(activity.frame.maxY, app.textFields["composer-input"].frame.minY)
+            XCTAssertTrue(app.buttons["composer-send"].isHittable)
+            let screenshot = XCTAttachment(screenshot: app.screenshot())
+            screenshot.name = "Compact activity \(state) \(dark ? "dark XXXL" : "light standard")"
+            screenshot.lifetime = .keepAlways
+            add(screenshot)
+            app.terminate()
+        }
+    }
+
+    @MainActor
+    func testPreferencesShareOneRowAtStandardTextSize() {
+        let app = coreJourneyApp()
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_PREFERENCES"] = "1"
+        app.launchArguments = []
+        app.launch()
+        openFixtureChat(in: app)
+        let model = app.buttons["composer-model"]
+        let effort = app.buttons["composer-effort"]
+        XCTAssertTrue(model.waitForExistence(timeout: timeout))
+        XCTAssertTrue(effort.exists)
+        XCTAssertEqual(model.frame.midY, effort.frame.midY, accuracy: 1)
+        XCTAssertLessThanOrEqual(model.frame.maxX, effort.frame.minX)
+        XCTAssertTrue(app.buttons["composer-send"].isHittable)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Composer preferences on one row"
         screenshot.lifetime = .keepAlways
         add(screenshot)
     }
