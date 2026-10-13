@@ -272,7 +272,7 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
 
 @Suite @MainActor struct ClaudeStreamFinalizationTests {
     private func recordedTurn() throws -> [HarnessMessage] {
-        let url = try #require(Bundle.module.url(forResource: "claude-partial-projection", withExtension: "json", subdirectory: "Fixtures"))
+        let url = try #require(droverKitFixtureURL("claude-partial-projection"))
         return try JSONDecoder().decode([HarnessMessage].self, from: Data(contentsOf: url))
     }
 

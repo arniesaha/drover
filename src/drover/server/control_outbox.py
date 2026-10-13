@@ -22,8 +22,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from uuid import uuid4
 
-from drover.server.harness.events import is_text_stream_delta
-
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -183,6 +181,10 @@ def record_event_side_effects(
     DuckDB compatibility keeps the inline envelope too; export intent is still
     durable and ingestion never writes parquet in either control-store mode.
     """
+    # Import after module initialization: the harness package loads registry,
+    # which imports these outbox primitives during exporter startup.
+    from drover.server.harness.events import is_text_stream_delta
+
     con.execute(
         """
         INSERT INTO harness_event_payloads (event_id, payload_json, payload_sha256)
