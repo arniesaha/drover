@@ -432,8 +432,15 @@ def test_recorded_partial_stream_emits_before_completion_without_duplicate_text(
             assert outputs == ["One two three four five six seven", " eight nine ten."]
         messages = driver.parse_line(line)
         all_messages.extend(messages)
-        outputs.extend(m.text for m in messages if m.type == "assistant_output")
+        outputs.extend(
+            m.text for m in messages if m.payload.get("text_stream_delta") is True
+        )
     assert outputs == ["One two three four five six seven", " eight nine ten."]
+    finals = [m for m in all_messages if m.payload.get("text_stream_final") is True]
+    assert len(finals) == 1
+    assert finals[0].text == "".join(outputs)
+    assert finals[0].payload["text_stream_id"] == "message-1:0"
+    assert finals[0].payload["text_stream_final"] is True
     assert all_messages[-1].payload["turn_complete"] is True
     assert any(m.payload.get("usage_message_id") == "message-1" for m in all_messages)
 
@@ -479,7 +486,11 @@ def test_partial_thinking_preserves_tools_and_resets_for_next_message():
             },
         }
     )
-    assert [m.type for m in messages] == ["tool_action", "assistant_output"]
+    assert [m.type for m in messages] == [
+        "assistant_output",
+        "tool_action",
+        "assistant_output",
+    ]
     assert messages[-1].text == "Unstreamed block"
     parse(
         {
@@ -513,3 +524,80 @@ def test_partial_stream_preserves_final_token_usage():
         for message in driver.parse_line(line)
     ]
     assert session_totals("claude-code", messages).output_tokens == 17
+
+
+def test_recorded_partial_hub_projection_matches_ios_fixture():
+    from drover.server.harness.models import HarnessEvent
+
+    driver = _driver([])
+    projected = []
+    for line in (
+        (FIXTURES_DIR / "claude_partial_capture.ndjson").read_text().splitlines()
+    ):
+        for message in driver.parse_line(line):
+            seq = len(projected) + 1
+            event = HarnessEvent(
+                event_id=f"e{seq}",
+                session_id="fixture-session",
+                event_type=message.type,
+                seq=seq,
+                payload=message.to_payload(),
+            )
+            row = event.wire_payload()
+            row.pop("ts", None)
+            projected.append(row)
+    fixture = Path(
+        "apps/drover/DroverKit/Tests/DroverKitTests/Fixtures/claude-partial-projection.json"
+    )
+    assert projected == json.loads(fixture.read_text())
+    assert [row["type"] for row in projected] == [
+        "assistant_output",
+        "assistant_output",
+        "assistant_output",
+        "status",
+        "status",
+    ]
+    assert len({row["event_id"] for row in projected}) == len(projected)
+    assert all(
+        row["payload"]["text_stream_id"] == "message-1:0" for row in projected[:3]
+    )
+
+
+def test_final_snapshot_identity_survives_a_later_message_start():
+    # The old suppression guard only remembered the latest message_start.
+    # A delayed snapshot must still finalize its own block, not append a bubble.
+    driver = _driver([])
+    lines = (FIXTURES_DIR / "claude_partial_capture.ndjson").read_text().splitlines()
+    deltas = [m for line in lines[:4] for m in driver.parse_line(line)]
+    driver.parse_line(
+        json.dumps(
+            {
+                "type": "stream_event",
+                "event": {"type": "message_start", "message": {"id": "message-2"}},
+            }
+        )
+    )
+    [final] = driver.parse_line(lines[4])
+    assert final.type == "assistant_output"
+    assert final.payload["text_stream_final"] is True
+    assert final.payload["text_stream_id"] == deltas[0].payload["text_stream_id"]
+    assert final.text == "".join(m.text for m in deltas)
+
+
+def test_recorded_partial_wire_uses_old_ios_assistant_type_with_delta_marker():
+    driver = _driver([])
+    rows = [
+        message.to_payload()
+        for line in (FIXTURES_DIR / "claude_partial_capture.ndjson")
+        .read_text()
+        .splitlines()
+        for message in driver.parse_line(line)
+    ]
+    assistant = [row for row in rows if row["role"] == "assistant"]
+    assert [row["type"] for row in assistant] == ["assistant_output"] * 3
+    assert [row["payload"].get("text_stream_delta", False) for row in assistant] == [
+        True,
+        True,
+        False,
+    ]
+    assert assistant[-1]["payload"]["text_stream_final"] is True

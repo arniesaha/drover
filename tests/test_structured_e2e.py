@@ -602,10 +602,21 @@ def test_recorded_claude_deltas_reach_app_feed_before_turn_completion(tmp_path):
                 return json.loads(res.read())["messages"]
 
         _wait_until(
-            lambda: len([m for m in feed() if m["type"] == "assistant_output"]) == 2
+            lambda: len(
+                [
+                    m
+                    for m in feed()
+                    if m.get("payload", {}).get("text_stream_delta") is True
+                ]
+            )
+            == 2
         )
         before = feed()
-        assert [m["text"] for m in before if m["type"] == "assistant_output"] == [
+        assert [
+            m["text"]
+            for m in before
+            if m.get("payload", {}).get("text_stream_delta") is True
+        ] == [
             "One two three four five six seven",
             " eight nine ten.",
         ]
@@ -616,14 +627,42 @@ def test_recorded_claude_deltas_reach_app_feed_before_turn_completion(tmp_path):
             if message is None:
                 continue
             assert not message.get("payload", {}).get("turn_complete")
-            if message["type"] == "assistant_output":
+            if message.get("payload", {}).get("text_stream_delta") is True:
                 streamed.append(message["text"])
         assert streamed == ["One two three four five six seven", " eight nine ten."]
         release.touch()
         _wait_until(
             lambda: any(m.get("payload", {}).get("turn_complete") for m in feed())
         )
-        assert len([m for m in feed() if m["type"] == "assistant_output"]) == 2
+        completed = feed()
+        assert (
+            len(
+                [
+                    m
+                    for m in completed
+                    if m.get("payload", {}).get("text_stream_delta") is True
+                ]
+            )
+            == 2
+        )
+        finals = [
+            m
+            for m in completed
+            if m.get("payload", {}).get("text_stream_final") is True
+        ]
+        assert len(finals) == 1
+        # Current main's decoder recognizes every assistant wire event.
+        assert all(
+            m["type"] == "assistant_output"
+            for m in completed
+            if m["role"] == "assistant"
+        )
+        assert finals[0]["text"] == "".join(streamed)
+        assert finals[0]["payload"]["text_stream_id"] == "message-1:0"
+        assert finals[0]["payload"]["text_stream_final"] is True
+        assert finals[0]["payload"]["usage"]["input_tokens"] == 2
+        # REST reload preserves the same one-final-message projection.
+        assert feed() == completed
     finally:
         if stream is not None:
             stream.close()

@@ -56,7 +56,10 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         containing messageID: String,
         in messages: [HarnessMessage]
     ) -> String? {
-        group(messages).first { $0.contains(messageID: messageID) }?.id
+        let streamID = messages.first { $0.id == messageID }?.payload["text_stream_id"]?.stringValue
+        return group(messages).first {
+            $0.contains(messageID: messageID) || (streamID.map($0.contains(streamID:)) ?? false)
+        }?.id
     }
 
     private func contains(messageID: String) -> Bool {
@@ -69,6 +72,17 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
             steps.contains {
                 $0.action.id == messageID || $0.result?.id == messageID
             }
+        }
+    }
+
+    private func contains(streamID: String) -> Bool {
+        switch self {
+        case .message(let row):
+            row.payload["text_stream_id"]?.stringValue == streamID
+        case .thinkingRun(let run, _):
+            run.contains { $0.payload["text_stream_id"]?.stringValue == streamID }
+        default:
+            false
         }
     }
 
@@ -93,7 +107,60 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
     /// and the result. `fold` tracks the id each message actually rendered
     /// into as it walks, so this stays correct in that case too.
     public static func latestRowID(of messages: [HarnessMessage]) -> String? {
-        fold(messages).lastRenderedID
+        if let latest = messages.last, latest.payload["text_stream_id"] != nil {
+            return rowID(containing: latest.id, in: messages)
+        }
+        return fold(messages).lastRenderedID
+    }
+
+    /// Fold provider block deltas and snapshots by identity before grouping.
+    /// Event IDs and sequences remain distinct in the transport and history.
+    /// The first delta owns the row; a snapshot replaces text and adds usage.
+    private static func finalizeStreams(_ messages: [HarnessMessage]) -> [HarnessMessage] {
+        var result: [HarnessMessage] = []
+        var streams: [String: Int] = [:]
+        var usageRows: [String: [Int]] = [:]
+        for message in messages {
+            if message.type == .assistantOutput,
+               let streamID = message.payload["text_stream_id"]?.stringValue {
+                if let index = streams[streamID] {
+                    if message.payload["text_stream_final"]?.boolValue == true {
+                        result[index].text = message.text
+                    } else if result[index].payload["text_stream_final"]?.boolValue != true {
+                        result[index].text += message.text
+                    }
+                    result[index].payload.merge(message.payload) { _, new in new }
+                    if message.payload["text_stream_final"]?.boolValue == true {
+                        result[index].payload.removeValue(forKey: "text_stream_delta")
+                    }
+                } else {
+                    streams[streamID] = result.count
+                    if let separator = streamID.lastIndex(of: ":") {
+                        usageRows[String(streamID[..<separator]), default: []].append(result.count)
+                    }
+                    var row = message
+                    row.type = .assistantOutput
+                    result.append(row)
+                }
+                continue
+            }
+            if message.type == .status,
+               let messageID = message.payload["usage_message_id"]?.stringValue,
+               let usage = message.payload["usage"] {
+                for index in usageRows[messageID] ?? [] {
+                    result[index].payload["usage"] = usage
+                }
+            }
+            result.append(message)
+        }
+        return result.map { row in
+            guard row.payload["text_stream_id"] != nil else { return row }
+            return HarnessMessage(
+                id: row.id, seq: row.seq, type: row.type, role: row.role,
+                text: row.text, turnID: row.turnID, timestamp: row.timestamp,
+                payload: row.payload
+            )
+        }
     }
 
     /// Shared walk behind `group` and `latestRowID` so both stay consistent
@@ -114,18 +181,6 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         var lastRenderedID: String?
 
         var statusRun: [HarnessMessage] = []
-        var textRun: [HarnessMessage] = []
-
-        func flushText() {
-            guard let first = textRun.first else { return }
-            let combined = HarnessMessage(
-                id: first.id, seq: first.seq, type: first.type, role: first.role,
-                text: textRun.map(\.text).joined(), turnID: first.turnID,
-                timestamp: first.timestamp, payload: first.payload
-            )
-            items.append(.message(combined))
-            textRun = []
-        }
 
         func flushRun() {
             guard !run.isEmpty else { return }
@@ -152,21 +207,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
             }
         }
 
-        for message in messages {
-            if message.type == .assistantOutput, !message.isThinking,
-               let streamID = message.payload["text_stream_id"]?.stringValue {
-                flushRun()
-                flushStatus()
-                openStepRun = nil
-                if let first = textRun.first,
-                   first.payload["text_stream_id"]?.stringValue != streamID {
-                    flushText()
-                }
-                textRun.append(message)
-                lastRenderedID = textRun[0].id
-                continue
-            }
-            flushText()
+        for message in finalizeStreams(messages) {
             // First branch on purpose: these are consumed into a run, and
             // must never flush a buffer or break the run they describe.
             if message.isThinkingTokens {
@@ -226,7 +267,6 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
             items.append(.message(message))
             lastRenderedID = message.id
         }
-        flushText()
         flushRun()
         flushStatus()
         return (items, lastRenderedID)

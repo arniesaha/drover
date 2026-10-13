@@ -486,3 +486,19 @@ def test_rejected_model_recap_persists_first_prompt(pg_control_path, output):
         "fallback:user-prompt",
         "live",
     )
+
+
+def test_delta_only_events_do_not_invoke_recap_backend(tmp_path):
+    worker = LiveRecapWorker(duckdb_path=tmp_path / "unused.duckdb")
+    recap, source = worker._generate_recap(
+        [
+            {
+                "event_type": "assistant_output",
+                "content_preview": "partial",
+                "payload": {"text_stream_delta": True},
+            }
+        ],
+        "Fix the transcript",
+    )
+    assert recap == "Fix the transcript"
+    assert source == "fallback:user-prompt"
