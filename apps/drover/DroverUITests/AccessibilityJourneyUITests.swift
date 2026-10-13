@@ -272,9 +272,32 @@ final class AccessibilityJourneyUITests: XCTestCase {
         launch.tap()
         let confirm = app.buttons["launch-confirm-button"]
         XCTAssertTrue(confirm.waitForExistence(timeout: timeout))
+        XCTAssertFalse(confirm.isEnabled)
+        // Launch requires an explicitly chosen working directory (#608).
+        let folder = app.buttons["launch-folder-browser"]
+        XCTAssertTrue(folder.waitForExistence(timeout: 5))
+        folder.tap()
+        let home = app.buttons["Home, folder"]
+        XCTAssertTrue(home.waitForExistence(timeout: 5))
+        home.tap()
+        let project = app.buttons["project, Git repository, folder"]
+        XCTAssertTrue(project.waitForExistence(timeout: 5))
+        project.tap()
+        let useFolder = app.buttons["folder-browser-use"]
+        XCTAssertTrue(useFolder.waitForExistence(timeout: 5))
+        XCTAssertTrue(useFolder.isEnabled)
+        useFolder.tap()
+        XCTAssertTrue(folder.waitForExistence(timeout: 5))
+        XCTAssertEqual(folder.value as? String, "/fixture/project")
+        let prompt = app.textFields["composer-input"]
+        XCTAssertTrue(prompt.waitForExistence(timeout: timeout))
+        prompt.tap()
+        prompt.typeText("fixture launch")
+        XCTAssertTrue(app.keyboards.firstMatch.exists)
         XCTAssertTrue(confirm.isHittable)
         XCTAssertTrue(confirm.isEnabled)
         XCTAssertTrue(app.frame.contains(confirm.frame))
+        XCTAssertLessThanOrEqual(confirm.frame.maxY, app.keyboards.firstMatch.frame.minY)
     }
 
     @MainActor
