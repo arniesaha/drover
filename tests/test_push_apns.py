@@ -926,3 +926,92 @@ def test_notification_category_matches_actual_prompt_or_completion(
     )
     assert payload["aps"]["category"] == category
     sender.close()
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("is_error,kind", [(False, "finished"), (True, "failed")])
+def test_postgres_turn_completion_push_is_not_time_sensitive(
+    pg_control_path, tmp_path, config, nested, is_error, kind
+):
+    from datetime import datetime, timezone
+
+    from drover.server.harness.registry import HarnessRegistry
+
+    registry = HarnessRegistry(pg_control_path)
+    registry.register_host(
+        host_id="fixture", display_name="Fixture", kind="macos", capabilities={}
+    )
+    registry.create_session(
+        session_id="fixture-session",
+        host_id="fixture",
+        harness="claude-code",
+        command="claude",
+        status="running",
+        mode="structured",
+    )
+    store, _ = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+    set_sender(sender)
+
+    def ingest(seq, event_type, payload):
+        record = {
+            "event_id": f"fixture-{seq}",
+            "session_id": "fixture-session",
+            "event_type": event_type,
+            "payload": {"payload": payload} if nested else payload,
+            "seq": seq,
+            "created_at": datetime.now(timezone.utc),
+        }
+        assert registry.ingest_structured_events([record]) == 1
+        assert registry.ingest_structured_events([record]) == 0
+
+    def flush(expected_kind, interruption):
+        now[0] += 60
+        sender.flush_due()
+        assert len(client.posts) == 1
+        payload = json.loads(client.posts.pop()["content"])
+        assert payload["session_id"] == "fixture-session"
+        assert payload["aps"]["category"] == expected_kind
+        assert payload["aps"]["interruption-level"] == interruption
+        assert payload["aps"]["alert"]["body"].startswith(
+            {
+                "finished": "Finished:",
+                "failed": "Failed:",
+                "input": "Needs your input:",
+            }[expected_kind]
+        )
+
+    try:
+        ingest(1, "assistant_output", {"text": "Synthetic reply ready"})
+        ingest(
+            2,
+            "status",
+            {
+                "turn_complete": True,
+                "awaiting": "input",
+                "result": {"is_error": is_error},
+            },
+        )
+        with registry._connect() as con:
+            # Reproduce the live split-payload layout, not a legacy inline row.
+            assert (
+                con.execute(
+                    "SELECT payload_json FROM harness_events WHERE event_id = 'fixture-2'"
+                ).fetchone()[0]
+                is None
+            )
+        assert registry.get_session("fixture-session").status == "running"
+        flush(kind, "active")
+
+        # A later question and permission prompt must still break through Focus.
+        ingest(3, "user_input", {"text": "Synthetic next turn"})
+        ingest(4, "status", {"awaiting": "input"})
+        flush("input", "time-sensitive")
+        ingest(5, "approval_prompt", {"prompt": "Synthetic permission"})
+        flush("input", "time-sensitive")
+        now[0] += 60
+        sender.flush_due()
+        assert client.posts == []
+    finally:
+        set_sender(None)
+        sender.close()
