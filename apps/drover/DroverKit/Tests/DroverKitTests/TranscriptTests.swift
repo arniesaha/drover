@@ -269,3 +269,66 @@ private func thinkingTokens(_ id: String, seq: Int, estimated: Int) -> HarnessMe
         #expect(TranscriptItem.group(chunks).count == 4)
     }
 }
+
+@Suite @MainActor struct ClaudeStreamFinalizationTests {
+    private func recordedTurn() throws -> [HarnessMessage] {
+        let url = try #require(droverKitFixtureURL("claude-partial-projection"))
+        return try JSONDecoder().decode([HarnessMessage].self, from: Data(contentsOf: url))
+    }
+
+    private func assistantRows(_ model: ChatModel) -> [HarnessMessage] {
+        TranscriptItem.group(model.messages).compactMap {
+            if case .message(let row) = $0, row.type == .assistantOutput { return row }
+            return nil
+        }
+    }
+
+    @Test func recordedMultiDeltaTurnFinalizesInPlaceInLiveAndReloadReducers() throws {
+        let messages = try recordedTurn()
+        // This is the released wire type set: old clients never see raw deltas.
+        #expect(messages.prefix(3).allSatisfy { $0.type == .assistantOutput })
+        #expect(messages.prefix(2).allSatisfy { $0.payload["text_stream_delta"]?.boolValue == true })
+        let live = recoveryChatModel(client: MockNetwork().client(), sessionID: "fixture-session", harness: "claude-code")
+        live.ingest(.message(messages[0]))
+        let firstID = try #require(assistantRows(live).first?.id)
+        live.ingest(.message(messages[1]))
+        #expect(assistantRows(live).count == 1)
+        #expect(assistantRows(live)[0].text == "One two three four five six seven eight nine ten.")
+        for message in messages.dropFirst(2) { live.ingest(.message(message)) }
+        let rows = assistantRows(live)
+        #expect(rows.count == 1)
+        #expect(rows[0].id == firstID)
+        #expect(rows[0].payload["text_stream_final"]?.boolValue == true)
+        #expect(rows[0].payload["text_stream_delta"] == nil)
+        #expect(rows[0].payload["usage"]?.objectValue?["output_tokens"]?.numberValue == 17)
+        #expect(TokenUsageSummary(message: rows[0]) != nil)
+        #expect(String(rows[0].displayText.characters) == rows[0].text)
+        #expect(TranscriptItem.latestRowID(of: Array(messages.prefix(3))) == firstID)
+        #expect(TranscriptItem.rowID(containing: messages[2].id, in: messages) == firstID)
+
+        let reload = recoveryChatModel(client: MockNetwork().client(), sessionID: "fixture-session", harness: "claude-code")
+        reload.ingest(.history(messages, decodeIssues: []))
+        #expect(assistantRows(reload) == rows)
+        // A page that starts at the final snapshot is independently readable.
+        #expect(TranscriptItem.group(Array(messages.dropFirst(2))).filter {
+            if case .message(let row) = $0 { return row.type == .assistantOutput }
+            return false
+        }.count == 1)
+    }
+
+    @Test func snapshotReplacesPartialTextAcrossStatusesAndCodexRemainsSeparate() {
+        let delta = HarnessMessage(id: "delta", seq: 1, type: .assistantOutput, text: "partial",
+                                   payload: ["text_stream_id": .string("m:0"), "text_stream_delta": .bool(true)])
+        let status = HarnessMessage(seq: 2, type: .status, text: "usage")
+        let final = HarnessMessage(id: "final", seq: 3, type: .assistantOutput, text: "complete",
+                                   payload: ["text_stream_id": .string("m:0"), "text_stream_final": .bool(true)])
+        let codex = HarnessMessage(id: "codex", seq: 4, type: .assistantOutput, text: "complete")
+        let rows = TranscriptItem.group([delta, status, final, codex])
+        #expect(rows.count == 3)
+        guard case .message(let row) = rows[0] else { Issue.record("Expected assistant"); return }
+        #expect(row.id == "delta")
+        #expect(row.text == "complete")
+        #expect(String(row.displayText.characters) == "complete")
+        #expect(rows[2] == .message(codex))
+    }
+}

@@ -2011,3 +2011,46 @@ def test_gap_only_and_leading_legacy_gap_are_readable(store, request, tmp_path):
         registry.list_event_page("gap-only", before_seq=1).events[0].event_id
         == gap.event_id
     )
+
+
+def test_marked_deltas_do_not_displace_completed_text_in_server_consumers(tmp_path):
+    from drover.server.harness.recap_worker import LiveRecapWorker
+
+    registry, path = _registry(tmp_path)
+    sid = "stream-compat"
+    registry.create_session(
+        session_id=sid,
+        host_id="test",
+        harness="claude-code",
+        command="claude",
+        mode="structured",
+    )
+    registry.append_event(
+        session_id=sid,
+        event_type="assistant_output",
+        seq=1,
+        payload={"text": "Complete reply."},
+    )
+    # More than either consumer's candidate limit. Explicit legacy metadata
+    # cannot make a marked delta a completed-message preview.
+    for seq in range(2, 42):
+        registry.append_event(
+            session_id=sid,
+            event_type="assistant_output",
+            seq=seq,
+            normalized_type="assistant_output",
+            payload={
+                "text": "Partial fragment",
+                "payload": {"text_stream_delta": True},
+            },
+        )
+    assert registry.latest_session_previews([sid]) == {sid: "Complete reply."}
+    with control_plane_connection(path) as con:
+        assert registry._attention_preview(con, sid) == "Complete reply."
+        assert con.execute(
+            "SELECT content_preview FROM harness_session_previews WHERE session_id=?",
+            [sid],
+        ).fetchone() == ("Complete reply.",)
+    assert registry.transcript_text(sid, limit=1) == "[assistant] Complete reply."
+    events = LiveRecapWorker(duckdb_path=path)._load_events(sid)
+    assert [event["content_preview"] for event in events] == ["Complete reply."]

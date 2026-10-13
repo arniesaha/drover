@@ -181,6 +181,10 @@ def record_event_side_effects(
     DuckDB compatibility keeps the inline envelope too; export intent is still
     durable and ingestion never writes parquet in either control-store mode.
     """
+    # Import after module initialization: the harness package loads registry,
+    # which imports these outbox primitives during exporter startup.
+    from drover.server.harness.events import is_text_stream_delta
+
     con.execute(
         """
         INSERT INTO harness_event_payloads (event_id, payload_json, payload_sha256)
@@ -189,7 +193,10 @@ def record_event_side_effects(
         """,
         [event_id, payload_json, payload_sha256(payload_json)],
     )
-    if event_type in {"user_input", "assistant_output", "terminal.input"}:
+    if event_type in {"user_input", "assistant_output", "terminal.input"} and not (
+        event_type == "assistant_output"
+        and is_text_stream_delta(json.loads(payload_json))
+    ):
         # The `WHERE` clause is the materialized equivalent of the legacy
         # ORDER BY: lower event-type priority wins; ties use coalesced seq,
         # timestamp, then event id.  A late lower-ranked event cannot clobber

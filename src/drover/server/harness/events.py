@@ -7,6 +7,7 @@ from typing import Any
 
 NORMALIZED_EVENT_TYPES = {
     "assistant_output",
+    "assistant_delta",
     "user_input",
     "tool_action",
     "tool_result",
@@ -46,6 +47,16 @@ _ANSI_RE = re.compile(
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
+def is_text_stream_delta(payload: dict[str, Any] | None) -> bool:
+    """Accept driver metadata or its persisted structured-event envelope."""
+    if not isinstance(payload, dict):
+        return False
+    inner = payload.get("payload")
+    return payload.get("text_stream_delta") is True or (
+        isinstance(inner, dict) and inner.get("text_stream_delta") is True
+    )
+
+
 def normalize_harness_event(
     *,
     event_type: str,
@@ -63,7 +74,13 @@ def normalize_harness_event(
     """
 
     payload = payload or {}
-    kind = _clean_type(normalized_type) or _infer_type(event_type, payload, harness)
+    # Keep the released wire type; classify marked deltas internally so
+    # bounded serving queries can skip them without opening every payload.
+    kind = (
+        "assistant_delta"
+        if event_type == "assistant_output" and is_text_stream_delta(payload)
+        else _clean_type(normalized_type) or _infer_type(event_type, payload, harness)
+    )
     source = normalized_source or _infer_source(event_type, payload)
     preview = _bounded_preview(
         content_preview
