@@ -16,7 +16,7 @@ struct MessageBubble: View {
 
     var body: some View {
         switch message.type {
-        case .assistantOutput:
+        case .assistantOutput, .assistantDelta:
             assistantBubble
         case .userInput:
             userBubble

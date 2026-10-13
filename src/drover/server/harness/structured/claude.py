@@ -114,7 +114,6 @@ class ClaudeDriver(ProcessDriver):
         # but tiny: one short string pair per tool call in the session.
         self._tool_names: dict[str, str] = {}
         self._stream_message_id: str | None = None
-        self._streamed_blocks: set[int] = set()
         self._stream_model: str | None = None
 
     def parse_line(self, line: str) -> list[StructuredMessage]:
@@ -183,14 +182,12 @@ class ClaudeDriver(ProcessDriver):
             message = event.get("message") or {}
             self._stream_message_id = message.get("id")
             self._stream_model = message.get("model")
-            self._streamed_blocks.clear()
         elif event.get("type") == "content_block_delta":
             delta = event.get("delta") or {}
             thinking = delta.get("type") == "thinking_delta"
             if delta.get("type") == "text_delta" or thinking:
                 text = delta.get("thinking" if thinking else "text") or ""
                 if text:
-                    self._streamed_blocks.add(event["index"])
                     payload = _metadata_payload(obj, {})
                     payload["model"] = self._stream_model
                     if self._stream_message_id:
@@ -201,7 +198,7 @@ class ClaudeDriver(ProcessDriver):
                         payload["thinking"] = True
                     return [
                         StructuredMessage(
-                            type="assistant_output",
+                            type="assistant_delta",
                             role="assistant",
                             text=text,
                             payload=payload,
@@ -236,22 +233,22 @@ class ClaudeDriver(ProcessDriver):
         content = message.get("content") or []
         for index, block in enumerate(content):
             block_type = block.get("type")
+            block_payload = dict(base_payload)
             if (
                 role == "assistant"
-                and message.get("id") == self._stream_message_id
-                and index in self._streamed_blocks
+                and message.get("id")
                 and block_type in ("text", "thinking")
             ):
-                # Partials already emitted the text. Keep snapshot accounting
-                # metadata without appending the entire answer a second time.
-                continue
+                # The snapshot replaces this block's deltas, including usage.
+                block_payload["text_stream_id"] = f"{message['id']}:{index}"
+                block_payload["text_stream_final"] = True
             if block_type == "text":
                 messages.append(
                     StructuredMessage(
                         type="assistant_output",
                         role="assistant",
                         text=block.get("text") or "",
-                        payload=base_payload,
+                        payload=block_payload,
                     )
                 )
             elif block_type == "thinking":
@@ -260,7 +257,7 @@ class ClaudeDriver(ProcessDriver):
                         type="assistant_output",
                         role="assistant",
                         text=block.get("thinking") or "",
-                        payload={**base_payload, "thinking": True},
+                        payload={**block_payload, "thinking": True},
                     )
                 )
             elif block_type == "tool_use":

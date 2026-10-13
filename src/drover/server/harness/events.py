@@ -7,6 +7,7 @@ from typing import Any
 
 NORMALIZED_EVENT_TYPES = {
     "assistant_output",
+    "assistant_delta",
     "user_input",
     "tool_action",
     "tool_result",
