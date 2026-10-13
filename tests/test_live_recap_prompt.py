@@ -203,6 +203,9 @@ import pytest
 @pytest.mark.parametrize(
     "text",
     [
+        "No coding activity is evident in this session.",
+        "Processing untrusted transcript to produce a summary.",
+        "Processing untrusted transcri...",
         "Lacking coding session events to summarize",
         "Not enough context to generate a summary.",
         "I cannot summarize this session without more information.",
