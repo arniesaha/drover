@@ -1,0 +1,116 @@
+[
+  {
+    "event_id": "e1",
+    "type": "assistant_output",
+    "role": "assistant",
+    "text": "Checking the request.",
+    "payload": {
+      "model": "test-model",
+      "text_stream_delta": true,
+      "text_stream_id": "thinking-message:0",
+      "thinking": true
+    },
+    "turn_id": null,
+    "session_id": "fixture-session",
+    "seq": 1
+  },
+  {
+    "event_id": "e2",
+    "type": "assistant_output",
+    "role": "assistant",
+    "text": "Checking the request.",
+    "payload": {
+      "usage": {
+        "input_tokens": 2,
+        "output_tokens": 241
+      },
+      "usage_message_id": "thinking-message",
+      "text_stream_id": "thinking-message:0",
+      "text_stream_final": true,
+      "thinking": true
+    },
+    "turn_id": null,
+    "session_id": "fixture-session",
+    "seq": 2
+  },
+  {
+    "event_id": "e3",
+    "type": "assistant_output",
+    "role": "assistant",
+    "text": "po",
+    "payload": {
+      "model": "test-model",
+      "text_stream_delta": true,
+      "text_stream_id": "thinking-message:1"
+    },
+    "turn_id": null,
+    "session_id": "fixture-session",
+    "seq": 3
+  },
+  {
+    "event_id": "e4",
+    "type": "assistant_output",
+    "role": "assistant",
+    "text": "ng",
+    "payload": {
+      "model": "test-model",
+      "text_stream_delta": true,
+      "text_stream_id": "thinking-message:1"
+    },
+    "turn_id": null,
+    "session_id": "fixture-session",
+    "seq": 4
+  },
+  {
+    "event_id": "e5",
+    "type": "assistant_output",
+    "role": "assistant",
+    "text": "pong",
+    "payload": {
+      "usage": {
+        "input_tokens": 2,
+        "output_tokens": 241
+      },
+      "usage_message_id": "thinking-message",
+      "text_stream_id": "thinking-message:1",
+      "text_stream_final": true
+    },
+    "turn_id": null,
+    "session_id": "fixture-session",
+    "seq": 5
+  },
+  {
+    "event_id": "e6",
+    "type": "status",
+    "role": "system",
+    "text": "usage",
+    "payload": {
+      "usage": {
+        "input_tokens": 2,
+        "output_tokens": 244
+      },
+      "usage_message_id": "thinking-message",
+      "model": "test-model"
+    },
+    "turn_id": null,
+    "session_id": "fixture-session",
+    "seq": 6
+  },
+  {
+    "event_id": "e7",
+    "type": "status",
+    "role": "system",
+    "text": "turn complete",
+    "payload": {
+      "turn_complete": true,
+      "awaiting": "input",
+      "result": {
+        "type": "result",
+        "subtype": "success"
+      }
+    },
+    "turn_id": null,
+    "session_id": "fixture-session",
+    "seq": 7
+  }
+]
