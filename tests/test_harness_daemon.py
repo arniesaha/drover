@@ -4787,6 +4787,31 @@ def test_a_repeat_create_with_a_client_key_does_not_spawn_a_second_session(tmp_p
         server.server_close()
 
 
+def test_structured_create_retry_with_ios_client_key_returns_one_session(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        payload = {
+            "harness": "claude-code",
+            "mode": "structured",
+            "command": FAKE_STRUCTURED_CLI,
+            "cwd": str(tmp_path),
+            "client_session_id": "ios-launch-regression",
+        }
+        status, first = _json_request(f"{base_url}/sessions", payload=payload)
+        assert status == 201
+        status, retry = _json_request(f"{base_url}/sessions", payload=payload)
+        assert status == 200
+        assert retry["session_id"] == first["session_id"]
+        assert retry["deduplicated"] is True
+        assert len(state.registry.list_sessions()) == 1
+        assert state.structured.has(first["session_id"])
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_creates_without_a_client_key_are_still_independent(tmp_path):
     """Only callers that opt in are fenced; everything else is untouched."""
     server, state, base_url = _start_test_server(tmp_path)

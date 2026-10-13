@@ -84,6 +84,24 @@ final class CapabilityJourneyUITests: XCTestCase {
 
         let confirm = app.buttons["launch-confirm-button"]
         XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+        XCTAssertFalse(confirm.isEnabled)
+        // Choose a directory so the legacy-host assertion below tests the
+        // host's capability gate rather than the missing-directory gate.
+        let folder = app.buttons["launch-folder-browser"]
+        XCTAssertTrue(folder.waitForExistence(timeout: 5))
+        folder.tap()
+        let home = app.buttons["Home, folder"]
+        XCTAssertTrue(home.waitForExistence(timeout: 5))
+        home.tap()
+        let project = app.buttons["project, Git repository, folder"]
+        XCTAssertTrue(project.waitForExistence(timeout: 5))
+        project.tap()
+        let useFolder = app.buttons["folder-browser-use"]
+        XCTAssertTrue(useFolder.waitForExistence(timeout: 5))
+        XCTAssertTrue(useFolder.isEnabled)
+        useFolder.tap()
+        XCTAssertTrue(folder.waitForExistence(timeout: 5))
+        XCTAssertEqual(folder.value as? String, "/fixture/project")
         XCTAssertTrue(confirm.isEnabled)
         XCTAssertTrue(app.buttons["launch-attach"].waitForExistence(timeout: 5))
 

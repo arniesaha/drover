@@ -429,12 +429,20 @@ def test_sparse_recap_falls_back_without_model(events, prompt, expected, tmp_pat
     assert worker._generate_recap(events, prompt) == (expected, "fallback:user-prompt")
 
 
-def test_complaint_recap_falls_back_to_first_prompt(tmp_path):
+@pytest.mark.parametrize(
+    "recap",
+    [
+        "Lacking coding session events to summarize",
+        "No coding activity is evident in this session.",
+        "Processing untrusted transcript to produce a summary.",
+    ],
+)
+def test_complaint_recap_falls_back_to_first_prompt(tmp_path, recap):
     worker = LiveRecapWorker(
         duckdb_path=tmp_path / "unused.duckdb",
         backend=StubBackend(
             {
-                "recap": "Lacking coding session events to summarize",
+                "recap": recap,
             }
         ),
     )

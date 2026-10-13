@@ -288,7 +288,9 @@ struct CapabilityDrivenLaunchTests {
     }
 
     @MainActor private func launchModel() throws -> LaunchModel {
-        LaunchModel(client: client(), snapshot: try mixedSnapshot(), store: store())
+        let model = LaunchModel(client: client(), snapshot: try mixedSnapshot(), store: store())
+        model.cwd = "/workspace/project"
+        return model
     }
 
     @Test @MainActor func defaultsComeFromTheEnvelopeNotAName() throws {
@@ -405,6 +407,7 @@ struct CapabilityDrivenLaunchTests {
          "sessions": [], "cwd_suggestions": []}
         """.utf8)
         let model = LaunchModel(client: client(), snapshot: try HarnessSnapshot.decode(from: before), store: store())
+        model.cwd = "/workspace/project"
         model.harness = "agy"
         #expect(model.canLaunch)
 
@@ -430,6 +433,7 @@ struct CapabilityDrivenLaunchTests {
            "launch_modes": ["structured"], "interrupt": true}}]}}], "sessions": [], "cwd_suggestions": []}
         """.utf8)
         let model = LaunchModel(client: client(), snapshot: try HarnessSnapshot.decode(from: before), store: store())
+        model.cwd = "/workspace/project"
         #expect(model.supportsInteractiveAuth && model.showsRunPreferences && model.canAttachImages)
         #expect(model.runPreferences.isCatalogAvailable)
 

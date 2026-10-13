@@ -97,7 +97,7 @@ struct LaunchView: View {
                 HStack {
                     Button { showFolderBrowser = true } label: {
                         HStack {
-                            Label(model.cwd.isEmpty ? "Choose folder (optional)" : model.cwd,
+                            Label(model.cwd.isEmpty ? "Choose folder" : model.cwd,
                                   systemImage: "folder")
                                 .lineLimit(2)
                             Spacer()
@@ -128,7 +128,7 @@ struct LaunchView: View {
                     showManualPath.toggle()
                 }
                 if showManualPath {
-                    TextField("cwd (optional)", text: $model.cwd)
+                    TextField("cwd", text: $model.cwd)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .accessibilityLabel("Manual working directory path")
@@ -204,6 +204,8 @@ struct LaunchView: View {
                         .padding(.top, 10)
                 }
                 Button {
+                    guard !isLaunching, model.canLaunch else { return }
+                    isLaunching = true
                     Task { await launch() }
                 } label: {
                     HStack {
@@ -301,7 +303,6 @@ struct LaunchView: View {
     }
 
     private func launch() async {
-        isLaunching = true
         defer { isLaunching = false }
         guard let sessionID = await model.launch() else {
             if let error = model.launchError {
