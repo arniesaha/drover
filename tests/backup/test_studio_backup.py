@@ -239,6 +239,67 @@ class BackupTests(unittest.TestCase):
                     self.remote("prepare", root, {"date": date}).returncode, 0
                 )
 
+    def test_fail_quarantines_old_pending_and_duplicate_failed_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for date in ("2026-10-13", "2026-10-14"):
+                pending = root / (".pending-" + date)
+                pending.mkdir()
+                (pending / "evidence").write_text(date)
+            duplicate = root / ".failed-2026-10-14-123"
+            duplicate.mkdir()
+            (duplicate / "evidence").write_text("original")
+            with mock.patch.object(nas.time, "time_ns", return_value=123):
+                older = nas.quarantine_pending(root, "2026-10-14")
+                failed = nas.preserve_failed(root, "2026-10-14")
+            self.assertEqual(failed, ".failed-2026-10-14-123-1")
+            self.assertEqual((root / failed / "evidence").read_text(), "2026-10-14")
+            self.assertEqual((duplicate / "evidence").read_text(), "original")
+            self.assertEqual((root / older[0] / "evidence").read_text(), "2026-10-13")
+            self.assertIsNone(nas.preserve_failed(root, "2026-10-14"))
+
+    def test_prepare_quarantines_prior_dates_and_keeps_last_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            good = root / "2026-10-12"
+            good.mkdir()
+            (good / "SUCCESS.json").write_text("{}")
+            for date in ("2026-10-13", "2026-10-14", "2026-10-15"):
+                (root / (".pending-" + date)).mkdir()
+            result = self.remote("prepare", root, {"date": "2026-10-14"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            receipt = json.loads(result.stdout)
+            self.assertEqual(receipt["previous"], "2026-10-12")
+            self.assertEqual(len(receipt["quarantined"]), 1)
+            self.assertFalse((root / ".pending-2026-10-13").exists())
+            self.assertTrue((root / receipt["failed"]).is_dir())
+            self.assertTrue((root / ".pending-2026-10-15").is_dir())
+            result = self.remote("fail", root, {"date": "2026-10-15"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(json.loads(result.stdout)["quarantined"]), 1)
+            self.assertFalse(list(root.glob(".pending-*")))
+            self.assertTrue(good.is_dir())
+
+    def test_fail_repairs_parent_permissions_without_traversing_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pending = root / ".pending-2026-10-14"
+            pending.mkdir()
+            (pending / "evidence").write_text("placeholder")
+            pending.chmod(0o000)
+            root.chmod(0o500)
+            try:
+                failed = nas.preserve_failed(root, "2026-10-14")
+                self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+                preserved = root / failed
+                self.assertEqual(preserved.stat().st_mode & 0o777, 0)
+                preserved.chmod(0o700)
+                self.assertEqual((preserved / "evidence").read_text(), "placeholder")
+            finally:
+                root.chmod(0o700)
+                for path in root.iterdir():
+                    path.chmod(0o700)
+
 
 class LiveBackupTests(unittest.TestCase):
     def setUp(self):
@@ -271,15 +332,12 @@ class LiveBackupTests(unittest.TestCase):
             "drover-studio:" + str(source) + "/",
             destination + "/",
         ]
-        command = (
-            "umask 077; mkdir -p "
-            + shlex.quote(destination)
-            + " && "
-            + shlex.join(pull)
-            + " && chmod -R go= "
-            + shlex.quote(destination)
-        )
-        run.assert_called_once_with(backup.SSH + [target, command])
+        command = run.call_args.args[0][-1]
+        self.assertIn(shlex.join(pull), command)
+        self.assertIn("mkdir -p " + shlex.quote(destination), command)
+        self.assertIn("chmod -R go= " + shlex.quote(destination), command)
+        self.assertIn("case $status in 0)", command)
+        self.assertEqual(run.call_args.kwargs, {"operation": "nas_pull"})
 
     def test_pull_chmod_removes_nas_acl_modes_and_pull_failure_propagates(self):
         backup = self.backup
@@ -296,7 +354,7 @@ class LiveBackupTests(unittest.TestCase):
             destination = root / "generation's files"
             real_run = backup.run
 
-            def run_nas_command(args):
+            def run_nas_command(args, **kwargs):
                 # Execute only the generated NAS shell command in a private local
                 # fixture, with a fake receiver that reproduces the NAS ACL modes.
                 environment = {
@@ -412,7 +470,8 @@ class LiveBackupTests(unittest.TestCase):
                     ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())]
                 )
                 log.assert_called_once_with(
-                    "FAILURE type=RuntimeError (command failed (exit 23)); "
+                    'FAILURE type=CommandFailure {"operation": "rsync", "exit_code": 23, '
+                    '"stderr_tail": "private diagnostic placeholder"}; '
                     "generation unpublished; inspect NAS failed or pending directory"
                 )
 
@@ -436,6 +495,134 @@ class LiveBackupTests(unittest.TestCase):
                 log.assert_called_once_with(
                     "FAILURE type=ValueError; generation unpublished; inspect NAS failed or pending directory"
                 )
+
+    def test_failure_diagnostics_redact_before_bounding_and_escape_newlines(self):
+        backup = self.backup
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stderr = (
+                b"x" * 3000
+                + b'\nrsync: open "/private/tree/data file": Permission denied\n'
+                b"password=credential token='credential with spaces'\n"
+                b"postgres://user:credential@host/db /private/config.json\n"
+                b"Authorization: Bearer credential\n"
+            )
+            result = subprocess.CompletedProcess(["rsync"], 23, b"", stderr)
+            with (
+                mock.patch.object(backup, "STATE", root / "state"),
+                mock.patch.object(backup, "LOG", root / "backup.log"),
+                mock.patch.object(backup.subprocess, "Popen"),
+                mock.patch.object(backup.subprocess, "run", return_value=result),
+                mock.patch.object(
+                    backup, "backup", side_effect=lambda: backup.run(["rsync"])
+                ),
+            ):
+                self.assertEqual(backup.main(), 1)
+            line = (root / "backup.log").read_text()
+            self.assertEqual(len(line.splitlines()), 1)
+            self.assertIn('"exit_code": 23', line)
+            self.assertIn("Permission denied", line)
+            for private in ("credential", "/private", "data file", "user:"):
+                self.assertNotIn(private, line)
+            diagnostic = backup.redact_diagnostic(stderr)
+            self.assertLessEqual(len(diagnostic.encode()), 2048)
+
+    def test_ssh_transport_retries_once_and_resets_readback(self):
+        backup = self.backup
+        failed = subprocess.CompletedProcess([], 255, b"", b"Connection reset by peer")
+        ok = subprocess.CompletedProcess([], 0, b"ok", b"")
+        with tempfile.TemporaryFile() as output:
+
+            def attempt(*args, **kwargs):
+                output.write(b"partial" if attempt.count == 0 else b"complete")
+                attempt.count += 1
+                return failed if attempt.count == 1 else ok
+
+            attempt.count = 0
+            with (
+                mock.patch.object(backup.subprocess, "run", side_effect=attempt) as run,
+                mock.patch.object(backup, "log"),
+            ):
+                backup.run(backup.SSH + ["fixture", "cat"], output=output)
+            self.assertEqual(run.call_count, 2)
+            output.seek(0)
+            self.assertEqual(output.read(), b"complete")
+        for code, stderr, expected in (
+            (255, b"Connection reset by peer", 2),
+            (12, b"ssh: Connection reset by peer", 2),
+            (255, b"Permission denied (publickey)", 1),
+            (1, b"Permission denied", 1),
+        ):
+            result = subprocess.CompletedProcess([], code, b"", stderr)
+            with (
+                mock.patch.object(backup.subprocess, "run", return_value=result) as run,
+                mock.patch.object(backup, "log"),
+            ):
+                with self.assertRaises(backup.CommandFailure):
+                    backup.run(backup.SSH + ["fixture", "command"])
+                self.assertEqual(run.call_count, expected)
+
+    def test_second_pass_tolerates_only_rsync_24_and_still_chmods(self):
+        backup = self.backup
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receiver = root / "rsync"
+            environment = {
+                **os.environ,
+                "PATH": str(root) + os.pathsep + os.environ["PATH"],
+            }
+
+            def execute(args, **kwargs):
+                result = subprocess.run(
+                    ["/bin/sh", "-c", args[-1]], env=environment, capture_output=True
+                )
+                if result.returncode:
+                    raise backup.CommandFailure(kwargs["operation"], result)
+                return result.stdout
+
+            with (
+                mock.patch.object(backup, "NAS", "fixture"),
+                mock.patch.object(backup, "run", side_effect=execute),
+            ):
+                for code in (0, 24, 23):
+                    receiver.write_text(
+                        "#!/bin/sh\nfor destination do :; done\n"
+                        'touch "$destination/file"\nchmod 777 "$destination/file"\n'
+                        + "exit %d\n" % code
+                    )
+                    receiver.chmod(0o700)
+                    for second_pass in (False, True):
+                        dest = root / ("copy-%d-%s" % (code, second_pass))
+                        if code == 0 or (code == 24 and second_pass):
+                            backup.sync(
+                                root, "fixture:" + str(dest), second_pass=second_pass
+                            )
+                            self.assertEqual((dest / "file").stat().st_mode & 0o077, 0)
+                        else:
+                            with self.assertRaises(backup.CommandFailure) as caught:
+                                backup.sync(
+                                    root,
+                                    "fixture:" + str(dest),
+                                    second_pass=second_pass,
+                                )
+                            self.assertEqual(caught.exception.returncode, code)
+                            self.assertIn("operation=rsync", caught.exception.stderr)
+                # A chmod failure must not be tolerated as a vanished source.
+                chmod = root / "chmod"
+                chmod.write_text("#!/bin/sh\necho 'Permission denied' >&2\nexit 1\n")
+                chmod.chmod(0o700)
+                receiver.write_text("#!/bin/sh\nexit 24\n")
+                with self.assertRaises(backup.CommandFailure) as caught:
+                    backup.sync(
+                        root, "fixture:" + str(root / "chmod-failure"), second_pass=True
+                    )
+                self.assertEqual(caught.exception.returncode, 1)
+                self.assertIn("operation=chmod", caught.exception.stderr)
+        result = subprocess.CompletedProcess([], 24, b"", b"vanished")
+        with mock.patch.object(backup.subprocess, "run", return_value=result):
+            with self.assertRaises(backup.CommandFailure):
+                backup.sync(root, str(root / "local"))
+            backup.sync(root, str(root / "local"), second_pass=True)
 
     def test_launchagent_uses_stable_dedicated_python(self):
         template = ROOT / "scripts/launchd/com.drover.backup.plist.template"
@@ -618,10 +805,13 @@ class LiveBackupTests(unittest.TestCase):
             calls = []
             mutations = iter((b"second", b"third!"))
 
-            def sync(src, dest, previous=None, excludes=()):
-                calls.append((src, dest, excludes))
+            def sync(src, dest, previous=None, excludes=(), **kwargs):
+                calls.append((src, dest, excludes, kwargs))
                 real_sync(
-                    src, dest.removeprefix("backup-user@nas-host:"), excludes=excludes
+                    src,
+                    dest.removeprefix("backup-user@nas-host:"),
+                    excludes=excludes,
+                    **kwargs,
                 )
                 if src == source:
                     # The source changes after each transfer, including final pass.
@@ -662,6 +852,8 @@ class LiveBackupTests(unittest.TestCase):
                 )
             lake_calls = [call for call in calls if call[0] == source]
             self.assertEqual(len(lake_calls), 2)
+            self.assertEqual(lake_calls[0][3], {})
+            self.assertEqual(lake_calls[1][3], {"second_pass": True})
             self.assertTrue(all(call[2] == backup.LAKE_EXCLUDES for call in lake_calls))
             pending = nas.pending_path(nas_root, date)
             self.assertFalse((pending / "drover-data/registry.duckdb").exists())
