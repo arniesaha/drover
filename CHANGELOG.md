@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-10-14
+
+### Added
+
+- Work queue support adds GitHub provider integration, policy controls, execution links, decision events, MCP and HTTP tools, quota-aware launch routing, restart recovery, and verification before completion (#616, #618).
+- iOS now shows a Needs you list with direct links to pending work (#622).
+
+### Changed
+
+- The chat composer, activity chips, and artifact chips use a floating translucent design on iOS (#619).
+- Installer shell tests reliably run on iOS-only changes (#621).
+
+### Fixed
+
+- Backup failures now preserve useful diagnostics and safely handle retry and quarantine paths (#623).
+
+### Upgrade notes
+
+- Restart the hub after upgrading. The hub applies an additive control migration that creates two new tables.
+- Upgrade harnessd hosts, including Studio and NAS.
+- The work-queue reconciler remains in shadow mode by default; do not enable it during this upgrade.
+
 ## [0.6.8] - 2026-10-13
 
 ### Added
