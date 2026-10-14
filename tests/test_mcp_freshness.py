@@ -73,7 +73,29 @@ def test_unknown_freshness_is_explicit():
     assert with_freshness(None, empty_envelope=True)["status"] == "unavailable"
 
 
-def test_every_public_read_carries_freshness_even_without_data(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("work_list_args", "expected_work_list"),
+    [
+        pytest.param(
+            {"goal_id": "test"},
+            {"goal_id": "test", "limit": 50},
+            id="view-omitted",
+        ),
+        pytest.param(
+            {"goal_id": "test", "view": None},
+            {"goal_id": "test", "limit": 50},
+            id="view-null",
+        ),
+        pytest.param(
+            {"goal_id": "test", "view": "attention"},
+            {"goal_id": "test", "limit": 50, "view": "attention"},
+            id="attention-view",
+        ),
+    ],
+)
+def test_every_public_read_carries_freshness_even_without_data(
+    tmp_path, monkeypatch, work_list_args, expected_work_list
+):
     from drover.server.profile import ProfileActor
 
     monkeypatch.setattr(
@@ -93,7 +115,7 @@ def test_every_public_read_carries_freshness_even_without_data(tmp_path, monkeyp
     monkeypatch.setattr("drover.server.work_queue.client.control_call", empty_work_read)
     argument_overrides = {
         "drover_work_get": {"goal_id": "test", "number": 1},
-        "drover_work_list": {"goal_id": "test"},
+        "drover_work_list": work_list_args,
         "drover_memory_acceptance": {"harness_ids": ["test"]},
     }
     server = build_mcp_server(duckdb_path=path)
@@ -122,7 +144,7 @@ def test_every_public_read_carries_freshness_even_without_data(tmp_path, monkeyp
         assert serialized_bytes(result) <= READ_CAPS[tool.name].response_bytes
     assert work_reads == {
         "get": {"goal_id": "test", "number": 1},
-        "list": {"goal_id": "test", "limit": 50},
+        "list": expected_work_list,
     }
 
 

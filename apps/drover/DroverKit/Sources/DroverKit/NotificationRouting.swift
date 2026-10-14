@@ -7,6 +7,7 @@ import Foundation
 /// running). Both carry the session id under the same key so tapping either
 /// resolves through one code path rather than two that drift.
 public enum NotificationPayloadKey {
+    public static let attentionRef = "attention_ref"
     /// Matches the `session_id` the server puts in its APNs payload.
     public static let sessionID = "session_id"
     public static let sessionIDs = "session_ids"
@@ -70,14 +71,34 @@ public final class NotificationRoute {
     public static let shared = NotificationRoute()
 
     /// Set by the notification delegate, cleared by whoever navigates.
+    public private(set) var pendingAttentionRef: WorkAttentionRef?
     public private(set) var pendingSessionID: String?
     public private(set) var pendingSessionIDs: [String]?
 
     public init() {}
 
+    public func open(attentionRef: WorkAttentionRef) {
+        pendingSessionID = nil
+        pendingSessionIDs = nil
+        pendingAttentionRef = attentionRef
+    }
+
+    public func consumeAttention() -> WorkAttentionRef? {
+        defer { pendingAttentionRef = nil }
+        return pendingAttentionRef
+    }
+
+    public nonisolated static func attentionRef(userInfo: [AnyHashable: Any]) -> WorkAttentionRef? {
+        guard let value = userInfo[NotificationPayloadKey.attentionRef] as? [String: String],
+              let workspace = value["workspace_id"], !workspace.isEmpty,
+              let id = value["id"], !id.isEmpty else { return nil }
+        return WorkAttentionRef(workspaceID: workspace, id: id)
+    }
+
     public func open(sessionID: String) {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        pendingAttentionRef = nil
         pendingSessionIDs = nil
         pendingSessionID = trimmed
     }
@@ -86,6 +107,7 @@ public final class NotificationRoute {
         let ids = Array(Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty })).sorted()
         guard !ids.isEmpty else { return }
+        pendingAttentionRef = nil
         pendingSessionID = nil
         pendingSessionIDs = ids
     }
@@ -96,6 +118,7 @@ public final class NotificationRoute {
     }
 
     public nonisolated static func sessionIDs(userInfo: [AnyHashable: Any]) -> [String]? {
+        guard userInfo[NotificationPayloadKey.attentionRef] == nil else { return nil }
         guard let ids = userInfo[NotificationPayloadKey.sessionIDs] as? [String] else { return nil }
         let cleaned = Array(Set(ids.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty })).sorted()
@@ -120,7 +143,8 @@ public final class NotificationRoute {
     public nonisolated static func sessionID(
         userInfo: [AnyHashable: Any], requestIdentifier: String
     ) -> String? {
-        if userInfo[NotificationPayloadKey.sessionIDs] != nil { return nil }
+        if userInfo[NotificationPayloadKey.attentionRef] != nil ||
+            userInfo[NotificationPayloadKey.sessionIDs] != nil { return nil }
         if let value = userInfo[NotificationPayloadKey.sessionID] as? String,
            !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return value

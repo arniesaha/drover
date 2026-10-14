@@ -20,10 +20,15 @@ public enum SessionNotificationKind: String, Codable, Sendable {
 public protocol Notifying: Sendable {
     func notify(title: String, body: String, id: String) async
     func setBadge(_ count: Int) async
+    func notify(attention: WorkAttentionRef) async
     func notify(kind: SessionNotificationKind, id: String) async
 }
 
 extension Notifying {
+    public func notify(attention: WorkAttentionRef) async {
+        await notify(title: "Needs you", body: "Open Drover to review pending work.", id: attention.id)
+    }
+
     public func notify(kind: SessionNotificationKind, id: String) async {
         await notify(title: "Session", body: kind.body, id: id)
     }
@@ -65,6 +70,25 @@ public struct LocalNotifier: Notifying {
         // Same key the push payload carries, so tapping either kind of alert
         // opens the session by exactly one code path.
         content.userInfo[NotificationPayloadKey.sessionID] = id
+        return content
+    }
+
+    public func notify(attention: WorkAttentionRef) async {
+        guard NotificationMode.saved() != .digest else { return }
+        let request = UNNotificationRequest(identifier: attention.id,
+                                           content: Self.content(attention: attention), trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    static func content(attention: WorkAttentionRef) -> UNMutableNotificationContent {
+        let content = UNMutableNotificationContent()
+        content.title = "Needs you"
+        content.body = "Open Drover to review pending work."
+        content.sound = .default
+        content.threadIdentifier = "work-attention"
+        content.userInfo[NotificationPayloadKey.attentionRef] = [
+            "workspace_id": attention.workspaceID, "id": attention.id
+        ]
         return content
     }
 
