@@ -173,13 +173,17 @@ class WorkService:
         with self.lock:
             return methods[operation](actor=actor, **args)
 
-    def list(self, goal_id, *, actor, limit=50):
+    def list(self, goal_id=None, *, actor, limit=50, view=None):
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
             or not 1 <= limit <= 100
         ):
             raise ValueError("bounded limit required")
+        if view == "attention":
+            return self.attention(goal_id, actor=actor, limit=limit)
+        if view is not None:
+            raise ValueError("unknown work view")
         scope, provider, _, _ = self.scope(goal_id)
         items = provider.list_items()
         return {
@@ -188,6 +192,133 @@ class WorkService:
             "workspace_id": self.config.workspace_id,
             "stale": False,
             "refreshed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def attention(self, goal_id, *, actor, limit):
+        """Disposable metadata projection; no provider or question text is copied."""
+        goals = [
+            g for g in self.config.goals if goal_id is None or g.goal_id == goal_id
+        ]
+        if goal_id is not None and not goals:
+            raise PermissionError("goal outside workspace")
+        refreshed = datetime.now(timezone.utc).isoformat()
+        rows = {}
+        intervals = []
+        for goal in goals:
+            scope, provider, policy, _ = self.scope(goal.goal_id)
+            intervals.append(policy.poll.interval_seconds)
+
+            def row(source, kind, url, **metadata):
+                key = identity(self.config.workspace_id, scope.repo, source)
+                rows.setdefault(
+                    key,
+                    {
+                        "id": key,
+                        "workspace_id": self.config.workspace_id,
+                        "actor_principal": actor.principal,
+                        "goal_id": goal.goal_id,
+                        "repo": scope.repo,
+                        "kind": kind,
+                        "url": url,
+                        "refreshed_at": refreshed,
+                        "freshness_seconds": policy.poll.freshness_seconds,
+                        "stale": False,
+                        "actions": [],
+                        **metadata,
+                    },
+                )
+
+            for entry in provider.list_attention():
+                row(
+                    entry["source_key"],
+                    entry["kind"],
+                    entry["url"],
+                    source_updated_at=entry.get("updated_at"),
+                )
+            for observed in provider.list_items():
+                try:
+                    provider, policy, ref, item = self.item(
+                        goal.goal_id, observed["number"]
+                    )
+                except ValueError:
+                    if observed["state"] == "open":
+                        row(
+                            f"labels:{observed['number']}",
+                            "blocked",
+                            f"https://github.com/{scope.repo}/issues/{observed['number']}",
+                            number=observed["number"],
+                            category="inspect_work_labels",
+                        )
+                    continue
+                links = self.store.links(goal_id=goal.goal_id, number=ref.number)
+                session_id = next(
+                    (l["session_id"] for l in reversed(links) if l["session_id"]), None
+                )
+                if item["state"] == "open" and any(
+                    l["name"] == policy.labels.status_prefix + "blocked"
+                    for l in item["labels"]
+                ):
+                    row(
+                        f"blocked:{ref.number}",
+                        "blocked",
+                        ref.url,
+                        number=ref.number,
+                        session_id=session_id,
+                    )
+                for link in links[-1:]:
+                    session = (
+                        self.harness.resolve(link["run_key"])
+                        if link["session_id"]
+                        else None
+                    )
+                    if session and session.status in {"failed", "errored"}:
+                        row(
+                            "failed:" + link["run_key"],
+                            "failed_session",
+                            ref.url,
+                            number=ref.number,
+                            session_id=link["session_id"],
+                        )
+                for decision in self.store.decisions(ref):
+                    if decision["resolved"]:
+                        continue
+                    actions = []
+                    if (
+                        actor.human
+                        and item["state"] == "open"
+                        and not self.config.shadow_mode
+                        and not decision["intent_recorded"]
+                    ):
+                        for action in decision["options"]:
+                            if action == "reject" or (
+                                action != "open"
+                                and provider.inspect_action(ref, action).get(
+                                    "supported"
+                                )
+                            ):
+                                actions.append(action)
+                    row(
+                        "question:" + decision["decision_id"],
+                        "agent_question",
+                        ref.url,
+                        number=ref.number,
+                        session_id=session_id,
+                        decision_id=decision["decision_id"],
+                        actions=actions,
+                        category=decision["action_category"],
+                        uncertain=decision["intent_recorded"],
+                        source_updated_at=decision["created_at"],
+                    )
+        items = list(rows.values())
+        return {
+            "items": items[:limit],
+            "truncated": len(items) > limit,
+            "workspace_id": self.config.workspace_id,
+            "poll_interval_seconds": (
+                min(intervals) if intervals else load_policy().poll.interval_seconds
+            ),
+            "stale": False,
+            "refreshed_at": refreshed,
         }
 
     def get(self, goal_id, number, *, actor):

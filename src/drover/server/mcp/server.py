@@ -115,9 +115,14 @@ def build_mcp_server(
         return control_call(work_control_url, current_headers(mcp), operation, args)
 
     @read_tool()
-    def drover_work_list(goal_id: str, limit: int = 50) -> dict:
-        """Read current provider items within a configured goal."""
-        return work_call("list", dict(goal_id=goal_id, limit=limit))
+    def drover_work_list(
+        goal_id: str | None = None, limit: int = 50, view: str | None = None
+    ) -> dict:
+        """Read goal items, or view=attention across configured workspace goals."""
+        args = dict(goal_id=goal_id, limit=limit)
+        if view is not None:
+            args["view"] = view
+        return work_call("list", args)
 
     @read_tool()
     def drover_work_get(goal_id: str, number: int) -> dict:
