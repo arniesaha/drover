@@ -49,6 +49,75 @@ private func catalog(
     )
 }
 
+@Test @MainActor func anEmptyOrWhitespaceDirectoryCannotLaunch() async throws {
+    let model = LaunchModel(client: client(), snapshot: try HarnessSnapshot.decode(from: snapshotJSON))
+    mock.handler = { _ in
+        Issue.record("An empty launch must never reach the server")
+        return (201, Data(#"{"session_id":"unexpected"}"#.utf8))
+    }
+    for path in ["", " \n "] {
+        model.cwd = path
+        #expect(!model.canLaunch)
+        #expect(await model.launch() == nil)
+        #expect(model.launchError == "Choose a working directory before launching.")
+    }
+}
+
+@Test @MainActor func overlappingAndCompletedLaunchesCreateOnlyOneSession() async throws {
+    let model = LaunchModel(client: client(), snapshot: try HarnessSnapshot.decode(from: snapshotJSON))
+    model.cwd = "/workspace"
+    let counter = SnapshotRequestCounter()
+    let release = DispatchSemaphore(value: 0)
+    mock.handler = { _ in
+        counter.bump()
+        #expect(release.wait(timeout: .now() + 5) == .success)
+        return (201, Data(#"{"session_id":"one-session"}"#.utf8))
+    }
+    let first = Task { await model.launch() }
+    while !model.isLaunching { await Task.yield() }
+    #expect(!model.canLaunch)
+    #expect(await model.launch() == nil)
+    release.signal()
+    #expect(await first.value == "one-session")
+    #expect(await model.launch() == "one-session")
+    #expect(counter.value == 1)
+    #expect(!model.isLaunching)
+    #expect(!model.canLaunch)
+}
+
+@Test @MainActor func aLostLaunchResponseRetriesWithTheSameKey() async throws {
+    let model = LaunchModel(client: client(), snapshot: try HarnessSnapshot.decode(from: snapshotJSON))
+    model.cwd = "/workspace"
+    nonisolated(unsafe) var keys: [String] = []
+    mock.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        keys.append(body["client_session_id"] as! String)
+        return keys.count == 1
+            ? (504, Data(#"{"error":"timeout"}"#.utf8))
+            : (200, Data(#"{"session_id":"existing-session"}"#.utf8))
+    }
+    #expect(await model.launch() == nil)
+    #expect(model.canLaunch)
+    #expect(await model.launch() == "existing-session")
+    #expect(keys.count == 2 && keys[0] == keys[1])
+    #expect(UUID(uuidString: keys[0]) != nil)
+}
+
+@Test @MainActor func changingLaunchIntentAfterFailureUsesANewKey() async throws {
+    let model = LaunchModel(client: client(), snapshot: try HarnessSnapshot.decode(from: snapshotJSON))
+    model.cwd = "/workspace"
+    nonisolated(unsafe) var keys: [String] = []
+    mock.handler = { request in
+        let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
+        keys.append(body["client_session_id"] as! String)
+        return (400, Data(#"{"error":"failed"}"#.utf8))
+    }
+    #expect(await model.launch() == nil)
+    model.prompt = "A different task"
+    #expect(await model.launch() == nil)
+    #expect(keys.count == 2 && keys[0] != keys[1])
+}
+
 @Test @MainActor func defaultsPickFirstOnlineHostAndClaudeCode() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
@@ -150,6 +219,7 @@ private func catalog(
 @Test @MainActor func launchPostsStructuredModeWithPromptForAgy() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+    model.cwd = "/workspace/project"
     model.harness = "agy"
     model.prompt = "explain the repo layout"
 
@@ -171,6 +241,7 @@ private func catalog(
 @Test @MainActor func launchUsesCatalogStateOverrides() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+    model.cwd = "/workspace/project"
     let attachment = TurnAttachment(mediaType: "image/jpeg", data: Data([0x0A, 0x0B]))
     // The fixture host advertises agy (not codex) with a catalog and images.
     model.harness = "agy"
@@ -198,6 +269,7 @@ private func catalog(
 @Test @MainActor func launchOmitsHarnessDefaultAndAutoOverrides() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+    model.cwd = "/workspace/project"
     model.harness = "agy"
     model.runPreferences.apply(catalog(harness: "agy"))
 
@@ -215,6 +287,7 @@ private func catalog(
 @Test @MainActor func launchPostsPtyModeWithNoPromptForShell() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+    model.cwd = "/workspace/project"
     model.harness = "shell"
     // Even if the model somehow retained prompt text, shell must omit it —
     // the view never shows the prompt field when `isStructured` is false.
@@ -236,6 +309,7 @@ private func catalog(
 @Test @MainActor func launchFailureSetsLaunchErrorAndReturnsNil() async throws {
     let snapshot = try HarnessSnapshot.decode(from: snapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+    model.cwd = "/workspace/project"
 
     mock.handler = { _ in
         (400, Data(#"{"error": "host offline"}"#.utf8))
@@ -473,6 +547,7 @@ private func catalog(
         snapshot: try HarnessSnapshot.decode(from: initialJSON),
         store: testStore()
     )
+    model.cwd = "/workspace/project"
     #expect(model.hostID == "mac-mini")
     #expect(model.harness == "claude-code")
 
@@ -506,6 +581,7 @@ private func catalog(
 @Test @MainActor func staleOfflineAndCanLaunchProperties() async throws {
     let snapshot = try HarnessSnapshot.decode(from: fleetSnapshotJSON)
     let model = LaunchModel(client: client(), snapshot: snapshot, store: testStore())
+    model.cwd = "/workspace/project"
 
     // Default selection: mac-mini (online)
     #expect(model.hostID == "mac-mini")

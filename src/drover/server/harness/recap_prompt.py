@@ -37,7 +37,8 @@ FALLBACK_RECAP_SOURCE = "fallback:user-prompt"
 # Reject statements about the model's inability to summarize, rather than
 # presenting them as the user's goal. Keep actual coding failures valid.
 _META_RECAP_RE = re.compile(
-    r"\b(?:as an ai|i (?:cannot|can't|am unable|don't have access)|"
+    r"\b(?:no coding activity (?:is|was) evident|processing untrusted transcri\w*|"
+    r"as an ai|i (?:cannot|can't|am unable|don't have access)|"
     r"(?:lacking|insufficient|not enough|no) (?:coding )?(?:session )?"
     r"(?:context|information|events|content|transcript)|"
     r"(?:please |need |requires? )(?:provide (?:a )?|more |a )"

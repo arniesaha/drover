@@ -73,11 +73,31 @@ final class DeterministicJourneyUITests: XCTestCase {
         XCTAssertNotEqual(app.buttons["theme-toggle"].label, previousThemeAction)
 
         app.buttons["launch-button"].tap()
+        let confirm = app.buttons["launch-confirm-button"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+        XCTAssertFalse(confirm.isEnabled)
+        // Launch requires an explicitly chosen working directory (#608).
+        let folder = app.buttons["launch-folder-browser"]
+        XCTAssertTrue(folder.waitForExistence(timeout: 5))
+        folder.tap()
+        let home = app.buttons["Home, folder"]
+        XCTAssertTrue(home.waitForExistence(timeout: 5))
+        home.tap()
+        let project = app.buttons["project, Git repository, folder"]
+        XCTAssertTrue(project.waitForExistence(timeout: 5))
+        project.tap()
+        let useFolder = app.buttons["folder-browser-use"]
+        XCTAssertTrue(useFolder.waitForExistence(timeout: 5))
+        XCTAssertTrue(useFolder.isEnabled)
+        useFolder.tap()
+        XCTAssertTrue(folder.waitForExistence(timeout: 5))
+        XCTAssertEqual(folder.value as? String, "/fixture/project")
+        XCTAssertTrue(confirm.isEnabled)
         let launchComposer = app.textFields["composer-input"]
         XCTAssertTrue(launchComposer.waitForExistence(timeout: 5))
         launchComposer.tap()
         launchComposer.typeText("fixture launch")
-        app.buttons["launch-confirm-button"].tap()
+        confirm.tap()
         XCTAssertTrue(app.staticTexts["Fixture ready: fixture-launched-session"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.textFields["composer-input"].exists)
     }

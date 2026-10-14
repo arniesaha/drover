@@ -23,6 +23,25 @@ final class FolderBrowserUITests: XCTestCase {
         add(attachment)
     }
 
+    @MainActor func testDoubleTapNewSessionCannotLaunchWithoutADirectory() {
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
+        app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        app.launch()
+        let newSession = app.buttons["launch-button"]
+        XCTAssertTrue(newSession.waitForExistence(timeout: 5))
+        newSession.doubleTap()
+        let launch = app.buttons["launch-confirm-button"]
+        XCTAssertTrue(launch.waitForExistence(timeout: 5))
+        XCTAssertFalse(launch.isEnabled)
+        XCTAssertEqual(app.buttons["launch-folder-browser"].value as? String, "Not selected")
+        app.buttons["Enter path manually"].tap()
+        app.textFields["launch-manual-cwd"].tap()
+        app.textFields["launch-manual-cwd"].typeText("/fixture/project")
+        XCTAssertTrue(launch.isEnabled)
+        capture("double-tap-launch-requires-directory", app)
+    }
+
     @MainActor func testBrowseFilterBackUpSelectAndManualEntry() {
         let app = openBrowser()
         XCTAssertTrue(app.buttons["Home, folder"].waitForExistence(timeout: 5))

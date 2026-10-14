@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +116,10 @@ class ClaudeDriver(ProcessDriver):
         self._tool_names: dict[str, str] = {}
         self._stream_message_id: str | None = None
         self._stream_model: str | None = None
+        # Claude emits one-block snapshots, whose local index is always zero.
+        # Retain recent wire indexes by message for delayed snapshots as well.
+        self._stream_blocks: OrderedDict[str, dict[int, str]] = OrderedDict()
+        self._finalized_blocks: dict[str, set[int]] = {}
 
     def parse_line(self, line: str) -> list[StructuredMessage]:
         obj = json.loads(line)
@@ -182,10 +187,18 @@ class ClaudeDriver(ProcessDriver):
             message = event.get("message") or {}
             self._stream_message_id = message.get("id")
             self._stream_model = message.get("model")
+            if self._stream_message_id:
+                self._stream_blocks.setdefault(self._stream_message_id, {})
+                while len(self._stream_blocks) > 32:
+                    old_id, _ = self._stream_blocks.popitem(last=False)
+                    self._finalized_blocks.pop(old_id, None)
+        elif event.get("type") == "content_block_start":
+            self._remember_block(event, (event.get("content_block") or {}).get("type"))
         elif event.get("type") == "content_block_delta":
             delta = event.get("delta") or {}
             thinking = delta.get("type") == "thinking_delta"
             if delta.get("type") == "text_delta" or thinking:
+                self._remember_block(event, "thinking" if thinking else "text")
                 text = delta.get("thinking" if thinking else "text") or ""
                 if text:
                     payload = _metadata_payload(obj, {})
@@ -225,6 +238,37 @@ class ClaudeDriver(ProcessDriver):
         # envelopes have no transcript text and must not flood the app feed.
         return []
 
+    def _remember_block(self, event: dict[str, Any], block_type: str | None) -> None:
+        if (
+            self._stream_message_id
+            and block_type
+            and isinstance(event.get("index"), int)
+        ):
+            self._stream_blocks[self._stream_message_id][event["index"]] = block_type
+
+    def _snapshot_index(
+        self, message_id: str, block_type: str, index: int, count: int
+    ) -> int:
+        blocks = self._stream_blocks.get(message_id, {})
+        finalized = (
+            self._finalized_blocks.setdefault(message_id, set()) if blocks else set()
+        )
+        if count == 1:
+            candidates = [
+                i
+                for i, kind in blocks.items()
+                if kind == block_type and i not in finalized
+            ]
+            if candidates:
+                index = min(candidates)
+            elif (
+                len(matches := [i for i, kind in blocks.items() if kind == block_type])
+                == 1
+            ):
+                index = matches[0]
+        finalized.add(index)
+        return index
+
     def _from_content(
         self, obj: dict[str, Any], *, role: str
     ) -> list[StructuredMessage]:
@@ -241,7 +285,10 @@ class ClaudeDriver(ProcessDriver):
                 and block_type in ("text", "thinking")
             ):
                 # The snapshot replaces this block's deltas, including usage.
-                block_payload["text_stream_id"] = f"{message['id']}:{index}"
+                stream_index = self._snapshot_index(
+                    message["id"], block_type, index, len(content)
+                )
+                block_payload["text_stream_id"] = f"{message['id']}:{stream_index}"
                 block_payload["text_stream_final"] = True
             if block_type == "text":
                 messages.append(

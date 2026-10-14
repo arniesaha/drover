@@ -124,10 +124,10 @@ public struct PairResponse: Decodable, Sendable, Equatable {
 /// `NSAllowsArbitraryLoads` in the app's Info.plist).
 public actor DroverClient {
     private static let cockpitRequestTimeout: TimeInterval = 60
-    /// Filesystem lookups run while someone types, so they get a shorter
-    /// budget than the 15s default: the host itself gives up after 3s, and
-    /// anything longer than this is the hub or the network, not the listing.
+    /// Completion runs while someone types and uses the hub's short budget.
+    /// Listing gets enough time for cold directory and Git metadata reads.
     private static let pathRequestTimeout: TimeInterval = 10
+    private static let folderListingTimeout: TimeInterval = 20
     public nonisolated let config: ServerConfig
     /// Foreground-only recovery scope. A client without a verified binding can
     /// still make normal authenticated requests, but cannot restore chat data.
@@ -343,7 +343,7 @@ public actor DroverClient {
     public func listFolders(hostID: String, path: String = "", filter: String = "", cursor: String = "", limit: Int = 100) async throws -> FolderListing {
         let basePath = "/harness/hosts/\(encodePathComponent(hostID))/fs/list"
         let url = try queryURL(path: basePath, items: [("path", path), ("filter", filter), ("cursor", cursor), ("limit", String(limit))])
-        let data = try await request(url: url, method: "GET", body: nil, timeout: Self.pathRequestTimeout)
+        let data = try await request(url: url, method: "GET", body: nil, timeout: Self.folderListingTimeout)
         return try decode(FolderListing.self, from: data)
     }
 
@@ -493,8 +493,10 @@ public actor DroverClient {
                               prompt: String?, cwd: String?,
                               images: [TurnAttachment] = [],
                               model: String? = nil,
-                              thinkingEffort: String? = nil) async throws -> String {
+                              thinkingEffort: String? = nil,
+                              clientSessionID: String? = nil) async throws -> String {
         var payload: [String: Any] = ["harness": harness, "mode": mode]
+        if let clientSessionID { payload["client_session_id"] = clientSessionID }
         if let prompt { payload["prompt"] = prompt }
         if let cwd { payload["cwd"] = cwd }
         if !images.isEmpty {

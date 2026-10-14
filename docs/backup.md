@@ -94,8 +94,14 @@ The operator-authorized machine backup in `scripts/backup/studio_backup.py` is
 separate from the R2 rehearsal design above. It runs as `com.drover.backup` at
 03:30 local time and uses SSH key authentication to the configured NAS account.
 The target is read from private `~/.drover/maintenance/backup-config.json`,
-containing `{"nas": "backup-user@nas-host"}` with the actual user and hostname.
-Keep this file mode 600.
+containing `{"nas": "backup-user@nas-host", "target_root": "/srv/backups/drover"}`
+with the actual SSH account and approved NAS destination supplied locally.
+The required `target_root` sets the absolute NAS directory above the host folder.
+It is independent of the SSH login account because UGOS storage homes can differ
+from login names. There is no built-in personal destination. Missing roots,
+relative roots and roots containing `..` are rejected before contacting the NAS.
+Existing configs containing only `nas` must add their approved `target_root`
+before running the updated script. Keep this file mode 600.
 The NAS requires `python3` and `rsync`, plus a `drover-studio` SSH alias in its
 `~/.ssh/config` with unattended key access back to the Studio. The Studio must
 allow incoming SSH for this account. Transfers run on the NAS, pulling from the
@@ -107,12 +113,13 @@ permissions in the local snapshot check. PostgreSQL 17 clients run on the Studio
 using its owner-authenticated Unix socket on port 15432.
 
 Successful generations live at
-`/home/<nas-user>/backups/drover/<hostname>/<YYYY-MM-DD>/`, using the configured
-NAS username. This is the approved NAS home-directory target.
-Unverified generations remain under `.pending-<date>` and never update the local
-freshness receipt. An existing generation or pending directory blocks a second
-run for the same date. Inspect failed pending directories before removing them
-and retrying. A nonblocking local lock prevents concurrent jobs. Every command
+`<target_root>/<hostname>/<YYYY-MM-DD>/`. The hostname is sanitized for a path
+component. Use the approved NAS home-directory target in the private config.
+Unverified generations never update the local freshness receipt. A failed run
+renames `.pending-<date>` to `.failed-<date>-<time>-<nanoseconds>` and retains its
+evidence. Preparation also preserves leftover pending trees from interrupted
+runs, allowing a retry on the same date. A successful date still blocks reuse.
+A nonblocking local lock prevents concurrent jobs. Every command
 failure exits nonzero; the FAILURE line includes the failed command's exit code,
 while logs omit child diagnostics to protect credentials. Each run starts
 `caffeinate -i -w <pid>` to prevent idle sleep until the backup process exits;
@@ -129,12 +136,20 @@ Contents:
   rebuildable `runtime`, `worktrees`, `rollout-worktrees`, the `incoming` symlink,
   backup scratch state, sockets, and DuckDB files. Symlinks are preserved.
 - `metadata/launchagents`: the user's LaunchAgents, including their historical copies.
-- `metadata/registry`: a live copy of `drover.registry.duckdb` and its WAL if present.
-  Metadata stability is checked and the copy retried up to three times. This is
-  **not a transactional DuckDB export**, and consistency is not guaranteed.
+- `metadata/registry`: a standalone checkpointed snapshot of the home registry.
+- `metadata/duckdb/<data-root>/<relative-path>`: standalone checkpointed snapshots
+  of DuckDB stores in both data roots. The job atomically clones each DB and WAL
+  on the source volume, checks inode, size, mtime and ctime before and after the
+  pair, and retries up to four times if either file changes. DuckDB replays the
+  captured WAL and checkpoints only the isolated clone. The live stores are
+  never opened or checkpointed. A busy source or unavailable atomic clone fails
+  the run; streamed database copies are never a fallback.
 - `drover-data` and `drover-lakes`: the two `/Volumes/M2 1/` data roots. Both are
-  copied before and after the Postgres dumps. The second pass does not delete
-  files retained by the first. Cross-database and catalog-to-file atomicity are
+  copied before and after the Postgres dumps. Both raw passes exclude DuckDB,
+  WAL, socket and lock files, plus `.drover-snapshots` and
+  `.drover-backup-snapshots` scratch directories. Dependency `uv.lock` files are
+  preserved. The second pass does not delete files retained by the first.
+  Cross-database and catalog-to-file atomicity are
   not guaranteed while writers and garbage collection remain active. This job
   does not prove that every catalog reference can be restored.
 
@@ -145,11 +160,19 @@ any owner execute bit left by the ACL, are retained; verification enforces that
 group and other access are absent.
 Rsync `--link-dest` shares unchanged files with the previous successful generation.
 This permission cleanup also removes group and other access from any shared
-inodes; do not edit published snapshots or add access to them. All current
-source data files and staged metadata are checked for size and SHA-256 on the
-NAS. The manifest permits extra data files retained from the first pass.
-Published generations include private `MANIFEST.json`, `SUCCESS.json`, and a
-consistency warning. Archive listing checks structure, not a complete restore.
+inodes; do not edit published snapshots or add access to them. Staged metadata
+is hashed before transfer and checked for size and SHA-256 on the NAS. Once the
+final raw pass finishes, the frozen NAS lake trees are inventoried and hashed,
+including files retained from the first pass. Verification rereads those files;
+it never compares the copy against a subsequently changing live source. This
+binds the manifest to the copied bytes, without proving transactional consistency
+of arbitrary exporter outputs or catalog reference completeness. Expected hashes
+are saved in private `MANIFEST.json` before verification, and `VERIFICATION.json`
+records every missing, changed, mismatched or non-private artifact. Failure logs
+contain escaped relative artifact paths and reasons, without file contents or
+child diagnostics. Publication requires a successful verification report.
+Published generations also include private `SUCCESS.json` and a consistency
+warning. Archive listing checks structure, not a complete restore.
 
 Retention preserves the newest seven successful daily generations and the newest
 representative from each of the latest four ISO calendar weeks. These sets can
@@ -160,11 +183,27 @@ Install both Python files under `~/.drover/maintenance/`, mode 700. Render
 `scripts/launchd/com.drover.backup.plist.template` by replacing `__HOME__` with the
 home directory, install it in `~/Library/LaunchAgents/`, validate with `plutil
 -lint`, and load using `launchctl bootstrap gui/$(id -u) <plist-path>`. The plist
-must use `~/.drover/runtime/current/bin/python`. macOS Local Network permission
-is per binary; Homebrew Python gets `No route to host` under launchd, while the
-Drover runtime Python has the required permission. Confirm that this runtime
-exists and has Local Network access before loading the agent. A foreground manual
-run is `~/.drover/runtime/current/bin/python ~/.drover/maintenance/studio_backup.py`.
+uses `~/.drover/maintenance/backup-python/bin/python`, a dedicated interpreter
+with macOS Local Network permission. The live fix used Drover runtime Python:
+Homebrew Python failed with `No route to host` under launchd, while the runtime
+interpreter had access. Permission follows the executable, so a stable spelling
+such as `runtime/current` alone does not preserve access when a release replaces
+the underlying binary.
+
+Before loading this template, provision the dedicated interpreter outside the
+release tree. For example, use an existing authorized runtime interpreter to
+create `~/.drover/maintenance/backup-python` with `python -m venv --copies`.
+Install the runtime's pinned `duckdb==1.5.5` into that interpreter for isolated
+snapshot checkpointing. Atomic snapshots require macOS and a clone-capable
+source volume, with scratch directories located beside each source store.
+Grant Local Network access to the resulting dedicated Python executable in
+System Settings and verify NAS connectivity under launchd. Copying an executable
+does not copy its permission grant. Keep this interpreter in place across Drover
+releases; recheck permission whenever Python itself is replaced. Until it is
+provisioned and authorized, retain the working live interpreter. Rendering the
+template does not install Python or grant permission. A foreground manual run is
+`~/.drover/maintenance/backup-python/bin/python ~/.drover/maintenance/studio_backup.py`.
+
 Logs live in `~/Library/Logs/drover/backup.log`. The successful local receipt is
 `~/.drover/backup-state/last-success.json`; `soak-probe.sh` reports its
 `backup_age_h`. Missing evidence is informational before the first success;

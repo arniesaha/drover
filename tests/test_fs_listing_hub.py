@@ -186,3 +186,26 @@ def test_hub_forwards_paging_cursor_and_limit(tmp_path, base_url, root):
                 break
             params["cursor"] = body["next_cursor"]
         assert sorted(found) == [f"project{index}" for index in range(5)]
+
+
+def test_cold_listing_gets_its_own_budget_without_a_fleet_snapshot(tmp_path):
+    from drover.server import metrics
+
+    collector = _collector_for_proxy(tmp_path)
+    collector._harness_host = lambda host_id, **kwargs: SimpleNamespace(host_id=host_id)
+    calls = []
+
+    def cold_host(host, path, *, method, payload, timeout_s, **kwargs):
+        calls.append((path, timeout_s))
+        # A cold directory scan outlasts the keystroke completion budget.
+        if timeout_s < 5:
+            return 504, '{"error":"timeout"}'
+        return 200, '{"roots":[],"path":"/workspace","entries":[]}'
+
+    collector._harness_request = cold_host
+    status, _ = collector.proxy_harness_fs_list("test-host", "/workspace")
+    assert status == 200
+    assert calls[0][1] == metrics.FS_LIST_TIMEOUT_S == 15
+    assert calls[0][1] > metrics.FS_COMPLETE_TIMEOUT_S
+    assert collector.proxy_harness_fs_complete("test-host", "/workspace")[0] == 504
+    assert calls[1][1] == metrics.FS_COMPLETE_TIMEOUT_S

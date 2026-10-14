@@ -56,10 +56,8 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
         containing messageID: String,
         in messages: [HarnessMessage]
     ) -> String? {
-        let streamID = messages.first { $0.id == messageID }?.payload["text_stream_id"]?.stringValue
-        return group(messages).first {
-            $0.contains(messageID: messageID) || (streamID.map($0.contains(streamID:)) ?? false)
-        }?.id
+        let rowID = finalizeStreams(messages).rowIDs[messageID] ?? messageID
+        return group(messages).first { $0.contains(messageID: rowID) }?.id
     }
 
     private func contains(messageID: String) -> Bool {
@@ -116,25 +114,53 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
     /// Fold provider block deltas and snapshots by identity before grouping.
     /// Event IDs and sequences remain distinct in the transport and history.
     /// The first delta owns the row; a snapshot replaces text and adds usage.
-    private static func finalizeStreams(_ messages: [HarnessMessage]) -> [HarnessMessage] {
+    private static func finalizeStreams(_ messages: [HarnessMessage]) -> (rows: [HarnessMessage], rowIDs: [String: String]) {
         var result: [HarnessMessage] = []
         var streams: [String: Int] = [:]
+        var rowIDs: [String: String] = [:]
+        var pending: [String: Set<Int>] = [:]
+
+        func key(_ streamID: String, thinking: Bool) -> String {
+            "\(streamID)|\(thinking)"
+        }
         var usageRows: [String: [Int]] = [:]
         for message in messages {
             if message.type == .assistantOutput,
                let streamID = message.payload["text_stream_id"]?.stringValue {
-                if let index = streams[streamID] {
+                let streamKey = key(streamID, thinking: message.isThinking)
+                let separator = streamID.lastIndex(of: ":")
+                let messageID = separator.map { String(streamID[..<$0]) }
+                let blockKey = messageID.map { key($0, thinking: message.isThinking) }
+                var target = streams[streamKey]
+                // 0.6.7 assigned singleton snapshots index 0 even when text
+                // streamed at index 1 after thinking. Recover only a unique
+                // unfinished block of the same message and content kind.
+                if target == nil, message.payload["text_stream_final"]?.boolValue == true,
+                   streamID.hasSuffix(":0"), let blockKey,
+                   let candidates = pending[blockKey], candidates.count == 1 {
+                    target = candidates.first
+                }
+                if let index = target {
+                    streams[streamKey] = index
+                    rowIDs[message.id] = result[index].id
                     if message.payload["text_stream_final"]?.boolValue == true {
                         result[index].text = message.text
                     } else if result[index].payload["text_stream_final"]?.boolValue != true {
                         result[index].text += message.text
                     }
+                    let canonicalStreamID = result[index].payload["text_stream_id"]
                     result[index].payload.merge(message.payload) { _, new in new }
+                    result[index].payload["text_stream_id"] = canonicalStreamID
                     if message.payload["text_stream_final"]?.boolValue == true {
                         result[index].payload.removeValue(forKey: "text_stream_delta")
+                        if let blockKey { pending[blockKey]?.remove(index) }
                     }
                 } else {
-                    streams[streamID] = result.count
+                    streams[streamKey] = result.count
+                    rowIDs[message.id] = message.id
+                    if message.payload["text_stream_final"]?.boolValue != true, let blockKey {
+                        pending[blockKey, default: []].insert(result.count)
+                    }
                     if let separator = streamID.lastIndex(of: ":") {
                         usageRows[String(streamID[..<separator]), default: []].append(result.count)
                     }
@@ -153,7 +179,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
             }
             result.append(message)
         }
-        return result.map { row in
+        let rows = result.map { row in
             guard row.payload["text_stream_id"] != nil else { return row }
             return HarnessMessage(
                 id: row.id, seq: row.seq, type: row.type, role: row.role,
@@ -161,6 +187,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
                 payload: row.payload
             )
         }
+        return (rows, rowIDs)
     }
 
     /// Shared walk behind `group` and `latestRowID` so both stay consistent
@@ -207,7 +234,7 @@ public enum TranscriptItem: Identifiable, Equatable, Sendable {
             }
         }
 
-        for message in finalizeStreams(messages) {
+        for message in finalizeStreams(messages).rows {
             // First branch on purpose: these are consumed into a run, and
             // must never flush a buffer or break the run they describe.
             if message.isThinkingTokens {

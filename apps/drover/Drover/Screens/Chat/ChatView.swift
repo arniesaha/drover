@@ -630,23 +630,10 @@ struct ChatView: View {
             // left by a tall row changing size during the animated scroll.
             scheduleScroll(with: proxy)
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "arrow.down")
-                Text("Jump to latest")
-                if followState.newEventCount > 0 {
-                    Text("\(followState.newEventCount)").monospacedDigit()
-                } else if followState.hasUnseenContent {
-                    Circle().frame(width: 6, height: 6).accessibilityHidden(true)
-                }
-            }
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.primary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .frame(minHeight: 44)
-                .background(.ultraThinMaterial.opacity(0.75), in: Capsule())
-                .overlay(Capsule().strokeBorder(.secondary.opacity(0.18), lineWidth: 1))
-                .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
+            JumpToLatestLabel(
+                newEventCount: followState.newEventCount,
+                hasUnseenContent: followState.hasUnseenContent
+            )
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 16)

@@ -60,8 +60,19 @@ class BackupTests(unittest.TestCase):
                 ],
             }
             artifact.write_bytes(b"bad archive!")
-            self.assertNotEqual(self.remote("verify", root, payload).returncode, 0)
-            self.assertFalse((pending / "MANIFEST.json").exists())
+            result = self.remote("verify", root, payload)
+            self.assertFalse(json.loads(result.stdout)["verification_ok"])
+            self.assertEqual(
+                json.loads(result.stdout)["failures"],
+                [{"path": "sample.dump", "reason": "checksum mismatch"}],
+            )
+            self.assertTrue((pending / "MANIFEST.json").exists())
+            self.assertNotEqual(
+                self.remote(
+                    "publish", root, {"date": "2026-10-12", "nas_pg_restore_list": True}
+                ).returncode,
+                0,
+            )
             artifact.write_bytes(b"test archive")
             self.assertEqual(self.remote("verify", root, payload).returncode, 0)
             self.assertNotEqual(
@@ -121,12 +132,11 @@ class BackupTests(unittest.TestCase):
                 "size": artifact.stat().st_size,
                 "sha256": nas.digest(artifact),
             }
-            self.assertNotEqual(
-                self.remote(
-                    "verify", root, {"date": "2026-10-12", "files": [entry]}
-                ).returncode,
-                0,
+            result = self.remote(
+                "verify", root, {"date": "2026-10-12", "files": [entry]}
             )
+            self.assertFalse(json.loads(result.stdout)["verification_ok"])
+
             entry["path"] = "../file"
             self.assertNotEqual(
                 self.remote(
@@ -134,6 +144,100 @@ class BackupTests(unittest.TestCase):
                 ).returncode,
                 0,
             )
+
+    def test_failed_generation_retained_and_same_date_retry_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            date = "2026-10-13"
+            self.remote("prepare", root, {"date": date})
+            (root / (".pending-" + date) / "evidence").write_text("placeholder")
+            failed = json.loads(self.remote("fail", root, {"date": date}).stdout)[
+                "failed"
+            ]
+            self.assertTrue(failed.startswith(".failed-2026-10-13-"))
+            self.assertEqual((root / failed / "evidence").read_text(), "placeholder")
+            self.assertEqual(self.remote("prepare", root, {"date": date}).returncode, 0)
+            # Also recover a run interrupted before its exception handler ran.
+            result = self.remote("prepare", root, {"date": date})
+            self.assertEqual(result.returncode, 0)
+            self.assertNotEqual(json.loads(result.stdout)["failed"], failed)
+            self.assertTrue((root / failed).exists())
+
+    def test_inventory_frozen_copy_survives_source_change_and_detects_nas_tamper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            date = "2026-10-13"
+            self.remote("prepare", root, {"date": date})
+            pending = root / (".pending-" + date)
+            tree = pending / "drover-data"
+            tree.mkdir()
+            source = root / "live-file"
+            source.write_bytes(b"before")
+            artifact = tree / "export.parquet"
+            artifact.write_bytes(source.read_bytes())
+            artifact.chmod(0o600)
+            source.write_bytes(b"after!")
+            entries = nas.inventory(pending, ["drover-data"])
+            request = {"date": date, "files": entries}
+            self.assertTrue(nas.verify(pending, request)["verification_ok"])
+            # Same-size mutation after inventory must still fail.
+            artifact.write_bytes(b"after!")
+            result = nas.verify(pending, request)
+            self.assertEqual(
+                result["failures"],
+                [{"path": "drover-data/export.parquet", "reason": "checksum mismatch"}],
+            )
+            self.assertEqual(
+                json.loads((pending / "MANIFEST.json").read_text()), request
+            )
+
+    def test_verify_reports_all_paths_and_change_during_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pending = Path(temporary)
+            artifact = pending / "file"
+            artifact.write_bytes(b"before")
+            artifact.chmod(0o600)
+            request = {
+                "files": [
+                    {"path": "file", "size": 6, "sha256": nas.digest(artifact)},
+                    {"path": "missing", "size": 1, "sha256": "unused"},
+                ]
+            }
+            digest = nas.digest
+
+            def mutate(path):
+                value = digest(path)
+                path.write_bytes(b"after!")
+                return value
+
+            with mock.patch.object(nas, "digest", side_effect=mutate):
+                result = nas.verify(pending, request)
+            self.assertEqual(
+                result["failures"],
+                [
+                    {"path": "file", "reason": "artifact changed during verification"},
+                    {"path": "missing", "reason": "missing artifact"},
+                ],
+            )
+            with mock.patch.object(nas, "digest", side_effect=mutate):
+                with self.assertRaisesRegex(ValueError, "changed during inventory"):
+                    tree = pending / "drover-data"
+                    tree.mkdir()
+                    artifact.rename(tree / "file")
+                    nas.inventory(pending, ["drover-data"])
+
+    def test_manifest_rejects_symlink_ancestor_and_invalid_dates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pending = root / "pending"
+            pending.mkdir()
+            (pending / "escape").symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink manifest path"):
+                nas.verify(pending, {"files": [{"path": "escape/file"}]})
+            for date in ("../escape", "2026-10-13/extra", "2026-99-13"):
+                self.assertNotEqual(
+                    self.remote("prepare", root, {"date": date}).returncode, 0
+                )
 
 
 class LiveBackupTests(unittest.TestCase):
@@ -147,10 +251,8 @@ class LiveBackupTests(unittest.TestCase):
     def test_nas_pulls_from_studio_with_link_dest_excludes_and_quoted_paths(self):
         backup = self.backup
         target = "backup-user@nas-host"
-        destination = (
-            "/home/Arnab/backups/drover/Studio/.pending-2026-10-12/data's files"
-        )
-        previous = "/home/Arnab/backups/drover/Studio/2026-10-11/data's files"
+        destination = "/srv/backups/drover/Studio/.pending-2026-10-12/data's files"
+        previous = "/srv/backups/drover/Studio/2026-10-11/data's files"
         source = Path("/Volumes/M2 1/drover-data")
         with (
             mock.patch.object(backup, "NAS", target),
@@ -232,13 +334,13 @@ class LiveBackupTests(unittest.TestCase):
             # The execution fixture did not replace the production wrapper.
             self.assertIs(backup.run, real_run)
 
-    def test_default_root_uses_nas_home_and_sanitized_host(self):
+    def test_missing_target_root_fails_before_contacting_nas(self):
         backup = self.backup
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             config = home / ".drover/maintenance/backup-config.json"
             config.parent.mkdir(parents=True)
-            config.write_text(json.dumps({"nas": "Arnab@nas-host"}))
+            config.write_text(json.dumps({"nas": "backup-user@nas-host"}))
             with (
                 mock.patch.object(backup, "HOME", home),
                 mock.patch.object(backup, "NAS", ""),
@@ -251,13 +353,41 @@ class LiveBackupTests(unittest.TestCase):
                     backup, "remote", side_effect=RuntimeError("stop at preflight")
                 ) as remote,
             ):
-                with self.assertRaisesRegex(RuntimeError, "stop at preflight"):
+                with self.assertRaisesRegex(RuntimeError, "invalid NAS backup root"):
                     backup.backup()
-                self.assertEqual(remote.call_args.args[1], "prepare")
-                self.assertEqual(
-                    remote.call_args.args[2],
-                    "/home/Arnab/backups/drover/Studio_test.local",
+                remote.assert_not_called()
+
+    def test_configurable_target_root_and_invalid_roots(self):
+        backup = self.backup
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            config = home / ".drover/maintenance/backup-config.json"
+            config.parent.mkdir(parents=True)
+            for target in ("/volume/backups", "relative", "/home/../escape", 42):
+                config.write_text(
+                    json.dumps({"nas": "backup-user@nas-host", "target_root": target})
                 )
+                with (
+                    mock.patch.object(backup, "HOME", home),
+                    mock.patch.object(backup, "NAS", ""),
+                    mock.patch.object(backup, "DATA", {}),
+                    mock.patch.object(
+                        backup.socket, "gethostname", return_value="backup host.local"
+                    ),
+                    mock.patch.object(backup, "log"),
+                    mock.patch.object(
+                        backup, "remote", side_effect=RuntimeError("preflight")
+                    ) as remote,
+                ):
+                    with self.assertRaises(RuntimeError):
+                        backup.backup()
+                    if target == "/volume/backups":
+                        self.assertEqual(
+                            remote.call_args.args[2],
+                            "/volume/backups/backup_host.local",
+                        )
+                    else:
+                        remote.assert_not_called()
 
     def test_failure_log_includes_command_exit_code_and_caffeinate_tracks_pid(self):
         backup = self.backup
@@ -283,7 +413,7 @@ class LiveBackupTests(unittest.TestCase):
                 )
                 log.assert_called_once_with(
                     "FAILURE type=RuntimeError (command failed (exit 23)); "
-                    "generation unpublished; inspect NAS pending directory"
+                    "generation unpublished; inspect NAS failed or pending directory"
                 )
 
     def test_failure_log_omits_arbitrary_exception_contents(self):
@@ -296,22 +426,254 @@ class LiveBackupTests(unittest.TestCase):
                 mock.patch.object(backup.os, "umask"),
                 mock.patch.object(backup.subprocess, "Popen"),
                 mock.patch.object(
-                    backup, "backup", side_effect=ValueError("private placeholder")
+                    backup,
+                    "backup",
+                    side_effect=ValueError("command failed (exit private placeholder)"),
                 ),
                 mock.patch.object(backup, "log") as log,
             ):
                 self.assertEqual(backup.main(), 1)
                 log.assert_called_once_with(
-                    "FAILURE type=ValueError; generation unpublished; inspect NAS pending directory"
+                    "FAILURE type=ValueError; generation unpublished; inspect NAS failed or pending directory"
                 )
 
-    def test_launchagent_uses_drover_runtime_python(self):
+    def test_launchagent_uses_stable_dedicated_python(self):
         template = ROOT / "scripts/launchd/com.drover.backup.plist.template"
         plist = plistlib.loads(template.read_bytes())
         self.assertEqual(
             plist["ProgramArguments"][0],
-            "__HOME__/.drover/runtime/current/bin/python",
+            "__HOME__/.drover/maintenance/backup-python/bin/python",
         )
+
+    def test_lake_exclusions_remove_live_stores_locks_and_snapshot_scratch(self):
+        backup = self.backup
+        if not Path(backup.RSYNC).is_file():
+            self.skipTest("Studio GNU rsync is not installed")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            excluded = [
+                "registry.duckdb",
+                "registry.duckdb.wal",
+                "writer.lock",
+                "writer.lck",
+                "writer.wal",
+                "nested/store.duckdb",
+                ".drover-snapshots/copy",
+                "nested/.drover-backup-snapshots/copy",
+            ]
+            included = [
+                "uv.lock",
+                "nested/uv.lock",
+                "nested/data.parquet",
+                "export.json",
+            ]
+            for name in excluded + included:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("placeholder")
+            backup.sync(source, str(root / "copy"), excludes=backup.LAKE_EXCLUDES)
+            for name in excluded:
+                self.assertFalse((root / "copy" / name).exists(), name)
+            for name in included:
+                self.assertTrue((root / "copy" / name).exists(), name)
+
+    def test_duckdb_snapshot_retries_wal_change_and_checkpoints_private_clone(self):
+        import duckdb
+
+        backup = self.backup
+        if sys.platform != "darwin":
+            self.skipTest("atomic clone requires macOS")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "registry.duckdb"
+            destination = root / "stage" / "registry.duckdb"
+            with duckdb.connect(str(source)) as writer:
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.execute("CHECKPOINT")
+                writer.execute("INSERT INTO sample VALUES (1)")
+                wal = Path(str(source) + ".wal")
+                self.assertTrue(wal.is_file())
+                clone = backup.clone_file
+                clones = []
+
+                def mutate_after_clone(src, dst):
+                    clone(src, dst)
+                    clones.append(src.name)
+                    if len(clones) == 1:
+                        writer.execute("INSERT INTO sample VALUES (2)")
+
+                with mock.patch.object(
+                    backup, "clone_file", side_effect=mutate_after_clone
+                ):
+                    backup.snapshot_duckdb(source, destination)
+                self.assertGreaterEqual(len(clones), 4)
+                self.assertFalse(Path(str(destination) + ".wal").exists())
+                self.assertTrue(wal.is_file())
+                with duckdb.connect(str(destination), read_only=True) as reader:
+                    self.assertEqual(
+                        reader.execute(
+                            "SELECT value FROM sample ORDER BY value"
+                        ).fetchall(),
+                        [(1,), (2,)],
+                    )
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(list((root / ".drover-backup-snapshots").iterdir()), [])
+
+    def test_atomic_clone_unavailable_fails_without_streamed_fallback(self):
+        backup = self.backup
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "registry.duckdb"
+            source.write_bytes(b"placeholder")
+            destination = Path(temporary) / "result.duckdb"
+            with (
+                mock.patch.object(
+                    backup, "clone_file", side_effect=RuntimeError("unavailable")
+                ),
+                mock.patch.object(backup.shutil, "copyfile") as copy,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    backup.snapshot_duckdb(source, destination)
+                copy.assert_not_called()
+            self.assertFalse(destination.exists())
+
+    def test_generation_failure_renames_pending_and_preserves_original_error(self):
+        backup = self.backup
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            config = home / ".drover/maintenance/backup-config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps(
+                    {"nas": "backup-user@nas-host", "target_root": "/srv/backups"}
+                )
+            )
+            for rename_fails in (False, True):
+
+                def remote(helper, action, root, payload):
+                    if action == "prepare":
+                        return {"previous": None}
+                    if rename_fails:
+                        raise RuntimeError("rename failure")
+                    return {"failed": "fixture"}
+
+                with (
+                    mock.patch.object(backup, "HOME", home),
+                    mock.patch.object(backup, "DATA", {}),
+                    mock.patch.object(backup, "log"),
+                    mock.patch.object(backup, "remote", side_effect=remote) as call,
+                    mock.patch.object(
+                        backup, "backup_generation", side_effect=ValueError("original")
+                    ),
+                ):
+                    with self.assertRaisesRegex(ValueError, "original"):
+                        backup.backup()
+                    self.assertEqual(
+                        [args.args[1] for args in call.call_args_list],
+                        ["prepare", "fail"],
+                    )
+
+    def test_mismatch_logs_all_relative_paths_without_child_diagnostics(self):
+        backup = self.backup
+        failures = [
+            {"path": "drover-data/export.json", "reason": "checksum mismatch"},
+            {"path": "drover-data/name\nwith-newline", "reason": "missing artifact"},
+        ]
+        with (
+            mock.patch.object(
+                backup,
+                "remote",
+                return_value={"verification_ok": False, "failures": failures},
+            ),
+            mock.patch.object(backup, "log") as log,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "NAS verification failed"):
+                backup.verify_generation("helper", "/fixture", "2026-10-13", [])
+        self.assertEqual(
+            [call.args[0] for call in log.call_args_list],
+            ["NAS_verification_failure " + json.dumps(item) for item in failures],
+        )
+        self.assertTrue(all("\n" not in call.args[0] for call in log.call_args_list))
+
+    def test_complete_generation_hashes_final_nas_copy(self):
+        backup = self.backup
+        if not Path(backup.RSYNC).is_file():
+            self.skipTest("Studio GNU rsync is not installed")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "export.parquet").write_bytes(b"before")
+            (source / "registry.duckdb").write_bytes(b"excluded")
+            nas_root = root / "nas"
+            state = root / "state"
+            state.mkdir()
+            date = "2026-10-13"
+            nas.pending_path(nas_root, date).mkdir(parents=True)
+            (root / ".drover").mkdir()
+            (root / "Library/LaunchAgents").mkdir(parents=True)
+            real_sync = backup.sync
+            real_run = backup.run
+            calls = []
+            mutations = iter((b"second", b"third!"))
+
+            def sync(src, dest, previous=None, excludes=()):
+                calls.append((src, dest, excludes))
+                real_sync(
+                    src, dest.removeprefix("backup-user@nas-host:"), excludes=excludes
+                )
+                if src == source:
+                    # The source changes after each transfer, including final pass.
+                    (source / "export.parquet").write_bytes(next(mutations))
+
+            def run(args, *, output=None, **kwargs):
+                if args[0] == backup.RSYNC:
+                    return real_run(args, output=output, **kwargs)
+                if args[0].endswith("psql"):
+                    return b"fixture\n"
+                if "-f" in args:
+                    Path(args[args.index("-f") + 1]).write_bytes(b"dump placeholder")
+                if output:
+                    output.write(b"placeholder")
+                return b""
+
+            def remote(helper, action, path, payload):
+                pending = nas.pending_path(Path(path), date)
+                if action == "inventory":
+                    return {"files": nas.inventory(pending, payload["trees"])}
+                if action == "verify":
+                    return nas.verify(pending, payload)
+                return {}
+
+            with (
+                mock.patch.object(backup, "HOME", root),
+                mock.patch.object(backup, "STATE", state),
+                mock.patch.object(backup, "NAS", "backup-user@nas-host"),
+                mock.patch.object(backup, "DATA", {"drover-data": source}),
+                mock.patch.object(backup, "sync", side_effect=sync),
+                mock.patch.object(backup, "run", side_effect=run),
+                mock.patch.object(backup, "snapshot_databases"),
+                mock.patch.object(backup, "remote", side_effect=remote),
+                mock.patch.object(backup, "log"),
+            ):
+                backup.backup_generation(
+                    "helper", str(nas_root), date, {"previous": None}, 0, "fixture"
+                )
+            lake_calls = [call for call in calls if call[0] == source]
+            self.assertEqual(len(lake_calls), 2)
+            self.assertTrue(all(call[2] == backup.LAKE_EXCLUDES for call in lake_calls))
+            pending = nas.pending_path(nas_root, date)
+            self.assertFalse((pending / "drover-data/registry.duckdb").exists())
+            self.assertNotEqual(
+                nas.digest(source / "export.parquet"),
+                nas.digest(pending / "drover-data/export.parquet"),
+            )
+            self.assertTrue(
+                json.loads((pending / "VERIFICATION.json").read_text())[
+                    "verification_ok"
+                ]
+            )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,72 @@ extension MockNetworkTests {
 struct FolderBrowserTests {
     let mock = MockNetwork()
 
+    @Test @MainActor func transientFirstListingStaysLoadingUntilHostStateAndRetryComplete() async {
+        let release = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var lists = 0
+        let resolvingHost = MockFlag()
+        mock.handler = { request in
+            if request.url?.path == "/harness" {
+                resolvingHost.raise()
+                #expect(release.wait(timeout: .now() + 5) == .success)
+                return (200, Data(#"{"hosts":[{"host_id":"test-host","status":"online"}],"sessions":[]}"#.utf8))
+            }
+            lists += 1
+            #expect(request.timeoutInterval == 20)
+            return lists == 1 ? (502, Data(#"{"error":"unreachable"}"#.utf8)) : (200, listingJSON)
+        }
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        let refresh = Task { await model.refresh() }
+        let waitDeadline = Date().addingTimeInterval(2)
+        while !resolvingHost.isRaised && Date() < waitDeadline { await Task.yield() }
+        #expect(resolvingHost.isRaised)
+        #expect(model.isLoading && model.failure == nil && !model.canSelect)
+        release.signal()
+        await refresh.value
+        #expect(lists == 2 && model.failure == nil && model.canSelect)
+    }
+
+    @Test @MainActor func aKnownOfflineHostIsNotRetried() async {
+        nonisolated(unsafe) var lists = 0
+        mock.handler = { request in
+            if request.url?.path == "/harness" {
+                return (200, Data(#"{"hosts":[{"host_id":"test-host","status":"offline"}],"sessions":[]}"#.utf8))
+            }
+            lists += 1
+            return (502, Data(#"{"error":"unreachable"}"#.utf8))
+        }
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        await model.refresh()
+        #expect(lists == 1 && model.failure == .offline && !model.isLoading)
+    }
+
+    @Test @MainActor func anOnlineHostWithPersistentListingFailureRetriesOnlyOnce() async {
+        nonisolated(unsafe) var lists = 0
+        mock.handler = { request in
+            if request.url?.path == "/harness" {
+                return (200, Data(#"{"hosts":[{"host_id":"test-host","status":"online"}],"sessions":[]}"#.utf8))
+            }
+            lists += 1
+            return (504, Data(#"{"error":"timeout"}"#.utf8))
+        }
+        let model = FolderBrowserModel(client: mock.client(), hostID: "test-host", path: "/workspace/project")
+        await model.refresh()
+        #expect(lists == 2 && model.failure == .offline && !model.isLoading)
+    }
+
+    @Test @MainActor func sharedReadCooldownKeepsLoadingAndRetriesAfterItsDeadline() async {
+        let client = mock.client()
+        let deadline = Date().addingTimeInterval(0.05)
+        await client.deferReads(until: deadline)
+        mock.handler = { _ in
+            #expect(Date() >= deadline)
+            return (200, listingJSON)
+        }
+        let model = FolderBrowserModel(client: client, hostID: "test-host", path: "/workspace/project")
+        await model.refresh()
+        #expect(model.failure == nil && model.canSelect)
+    }
+
     @Test func errorMappingCoversEndpointPermissionsNetworkAndPaths() {
         let cases: [(DroverError, FolderBrowserFailure)] = [
             (.unavailable("Not Found"), .unsupported),
@@ -28,7 +94,7 @@ struct FolderBrowserTests {
             (.httpStatus(403, "symlink_not_allowed"), .symlinkNotAllowed),
             (.httpStatus(403, "hidden_folder_not_allowed"), .hiddenFolderNotAllowed),
             (.transport("offline"), .offline), (.transport("timed out"), .offline),
-            (.httpStatus(504, ""), .offline), (.busy(until: .now), .offline),
+            (.httpStatus(504, ""), .offline), (.busy(until: .now), .hubBusy), (.httpStatus(503, ""), .hubBusy),
             (.badRequest("invalid path"), .unavailable),
             (.unavailable("path not found"), .unavailable),
             (.unavailable("not_found"), .unavailable),

@@ -42,7 +42,7 @@ public struct FolderListing: Decodable, Sendable, Equatable {
 }
 
 public enum FolderBrowserFailure: Sendable, Equatable {
-    case staleListing, invalidName, folderExists, outsideAllowedFolders, symlinkNotAllowed, hiddenFolderNotAllowed, permissionDenied, authentication, offline, unsupported, hostUnavailable, unavailable, invalidResponse
+    case staleListing, invalidName, folderExists, outsideAllowedFolders, symlinkNotAllowed, hiddenFolderNotAllowed, permissionDenied, authentication, offline, hubBusy, unsupported, hostUnavailable, unavailable, invalidResponse
 
     public static func classify(_ error: Error) -> Self {
         switch error as? DroverError {
@@ -57,8 +57,9 @@ public enum FolderBrowserFailure: Sendable, Equatable {
             case "hidden_folder_not_allowed": return .hiddenFolderNotAllowed
             default: return .permissionDenied
             }
-        case .httpStatus(408, _), .httpStatus(502, _), .httpStatus(503, _),
-             .httpStatus(504, _), .transport, .busy: return .offline
+        case .httpStatus(503, _), .busy: return .hubBusy
+        case .httpStatus(408, _), .httpStatus(502, _),
+             .httpStatus(504, _), .transport: return .offline
         case .httpStatus(405, _), .httpStatus(501, _): return .unsupported
         case .unavailable(let detail):
             let detail = detail.lowercased()
@@ -87,6 +88,7 @@ public enum FolderBrowserFailure: Sendable, Equatable {
         case .hiddenFolderNotAllowed: "This host does not allow browsing hidden folders."
         case .permissionDenied: "You do not have permission to browse this folder."
         case .authentication: "Check the connection credential in Settings."
+        case .hubBusy: "Hub is busy. Try again shortly."
         case .offline: "Host offline or unreachable. Try again when it reconnects."
         case .unsupported: "This host needs a newer Drover version to browse folders. You can still enter a path manually."
         case .hostUnavailable: "This host is no longer available. Select another host."
@@ -154,7 +156,7 @@ public final class FolderBrowserModel {
         failure = nil
         let requestedFilter = filter
         do {
-            let response = try await client.listFolders(hostID: hostID, path: path, filter: requestedFilter)
+            let response = try await initialListing(filter: requestedFilter)
             guard requestGeneration == generation else { return }
             if Task.isCancelled {
                 isLoading = false
@@ -171,6 +173,40 @@ public final class FolderBrowserModel {
             failure = FolderBrowserFailure.classify(error)
         }
         isLoading = false
+    }
+
+    /// A transient first read is not evidence that the selected host is offline.
+    /// Keep loading through one recovery attempt; never retry folder mutations.
+    private func initialListing(filter: String) async throws -> FolderListing {
+        do {
+            return try await client.listFolders(hostID: hostID, path: path, filter: filter)
+        } catch {
+            let originalError = error
+            guard listing == nil, !Task.isCancelled,
+                  [.offline, .hubBusy].contains(FolderBrowserFailure.classify(error)) else { throw error }
+            if case .busy(let deadline) = error as? DroverError {
+                try await RetryPolicy.wait(until: deadline)
+            } else {
+                // Resolve unknown host state before showing an offline message.
+                // If the fleet itself is unavailable, retain the original failure.
+                let snapshot: HarnessSnapshot
+                do {
+                    do { snapshot = try await client.snapshot() }
+                    catch DroverError.busy(let deadline) {
+                        try await RetryPolicy.wait(until: deadline)
+                        snapshot = try await client.snapshot()
+                    }
+                } catch { throw originalError }
+                guard let host = snapshot.hosts.first(where: { $0.id == hostID }) else {
+                    throw DroverError.unavailable("unknown harness host")
+                }
+                guard host.status == "online" || host.status == "stale" else {
+                    throw originalError
+                }
+            }
+            try Task.checkCancellation()
+            return try await client.listFolders(hostID: hostID, path: path, filter: filter)
+        }
     }
 
     public func loadMore() async {

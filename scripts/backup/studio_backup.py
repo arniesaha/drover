@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Private nightly Studio snapshots. No service restarts; fail on any failed step."""
 
+import ctypes
+import ctypes.util
 import datetime as dt
 import fcntl
 import hashlib
@@ -11,6 +13,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -57,11 +60,22 @@ EXCLUDES = [
     "*.duckdb.wal",
     "*.sock",
 ]
+# Apply to both raw passes. Never transfer database pages or transient locks.
+LAKE_EXCLUDES = [
+    "*.duckdb",
+    "*.duckdb.wal",
+    "*.wal",
+    "*.lock",
+    "*.lck",
+    "*.sock",
+    ".drover-snapshots",
+    ".drover-backup-snapshots",
+]
 RISK = (
-    "Registry DuckDB and WAL are live file copies, not transactional exports. "
-    "Postgres databases have separate consistent dump snapshots. Live lake copies "
-    "are taken before and after dumps without deleting the first pass; cross-store "
-    "atomicity and DuckLake catalog reference completeness are not proven."
+    "DuckDB stores are stable atomic DB/WAL clones checkpointed in isolation. "
+    "Postgres databases have separate consistent dump snapshots. Lake manifests "
+    "describe the frozen NAS copy after the final pass. Cross-store atomicity "
+    "and DuckLake catalog reference completeness are not proven."
 )
 
 
@@ -106,6 +120,8 @@ def sync(source, destination, previous=None, excludes=()):
         ]
         if previous:
             args.append("--link-dest=" + previous)
+        if "*.lock" in excludes:
+            args.append("--include=uv.lock")
         args.extend("--exclude=" + item for item in excludes)
         args += [STUDIO_FROM_NAS + ":" + str(source) + "/", remote_dest + "/"]
         # The NAS home ACL leaves pulled files 0777; make the tree private again.
@@ -133,6 +149,8 @@ def sync(source, destination, previous=None, excludes=()):
     ]
     if previous:
         args.append("--link-dest=" + previous)
+    if "*.lock" in excludes:
+        args.append("--include=uv.lock")
     args.extend("--exclude=" + item for item in excludes)
     run(args + [str(source) + "/", destination + "/"])
 
@@ -160,52 +178,128 @@ def file_entries(root, prefix):
     return entries
 
 
-def copy_registry(destination):
-    # Retry if metadata changes during the copy. This does not prove transactional
-    # consistency of a live database, so the receipt always carries the warning.
-    source = HOME / ".drover/drover.registry.duckdb"
-    if not source.is_file():
-        raise RuntimeError("registry missing")
-    paths = [source, Path(str(source) + ".wal")]
+def clone_file(source, destination):
+    # Atomic extents are required. A streamed copy of a live database can tear.
+    if sys.platform != "darwin":
+        raise RuntimeError("atomic DuckDB clone unavailable")
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    clone = libc.clonefile
+    clone.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    clone.restype = ctypes.c_int
+    if clone(os.fsencode(source), os.fsencode(destination), 0):
+        raise RuntimeError("atomic DuckDB clone failed")
+
+
+def snapshot_duckdb(source, destination):
+    import duckdb
+
+    source = source.resolve(strict=True)
+    wal = Path(str(source) + ".wal")
 
     def signature():
-        return [
-            (p.name, p.stat().st_size, p.stat().st_mtime_ns)
-            for p in paths
-            if p.exists()
-        ]
+        result = []
+        for path in (source, wal):
+            try:
+                stat = path.stat()
+                result.append(
+                    (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                )
+            except FileNotFoundError:
+                result.append(None)
+        return result
 
-    for _ in range(3):
-        before = signature()
-        for p in destination.iterdir():
-            p.unlink()
-        for p in paths:
-            if p.exists():
-                shutil.copyfile(p, destination / p.name)
-                (destination / p.name).chmod(0o600)
-        if before == signature():
-            return
-    raise RuntimeError("registry changed during all copy attempts")
+    # clonefile requires the scratch directory to be on the source volume.
+    scratch = source.parent / ".drover-backup-snapshots"
+    scratch.mkdir(mode=0o700, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+        copied = Path(temporary) / source.name
+        copied_wal = Path(str(copied) + ".wal")
+        for _ in range(4):
+            copied.unlink(missing_ok=True)
+            copied_wal.unlink(missing_ok=True)
+            before = signature()
+            try:
+                clone_file(source, copied)
+                if before[1] is not None:
+                    clone_file(wal, copied_wal)
+            except RuntimeError:
+                if before != signature():
+                    continue
+                raise
+            if before == signature():
+                break
+        else:
+            raise RuntimeError("DuckDB changed during all snapshot attempts")
+        # Replay the captured WAL and checkpoint only the private clone. Opening
+        # also rejects invalid database/WAL pairs; never fall back to raw copies.
+        with duckdb.connect(str(copied)) as connection:
+            connection.execute("CHECKPOINT")
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copyfile(copied, destination)
+        destination.chmod(0o600)
+
+
+def snapshot_databases(stage):
+    registry = HOME / ".drover/drover.registry.duckdb"
+    if not registry.is_file():
+        raise RuntimeError("registry missing")
+    snapshot_duckdb(registry, stage / "registry" / registry.name)
+    for name, root in DATA.items():
+        for source in sorted(root.rglob("*.duckdb")):
+            relative = source.relative_to(root)
+            if any(part in LAKE_EXCLUDES for part in relative.parts[:-1]):
+                continue
+            if source.is_symlink() or not source.is_file():
+                continue
+            snapshot_duckdb(source, stage / "duckdb" / name / relative)
 
 
 def backup():
     global NAS
-    NAS = json.loads((HOME / ".drover/maintenance/backup-config.json").read_text())[
-        "nas"
-    ]
+    config = json.loads((HOME / ".drover/maintenance/backup-config.json").read_text())
+    NAS = config["nas"]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", NAS):
         raise RuntimeError("invalid NAS SSH target")
     started = time.monotonic()
     date = dt.date.today().isoformat()
     host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())
-    # Derive the approved NAS home root from the private account configuration.
-    root = str(Path("/home") / NAS.split("@", 1)[0] / "backups/drover" / host)
+    # The storage home can differ from the SSH login account on UGOS.
+    target = config.get("target_root")
+    if (
+        not isinstance(target, str)
+        or not target.startswith("/")
+        or ".." in Path(target).parts
+    ):
+        raise RuntimeError("invalid NAS backup root")
+    root = str(Path(target) / host)
     helper = Path(__file__).with_name("nas_snapshot.py").read_text()
     for source in DATA.values():
         if not source.is_dir():
             raise RuntimeError("required M2 data root is missing")
     log("stage=NAS_preflight")
     preparation = remote(helper, "prepare", root, {"date": date})
+    try:
+        backup_generation(helper, root, date, preparation, started, host)
+    except Exception:
+        try:
+            remote(helper, "fail", root, {"date": date})
+            log("stage=failed_generation_preserved")
+        except Exception:
+            log("stage=failed_generation_rename_failed")
+        raise
+
+
+def verify_generation(helper, root, date, entries):
+    verification = remote(helper, "verify", root, {"date": date, "files": entries})
+    if not verification.pop("verification_ok"):
+        for failure in verification["failures"]:
+            # JSON escaping prevents filenames injecting additional log lines.
+            log("NAS_verification_failure " + json.dumps(failure, ensure_ascii=True))
+        raise RuntimeError("NAS verification failed")
+    return verification
+
+
+def backup_generation(helper, root, date, preparation, started, host):
     pending = root + "/.pending-" + date
     previous = root + "/" + preparation["previous"] if preparation["previous"] else None
     with tempfile.TemporaryDirectory(prefix="stage-", dir=STATE) as staging:
@@ -218,6 +312,7 @@ def backup():
                 source,
                 NAS + ":" + pending + "/" + name,
                 previous + "/" + name if previous else None,
+                excludes=LAKE_EXCLUDES,
             )
         log("stage=postgres_dumps")
         databases = (
@@ -265,9 +360,11 @@ def backup():
             if source.is_file():
                 shutil.copyfile(source, stage / "postgres" / name)
         log("stage=configs_and_registry")
-        sync(HOME / ".drover", str(stage / "configs"), excludes=EXCLUDES)
+        sync(
+            HOME / ".drover", str(stage / "configs"), excludes=EXCLUDES + LAKE_EXCLUDES
+        )
         sync(HOME / "Library/LaunchAgents", str(stage / "launchagents"))
-        copy_registry(stage / "registry")
+        snapshot_databases(stage)
         (stage / "CONSISTENCY.txt").write_text(RISK + "\n")
         for path in stage.rglob("*"):
             if not path.is_symlink():
@@ -285,10 +382,17 @@ def backup():
                 source,
                 NAS + ":" + pending + "/" + name,
                 previous + "/" + name if previous else None,
+                excludes=LAKE_EXCLUDES,
             )
-            entries.extend(file_entries(source, name))
+        # Sources may change immediately after rsync. Hash the now-frozen
+        # destination, including files retained by the first pass, instead.
+        entries.extend(
+            remote(helper, "inventory", root, {"date": date, "trees": list(DATA)})[
+                "files"
+            ]
+        )
         log("stage=NAS_checksum_verification")
-        verification = remote(helper, "verify", root, {"date": date, "files": entries})
+        verification = verify_generation(helper, root, date, entries)
         # Read every archive back from NAS and list it with the matching local tool.
         # NAS does not need PostgreSQL installed. No production restore is performed.
         log("stage=NAS_pg_restore_list")
@@ -348,10 +452,10 @@ def main():
                 + type(error).__name__
                 + (
                     " (" + str(error) + ")"
-                    if str(error).startswith("command failed (exit")
+                    if re.fullmatch(r"command failed \(exit -?\d+\)", str(error))
                     else ""
                 )
-                + "; generation unpublished; inspect NAS pending directory"
+                + "; generation unpublished; inspect NAS failed or pending directory"
             )
             return 1
     return 0
