@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 PROFILE_MIGRATION = 15
 EXPORTER_FRESHNESS_MIGRATION = 16
+WORK_QUEUE_MIGRATION = 18
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -613,6 +614,63 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         17,
         (
             "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS notification_mode TEXT NOT NULL DEFAULT 'action' CHECK (notification_mode IN ('all', 'action', 'digest'))",
+        ),
+    ),
+    (
+        WORK_QUEUE_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS execution_links (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              actor_principal TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              item_number BIGINT NOT NULL CHECK (item_number > 0),
+              item_url TEXT NOT NULL,
+              goal_id TEXT NOT NULL,
+              goal_ref TEXT NOT NULL,
+              session_id TEXT,
+              pr_ref TEXT,
+              run_key TEXT NOT NULL,
+              run_role TEXT NOT NULL CHECK (run_role IN ('work', 'verify')),
+              failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+              last_progress_at TIMESTAMPTZ,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              UNIQUE (workspace_id, id),
+              UNIQUE (workspace_id, run_key),
+              UNIQUE (workspace_id, session_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS decision_events (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              actor_principal TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              item_number BIGINT NOT NULL CHECK (item_number > 0),
+              execution_link_id TEXT,
+              request_key TEXT NOT NULL CHECK (request_key ~ '^[a-f0-9]{64}$'),
+              event_kind TEXT NOT NULL CHECK (event_kind IN ('question', 'intent', 'outcome', 'redaction', 'policy')),
+              action_category TEXT NOT NULL,
+              options TEXT[] NOT NULL DEFAULT '{}' CHECK (options <@ ARRAY['approve', 'reject', 'open', 'retry']::text[]),
+              outcome TEXT,
+              provider_operation_id TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              FOREIGN KEY (workspace_id, execution_link_id) REFERENCES execution_links (workspace_id, id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS decision_events_request ON decision_events (workspace_id, request_key, created_at)",
+            """
+            CREATE OR REPLACE FUNCTION work_decision_append_only() RETURNS trigger
+            LANGUAGE plpgsql AS $$ BEGIN
+              RAISE EXCEPTION 'decision_events is append only';
+            END $$
+            """,
+            "DROP TRIGGER IF EXISTS decision_events_append_only ON decision_events",
+            "CREATE TRIGGER decision_events_append_only BEFORE UPDATE OR DELETE ON decision_events FOR EACH ROW EXECUTE FUNCTION work_decision_append_only()",
         ),
     ),
 )

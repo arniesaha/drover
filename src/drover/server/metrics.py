@@ -2864,7 +2864,7 @@ class MetricsCollector:
                     repo_owner=_optional_str(request_payload.get("repo_owner")),
                     repo_name=_optional_str(request_payload.get("repo_name")),
                     branch=_optional_str(request_payload.get("branch")),
-                    cwd=_optional_str(request_payload.get("cwd")),
+                    cwd=_optional_str(payload.get("cwd") or request_payload.get("cwd")),
                     status=status,
                     native_session_id=_native_session_id(
                         request_payload.get("native_resume")
@@ -2886,6 +2886,10 @@ class MetricsCollector:
                     thinking_effort=_optional_str(
                         payload.get("thinking_effort")
                         or request_payload.get("thinking_effort")
+                    ),
+                    client_session_id=_optional_str(
+                        payload.get("client_session_id")
+                        or request_payload.get("client_session_id")
                     ),
                     parent_session_id=_optional_str(
                         payload.get("parent_session_id")

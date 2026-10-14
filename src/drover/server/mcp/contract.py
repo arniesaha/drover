@@ -28,6 +28,8 @@ class ReadCaps:
 READ_CAPS = {
     f"drover_{name}": ReadCaps(rows=rows)
     for name, rows in {
+        "work_list": 100,
+        "work_get": 100,
         "profile": 100,
         "memory_acceptance": 25,
         "handoff": 20,

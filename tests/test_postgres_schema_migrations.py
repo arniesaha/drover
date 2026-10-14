@@ -25,6 +25,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    18: "6e9b1d706f78fd8674e913da95ca6bc5ceb88112b0c7c5766f434f5eceed01dc",
     EXPORTER_FRESHNESS_MIGRATION: "83b89a5b043a659612309179679d835d35a2c09c4dfd36bb801c7488de27352d",
     17: "fda9bab1f66135d72af01bbe366c9ecc7edda43161498e602a0c83dd63e5d9a0",
     1: "f1982d26c425aea2c00be04ba80e393d1dce5dd27db1eeb98998d6b93d60eacf",
