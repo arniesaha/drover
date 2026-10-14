@@ -30,10 +30,10 @@ struct Composer: View {
         // can reflow inside it without consuming the transcript viewport.
         promptSurface
             .frame(maxHeight: dynamicTypeSize.isAccessibilitySize ? 200 : nil)
+            .floatingChatSurface(in: RoundedRectangle(cornerRadius: 30, style: .continuous))
             .padding(.horizontal, 16)
             .padding(.top, 8)
             .padding(.bottom, 10)
-            .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .bottom))
             .onChange(of: pickerItems) { _, items in
                 guard !items.isEmpty else { return }
                 pickerItems = []
@@ -53,6 +53,7 @@ struct Composer: View {
             isSending: isSending,
             canSend: !isEmpty && canSend,
             scrollsInput: dynamicTypeSize.isAccessibilitySize,
+            floatsInChat: true,
             attachmentAccessibilityIdentifier: "composer-attachment"
         ) {
             PhotosPicker(selection: $pickerItems, maxSelectionCount: 4,
@@ -60,7 +61,7 @@ struct Composer: View {
                 Image(systemName: "plus")
                     .font(.system(size: 24, weight: .regular))
                     .foregroundStyle(.primary)
-                    .frame(width: 32, height: 32)
+                    .frame(width: 44, height: 44)
                     .contentShape(Circle())
             }
             .accessibilityLabel("Attach image")

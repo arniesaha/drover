@@ -60,6 +60,10 @@ struct ChatView: View {
     @State private var prependScrollGeneration = 0
     @State private var followState = TranscriptFollowState()
     @State private var scrollPosition = ScrollPosition(y: 0)
+    @State private var floatingStackHeight: CGFloat = 0
+    @State private var surfaceBottom: CGFloat = 0
+    @State private var transcriptBottom: CGFloat = 0
+    @State private var floatingSheet: FloatingChatSheet?
     @State private var rowFrames: [String: CGRect] = [:]
     @State private var transcriptOffset: CGFloat = 0
     @State private var scrollPhase: ScrollPhase = .idle
@@ -149,13 +153,6 @@ struct ChatView: View {
                     }
                 }
 
-            // Read once: `artifacts` is cached, but two reads still cost two
-            // dictionary lookups and obscure that this is one value.
-            let artifacts = model.artifacts
-            if !artifacts.isEmpty {
-                ArtifactRows(artifacts: artifacts)
-            }
-
             // Allow/Deny only when the host advertises approvals. Otherwise the
             // request is still shown as pending, with why iOS can't answer it.
             if !model.isEnded, let approval = model.pendingApproval {
@@ -202,11 +199,46 @@ struct ChatView: View {
                 ChatHintBanner(hint)
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
+        // Recovery and approval actions still need their own space above the dock.
+        .padding(.bottom, hasBottomBanner ? floatingStackHeight : 0)
+        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: {
+            surfaceBottom = $0
+        }
+        .overlay(alignment: .bottom) {
+            let artifacts = currentTurnArtifacts
+            let artifactTitle = artifacts.count == 1 ? "1 artifact" : "\(artifacts.count) artifacts"
             VStack(spacing: 0) {
-                if model.isStopping || (model.hasConnectedOnce && model.isConnected
-                    && model.pendingTurn == nil && model.pendingApproval == nil
-                    && model.activity.phase != .ready) {
+                if !artifacts.isEmpty {
+                    Button { floatingSheet = .artifacts(artifacts) } label: {
+                        Label(artifactTitle, systemImage: "shippingbox")
+                            .font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 44)
+                            .floatingChatSurface(in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Show \(artifactTitle)")
+                    .accessibilityIdentifier("chat-floating-artifacts")
+                    .padding(.bottom, 4)
+                }
+                if let run = liveStatusRun {
+                    Button { floatingSheet = .status(run) } label: {
+                        Label(dynamicTypeSize.isAccessibilitySize ? "\(run.count) status updates" : FoldSummary.status(run: run),
+                              systemImage: "waveform")
+                            .font(.footnote.weight(.medium))
+                            .lineLimit(1)
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 44)
+                            .floatingChatSurface(in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(FoldSummary.status(run: run))
+                    .accessibilityHint("Show status updates")
+                    .accessibilityIdentifier("chat-floating-status")
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 4)
+                }
+                if showsFloatingActivity {
                     SessionActivityView(activity: model.activity)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 4)
@@ -229,9 +261,30 @@ struct ChatView: View {
                 }
                 .disabled(model.isEnded)
             }
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                floatingStackHeight = $0
+            }
+        }
+        .sheet(item: $floatingSheet) { sheet in
+            NavigationStack {
+                ScrollView {
+                    switch sheet {
+                    case .artifacts(let artifacts):
+                        ArtifactRows(artifacts: artifacts, initiallyExpanded: true)
+                    case .status(let run):
+                        SessionEventsRow(run: run).padding()
+                    }
+                }
+                .navigationTitle(sheet.title)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { floatingSheet = nil }
+                    }
+                }
+            }
         }
         .onChange(of: model.isEnded) { _, ended in onSessionEnded?(sessionID, ended) }
-        .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
+        .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(.container, edges: [.top, .bottom]))
         .navigationTitle(model.harnessPresentation.name)
         .navigationBarTitleDisplayMode(.inline)
         // Without an explicit bar background the transcript scrolls under a
@@ -466,13 +519,20 @@ struct ChatView: View {
                                 }
                         }
 
+                        if !model.artifacts.isEmpty {
+                            ArtifactRows(artifacts: model.artifacts)
+                        }
+                        if showsInlineActivity {
+                            SessionActivityView(activity: model.activity, isFloating: false)
+                        }
+
                         // The ID belongs to the bottom of the clearance, not the
                         // final transcript row. `scrollTo(..., anchor: .bottom)`
-                        // therefore keeps this 24pt gap visible above the composer.
-                        // VStack contributes 8pt before this final 16pt tail.
+                        // therefore keeps the measured floating stack and a 24pt gap
+                        // clear of the final message while content scrolls behind it.
                         if let visualTailID {
                             Color.clear
-                                .frame(height: 16)
+                                .frame(height: hasBottomBanner ? 16 : floatingStackHeight + bottomSafeArea + 24)
                                 .id(visualTailID)
                         }
                     }
@@ -492,6 +552,10 @@ struct ChatView: View {
                 // Scrolling back to read is the other moment you want the
                 // keyboard gone, and dragging it away is cheaper than reaching
                 // for the accessory bar's dismiss button.
+                .ignoresSafeArea(.container, edges: hasBottomBanner ? [] : .bottom)
+                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: {
+                    transcriptBottom = $0
+                }
                 .scrollDismissesKeyboard(.interactively)
                 .scrollPosition($scrollPosition)
                 .onPreferenceChange(TranscriptRowFrames.self) { frames in
@@ -598,6 +662,44 @@ struct ChatView: View {
         }
     }
 
+    // Measure only the transcript's extension through the container safe area.
+    // The keyboard already moves the overlay; its inset must not be added again.
+    private var bottomSafeArea: CGFloat {
+        guard surfaceBottom > 0, transcriptBottom > 0 else { return 0 }
+        return max(0, transcriptBottom - surfaceBottom)
+    }
+
+    private var hasBottomBanner: Bool {
+        (!model.isEnded && model.pendingApproval != nil)
+            || model.pendingTurn?.canRetry == true
+            || model.pendingTurn?.deliveryState == .needsManualReview
+            || model.recoveryStatusMessage != nil || model.hint != nil
+    }
+
+    private var showsFloatingActivity: Bool {
+        model.isStopping || (model.hasConnectedOnce && model.isConnected
+            && model.pendingTurn == nil && model.pendingApproval == nil
+            && model.activity.isActive)
+    }
+
+    private var showsInlineActivity: Bool {
+        model.hasConnectedOnce && !showsFloatingActivity
+            && model.pendingTurn == nil && model.pendingApproval == nil
+            && model.activity.phase != .ready
+    }
+
+    private var liveStatusRun: [HarnessMessage]? {
+        guard showsFloatingActivity, case .statusRun(let run) = model.items.last else { return nil }
+        return run
+    }
+
+    private var currentTurnArtifacts: [SessionArtifact] {
+        let start = model.messages.lastIndex {
+            $0.type == .userInput || ($0.type == .status && $0.text == "turn.started")
+        } ?? model.messages.startIndex
+        return SessionArtifactExtractor.artifacts(in: Array(model.messages[start...]))
+    }
+
     @ViewBuilder
     private func row(for item: TranscriptItem, isNewest: Bool) -> some View {
         switch item {
@@ -610,7 +712,7 @@ struct ChatView: View {
                 isStreaming: isNewest && model.activity.isActive && (model.messages.last?.isThinking ?? false)
             )
         case .statusRun(let run):
-            SessionEventsRow(run: run)
+            if !isNewest || liveStatusRun == nil { SessionEventsRow(run: run) }
         case .stepRun(let steps):
             StepRunCard(steps: steps, activeToolIDs: model.activity.activeToolIDs)
         }
@@ -637,7 +739,7 @@ struct ChatView: View {
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 16)
-        .padding(.bottom, 8)
+        .padding(.bottom, hasBottomBanner ? 8 : floatingStackHeight + bottomSafeArea + 8)
         .transition(.opacity.combined(with: .scale(scale: 0.8)))
         .accessibilityLabel("Jump to latest")
         .accessibilityValue(followState.newEventCount > 0 ? "\(followState.newEventCount) new events" : "")
@@ -788,4 +890,18 @@ private struct HandoffSession: Identifiable, Hashable {
     let id: String
     let isStructured: Bool
     let harness: String
+}
+
+/// Capture the tapped list so a new transcript item cannot empty an open sheet.
+private enum FloatingChatSheet: Identifiable {
+    case artifacts([SessionArtifact])
+    case status([HarnessMessage])
+
+    var id: String { title }
+    var title: String {
+        switch self {
+        case .artifacts: "Artifacts"
+        case .status: "Status updates"
+        }
+    }
 }

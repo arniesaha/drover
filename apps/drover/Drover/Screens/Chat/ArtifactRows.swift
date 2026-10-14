@@ -2,28 +2,13 @@ import SwiftUI
 import DroverKit
 import UIKit
 
-/// What this session produced, as rows you can act on.
-///
-/// Machine strings never wrap: a branch name gets middle truncation so both
-/// the prefix that identifies the work and the suffix that distinguishes it
-/// survive, and one verb sits beside it. They are pinned under the transcript
-/// rather than left inline — on a phone the branch you want is otherwise
-/// somewhere up a scroll you have to hunt for.
-///
-/// Pinned, though, means it competes with the transcript for the same screen,
-/// and a long session pushes out branches and pull requests until the pane
-/// owns the phone. So the pane is bounded rather than proportional: a header
-/// that says how many there are and collapses the lot, and a list that stops
-/// growing at `listHeight` and scrolls inside itself. Newest sits at the
-/// bottom and the list opens there — the pull request just opened is the one
-/// you came for, and it is one row from the composer.
+/// Inline artifact pane, also used in the floating chip's sheet.
+/// Machine strings truncate in the middle and retain their Open or Copy action.
+/// The bounded list scrolls when more than three artifacts are present.
 struct ArtifactRows: View {
     let artifacts: [SessionArtifact]
 
-    /// Collapsed until asked. The header already answers the question the
-    /// pane exists for — *did this session produce anything, and how much* —
-    /// and answering it costs one row instead of four. Opening it is a tap;
-    /// the transcript gets the rest of the screen until then.
+    /// The transcript starts collapsed; the sheet opens the list immediately.
     @State private var isExpanded: Bool
 
     init(artifacts: [SessionArtifact], initiallyExpanded: Bool = false) {
@@ -79,6 +64,7 @@ struct ArtifactRows: View {
             }
             .padding(.horizontal, 11)
             .padding(.vertical, 9)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -154,6 +140,7 @@ struct ArtifactRows: View {
                     .foregroundStyle(DroverColor.accentHi)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
+                    .frame(minWidth: 44, minHeight: 44)
                     .overlay { Capsule().strokeBorder(DroverColor.accent, lineWidth: 1) }
             }
             .buttonStyle(.plain)

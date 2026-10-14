@@ -100,6 +100,7 @@ private struct PreferenceChip: View {
         .font(.callout.weight(.medium))
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
+        .frame(minWidth: 44, minHeight: 44)
         .background(.ultraThinMaterial, in: Capsule())
         .overlay(Capsule().strokeBorder(.secondary.opacity(0.18)))
         .accessibilityElement(children: .ignore)

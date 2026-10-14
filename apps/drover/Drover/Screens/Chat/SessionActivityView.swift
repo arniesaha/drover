@@ -3,6 +3,7 @@ import SwiftUI
 
 struct SessionActivityView: View {
     let activity: SessionActivityPresentation
+    var isFloating = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -80,12 +81,14 @@ struct SessionActivityView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .frame(minHeight: 44)
         .fixedSize(horizontal: false, vertical: true)
-        .background(.ultraThinMaterial.opacity(0.75), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.secondary.opacity(0.18), lineWidth: 1)
+        .background {
+            if !isFloating {
+                RoundedRectangle(cornerRadius: 16, style: .continuous).fill(DroverColor.surface)
+            }
         }
+        .modifier(ActivitySurface(isFloating: isFloating))
         // At accessibility sizes reserve the dock for the current phase.
         // Details and VoiceOver retain telemetry without forcing multiple
         // large rows above the composer.
@@ -107,5 +110,16 @@ struct SessionActivityView: View {
             }
         }
         return parts.joined(separator: ", ")
+    }
+}
+
+private struct ActivitySurface: ViewModifier {
+    let isFloating: Bool
+    @ViewBuilder func body(content: Content) -> some View {
+        if isFloating {
+            content.floatingChatSurface(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        } else {
+            content
+        }
     }
 }

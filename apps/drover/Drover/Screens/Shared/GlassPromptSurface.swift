@@ -17,6 +17,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     let isSending: Bool
     let canSend: Bool
     let showsSendButton: Bool
+    let floatsInChat: Bool
     let scrollsInput: Bool
     let attachmentAccessibilityIdentifier: String
     let attachmentButton: AttachmentButton
@@ -38,6 +39,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         canSend: Bool = true,
         showsSendButton: Bool = true,
         scrollsInput: Bool = false,
+        floatsInChat: Bool = false,
         attachmentAccessibilityIdentifier: String,
         @ViewBuilder attachmentButton: () -> AttachmentButton,
         onSend: @escaping () -> Void = {}
@@ -53,6 +55,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         self.isSending = isSending
         self.canSend = canSend
         self.showsSendButton = showsSendButton
+        self.floatsInChat = floatsInChat
         self.scrollsInput = scrollsInput
         self.attachmentAccessibilityIdentifier = attachmentAccessibilityIdentifier
         self.attachmentButton = attachmentButton()
@@ -78,14 +81,15 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         .padding(.horizontal, 18)
         .padding(.top, attachments.isEmpty ? 16 : 14)
         .padding(.bottom, 14)
-        // Nocturne separates surfaces by ramp step and a hairline, not by
-        // material and drop shadow: the composer is `sheet` lifted off `bg`,
-        // outlined in `line`. Dropping the shadow also drops this view's last
-        // reason to know which theme it is in.
-        .background(DroverColor.sheet, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 30, style: .continuous)
-                .strokeBorder(DroverColor.line, lineWidth: 1)
+        .background {
+            if !floatsInChat {
+                RoundedRectangle(cornerRadius: 30, style: .continuous)
+                    .fill(DroverColor.sheet)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 30, style: .continuous)
+                            .strokeBorder(DroverColor.line, lineWidth: 1)
+                    }
+            }
         }
     }
 
@@ -126,7 +130,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     private var actionControls: some View {
         HStack(spacing: 12) {
             attachmentButton
-                .frame(width: 32, height: 32)
+                .frame(width: 44, height: 44)
 
             if showsPreferences && !dynamicTypeSize.isAccessibilitySize {
                 preferenceControls
@@ -147,6 +151,8 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                             .background(sendFill, in: Circle())
                     }
                 }
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
                 .buttonStyle(.plain)
                 .disabled(!canSend || isSending)
                 .opacity(canSend || isSending ? 1 : 0.45)
@@ -185,7 +191,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
             Image(systemName: "keyboard.chevron.compact.down")
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(DroverColor.muted)
-                .frame(width: 32, height: 30)
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
