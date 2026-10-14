@@ -2615,6 +2615,9 @@ def test_harnessd_lists_and_gets_live_sessions(tmp_path):
 def _expected_structured_json(row) -> dict:
     return {
         "session_id": row.session_id,
+        "client_session_id": row.client_session_id,
+        "parent_session_id": row.parent_session_id,
+        "harness": row.harness,
         "command": row.command,
         "cwd": row.cwd,
         "pid": None,
@@ -4959,3 +4962,33 @@ def test_structured_launch_refuses_when_worktree_isolation_fails(monkeypatch, tm
         assert state.registry.list_sessions() == []
     finally:
         server.shutdown()
+
+
+def test_work_run_key_lookup_is_read_only_and_includes_archived_session(tmp_path):
+    server, state, base = _start_test_server(tmp_path, api_token="synthetic-token")
+    try:
+        row = state.registry.create_session(
+            session_id="work-recovery-session",
+            host_id="test-host",
+            harness="codex",
+            command="codex",
+            mode="structured",
+            status="completed",
+            client_session_id="persisted-work-key",
+            parent_session_id="work-parent",
+        )
+        request = urllib.request.Request(
+            base + "/sessions?client_session_id=persisted-work-key",
+            headers={"Authorization": "Bearer synthetic-token"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            result = json.loads(response.read())
+        assert result["sessions"][0]["session_id"] == row.session_id
+        assert result["sessions"][0]["client_session_id"] == "persisted-work-key"
+        assert result["sessions"][0]["parent_session_id"] == "work-parent"
+        assert result["sessions"][0]["harness"] == "codex"
+        assert len(state.registry.list_sessions()) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        state.pty.close_all()

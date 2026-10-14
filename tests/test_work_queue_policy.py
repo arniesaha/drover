@@ -129,8 +129,7 @@ def test_scope_and_app_config_reject_ambiguity_and_unscoped_credentials():
     )
     with pytest.raises(ValueError):
         WorkQueueConfig(enabled=True)
-    with pytest.raises(ValueError):
-        WorkQueueConfig(shadow_mode=False)
+    assert not WorkQueueConfig(shadow_mode=False).shadow_mode
 
 
 def test_runtime_config_defaults_and_toml_opt_in(tmp_path):

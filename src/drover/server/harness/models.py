@@ -114,6 +114,7 @@ class HarnessSession:
     lifecycle_generation: int = 1
     # Optional delegation link an orchestrator records at launch (#473).
     parent_session_id: str | None = None
+    client_session_id: str | None = None
 
     @property
     def effective_awaiting(self) -> str | None:
@@ -148,6 +149,7 @@ class HarnessSession:
             awaiting=row.get("awaiting"),
             last_activity=row.get("last_activity"),
             parent_session_id=row.get("parent_session_id"),
+            client_session_id=row.get("client_session_id"),
             end_reason=row.get("end_reason"),
             archived_at=row.get("archived_at"),
             retention_policy=row.get("retention_policy") or "auto",

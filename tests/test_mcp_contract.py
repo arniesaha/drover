@@ -49,17 +49,34 @@ def test_every_registered_read_enforces_caps(tmp_path, monkeypatch):
         "recall_bundle",
         lambda self, **kw: implementation("drover_recall_bundle")(**kw),
     )
+    monkeypatch.setattr(
+        "drover.server.work_queue.client.control_call",
+        lambda url, headers, operation, args: implementation(
+            "drover_work_" + operation
+        )(**args),
+    )
     server = build_mcp_server(duckdb_path=tmp_path / "unused")
     registered = asyncio.run(server.list_tools())
     assert {t.name for t in registered} - {
         "drover_session_close",
         "drover_profile_propose",
+        *{
+            "drover_work_" + operation
+            for operation in ("launch", "link", "update", "question", "decide")
+        },
     } == set(READ_CAPS)
     for tool in registered:
-        if tool.name in {"drover_session_close", "drover_profile_propose"}:
+        if tool.name not in READ_CAPS:
             continue
         caps = READ_CAPS[tool.name]
-        args = {key: "test" for key in tool.inputSchema.get("required", [])}
+        args = {
+            key: (
+                1
+                if tool.inputSchema["properties"][key].get("type") == "integer"
+                else "test"
+            )
+            for key in tool.inputSchema.get("required", [])
+        }
         if "harness_ids" in args:
             args["harness_ids"] = ["test"] * 26
             rejected = call(server, tool.name, args)
