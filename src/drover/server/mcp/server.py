@@ -119,7 +119,10 @@ def build_mcp_server(
         goal_id: str | None = None, limit: int = 50, view: str | None = None
     ) -> dict:
         """Read goal items, or view=attention across configured workspace goals."""
-        return work_call("list", dict(goal_id=goal_id, limit=limit, view=view))
+        args = dict(goal_id=goal_id, limit=limit)
+        if view is not None:
+            args["view"] = view
+        return work_call("list", args)
 
     @read_tool()
     def drover_work_get(goal_id: str, number: int) -> dict:
