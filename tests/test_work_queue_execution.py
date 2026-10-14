@@ -1,7 +1,7 @@
 """Phase 2 exit checks against the real control Postgres store."""
 
-from types import SimpleNamespace
 import json
+from types import SimpleNamespace
 
 import pytest
 

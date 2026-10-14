@@ -6,13 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+from test_work_queue_execution import ACTOR, launch, service, update
 
 from drover.server.mcp.server import build_mcp_server
 from drover.server.web.app import start_metrics_server
 from drover.server.web.auth import AuthSettings
 from drover.server.web.credentials import CredentialStore
 from drover.server.work_queue.client import control_call
-from test_work_queue_execution import ACTOR, launch, service, update
 
 
 @pytest.fixture
