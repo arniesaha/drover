@@ -261,6 +261,14 @@ enum FixtureScenarioData {
                 "payload": status == "completed" ? ["turn_complete": true] : [:],
             ])
         }
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_CHAT_ARTIFACTS"] == "1" {
+            messages.append([
+                "event_id": "fixture-artifact", "seq": messages.count + 1,
+                "type": "assistant_output", "role": "assistant",
+                "text": "Synthetic artifact: https://github.com/example/project/pull/42",
+                "payload": [:],
+            ])
+        }
         // Capability sessions wait on a tool approval, so the journey can
         // see who may answer it from iOS.
         if sessionID == labSessionID || sessionID == codexApprovalSessionID {

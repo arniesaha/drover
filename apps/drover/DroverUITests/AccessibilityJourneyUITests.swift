@@ -36,6 +36,8 @@ final class AccessibilityJourneyUITests: XCTestCase {
         XCTAssertTrue(send.waitForExistence(timeout: timeout))
         XCTAssertTrue(send.isHittable)
         XCTAssertTrue(attach.isHittable)
+        XCTAssertGreaterThanOrEqual(send.frame.height, 44)
+        XCTAssertGreaterThanOrEqual(attach.frame.height, 44)
         XCTAssertTrue(app.frame.contains(send.frame))
         XCTAssertTrue(app.frame.contains(attach.frame))
         XCTAssertFalse(send.frame.intersects(attach.frame))
@@ -86,15 +88,27 @@ final class AccessibilityJourneyUITests: XCTestCase {
             } else {
                 XCTAssertTrue(app.staticTexts[title].exists)
             }
-            if largestText {
+            if largestText || state == "completed" {
                 // Large labels may need the available width to wrap.
-                XCTAssertLessThanOrEqual(activity.frame.width, app.frame.width - 32)
+                XCTAssertLessThanOrEqual(activity.frame.width, app.frame.width - (state == "completed" ? 28 : 32))
             } else {
                 XCTAssertLessThan(activity.frame.width, app.frame.width * 0.9)
             }
             XCTAssertTrue(app.frame.contains(activity.frame))
             XCTAssertLessThanOrEqual(activity.frame.maxY, app.textFields["composer-input"].frame.minY)
             XCTAssertTrue(app.buttons["composer-send"].isHittable)
+            let status = app.buttons["chat-floating-status"]
+            if state == "active" {
+                XCTAssertTrue(status.exists)
+                XCTAssertGreaterThanOrEqual(status.frame.height, 44)
+                XCTAssertLessThanOrEqual(status.frame.maxY, activity.frame.minY)
+                status.tap()
+                XCTAssertTrue(app.buttons["session-events-row"].waitForExistence(timeout: timeout))
+                app.buttons["Done"].tap()
+            } else {
+                XCTAssertFalse(status.exists)
+                XCTAssertTrue(app.buttons["session-events-row"].exists)
+            }
             let screenshot = XCTAttachment(screenshot: app.screenshot())
             screenshot.name = "Compact activity \(state) \(dark ? "dark XXXL" : "light standard")"
             screenshot.lifetime = .keepAlways
@@ -152,8 +166,73 @@ final class AccessibilityJourneyUITests: XCTestCase {
             .waitForExistence(timeout: timeout))
         app.buttons["Done"].tap()
         XCTAssertTrue(app.buttons["composer-send"].isHittable)
+        app.textFields["composer-input"].tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: timeout))
+        XCTAssertTrue(send.isHittable)
+        XCTAssertTrue(jump.isHittable)
+        XCTAssertGreaterThanOrEqual(jump.frame.minY, app.navigationBars.firstMatch.frame.maxY)
+        XCTAssertLessThanOrEqual(send.frame.maxY, app.keyboards.firstMatch.frame.minY)
+        XCTAssertLessThanOrEqual(jump.frame.maxY, activity.frame.minY)
+        let keyboardScreenshot = XCTAttachment(screenshot: app.screenshot())
+        keyboardScreenshot.name = "Floating running chrome with keyboard XXXL \(dark ? "dark" : "light")"
+        keyboardScreenshot.lifetime = .keepAlways
+        add(keyboardScreenshot)
+        app.buttons["keyboard-dismiss"].tap()
         jump.tap()
         XCTAssertTrue(jump.waitForNonExistence(timeout: timeout))
+    }
+
+    @MainActor
+    func testFloatingChromeWithReducedTransparency() {
+        let app = coreJourneyApp()
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_ACTIVITY"] = "active"
+        app.launchEnvironment["DROVER_UI_TEST_TRANSCRIPT_STREAM"] = "1"
+        app.launchEnvironment["DROVER_UI_TEST_REDUCE_TRANSPARENCY"] = "1"
+        app.launch()
+        openFixtureChat(in: app)
+        app.scrollViews.firstMatch.swipeDown()
+        let jump = app.buttons["chat-scroll-to-bottom"]
+        XCTAssertTrue(jump.waitForExistence(timeout: timeout))
+        XCTAssertTrue(jump.isHittable)
+        XCTAssertTrue(app.buttons["composer-send"].isHittable)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Opaque floating chrome with Reduce Transparency XXXL"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    @MainActor
+    func testFloatingArtifactsOpenAndTranscriptExtendsBehindComposer() {
+        let app = coreJourneyApp()
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_ACTIVITY"] = "active"
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_ARTIFACTS"] = "1"
+        app.launchEnvironment["DROVER_UI_TEST_TRANSCRIPT_STREAM"] = "1"
+        app.launch()
+        openFixtureChat(in: app)
+        let chip = app.buttons["chat-floating-artifacts"]
+        XCTAssertTrue(chip.waitForExistence(timeout: timeout))
+        XCTAssertGreaterThanOrEqual(chip.frame.height, 44)
+        XCTAssertTrue(chip.isHittable)
+        let transcript = app.scrollViews.firstMatch
+        let send = app.buttons["composer-send"]
+        XCTAssertGreaterThan(transcript.frame.maxY, send.frame.maxY)
+        XCTAssertLessThanOrEqual(chip.frame.maxY,
+                                 app.buttons["chat-activity"].frame.minY)
+        let inline = app.buttons["artifact-pane-toggle"]
+        XCTAssertTrue(inline.exists)
+        let jump = app.buttons["chat-scroll-to-bottom"]
+        if jump.exists { jump.tap() }
+        let cleared = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in inline.frame.maxY <= chip.frame.minY }, object: inline)
+        XCTAssertEqual(XCTWaiter.wait(for: [cleared], timeout: timeout), .completed)
+        chip.tap()
+        XCTAssertTrue(app.buttons["Open Pull request"].waitForExistence(timeout: timeout))
+        app.buttons["Done"].tap()
+        XCTAssertTrue(chip.isHittable)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Floating artifact and activity above composer XXXL"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
     }
 
     @MainActor

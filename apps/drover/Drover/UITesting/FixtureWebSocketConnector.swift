@@ -42,8 +42,14 @@ struct FixtureWebSocketConnector: WebSocketConnecting {
                 continuation.onTermination = { _ in }
                 return
             }
+            // Optional history chrome events occupy sequences after marker 40.
+            // Streaming must not replace them with the same sequence numbers.
+            let environment = ProcessInfo.processInfo.environment
+            let firstSequence = 41
+                + (environment["DROVER_UI_TEST_CHAT_ACTIVITY"] == nil ? 0 : 1)
+                + (environment["DROVER_UI_TEST_CHAT_ARTIFACTS"] == "1" ? 1 : 0)
             let producer = Task {
-                for index in 41...100 {
+                for index in firstSequence...100 {
                     do { try await Task.sleep(for: .seconds(1)) } catch { return }
                     let message: [String: Any] = [
                         "event_id": "reading-\(index)", "seq": index,
