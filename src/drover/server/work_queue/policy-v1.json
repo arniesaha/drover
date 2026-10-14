@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "labels": {
+    "statuses": ["queued", "running", "review", "blocked"],
+    "agents": ["nix", "jenny", "max", "worker"],
+    "status_prefix": "status:", "agent_prefix": "agent:", "goal_prefix": "goal:",
+    "priorities": ["urgent", "normal"], "priority_prefix": "priority:"
+  },
+  "authority": {
+    "coordinator": "nix", "allowed_actions": ["merge", "deploy", "spend", "delegate"],
+    "human_actions": ["production_cutover", "data_migration", "delete_data", "outward_post"],
+    "ambiguous_requires_decision": true
+  },
+  "acceptance": {
+    "criteria_owner": "nix", "amendment_record_required": true,
+    "separate_verification_run": true, "human_acceptance_required": false,
+    "separate_verifier_credential": false, "behavioral_evidence_required": true,
+    "rerun_relevant_checks": true
+  },
+  "priority": {"default": "normal", "order": ["incident", "goal_priority", "oldest_queued"]},
+  "retries": {
+    "attempts": 3, "systemic_review_required": true,
+    "new_attempt_requires_changed_approach": true, "new_attempt_authorizer": "nix",
+    "human_rejection_consumes_attempt": false
+  },
+  "capacity": {"goal_workers": 5, "workspace_workers": 5, "include_verification": true},
+  "quota": {"reserve_fraction": 0.2, "unknown_pauses_launch": true, "estimated_cost_required": true},
+  "progress": {"stale_seconds": 1800, "active_tool_seconds": 3600, "stale_restarts_worker": false, "explicit_slow_tool_extension": true},
+  "window": {"running_may_finish": true, "extension_limit": 1, "extension_seconds": 86400, "extension_authorizer": "nix", "unchanged_scope_quota_required": true, "expired_launch_requires_extension": true},
+  "poll": {"interval_seconds": 120, "freshness_seconds": 120},
+  "retention": {"links_after_session_days": 90, "decision_days": 365}
+}
