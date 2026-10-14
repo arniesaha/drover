@@ -3165,7 +3165,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if "client_session_id" in params:
             key = params["client_session_id"][0]
             row = self.server.state.registry.session_by_client_id(key)
-            self._write_json({"sessions": [_structured_session_row_json(row)] if row else []})
+            self._write_json(
+                {"sessions": [_structured_session_row_json(row)] if row else []}
+            )
             return
         archived_limit = _session_list_archived_limit(params)
         try:
