@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from drover.server.work_queue.config import WorkQueueConfig
+
 log = logging.getLogger("drover.config")
 _pond_deprecation_warned = False
 _pond_deprecation_lock = _thread.allocate_lock()
@@ -426,6 +428,7 @@ class DroverConfig:
     control_store: ControlStoreConfig
     runtime: RuntimeConfig
     analytics_boundary: AnalyticsBoundaryConfig
+    work_queue: WorkQueueConfig
     processed_retention_days: int
     receipt_retention_days: int
     advisory_occurrence_retention_days: int
@@ -597,6 +600,12 @@ _DEFAULTS = {
         "outbox_retention_days": 14,
     },
     "runtime": {"role": "all"},
+    "work_queue": {
+        "enabled": False,
+        "shadow_mode": True,
+        "workspace_id": "",
+        "goals": [],
+    },
     "analytics_boundary": {
         "worker_url": "http://127.0.0.1:7082",
         "api_url": "http://127.0.0.1:7080",
@@ -854,6 +863,7 @@ def _from_dict(d: dict) -> DroverConfig:
         if not str(d["update"]["in_place_venv"]).strip():
             raise ValueError("update.runtime_root requires update.in_place_venv")
     return DroverConfig(
+        work_queue=WorkQueueConfig.model_validate(d["work_queue"]),
         lifecycle=LifecycleConfig(**d.get("lifecycle", {})),
         incoming_dir=Path(d["paths"]["incoming_dir"]),
         parquet_dir=Path(d["paths"]["parquet_dir"]),

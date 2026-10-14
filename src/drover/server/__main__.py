@@ -2495,6 +2495,9 @@ def _run_api_role(
     from drover.server.harness.lifecycle_report import start_reporter
 
     start_reporter(collector, stop)
+    from drover.server.work_queue.reconciler import start_shadow_reconciler
+
+    start_shadow_reconciler(collector, cfg.work_queue, stop, auth=auth)
     if cfg.update_enabled:
         planner = UpdatePlanner(
             cfg, RuntimeLayout(config_home(), root=cfg.update_runtime_root)
@@ -3102,6 +3105,11 @@ def run(
 
             if selected_role != "analytics":
                 start_reporter(metrics_collector, stop)
+                from drover.server.work_queue.reconciler import start_shadow_reconciler
+
+                start_shadow_reconciler(
+                    metrics_collector, cfg.work_queue, stop, auth=auth
+                )
             # The hub decides what the fleet converges on and publishes it on
             # the heartbeat every harnessd already sends. Attached to the
             # collector rather than threaded through, because the only thing

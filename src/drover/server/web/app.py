@@ -1063,6 +1063,26 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 ),
             )
             return
+        if path == "/work-queue/report":
+            credential = bearer_credential(self.auth, self.headers)
+            if credential is None or credential.scope != "device":
+                self._send(
+                    403,
+                    "application/json",
+                    json.dumps({"error": "paired device credential required"}),
+                )
+                return
+            service = getattr(self.collector, "work_queue", None)
+            payload = (
+                service.report() if service else {"enabled": False, "shadow_mode": True}
+            )
+            self._send(
+                200,
+                "application/json",
+                json.dumps(payload),
+                extra_headers={"Cache-Control": "no-store"},
+            )
+            return
         if path == "/harness/lifecycle":
             status, body = self.collector.lifecycle_report()
             self._send(status, "application/json", body)
