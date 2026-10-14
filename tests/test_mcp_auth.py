@@ -253,7 +253,9 @@ def test_every_registered_tool_refuses_anonymous(tmp_path):
     with bearer_context(None):
         for tool in tools:
             arguments = {
-                key: (["test"] if key == "harness_ids" else "test")
+                key: {"integer": 1, "number": 1.0, "array": ["test"]}.get(
+                    tool.inputSchema["properties"][key].get("type"), "test"
+                )
                 for key in tool.inputSchema.get("required", [])
             }
             with pytest.raises(Exception, match="requires an active bearer"):

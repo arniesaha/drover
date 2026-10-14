@@ -1,1 +1,1 @@
-"""Phase 1 provider reads and shadow reconciliation. No durable queue copy."""
+"""Live provider work tools, shadow diagnostics and durable execution metadata."""
