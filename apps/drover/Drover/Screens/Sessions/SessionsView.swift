@@ -25,6 +25,9 @@ import DroverKit
 /// dot to its offline form, which is why there is no longer a banner inset or
 /// a whole-screen dim here.
 struct SessionsView: View {
+    @State private var workStore: WorkAttentionStore
+    @State private var focusedAttentionID: String?
+    @State private var attentionFocusRevision = 0
     @State private var store: SessionStore
     @State private var cockpitStore: CockpitStore
     private let client: DroverClient
@@ -65,6 +68,7 @@ struct SessionsView: View {
         self.chatModelFactory = chatModelFactory
         self.defaults = defaults
         self.onOpenSettings = onOpenSettings
+        _workStore = State(initialValue: WorkAttentionStore(service: client))
         _store = State(initialValue: SessionStore(client: client))
         _cockpitStore = State(initialValue: CockpitStore(client: client))
     }
@@ -97,108 +101,123 @@ struct SessionsView: View {
                     .accessibilityIdentifier("exporterFreshnessWarning")
             }
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if dynamicTypeSize.isAccessibilitySize { statusHeader }
-                    // Action errors (e.g. a failed continueSession) land here.
-                    // They are distinct from an unreachable hub: connected, but
-                    // the last thing you asked for didn't happen. Refresh
-                    // failures flip `isReachable` and are reported by the fleet
-                    // line instead, so the two can never both be showing.
-                    if store.hasLoadedOnce, store.isReachable, let lastError = store.lastError {
-                        actionFailedRow(lastError)
-                    }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        if dynamicTypeSize.isAccessibilitySize { statusHeader }
+                        WorkAttentionList(store: workStore, focusedID: focusedAttentionID) { sessionID in
+                            NotificationRoute.shared.open(sessionID: sessionID)
+                            openSessionFromNotification()
+                        }
+                        .id("work-attention")
+                        // Action errors (e.g. a failed continueSession) land here.
+                        // They are distinct from an unreachable hub: connected, but
+                        // the last thing you asked for didn't happen. Refresh
+                        // failures flip `isReachable` and are reported by the fleet
+                        // line instead, so the two can never both be showing.
+                        if store.hasLoadedOnce, store.isReachable, let lastError = store.lastError {
+                            actionFailedRow(lastError)
+                        }
 
-                    // One list, in one run. Work that needs a human is still
-                    // first and running sessions still follow it, but nothing
-                    // is allowed between them any more: the analytics that used
-                    // to sit in the middle are below the list now (#80).
-                    if inboxSessions.isEmpty, store.hasLoadedOnce {
-                        ContentUnavailableView("Nothing running",
-                                               systemImage: "rectangle.stack.badge.plus",
-                                               description: Text("Start a new session when you're ready."))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 40)
-                    } else {
-                        ForEach(inboxSessions) { session in
-                            row(for: session)
+                        // One list, in one run. Work that needs a human is still
+                        // first and running sessions still follow it, but nothing
+                        // is allowed between them any more: the analytics that used
+                        // to sit in the middle are below the list now (#80).
+                        if inboxSessions.isEmpty, store.hasLoadedOnce {
+                            ContentUnavailableView("Nothing running",
+                                                   systemImage: "rectangle.stack.badge.plus",
+                                                   description: Text("Start a new session when you're ready."))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 40)
+                        } else {
+                            ForEach(inboxSessions) { session in
+                                row(for: session)
+                            }
+                        }
+
+                        if notificationSessionIDs == nil, !store.finished.isEmpty {
+                            finishedSection
+                        }
+
+                        // The live list holds only recent finished sessions per
+                        // host; everything older, across every host, is History.
+                        if store.hasLoadedOnce {
+                            historyEntry
+                        }
+
+                        if cockpitStore.isCockpitAvailable {
+                            VStack(alignment: .leading, spacing: 10) {
+                                analyticsSections
+                            }
+                            .padding(.top, 6)
                         }
                     }
-
-                    if notificationSessionIDs == nil, !store.finished.isEmpty {
-                        finishedSection
-                    }
-
-                    // The live list holds only recent finished sessions per
-                    // host; everything older, across every host, is History.
-                    if store.hasLoadedOnce {
-                        historyEntry
-                    }
-
-                    if cockpitStore.isCockpitAvailable {
-                        VStack(alignment: .leading, spacing: 10) {
-                            analyticsSections
-                        }
-                        .padding(.top, 6)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+                    .padding(.bottom, 16)
+                }
+                .accessibilityIdentifier("fleet-list")
+                .refreshable {
+                    await workStore.refresh()
+                    await store.refresh()
+                    if let snapshot = store.snapshot {
+                        await cockpitStore.refresh(for: snapshot)
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 8)
-                .padding(.bottom, 16)
-            }
-            .accessibilityIdentifier("fleet-list")
-            .refreshable {
-                await store.refresh()
-                if let snapshot = store.snapshot {
-                    await cockpitStore.refresh(for: snapshot)
-                }
-            }
-            .overlay {
-                if !store.hasLoadedOnce {
-                    if let deadline = store.busyUntil {
-                        Label(RetryPolicy.busyMessage(until: deadline), systemImage: "clock")
-                            .droverText(.subtitle)
-                    } else if let error = store.lastError {
-                        if store.isTailscaleTransportFailure {
-                            ContentUnavailableView {
-                                Label("Can't reach the hub over Tailscale", systemImage: "network.badge.shield.half.filled")
-                            } description: {
-                                let host = client.config.tailscaleHost ?? client.config.baseURL.host ?? "Tailscale"
-                                Text("Your Drover hub is configured at a Tailscale address (\(host)). Check that Tailscale is connected on this device and that the hub is running.")
-                            } actions: {
-                                Button("Retry") {
-                                    Task { await store.refresh() }
+                .overlay {
+                    if !store.hasLoadedOnce {
+                        if let deadline = store.busyUntil {
+                            Label(RetryPolicy.busyMessage(until: deadline), systemImage: "clock")
+                                .droverText(.subtitle)
+                        } else if let error = store.lastError {
+                            if store.isTailscaleTransportFailure {
+                                ContentUnavailableView {
+                                    Label("Can't reach the hub over Tailscale", systemImage: "network.badge.shield.half.filled")
+                                } description: {
+                                    let host = client.config.tailscaleHost ?? client.config.baseURL.host ?? "Tailscale"
+                                    Text("Your Drover hub is configured at a Tailscale address (\(host)). Check that Tailscale is connected on this device and that the hub is running.")
+                                } actions: {
+                                    Button("Retry") {
+                                        Task { await store.refresh() }
+                                    }
+                                    .buttonStyle(.bordered)
                                 }
-                                .buttonStyle(.bordered)
+                            } else {
+                                ContentUnavailableView {
+                                    Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
+                                } description: {
+                                    Text(error)
+                                } actions: {
+                                    Button("Retry") {
+                                        Task { await store.refresh() }
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
                             }
                         } else {
-                            ContentUnavailableView {
-                                Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
-                            } description: {
-                                Text(error)
-                            } actions: {
-                                Button("Retry") {
-                                    Task { await store.refresh() }
+                            // The spinner alone cannot distinguish a hub that is
+                            // unreachable from a first load repeatedly torn down
+                            // before it lands, which is exactly why a recurring
+                            // stuck "Connecting…" could not be diagnosed from the
+                            // phone (#85). After the second failure it says which.
+                            VStack(spacing: 8) {
+                                ProgressView("Connecting…")
+                                if let detail = store.connectingDetail {
+                                    Text(detail)
+                                        .droverText(.subtitle)
+                                        .multilineTextAlignment(.center)
+                                        .accessibilityIdentifier("connecting-detail")
                                 }
-                                .buttonStyle(.bordered)
-                            }
-                        }
-                    } else {
-                        // The spinner alone cannot distinguish a hub that is
-                        // unreachable from a first load repeatedly torn down
-                        // before it lands — which is exactly why a recurring
-                        // stuck "Connecting…" could not be diagnosed from the
-                        // phone (#85). After the second failure it says which.
-                        VStack(spacing: 8) {
-                            ProgressView("Connecting…")
-                            if let detail = store.connectingDetail {
-                                Text(detail)
-                                    .droverText(.subtitle)
-                                    .multilineTextAlignment(.center)
-                                    .accessibilityIdentifier("connecting-detail")
                             }
                         }
                     }
+                }
+
+                .onChange(of: attentionFocusRevision) { _, _ in
+                    if let id = focusedAttentionID { proxy.scrollTo(id, anchor: .top) }
+                }
+                .onChange(of: workStore.items) { _, _ in
+                    if let id = focusedAttentionID { proxy.scrollTo(id, anchor: .top) }
                 }
             }
 
@@ -219,6 +238,22 @@ struct SessionsView: View {
         // `startPolling()` now leaves a live loop alone, so the two calls can
         // stay independent and neither has to know about the other.
         .task { store.startPolling() }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            while !Task.isCancelled {
+                await workStore.refresh()
+                if workStore.isReachable {
+                    await WorkAttentionNotifications.evaluate(workStore.items, notifier: notifier, defaults: defaults)
+                }
+                openAttentionFromNotification()
+                guard let interval = workStore.pollIntervalSeconds else { return }
+                do { try await Task.sleep(for: .seconds(interval)) }
+                catch { return }
+            }
+        }
+        .onChange(of: NotificationRoute.shared.pendingAttentionRef) { _, _ in
+            openAttentionFromNotification()
+        }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             while !Task.isCancelled {
@@ -278,7 +313,7 @@ struct SessionsView: View {
         .onChange(of: store.snapshot?.sessions.count) { _, _ in
             openSessionFromNotification()
         }
-        .onAppear { openSessionFromNotification() }
+        .onAppear { openSessionFromNotification(); openAttentionFromNotification() }
         .sheet(isPresented: $showLaunch) {
             NavigationStack {
                 LaunchView(
@@ -548,6 +583,18 @@ struct SessionsView: View {
                 }
             }
         }
+    }
+
+    private func openAttentionFromNotification() {
+        guard let ref = NotificationRoute.shared.pendingAttentionRef else { return }
+        guard workStore.isReachable else { return }
+        notificationSessionIDs = nil
+        launchedSession = nil
+        focusedAttentionID = workStore.items.first {
+            $0.workspaceID == ref.workspaceID && $0.id == ref.id
+        }?.id ?? "work-attention"
+        attentionFocusRevision += 1
+        _ = NotificationRoute.shared.consumeAttention()
     }
 
     /// Marked on open and again on leaving: the session may only start asking
