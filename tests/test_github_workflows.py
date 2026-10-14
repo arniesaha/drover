@@ -281,12 +281,29 @@ def test_public_workflows_select_expensive_suites_from_changed_paths() -> None:
     # the Python suite, so interpreter setup is unconditional and only the
     # lightweight shell dependency install is scoped to that case.
     assert "if" not in python_setup
+    assert python_setup["uses"].startswith("actions/setup-python@")
+    assert python_setup["with"]["python-version"] == "3.11"
     shell_deps = next(
         step
         for step in python_steps
         if step.get("name") == "Install shell test dependencies"
     )
     assert shell_deps["if"] == "steps.scope.outputs.python != 'true'"
+    assert shell_deps["run"] == 'python -m pip install "pydantic>=2.0"'
+    shell_tests = next(
+        step for step in python_steps if step.get("name") == "Run installer shell tests"
+    )
+    assert "if" not in shell_tests
+    assert python_steps.index(python_setup) < python_steps.index(shell_deps)
+    assert python_steps.index(shell_deps) < python_steps.index(shell_tests)
+    for name in (
+        "Install dependencies",
+        "Check imports with isort",
+        "Check formatting with Black",
+        "Run tests with pytest",
+    ):
+        expensive_step = next(step for step in python_steps if step.get("name") == name)
+        assert expensive_step["if"] == "steps.scope.outputs.python == 'true'"
     ios_xcode = next(
         step for step in ios_steps if step.get("name") == "Show Xcode version"
     )

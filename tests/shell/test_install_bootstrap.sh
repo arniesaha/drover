@@ -205,28 +205,42 @@ check_invalid_port 0 zero
 check_invalid_port 65536 oversized
 check_invalid_port nope nonnumeric
 
-# Force the producer past any pipe buffer before an early consumer refusal.
-# The public stdin path must report bash's exit 1, irrespective of cat's 141.
-EARLY_REPO="$REMOTE/early refusal"
-mkdir -p "$EARLY_REPO"
-/usr/bin/awk 'BEGIN {
-  print "printf '\''fixture early refusal\\n'\'' >&2; exit 1"
-  for (i = 0; i < 100000; i++) print "# unread installer input"
-}' > "$EARLY_REPO/install.sh"
-INSTALL_LOG="$REMOTE/early refusal.log"
-OUT="$(REPO="$EARLY_REPO" run_installer)"
-RESULT=$?
-check_status "early piped refusal reports the installer status" "$RESULT" "1"
-check_contains "early piped refusal captures installer stderr" "$INSTALL_LOG" 'fixture early refusal'
+# Force the producer past any pipe buffer and inherit ignored SIGPIPE, as a
+# runner can do. Without restoring the signal, cat reports EPIPE as exit 1
+# instead of 141, which must not turn a successful installer into a failure.
+check_early_exit() {
+  local label="$1" expected="$2" message="$3"
+  local case_dir="$REMOTE/early $label"
+  local home="$case_dir/home dir"
+  local output result
+  mkdir -p "$home"
+  {
+    printf "printf '%s\\n' >&2; exit %s\n" "$message" "$expected"
+    /usr/bin/awk 'BEGIN { for (i = 0; i < 100000; i++) print "# unread installer input" }'
+  } > "$case_dir/install.sh"
+  INSTALL_LOG="$case_dir/install.log"
+  output="$(trap '' PIPE; HOME="$home" REPO="$case_dir" run_installer)"
+  result=$?
+  check_status "early piped $label reports the installer status" "$result" "$expected"
+  check_contains "early piped $label captures installer stderr" "$INSTALL_LOG" "$message"
+  if [ "$label" = success ]; then
+    check_absent "early piped success has no refusal stderr" "$output" 'fixture early refusal'
+  fi
+}
 
-# Release verification also exits before the rest of the stdin script runs.
-# Its successful status must survive the same producer SIGPIPE.
-/usr/bin/sed '1s/exit 1/exit 0/' "$EARLY_REPO/install.sh" > "$EARLY_REPO/success.sh"
-mv "$EARLY_REPO/success.sh" "$EARLY_REPO/install.sh"
-INSTALL_LOG="$REMOTE/early success.log"
-OUT="$(REPO="$EARLY_REPO" run_installer)"
+check_early_exit refusal 1 'fixture early refusal'
+check_early_exit success 0 'fixture early success'
+
+# A missing input is a genuine producer failure, unlike the consumer closing
+# the pipe early. Keep that failure visible even though bash sees empty stdin.
+MISSING_REPO="$REMOTE/missing input"
+mkdir -p "$MISSING_REPO"
+INSTALL_LOG="$MISSING_REPO/install.log"
+OUT="$(REPO="$MISSING_REPO" run_installer)"
 RESULT=$?
-check_status "early piped success reports the installer status" "$RESULT" "0"
+check_status "missing installer input is rejected" "$RESULT" "1"
+check_contains "missing installer input reports the producer failure" "$INSTALL_LOG" \
+  'installer input failed (exit 1)'
 
 [ "$FAILURES" -eq 0 ] || exit 1
 echo "all install-bootstrap checks passed"
