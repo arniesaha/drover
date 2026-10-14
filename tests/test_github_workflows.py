@@ -277,7 +277,16 @@ def test_public_workflows_select_expensive_suites_from_changed_paths() -> None:
     python_setup = next(
         step for step in python_steps if step.get("name") == "Set up Python"
     )
-    assert python_setup["if"] == "steps.scope.outputs.python == 'true'"
+    # Shell installer fixtures need Python even when an iOS-only diff skips
+    # the Python suite, so interpreter setup is unconditional and only the
+    # lightweight shell dependency install is scoped to that case.
+    assert "if" not in python_setup
+    shell_deps = next(
+        step
+        for step in python_steps
+        if step.get("name") == "Install shell test dependencies"
+    )
+    assert shell_deps["if"] == "steps.scope.outputs.python != 'true'"
     ios_xcode = next(
         step for step in ios_steps if step.get("name") == "Show Xcode version"
     )
