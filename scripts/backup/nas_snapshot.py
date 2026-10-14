@@ -48,20 +48,40 @@ def pending_path(root, date):
 
 
 def preserve_failed(root, date):
+    if root.is_symlink():
+        raise ValueError("symlink backup root")
+    # Parent write/search permission is sufficient even for unreadable children.
+    root.chmod(0o700)
     pending = pending_path(root, date)
     if not pending.exists():
         return None
-    # Nanoseconds avoid collisions when the same date is retried quickly.
-    failed = root / (
-        ".failed-"
-        + date
-        + "-"
-        + dt.datetime.now().strftime("%H%M%S")
-        + "-"
-        + str(time.time_ns())
-    )
-    pending.rename(failed)
-    return failed.name
+    base = ".failed-" + date + "-" + str(time.time_ns())
+    suffix = 0
+    while True:
+        failed = root / (base + ("-" + str(suffix) if suffix else ""))
+        # Never replace even an empty failed directory or a dangling symlink.
+        if failed.exists() or failed.is_symlink():
+            suffix += 1
+            continue
+        pending.rename(failed)
+        return failed.name
+
+
+def quarantine_pending(root, date):
+    if root.is_symlink():
+        raise ValueError("symlink backup root")
+    root.chmod(0o700)
+    pending_path(root, date)  # Validate before modifying any generation.
+    quarantined = []
+    for path in sorted(root.iterdir()):
+        old_date = path.name.removeprefix(".pending-")
+        if (
+            path.name.startswith(".pending-")
+            and DATE.fullmatch(old_date)
+            and old_date < date
+        ):
+            quarantined.append(preserve_failed(root, old_date))
+    return quarantined
 
 
 def manifest_path(pending, value):
@@ -169,6 +189,7 @@ def main():
             raise ValueError("generation already exists")
         # The Studio holds its local job lock. A leftover pending generation is
         # an interrupted run; retain it and allow the same date to be retried.
+        quarantined = quarantine_pending(root, date)
         failed = preserve_failed(root, date)
         pending.mkdir(mode=0o700)
         previous = sorted(
@@ -180,13 +201,18 @@ def main():
         )
         print(
             json.dumps(
-                {"previous": previous[-1] if previous else None, "failed": failed}
+                {
+                    "previous": previous[-1] if previous else None,
+                    "failed": failed,
+                    "quarantined": quarantined,
+                }
             )
         )
     elif action == "fail":
-        print(
-            json.dumps({"failed": preserve_failed(root, json.load(sys.stdin)["date"])})
-        )
+        date = json.load(sys.stdin)["date"]
+        failed = preserve_failed(root, date)
+        quarantined = quarantine_pending(root, date)
+        print(json.dumps({"failed": failed, "quarantined": quarantined}))
     elif action == "inventory":
         request = json.load(sys.stdin)
         pending = pending_path(root, request["date"])

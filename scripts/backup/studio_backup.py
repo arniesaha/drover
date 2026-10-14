@@ -84,28 +84,107 @@ def log(message):
         f.write(dt.datetime.now().astimezone().isoformat() + " " + message + "\n")
 
 
-def run(args, *, input_data=None, output=None):
-    # Child diagnostics may contain private configuration. Never emit them in logs.
-    result = subprocess.run(
-        args,
-        input=input_data,
-        stdout=output or subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        umask=0o077,
+def redact_diagnostic(value):
+    """Keep error reasons, never command arguments, credentials or data paths."""
+    text = (
+        value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
     )
-    if result.returncode:
-        raise RuntimeError("command failed (exit %d)" % result.returncode)
-    return result.stdout
+    # Redact before taking the tail so truncation cannot expose half a secret.
+    text = re.sub(r"(?i)\b[a-z][a-z0-9+.-]*://\S+", "[redacted-url]", text)
+    text = re.sub(
+        r"(?i)\b(password|pgpassword|passwd|passphrase|(?:access[_-]?)?token|"
+        r"(?:aws[_-]?)?secret(?:[_-]?access[_-]?key)?|api[_-]?key|authorization)"
+        r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\bauthorization\s*[:=]\s*[^\n]+", "authorization=[redacted]", text
+    )
+    # Quoted filenames include spaces; traceback filenames are quoted too.
+    text = re.sub(r"\"[^\"\n]*\"|'[^'\n]*'", "[redacted]", text)
+    for private in (
+        str(HOME),
+        NAS,
+        STUDIO_FROM_NAS,
+        *(str(path) for path in DATA.values()),
+    ):
+        if private:
+            text = text.replace(private, "[redacted]")
+    text = re.sub(r"(?:[\w.-]+@)?[\w.-]+:(?=/)", "[redacted]:", text)
+    text = re.sub(r"(?:~?/|\b[\w.-]+/)[^\s,;:)]+", "[redacted-path]", text)
+    text = re.sub(r"\b[\w.-]+@[\w.-]+\b", "[redacted-host]", text)
+    return text.encode("utf-8")[-2048:].decode("utf-8", errors="ignore")
+
+
+class CommandFailure(RuntimeError):
+    def __init__(self, operation, result):
+        super().__init__("command failed (exit %d)" % result.returncode)
+        self.operation = operation
+        self.returncode = result.returncode
+        self.stderr = redact_diagnostic(result.stderr or b"")
+
+
+def failure_details(error):
+    if isinstance(error, CommandFailure):
+        return " " + json.dumps(
+            {
+                "operation": error.operation,
+                "exit_code": error.returncode,
+                "stderr_tail": error.stderr,
+            },
+            ensure_ascii=True,
+        )
+    return ""
+
+
+def run(args, *, input_data=None, output=None, operation=None, accepted_codes=()):
+    operation = operation or Path(args[0]).name
+    is_ssh = args[0] == SSH[0]
+    offset = output.tell() if output is not None and is_ssh else None
+    for attempt in range(2 if is_ssh else 1):
+        result = subprocess.run(
+            args,
+            input=input_data,
+            stdout=output or subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            umask=0o077,
+        )
+        if result.returncode == 0 or result.returncode in accepted_codes:
+            return result.stdout
+        # Authentication and remote program failures are not transport retries.
+        transient = result.returncode in (12, 255) and any(
+            reason in (result.stderr or b"").lower()
+            for reason in (
+                b"connection reset",
+                b"connection timed out",
+                b"connection closed",
+                b"broken pipe",
+                b"no route to host",
+                b"connection refused",
+                b"connection unexpectedly closed",
+            )
+        )
+        if not transient or attempt:
+            raise CommandFailure(operation, result)
+        log("stage=ssh_retry operation=" + operation)
+        if offset is not None:
+            output.seek(offset)
+            output.truncate()
 
 
 def remote(helper, action, root, payload):
     command = "python3 -c %s %s %s" % tuple(map(shlex.quote, (helper, action, root)))
     return json.loads(
-        run(SSH + [NAS, command], input_data=json.dumps(payload).encode())
+        run(
+            SSH + [NAS, command],
+            input_data=json.dumps(payload).encode(),
+            operation="nas_" + action,
+        )
     )
 
 
-def sync(source, destination, previous=None, excludes=()):
+def sync(source, destination, previous=None, excludes=(), *, second_pass=False):
     # UGOS ships a patched rsync that refuses non-shared-folder paths when it
     # runs as the receiving server, so for NAS targets the NAS pulls instead.
     if destination.startswith(NAS + ":"):
@@ -124,18 +203,25 @@ def sync(source, destination, previous=None, excludes=()):
             args.append("--include=uv.lock")
         args.extend("--exclude=" + item for item in excludes)
         args += [STUDIO_FROM_NAS + ":" + str(source) + "/", remote_dest + "/"]
-        # The NAS home ACL leaves pulled files 0777; make the tree private again.
+        # Check rsync's status before chmod, which otherwise hides the operation
+        # behind a single SSH status. Only the final raw pass permits vanished files.
+        allowed = "0|24" if second_pass else "0"
+        command = (
+            "umask 077; mkdir -p "
+            + shlex.quote(remote_dest)
+            + " || exit $?; "
+            + shlex.join(args)
+            + "; status=$?; case $status in "
+            + allowed
+            + ") ;; "
+            + '*) printf \'operation=rsync exit=%s\\n\' "$status" >&2; exit "$status";; esac; '
+            + "chmod -R go= "
+            + shlex.quote(remote_dest)
+            + ' || { status=$?; printf \'operation=chmod exit=%s\\n\' "$status" >&2; exit "$status"; }'
+        )
         run(
-            SSH
-            + [
-                NAS,
-                "umask 077; mkdir -p "
-                + shlex.quote(remote_dest)
-                + " && "
-                + shlex.join(args)
-                + " && chmod -R go= "
-                + shlex.quote(remote_dest),
-            ]
+            SSH + [NAS, command],
+            operation="nas_pull_second_pass" if second_pass else "nas_pull",
         )
         return
     args = [
@@ -152,7 +238,10 @@ def sync(source, destination, previous=None, excludes=()):
     if "*.lock" in excludes:
         args.append("--include=uv.lock")
     args.extend("--exclude=" + item for item in excludes)
-    run(args + [str(source) + "/", destination + "/"])
+    run(
+        args + [str(source) + "/", destination + "/"],
+        accepted_codes=(24,) if second_pass else (),
+    )
 
 
 def file_entries(root, prefix):
@@ -284,8 +373,8 @@ def backup():
         try:
             remote(helper, "fail", root, {"date": date})
             log("stage=failed_generation_preserved")
-        except Exception:
-            log("stage=failed_generation_rename_failed")
+        except Exception as error:
+            log("stage=failed_generation_rename_failed" + failure_details(error))
         raise
 
 
@@ -383,6 +472,7 @@ def backup_generation(helper, root, date, preparation, started, host):
                 NAS + ":" + pending + "/" + name,
                 previous + "/" + name if previous else None,
                 excludes=LAKE_EXCLUDES,
+                second_pass=True,
             )
         # Sources may change immediately after rsync. Hash the now-frozen
         # destination, including files retained by the first pass, instead.
@@ -446,15 +536,12 @@ def main():
         try:
             backup()
         except Exception as error:
-            # Do not print exception strings, paths, DSNs, or child diagnostics.
+            # Arbitrary exceptions remain opaque; command failures carry only
+            # bounded, redacted diagnostics with JSON escaping for single-line logs.
             log(
                 "FAILURE type="
                 + type(error).__name__
-                + (
-                    " (" + str(error) + ")"
-                    if re.fullmatch(r"command failed \(exit -?\d+\)", str(error))
-                    else ""
-                )
+                + failure_details(error)
                 + "; generation unpublished; inspect NAS failed or pending directory"
             )
             return 1
