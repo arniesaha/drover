@@ -162,6 +162,8 @@ class GoalScope(Model):
     goal_label: str | None = None
     milestone: int | None = Field(default=None, gt=0)
     policy_path: str = ""
+    execution_cwds: dict[str, str] = Field(default_factory=dict)
+    brief_ref: str | None = None
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -183,11 +185,10 @@ class WorkQueueConfig(Model):
     shadow_mode: bool = True
     workspace_id: str = ""
     goals: list[GoalScope] = Field(default_factory=list)
+    principal_roles: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def valid(self):
-        if not self.shadow_mode:
-            raise ValueError("work queue phase 1 only supports shadow mode")
         if self.enabled and (not self.workspace_id.strip() or not self.goals):
             raise ValueError("enabled work queue requires workspace and goals")
         if len({g.goal_id for g in self.goals}) != len(self.goals):

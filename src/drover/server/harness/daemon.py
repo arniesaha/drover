@@ -2770,6 +2770,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             "model": model,
             "thinking_effort": thinking_effort,
             "registry_synced": registry_created,
+            "cwd": session_cwd,
+            "client_session_id": client_session_id,
+            "parent_session_id": _optional_text(body.get("parent_session_id")),
         }
         if factory_launch is not None:
             response["factory_observer"] = factory_launch.wire_projection(
@@ -3159,6 +3162,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         reached with ``?archived_cursor=`` from ``next_archived_cursor``.
         """
         params = parse_qs(query)
+        if "client_session_id" in params:
+            key = params["client_session_id"][0]
+            row = self.server.state.registry.session_by_client_id(key)
+            self._write_json(
+                {"sessions": [_structured_session_row_json(row)] if row else []}
+            )
+            return
         archived_limit = _session_list_archived_limit(params)
         try:
             archived_after = _decode_archived_cursor(params)
@@ -4577,6 +4587,9 @@ def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
     """
     return {
         "session_id": registry_session.session_id,
+        "client_session_id": registry_session.client_session_id,
+        "parent_session_id": registry_session.parent_session_id,
+        "harness": registry_session.harness,
         "command": registry_session.command,
         "cwd": registry_session.cwd,
         "pid": None,

@@ -37,6 +37,7 @@ def build_mcp_server(
     auth: AuthSettings | None = None,
     provider_usage: Any | None = None,
     provider_fetch: Any | None = None,
+    work_control_url: str = "http://127.0.0.1:7080",
 ) -> FastMCP:
     """Construct a FastMCP server with all Drover tools registered.
 
@@ -107,6 +108,122 @@ def build_mcp_server(
     recall_service = RecallBundleService(
         duckdb_path=db,
     )
+
+    def work_call(operation, args):
+        from drover.server.work_queue.client import control_call
+
+        return control_call(work_control_url, current_headers(mcp), operation, args)
+
+    @read_tool()
+    def drover_work_list(
+        goal_id: str | None = None, limit: int = 50, view: str | None = None
+    ) -> dict:
+        """Read goal items, or view=attention across configured workspace goals."""
+        args = dict(goal_id=goal_id, limit=limit)
+        if view is not None:
+            args["view"] = view
+        return work_call("list", args)
+
+    @read_tool()
+    def drover_work_get(goal_id: str, number: int) -> dict:
+        """Read a live item and its workspace-scoped execution links."""
+        return work_call("get", dict(goal_id=goal_id, number=number))
+
+    @mutation_tool(path="/work/launch")
+    def drover_work_launch(
+        goal_id: str,
+        number: int,
+        request_key: str,
+        estimated_cost: float,
+        run_role: str = "work",
+        parent_session_id: Optional[str] = None,
+    ) -> dict:
+        """Launch through the sole coordinator with quota and recovery checks."""
+        return work_call(
+            "launch",
+            dict(
+                goal_id=goal_id,
+                number=number,
+                request_key=request_key,
+                estimated_cost=estimated_cost,
+                run_role=run_role,
+                parent_session_id=parent_session_id,
+            ),
+        )
+
+    @mutation_tool(path="/work/link")
+    def drover_work_link(
+        goal_id: str,
+        number: int,
+        run_key: str,
+        session_id: str,
+        pr_number: Optional[int] = None,
+    ) -> dict:
+        """Associate a resolved session and optional PR with its persisted intent."""
+        return work_call(
+            "link",
+            dict(
+                goal_id=goal_id,
+                number=number,
+                run_key=run_key,
+                session_id=session_id,
+                pr_number=pr_number,
+            ),
+        )
+
+    @mutation_tool(path="/work/update")
+    def drover_work_update(
+        goal_id: str,
+        number: int,
+        run_key: str,
+        action: str,
+        estimated_cost: Optional[float] = None,
+        behavioral_passed: Optional[bool] = None,
+        checks_rerun: Optional[bool] = None,
+        evidence_key: Optional[str] = None,
+    ) -> dict:
+        """Report progress, failure, completion or separate behavioral verification."""
+        return work_call(
+            "update",
+            dict(
+                goal_id=goal_id,
+                number=number,
+                run_key=run_key,
+                action=action,
+                estimated_cost=estimated_cost,
+                behavioral_passed=behavioral_passed,
+                checks_rerun=checks_rerun,
+                evidence_key=evidence_key,
+            ),
+        )
+
+    @mutation_tool(path="/work/question")
+    def drover_work_question(
+        goal_id: str, number: int, request_key: str, category: str, options: list[str]
+    ) -> dict:
+        """Record a stable question identity and action codes, without text."""
+        return work_call(
+            "question",
+            dict(
+                goal_id=goal_id,
+                number=number,
+                request_key=request_key,
+                category=category,
+                options=options,
+            ),
+        )
+
+    @mutation_tool(path="/work/decide")
+    def drover_work_decide(
+        goal_id: str, number: int, decision_id: str, action: str
+    ) -> dict:
+        """Refresh and resolve an offered decision using paired device authority."""
+        return work_call(
+            "decide",
+            dict(
+                goal_id=goal_id, number=number, decision_id=decision_id, action=action
+            ),
+        )
 
     @mutation_tool(path="/profile/proposals")
     def drover_profile_propose(

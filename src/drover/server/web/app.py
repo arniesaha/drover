@@ -1063,6 +1063,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 ),
             )
             return
+        if path in {"/work/list", "/work/get"}:
+            args = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            for name in ("number", "limit"):
+                if name in args:
+                    try:
+                        args[name] = int(args[name])
+                    except ValueError:
+                        self._send(
+                            400, "application/json", '{"error":"invalid work request"}'
+                        )
+                        return
+            self._work_tool(path.rsplit("/", 1)[1], args)
+            return
         if path == "/work-queue/report":
             credential = bearer_credential(self.auth, self.headers)
             if credential is None or credential.scope != "device":
@@ -1568,6 +1581,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 return
             status, payload = self.collector.consent_content_analysis(body)
             self._send(status, "application/json", payload)
+            return
+        if path in {
+            "/work/launch",
+            "/work/link",
+            "/work/update",
+            "/work/question",
+            "/work/decide",
+        }:
+            body = self._read_json()
+            if not isinstance(body, dict):
+                self._send(400, "application/json", '{"error":"JSON object required"}')
+                return
+            self._work_tool(path.rsplit("/", 1)[1], body)
             return
         if path == "/insights/content-analysis/revoke":
             body = self._read_json()
@@ -2292,6 +2318,23 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 if self.auth.enabled
                 else None
             ),
+        )
+
+    def _work_tool(self, operation, args):
+        from drover.server.work_queue.runtime import dispatch
+
+        status, result = dispatch(
+            getattr(self.collector, "work_control", None),
+            self.auth,
+            self.headers,
+            operation,
+            args,
+        )
+        self._send(
+            status,
+            "application/json",
+            json.dumps(result, default=str),
+            extra_headers={"Cache-Control": "no-store"},
         )
 
     def _harness_registry(self) -> HarnessRegistry:

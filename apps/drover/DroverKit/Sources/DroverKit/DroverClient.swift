@@ -196,6 +196,23 @@ public actor DroverClient {
 
     // MARK: Public API
 
+    public func workAttention() async throws -> WorkAttentionResponse {
+        let data = try await request(path: "/work/list?view=attention&limit=100", method: "GET", body: nil)
+        return try decode(WorkAttentionResponse.self, from: data)
+    }
+
+    /// Uses the same authenticated control operation as drover_work_decide.
+    public func workDecide(item: WorkAttentionItem, action: String) async throws -> WorkDecisionResponse {
+        guard let number = item.number, let decisionID = item.decisionID else {
+            throw DroverError.badRequest("Decision identity required")
+        }
+        let body = try JSONSerialization.data(withJSONObject: [
+            "goal_id": item.goalID, "number": number, "decision_id": decisionID, "action": action
+        ])
+        let data = try await request(path: "/work/decide", method: "POST", body: body)
+        return try decode(WorkDecisionResponse.self, from: data)
+    }
+
     public func snapshot() async throws -> HarnessSnapshot {
         let data = try await request(path: "/harness", method: "GET", body: nil)
         return try decode(HarnessSnapshot.self, from: data)

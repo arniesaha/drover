@@ -57,6 +57,9 @@ enum BackgroundRefresh {
             var success = false
             if let built = ClientFactory.make() {
                 success = await watcher.check(client: built.client)
+                if let response = try? await built.client.workAttention(), !response.stale {
+                    await WorkAttentionNotifications.evaluate(response.items, notifier: notifier)
+                }
                 schedule()
             }
             box.value.setTaskCompleted(success: success)

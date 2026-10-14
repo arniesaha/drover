@@ -5868,3 +5868,32 @@ def test_saturated_fleet_listing_route_answers_503_with_retry_after(tmp_path):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_sync_created_work_session_preserves_run_key_and_parent(tmp_path):
+    collector = _make_collector(tmp_path)
+    collector._sync_created_harness_session(
+        "mac-mini",
+        {
+            "harness": "codex",
+            "mode": "structured",
+            "client_session_id": "persisted-work-key",
+            "parent_session_id": "work-parent",
+        },
+        json.dumps(
+            {
+                "session_id": "work-synced",
+                "harness": "codex",
+                "status": "completed",
+                "cwd": "/work/resulting-artifact",
+            }
+        ),
+    )
+    session = HarnessRegistry(collector.duckdb_path).session_by_client_id(
+        "persisted-work-key"
+    )
+    assert session is not None
+    assert session.session_id == "work-synced"
+    assert session.client_session_id == "persisted-work-key"
+    assert session.parent_session_id == "work-parent"
+    assert session.cwd == "/work/resulting-artifact"

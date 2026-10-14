@@ -255,7 +255,7 @@ class ShadowReconciler:
 
 
 def start_shadow_reconciler(collector, config, stop, *, auth=None):
-    if not config.enabled:
+    if not config.enabled or not config.shadow_mode:
         return None
     if auth is None or not auth.enabled or auth.credentials is None:
         raise ValueError("enabled work queue requires control credentials")

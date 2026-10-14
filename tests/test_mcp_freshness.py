@@ -73,7 +73,29 @@ def test_unknown_freshness_is_explicit():
     assert with_freshness(None, empty_envelope=True)["status"] == "unavailable"
 
 
-def test_every_public_read_carries_freshness_even_without_data(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("work_list_args", "expected_work_list"),
+    [
+        pytest.param(
+            {"goal_id": "test"},
+            {"goal_id": "test", "limit": 50},
+            id="view-omitted",
+        ),
+        pytest.param(
+            {"goal_id": "test", "view": None},
+            {"goal_id": "test", "limit": 50},
+            id="view-null",
+        ),
+        pytest.param(
+            {"goal_id": "test", "view": "attention"},
+            {"goal_id": "test", "limit": 50, "view": "attention"},
+            id="attention-view",
+        ),
+    ],
+)
+def test_every_public_read_carries_freshness_even_without_data(
+    tmp_path, monkeypatch, work_list_args, expected_work_list
+):
     from drover.server.profile import ProfileActor
 
     monkeypatch.setattr(
@@ -84,13 +106,24 @@ def test_every_public_read_carries_freshness_even_without_data(tmp_path, monkeyp
     for name in READ_CAPS:
         if hasattr(tools, name):
             monkeypatch.setattr(tools, name, lambda **kw: None)
+    work_reads = {}
+
+    def empty_work_read(url, headers, operation, args):
+        work_reads[operation] = args
+        return None
+
+    monkeypatch.setattr("drover.server.work_queue.client.control_call", empty_work_read)
+    argument_overrides = {
+        "drover_work_get": {"goal_id": "test", "number": 1},
+        "drover_work_list": work_list_args,
+        "drover_memory_acceptance": {"harness_ids": ["test"]},
+    }
     server = build_mcp_server(duckdb_path=path)
     for tool in asyncio.run(server.list_tools()):
         if tool.name not in READ_CAPS:
             continue
         args = {key: "test" for key in tool.inputSchema.get("required", [])}
-        if "harness_ids" in args:
-            args["harness_ids"] = ["test"]
+        args.update(argument_overrides.get(tool.name, {}))
         if tool.name == "drover_recall_bundle":
             # Bundle requires search-shaped empty data even when memory is absent.
             monkeypatch.setattr(
@@ -109,6 +142,10 @@ def test_every_public_read_carries_freshness_even_without_data(tmp_path, monkeyp
             "basis": "unknown",
         }, tool.name
         assert serialized_bytes(result) <= READ_CAPS[tool.name].response_bytes
+    assert work_reads == {
+        "get": {"goal_id": "test", "number": 1},
+        "list": expected_work_list,
+    }
 
 
 def test_active_handoff_uses_saved_brief_generation_time():
