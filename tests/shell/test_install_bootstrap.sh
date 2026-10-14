@@ -6,14 +6,30 @@
 # finish while emitting a Bash error before it has selected its helper source.
 set -uo pipefail
 
+# Select the caller's Python (including an activated venv), then discard
+# runner settings before invoking any fixture or installer subprocess.
+if [ "${1:-}" != --isolated ]; then
+  exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin \
+    TMPDIR="${TMPDIR:-/tmp}" FIXTURE_PYTHON="$(command -v python3)" \
+    USER=installer /bin/bash "$0" --isolated
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+. "$HERE/lib/install_fixture.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 FAILURES=0
 
 pass() { printf 'ok   - %s\n' "$1"; }
-fail() { printf 'FAIL - %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
+fail() {
+  printf 'FAIL - %s\n' "$1"
+  FAILURES=$((FAILURES + 1))
+  if [ -s "${INSTALL_LOG:-}" ]; then
+    printf 'installer stdout/stderr:\n'
+    /bin/cat "$INSTALL_LOG"
+  fi
+}
 
 check_status() {
   if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (exit $2, wanted $3)"; fi
@@ -50,7 +66,7 @@ WHEEL_CONTENT='test wheel'
 LOCK_CONTENT='test lock'
 WHEEL_SHA="$(printf '%s' "$WHEEL_CONTENT" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
 LOCK_SHA="$(printf '%s' "$LOCK_CONTENT" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
-PYTHON="$(command -v python3)"
+PYTHON="$FIXTURE_PYTHON"
 export FIXTURE_REPO="$REPO" FIXTURE_CURL_LOG="$REMOTE/curl.log"
 export FIXTURE_WHEEL_CONTENT="$WHEEL_CONTENT" FIXTURE_LOCK_CONTENT="$LOCK_CONTENT"
 export FIXTURE_WHEEL_SHA="$WHEEL_SHA" FIXTURE_LOCK_SHA="$LOCK_SHA"
@@ -101,7 +117,8 @@ printf '%s\n' \
   '    if [ "${2:-}" = "--relocatable" ]; then target="$3"; else target="$2"; fi' \
   '    printf "venv\\n" >> "$FIXTURE_UV_LOG"' \
   '    mkdir -p "$target/bin"' \
-  '    ln -s "$FIXTURE_PYTHON" "$target/bin/python"' \
+  '    printf '\''#!/bin/bash\nexec "$FIXTURE_PYTHON" "$@"\n'\'' > "$target/bin/python"' \
+  '    chmod +x "$target/bin/python"' \
   '    ln -s "$(dirname "$0")/drover-server" "$target/bin/drover-server"' \
   '    ;;' \
   '  pip) printf "pip\\n" >> "$FIXTURE_UV_LOG" ;;' \
@@ -122,7 +139,8 @@ chmod +x "$FAKE_BIN/drover-server"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$FAKE_BIN/loginctl"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$FAKE_BIN/systemctl"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$FAKE_BIN/sleep"
-chmod +x "$FAKE_BIN/loginctl" "$FAKE_BIN/systemctl" "$FAKE_BIN/sleep"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "installer-host\\n"' > "$FAKE_BIN/hostname"
+chmod +x "$FAKE_BIN/loginctl" "$FAKE_BIN/systemctl" "$FAKE_BIN/sleep" "$FAKE_BIN/hostname"
 
 # Keep an unrelated setting in the real config-generation seam. Later checks
 # will assert that the inline Python preserves it while updating server keys.
@@ -133,11 +151,12 @@ printf '%s\n' \
 
 run_piped_install() {
   local home="$1" url="$2" bin="${3:-$FAKE_BIN}"
-  /bin/cat "$REPO/install.sh" | HOME="$home" PATH="$bin:$PATH" \
-    PYTHONPATH="$REPO/src" DROVER_OS=linux \
-    bash -s -- --version 0.0.0 --url "$url" 2>&1
+  HOME="$home" PATH="$bin:$PATH" PYTHONPATH="$REPO/src" DROVER_OS=linux \
+    DROVER_TAILSCALE_CANDIDATES="$REMOTE/no-tailscale" \
+    run_installer --version 0.0.0 --url "$url"
 }
 
+INSTALL_LOG="$REMOTE/install.log"
 OUT="$(cd "$UNRELATED" && run_piped_install "$HOME_DIR" '100.64.0.10:7099')"
 RESULT=$?
 check_status "piped installer succeeds" "$RESULT" "0"
@@ -164,6 +183,7 @@ check_invalid_port() {
   local curl_log="$REMOTE/invalid port $label curl.log"
   local output result
   mkdir -p "$home"
+  INSTALL_LOG="$REMOTE/invalid port $label install.log"
   export FIXTURE_UV_LOG="$uv_log"
   export FIXTURE_OFFLINE_CURL_LOG="$curl_log"
   output="$(cd "$UNRELATED" && run_piped_install "$home" "100.64.0.10:$port" "$OFFLINE_BIN")"
@@ -184,6 +204,43 @@ check_invalid_port() {
 check_invalid_port 0 zero
 check_invalid_port 65536 oversized
 check_invalid_port nope nonnumeric
+
+# Force the producer past any pipe buffer and inherit ignored SIGPIPE, as a
+# runner can do. Without restoring the signal, cat reports EPIPE as exit 1
+# instead of 141, which must not turn a successful installer into a failure.
+check_early_exit() {
+  local label="$1" expected="$2" message="$3"
+  local case_dir="$REMOTE/early $label"
+  local home="$case_dir/home dir"
+  local output result
+  mkdir -p "$home"
+  {
+    printf "printf '%s\\n' >&2; exit %s\n" "$message" "$expected"
+    /usr/bin/awk 'BEGIN { for (i = 0; i < 100000; i++) print "# unread installer input" }'
+  } > "$case_dir/install.sh"
+  INSTALL_LOG="$case_dir/install.log"
+  output="$(trap '' PIPE; HOME="$home" REPO="$case_dir" run_installer)"
+  result=$?
+  check_status "early piped $label reports the installer status" "$result" "$expected"
+  check_contains "early piped $label captures installer stderr" "$INSTALL_LOG" "$message"
+  if [ "$label" = success ]; then
+    check_absent "early piped success has no refusal stderr" "$output" 'fixture early refusal'
+  fi
+}
+
+check_early_exit refusal 1 'fixture early refusal'
+check_early_exit success 0 'fixture early success'
+
+# A missing input is a genuine producer failure, unlike the consumer closing
+# the pipe early. Keep that failure visible even though bash sees empty stdin.
+MISSING_REPO="$REMOTE/missing input"
+mkdir -p "$MISSING_REPO"
+INSTALL_LOG="$MISSING_REPO/install.log"
+OUT="$(REPO="$MISSING_REPO" run_installer)"
+RESULT=$?
+check_status "missing installer input is rejected" "$RESULT" "1"
+check_contains "missing installer input reports the producer failure" "$INSTALL_LOG" \
+  'installer input failed (exit 1)'
 
 [ "$FAILURES" -eq 0 ] || exit 1
 echo "all install-bootstrap checks passed"

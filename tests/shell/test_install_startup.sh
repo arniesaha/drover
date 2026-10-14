@@ -5,14 +5,30 @@
 # supported service managers without touching a real user service.
 set -uo pipefail
 
+# Select the caller's Python (including an activated venv), then discard
+# runner settings before invoking any fixture or installer subprocess.
+if [ "${1:-}" != --isolated ]; then
+  exec /usr/bin/env -i HOME="$HOME" PATH=/usr/bin:/bin \
+    TMPDIR="${TMPDIR:-/tmp}" FIXTURE_PYTHON="$(command -v python3)" \
+    USER=installer /bin/bash "$0" --isolated
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+. "$HERE/lib/install_fixture.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 FAILURES=0
 
 pass() { printf 'ok   - %s\n' "$1"; }
-fail() { printf 'FAIL - %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
+fail() {
+  printf 'FAIL - %s\n' "$1"
+  FAILURES=$((FAILURES + 1))
+  if [ -s "${INSTALL_LOG:-}" ]; then
+    printf 'installer stdout/stderr:\n'
+    /bin/cat "$INSTALL_LOG"
+  fi
+}
 
 check_status() {
   if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (exit $2, wanted $3)"; fi
@@ -71,8 +87,9 @@ check_event_count() {
 REMOTE="$WORK/remote"
 FAKE_BIN="$REMOTE/bin"
 FAKE_SERVER="$FAKE_BIN/drover-server"
-PYTHON="$(command -v python3)"
+PYTHON="$FIXTURE_PYTHON"
 INCOMPATIBLE_RUNTIME_PYTHON="$FAKE_BIN/incompatible-runtime-python"
+RUNTIME_PYTHON="$FAKE_BIN/runtime-python"
 WHEEL_CONTENT='test wheel'
 LOCK_CONTENT='test lock'
 WHEEL_SHA="$(printf '%s' "$WHEEL_CONTENT" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
@@ -82,6 +99,7 @@ mkdir -p "$FAKE_BIN"
 export FIXTURE_REPO="$REPO"
 export FIXTURE_PYTHON="$PYTHON"
 export FIXTURE_INCOMPATIBLE_RUNTIME_PYTHON="$INCOMPATIBLE_RUNTIME_PYTHON"
+export FIXTURE_RUNTIME_PYTHON="$RUNTIME_PYTHON"
 export FIXTURE_SERVER="$FAKE_SERVER"
 export FIXTURE_WHEEL_CONTENT="$WHEEL_CONTENT"
 export FIXTURE_LOCK_CONTENT="$LOCK_CONTENT"
@@ -91,6 +109,15 @@ export FIXTURE_LOCK_SHA="$LOCK_SHA"
 printf '%s\n' '#!/usr/bin/env bash' 'cat >/dev/null' 'exit 1' \
   > "$INCOMPATIBLE_RUNTIME_PYTHON"
 chmod +x "$INCOMPATIBLE_RUNTIME_PYTHON"
+
+# curl supplies the reachability result, so the join probe needs no real
+# listener on the host's fixed port 7081. All inline Python still runs through
+# the selected interpreter, preserving its venv's installed dependencies.
+printf '%s\n' \
+  '#!/bin/bash' \
+  'if [ "${1:-}" = -m ] && [ "${2:-}" = http.server ]; then exit 0; fi' \
+  'exec "$FIXTURE_PYTHON" "$@"' > "$RUNTIME_PYTHON"
+chmod +x "$RUNTIME_PYTHON"
 
 printf '%s\n' \
   '#!/usr/bin/env bash' \
@@ -147,7 +174,7 @@ printf '%s\n' \
   '    if [ "${FIXTURE_RUNTIME_CAPABILITY:-postgres-default}" = "legacy" ]; then' \
   '      ln -sf "$FIXTURE_INCOMPATIBLE_RUNTIME_PYTHON" "$target/bin/python"' \
   '    else' \
-  '      ln -sf "$FIXTURE_PYTHON" "$target/bin/python"' \
+  '      ln -sf "$FIXTURE_RUNTIME_PYTHON" "$target/bin/python"' \
   '    fi' \
   '    ln -sf "$FIXTURE_SERVER" "$target/bin/drover-server"' \
   '    ;;' \
@@ -205,14 +232,17 @@ chmod +x "$FAKE_BIN/launchctl"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$FAKE_BIN/loginctl"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$FAKE_BIN/lsof"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$FAKE_BIN/sleep"
-chmod +x "$FAKE_BIN/loginctl" "$FAKE_BIN/lsof" "$FAKE_BIN/sleep"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "installer-host\\n"' > "$FAKE_BIN/hostname"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "1.1.1.1 dev fixture src 192.168.1.2\\n"' > "$FAKE_BIN/ip"
+chmod +x "$FAKE_BIN/loginctl" "$FAKE_BIN/lsof" "$FAKE_BIN/sleep" "$FAKE_BIN/hostname" "$FAKE_BIN/ip"
 
 new_case() {
   local name
   name="$1"
   CASE_DIR="$REMOTE/$name"
-  HOME_DIR="$CASE_DIR/home"
+  HOME_DIR="$CASE_DIR/home dir"
   EVENT_LOG="$CASE_DIR/events.log"
+  INSTALL_LOG="$CASE_DIR/install.log"
   mkdir -p "$HOME_DIR"
   : > "$EVENT_LOG"
   export FIXTURE_EVENT_LOG="$EVENT_LOG"
@@ -227,10 +257,10 @@ run_new_fleet() {
   address="$3"
   shift 3
   local dsn="${FIXTURE_INSTALL_DSN-postgresql://fixture-control}"
-  /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
+  HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
     PYTHONPATH="$REPO/src" DROVER_OS="$os" DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
     USER=installer FIXTURE_HEALTH_MODE="$health_mode" DROVER_CONTROL_DSN="$dsn" \
-    bash -s -- --version 0.0.0 --url "$address" "$@" 2>&1
+    run_installer --version 0.0.0 --url "$address" "$@"
 }
 
 run_existing_fleet_without_dsn() {
@@ -238,30 +268,30 @@ run_existing_fleet_without_dsn() {
   local address
   os="$1"
   address="$2"
-  /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
+  HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
     PYTHONPATH="$REPO/src" DROVER_OS="$os" DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
     USER=installer FIXTURE_HEALTH_MODE=ready DROVER_CONTROL_DSN="" \
-    bash -s -- --version 0.0.0 --url "$address" --no-start 2>&1
+    run_installer --version 0.0.0 --url "$address" --no-start
 }
 
 run_join() {
-  /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
+  HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
     PYTHONPATH="$REPO/src" DROVER_OS=linux DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
     USER=installer FIXTURE_HEALTH_MODE=fail \
-    bash -s -- --version 0.0.0 --join 'drover://100.64.0.10:7099?v=1&code=JOIN-CODE' "$@" 2>&1
+    run_installer --version 0.0.0 --join 'drover://100.64.0.10:7099?v=1&code=JOIN-CODE' "$@"
 }
 
 run_release_verification() {
   mkdir -p "$CASE_DIR/verify-tmp"
-  /bin/cat "$REPO/install.sh" | HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
+  HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
     PYTHONPATH="$REPO/src" DROVER_OS=linux TMPDIR="$CASE_DIR/verify-tmp" \
-    bash -s -- --version 0.0.0 --verify-release 2>&1
+    run_installer --version 0.0.0 --verify-release
 }
 
 run_release_verification_without_uv() {
   HOME="$HOME_DIR" PATH="$CASE_DIR/no-uv:/usr/bin:/bin" \
     DROVER_OS=linux DROVER_TAILSCALE_CANDIDATES="$CASE_DIR/no-tailscale" \
-    bash "$REPO/install.sh" --version 0.0.0 --verify-release 2>&1
+    run_checkout_installer --version 0.0.0 --verify-release
 }
 
 run_order_case() {
@@ -483,7 +513,7 @@ chmod 0644 "$HOME_DIR/.drover/server.env"
 OUT="$(run_existing_fleet_without_dsn linux '100.64.0.10:7099')"
 RESULT=$?
 check_status "existing PostgreSQL install accepts its private environment" "$RESULT" "0"
-MODE="$($PYTHON -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$HOME_DIR/.drover/server.env")"
+MODE="$("$PYTHON" -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$HOME_DIR/.drover/server.env")"
 check_status "existing PostgreSQL environment is owner-only" "$MODE" "0o600"
 
 new_case tailscale-address
@@ -500,7 +530,7 @@ chmod +x "$TAILSCALE_BIN"
 OUT="$(HOME="$HOME_DIR" PATH="$FAKE_BIN:$PATH" \
   PYTHONPATH="$REPO/src" DROVER_OS=linux DROVER_TAILSCALE_CANDIDATES="$TAILSCALE_BIN" \
   USER=installer FIXTURE_HEALTH_MODE=ready DROVER_CONTROL_DSN=postgresql://fixture-control \
-  bash "$REPO/install.sh" --version 0.0.0 --no-start 2>&1)"
+  run_checkout_installer --version 0.0.0 --no-start)"
 RESULT=$?
 check_status "tailscale install succeeds" "$RESULT" "0"
 check_contains "tailscale harness advertises tailscale URL" \
