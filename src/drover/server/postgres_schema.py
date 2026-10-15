@@ -14,6 +14,7 @@ log = logging.getLogger(__name__)
 PROFILE_MIGRATION = 15
 EXPORTER_FRESHNESS_MIGRATION = 16
 WORK_QUEUE_MIGRATION = 18
+EXPORTER_RESTART_GUARD_MIGRATION = 19
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -671,6 +672,17 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
             "DROP TRIGGER IF EXISTS decision_events_append_only ON decision_events",
             "CREATE TRIGGER decision_events_append_only BEFORE UPDATE OR DELETE ON decision_events FOR EACH ROW EXECUTE FUNCTION work_decision_append_only()",
+        ),
+    ),
+    (
+        EXPORTER_RESTART_GUARD_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS lake_export_restart_requests (
+              requested_at TIMESTAMPTZ NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS lake_export_restart_requests_recent ON lake_export_restart_requests (requested_at)",
         ),
     ),
 )

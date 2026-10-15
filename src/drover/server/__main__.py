@@ -2535,6 +2535,10 @@ def _run_api_role(
         metrics_server.shutdown()
         metrics_server.server_close()
         close_control_plane_connections()
+    if outbox_exporter is not None:
+        exit_code = getattr(outbox_exporter, "server_exit_code", lambda: None)()
+        if exit_code is not None:
+            raise SystemExit(exit_code)
 
 
 def _worker_archive_payload_resolver(

@@ -4,6 +4,8 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from .export_guard import GUARD_SCHEMA
 from .exporter import LakeOutboxExporter
@@ -18,12 +20,65 @@ log = logging.getLogger(__name__)
 # ~11/min, so a serving child re-checks at most a few hundred exports.
 CHECKPOINT_EVERY_EXPORTS = 500
 MAX_RESTARTS = 5
+MAX_SERVER_RESTART_REQUESTS_PER_HOUR = 3
+SERVER_RESTART_EXIT_CODE = 75
 RESTART_BACKOFF_SECONDS = 1
 FRESHNESS_POLL_SECONDS = 10
 CANCELLATION_GRACE_SECONDS = 35
 
 # SQLSTATEs for a missing schema (3F000) or function (42883).
 _MISSING_GUARD_SQLSTATES = {"3F000", "42883"}
+
+
+@dataclass(frozen=True)
+class RestartBudget:
+    allowed: bool
+    requests_last_hour: int
+    next_restart_at: str | None = None
+
+
+def record_server_restart_request(path) -> RestartBudget:
+    """Durably reserve one launchd restart without creating a crash loop."""
+    from drover.server.db import control_plane_connection
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=1)
+    try:
+        with control_plane_connection(path, timeout=2) as control:
+            control.execute("BEGIN")
+            try:
+                control.execute("SET LOCAL statement_timeout = '2s'")
+                control.execute("LOCK TABLE lake_export_restart_requests IN EXCLUSIVE MODE")
+                control.execute(
+                    "DELETE FROM lake_export_restart_requests WHERE requested_at < ?",
+                    [cutoff],
+                )
+                count = int(
+                    control.execute(
+                        "SELECT count(*) FROM lake_export_restart_requests"
+                    ).fetchone()[0]
+                )
+                if count >= MAX_SERVER_RESTART_REQUESTS_PER_HOUR:
+                    first = control.execute(
+                        "SELECT min(requested_at) FROM lake_export_restart_requests"
+                    ).fetchone()[0]
+                    control.execute("COMMIT")
+                    return RestartBudget(
+                        allowed=False,
+                        requests_last_hour=count,
+                        next_restart_at=(first + timedelta(hours=1)).isoformat(),
+                    )
+                control.execute(
+                    "INSERT INTO lake_export_restart_requests (requested_at) VALUES (?)",
+                    [now],
+                )
+                control.execute("COMMIT")
+                return RestartBudget(allowed=True, requests_last_hour=count + 1)
+            except BaseException:
+                control.execute("ROLLBACK")
+                raise
+    except Exception as exc:
+        raise LakeError("lake_export_restart_guard_unavailable") from exc
 
 
 def _guard_missing(exc: BaseException) -> bool:
@@ -74,6 +129,9 @@ class ExporterLifecycle:
         self._attempt_started_at = None
         self._restart_requested = False
         self._recovery_escalations = 0
+        self._crash_loop_guarded = False
+        self._restart_requests_last_hour = 0
+        self._next_restart_at = None
         self._batch_deadline = (
             getattr(config.analytics, "exporter_recovery_deadline_seconds", 120)
             if hasattr(config, "analytics")
@@ -203,8 +261,23 @@ class ExporterLifecycle:
             self._recovering = False
 
     def _request_restart(self, shutdown):
+        path = getattr(self.config, "duckdb_path", None)
+        try:
+            budget = (
+                record_server_restart_request(path)
+                if path is not None
+                else RestartBudget(allowed=True, requests_last_hour=1)
+            )
+        except LakeError:
+            budget = RestartBudget(allowed=False, requests_last_hour=0)
+            self._error = "lake_export_restart_guard_unavailable"
         with self._owner_lock:
             if self._restart_requested:
+                return
+            self._restart_requests_last_hour = budget.requests_last_hour
+            self._next_restart_at = budget.next_restart_at
+            if not budget.allowed:
+                self._crash_loop_guarded = True
                 return
             self._restart_requested = True
             self._recovery_escalations += 1
@@ -215,6 +288,10 @@ class ExporterLifecycle:
             self._restarts,
         )
         shutdown.set()
+
+    def server_exit_code(self) -> int | None:
+        """The foreground server translates an allowed escalation to failure."""
+        return SERVER_RESTART_EXIT_CODE if self._restart_requested else None
 
     def _run(self, shutdown):
         with self._owner_lock:
@@ -389,6 +466,14 @@ class ExporterLifecycle:
         health["recovery_attempt_age_seconds"] = attempt_age
         health["recovery_escalation_count"] = self._recovery_escalations
         health["restart_requested"] = self._restart_requested
+        health["recovery_crash_loop_guarded"] = self._crash_loop_guarded
+        health["recovery_restart_requests_last_hour"] = self._restart_requests_last_hour
+        health["recovery_next_restart_at"] = self._next_restart_at
+        if self._crash_loop_guarded:
+            health["recovery_action"] = (
+                "Crash-loop guard active; exporter remains stopped until the "
+                "rolling restart budget resets."
+            )
         if self._restart_requested:
             health["recovery_action"] = (
                 "Server restart requested; the service manager will replace the exporter."
