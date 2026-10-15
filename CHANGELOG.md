@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-10-15
+
+### Added
+
+- The DuckLake exporter now bounds restart escalation to three requests per hour. When that guard is reached, readiness reports the protected stopped state instead of allowing a restart loop (#631).
+- Operators can run the fenced `lake maintain` command to compact the five export tables, expire snapshots under the existing 30-day policy, and clean files only after a seven-day safety window (#631).
+
+### Fixed
+
+- DuckLake 1.5.5 provisioning keeps mutable export tables out of inlining, avoiding a least-privilege delete failure while preserving inline writes for append-only export tables (#630).
+
+### Upgrade notes
+
+- Hub startup applies additive control migration 19 for the restart-escalation guard.
+- After upgrading, stop the hub and run `lake maintain` once after verifying the control, lake-catalog, and lake-data backups. Schedule the same command in a weekly maintenance window.
+- Upgrade Studio and NAS harnessd hosts.
+
 ## [0.6.10] - 2026-10-14
 
 ### Changed
