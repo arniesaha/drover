@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.12] - 2026-10-15
+
+### Fixed
+
+- `lake maintain` no longer locks the hub out. Merge, snapshot expiry and file cleanup now commit as one `drover-maintenance` snapshot. Each table's logical content is fingerprinted before and after, and a maintenance receipt binds that snapshot to the serving proof, so the serving check accepts it and advances its checkpoint. Unknown or tampered snapshots still fail closed (#634).
+- Snapshot expiry during maintenance keeps both the serving baseline and the 30-day time-travel window (#634).
+
+### Added
+
+- `drover-server lake reconcile` finds batches that control acknowledged but whose receipts are missing from the lake, for example after a catalog restore. It is dry-run by default; `--apply` re-exports them without overwriting newer event versions (#634).
+
+### Upgrade notes
+
+- No control migration. Upgrade the hub, then stop it and run `lake maintain` after verifying the control, lake-catalog and lake-data backups. After a lake restore, run `lake reconcile` (dry-run first).
+- Upgrade Studio and NAS harnessd hosts.
+
 ## [0.6.11] - 2026-10-15
 
 ### Added
