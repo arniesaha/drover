@@ -169,6 +169,85 @@ def test_reconcile_repairs_acknowledged_batch_missing_from_restored_lake(
     assert reconcile_acknowledged(control_path, export_lake)["missing"] == []
 
 
+def test_reconcile_old_batch_preserves_newer_winner_and_receipt(
+    export_lake, postgres_control_store, monkeypatch
+):
+    """Restoring A appends its evidence but cannot replace later winner B."""
+    from drover.server.lake import exporter as exporter_module
+    from drover.server.lake.reconcile import reconcile_acknowledged
+
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    original = exporter_module.project_control_event
+
+    def same_key(row, session):
+        event = original(row, session)
+        event["dedup_key"] = "reconcile-shared-key"
+        if row["event_id"] == "event-0":
+            event.update(timestamp="2026-10-15T09:00:00+00:00", date="2026-10-15")
+        else:
+            event.update(timestamp="2026-10-15T10:00:00+00:00", date="2026-10-15")
+        return event
+
+    monkeypatch.setattr(exporter_module, "project_control_event", same_key)
+    registry = HarnessRegistry(control_path)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+        registry.append_event(
+            session_id="export-session",
+            event_id="event-new",
+            event_type="assistant_output",
+            payload={"text": "newer winner"},
+            seq=2,
+            content_preview="newer winner",
+        )
+        assert exporter.run_once()["acknowledged"] == 1
+    with control_plane_connection(control_path) as con:
+        old_batch, old_receipt = con.execute(
+            "SELECT x.batch_id,x.receipt_sha256 FROM lake_export_batches x "
+            "JOIN control_outbox_batches b USING (batch_id) "
+            "ORDER BY b.created_at LIMIT 1"
+        ).fetchone()
+    with lake_connection(export_lake, read_only=False) as con:
+        con.execute(
+            "DELETE FROM lake.export_batch_receipts WHERE batch_id=?", [old_batch]
+        )
+        con.execute(
+            "DELETE FROM lake.export_event_versions WHERE _import_file=?",
+            ["outbox:" + old_batch],
+        )
+        con.execute(
+            "DELETE FROM lake.control_outbox_batches WHERE _import_file=?",
+            ["outbox:" + old_batch],
+        )
+        before_daily = con.execute(
+            "SELECT event_count,first_event_at,last_event_at FROM lake.activity_daily"
+        ).fetchall()
+
+    repaired = reconcile_acknowledged(control_path, export_lake, apply=True)
+
+    assert repaired["repaired"] == [{"batch_id": old_batch, "replayed": False}]
+    with lake_connection(export_lake) as con:
+        assert con.execute(
+            "SELECT id,content FROM lake.agent_events WHERE dedup_key='reconcile-shared-key'"
+        ).fetchall() == [("event-new", "newer winner")]
+        assert con.execute(
+            "SELECT count(*) FROM lake.export_event_versions WHERE _import_file=?",
+            ["outbox:" + old_batch],
+        ).fetchone() == (1,)
+        assert (
+            con.execute(
+                "SELECT event_count,first_event_at,last_event_at FROM lake.activity_daily"
+            ).fetchall()
+            == before_daily
+        )
+    with control_plane_connection(control_path) as con:
+        assert con.execute(
+            "SELECT receipt_sha256 FROM lake_export_batches WHERE batch_id=?",
+            [old_batch],
+        ).fetchone() == (old_receipt,)
+
+
 def test_reconcile_refuses_corrupt_acknowledged_frozen_input(
     export_lake, postgres_control_store
 ):

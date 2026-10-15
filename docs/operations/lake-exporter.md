@@ -302,9 +302,12 @@ backup choice, then repeat with `--apply`. This republishes the exact frozen
 input document, not current source rows, and the exporter merge ranks it with
 the existing `export_event_versions` rules, so an older repaired batch cannot
 overwrite a newer canonical row. The command is idempotent and dry-run by
-default. It does not waive serving-proof rollback detection: a missing proof or
-checkpoint baseline remains a fail-closed condition requiring normal offline
-verification before serving.
+default. The re-export receipt is derived only from that frozen input; if its
+stored control digest differs, reconciliation fails closed with
+`lake_reconcile_receipt_mismatch` rather than replacing the acknowledgement's
+receipt. It does not waive serving-proof rollback detection: a missing proof
+or checkpoint baseline remains a fail-closed condition requiring normal
+offline verification before serving.
 
 Deployment needs no new environment variables. The recovery deadline config
 is optional. Restart the upgraded hub to load the supervisor and apply control
