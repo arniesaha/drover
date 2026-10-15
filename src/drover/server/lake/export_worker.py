@@ -168,12 +168,17 @@ def _merge_events(con):
         + row_hash_expression(EVENT_SCHEMA)
         + " AS _winner_hash FROM export_events) e) WHERE rank=1"
     )
-    assignments = ",".join(f'"{c}"=s."{c}"' for c in columns)
-    con.execute(
-        f"""MERGE INTO lake.agent_events t USING merged_winners s ON t.dedup_key=s.dedup_key
-        WHEN MATCHED AND t._row_sha256 IS DISTINCT FROM s._row_sha256 THEN UPDATE SET {assignments}
-        WHEN NOT MATCHED THEN INSERT BY NAME"""
-    )
+    # DuckLake cannot inline MERGE writes, so a two-row export used to create a
+    # new target Parquet file even after the other export tables were inlined.
+    # The explicit delete/insert has the same affected-key winner semantics in
+    # this surrounding transaction, while allowing tiny deletes and inserts to
+    # use the table's persisted inlining threshold.
+    con.execute("""DELETE FROM lake.agent_events t USING merged_winners s
+        WHERE t.dedup_key=s.dedup_key
+        AND t._row_sha256 IS DISTINCT FROM s._row_sha256""")
+    con.execute("""INSERT INTO lake.agent_events BY NAME
+        SELECT s.* FROM merged_winners s LEFT JOIN lake.agent_events t
+        ON t.dedup_key=s.dedup_key WHERE t.dedup_key IS NULL""")
 
 
 def export(spec, document, *, before_commit=None, report_phase=lambda phase: None):

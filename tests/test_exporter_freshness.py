@@ -251,6 +251,76 @@ def test_repeated_live_hangs_exhaust_shared_restart_budget(monkeypatch, tmp_path
         worker.stop()
 
 
+def test_recovery_attempt_stuck_before_owner_requests_server_restart(
+    monkeypatch, tmp_path
+):
+    """A replacement that blocks before ownership cannot leave export stopped."""
+    import time
+
+    from drover.server.lake import task_projection
+
+    monkeypatch.setattr(lifecycle, "FRESHNESS_POLL_SECONDS", 0.005)
+    monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: None)
+    monkeypatch.setattr(lifecycle, "_check_export_catalog", lambda *a: None)
+    monkeypatch.setattr(lifecycle, "read_freshness", lambda *a: {})
+    monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
+    monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
+    entered, release, shutdown = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockingStartupExporter:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            entered.set()
+            assert release.wait(2)
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(lifecycle, "LakeOutboxExporter", BlockingStartupExporter)
+    worker = lifecycle.ExporterLifecycle(
+        SimpleNamespace(
+            duckdb_path=tmp_path,
+            analytics=SimpleNamespace(
+                retire_legacy_writers=False, exporter_recovery_deadline_seconds=0.03
+            ),
+        )
+    )
+    supervisor = threading.Thread(target=worker._supervise, args=(shutdown,))
+    monitor = threading.Thread(target=worker._watch_freshness, args=(shutdown,))
+    try:
+        supervisor.start()
+        assert entered.wait(1)
+        monitor.start()
+        assert shutdown.wait(1), worker.health()
+        assert worker.health()["last_error"] == "lake_export_recovery_deadline"
+        assert worker.health()["recovery_escalation_count"] == 1
+    finally:
+        release.set()
+        supervisor.join(2)
+        monitor.join(2)
+
+
+def test_restart_request_does_not_wait_for_wedged_supervisor():
+    worker = lifecycle.ExporterLifecycle(SimpleNamespace())
+
+    class WedgedSupervisor:
+        joined = False
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout):
+            self.joined = True
+
+    worker._thread = WedgedSupervisor()
+    worker._restart_requested = True
+    worker.stop()
+    assert not worker._thread.joined
+
+
 def test_unresponsive_cancellation_stops_without_replacement(monkeypatch):
     worker = lifecycle.ExporterLifecycle(SimpleNamespace())
     worker._running = True

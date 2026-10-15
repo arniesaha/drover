@@ -215,7 +215,7 @@ def provision_exporter_cmd(data_root, catalog_dsn_env, exporter_role):
 
     spec = spec_from_options(data_root, catalog_dsn_env)
     try:
-        provision_exporter(spec, exporter_role=exporter_role)
+        result = provision_exporter(spec, exporter_role=exporter_role)
     except LakeError as exc:
         raise _lake_failure(exc, data_root) from None
     except Exception as exc:
@@ -228,7 +228,7 @@ def provision_exporter_cmd(data_root, catalog_dsn_env, exporter_role):
     click.echo(
         json.dumps(
             {
-                "provisioned": True,
+                **result,
                 "exporter_role": exporter_role,
                 "next": "grant roles, then run lake verify (serving proof invalidated)",
             },
