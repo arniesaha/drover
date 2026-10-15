@@ -11,9 +11,10 @@ from test_lake_runtime import lake_spec
 
 from drover.server.db import control_plane_connection
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.lake.export_guard import APPLICATION_PREFIX
+from drover.server.lake.export_guard import APPLICATION_PREFIX, activate
 from drover.server.lake.export_worker import export
 from drover.server.lake.exporter import LakeOutboxExporter, provision_exporter
+from drover.server.lake.fence import MutationFence
 from drover.server.lake.rebuild import OUTBOX_SCHEMA
 from drover.server.lake.rebuild_worker import LINEAGE, POLICY_SCHEMA
 from drover.server.lake.runtime import (
@@ -80,10 +81,10 @@ class CrashBeforeAck(RuntimeError):
     pass
 
 
-def test_tiny_export_batches_are_inlined_after_provisioning(
+def test_tiny_export_batches_inline_only_append_only_tables_after_provisioning(
     export_lake, postgres_control_store
 ):
-    """A two-row export must not add five tiny Parquet files to the catalog."""
+    """The mutable targets stay Parquet; append-only targets stay inlined."""
     control_path, _ = postgres_control_store
     seed(control_path)
 
@@ -101,18 +102,16 @@ def test_tiny_export_batches_are_inlined_after_provisioning(
             "export_batch_receipts",
         )
     } == {
-        "agent_events": 0,
-        "activity_daily": 0,
+        "agent_events": 1,
+        "activity_daily": 1,
         "control_outbox_batches": 0,
         "export_event_versions": 0,
         "export_batch_receipts": 0,
     }
 
 
-def test_existing_small_file_history_stops_growing_after_retuning(
-    export_lake, postgres_control_store
-):
-    """Many old tiny snapshots do not make the next tiny merge create more files."""
+def test_retuning_inlines_only_append_only_tables(export_lake, postgres_control_store):
+    """Retuning stops file growth only where DuckLake deletes are impossible."""
     control_path, _ = postgres_control_store
     seed(control_path, count=1)
     registry = HarnessRegistry(control_path)
@@ -155,7 +154,15 @@ def test_existing_small_file_history_stops_growing_after_retuning(
     )
     with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
         assert exporter.run_once()["acknowledged"] == 1
-    assert lake_file_counts(export_lake) == before
+    after = lake_file_counts(export_lake)
+    assert after["agent_events"] == before["agent_events"] + 1
+    assert after["activity_daily"] >= before["activity_daily"]
+    for table in (
+        "control_outbox_batches",
+        "export_event_versions",
+        "export_batch_receipts",
+    ):
+        assert after[table] == before[table]
 
 
 def test_crash_before_ack_replays_receipt_without_second_commit(
@@ -424,6 +431,88 @@ def test_limited_exporter_role_can_activate_and_commit(
                 con.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
 
 
+def test_least_privilege_exporter_updates_inlined_and_parquet_rows_after_provisioning(
+    lake_spec, monkeypatch
+):
+    """Real DuckLake 1.5.5 DML stays safe without exporter schema CREATE."""
+    from uuid import uuid4
+
+    from psycopg import sql
+
+    from drover.server.lake.catalog_roles import provision_catalog_roles
+
+    with lake_connection(lake_spec, read_only=False, create=True) as con:
+        configure_catalog(con)
+        create_table(con, "agent_events", POLICY_SCHEMA | LINEAGE, day_partition=True)
+        create_table(con, "control_outbox_batches", OUTBOX_SCHEMA | LINEAGE)
+    roles = provision_catalog_roles(lake_spec, prefix="inline_dml_" + uuid4().hex[:12])[
+        "roles"
+    ]
+    try:
+        provision_exporter(lake_spec, exporter_role=roles["exporter"])
+        exporter_env = "DROVER_INLINE_DML_EXPORTER_DSN"
+        monkeypatch.setenv(
+            exporter_env,
+            make_conninfo(lake_spec.dsn(), options="-c role=" + roles["exporter"]),
+        )
+        exporter_spec = replace(lake_spec, catalog_dsn_env=exporter_env)
+        with psycopg.connect(exporter_spec.dsn(), autocommit=True) as catalog:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                catalog.execute("CREATE TABLE exporter_must_not_create (id INT)")
+
+        with MutationFence(exporter_spec.dsn()) as fence:
+            _, token = activate(fence)
+            active_env = "DROVER_INLINE_DML_ACTIVE_DSN"
+            monkeypatch.setenv(
+                active_env,
+                make_conninfo(
+                    exporter_spec.dsn(),
+                    application_name=APPLICATION_PREFIX + token,
+                ),
+            )
+            active_spec = replace(exporter_spec, catalog_dsn_env=active_env)
+            with lake_connection(active_spec, read_only=False) as con:
+                # This append-only table has the ten-row inlining limit. Its
+                # inline update/delete never needs DuckLake's file-delete DDL.
+                con.execute(
+                    "INSERT INTO lake.control_outbox_batches (event_id) VALUES ('inline')"
+                )
+                con.execute(
+                    "UPDATE lake.control_outbox_batches SET event_id='inline-updated' "
+                    "WHERE event_id='inline'"
+                )
+                con.execute(
+                    "DELETE FROM lake.control_outbox_batches WHERE event_id='inline-updated'"
+                )
+
+                # The mutable canonical table remains at zero inlining. Even a
+                # small batch is Parquet-resident, so its update/delete uses a
+                # Parquet delete file rather than inlined-delete catalog DDL.
+                con.execute(
+                    "INSERT INTO lake.agent_events (id) "
+                    "SELECT 'parquet-' || range::VARCHAR FROM range(11)"
+                )
+                assert (
+                    con.execute(
+                        "SELECT file_count FROM ducklake_table_info('lake') "
+                        "WHERE table_name='agent_events'"
+                    ).fetchone()[0]
+                    >= 1
+                )
+                con.execute(
+                    "UPDATE lake.agent_events SET id='parquet-updated' "
+                    "WHERE id='parquet-0'"
+                )
+                con.execute("DELETE FROM lake.agent_events WHERE id='parquet-1'")
+    finally:
+        with psycopg.connect(lake_spec.dsn(), autocommit=True) as con:
+            for role in roles.values():
+                con.execute(
+                    sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(role))
+                )
+                con.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
 def test_invalid_payload_hash_never_reaches_lake(export_lake, postgres_control_store):
     control_path, _ = postgres_control_store
     seed(control_path, count=1)
@@ -510,24 +599,27 @@ def unprovisioned_lake(lake_spec):
     return lake_spec
 
 
-def _provision_cli(spec, monkeypatch, *, role="drover_export_group"):
+def _provision_cli(spec, monkeypatch, *, role="drover_export_group", dry_run=False):
     from click.testing import CliRunner
 
     from drover.server.lake import cli as lake_cli
 
     monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(spec.extension_dir))
     monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", spec.engine_sha256)
+    args = [
+        "provision-exporter",
+        "--data-root",
+        str(spec.data_root),
+        "--catalog-dsn-env",
+        spec.catalog_dsn_env,
+        "--exporter-role",
+        role,
+    ]
+    if dry_run:
+        args.append("--dry-run")
     return CliRunner().invoke(
         lake_cli.lake_cmd,
-        [
-            "provision-exporter",
-            "--data-root",
-            str(spec.data_root),
-            "--catalog-dsn-env",
-            spec.catalog_dsn_env,
-            "--exporter-role",
-            role,
-        ],
+        args,
     )
 
 
@@ -564,6 +656,68 @@ def test_provision_exporter_cli_reports_missing_tables(lake_spec, monkeypatch):
     result = _provision_cli(lake_spec, monkeypatch)
     assert result.exit_code != 0
     assert "lake_export_tables_missing" in result.output
+
+
+def test_provision_exporter_preflights_admin_temp_before_mutating(
+    unprovisioned_lake, monkeypatch
+):
+    from psycopg import sql
+
+    role = "no_temp_" + unprovisioned_lake.data_root.parent.name[-8:].replace("-", "_")
+    with psycopg.connect(unprovisioned_lake.dsn(), autocommit=True) as catalog:
+        database = catalog.execute("SELECT current_database()").fetchone()[0]
+        catalog.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(role)))
+        catalog.execute(
+            sql.SQL("REVOKE TEMPORARY ON DATABASE {} FROM PUBLIC").format(
+                sql.Identifier(database)
+            )
+        )
+        catalog.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                sql.Identifier(database), sql.Identifier(role)
+            )
+        )
+    try:
+        env = "DROVER_NO_TEMP_ADMIN_DSN"
+        monkeypatch.setenv(
+            env, make_conninfo(unprovisioned_lake.dsn(), options="-c role=" + role)
+        )
+        with pytest.raises(LakeError, match="lake_export_admin_temp_required"):
+            provision_exporter(replace(unprovisioned_lake, catalog_dsn_env=env))
+        with lake_connection(unprovisioned_lake) as con:
+            assert con.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_catalog='lake' AND table_name='export_batch_receipts'"
+            ).fetchone() == (0,)
+    finally:
+        with psycopg.connect(unprovisioned_lake.dsn(), autocommit=True) as catalog:
+            catalog.execute(
+                sql.SQL("GRANT TEMPORARY ON DATABASE {} TO PUBLIC").format(
+                    sql.Identifier(database)
+                )
+            )
+            catalog.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
+            catalog.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+def test_provision_exporter_cli_dry_run_prints_storage_and_grants(
+    lake_spec, monkeypatch
+):
+    import json
+
+    result = _provision_cli(lake_spec, monkeypatch, dry_run=True)
+    assert result.exit_code == 0, result.output
+    plan = json.loads(result.output)
+    assert plan["dry_run"] is True
+    assert plan["options"]["data_inlining_row_limit"] == {
+        "agent_events": 0,
+        "activity_daily": 0,
+        "control_outbox_batches": 10,
+        "export_event_versions": 10,
+        "export_batch_receipts": 10,
+    }
+    assert plan["options"]["expire_older_than"] == "30 days"
+    assert any("TEMPORARY" in grant for grant in plan["grants"])
 
 
 def test_provision_exporter_cli_requires_runtime_env(tmp_path, monkeypatch):

@@ -47,16 +47,16 @@ from .runtime import LakeError, LakeSpec, create_table, lake_connection, verify_
 
 MAX_INPUT_BYTES = 32 * 1024**2
 EXPORT_INLINE_ROW_LIMIT = 10
-EXPORT_INLINE_TABLES = (
+EXPORT_MUTABLE_TABLES = (
     "agent_events",
     "activity_daily",
+)
+EXPORT_INLINE_TABLES = (
     "control_outbox_batches",
     "export_event_versions",
     "export_batch_receipts",
 )
 EXPORT_INLINE_PROBES = {
-    "agent_events": ("id", "__drover_inline_probe_agent_events__"),
-    "activity_daily": ("date", "__drover_inline_probe_activity_daily__"),
     "control_outbox_batches": (
         "event_id",
         "__drover_inline_probe_control_outbox_batches__",
@@ -72,14 +72,43 @@ EXPORT_INLINE_PROBES = {
 }
 
 
+def _catalog_temp_preflight(spec: LakeSpec) -> None:
+    """Require catalog-admin TEMP before DuckLake mutates anything.
+
+    DuckLake 1.5.5 uses a PostgreSQL temporary table while applying table
+    options. Check that before taking the mutation fence or opening the writer,
+    so a missing grant has a stable, actionable failure and no partial change.
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(spec.dsn(), autocommit=True, connect_timeout=5) as con:
+            allowed = con.execute(
+                "SELECT has_database_privilege(current_user, current_database(), 'TEMP')"
+            ).fetchone()[0]
+    except Exception as exc:
+        raise LakeError("lake_export_admin_temp_preflight_failed") from exc
+    if not allowed:
+        raise LakeError(
+            "lake_export_admin_temp_required",
+            "catalog administrator lacks TEMP; GRANT TEMPORARY ON DATABASE to the admin role",
+        )
+
+
 def configure_export_storage(con) -> None:
     """Persist small-batch inlining and finite snapshot retention for exports.
 
-    DuckLake otherwise emits a file for each table touched by every tiny export.
-    The exporter commonly publishes one or two rows, so leave those rows in the
-    PostgreSQL catalog; larger batches still become Parquet files. This is an
-    explicit provisioning/retuning action, never startup work.
+    DuckLake 1.5.5 emits catalog DDL on a small delete of a Parquet row. The
+    least-privilege exporter cannot safely use inlining for the two tables it
+    deletes from, so retain zero there. Its append-only tables can safely keep
+    one- or two-row writes in PostgreSQL; larger batches still become Parquet.
+    This is an explicit provisioning/retuning action, never startup work.
     """
+    for table in EXPORT_MUTABLE_TABLES:
+        con.execute(
+            "CALL lake.set_option('data_inlining_row_limit', 0, table_name => ?)",
+            [table],
+        )
     for table in EXPORT_INLINE_TABLES:
         con.execute(
             "CALL lake.set_option('data_inlining_row_limit', ?, table_name => ?)",
@@ -108,6 +137,7 @@ def provision_exporter(spec: LakeSpec, *, exporter_role: str | None = None):
     A repeat invocation never replaces tables or guard ownership. It only
     applies the current bounded-storage policy to an already-provisioned lake.
     """
+    _catalog_temp_preflight(spec)
     with MutationFence(spec.dsn()), lake_connection(spec, read_only=False) as con:
         names = {
             r[0]
