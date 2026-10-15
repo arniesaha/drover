@@ -1,5 +1,6 @@
 """Real exporter transactions on a private PG cluster and small fixture lake."""
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -80,16 +81,50 @@ def lake_file_counts(spec):
         )
 
 
-def test_maintenance_compacts_export_files_under_the_drained_fence(
-    export_lake, monkeypatch
-):
+def write_serving_proof(spec):
+    """Build the smallest real serving baseline for maintenance integration."""
+    from drover.server.lake.runtime import create_table
+    from drover.server.lake.serving_proof import catalog_identity
+
+    with lake_connection(spec, read_only=False) as con:
+        for table in ("agent_events_legacy_metadata", "provider_usage_snapshots"):
+            create_table(con, table, {"id": "VARCHAR"})
+        snapshot = con.execute(
+            "SELECT max(snapshot_id) FROM lake.snapshots()"
+        ).fetchone()[0]
+    verification = spec.data_root / "verification"
+    verification.mkdir(exist_ok=True)
+    report = json.dumps({"dry_run": False}).encode()
+    tables = {
+        table: {"rows": 0}
+        for table in (
+            "agent_events",
+            "agent_events_legacy_metadata",
+            "provider_usage_snapshots",
+            "control_outbox_batches",
+        )
+    }
+    (verification / "report.json").write_bytes(report)
+    (verification / "last-verify.json").write_text(json.dumps({"tables": tables}))
+    proof = {
+        "version": 1,
+        "catalog_id": catalog_identity(spec),
+        "data_root": str(spec.data_root.resolve()),
+        "snapshot": snapshot,
+        "report_sha256": hashlib.sha256(report).hexdigest(),
+        "tables": tables,
+    }
+    (verification / "serving-proof.json").write_text(json.dumps(proof, sort_keys=True))
+    return snapshot
+
+
+def test_maintenance_compacts_export_files_under_the_drained_fence(export_lake):
     """A catalog-admin operation reduces mutable export files without inlining."""
-    from drover.server.lake import serving_proof
     from drover.server.lake.maintenance import maintain_lake
 
     with lake_connection(export_lake, read_only=False) as con:
-        # Force this disposable fixture's historical snapshots eligible so the
-        # integration path proves expiry runs after compaction.
+        # Even with the catalog option shortened, maintenance preserves the
+        # normal 30-day time-travel window before considering its baseline.
         con.execute("CALL lake.set_option('expire_older_than', '0 seconds')")
         for i in range(80):
             con.execute(
@@ -98,27 +133,7 @@ def test_maintenance_compacts_export_files_under_the_drained_fence(
             )
     before = lake_file_counts(export_lake)["agent_events"]
 
-    with lake_connection(export_lake) as con:
-        snapshot = con.execute(
-            "SELECT max(snapshot_id) FROM lake.snapshots()"
-        ).fetchone()[0]
-    verification = export_lake.data_root / "verification"
-    verification.mkdir()
-    (verification / "serving-proof.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "catalog_id": serving_proof.catalog_identity(export_lake),
-                "data_root": str(export_lake.data_root.resolve()),
-                "snapshot": snapshot,
-            }
-        )
-    )
-    monkeypatch.setattr(
-        serving_proof,
-        "advance_checkpoint",
-        lambda *args, **kwargs: {"snapshot": snapshot + 1},
-    )
+    snapshot = write_serving_proof(export_lake)
 
     report = maintain_lake(export_lake, tables=("agent_events",))
 
@@ -126,7 +141,7 @@ def test_maintenance_compacts_export_files_under_the_drained_fence(
     assert before >= 80
     assert report["tables"]["agent_events"]["files_before"] == before
     assert after < before
-    assert report["snapshots_after"] < report["snapshots_before"]
+    assert report["snapshots_after"] == report["snapshots_before"] + 1
     assert report["baseline_snapshot"] == snapshot
 
 
@@ -152,6 +167,23 @@ def test_reconcile_repairs_acknowledged_batch_missing_from_restored_lake(
     assert repaired["repaired"] == [{"batch_id": plan["missing"][0], "replayed": False}]
     assert lake_counts(export_lake) == [1, 1, 1, 1]
     assert reconcile_acknowledged(control_path, export_lake)["missing"] == []
+
+
+def test_reconcile_refuses_corrupt_acknowledged_frozen_input(
+    export_lake, postgres_control_store
+):
+    """A bad durable input must not disappear from restore reconciliation."""
+    from drover.server.lake.reconcile import reconcile_acknowledged
+
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+    with control_plane_connection(control_path) as con:
+        con.execute("UPDATE lake_export_batches SET input_sha256='bad'")
+
+    with pytest.raises(LakeError, match="lake_reconcile_input_corrupt"):
+        reconcile_acknowledged(control_path, export_lake)
 
 
 @pytest.mark.acceptance_scale
@@ -219,6 +251,8 @@ print(json.dumps({'elapsed_seconds': round(monotonic() - started, 3), 'peak_rss_
             )
 
     before = fresh_merge_measure()
+
+    write_serving_proof(export_lake)
 
     report = maintain_lake(export_lake, tables=("agent_events",))
 

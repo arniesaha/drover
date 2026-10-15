@@ -7,15 +7,31 @@ import json
 from drover.server.control_outbox import canonical_payload, payload_sha256
 from drover.server.db import control_plane_connection
 
+from .export_guard import GUARD_SCHEMA
 from .export_worker import export, receipt_hash, validate_input
 from .fence import drained_mutation
 from .runtime import LakeError, LakeSpec, lake_connection
-from .serving_proof import catalog_identity
+
+
+def _export_catalog_id(spec):
+    """Match the durable id stamped into frozen export inputs, not schema UUID."""
+    import psycopg
+
+    try:
+        with psycopg.connect(spec.dsn(), connect_timeout=2) as con:
+            rows = con.execute(
+                f"SELECT catalog_id FROM {GUARD_SCHEMA}.ownership WHERE singleton"
+            ).fetchall()
+    except Exception:
+        raise LakeError("lake_reconcile_catalog_missing") from None
+    if len(rows) != 1:
+        raise LakeError("lake_reconcile_catalog_missing")
+    return str(rows[0][0])
 
 
 def missing_acknowledged(control_path, spec: LakeSpec):
     """Return immutable frozen inputs acknowledged for this catalog but absent in it."""
-    catalog_id = catalog_identity(spec)
+    catalog_id = _export_catalog_id(spec)
     with control_plane_connection(control_path, timeout=2) as control:
         rows = control.execute(
             """SELECT x.batch_id,x.input_json,x.input_sha256,x.receipt_sha256
@@ -38,7 +54,9 @@ def missing_acknowledged(control_path, spec: LakeSpec):
         }
     missing = []
     for batch_id, input_json, input_sha256, stored_receipt in rows:
-        if batch_id in found or payload_sha256(input_json) != input_sha256:
+        if payload_sha256(input_json) != input_sha256:
+            raise LakeError("lake_reconcile_input_corrupt")
+        if batch_id in found:
             continue
         document = json.loads(input_json)
         validate_input(document)

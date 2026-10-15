@@ -261,20 +261,25 @@ def _check_maintenance_receipts(directory, digest, proof, snapshots):
         raise ValueError()
 
 
-def advance_checkpoint(spec, digest, *, fence):
+def advance_checkpoint(spec, digest, *, fence, con=None):
     """Run the serving check at the lake head and record it as the checkpoint.
 
     Only the lake's single writer calls this, holding its mutation fence, so
-    nothing it did not check can be committed in between. The check runs in an
-    admitted serving child; a failure raises and leaves the old checkpoint.
+    nothing it did not check can be committed in between. The check normally
+    runs in an admitted serving child. Fenced maintenance supplies its
+    already-drained writer connection because its drain intentionally blocks a
+    child reader; a failure leaves the old checkpoint.
     """
-    from .query_process import query
+    if con is None:
+        from .query_process import query
 
-    record = query(
-        spec,
-        "SELECT 1",
-        serving={"verification_sha256": digest, "checkpoint": True},
-    )["checkpoint"]
+        record = query(
+            spec,
+            "SELECT 1",
+            serving={"verification_sha256": digest, "checkpoint": True},
+        )["checkpoint"]
+    else:
+        record = check_proof(spec, con, digest)
     if record["snapshot"] == record["from_snapshot"]:
         return None
     path = spec.data_root / "verification" / CHECKPOINT_NAME
