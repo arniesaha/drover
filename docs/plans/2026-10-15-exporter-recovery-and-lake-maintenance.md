@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11, psycopg, DuckDB/DuckLake 1.5.5, Click, pytest.
 
-**Spec:** `docs/superpowers/specs/2026-10-15-exporter-recovery-and-lake-maintenance-design.md`
+**Spec:** `docs/design/2026-10-15-exporter-recovery-and-lake-maintenance.md`
 
 ## Global Constraints
 

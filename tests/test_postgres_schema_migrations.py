@@ -19,12 +19,14 @@ from __future__ import annotations
 import hashlib
 
 from drover.server.postgres_schema import (
+    EXPORTER_RESTART_GUARD_MIGRATION,
     EXPORTER_FRESHNESS_MIGRATION,
     PROFILE_MIGRATION,
 )
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    EXPORTER_RESTART_GUARD_MIGRATION: "095352196aeecf2c6f86e819465f33f993e54b4bcfceda46dc65f9bb245d31b8",
     18: "6e9b1d706f78fd8674e913da95ca6bc5ceb88112b0c7c5766f434f5eceed01dc",
     EXPORTER_FRESHNESS_MIGRATION: "83b89a5b043a659612309179679d835d35a2c09c4dfd36bb801c7488de27352d",
     17: "fda9bab1f66135d72af01bbe366c9ecc7edda43161498e602a0c83dd63e5d9a0",

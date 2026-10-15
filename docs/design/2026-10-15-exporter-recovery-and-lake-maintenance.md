@@ -2,7 +2,7 @@
 
 ## Purpose and constraints
 
-The DuckLake exporter must not leave the Studio hub running with export stopped
+The DuckLake exporter must not leave the managed hub running with export stopped
 after in-process recovery is exhausted.  The live catalog has accumulated
 8,560 snapshots and 42,792 catalog data-file rows in nine days, so the repair
 must also provide an explicit, fenced operator maintenance path.  The exporter
