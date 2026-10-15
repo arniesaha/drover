@@ -313,3 +313,46 @@ def maintain_cmd(data_root, catalog_dsn_env, dry_run):
     except LakeError as exc:
         raise _lake_failure(exc, data_root) from None
     click.echo(json.dumps(report, indent=2))
+
+
+@lake_cmd.command("reconcile")
+@click.option(
+    "--data-root", type=click.Path(exists=True, path_type=Path), required=True
+)
+@click.option(
+    "--catalog-dsn-env", required=True, help="Catalog ADMIN DSN environment variable."
+)
+@click.option(
+    "--control-dsn-env",
+    required=True,
+    help="Control PostgreSQL DSN environment variable.",
+)
+@click.option("--control-schema", default="drover_control", show_default=True)
+@click.option(
+    "--apply",
+    is_flag=True,
+    help="Republish the listed frozen batches; dry-run is the default.",
+)
+def reconcile_cmd(data_root, catalog_dsn_env, control_dsn_env, control_schema, apply):
+    """Find acknowledged control batches missing from this lake and repair them."""
+    from drover.config import ControlStoreConfig
+    from drover.server.control_store import close_control_store, configure_control_store
+
+    from .reconcile import reconcile_acknowledged
+
+    # Lake tools deliberately do not resolve hub config. Register this short-
+    # lived, explicitly named PG connection only for the operator command.
+    control_path = data_root / ".reconcile-control-store"
+    configure_control_store(
+        control_path,
+        ControlStoreConfig("postgres", control_dsn_env, 1, 1, 5.0, 5.0, control_schema),
+    )
+    try:
+        report = reconcile_acknowledged(
+            control_path, spec_from_options(data_root, catalog_dsn_env), apply=apply
+        )
+    except LakeError as exc:
+        raise _lake_failure(exc, data_root) from None
+    finally:
+        close_control_store(control_path)
+    click.echo(json.dumps(report, indent=2))

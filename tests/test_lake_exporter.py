@@ -80,8 +80,11 @@ def lake_file_counts(spec):
         )
 
 
-def test_maintenance_compacts_export_files_under_the_drained_fence(export_lake):
+def test_maintenance_compacts_export_files_under_the_drained_fence(
+    export_lake, monkeypatch
+):
     """A catalog-admin operation reduces mutable export files without inlining."""
+    from drover.server.lake import serving_proof
     from drover.server.lake.maintenance import maintain_lake
 
     with lake_connection(export_lake, read_only=False) as con:
@@ -95,6 +98,28 @@ def test_maintenance_compacts_export_files_under_the_drained_fence(export_lake):
             )
     before = lake_file_counts(export_lake)["agent_events"]
 
+    with lake_connection(export_lake) as con:
+        snapshot = con.execute(
+            "SELECT max(snapshot_id) FROM lake.snapshots()"
+        ).fetchone()[0]
+    verification = export_lake.data_root / "verification"
+    verification.mkdir()
+    (verification / "serving-proof.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "catalog_id": serving_proof.catalog_identity(export_lake),
+                "data_root": str(export_lake.data_root.resolve()),
+                "snapshot": snapshot,
+            }
+        )
+    )
+    monkeypatch.setattr(
+        serving_proof,
+        "advance_checkpoint",
+        lambda *args, **kwargs: {"snapshot": snapshot + 1},
+    )
+
     report = maintain_lake(export_lake, tables=("agent_events",))
 
     after = lake_file_counts(export_lake)["agent_events"]
@@ -102,6 +127,31 @@ def test_maintenance_compacts_export_files_under_the_drained_fence(export_lake):
     assert report["tables"]["agent_events"]["files_before"] == before
     assert after < before
     assert report["snapshots_after"] < report["snapshots_before"]
+    assert report["baseline_snapshot"] == snapshot
+
+
+def test_reconcile_repairs_acknowledged_batch_missing_from_restored_lake(
+    export_lake, postgres_control_store
+):
+    """A control acknowledgement is not mistaken for present lake evidence."""
+    from drover.server.lake.reconcile import reconcile_acknowledged
+
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+    with lake_connection(export_lake, read_only=False) as con:
+        con.execute("DELETE FROM lake.export_batch_receipts")
+        con.execute("DELETE FROM lake.export_event_versions")
+        con.execute("DELETE FROM lake.control_outbox_batches")
+        con.execute("DELETE FROM lake.agent_events")
+
+    plan = reconcile_acknowledged(control_path, export_lake)
+    assert plan["dry_run"] and len(plan["missing"]) == 1
+    repaired = reconcile_acknowledged(control_path, export_lake, apply=True)
+    assert repaired["repaired"] == [{"batch_id": plan["missing"][0], "replayed": False}]
+    assert lake_counts(export_lake) == [1, 1, 1, 1]
+    assert reconcile_acknowledged(control_path, export_lake)["missing"] == []
 
 
 @pytest.mark.acceptance_scale
