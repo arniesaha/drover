@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-10-14
+
+### Changed
+
+- Empty work-decision sections are hidden on the iOS Sessions home screen (#625).
+- DuckLake export recovery now handles small batches reliably by keeping tiny catalog writes inline and adding clearer exporter health signals (#627).
+
+### Fixed
+
+- The exporter fails fast instead of hanging during a recovery, and catalog snapshots now expire after 30 days (#627).
+
+### Upgrade notes
+
+- Restart the hub after upgrading, then run `lake provision-exporter` once with the catalog admin DSN to retune existing export tables.
+- Upgrade harnessd hosts, including Studio and NAS.
+
+
 ## [0.6.9] - 2026-10-14
 
 ### Added
