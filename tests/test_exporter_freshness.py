@@ -96,6 +96,54 @@ def test_supervisor_cap_and_backoff(monkeypatch):
     assert shutdown.is_set()
 
 
+def test_exporter_restart_budget_is_durable_and_guards_the_fourth_exit(
+    pg_control_path,
+):
+    """A replacement process cannot reset the service-manager crash budget."""
+    from drover.server.lake.lifecycle import record_server_restart_request
+
+    attempts = [record_server_restart_request(pg_control_path) for _ in range(4)]
+
+    assert [attempt.allowed for attempt in attempts] == [True, True, True, False]
+    assert [attempt.requests_last_hour for attempt in attempts] == [1, 2, 3, 3]
+    assert attempts[-1].next_restart_at is not None
+
+
+def test_exhausted_recovery_exits_nonzero_until_crash_loop_is_guarded(
+    monkeypatch, tmp_path
+):
+    from drover.server.lake import lifecycle
+
+    worker = lifecycle.ExporterLifecycle(SimpleNamespace(duckdb_path=tmp_path))
+    shutdown = threading.Event()
+    decisions = iter(
+        [
+            lifecycle.RestartBudget(allowed=True, requests_last_hour=1),
+            lifecycle.RestartBudget(
+                allowed=False,
+                requests_last_hour=3,
+                next_restart_at="2026-10-15T01:00:00+00:00",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        lifecycle, "record_server_restart_request", lambda _: next(decisions)
+    )
+
+    worker._request_restart(shutdown)
+    assert shutdown.is_set()
+    assert worker.server_exit_code() == 75
+
+    shutdown.clear()
+    worker._restart_requested = False
+    worker._request_restart(shutdown)
+    health = worker.health()
+    assert not shutdown.is_set()
+    assert worker.server_exit_code() is None
+    assert health["recovery_crash_loop_guarded"] is True
+    assert health["recovery_restart_requests_last_hour"] == 3
+
+
 def test_readyz_exporter_status_is_separate(monkeypatch, tmp_path):
     from drover.server.metrics import MetricsCollector
     from drover.server.readiness import ReadinessProbe
@@ -204,6 +252,11 @@ def test_repeated_live_hangs_exhaust_shared_restart_budget(monkeypatch, tmp_path
     monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: None)
     monkeypatch.setattr(lifecycle, "_check_export_catalog", lambda *a: None)
     monkeypatch.setattr(lifecycle, "read_freshness", lambda *a: {})
+    monkeypatch.setattr(
+        lifecycle,
+        "record_server_restart_request",
+        lambda _: lifecycle.RestartBudget(allowed=True, requests_last_hour=1),
+    )
     monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
     monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
     starts, exits = [], []
@@ -263,6 +316,11 @@ def test_recovery_attempt_stuck_before_owner_requests_server_restart(
     monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: None)
     monkeypatch.setattr(lifecycle, "_check_export_catalog", lambda *a: None)
     monkeypatch.setattr(lifecycle, "read_freshness", lambda *a: {})
+    monkeypatch.setattr(
+        lifecycle,
+        "record_server_restart_request",
+        lambda _: lifecycle.RestartBudget(allowed=True, requests_last_hour=1),
+    )
     monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
     monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
     entered, release, shutdown = threading.Event(), threading.Event(), threading.Event()

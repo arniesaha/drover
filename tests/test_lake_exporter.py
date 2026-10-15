@@ -1,5 +1,8 @@
 """Real exporter transactions on a private PG cluster and small fixture lake."""
 
+import json
+import subprocess
+import sys
 from dataclasses import replace
 
 import duckdb
@@ -75,6 +78,103 @@ def lake_file_counts(spec):
                 "SELECT table_name,file_count FROM ducklake_table_info('lake')"
             ).fetchall()
         )
+
+
+def test_maintenance_compacts_export_files_under_the_drained_fence(export_lake):
+    """A catalog-admin operation reduces mutable export files without inlining."""
+    from drover.server.lake.maintenance import maintain_lake
+
+    with lake_connection(export_lake, read_only=False) as con:
+        # Force this disposable fixture's historical snapshots eligible so the
+        # integration path proves expiry runs after compaction.
+        con.execute("CALL lake.set_option('expire_older_than', '0 seconds')")
+        for i in range(80):
+            con.execute(
+                "INSERT INTO lake.agent_events (id, date) VALUES (?, '2026-10-15')",
+                [f"maintenance-{i}"],
+            )
+    before = lake_file_counts(export_lake)["agent_events"]
+
+    report = maintain_lake(export_lake, tables=("agent_events",))
+
+    after = lake_file_counts(export_lake)["agent_events"]
+    assert before >= 80
+    assert report["tables"]["agent_events"]["files_before"] == before
+    assert after < before
+    assert report["snapshots_after"] < report["snapshots_before"]
+
+
+@pytest.mark.acceptance_scale
+def test_maintenance_scale_fixture_measures_merge_before_and_after_compaction(
+    export_lake,
+):
+    """A realistic tiny-file history makes the maintenance effect observable."""
+    from drover.server.lake.maintenance import maintain_lake
+
+    def fresh_merge_measure():
+        # An exec'd child avoids attributing compaction's own allocator cache to
+        # the after probe, matching the exporter architecture's fresh workers.
+        script = """
+import json, os, sys, threading
+from pathlib import Path
+from time import monotonic
+import psutil
+from drover.server.lake.runtime import LakeSpec, lake_connection
+spec_data = json.loads(sys.argv[1])
+spec = LakeSpec(spec_data['catalog_dsn_env'], Path(spec_data['data_root']), Path(spec_data['extension_dir']), spec_data['engine_sha256'])
+with lake_connection(spec, read_only=False) as con:
+    process = psutil.Process(os.getpid())
+    baseline = process.memory_info().rss
+    peak = [baseline]
+    stop = threading.Event()
+    def sample():
+        while not stop.wait(0.005): peak[0] = max(peak[0], process.memory_info().rss)
+    sampler = threading.Thread(target=sample)
+    sampler.start()
+    started = monotonic()
+    try:
+        con.execute('BEGIN')
+        con.execute("DELETE FROM lake.agent_events WHERE id = 'scale-0'")
+        con.execute("INSERT INTO lake.agent_events (id, date) VALUES ('scale-0', '2026-10-15')")
+        con.execute('COMMIT')
+    finally:
+        stop.set(); sampler.join()
+print(json.dumps({'elapsed_seconds': round(monotonic() - started, 3), 'peak_rss_bytes': peak[0], 'rss_delta_bytes': peak[0] - baseline}))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                json.dumps(
+                    {
+                        "catalog_dsn_env": export_lake.catalog_dsn_env,
+                        "data_root": str(export_lake.data_root),
+                        "extension_dir": str(export_lake.extension_dir),
+                        "engine_sha256": export_lake.engine_sha256,
+                    }
+                ),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(result.stdout)
+
+    with lake_connection(export_lake, read_only=False) as con:
+        for i in range(2_000):
+            con.execute(
+                "INSERT INTO lake.agent_events (id, date) VALUES (?, '2026-10-15')",
+                [f"scale-{i}"],
+            )
+
+    before = fresh_merge_measure()
+
+    report = maintain_lake(export_lake, tables=("agent_events",))
+
+    after = fresh_merge_measure()
+    print({"before": before, "after": after, "maintenance": report})
+    assert report["tables"]["agent_events"]["files_after"] < 2_000
 
 
 class CrashBeforeAck(RuntimeError):
