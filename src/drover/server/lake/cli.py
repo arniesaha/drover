@@ -219,6 +219,7 @@ def provision_exporter_cmd(data_root, catalog_dsn_env, exporter_role, dry_run):
     from .exporter import (
         EXPORT_INLINE_ROW_LIMIT,
         EXPORT_INLINE_TABLES,
+        EXPORT_MUTABLE_TABLES,
         provision_exporter,
     )
 
@@ -231,8 +232,11 @@ def provision_exporter_cmd(data_root, catalog_dsn_env, exporter_role, dry_run):
                     "exporter_role": exporter_role,
                     "options": {
                         "data_inlining_row_limit": {
-                            table: EXPORT_INLINE_ROW_LIMIT
-                            for table in EXPORT_INLINE_TABLES
+                            **{table: 0 for table in EXPORT_MUTABLE_TABLES},
+                            **{
+                                table: EXPORT_INLINE_ROW_LIMIT
+                                for table in EXPORT_INLINE_TABLES
+                            },
                         },
                         "expire_older_than": "30 days",
                     },

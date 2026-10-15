@@ -32,10 +32,13 @@ startup; it must complete before an exporter starts. The group name comes from
 `provision_catalog_roles`. No login/password is created. Retuning is safe to
 repeat; partially failed initial setup requires inspection.
 
-The added lake tables use Zstd and persist a ten-row inlining limit for the
-five tables written by an export. A one- or two-row export therefore stays in
-the catalog instead of creating five tiny Parquet files; larger batches still
-use Parquet. The catalog also retains snapshots for 30 days. Re-running
+The added lake tables use Zstd. The append-only `control_outbox_batches`,
+`export_event_versions`, and `export_batch_receipts` tables persist a ten-row
+inlining limit. `agent_events` and `activity_daily` remain at zero because an
+export deletes from them. Thus a one- or two-row export avoids three tiny
+Parquet files, while the two mutable targets stay safe for a least-privilege
+exporter. Larger writes use Parquet. The catalog also retains snapshots for 30
+days. Re-running
 `provision-exporter` against an already-provisioned catalog is the explicit,
 idempotent retuning action for these storage settings; it does not replace
 tables or the ownership guard.
@@ -91,9 +94,9 @@ catalog upgrades must retest it before changing the recorded runtime pins.
    canonical projection. Control identities retain `control:<event_id>` keys.
 4. In **one lake transaction**, replace affected canonical event keys with a
    delete/insert and append raw outbox rows, immutable deduplicated event
-   versions, and one immutable batch receipt. The delete/insert keeps DuckLake's
-   small export writes eligible for inlining while preserving MERGE winner
-   semantics.
+   versions, and one immutable batch receipt. On DuckLake 1.5.5 the mutable
+   targets deliberately remain Parquet-resident; the append-only writes remain
+   eligible for inlining while preserving MERGE winner semantics.
    The receipt binds catalog identity, contract version, batch/input hash,
    raw/canonical counts and normalized multiset hashes. Version rows preserve
    per-batch proof even when a later canonical winner replaces an active row.
@@ -231,15 +234,13 @@ after provisioning and the subsequent serving verification.
 
 ### DuckLake 1.5.5 least-privilege boundary
 
-Do **not** apply the inlining retune to a live least-privilege exporter on the
-pinned 1.5.5 extension yet. A disposable PostgreSQL rehearsal established that
-DuckLake emits `CREATE TABLE IF NOT EXISTS ducklake_inlined_delete_<id>` on
-every small delete of a Parquet-resident row, even after an administrator has
-created that table. PostgreSQL requires schema `CREATE` before evaluating that
-statement, so priming cannot make that path work while the exporter correctly
-has no schema `CREATE`. The safe choices are to keep the current zero-inlining
-setting, or wait for a DuckLake fix that omits the DDL after the table exists.
-Do not broaden the exporter role as a workaround.
+DuckLake 1.5.5 emits `CREATE TABLE IF NOT EXISTS
+ducklake_inlined_delete_<id>` for a small delete of a Parquet-resident row,
+even if an administrator already created that relation. PostgreSQL checks schema
+`CREATE` first, so priming cannot make that operation safe for the
+least-privilege exporter. Provisioning therefore keeps its two delete targets
+at a zero inlining limit and only inlines append-only tables. Do not broaden the
+exporter role as a workaround.
 
 For a catalog that already accumulated tiny files, schedule bounded
 `ducklake_merge_adjacent_files` maintenance for the five export tables. After
