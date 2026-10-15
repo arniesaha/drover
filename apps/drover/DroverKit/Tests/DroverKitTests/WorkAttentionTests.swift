@@ -15,9 +15,9 @@ func attentionItemJSON(kind: String = "agent_question", uncertain: Bool = false,
     """
 }
 
-func attentionResponse(_ items: [String]) throws -> WorkAttentionResponse {
+func attentionResponse(_ items: [String], truncated: Bool = false) throws -> WorkAttentionResponse {
     try JSONDecoder().decode(WorkAttentionResponse.self, from: Data("""
-    {"items":[\(items.joined(separator: ","))],"stale":false,"truncated":false,"poll_interval_seconds":120}
+    {"items":[\(items.joined(separator: ","))],"stale":false,"truncated":\(truncated),"poll_interval_seconds":120}
     """.utf8))
 }
 
@@ -25,14 +25,14 @@ private actor AttentionService: WorkAttentionServing {
     var snapshots: [WorkAttentionResponse]
     var sends = 0
     var reads = 0
-    var fails = false
+    var failure: DroverError?
     var failDecision = false
     init(_ snapshots: [WorkAttentionResponse]) { self.snapshots = snapshots }
-    func setFailure(_ value: Bool) { fails = value }
+    func setFailure(_ error: DroverError = .transport("offline")) { failure = error }
     func setDecisionFailure() { failDecision = true }
     func workAttention() async throws -> WorkAttentionResponse {
         reads += 1
-        if fails { throw DroverError.transport("offline") }
+        if let failure { throw failure }
         if snapshots.count > 1 { return snapshots.removeFirst() }
         return snapshots[0]
     }
@@ -45,6 +45,59 @@ private actor AttentionService: WorkAttentionServing {
 
 @MainActor
 struct WorkAttentionTests {
+    @Test func initialFailureIsHidden() async throws {
+        let service = AttentionService([try attentionResponse([])])
+        await service.setFailure()
+        let store = WorkAttentionStore(service: service)
+        #expect(!store.isVisible)
+        await store.refresh()
+        #expect(!store.isVisible)
+        #expect(store.message == nil)
+        #expect(!store.isReachable)
+    }
+
+    @Test func emptySuccessIsHiddenUnlessTruncated() async throws {
+        let service = AttentionService([try attentionResponse([], truncated: true), try attentionResponse([])])
+        let store = WorkAttentionStore(service: service)
+        await store.refresh()
+        #expect(store.isVisible)
+        #expect(store.truncated)
+        await store.refresh()
+        #expect(!store.isVisible)
+        #expect(store.isReachable)
+        #expect(store.message == nil)
+    }
+
+    @Test func failedRefreshKeepsItemsVisibleAndDisablesDecisions() async throws {
+        let full = try attentionResponse([attentionItemJSON()])
+        let service = AttentionService([full])
+        let store = WorkAttentionStore(service: service)
+        await store.refresh()
+        #expect(store.canDecide(full.items[0], action: "reject"))
+        await service.setFailure()
+        await store.refresh()
+        #expect(store.isVisible)
+        #expect(store.items == full.items)
+        #expect(!store.isReachable)
+        #expect(!store.canDecide(full.items[0], action: "reject"))
+        #expect(store.message == "Couldn't update. Pull to refresh.")
+    }
+
+    @Test func disabledWorkControlIsHiddenEvenWithCachedItems() async throws {
+        for detail in ["work control unavailable", "work control disabled"] {
+            let service = AttentionService([try attentionResponse([attentionItemJSON()], truncated: true)])
+            let store = WorkAttentionStore(service: service)
+            await store.refresh()
+            #expect(store.isVisible)
+            await service.setFailure(.httpStatus(503, detail))
+            await store.refresh()
+            #expect(!store.isVisible)
+            #expect(store.items.isEmpty)
+            #expect(!store.truncated)
+            #expect(store.message == nil)
+        }
+    }
+
     @Test func fourKindsHaveReadableTitlesSourceAndRefreshAge() throws {
         for kind in ["environment_approval", "draft_pr", "agent_question", "blocked", "failed_session"] {
             let item = try #require(attentionResponse([attentionItemJSON(kind: kind)]).items.first)
@@ -104,11 +157,13 @@ struct WorkAttentionTests {
         let service = AttentionService([full])
         let store = WorkAttentionStore(service: service)
         await store.refresh()
-        await service.setFailure(true)
+        await service.setFailure()
         _ = await store.decide(full.items[0], action: "reject")
         #expect(await service.sends == 0)
         #expect(!store.canDecide(full.items[0], action: "reject"))
         #expect(!store.isReachable)
+        #expect(store.isVisible)
+        #expect(store.message == "Couldn't update. Pull to refresh.")
         let uncertain = try attentionResponse([attentionItemJSON(uncertain: true)])
         let second = WorkAttentionStore(service: AttentionService([uncertain]))
         await second.refresh()

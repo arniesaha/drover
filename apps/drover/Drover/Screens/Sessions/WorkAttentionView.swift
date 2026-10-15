@@ -8,30 +8,30 @@ struct WorkAttentionList: View {
     @Environment(\.openURL) private var openURL
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Needs you").font(.title2.bold())
-            Button("Refresh Needs you") { Task { await store.refresh() } }
-                .disabled(store.isRefreshing || store.isDeciding)
-                .frame(minHeight: 44)
-            if let message = store.message { Text(message).font(.body) }
-            if store.items.isEmpty, store.isReachable { Text("No pending work decisions.") }
-            if store.truncated { Text("More work needs attention. Open GitHub to inspect all items.") }
-            ForEach(store.items) { item in
-                WorkAttentionRow(
-                    item: item, stale: !store.isReachable || item.stale,
-                    focused: item.id == focusedID,
-                    canDecide: { store.canDecide(item, action: $0) },
-                    decide: { action in
-                        Task {
-                            if let url = await store.decide(item, action: action) { openURL(url) }
-                        }
-                    },
-                    openSession: openSession
-                )
-                .id(item.id)
+        if store.isVisible {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Work decisions").font(.headline)
+                if let message = store.message {
+                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                }
+                if store.truncated { Text("More work needs attention. Open GitHub to inspect all items.") }
+                ForEach(store.items) { item in
+                    WorkAttentionRow(
+                        item: item, stale: !store.isReachable || item.stale,
+                        focused: item.id == focusedID,
+                        canDecide: { store.canDecide(item, action: $0) },
+                        decide: { action in
+                            Task {
+                                if let url = await store.decide(item, action: action) { openURL(url) }
+                            }
+                        },
+                        openSession: openSession
+                    )
+                    .id(item.id)
+                }
             }
+            .accessibilityIdentifier("work-attention-list")
         }
-        .accessibilityIdentifier("work-attention-list")
     }
 }
 

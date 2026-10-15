@@ -98,12 +98,14 @@ public final class WorkAttentionStore {
 
     public init(service: any WorkAttentionServing) { self.service = service }
 
+    public var isVisible: Bool { !items.isEmpty || truncated }
+
     public func refresh() async {
         guard !isRefreshing, !isDeciding else { return }
         isRefreshing = true
         defer { isRefreshing = false }
         do { try await load() }
-        catch { failedRefresh() }
+        catch { failedRefresh(error) }
     }
 
     private func load() async throws {
@@ -115,9 +117,22 @@ public final class WorkAttentionStore {
         message = response.stale ? "Showing last refreshed work. Refresh before deciding." : nil
     }
 
-    private func failedRefresh() {
+    private func failedRefresh(_ error: Error) {
         isReachable = false
-        message = "Can't refresh Needs you. Decisions are unavailable."
+        // A disabled work control is a capability state, including after it
+        // previously supplied items. Do not leave obsolete decisions visible.
+        if let error = error as? DroverError {
+            let detail: String?
+            switch error {
+            case .unavailable(let value), .httpStatus(_, let value): detail = value
+            default: detail = nil
+            }
+            if let detail, ["work control unavailable", "work control disabled"].contains(detail.lowercased()) {
+                items = []
+                truncated = false
+            }
+        }
+        message = isVisible ? "Couldn't update. Pull to refresh." : nil
     }
 
     public func canDecide(_ item: WorkAttentionItem, action: String) -> Bool {
@@ -152,9 +167,12 @@ public final class WorkAttentionStore {
                    url.user == nil, url.password == nil { return url }
             }
         } catch {
-            isReachable = false
-            message = sent ? "Decision outcome is unknown. Refresh and inspect before trying again."
-                : "Can't refresh Needs you. Decisions are unavailable."
+            if sent {
+                isReachable = false
+                message = "Decision outcome is unknown. Refresh and inspect before trying again."
+            } else {
+                failedRefresh(error)
+            }
         }
         return nil
     }
