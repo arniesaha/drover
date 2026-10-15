@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -278,6 +279,211 @@ def _verify_aggregate(con, job):
     }
 
 
+def _same_multiset(con, left, right):
+    """Compare row-hash multisets without materialising either relation."""
+    return not con.execute(f"""WITH left_counts AS (
+              SELECT _row_sha256 AS digest,count(*) AS rows FROM {left} GROUP BY 1
+            ), right_counts AS (
+              SELECT _row_sha256 AS digest,count(*) AS rows FROM {right} GROUP BY 1
+            )
+            SELECT 1 FROM left_counts l FULL OUTER JOIN right_counts r USING (digest)
+            WHERE coalesce(l.rows,0) != coalesce(r.rows,0) LIMIT 1""").fetchone()
+
+
+def _verify_baseline(con, job):
+    """Check one immutable rebuild partition against its live successor.
+
+    A live serving row is allowed to replace a rebuild row only when it is an
+    exact row from ``export_event_versions``.  The caller verifies that table
+    against exporter receipts in a separate bounded worker before trusting it.
+    """
+    spec = _spec(job["spec"])
+    attach_lake(con, spec, read_only=True)
+    table = job["table"]
+    schema = POLICY_SCHEMA if table != "control_outbox_batches" else SCHEMAS[table]
+    files = job.get("files", [])
+    if files:
+        con.execute(
+            "CREATE TEMP VIEW baseline AS SELECT * FROM read_parquet("
+            + literal_list(files)
+            + ")"
+        )
+    else:
+        con.execute(
+            f"CREATE TEMP VIEW baseline AS SELECT * FROM lake.{table} WHERE false"
+        )
+    expression = row_hash_expression(schema)
+    for relation in ("baseline", f"lake.{table}"):
+        if con.execute(
+            f"SELECT count(*) FROM {relation} WHERE _row_sha256 != {expression}"
+        ).fetchone()[0]:
+            raise LakeError("lake_verification_mismatch")
+
+    if table == "control_outbox_batches":
+        # Rebuild rows are not exporter rows.  The receipt worker separately
+        # accounts for every outbox: row, so this equality cannot hide a new
+        # unreceipted row behind a frozen hash.
+        live = "(SELECT * FROM lake.control_outbox_batches WHERE _import_file NOT LIKE 'outbox:%')"
+        if not _same_multiset(con, "baseline", live):
+            raise LakeError("lake_verification_mismatch")
+        return {
+            "baseline_rows": con.execute("SELECT count(*) FROM baseline").fetchone()[0]
+        }
+
+    if table == "agent_events":
+        if job.get("has_exports"):
+            versions = "lake.export_event_versions"
+        else:
+            con.execute(
+                "CREATE TEMP VIEW export_versions AS SELECT * FROM lake.agent_events WHERE false"
+            )
+            versions = "export_versions"
+        # No live hash may exceed the frozen partition plus an exporter version
+        # for this date.  This catches duplicate inserts as well as new,
+        # unaccounted partitions without needing a whole-lake materialisation.
+        con.execute(
+            "CREATE TEMP VIEW allowed AS SELECT _row_sha256,count(*) AS rows FROM ("
+            "SELECT _row_sha256 FROM baseline UNION ALL "
+            "SELECT _row_sha256 FROM " + versions + " "
+            "WHERE date=" + literal(job["day"]) + ") GROUP BY 1"
+        )
+        if con.execute(
+            """WITH actual AS (SELECT _row_sha256,count(*) AS rows
+                FROM lake.agent_events WHERE date=? GROUP BY 1)
+                SELECT 1 FROM actual a LEFT JOIN allowed b USING (_row_sha256)
+                WHERE a.rows > coalesce(b.rows,0) LIMIT 1""",
+            [job["day"]],
+        ).fetchone():
+            raise LakeError("lake_verification_unexpected_partition")
+        # A frozen canonical row may be removed only by a receipted exporter
+        # version for its key.  NULL-key rebuild rows cannot be exported.
+        if con.execute(
+            """SELECT 1 FROM baseline b WHERE NOT EXISTS (
+                  SELECT 1 FROM lake.agent_events live
+                  WHERE live._row_sha256=b._row_sha256
+                ) AND (b.dedup_key IS NULL OR NOT EXISTS (
+                  SELECT 1 FROM lake.agent_events live
+                  JOIN """
+            + versions
+            + """ version
+                    ON version._row_sha256=live._row_sha256
+                  WHERE live.dedup_key=b.dedup_key
+                )) LIMIT 1"""
+        ).fetchone():
+            raise LakeError("lake_verification_mismatch")
+    elif not _same_multiset(
+        con,
+        "baseline",
+        f"(SELECT * FROM lake.{table} WHERE date={literal(job['day'])})",
+    ):
+        raise LakeError("lake_verification_mismatch")
+    return {"baseline_rows": con.execute("SELECT count(*) FROM baseline").fetchone()[0]}
+
+
+def _write_batch_fingerprints(con, table, schema, path):
+    """Stream per-batch multiset fingerprints to a small temporary parquet."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    expression = row_hash_expression(schema)
+    if con.execute(
+        f"SELECT count(*) FROM lake.{table} WHERE _import_file LIKE 'outbox:%' "
+        f"AND _row_sha256 != {expression}"
+    ).fetchone()[0]:
+        raise LakeError("lake_verification_receipt_content_mismatch")
+    cursor = con.execute(
+        f"SELECT substr(_import_file,8),_row_sha256 FROM lake.{table} "
+        "WHERE _import_file LIKE 'outbox:%' ORDER BY 1,2"
+    )
+    writer = None
+    records = []
+    batch = None
+    digest = None
+    rows = 0
+
+    def flush():
+        nonlocal records, writer
+        if batch is not None:
+            records.append(
+                {"batch_id": batch, "rows": rows, "sha256": digest.hexdigest()}
+            )
+        if len(records) >= 256:
+            chunk = pa.Table.from_pylist(records)
+            if writer is None:
+                writer = pq.ParquetWriter(path, chunk.schema, compression="zstd")
+            writer.write_table(chunk)
+            records = []
+
+    while values := cursor.fetchmany(1024):
+        for value, row_hash in values:
+            if value != batch:
+                flush()
+                batch = value
+                digest = hashlib.sha256()
+                rows = 0
+            digest.update(row_hash.encode("ascii") + b"\n")
+            rows += 1
+    flush()
+    if records:
+        chunk = pa.Table.from_pylist(records)
+        if writer is None:
+            writer = pq.ParquetWriter(path, chunk.schema, compression="zstd")
+        writer.write_table(chunk)
+    if writer is not None:
+        writer.close()
+    else:
+        # Keep read_parquet's schema stable when there are no exporter rows.
+        pq.write_table(
+            pa.Table.from_pylist(
+                [],
+                schema=pa.schema(
+                    [
+                        ("batch_id", pa.string()),
+                        ("rows", pa.int64()),
+                        ("sha256", pa.string()),
+                    ]
+                ),
+            ),
+            path,
+            compression="zstd",
+        )
+
+
+def _verify_receipts(con, job):
+    """Validate every exported row against the receipt it claims to implement."""
+    spec = _spec(job["spec"])
+    attach_lake(con, spec, read_only=True)
+    output = Path(job["output"])
+    output.mkdir(parents=True, exist_ok=True)
+    raw = output / "raw-fingerprints.parquet"
+    versions = output / "version-fingerprints.parquet"
+    _write_batch_fingerprints(
+        con, "control_outbox_batches", SCHEMAS["control_outbox_batches"], raw
+    )
+    _write_batch_fingerprints(con, "export_event_versions", POLICY_SCHEMA, versions)
+    con.execute(
+        f"CREATE TEMP VIEW raw AS SELECT * FROM read_parquet({literal(str(raw))})"
+    )
+    con.execute(
+        f"CREATE TEMP VIEW versions AS SELECT * FROM read_parquet({literal(str(versions))})"
+    )
+    for relation, count, digest in (
+        ("raw", "raw_rows", "raw_sha256"),
+        ("versions", "canonical_rows", "canonical_sha256"),
+    ):
+        if con.execute(f"""SELECT 1 FROM lake.export_batch_receipts receipt
+                FULL OUTER JOIN {relation} actual USING (batch_id)
+                WHERE receipt.batch_id IS NULL OR actual.batch_id IS NULL
+                   OR receipt.{count} != actual.rows
+                   OR receipt.{digest} != actual.sha256 LIMIT 1""").fetchone():
+            raise LakeError("lake_verification_receipt_content_mismatch")
+    return {
+        "receipts": con.execute(
+            "SELECT count(*) FROM lake.export_batch_receipts"
+        ).fetchone()[0]
+    }
+
+
 def _spec(value):
     return LakeSpec(
         **{
@@ -312,6 +518,8 @@ def work(job):
             "publish": _publish,
             "verify": _verify,
             "verify_aggregate": _verify_aggregate,
+            "verify_baseline": _verify_baseline,
+            "verify_receipts": _verify_receipts,
         }[job["operation"]]
         return operation(con, job)
 

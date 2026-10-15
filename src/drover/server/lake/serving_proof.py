@@ -112,11 +112,7 @@ def check_proof(spec, con, digest):
         maintenance = [row for row in later if row[1] == "drover-maintenance"]
         if len(exports) + len(maintenance) != len(later):
             raise ValueError()
-        receipts = _export_receipts(con, [batch for _, _, batch, _ in exports])
-        for _, _, batch, receipt_digest in exports:
-            rows = receipts.get(batch, [])
-            if len(rows) != 1 or receipt_hash(rows[0]) != receipt_digest:
-                raise ValueError()
+        _check_export_receipts(con, exports)
         # A checkpoint is trusted only after its own maintenance receipt still
         # validates; otherwise deleting/tampering that receipt would turn a
         # formerly accepted maintenance boundary into a blind spot.
@@ -314,6 +310,50 @@ def _export_receipts(con, batches):
         receipt = dict(zip(names, row))
         receipts.setdefault(receipt["batch_id"], []).append(receipt)
     return receipts
+
+
+def _check_export_receipts(con, exports):
+    """Check snapshot receipt commitments using the serving proof's rule."""
+    from .export_worker import receipt_hash
+
+    receipts = _export_receipts(con, [batch for _, _, batch, _ in exports])
+    for _, _, batch, receipt_digest in exports:
+        rows = receipts.get(batch, [])
+        if len(rows) != 1 or receipt_hash(rows[0]) != receipt_digest:
+            raise ValueError()
+
+
+def validate_export_receipts(con):
+    """Validate every exporter receipt against its committed export snapshot.
+
+    Full offline verification starts from frozen rows and may deliberately
+    recertify a provisioning snapshot that a serving proof rejects.  It still
+    uses the exact receipt commitment rule serving uses for every export.
+    """
+    from .export_worker import receipt_hash
+
+    missing = con.execute("""SELECT 1 FROM lake.export_batch_receipts receipt
+            LEFT JOIN lake.snapshots() snapshot
+              ON snapshot.author='drover-export'
+             AND snapshot.commit_message=receipt.batch_id
+            WHERE snapshot.snapshot_id IS NULL LIMIT 1""").fetchone()
+    orphan = con.execute("""SELECT 1 FROM lake.snapshots() snapshot
+            LEFT JOIN lake.export_batch_receipts receipt
+              ON receipt.batch_id=snapshot.commit_message
+            WHERE snapshot.author='drover-export' AND receipt.batch_id IS NULL
+            LIMIT 1""").fetchone()
+    if missing or orphan:
+        raise ValueError()
+    cursor = con.execute("""SELECT snapshot.commit_extra_info,receipt.*
+            FROM lake.snapshots() snapshot
+            JOIN lake.export_batch_receipts receipt
+              ON receipt.batch_id=snapshot.commit_message
+            WHERE snapshot.author='drover-export' ORDER BY snapshot.snapshot_id""")
+    names = [column[0] for column in cursor.description][1:]
+    while rows := cursor.fetchmany(1024):
+        for row in rows:
+            if receipt_hash(dict(zip(names, row[1:], strict=True))) != row[0]:
+                raise ValueError()
 
 
 def _check_referenced_files(spec, con):
