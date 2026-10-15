@@ -235,22 +235,125 @@ def _verify_jobs(spec, report, work, *, rss_ceiling=None):
 
 def _verify_days(spec, report, work, *, rss_ceiling=None):
     peak = 0
-    results = {}
     from .query_process import query
 
-    allowed_days = {item["day"] for item in report["days"]}
-    for table in ("agent_events", "agent_events_legacy_metadata"):
-        days = query(spec, f"SELECT DISTINCT date FROM lake.{table}")["rows"]
-        if any(row[0] not in allowed_days for row in days):
-            raise LakeError("lake_verification_unexpected_partition")
-    for table in (*SCHEMAS, "agent_events_legacy_metadata"):
-        jobs = []
-        days = (
-            [p["day"] for p in report["days"]]
-            if table in {"agent_events", "agent_events_legacy_metadata"}
-            else [None]
+    tables = {
+        row[0]
+        for row in query(
+            spec,
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_catalog='lake' AND table_schema='main'",
+        )["rows"]
+    }
+    export_tables = {"export_batch_receipts", "export_event_versions"}
+    if export_tables & tables and not export_tables <= tables:
+        raise LakeError("lake_verification_receipt_tables_missing")
+    has_exports = export_tables <= tables
+
+    def run(request):
+        nonlocal peak
+        if rss_ceiling is not None:
+            result, rss = run_admin(request, spec.data_root, rss_ceiling=rss_ceiling)
+        else:
+            result, rss = run_admin(request, spec.data_root)
+        peak = max(peak, rss)
+        return result
+
+    if has_exports:
+        # This is the same export snapshot/receipt commitment serving trusts.
+        # Unlike a serving proof, it intentionally allows a verify to certify
+        # an intervening exporter-provisioning snapshot after its frozen rows
+        # have independently been checked below.
+        from .serving_proof import validate_export_receipts
+
+        with lake_connection(spec) as con:
+            try:
+                validate_export_receipts(con)
+            except Exception:
+                raise LakeError("lake_verification_required") from None
+        run(
+            {
+                "operation": "verify_receipts",
+                "spec": _spec(spec),
+                "output": str(work / "receipts"),
+                "spill": str(spec.data_root / "spill"),
+            }
         )
-        for day in days:
+
+    baseline_days = {item["day"] for item in report["days"]}
+    event_days = {
+        row[0]
+        for row in query(spec, "SELECT DISTINCT date FROM lake.agent_events")["rows"]
+    }
+    if has_exports:
+        event_days |= {
+            row[0]
+            for row in query(
+                spec, "SELECT DISTINCT date FROM lake.export_event_versions"
+            )["rows"]
+        }
+    legacy_days = {
+        row[0]
+        for row in query(
+            spec, "SELECT DISTINCT date FROM lake.agent_events_legacy_metadata"
+        )["rows"]
+    }
+    if None in event_days or None in legacy_days:
+        raise LakeError("lake_verification_unexpected_partition")
+    partition_files = {
+        day: {
+            "agent_events": [
+                str(spec.data_root / "partitions" / day / "events.parquet")
+            ],
+            "agent_events_legacy_metadata": [
+                str(spec.data_root / "partitions" / day / "metadata.parquet")
+            ],
+        }
+        for day in baseline_days
+    }
+    for table, days in (
+        ("agent_events", event_days | baseline_days),
+        ("agent_events_legacy_metadata", legacy_days | baseline_days),
+    ):
+        for day in sorted(days):
+            run(
+                {
+                    "operation": "verify_baseline",
+                    "spec": _spec(spec),
+                    "output": str(work / table / day),
+                    "spill": str(spec.data_root / "spill"),
+                    "table": table,
+                    "day": day,
+                    "files": partition_files.get(day, {}).get(table, []),
+                    "has_exports": has_exports,
+                }
+            )
+    control_files = sorted(
+        str(path)
+        for path in (spec.data_root / "partitions" / "control_outbox_batches").glob(
+            "*/rows.parquet"
+        )
+    )
+    run(
+        {
+            "operation": "verify_baseline",
+            "spec": _spec(spec),
+            "output": str(work / "control_outbox_batches"),
+            "spill": str(spec.data_root / "spill"),
+            "table": "control_outbox_batches",
+            "files": control_files,
+            "has_exports": has_exports,
+        }
+    )
+
+    results = {}
+    # Provider observations are not exporter output and retain their original
+    # whole-table identity. The other three frozen tables were checked above
+    # using a baseline-plus-receipt rule, so their report fingerprints remain
+    # the stable evidence stored in the serving proof.
+    for table in ("provider_usage_snapshots",):
+        jobs = []
+        for day in [None]:
             out = work / table / (day or "all")
             out.mkdir(parents=True, exist_ok=True)
             request = {
@@ -262,13 +365,7 @@ def _verify_days(spec, report, work, *, rss_ceiling=None):
             }
             if day is not None:
                 request["day"] = day
-            if rss_ceiling is not None:
-                result, rss = run_admin(
-                    request, spec.data_root, rss_ceiling=rss_ceiling
-                )
-            else:
-                result, rss = run_admin(request, spec.data_root)
-            peak = max(peak, rss)
+            run(request)
             jobs.append(str(out / "hashes.parquet"))
         request = {
             "operation": "verify_aggregate",
@@ -276,20 +373,15 @@ def _verify_days(spec, report, work, *, rss_ceiling=None):
             "spill": str(spec.data_root / "spill"),
             "files": jobs,
         }
-        if rss_ceiling is not None:
-            result, rss = run_admin(request, spec.data_root, rss_ceiling=rss_ceiling)
-        else:
-            result, rss = run_admin(request, spec.data_root)
-        peak = max(peak, rss)
-        results[table] = result
+        results[table] = run(request)
     expected = {
         **report["raw"],
         "agent_events": report["canonical_agent_events"],
         "agent_events_legacy_metadata": report["legacy_metadata"],
     }
-    if results != expected:
+    if results["provider_usage_snapshots"] != expected["provider_usage_snapshots"]:
         raise LakeError("lake_verification_mismatch")
-    return results, peak
+    return expected, peak
 
 
 def verify_partitioned(spec):

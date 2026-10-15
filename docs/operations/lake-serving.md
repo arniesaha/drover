@@ -20,7 +20,23 @@ to change operator settings.
 Successful offline `lake verify` now holds the mutation fence for the entire
 verification, rechecks ownership and the initially captured snapshot, and writes
 `verification/serving-proof.json` only after all table hashes match the rebuilt
-baseline. It rejects unexpected day partitions as well as count/hash mismatches.
+baseline. It does not mistake that baseline for a static live lake: every frozen
+canonical row must still exist byte-for-byte, or be replaced by a current
+`export_event_versions` row with the same dedup key. Every current event row
+must be either a frozen row or one of those exported versions; legacy metadata
+and frozen outbox rows remain exact multisets. Thus compaction is harmless
+(logical rows do not change), while a later exporter upsert can legitimately
+replace an older baseline winner. Any new partition, duplicate, changed or
+deleted row which has neither baseline nor exporter evidence fails closed.
+
+Exporter evidence has two layers. Offline verification first validates every
+`drover-export` snapshot against its immutable receipt using the same
+snapshot/receipt commitment code as serving-proof verification, then streams
+the raw and canonical exported rows per receipt and compares their counts and
+multiset hashes. An outbox-prefixed row without exactly one receipt, or a
+receipt whose rows have changed, is not evidence. This keeps the per-day
+disposable-worker/RSS-bounded verification design while allowing a healthy live
+lake to advance after its rebuild.
 The proof binds the absolute root, catalog main-schema UUID, verified snapshot,
 rebuild report SHA-256, and verified hashes/counts for all four retained tables.
 Its SHA-256 must be explicitly pinned in the selected configuration; startup

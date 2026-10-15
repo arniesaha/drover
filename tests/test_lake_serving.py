@@ -421,6 +421,89 @@ def test_verify_refuses_extra_unaccounted_partition(verified_lake):
         verify(spec)
 
 
+def test_verify_accepts_receipted_extension_compaction_and_reconcile(
+    verified_lake, postgres_control_store, monkeypatch
+):
+    """A live lake keeps its frozen baseline while receipts extend it."""
+    from drover.server.lake import exporter as exporter_module
+    from drover.server.lake.exporter import LakeOutboxExporter, provision_exporter
+    from drover.server.lake.maintenance import maintain_lake
+    from drover.server.lake.rebuild import verify
+    from drover.server.lake.reconcile import reconcile_acknowledged
+
+    spec, path, config = verified_lake
+    control_path, _ = postgres_control_store
+    provision_exporter(spec)
+    verify(spec)
+    original = exporter_module.project_control_event
+
+    def replacing_baseline(row, session):
+        event = original(row, session)
+        # This is newer than the frozen k2 row, and belongs to a post-rebuild
+        # partition. The exporter legitimately removes the frozen winner.
+        event.update(
+            dedup_key="k2", timestamp="2026-10-02T00:00:00+00:00", date="2026-10-02"
+        )
+        return event
+
+    monkeypatch.setattr(exporter_module, "project_control_event", replacing_baseline)
+    seed(control_path, count=2)
+    with LakeOutboxExporter(control_path=control_path, spec=spec) as exporter:
+        assert exporter.run_once()["acknowledged"] == 2
+    assert verify(spec)["agent_events"]["rows"] == 3
+
+    maintain_lake(spec)
+    assert verify(spec)["agent_events"]["rows"] == 3
+
+    # Model a restored catalog that lost one acknowledged export. Reconcile
+    # must replay the frozen input and restore both row evidence and its receipt.
+    with lake_connection(spec, read_only=False) as con:
+        con.execute("DELETE FROM lake.export_batch_receipts")
+        for table in ("export_event_versions", "control_outbox_batches"):
+            con.execute(f"DELETE FROM lake.{table} WHERE _import_file LIKE 'outbox:%'")
+        con.execute("DELETE FROM lake.agent_events WHERE id IN ('event-0','event-1')")
+    repaired = reconcile_acknowledged(control_path, spec, apply=True)
+    assert len(repaired["repaired"]) == 1
+    assert verify(spec)["agent_events"]["rows"] == 3
+
+
+def test_verify_refuses_tampered_receipted_rows(verified_lake, postgres_control_store):
+    from drover.server.lake.exporter import LakeOutboxExporter, provision_exporter
+    from drover.server.lake.rebuild import verify
+
+    spec, path, config = verified_lake
+    control_path, _ = postgres_control_store
+    provision_exporter(spec)
+    verify(spec)
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=spec) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+    with lake_connection(spec, read_only=False) as con:
+        con.execute(
+            "UPDATE lake.export_event_versions SET content='tampered' "
+            "WHERE _import_file LIKE 'outbox:%'"
+        )
+    with pytest.raises(LakeError, match="receipt_content_mismatch"):
+        verify(spec)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DELETE FROM lake.agent_events WHERE id='newer'",
+        "UPDATE lake.agent_events SET content='changed outside exporter' WHERE id='newer'",
+    ],
+)
+def test_verify_refuses_changed_or_deleted_baseline_row(verified_lake, statement):
+    from drover.server.lake.rebuild import verify
+
+    spec, path, config = verified_lake
+    with lake_connection(spec, read_only=False) as con:
+        con.execute(statement)
+    with pytest.raises(LakeError, match="lake_verification_mismatch"):
+        verify(spec)
+
+
 def test_proof_cannot_authorize_a_different_catalog_identity(verified_lake):
     import hashlib
     import json
