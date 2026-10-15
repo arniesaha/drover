@@ -19,8 +19,8 @@ from __future__ import annotations
 import hashlib
 
 from drover.server.postgres_schema import (
-    EXPORTER_RESTART_GUARD_MIGRATION,
     EXPORTER_FRESHNESS_MIGRATION,
+    EXPORTER_RESTART_GUARD_MIGRATION,
     PROFILE_MIGRATION,
 )
 
