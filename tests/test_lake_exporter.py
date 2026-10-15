@@ -510,24 +510,27 @@ def unprovisioned_lake(lake_spec):
     return lake_spec
 
 
-def _provision_cli(spec, monkeypatch, *, role="drover_export_group"):
+def _provision_cli(spec, monkeypatch, *, role="drover_export_group", dry_run=False):
     from click.testing import CliRunner
 
     from drover.server.lake import cli as lake_cli
 
     monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(spec.extension_dir))
     monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", spec.engine_sha256)
+    args = [
+        "provision-exporter",
+        "--data-root",
+        str(spec.data_root),
+        "--catalog-dsn-env",
+        spec.catalog_dsn_env,
+        "--exporter-role",
+        role,
+    ]
+    if dry_run:
+        args.append("--dry-run")
     return CliRunner().invoke(
         lake_cli.lake_cmd,
-        [
-            "provision-exporter",
-            "--data-root",
-            str(spec.data_root),
-            "--catalog-dsn-env",
-            spec.catalog_dsn_env,
-            "--exporter-role",
-            role,
-        ],
+        args,
     )
 
 
@@ -564,6 +567,62 @@ def test_provision_exporter_cli_reports_missing_tables(lake_spec, monkeypatch):
     result = _provision_cli(lake_spec, monkeypatch)
     assert result.exit_code != 0
     assert "lake_export_tables_missing" in result.output
+
+
+def test_provision_exporter_preflights_admin_temp_before_mutating(
+    unprovisioned_lake, monkeypatch
+):
+    from psycopg import sql
+
+    role = "no_temp_" + unprovisioned_lake.data_root.parent.name[-8:].replace("-", "_")
+    with psycopg.connect(unprovisioned_lake.dsn(), autocommit=True) as catalog:
+        database = catalog.execute("SELECT current_database()").fetchone()[0]
+        catalog.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(role)))
+        catalog.execute(
+            sql.SQL("REVOKE TEMPORARY ON DATABASE {} FROM PUBLIC").format(
+                sql.Identifier(database)
+            )
+        )
+        catalog.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                sql.Identifier(database), sql.Identifier(role)
+            )
+        )
+    try:
+        env = "DROVER_NO_TEMP_ADMIN_DSN"
+        monkeypatch.setenv(
+            env, make_conninfo(unprovisioned_lake.dsn(), options="-c role=" + role)
+        )
+        with pytest.raises(LakeError, match="lake_export_admin_temp_required"):
+            provision_exporter(replace(unprovisioned_lake, catalog_dsn_env=env))
+        with lake_connection(unprovisioned_lake) as con:
+            assert con.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_catalog='lake' AND table_name='export_batch_receipts'"
+            ).fetchone() == (0,)
+    finally:
+        with psycopg.connect(unprovisioned_lake.dsn(), autocommit=True) as catalog:
+            catalog.execute(
+                sql.SQL("GRANT TEMPORARY ON DATABASE {} TO PUBLIC").format(
+                    sql.Identifier(database)
+                )
+            )
+            catalog.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
+            catalog.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+def test_provision_exporter_cli_dry_run_prints_storage_and_grants(
+    lake_spec, monkeypatch
+):
+    import json
+
+    result = _provision_cli(lake_spec, monkeypatch, dry_run=True)
+    assert result.exit_code == 0, result.output
+    plan = json.loads(result.output)
+    assert plan["dry_run"] is True
+    assert plan["options"]["data_inlining_row_limit"]["agent_events"] == 10
+    assert plan["options"]["expire_older_than"] == "30 days"
+    assert any("TEMPORARY" in grant for grant in plan["grants"])
 
 
 def test_provision_exporter_cli_requires_runtime_env(tmp_path, monkeypatch):

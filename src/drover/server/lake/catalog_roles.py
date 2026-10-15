@@ -51,6 +51,14 @@ def provision_catalog_roles(spec: LakeSpec, *, prefix: str) -> dict:
                 sql.Identifier(database), sql.Identifier(names["admin"])
             )
         )
+        # DuckLake 1.5.5 uses a PostgreSQL temporary table while applying
+        # table options. Keep it with the explicit admin group; reader and
+        # least-privilege exporter do not need this capability.
+        con.execute(
+            sql.SQL("GRANT TEMPORARY ON DATABASE {} TO {}").format(
+                sql.Identifier(database), sql.Identifier(names["admin"])
+            )
+        )
         con.execute(
             sql.SQL("REVOKE ALL ON SCHEMA {} FROM PUBLIC").format(
                 sql.Identifier(schema)

@@ -204,16 +204,51 @@ def verify_cmd(data_root, catalog_dsn_env):
     required=True,
     help="Catalog group role that may activate the exporter guard.",
 )
-def provision_exporter_cmd(data_root, catalog_dsn_env, exporter_role):
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the storage options and grants; do not contact or mutate the catalog.",
+)
+def provision_exporter_cmd(data_root, catalog_dsn_env, exporter_role, dry_run):
     """Explicit admin step: create export tables and the commit guard.
 
     Never run at startup. Run after ``rebuild`` and before role grants and
     ``verify``: provisioning changes the snapshot and invalidates any serving
     proof.
     """
-    from .exporter import provision_exporter
+    from .exporter import (
+        EXPORT_INLINE_ROW_LIMIT,
+        EXPORT_INLINE_TABLES,
+        provision_exporter,
+    )
 
     spec = spec_from_options(data_root, catalog_dsn_env)
+    if dry_run:
+        click.echo(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "exporter_role": exporter_role,
+                    "options": {
+                        "data_inlining_row_limit": {
+                            table: EXPORT_INLINE_ROW_LIMIT
+                            for table in EXPORT_INLINE_TABLES
+                        },
+                        "expire_older_than": "30 days",
+                    },
+                    "grants": [
+                        "GRANT TEMPORARY ON DATABASE <catalog> TO <admin-role>",
+                        "GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA <metadata-schema> TO "
+                        + exporter_role,
+                        "GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA <metadata-schema> TO "
+                        + exporter_role,
+                    ],
+                    "next": "stop the hub, grant TEMP to the admin role, then run without --dry-run",
+                },
+                indent=2,
+            )
+        )
+        return
     try:
         result = provision_exporter(spec, exporter_role=exporter_role)
     except LakeError as exc:

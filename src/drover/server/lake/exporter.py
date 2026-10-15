@@ -72,6 +72,29 @@ EXPORT_INLINE_PROBES = {
 }
 
 
+def _catalog_temp_preflight(spec: LakeSpec) -> None:
+    """Require catalog-admin TEMP before DuckLake mutates anything.
+
+    DuckLake 1.5.5 uses a PostgreSQL temporary table while applying table
+    options. Check that before taking the mutation fence or opening the writer,
+    so a missing grant has a stable, actionable failure and no partial change.
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(spec.dsn(), autocommit=True, connect_timeout=5) as con:
+            allowed = con.execute(
+                "SELECT has_database_privilege(current_user, current_database(), 'TEMP')"
+            ).fetchone()[0]
+    except Exception as exc:
+        raise LakeError("lake_export_admin_temp_preflight_failed") from exc
+    if not allowed:
+        raise LakeError(
+            "lake_export_admin_temp_required",
+            "catalog administrator lacks TEMP; GRANT TEMPORARY ON DATABASE to the admin role",
+        )
+
+
 def configure_export_storage(con) -> None:
     """Persist small-batch inlining and finite snapshot retention for exports.
 
@@ -108,6 +131,7 @@ def provision_exporter(spec: LakeSpec, *, exporter_role: str | None = None):
     A repeat invocation never replaces tables or guard ownership. It only
     applies the current bounded-storage policy to an already-provisioned lake.
     """
+    _catalog_temp_preflight(spec)
     with MutationFence(spec.dsn()), lake_connection(spec, read_only=False) as con:
         names = {
             r[0]

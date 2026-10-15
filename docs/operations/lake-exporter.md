@@ -16,6 +16,13 @@ serving proof, so it must precede `verify`. It is never run at startup; an
 unprovisioned catalog makes the hub log `lake_export_not_provisioned` with the
 sanitized cause.
 
+Before changing a live catalog, use `--dry-run` to print the inlining/expiry
+options and grants without connecting to it. DuckLake 1.5.5 requires the admin
+role to have database `TEMPORARY` while it sets these options. Provisioning
+preflights that privilege before it acquires the mutation fence; if it reports
+`lake_export_admin_temp_required`, grant TEMPORARY to the catalog admin role
+and retry. The exporter must not receive metadata-schema `CREATE`.
+
 An admin explicitly calls `provision_exporter(spec, exporter_role=...)` against an
 initialized separate catalog with the rebuilt `agent_events` and
 `control_outbox_batches` tables. It creates stable `export_batch_receipts` and
@@ -218,6 +225,22 @@ After deploying this version, an operator must run `lake provision-exporter`
 once with the catalog administrator DSN and the existing exporter role. This
 retunes existing export tables, creates the administrator-owned inlined-data
 tables, and grants the exporter DML only; it does not run at server startup.
+Provisioning takes the shared `MutationFence`, so stop the hub first; otherwise
+the running exporter owns that lock and provisioning fails safely. Start it only
+after provisioning and the subsequent serving verification.
+
+### DuckLake 1.5.5 least-privilege boundary
+
+Do **not** apply the inlining retune to a live least-privilege exporter on the
+pinned 1.5.5 extension yet. A disposable PostgreSQL rehearsal established that
+DuckLake emits `CREATE TABLE IF NOT EXISTS ducklake_inlined_delete_<id>` on
+every small delete of a Parquet-resident row, even after an administrator has
+created that table. PostgreSQL requires schema `CREATE` before evaluating that
+statement, so priming cannot make that path work while the exporter correctly
+has no schema `CREATE`. The safe choices are to keep the current zero-inlining
+setting, or wait for a DuckLake fix that omits the DDL after the table exists.
+Do not broaden the exporter role as a workaround.
+
 For a catalog that already accumulated tiny files, schedule bounded
 `ducklake_merge_adjacent_files` maintenance for the five export tables. After
 the configured 30-day retention window and a verified backup, expire old
