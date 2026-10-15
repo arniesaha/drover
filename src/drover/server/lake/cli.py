@@ -274,3 +274,42 @@ def provision_exporter_cmd(data_root, catalog_dsn_env, exporter_role, dry_run):
             indent=2,
         )
     )
+
+
+@lake_cmd.command("maintain")
+@click.option(
+    "--data-root", type=click.Path(exists=True, path_type=Path), required=True
+)
+@click.option(
+    "--catalog-dsn-env",
+    required=True,
+    help="Environment variable holding the catalog ADMIN DSN.",
+)
+@click.option("--dry-run", is_flag=True, help="Print the fenced maintenance plan.")
+def maintain_cmd(data_root, catalog_dsn_env, dry_run):
+    """Compact export files and expire old snapshots on a stopped hub."""
+    from .maintenance import CLEANUP_RETENTION, EXPORT_MAINTENANCE_TABLES, maintain_lake
+
+    if dry_run:
+        click.echo(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "tables": EXPORT_MAINTENANCE_TABLES,
+                    "operations": [
+                        "drained_mutation fence",
+                        "merge adjacent files per table",
+                        "expire snapshots using configured retention",
+                        f"clean files scheduled more than {CLEANUP_RETENTION} ago",
+                    ],
+                    "next": "stop the hub, then run without --dry-run",
+                },
+                indent=2,
+            )
+        )
+        return
+    try:
+        report = maintain_lake(spec_from_options(data_root, catalog_dsn_env))
+    except LakeError as exc:
+        raise _lake_failure(exc, data_root) from None
+    click.echo(json.dumps(report, indent=2))

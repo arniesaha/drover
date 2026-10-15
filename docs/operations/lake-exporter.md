@@ -248,6 +248,36 @@ the configured 30-day retention window and a verified backup, expire old
 snapshots and clean their unreferenced files with DuckLake's maintenance
 procedures. Do not perform these operations as part of normal server restart.
 
+### First compaction and schedule
+
+`lake maintain` is an administrator-only, fenced operation. It acquires the
+same mutation fence as the exporter and drains readers; it therefore fails
+safely if the hub is still exporting. It merges adjacent files in the five
+export tables, then expires snapshots using the catalog's configured 30-day
+retention, and finally removes files scheduled for deletion more than seven
+days ago. It never changes exporter privileges or inlining options.
+
+1. Verify a current, restorable backup generation. Do not shorten either
+   retention window for the first run.
+2. Stop the hub using the normal operator maintenance procedure and confirm
+   there is no running exporter owner.
+3. In the administrator shell that already supplies the pinned extension
+   variables and catalog admin DSN, inspect the plan:
+
+   ```sh
+   drover-server lake maintain --data-root "$DROVER_LAKE_ROOT/$LAKE" \
+     --catalog-dsn-env DROVER_LAKE_V2_ADMIN_DSN --dry-run
+   ```
+
+4. Run the same command without `--dry-run`. Save its JSON report, including
+   per-table file counts and snapshot counts, with the maintenance record.
+5. Run the normal serving verification, start the hub, then confirm `/readyz`
+   reports a running exporter and a later successful export.
+6. Add an operator-owned weekly launchd timer invoking that exact command while
+   the hub is stopped for its maintenance window. Keep the seven-day cleanup
+   safety window and the 30-day snapshot retention unless a separately
+   verified backup/restore policy authorizes a change.
+
 Deployment needs no new environment variables. The recovery deadline config
 is optional. Restart the upgraded hub to load the supervisor and apply control
 schema migration 16 through normal bootstrap. This adds partial indexes for

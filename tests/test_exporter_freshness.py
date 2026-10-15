@@ -126,7 +126,9 @@ def test_exhausted_recovery_exits_nonzero_until_crash_loop_is_guarded(
             ),
         ]
     )
-    monkeypatch.setattr(lifecycle, "record_server_restart_request", lambda _: next(decisions))
+    monkeypatch.setattr(
+        lifecycle, "record_server_restart_request", lambda _: next(decisions)
+    )
 
     worker._request_restart(shutdown)
     assert shutdown.is_set()

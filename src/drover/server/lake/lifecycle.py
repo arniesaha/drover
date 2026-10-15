@@ -48,7 +48,9 @@ def record_server_restart_request(path) -> RestartBudget:
             control.execute("BEGIN")
             try:
                 control.execute("SET LOCAL statement_timeout = '2s'")
-                control.execute("LOCK TABLE lake_export_restart_requests IN EXCLUSIVE MODE")
+                control.execute(
+                    "LOCK TABLE lake_export_restart_requests IN EXCLUSIVE MODE"
+                )
                 control.execute(
                     "DELETE FROM lake_export_restart_requests WHERE requested_at < ?",
                     [cutoff],
