@@ -12,6 +12,27 @@ GUARD_SCHEMA = "drover_lake_export"
 APPLICATION_PREFIX = "drover-export:"
 
 
+def grant_exporter_catalog_dml(spec: LakeSpec, exporter_role: str) -> None:
+    """Grant an already-provisioned exporter DML on DuckLake-owned tables."""
+    with psycopg.connect(spec.dsn(), autocommit=True) as con:
+        schemas = con.execute(
+            "SELECT schemaname FROM pg_tables WHERE tablename='ducklake_snapshot'"
+        ).fetchall()
+        if len(schemas) != 1:
+            raise LakeError("lake_snapshot_catalog_missing")
+        metadata_schema = schemas[0][0]
+        con.execute(
+            sql.SQL(
+                "GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA {} TO {}"
+            ).format(sql.Identifier(metadata_schema), sql.Identifier(exporter_role))
+        )
+        con.execute(
+            sql.SQL("GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(
+                sql.Identifier(metadata_schema), sql.Identifier(exporter_role)
+            )
+        )
+
+
 def install_commit_guard(spec: LakeSpec, *, exporter_role: str | None = None):
     """Explicit catalog-admin provisioning, never exporter startup DDL.
 
@@ -106,6 +127,25 @@ def install_commit_guard(spec: LakeSpec, *, exporter_role: str | None = None):
                 ).format(sql.Identifier(metadata_schema), sql.Identifier(GUARD_SCHEMA))
             )
             if exporter_role:
+                # Per-table inlining creates DuckLake-managed PostgreSQL tables
+                # while provisioning is still using the catalog admin. Grant
+                # the same DML surface as the metadata tables created before
+                # role provisioning; the exporter still has no schema CREATE
+                # privilege or ownership.
+                con.execute(
+                    sql.SQL(
+                        "GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA {} TO {}"
+                    ).format(
+                        sql.Identifier(metadata_schema), sql.Identifier(exporter_role)
+                    )
+                )
+                con.execute(
+                    sql.SQL(
+                        "GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}"
+                    ).format(
+                        sql.Identifier(metadata_schema), sql.Identifier(exporter_role)
+                    )
+                )
                 con.execute(
                     sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
                         sql.Identifier(GUARD_SCHEMA), sql.Identifier(exporter_role)

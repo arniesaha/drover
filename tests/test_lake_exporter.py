@@ -67,8 +67,95 @@ def lake_counts(spec):
         ]
 
 
+def lake_file_counts(spec):
+    with lake_connection(spec) as con:
+        return dict(
+            con.execute(
+                "SELECT table_name,file_count FROM ducklake_table_info('lake')"
+            ).fetchall()
+        )
+
+
 class CrashBeforeAck(RuntimeError):
     pass
+
+
+def test_tiny_export_batches_are_inlined_after_provisioning(
+    export_lake, postgres_control_store
+):
+    """A two-row export must not add five tiny Parquet files to the catalog."""
+    control_path, _ = postgres_control_store
+    seed(control_path)
+
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 2
+
+    counts = lake_file_counts(export_lake)
+    assert {
+        table: counts[table]
+        for table in (
+            "agent_events",
+            "activity_daily",
+            "control_outbox_batches",
+            "export_event_versions",
+            "export_batch_receipts",
+        )
+    } == {
+        "agent_events": 0,
+        "activity_daily": 0,
+        "control_outbox_batches": 0,
+        "export_event_versions": 0,
+        "export_batch_receipts": 0,
+    }
+
+
+def test_existing_small_file_history_stops_growing_after_retuning(
+    export_lake, postgres_control_store
+):
+    """Many old tiny snapshots do not make the next tiny merge create more files."""
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    registry = HarnessRegistry(control_path)
+    with lake_connection(export_lake, read_only=False) as con:
+        for table in (
+            "agent_events",
+            "activity_daily",
+            "control_outbox_batches",
+            "export_event_versions",
+            "export_batch_receipts",
+        ):
+            con.execute(
+                "CALL lake.set_option('data_inlining_row_limit', 0, table_name => ?)",
+                [table],
+            )
+
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        for sequence in range(1, 25):
+            assert exporter.run_once()["acknowledged"] == 1
+            registry.append_event(
+                session_id="export-session",
+                event_id=f"many-small-{sequence}",
+                event_type="assistant_output",
+                payload={"text": f"small batch {sequence}"},
+                seq=sequence + 1,
+                content_preview="small batch",
+            )
+        assert exporter.run_once()["acknowledged"] == 1
+
+    before = lake_file_counts(export_lake)
+    assert before["agent_events"] >= 25
+    provision_exporter(export_lake)
+    registry.append_event(
+        session_id="export-session",
+        event_id="after-retune",
+        event_type="assistant_output",
+        payload={"text": "no extra parquet file"},
+        seq=27,
+        content_preview="retuned",
+    )
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+    assert lake_file_counts(export_lake) == before
 
 
 def test_crash_before_ack_replays_receipt_without_second_commit(
@@ -444,7 +531,7 @@ def _provision_cli(spec, monkeypatch, *, role="drover_export_group"):
     )
 
 
-def test_provision_exporter_cli_success_then_already_provisioned(
+def test_provision_exporter_cli_success_then_retunes(
     unprovisioned_lake, postgres_dsn, monkeypatch
 ):
     import json
@@ -461,8 +548,9 @@ def test_provision_exporter_cli_success_then_already_provisioned(
         assert json.loads(result.output)["provisioned"] is True
         assert spec.dsn() not in result.output
         again = _provision_cli(spec, monkeypatch, role=role)
-        assert again.exit_code != 0
-        assert "lake_export_already_provisioned" in again.output
+        assert again.exit_code == 0, again.output
+        assert json.loads(again.output)["provisioned"] is False
+        assert json.loads(again.output)["retuned"] is True
     finally:
         with psycopg.connect(spec.dsn(), autocommit=True) as con:
             con.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))

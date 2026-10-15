@@ -22,10 +22,16 @@ initialized separate catalog with the rebuilt `agent_events` and
 `export_event_versions` tables, then installs the private catalog ownership
 schema and snapshot commit trigger. Setup is deliberately separate from runtime
 startup; it must complete before an exporter starts. The group name comes from
-`provision_catalog_roles`. No login/password is created. Provisioning is not a
-retryable migration command; partially failed admin setup requires inspection.
+`provision_catalog_roles`. No login/password is created. Retuning is safe to
+repeat; partially failed initial setup requires inspection.
 
-The added lake tables use Zstd, disabled inlining, and the pinned runtime.
+The added lake tables use Zstd and persist a ten-row inlining limit for the
+five tables written by an export. A one- or two-row export therefore stays in
+the catalog instead of creating five tiny Parquet files; larger batches still
+use Parquet. The catalog also retains snapshots for 30 days. Re-running
+`provision-exporter` against an already-provisioned catalog is the explicit,
+idempotent retuning action for these storage settings; it does not replace
+tables or the ownership guard.
 Event versions retain UTC-day partitioning; raw outbox rows and receipts remain
 unpartitioned. Neither tables nor receipts are replaced. No time-travel reads
 or filesystem globs participate in publication or recovery.
@@ -76,8 +82,11 @@ catalog upgrades must retest it before changing the recorded runtime pins.
    payload SHA-256 and stable file/ordinal tie-breaks. Compare only affected
    target keys with the same ordering. Full payloads, not UI previews, feed the
    canonical projection. Control identities retain `control:<event_id>` keys.
-4. In **one lake transaction**, MERGE canonical events and append raw outbox
-   rows, immutable deduplicated event versions, and one immutable batch receipt.
+4. In **one lake transaction**, replace affected canonical event keys with a
+   delete/insert and append raw outbox rows, immutable deduplicated event
+   versions, and one immutable batch receipt. The delete/insert keeps DuckLake's
+   small export writes eligible for inlining while preserving MERGE winner
+   semantics.
    The receipt binds catalog identity, contract version, batch/input hash,
    raw/canonical counts and normalized multiset hashes. Version rows preserve
    per-batch proof even when a later canonical winner replaces an active row.
@@ -129,8 +138,9 @@ and `git diff --check` passed. Runtime-pin rejection leaves ingress pending.
 For DuckLake hubs, `/readyz` includes `exporter`: `state`, `running`,
 `last_successful_export_at` (UTC, null until the first acknowledged export),
 `unacknowledged_batches`, `oldest_unacknowledged_age_seconds`,
-`oldest_outstanding_age_seconds`, `last_error`, `restart_count` and
-`recovery_action`. During backoff, `recovery_pending` is true and the action
+`oldest_outstanding_age_seconds`, `last_error`, `restart_count`,
+`recovery_attempt_age_seconds`, `recovery_escalation_count`,
+`restart_requested` and `recovery_action`. During backoff, `recovery_pending` is true and the action
 reports the scheduled restart. The outstanding age also includes pending ingress that has
 not yet formed a batch. A running idle exporter is `ok` even if its last export
 was hours ago. Outstanding work is `lagging` at 30 seconds and `stalled` at
@@ -176,7 +186,11 @@ fail closed. Shutdown interrupts backoff and prevents replacement. If an owner
 cannot unwind within the 35-second cancellation grace, the exporter reports
 `lake_export_cancellation_stuck` and stopped; no overlapping owner is started.
 The watchdog requests server shutdown to clear the unresponsive thread.
-After the fifth replacement fails, the supervisor also requests server shutdown.
+If recovery blocks before it acquires an owner, the same attempt deadline
+requests server shutdown directly; this covers a stuck fence, exporter startup
+or serving proof that cannot be cooperatively cancelled. The health counter
+`recovery_escalation_count` records this transition. After the fifth replacement
+fails, the supervisor also requests server shutdown.
 The existing server cleanup runs and launchd's KeepAlive job restarts the process.
 An unmanaged foreground server exits and must be started by its operator.
 
@@ -197,6 +211,18 @@ replacement budget is exhausted, the managed hub restarts automatically. Confirm
 status, decreasing outstanding age and batch count, and a new successful export
 time after synthetic ingestion. Verify that synthetic content is returned by
 recall and search before declaring recovery complete.
+
+## Upgrade maintenance
+
+After deploying this version, an operator must run `lake provision-exporter`
+once with the catalog administrator DSN and the existing exporter role. This
+retunes existing export tables, creates the administrator-owned inlined-data
+tables, and grants the exporter DML only; it does not run at server startup.
+For a catalog that already accumulated tiny files, schedule bounded
+`ducklake_merge_adjacent_files` maintenance for the five export tables. After
+the configured 30-day retention window and a verified backup, expire old
+snapshots and clean their unreferenced files with DuckLake's maintenance
+procedures. Do not perform these operations as part of normal server restart.
 
 Deployment needs no new environment variables. The recovery deadline config
 is optional. Restart the upgraded hub to load the supervisor and apply control

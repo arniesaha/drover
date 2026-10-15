@@ -33,7 +33,12 @@ from drover.server.memory_identity import project_control_event
 from drover.task_id import compute_task_id
 
 from .activity_daily import ACTIVITY_DAILY_SCHEMA, refresh_activity_daily
-from .export_guard import APPLICATION_PREFIX, activate, install_commit_guard
+from .export_guard import (
+    APPLICATION_PREFIX,
+    activate,
+    grant_exporter_catalog_dml,
+    install_commit_guard,
+)
 from .export_worker import RECEIPT_SCHEMA, receipt_hash, validate_input
 from .fence import MutationFence
 from .query_process import _rss
@@ -41,10 +46,68 @@ from .rebuild_worker import LINEAGE, POLICY_SCHEMA
 from .runtime import LakeError, LakeSpec, create_table, lake_connection, verify_runtime
 
 MAX_INPUT_BYTES = 32 * 1024**2
+EXPORT_INLINE_ROW_LIMIT = 10
+EXPORT_INLINE_TABLES = (
+    "agent_events",
+    "activity_daily",
+    "control_outbox_batches",
+    "export_event_versions",
+    "export_batch_receipts",
+)
+EXPORT_INLINE_PROBES = {
+    "agent_events": ("id", "__drover_inline_probe_agent_events__"),
+    "activity_daily": ("date", "__drover_inline_probe_activity_daily__"),
+    "control_outbox_batches": (
+        "event_id",
+        "__drover_inline_probe_control_outbox_batches__",
+    ),
+    "export_event_versions": (
+        "id",
+        "__drover_inline_probe_export_event_versions__",
+    ),
+    "export_batch_receipts": (
+        "batch_id",
+        "__drover_inline_probe_export_batch_receipts__",
+    ),
+}
+
+
+def configure_export_storage(con) -> None:
+    """Persist small-batch inlining and finite snapshot retention for exports.
+
+    DuckLake otherwise emits a file for each table touched by every tiny export.
+    The exporter commonly publishes one or two rows, so leave those rows in the
+    PostgreSQL catalog; larger batches still become Parquet files. This is an
+    explicit provisioning/retuning action, never startup work.
+    """
+    for table in EXPORT_INLINE_TABLES:
+        con.execute(
+            "CALL lake.set_option('data_inlining_row_limit', ?, table_name => ?)",
+            [EXPORT_INLINE_ROW_LIMIT, table],
+        )
+    # DuckLake retains every snapshot by default. A bounded history lets its
+    # own maintenance clear obsolete metadata and files after compaction.
+    con.execute("CALL lake.set_option('expire_older_than', '30 days')")
+
+
+def prime_export_inlining(con) -> None:
+    """Create DuckLake's inlined-data tables under the catalog administrator.
+
+    DuckLake creates these physical PostgreSQL tables lazily. The steady-state
+    exporter deliberately has no CREATE privilege on the metadata schema, so
+    create each mapping during explicit provisioning and leave no probe rows.
+    """
+    for table, (column, value) in EXPORT_INLINE_PROBES.items():
+        con.execute(f'INSERT INTO lake."{table}" ("{column}") VALUES (?)', [value])
+        con.execute(f'DELETE FROM lake."{table}" WHERE "{column}" = ?', [value])
 
 
 def provision_exporter(spec: LakeSpec, *, exporter_role: str | None = None):
-    """Admin-only setup on an initialized catalog; startup does no lake DDL."""
+    """Admin-only setup or retuning on an initialized catalog.
+
+    A repeat invocation never replaces tables or guard ownership. It only
+    applies the current bounded-storage policy to an already-provisioned lake.
+    """
     with MutationFence(spec.dsn()), lake_connection(spec, read_only=False) as con:
         names = {
             r[0]
@@ -54,8 +117,17 @@ def provision_exporter(spec: LakeSpec, *, exporter_role: str | None = None):
         }
         if not {"agent_events", "control_outbox_batches"} <= names:
             raise LakeError("lake_export_tables_missing")
-        if {"export_batch_receipts", "export_event_versions"} & names:
-            raise LakeError("lake_export_already_provisioned")
+        export_tables = {"export_batch_receipts", "export_event_versions"}
+        if export_tables & names:
+            if not export_tables <= names:
+                raise LakeError("lake_export_provisioning_partial")
+            if "activity_daily" not in names:
+                raise LakeError("lake_export_provisioning_partial")
+            configure_export_storage(con)
+            prime_export_inlining(con)
+            if exporter_role:
+                grant_exporter_catalog_dml(spec, exporter_role)
+            return {"provisioned": False, "retuned": True}
         if "activity_daily" not in names:
             create_table(
                 con, "activity_daily", ACTIVITY_DAILY_SCHEMA, day_partition=True
@@ -73,7 +145,10 @@ def provision_exporter(spec: LakeSpec, *, exporter_role: str | None = None):
         create_table(
             con, "export_event_versions", POLICY_SCHEMA | LINEAGE, day_partition=True
         )
+        configure_export_storage(con)
+        prime_export_inlining(con)
     install_commit_guard(spec, exporter_role=exporter_role)
+    return {"provisioned": True, "retuned": False}
 
 
 def _json_value(value):

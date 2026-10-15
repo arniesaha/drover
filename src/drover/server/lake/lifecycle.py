@@ -71,6 +71,9 @@ class ExporterLifecycle:
         self._batch_started_at = None
         self._cancel_requested_at = None
         self._cancellation_stuck = False
+        self._attempt_started_at = None
+        self._restart_requested = False
+        self._recovery_escalations = 0
         self._batch_deadline = (
             getattr(config.analytics, "exporter_recovery_deadline_seconds", 120)
             if hasattr(config, "analytics")
@@ -139,6 +142,9 @@ class ExporterLifecycle:
 
     def _watch_freshness(self, shutdown):
         while not self._stop.is_set() and not shutdown.is_set():
+            self._watch_attempt(shutdown)
+            if self._restart_requested:
+                return
             self._watch_batch()
             if self._cancellation_stuck:
                 self._request_restart(shutdown)
@@ -151,6 +157,33 @@ class ExporterLifecycle:
                     "freshness_error": "lake_freshness_unavailable",
                 }
             self._stop.wait(FRESHNESS_POLL_SECONDS)
+
+    def _watch_attempt(self, shutdown):
+        """Fail fast if recovery wedges before it owns a cancellable batch.
+
+        Ownership acquisition and the serving proof happen before ``_owner`` is
+        registered. A catalog lock in either step used to leave the supervisor
+        thread alive forever, so neither the batch watchdog nor the restart cap
+        could make progress.
+        """
+        now = time.monotonic()
+        with self._owner_lock:
+            started = self._attempt_started_at
+            owner = self._owner
+            expired = (
+                started is not None
+                and owner is None
+                and now - started >= self._batch_deadline
+            )
+            if expired:
+                self._error = "lake_export_recovery_deadline"
+                self._stop.set()
+        if expired:
+            log.error(
+                "DuckLake recovery attempt exceeded deadline before ownership; "
+                "requesting server restart"
+            )
+            self._request_restart(shutdown)
 
     def _supervise(self, shutdown):
         while not self._stop.is_set() and not shutdown.is_set():
@@ -170,6 +203,11 @@ class ExporterLifecycle:
             self._recovering = False
 
     def _request_restart(self, shutdown):
+        with self._owner_lock:
+            if self._restart_requested:
+                return
+            self._restart_requested = True
+            self._recovery_escalations += 1
         log.error(
             "DuckLake recovery exhausted: error=%s restarts=%s; "
             "requesting server shutdown for service-manager restart",
@@ -179,6 +217,8 @@ class ExporterLifecycle:
         shutdown.set()
 
     def _run(self, shutdown):
+        with self._owner_lock:
+            self._attempt_started_at = time.monotonic()
         try:
             # Create, use and release the dedicated fence on this owner thread.
             with LakeOutboxExporter(
@@ -266,6 +306,7 @@ class ExporterLifecycle:
                 self._owner = None
                 self._batch_started_at = None
                 self._cancel_requested_at = None
+                self._attempt_started_at = None
             self._running = False
             self._ready.set()
 
@@ -317,6 +358,10 @@ class ExporterLifecycle:
     def stop(self):
         self._stop.set()
         if self._thread is not None:
+            if self._restart_requested and self._thread.is_alive():
+                # The supervisor is a daemon; server shutdown must not wait
+                # behind the very wedged call that requested launchd recovery.
+                return
             self._thread.join(35)
             if self._thread.is_alive():
                 raise LakeError("lake_exporter_stop_deadline")
@@ -335,6 +380,19 @@ class ExporterLifecycle:
         health["recovery_pending"] = self._recovering or (
             self._cancel_requested_at is not None and not self._cancellation_stuck
         )
+        with self._owner_lock:
+            attempt_age = (
+                max(0.0, time.monotonic() - self._attempt_started_at)
+                if self._attempt_started_at is not None
+                else 0.0
+            )
+        health["recovery_attempt_age_seconds"] = attempt_age
+        health["recovery_escalation_count"] = self._recovery_escalations
+        health["restart_requested"] = self._restart_requested
+        if self._restart_requested:
+            health["recovery_action"] = (
+                "Server restart requested; the service manager will replace the exporter."
+            )
         if health["recovery_pending"]:
             health["recovery_action"] = (
                 "Supervised restart scheduled; check exporter logs and connectivity."
