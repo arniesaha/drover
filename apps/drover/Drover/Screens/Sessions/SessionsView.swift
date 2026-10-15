@@ -105,11 +105,13 @@ struct SessionsView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         if dynamicTypeSize.isAccessibilitySize { statusHeader }
-                        WorkAttentionList(store: workStore, focusedID: focusedAttentionID) { sessionID in
-                            NotificationRoute.shared.open(sessionID: sessionID)
-                            openSessionFromNotification()
+                        if workStore.isVisible {
+                            WorkAttentionList(store: workStore, focusedID: focusedAttentionID) { sessionID in
+                                NotificationRoute.shared.open(sessionID: sessionID)
+                                openSessionFromNotification()
+                            }
+                            .id("work-attention")
                         }
-                        .id("work-attention")
                         // Action errors (e.g. a failed continueSession) land here.
                         // They are distinct from an unreachable hub: connected, but
                         // the last thing you asked for didn't happen. Refresh

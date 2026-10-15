@@ -142,6 +142,8 @@ final class FixtureHubURLProtocol: URLProtocol {
             return .json(status: 400, ["error": "fixture refuses non-synthetic origin"])
         }
         switch (request.httpMethod, path) {
+        case ("GET", "/work/list"):
+            return .json(status: 503, ["error": "work control unavailable"])
         case ("GET", "/cockpit/overview") where state.kind == .observability:
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.overview)
         case ("GET", "/analytics"):

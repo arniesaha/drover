@@ -19,6 +19,32 @@ final class DeterministicJourneyUITests: XCTestCase {
     }
 
     @MainActor
+    func testDisabledWorkDecisionsLeaveHomeClearAfterPullToRefresh() {
+        let app = makeCoreJourneyApp()
+        app.launch()
+        let session = app.buttons["fixture-session"]
+        XCTAssertTrue(session.waitForExistence(timeout: 5))
+        assertNoWorkDecisions(in: app)
+        app.scrollViews["fleet-list"].swipeDown()
+        XCTAssertTrue(session.waitForExistence(timeout: 5))
+        assertNoWorkDecisions(in: app)
+        XCTAssertTrue(session.isHittable)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Home with work control disabled"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    @MainActor
+    private func assertNoWorkDecisions(in app: XCUIApplication) {
+        XCTAssertFalse(app.descendants(matching: .any)["work-attention-list"].exists)
+        XCTAssertFalse(app.staticTexts["Work decisions"].exists)
+        XCTAssertFalse(app.buttons["Refresh Needs you"].exists)
+        XCTAssertFalse(app.staticTexts["No pending work decisions."].exists)
+        XCTAssertFalse(app.staticTexts["Couldn't update. Pull to refresh."].exists)
+    }
+
+    @MainActor
     func testFleetChatBackLaunchAndRecoveredDeliveryKeepsOneReceipt() throws {
         let app = makeCoreJourneyApp()
         app.launch()
