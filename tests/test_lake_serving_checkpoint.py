@@ -5,6 +5,7 @@ prod exports 2.5-11 a minute. The hub's exporter checkpoints the same check
 so serving only re-checks exports after it, with no config edit or restart.
 """
 
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -19,6 +20,30 @@ from drover.server.lake.lifecycle import CHECKPOINT_EVERY_EXPORTS, ExporterLifec
 from drover.server.lake.runtime import LakeError
 
 HELD = SimpleNamespace(check=lambda: None)
+
+
+def _maintenance_receipt(spec, digest, snapshot, *, after=None):
+    tables = {"agent_events": {"rows": 1, "normalized_multiset_sha256": "a" * 64}}
+    intent = {
+        "version": 1,
+        "proof_sha256": digest,
+        "catalog_id": "catalog",
+        "data_root": str(spec.data_root.resolve()),
+        "before_snapshot": snapshot - 1,
+        "tables": tables,
+    }
+    commitment = hashlib.sha256(json.dumps(intent, sort_keys=True).encode()).hexdigest()
+    receipt = {
+        **intent,
+        "after_snapshot": snapshot,
+        "after_tables": after or tables,
+        "commits": [[snapshot, "drover-maintenance", "maint-1", commitment]],
+        "intent_sha256": commitment,
+    }
+    (spec.data_root / "verification" / "maintenance-receipts.json").write_text(
+        json.dumps([receipt])
+    )
+    return commitment
 
 
 def _bulk_export(con, first_snapshot, count, prefix):
@@ -108,6 +133,50 @@ def test_checkpoint_still_rejects_a_non_export_snapshot_after_it(
     spec, con, digest, export = proven_lake
     advance()
     export(100, "batch-manual", author="operator")
+
+    with pytest.raises(LakeError, match="lake_verification_required"):
+        serving_proof.check_proof(spec, con, digest)
+
+
+def test_receipted_unchanged_maintenance_snapshot_is_servable(
+    proven_lake,
+):  # noqa: F811
+    spec, con, digest, _ = proven_lake
+    commitment = _maintenance_receipt(spec, digest, 100)
+    con.execute(
+        "INSERT INTO lake.snapshot_log VALUES (100,'drover-maintenance','maint-1',?)",
+        [commitment],
+    )
+
+    assert serving_proof.check_proof(spec, con, digest)["snapshot"] == 100
+
+
+def test_tampered_maintenance_receipt_fails_closed(proven_lake):  # noqa: F811
+    spec, con, digest, _ = proven_lake
+    commitment = _maintenance_receipt(
+        spec,
+        digest,
+        100,
+        after={"agent_events": {"rows": 2, "normalized_multiset_sha256": "a" * 64}},
+    )
+    con.execute(
+        "INSERT INTO lake.snapshot_log VALUES (100,'drover-maintenance','maint-1',?)",
+        [commitment],
+    )
+    _checkpoint_file(spec).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "proof_sha256": digest,
+                "catalog_id": "catalog",
+                "data_root": str(spec.data_root.resolve()),
+                "snapshot": 100,
+                "commit": ["drover-maintenance", "maint-1", commitment],
+                "exports": 60,
+                "chain_sha256": "a" * 64,
+            }
+        )
+    )
 
     with pytest.raises(LakeError, match="lake_verification_required"):
         serving_proof.check_proof(spec, con, digest)

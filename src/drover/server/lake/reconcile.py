@@ -1,0 +1,111 @@
+"""Find and explicitly repair control acknowledgements absent from a lake."""
+
+from __future__ import annotations
+
+import json
+
+from drover.server.control_outbox import canonical_payload, payload_sha256
+from drover.server.db import control_plane_connection
+
+from .export_guard import GUARD_SCHEMA
+from .export_worker import export, receipt_hash, validate_input
+from .fence import drained_mutation
+from .runtime import LakeError, LakeSpec, lake_connection
+
+
+def _export_catalog_id(spec):
+    """Match the durable id stamped into frozen export inputs, not schema UUID."""
+    import psycopg
+
+    try:
+        with psycopg.connect(spec.dsn(), connect_timeout=2) as con:
+            rows = con.execute(
+                f"SELECT catalog_id FROM {GUARD_SCHEMA}.ownership WHERE singleton"
+            ).fetchall()
+    except Exception:
+        raise LakeError("lake_reconcile_catalog_missing") from None
+    if len(rows) != 1:
+        raise LakeError("lake_reconcile_catalog_missing")
+    return str(rows[0][0])
+
+
+def missing_acknowledged(control_path, spec: LakeSpec):
+    """Return immutable frozen inputs acknowledged for this catalog but absent in it."""
+    catalog_id = _export_catalog_id(spec)
+    with control_plane_connection(control_path, timeout=2) as control:
+        rows = control.execute(
+            """SELECT x.batch_id,x.input_json,x.input_sha256,x.receipt_sha256
+            FROM lake_export_batches x JOIN control_outbox_batches b USING (batch_id)
+            WHERE x.catalog_id=? AND x.acknowledged_at IS NOT NULL
+              AND b.acknowledged_at IS NOT NULL ORDER BY b.acknowledged_at,x.batch_id""",
+            [catalog_id],
+        ).fetchall()
+    batch_ids = [row[0] for row in rows]
+    if not batch_ids:
+        return []
+    with lake_connection(spec) as lake:
+        found = {
+            row[0]
+            for row in lake.execute(
+                "SELECT batch_id FROM lake.export_batch_receipts "
+                "WHERE batch_id IN (SELECT unnest(?::VARCHAR[]))",
+                [batch_ids],
+            ).fetchall()
+        }
+    missing = []
+    for batch_id, input_json, input_sha256, stored_receipt in rows:
+        if payload_sha256(input_json) != input_sha256:
+            raise LakeError("lake_reconcile_input_corrupt")
+        if batch_id in found:
+            continue
+        document = json.loads(input_json)
+        validate_input(document)
+        if (
+            document.get("catalog_id") != catalog_id
+            or document.get("batch_id") != batch_id
+        ):
+            raise LakeError("lake_reconcile_input_mismatch")
+        missing.append(
+            {
+                "batch_id": batch_id,
+                "input_sha256": input_sha256,
+                "receipt_sha256": stored_receipt,
+                "document": document,
+            }
+        )
+    return missing
+
+
+def reconcile_acknowledged(control_path, spec: LakeSpec, *, apply=False):
+    """Dry-run by default; republish exact frozen documents only when requested.
+
+    ``export`` merges candidates with current rows using its deterministic
+    version ordering. Consequently an old repaired batch can append its
+    immutable evidence but cannot replace a newer canonical winner.
+    """
+    missing = missing_acknowledged(control_path, spec)
+    report = {
+        "dry_run": not apply,
+        "missing": [r["batch_id"] for r in missing],
+        "repaired": [],
+    }
+    if not apply or not missing:
+        return report
+    with drained_mutation(spec.dsn()) as fence:
+        for item in missing:
+            fence.check()
+            result = export(spec, item["document"])
+            fence.check()
+            digest = receipt_hash(result["receipt"])
+            if item["receipt_sha256"] not in (None, digest):
+                raise LakeError("lake_reconcile_receipt_mismatch")
+            with control_plane_connection(control_path, timeout=2) as control:
+                control.execute(
+                    "UPDATE lake_export_batches SET receipt_sha256=? "
+                    "WHERE batch_id=? AND acknowledged_at IS NOT NULL",
+                    [digest, item["batch_id"]],
+                )
+            report["repaired"].append(
+                {"batch_id": item["batch_id"], "replayed": result["replayed"]}
+            )
+    return report

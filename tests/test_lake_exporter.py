@@ -1,5 +1,6 @@
 """Real exporter transactions on a private PG cluster and small fixture lake."""
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -80,13 +81,50 @@ def lake_file_counts(spec):
         )
 
 
+def write_serving_proof(spec):
+    """Build the smallest real serving baseline for maintenance integration."""
+    from drover.server.lake.runtime import create_table
+    from drover.server.lake.serving_proof import catalog_identity
+
+    with lake_connection(spec, read_only=False) as con:
+        for table in ("agent_events_legacy_metadata", "provider_usage_snapshots"):
+            create_table(con, table, {"id": "VARCHAR"})
+        snapshot = con.execute(
+            "SELECT max(snapshot_id) FROM lake.snapshots()"
+        ).fetchone()[0]
+    verification = spec.data_root / "verification"
+    verification.mkdir(exist_ok=True)
+    report = json.dumps({"dry_run": False}).encode()
+    tables = {
+        table: {"rows": 0}
+        for table in (
+            "agent_events",
+            "agent_events_legacy_metadata",
+            "provider_usage_snapshots",
+            "control_outbox_batches",
+        )
+    }
+    (verification / "report.json").write_bytes(report)
+    (verification / "last-verify.json").write_text(json.dumps({"tables": tables}))
+    proof = {
+        "version": 1,
+        "catalog_id": catalog_identity(spec),
+        "data_root": str(spec.data_root.resolve()),
+        "snapshot": snapshot,
+        "report_sha256": hashlib.sha256(report).hexdigest(),
+        "tables": tables,
+    }
+    (verification / "serving-proof.json").write_text(json.dumps(proof, sort_keys=True))
+    return snapshot
+
+
 def test_maintenance_compacts_export_files_under_the_drained_fence(export_lake):
     """A catalog-admin operation reduces mutable export files without inlining."""
     from drover.server.lake.maintenance import maintain_lake
 
     with lake_connection(export_lake, read_only=False) as con:
-        # Force this disposable fixture's historical snapshots eligible so the
-        # integration path proves expiry runs after compaction.
+        # Even with the catalog option shortened, maintenance preserves the
+        # normal 30-day time-travel window before considering its baseline.
         con.execute("CALL lake.set_option('expire_older_than', '0 seconds')")
         for i in range(80):
             con.execute(
@@ -95,13 +133,136 @@ def test_maintenance_compacts_export_files_under_the_drained_fence(export_lake):
             )
     before = lake_file_counts(export_lake)["agent_events"]
 
+    snapshot = write_serving_proof(export_lake)
+
     report = maintain_lake(export_lake, tables=("agent_events",))
 
     after = lake_file_counts(export_lake)["agent_events"]
     assert before >= 80
     assert report["tables"]["agent_events"]["files_before"] == before
     assert after < before
-    assert report["snapshots_after"] < report["snapshots_before"]
+    assert report["snapshots_after"] == report["snapshots_before"] + 1
+    assert report["baseline_snapshot"] == snapshot
+
+
+def test_reconcile_repairs_acknowledged_batch_missing_from_restored_lake(
+    export_lake, postgres_control_store
+):
+    """A control acknowledgement is not mistaken for present lake evidence."""
+    from drover.server.lake.reconcile import reconcile_acknowledged
+
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+    with lake_connection(export_lake, read_only=False) as con:
+        con.execute("DELETE FROM lake.export_batch_receipts")
+        con.execute("DELETE FROM lake.export_event_versions")
+        con.execute("DELETE FROM lake.control_outbox_batches")
+        con.execute("DELETE FROM lake.agent_events")
+
+    plan = reconcile_acknowledged(control_path, export_lake)
+    assert plan["dry_run"] and len(plan["missing"]) == 1
+    repaired = reconcile_acknowledged(control_path, export_lake, apply=True)
+    assert repaired["repaired"] == [{"batch_id": plan["missing"][0], "replayed": False}]
+    assert lake_counts(export_lake) == [1, 1, 1, 1]
+    assert reconcile_acknowledged(control_path, export_lake)["missing"] == []
+
+
+def test_reconcile_old_batch_preserves_newer_winner_and_receipt(
+    export_lake, postgres_control_store, monkeypatch
+):
+    """Restoring A appends its evidence but cannot replace later winner B."""
+    from drover.server.lake import exporter as exporter_module
+    from drover.server.lake.reconcile import reconcile_acknowledged
+
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    original = exporter_module.project_control_event
+
+    def same_key(row, session):
+        event = original(row, session)
+        event["dedup_key"] = "reconcile-shared-key"
+        if row["event_id"] == "event-0":
+            event.update(timestamp="2026-10-15T09:00:00+00:00", date="2026-10-15")
+        else:
+            event.update(timestamp="2026-10-15T10:00:00+00:00", date="2026-10-15")
+        return event
+
+    monkeypatch.setattr(exporter_module, "project_control_event", same_key)
+    registry = HarnessRegistry(control_path)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+        registry.append_event(
+            session_id="export-session",
+            event_id="event-new",
+            event_type="assistant_output",
+            payload={"text": "newer winner"},
+            seq=2,
+            content_preview="newer winner",
+        )
+        assert exporter.run_once()["acknowledged"] == 1
+    with control_plane_connection(control_path) as con:
+        old_batch, old_receipt = con.execute(
+            "SELECT x.batch_id,x.receipt_sha256 FROM lake_export_batches x "
+            "JOIN control_outbox_batches b USING (batch_id) "
+            "ORDER BY b.created_at LIMIT 1"
+        ).fetchone()
+    with lake_connection(export_lake, read_only=False) as con:
+        con.execute(
+            "DELETE FROM lake.export_batch_receipts WHERE batch_id=?", [old_batch]
+        )
+        con.execute(
+            "DELETE FROM lake.export_event_versions WHERE _import_file=?",
+            ["outbox:" + old_batch],
+        )
+        con.execute(
+            "DELETE FROM lake.control_outbox_batches WHERE _import_file=?",
+            ["outbox:" + old_batch],
+        )
+        before_daily = con.execute(
+            "SELECT event_count,first_event_at,last_event_at FROM lake.activity_daily"
+        ).fetchall()
+
+    repaired = reconcile_acknowledged(control_path, export_lake, apply=True)
+
+    assert repaired["repaired"] == [{"batch_id": old_batch, "replayed": False}]
+    with lake_connection(export_lake) as con:
+        assert con.execute(
+            "SELECT id,content FROM lake.agent_events WHERE dedup_key='reconcile-shared-key'"
+        ).fetchall() == [("event-new", "newer winner")]
+        assert con.execute(
+            "SELECT count(*) FROM lake.export_event_versions WHERE _import_file=?",
+            ["outbox:" + old_batch],
+        ).fetchone() == (1,)
+        assert (
+            con.execute(
+                "SELECT event_count,first_event_at,last_event_at FROM lake.activity_daily"
+            ).fetchall()
+            == before_daily
+        )
+    with control_plane_connection(control_path) as con:
+        assert con.execute(
+            "SELECT receipt_sha256 FROM lake_export_batches WHERE batch_id=?",
+            [old_batch],
+        ).fetchone() == (old_receipt,)
+
+
+def test_reconcile_refuses_corrupt_acknowledged_frozen_input(
+    export_lake, postgres_control_store
+):
+    """A bad durable input must not disappear from restore reconciliation."""
+    from drover.server.lake.reconcile import reconcile_acknowledged
+
+    control_path, _ = postgres_control_store
+    seed(control_path, count=1)
+    with LakeOutboxExporter(control_path=control_path, spec=export_lake) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+    with control_plane_connection(control_path) as con:
+        con.execute("UPDATE lake_export_batches SET input_sha256='bad'")
+
+    with pytest.raises(LakeError, match="lake_reconcile_input_corrupt"):
+        reconcile_acknowledged(control_path, export_lake)
 
 
 @pytest.mark.acceptance_scale
@@ -169,6 +330,8 @@ print(json.dumps({'elapsed_seconds': round(monotonic() - started, 3), 'peak_rss_
             )
 
     before = fresh_merge_measure()
+
+    write_serving_proof(export_lake)
 
     report = maintain_lake(export_lake, tables=("agent_events",))
 

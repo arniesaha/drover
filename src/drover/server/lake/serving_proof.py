@@ -65,10 +65,9 @@ def check_proof(spec, con, digest):
 
     directory = spec.data_root / "verification"
     try:
-        payload = (directory / "serving-proof.json").read_bytes()
-        if len(payload) > 1024 * 1024 or hashlib.sha256(payload).hexdigest() != digest:
+        proof, actual_digest = _proof(spec)
+        if actual_digest != digest:
             raise ValueError()
-        proof = json.loads(payload)
         report = json.loads((directory / "report.json").read_bytes())
         verified = json.loads((directory / "last-verify.json").read_bytes())
         if (
@@ -109,13 +108,22 @@ def check_proof(spec, con, digest):
         if checkpoint and list(snapshots[0][1:]) != checkpoint["commit"]:
             raise ValueError()
         later = snapshots[1:]
-        if any(author != "drover-export" for _, author, _, _ in later):
+        exports = [row for row in later if row[1] == "drover-export"]
+        maintenance = [row for row in later if row[1] == "drover-maintenance"]
+        if len(exports) + len(maintenance) != len(later):
             raise ValueError()
-        receipts = _export_receipts(con, [batch for _, _, batch, _ in later])
-        for _, _, batch, receipt_digest in later:
+        receipts = _export_receipts(con, [batch for _, _, batch, _ in exports])
+        for _, _, batch, receipt_digest in exports:
             rows = receipts.get(batch, [])
             if len(rows) != 1 or receipt_hash(rows[0]) != receipt_digest:
                 raise ValueError()
+        # A checkpoint is trusted only after its own maintenance receipt still
+        # validates; otherwise deleting/tampering that receipt would turn a
+        # formerly accepted maintenance boundary into a blind spot.
+        checked_maintenance = maintenance
+        if checkpoint and snapshots[0][1] == "drover-maintenance":
+            checked_maintenance = [snapshots[0], *maintenance]
+        _check_maintenance_receipts(directory, digest, proof, checked_maintenance)
         _check_referenced_files(spec, con)
         head = snapshots[-1]
         return {
@@ -126,7 +134,7 @@ def check_proof(spec, con, digest):
             "from_snapshot": start,
             "snapshot": head[0],
             "commit": list(head[1:]),
-            "exports": (checkpoint["exports"] if checkpoint else 0) + len(later),
+            "exports": (checkpoint["exports"] if checkpoint else 0) + len(exports),
             "chain_sha256": _chain(
                 checkpoint["chain_sha256"] if checkpoint else digest, later
             ),
@@ -171,9 +179,9 @@ def _checkpoint(directory, digest, proof):
         or record["snapshot"] <= proof["snapshot"]
         or not isinstance(record.get("commit"), list)
         or len(record["commit"]) != 3
-        or record["commit"][0] != "drover-export"
+        or record["commit"][0] not in {"drover-export", "drover-maintenance"}
         or type(record.get("exports")) is not int
-        or record["exports"] < 1
+        or record["exports"] < 0
         or not isinstance(record.get("chain_sha256"), str)
         or len(record["chain_sha256"]) != 64
     ):
@@ -181,20 +189,97 @@ def _checkpoint(directory, digest, proof):
     return record
 
 
-def advance_checkpoint(spec, digest, *, fence):
+def _proof(spec):
+    """Load the config-pinned proof before accepting any local attestation."""
+    payload = (spec.data_root / "verification" / "serving-proof.json").read_bytes()
+    if len(payload) > 1024 * 1024:
+        raise ValueError()
+    return json.loads(payload), hashlib.sha256(payload).hexdigest()
+
+
+def _check_maintenance_receipts(directory, digest, proof, snapshots):
+    """Accept only a journal entry committed by the fenced maintenance run.
+
+    The catalog stores an intent hash in every maintenance snapshot. The local
+    entry binds that intent to the proof, exact before/after snapshots and
+    equal before/after logical table fingerprints. Thus a foreign snapshot or
+    a modified receipt cannot become a checkpoint boundary.
+    """
+    if not snapshots:
+        return
+    from .maintenance import MAINTENANCE_RECEIPTS
+
+    try:
+        records = json.loads((directory / MAINTENANCE_RECEIPTS).read_text())
+        if not isinstance(records, list):
+            raise ValueError()
+    except (OSError, ValueError):
+        raise ValueError() from None
+    remaining = {tuple(row) for row in snapshots}
+    for record in records:
+        try:
+            intent = {
+                key: record[key]
+                for key in (
+                    "version",
+                    "proof_sha256",
+                    "catalog_id",
+                    "data_root",
+                    "before_snapshot",
+                    "tables",
+                )
+            }
+            expected = hashlib.sha256(
+                json.dumps(intent, sort_keys=True).encode()
+            ).hexdigest()
+            commits = {tuple(row) for row in record["commits"]}
+            # Old receipts naturally precede a later checkpoint. They are
+            # irrelevant here; a partially overlapping receipt is not.
+            if not commits & remaining:
+                continue
+            if (
+                record["version"] != 1
+                or record["proof_sha256"] != digest
+                or record["catalog_id"] != proof["catalog_id"]
+                or record["data_root"] != proof["data_root"]
+                or record["intent_sha256"] != expected
+                or record["tables"] != record["after_tables"]
+                or not commits <= remaining
+                or not commits
+                or min(row[0] for row in commits) <= record["before_snapshot"]
+                or record["after_snapshot"] != max(row[0] for row in commits)
+                or any(
+                    row[1] != "drover-maintenance" or row[3] != expected
+                    for row in commits
+                )
+            ):
+                raise ValueError()
+            remaining -= commits
+        except (KeyError, TypeError, ValueError):
+            raise ValueError() from None
+    if remaining:
+        raise ValueError()
+
+
+def advance_checkpoint(spec, digest, *, fence, con=None):
     """Run the serving check at the lake head and record it as the checkpoint.
 
     Only the lake's single writer calls this, holding its mutation fence, so
-    nothing it did not check can be committed in between. The check runs in an
-    admitted serving child; a failure raises and leaves the old checkpoint.
+    nothing it did not check can be committed in between. The check normally
+    runs in an admitted serving child. Fenced maintenance supplies its
+    already-drained writer connection because its drain intentionally blocks a
+    child reader; a failure leaves the old checkpoint.
     """
-    from .query_process import query
+    if con is None:
+        from .query_process import query
 
-    record = query(
-        spec,
-        "SELECT 1",
-        serving={"verification_sha256": digest, "checkpoint": True},
-    )["checkpoint"]
+        record = query(
+            spec,
+            "SELECT 1",
+            serving={"verification_sha256": digest, "checkpoint": True},
+        )["checkpoint"]
+    else:
+        record = check_proof(spec, con, digest)
     if record["snapshot"] == record["from_snapshot"]:
         return None
     path = spec.data_root / "verification" / CHECKPOINT_NAME

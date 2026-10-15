@@ -252,10 +252,15 @@ procedures. Do not perform these operations as part of normal server restart.
 
 `lake maintain` is an administrator-only, fenced operation. It acquires the
 same mutation fence as the exporter and drains readers; it therefore fails
-safely if the hub is still exporting. It merges adjacent files in the five
-export tables, then expires snapshots using the catalog's configured 30-day
-retention, and finally removes files scheduled for deletion more than seven
-days ago. It never changes exporter privileges or inlining options.
+safely if the hub is still exporting. It fingerprints each compacted table
+before and after merging and writes a fenced `drover-maintenance` receipt in
+`verification/maintenance-receipts.json`. The receipt binds the pinned proof,
+catalog identity, before/after snapshots and content hashes. Serving accepts
+only receipted unchanged maintenance snapshots; an unknown snapshot or changed
+receipt still fails closed. Expiry is capped at the proof/checkpoint serving
+baseline, then seven-day old unreferenced files are cleaned. Maintenance checks
+that chain and advances its checkpoint; it never changes exporter privileges or
+inlining options.
 
 1. Verify a current, restorable backup generation. Do not shorten either
    retention window for the first run.
@@ -271,12 +276,38 @@ days ago. It never changes exporter privileges or inlining options.
 
 4. Run the same command without `--dry-run`. Save its JSON report, including
    per-table file counts and snapshot counts, with the maintenance record.
-5. Run the normal serving verification, start the hub, then confirm `/readyz`
-   reports a running exporter and a later successful export.
+5. Save the report and confirm it names a checkpoint snapshot. Start the hub,
+   then confirm `/readyz` reports a running exporter and a later successful
+   export. Do not edit a proof or checkpoint to recover a failed maintenance
+   run; investigate it and perform offline verification if needed.
 6. Add an operator-owned weekly launchd timer invoking that exact command while
    the hub is stopped for its maintenance window. Keep the seven-day cleanup
    safety window and the 30-day snapshot retention unless a separately
    verified backup/restore policy authorizes a change.
+
+### Restoring a lake without restoring control
+
+After restoring an older catalog/data generation, keep the hub stopped and run
+the following first as a dry run. It compares acknowledged frozen control
+batches for this catalog identity with `lake.export_batch_receipts`:
+
+```sh
+drover-server lake reconcile --data-root "$DROVER_LAKE_ROOT/$LAKE" \
+  --catalog-dsn-env DROVER_LAKE_V2_ADMIN_DSN \
+  --control-dsn-env DROVER_CONTROL_DSN --control-schema drover_control
+```
+
+If it lists batches, retain its output with the restore record, verify the
+backup choice, then repeat with `--apply`. This republishes the exact frozen
+input document, not current source rows, and the exporter merge ranks it with
+the existing `export_event_versions` rules, so an older repaired batch cannot
+overwrite a newer canonical row. The command is idempotent and dry-run by
+default. The re-export receipt is derived only from that frozen input; if its
+stored control digest differs, reconciliation fails closed with
+`lake_reconcile_receipt_mismatch` rather than replacing the acknowledgement's
+receipt. It does not waive serving-proof rollback detection: a missing proof
+or checkpoint baseline remains a fail-closed condition requiring normal
+offline verification before serving.
 
 Deployment needs no new environment variables. The recovery deadline config
 is optional. Restart the upgraded hub to load the supervisor and apply control
