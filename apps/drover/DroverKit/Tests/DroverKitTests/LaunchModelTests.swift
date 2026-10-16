@@ -61,6 +61,8 @@ private func catalog(
         #expect(await model.launch() == nil)
         #expect(model.launchError == "Choose a working directory before launching.")
     }
+    model.cwd = "/workspace"
+    #expect(model.canLaunch)
 }
 
 @Test @MainActor func overlappingAndCompletedLaunchesCreateOnlyOneSession() async throws {
