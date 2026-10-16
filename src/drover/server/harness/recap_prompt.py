@@ -47,6 +47,11 @@ _META_RECAP_RE = re.compile(
 )
 
 
+def is_meta_recap(value: Any) -> bool:
+    """Whether text is summarizer commentary rather than a session subject."""
+    return isinstance(value, str) and bool(_META_RECAP_RE.search(value))
+
+
 def fallback_live_recap(first_prompt: str, *, max_chars: int = 160) -> str:
     """Use trusted input as a neutral title, preserving short prompts."""
     text = " ".join(redact_auth_text(first_prompt).split())
@@ -107,7 +112,7 @@ def normalize_live_recap(value: Any, *, max_chars: int = 160) -> str:
         return ""
 
     text = _WHITESPACE_RE.sub(" ", _MARKDOWN_RE.sub("", value)).strip()
-    if _META_RECAP_RE.search(text):
+    if is_meta_recap(text):
         return ""
     # Before the length cap, so the budget is spent on the recap and not on
     # its subject.
