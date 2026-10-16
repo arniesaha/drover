@@ -155,6 +155,13 @@ FS_EXISTS_MAX_PATHS = 64
 TERMINAL_MIRROR_QUEUE_MAX = 2048
 TERMINAL_MIRROR_BATCH_MAX = 128
 
+# The hub pulls provider usage every five minutes.  Harnessd refreshes on the
+# same cadence, but never lets one local CLI or HTTP request occupy its
+# scheduler indefinitely.  This is deliberately independent of the relay's
+# request timeout: probes are not on the request path.
+PROVIDER_USAGE_REFRESH_INTERVAL_SECONDS = 300.0
+PROVIDER_USAGE_PROBE_TIMEOUT_SECONDS = 60.0
+
 
 def save_turn_attachments(
     attachments_dir: Path, session_id: str, images: list
@@ -1390,12 +1397,16 @@ class HarnessDaemonState:
     content_consent: DurableContentConsent | None = None
     model_catalog_service: ModelCatalogService | None = None
     model_catalog_service_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Constructed with the state so it can detect the enabled local providers,
+    # but started only by run_harnessd after the listener has bound.
+    provider_usage_cache: Any | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.auth is None:
             self.auth = AuthFlowManager(default_auth_adapters(adapters=self.adapters))
         if isinstance(self.structured, StructuredSessionManager):
             self.structured.adapters = self.adapters
+        self.provider_usage_cache = ProviderUsageRefreshCache(self)
 
     def recovery_lock_for(self, session_id: str) -> threading.Lock:
         with self.recovery_locks_guard:
@@ -1454,6 +1465,171 @@ class HarnessDaemonState:
             },
             self.host_id,
         )
+
+
+@dataclass
+class _InFlightProviderProbe:
+    """One provider read that may outlive the scheduler's wait budget."""
+
+    detected: DetectedProvider
+    thread: threading.Thread | None = None
+
+
+class ProviderUsageRefreshCache:
+    """Refresh local provider facts without putting probes on an HTTP thread.
+
+    A probe is waited on serially, so normal refreshes do not compete for the
+    local CLIs or credentials.  A misbehaving third-party probe cannot always
+    be cancelled safely in Python, however, so a timed-out daemon worker is
+    abandoned and the scheduler moves to the next provider.  The published
+    value remains the previous successful observation in that case.
+    """
+
+    def __init__(
+        self,
+        state: HarnessDaemonState,
+        *,
+        interval_seconds: float = PROVIDER_USAGE_REFRESH_INTERVAL_SECONDS,
+        probe_timeout_seconds: float = PROVIDER_USAGE_PROBE_TIMEOUT_SECONDS,
+    ) -> None:
+        self.state = state
+        self.interval_seconds = interval_seconds
+        self.probe_timeout_seconds = probe_timeout_seconds
+        self._snapshots: dict[tuple[str, tuple[str, ...]], ProviderAccountSnapshot] = {}
+        self._in_flight: dict[tuple[str, tuple[str, ...]], _InFlightProviderProbe] = {}
+        self._lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="drover-provider-usage-refresh",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def request_refresh(self) -> None:
+        """Schedule, rather than perform, a caller-requested refresh."""
+        self._wake.set()
+
+    def refresh_once(self) -> None:
+        """Refresh each currently detected provider, one at a time."""
+        if not self._refresh_lock.acquire(blocking=False):
+            return
+        try:
+            for detected in detect_provider_accounts(self.state.capabilities()):
+                self._refresh_provider(detected)
+        finally:
+            self._refresh_lock.release()
+
+    def accounts(self) -> list[dict[str, Any]]:
+        """Return immediately from cached observations or existing placeholder."""
+        accounts: list[dict[str, Any]] = []
+        for detected in detect_provider_accounts(self.state.capabilities()):
+            if detected.provider == "anthropic":
+                detected = _with_claude_plan_label(detected, self.state.auth)
+            with self._lock:
+                snapshot = self._snapshots.get(_provider_cache_key(detected))
+            if snapshot is None:
+                # This is the existing inventory-shaped answer.  In
+                # particular, do not introduce a new `pending` status for a
+                # client that has not seen its first observation yet.
+                accounts.append(
+                    _unavailable_provider_json(detected, datetime.now(timezone.utc))
+                )
+            else:
+                accounts.append(_provider_snapshot_json(snapshot, detected))
+        return accounts
+
+    def _refresh_provider(self, detected: DetectedProvider) -> None:
+        key = _provider_cache_key(detected)
+        with self._lock:
+            in_flight = self._in_flight.get(key)
+            if in_flight is not None and in_flight.thread is not None:
+                if in_flight.thread.is_alive():
+                    self._store_snapshot_locked(
+                        key, _provider_probe_error_snapshot(detected, "timeout")
+                    )
+                    return
+                self._in_flight.pop(key, None)
+
+            in_flight = _InFlightProviderProbe(detected)
+            worker = threading.Thread(
+                target=self._read_and_publish,
+                args=(key, in_flight),
+                name=f"drover-provider-probe-{detected.provider}",
+                daemon=True,
+            )
+            in_flight.thread = worker
+            self._in_flight[key] = in_flight
+
+        worker.start()
+        worker.join(self.probe_timeout_seconds)
+        if worker.is_alive():
+            log.warning(
+                "provider usage probe timed out for %s after %.1fs",
+                detected.provider,
+                self.probe_timeout_seconds,
+            )
+            with self._lock:
+                self._store_snapshot_locked(
+                    key, _provider_probe_error_snapshot(detected, "timeout")
+                )
+
+    def _read_and_publish(
+        self,
+        key: tuple[str, tuple[str, ...]],
+        in_flight: _InFlightProviderProbe,
+    ) -> None:
+        try:
+            snapshot = _read_provider_usage_snapshot(self.state, in_flight.detected)
+        except Exception as exc:  # noqa: BLE001 - isolate one connector
+            log.warning(
+                "provider usage probe failed for %s: %s",
+                in_flight.detected.provider,
+                exc,
+            )
+            snapshot = _provider_probe_error_snapshot(
+                in_flight.detected, "probe_failed"
+            )
+        with self._lock:
+            self._store_snapshot_locked(key, snapshot)
+            if self._in_flight.get(key) is in_flight:
+                self._in_flight.pop(key, None)
+
+    def _store_snapshot_locked(
+        self,
+        key: tuple[str, tuple[str, ...]],
+        snapshot: ProviderAccountSnapshot,
+    ) -> None:
+        previous = self._snapshots.get(key)
+        if _provider_probe_failed(snapshot) and previous is not None:
+            # Match the hub's last-good projection: preserve useful quota
+            # facts, carry their original observed_at, and surface the newest
+            # connector failure on that card.
+            self._snapshots[key] = replace(
+                previous,
+                status="stale",
+                error_category=snapshot.error_category,
+            )
+        else:
+            self._snapshots[key] = snapshot
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.refresh_once()
+            self._wake.wait(self.interval_seconds)
+            self._wake.clear()
 
 
 class HarnessHTTPServer(ThreadingHTTPServer):
@@ -1534,7 +1710,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             self._model_catalog(parsed.query)
             return
         if parsed.path == "/providers/usage":
-            self._provider_usage()
+            self._provider_usage(parsed.query)
             return
         if parsed.path == "/fs/list":
             self._fs_list(parsed.query)
@@ -1833,50 +2009,17 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         )
         self._write_json(envelope.to_wire())
 
-    def _provider_usage(self) -> None:
-        observed_at = datetime.now(timezone.utc)
-        accounts: list[dict[str, Any]] = []
-        for detected in detect_provider_accounts(self.server.state.capabilities()):
-            if detected.provider == "openai":
-                snapshot = self._codex_usage_snapshot()
-                accounts.append(_provider_snapshot_json(snapshot, detected))
-                continue
-            if detected.provider == "anthropic":
-                detected = _with_claude_plan_label(detected, self.server.state.auth)
-                probe = self.server.state.claude_usage_probe
-                if probe is None:
-                    from drover.server.providers.claude import ClaudeUsageProbe
-
-                    probe = ClaudeUsageProbe()
-                    self.server.state.claude_usage_probe = probe
-                snapshot = probe.read(host_id=self.server.state.host_id)
-                accounts.append(_provider_snapshot_json(snapshot, detected))
-                continue
-            if detected.provider == "google":
-                from drover.server.providers.agy import AgyUsageProbe
-
-                probe = self.server.state.agy_usage_probe
-                if probe is None:
-                    probe = AgyUsageProbe()
-                    self.server.state.agy_usage_probe = probe
-                snapshot = probe.read(host_id=self.server.state.host_id)
-                accounts.append(_provider_snapshot_json(snapshot, detected))
-                continue
-            accounts.append(_unavailable_provider_json(detected, observed_at))
-        self._write_json({"accounts": accounts, "observed_at": observed_at.isoformat()})
-
-    def _codex_usage_snapshot(self) -> ProviderAccountSnapshot:
-        """Probe Codex at the path its preset already resolved."""
-        from drover.server.providers.codex import CodexUsageProbe
-
-        preset = self.server.state.presets.get("codex")
-        executable = preset.executable if preset is not None else None
-        command = (executable, "app-server", "--stdio") if executable else None
-        probe = self.server.state.provider_usage_probe
-        if probe is None or probe.command != command:
-            probe = CodexUsageProbe(command=command)
-            self.server.state.provider_usage_probe = probe
-        return probe.read(host_id=self.server.state.host_id)
+    def _provider_usage(self, _query: str) -> None:
+        # This route had no refresh/force contract: query strings were ignored.
+        # Keep that wire behavior while ensuring they cannot cause a probe on
+        # the request thread.
+        cache = self.server.state.provider_usage_cache
+        accounts = cache.accounts() if cache is not None else []
+        observed_at = max(
+            (account["observed_at"] for account in accounts),
+            default=datetime.now(timezone.utc).isoformat(),
+        )
+        self._write_json({"accounts": accounts, "observed_at": observed_at})
 
     def _advisory_content_bundle(self) -> None:
         if not self.server.state.api_token or not self._authorized():
@@ -3806,6 +3949,89 @@ def _with_claude_plan_label(
     )
 
 
+def _provider_cache_key(detected: DetectedProvider) -> tuple[str, tuple[str, ...]]:
+    """Stable local identity before a probe learns an account email."""
+    return detected.provider, detected.harnesses
+
+
+def _read_provider_usage_snapshot(
+    state: HarnessDaemonState, detected: DetectedProvider
+) -> ProviderAccountSnapshot:
+    if detected.provider == "openai":
+        from drover.server.providers.codex import CodexUsageProbe
+
+        preset = state.presets.get("codex")
+        executable = preset.executable if preset is not None else None
+        command = (executable, "app-server", "--stdio") if executable else None
+        probe = state.provider_usage_probe
+        if probe is None or getattr(probe, "command", command) != command:
+            probe = CodexUsageProbe(command=command)
+            state.provider_usage_probe = probe
+        return probe.read(host_id=state.host_id)
+    if detected.provider == "anthropic":
+        probe = state.claude_usage_probe
+        if probe is None:
+            from drover.server.providers.claude import ClaudeUsageProbe
+
+            probe = ClaudeUsageProbe()
+            state.claude_usage_probe = probe
+        return probe.read(host_id=state.host_id)
+    if detected.provider == "google":
+        from drover.server.providers.agy import AgyUsageProbe
+
+        probe = state.agy_usage_probe
+        if probe is None:
+            probe = AgyUsageProbe()
+            state.agy_usage_probe = probe
+        return probe.read(host_id=state.host_id)
+    return _provider_probe_error_snapshot(detected, "probe_failed")
+
+
+def _provider_probe_error_snapshot(
+    detected: DetectedProvider, error_category: str
+) -> ProviderAccountSnapshot:
+    from drover.server.providers.types import ProviderAccountSnapshot
+
+    observed_at = datetime.now(timezone.utc)
+    fingerprint = json.dumps(
+        {
+            "provider": detected.provider,
+            "host_id": detected.host_id,
+            "source": "harness-inventory",
+            "error_category": error_category,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return ProviderAccountSnapshot(
+        snapshot_id=str(uuid4()),
+        dedup_key=hashlib.sha256(fingerprint.encode("utf-8")).hexdigest(),
+        provider=detected.provider,
+        account_label=detected.account_label,
+        plan_label=detected.plan_label,
+        host_id=detected.host_id,
+        status="error",
+        observed_at=observed_at,
+        windows=(),
+        source="harness-inventory",
+        error_category=error_category,
+    )
+
+
+def _provider_probe_failed(snapshot: ProviderAccountSnapshot) -> bool:
+    """Whether a probe result should overlay, rather than replace, good data."""
+    if snapshot.status == "error":
+        return True
+    # Claude's expired/missing OAuth credential is a failed attempt even
+    # though its established wire status is usage_unavailable.  A genuine
+    # provider answer with no published quota windows is not a failure and
+    # should still replace an obsolete cached quota.
+    return snapshot.status == "usage_unavailable" and snapshot.error_category not in {
+        None,
+        "no_usage_reported",
+    }
+
+
 def _detected_provider_json(detected: DetectedProvider) -> dict[str, Any]:
     return {
         "provider": detected.provider,
@@ -4410,6 +4636,11 @@ def run_harnessd(
             listen_port=listen_port,
             state=state,
         )
+        # The first pass is asynchronous: a slow Codex app-server startup
+        # must not hold either daemon startup or a future relay request open.
+        provider_usage_cache = getattr(state, "provider_usage_cache", None)
+        if provider_usage_cache is not None:
+            provider_usage_cache.start()
         # Capture only paths from the previous daemon run. The sweep itself runs
         # concurrently with serving, so scanning the directory later could pick
         # up and remove a new session's still-clean worktree.
@@ -4501,6 +4732,9 @@ def run_harnessd(
         finally:
             state.pty.close_all()
             state.auth.close_all()
+            provider_usage_cache = getattr(state, "provider_usage_cache", None)
+            if provider_usage_cache is not None:
+                provider_usage_cache.stop()
             if relay_client is not None:
                 relay_client.stop()
             if pusher is not None:

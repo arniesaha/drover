@@ -26,6 +26,7 @@ from drover.server.__main__ import main
 from drover.server.harness import cli as harness_cli
 from drover.server.harness import daemon as harness_daemon
 from drover.server.harness import model_catalog
+from drover.server.harness import relay_client as harness_relay_client
 from drover.server.harness.adapters import HarnessAdapterRegistry
 from drover.server.harness.auth import (
     AuthFlowManager,
@@ -38,6 +39,7 @@ from drover.server.harness.daemon import (
     DEFAULT_PRESETS,
     HarnessDaemonState,
     HarnessPreset,
+    ProviderUsageRefreshCache,
     create_harness_server,
     discover_native_history_metadata,
     discover_native_resume_sessions,
@@ -1281,6 +1283,261 @@ def test_harnessd_health_and_capabilities(tmp_path):
         server.server_close()
 
 
+def _provider_snapshot(
+    provider: str,
+    observed_at: datetime,
+    *,
+    status: str = "ok",
+    error_category: str | None = None,
+    used_percent: float = 25.0,
+) -> ProviderAccountSnapshot:
+    return ProviderAccountSnapshot(
+        snapshot_id=f"{provider}-{observed_at.timestamp()}-{status}",
+        dedup_key=f"{provider}-{observed_at.timestamp()}-{status}",
+        provider=provider,
+        account_label=f"{provider}@example.com",
+        plan_label="plus",
+        host_id="test-host",
+        status=status,
+        observed_at=observed_at,
+        windows=(
+            (
+                ProviderUsageWindow(
+                    kind="five_hour", used_percent=used_percent, window_minutes=300
+                ),
+            )
+            if status == "ok"
+            else ()
+        ),
+        source="test-provider",
+        error_category=error_category,
+    )
+
+
+def test_harnessd_provider_usage_returns_cached_snapshot_while_probe_is_slow(tmp_path):
+    """A slow probe must never occupy the relay-facing request thread."""
+    started = threading.Event()
+    release = threading.Event()
+    observed_at = datetime(2026, 10, 16, tzinfo=timezone.utc)
+
+    class _Probe:
+        command = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def read(self, *, host_id):
+            self.calls += 1
+            if self.calls > 1:
+                started.set()
+                release.wait(harness_relay_client.LOOPBACK_TIMEOUT_S + 1)
+            return _provider_snapshot("openai", observed_at)
+
+    server, state, base_url = _start_test_server(tmp_path)
+    state.presets = {"codex": replace(DEFAULT_PRESETS["codex"], enabled=True)}
+    state.provider_usage_probe = _Probe()
+    cache = ProviderUsageRefreshCache(state, probe_timeout_seconds=0.05)
+    state.provider_usage_cache = cache
+    cache.refresh_once()
+    refresh = threading.Thread(target=cache.refresh_once, daemon=True)
+    refresh.start()
+    assert started.wait(1)
+    try:
+        began = time.monotonic()
+        _, body = _json_request(f"{base_url}/providers/usage")
+        elapsed = time.monotonic() - began
+    finally:
+        release.set()
+        refresh.join(1)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert elapsed < 0.5
+    assert cache.probe_timeout_seconds < harness_relay_client.LOOPBACK_TIMEOUT_S
+    assert body["accounts"][0]["observed_at"] == observed_at.isoformat()
+    assert body["accounts"][0]["status"] == "ok"
+
+
+def test_provider_usage_background_refresh_keeps_last_good_snapshot_on_failure(
+    tmp_path,
+):
+    first = datetime(2026, 10, 16, tzinfo=timezone.utc)
+    second = datetime(2026, 10, 16, 0, 5, tzinfo=timezone.utc)
+
+    class _Probe:
+        command = None
+
+        def __init__(self):
+            self.responses = [
+                _provider_snapshot("openai", first, used_percent=20),
+                _provider_snapshot("openai", second, used_percent=30),
+                _provider_snapshot(
+                    "openai", second, status="error", error_category="timeout"
+                ),
+            ]
+
+        def read(self, *, host_id):
+            return self.responses.pop(0)
+
+    server, state, _ = _start_test_server(tmp_path)
+    try:
+        state.presets = {"codex": replace(DEFAULT_PRESETS["codex"], enabled=True)}
+        state.provider_usage_probe = _Probe()
+        cache = ProviderUsageRefreshCache(state, probe_timeout_seconds=0.05)
+        state.provider_usage_cache = cache
+
+        cache.refresh_once()
+        cache.refresh_once()
+        refreshed = cache.accounts()[0]
+        cache.refresh_once()
+        failed = cache.accounts()[0]
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert refreshed["observed_at"] == second.isoformat()
+    assert refreshed["windows"][0]["used_percent"] == 30
+    assert failed["observed_at"] == second.isoformat()
+    assert failed["windows"][0]["used_percent"] == 30
+    assert (failed["status"], failed["error_category"]) == ("stale", "timeout")
+
+
+def test_provider_usage_hung_probe_does_not_block_other_providers(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    claude_read = threading.Event()
+    observed_at = datetime(2026, 10, 16, tzinfo=timezone.utc)
+
+    class _HungCodex:
+        command = None
+
+        def read(self, *, host_id):
+            started.set()
+            release.wait(1)
+            return _provider_snapshot("openai", observed_at)
+
+    class _Claude:
+        def read(self, *, host_id):
+            claude_read.set()
+            return _provider_snapshot("anthropic", observed_at)
+
+    server, state, _ = _start_test_server(tmp_path)
+    try:
+        state.presets = {
+            "codex": replace(DEFAULT_PRESETS["codex"], enabled=True),
+            "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
+        }
+        state.provider_usage_probe = _HungCodex()
+        state.claude_usage_probe = _Claude()
+        cache = ProviderUsageRefreshCache(state, probe_timeout_seconds=0.05)
+        state.provider_usage_cache = cache
+
+        began = time.monotonic()
+        cache.refresh_once()
+        elapsed = time.monotonic() - began
+    finally:
+        release.set()
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert started.is_set()
+    assert claude_read.is_set()
+    assert elapsed < 0.5
+
+
+def test_provider_usage_probe_slower_than_old_bound_completes_with_new_bound(tmp_path):
+    """A healthy slow startup must not be mistaken for a hung provider."""
+    observed_at = datetime(2026, 10, 16, tzinfo=timezone.utc)
+
+    class _SlowButHealthyProbe:
+        command = None
+
+        def read(self, *, host_id):
+            time.sleep(0.1)
+            return _provider_snapshot("openai", observed_at, used_percent=40)
+
+    server, state, _ = _start_test_server(tmp_path)
+    try:
+        state.presets = {"codex": replace(DEFAULT_PRESETS["codex"], enabled=True)}
+        state.provider_usage_probe = _SlowButHealthyProbe()
+        # 0.05s models the old bound; 0.2s models the increased bound without
+        # making the suite wait for a real ten-second timeout.
+        cache = ProviderUsageRefreshCache(state, probe_timeout_seconds=0.2)
+        state.provider_usage_cache = cache
+
+        cache.refresh_once()
+        account = cache.accounts()[0]
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert account["status"] == "ok"
+    assert account["windows"][0]["used_percent"] == 40
+
+
+def test_provider_usage_does_not_reenter_hung_probe_and_publishes_late_success(
+    tmp_path,
+):
+    observed_at = datetime(2026, 10, 16, tzinfo=timezone.utc)
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    class _Probe:
+        command = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def read(self, *, host_id):
+            self.calls += 1
+            if self.calls == 1:
+                return _provider_snapshot("openai", observed_at, used_percent=20)
+            started.set()
+            release.wait(1)
+            completed.set()
+            return _provider_snapshot("openai", observed_at, used_percent=40)
+
+    server, state, _ = _start_test_server(tmp_path)
+    try:
+        state.presets = {"codex": replace(DEFAULT_PRESETS["codex"], enabled=True)}
+        probe = _Probe()
+        state.provider_usage_probe = probe
+        cache = ProviderUsageRefreshCache(state, probe_timeout_seconds=0.05)
+        state.provider_usage_cache = cache
+
+        cache.refresh_once()
+        cache.refresh_once()
+        stale = cache.accounts()[0]
+        cache.refresh_once()
+        skipped = cache.accounts()[0]
+        release.set()
+        assert completed.wait(1)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            late = cache.accounts()[0]
+            if late["status"] == "ok" and late["windows"][0]["used_percent"] == 40:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("late successful probe was not published")
+    finally:
+        release.set()
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert probe.calls == 2
+    assert (stale["status"], stale["error_category"]) == ("stale", "timeout")
+    assert (skipped["status"], skipped["error_category"]) == ("stale", "timeout")
+    assert late["status"] == "ok"
+    assert late["windows"][0]["used_percent"] == 40
+
+
 def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     tmp_path,
 ):
@@ -1312,6 +1569,7 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
             )
 
     state.agy_usage_probe = _UnavailableAgyProbe()
+    state.provider_usage_cache.refresh_once()
     try:
         with pytest.raises(urllib.error.HTTPError) as error:
             _json_request(f"{base_url}/providers/usage")
@@ -1367,6 +1625,7 @@ def test_harnessd_provider_usage_uses_configured_agy_probe(tmp_path):
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")
     state.presets = {"agy": replace(DEFAULT_PRESETS["agy"], enabled=True)}
     state.agy_usage_probe = _FixtureAgyProbe()
+    state.provider_usage_cache.refresh_once()
     try:
         request = urllib.request.Request(
             f"{base_url}/providers/usage",
@@ -1413,6 +1672,7 @@ def test_harnessd_provider_usage_reports_claude_windows(tmp_path):
         "claude-code": replace(DEFAULT_PRESETS["claude-code"], enabled=True),
     }
     state.claude_usage_probe = _StubClaudeProbe()
+    state.provider_usage_cache.refresh_once()
     try:
         request = urllib.request.Request(
             f"{base_url}/providers/usage",
@@ -1476,6 +1736,7 @@ def test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card(
         }
     )
     state.claude_usage_probe = _FailingClaudeProbe()
+    state.provider_usage_cache.refresh_once()
     try:
         request = urllib.request.Request(
             f"{base_url}/providers/usage",
@@ -1536,6 +1797,7 @@ for line in sys.stdin:
             executable=str(codex),
         ),
     }
+    state.provider_usage_cache.refresh_once()
     try:
         request = urllib.request.Request(
             f"{base_url}/providers/usage",
@@ -1563,6 +1825,7 @@ def test_harnessd_provider_usage_reports_codex_cli_not_found(tmp_path):
     state.presets = {
         "codex": replace(DEFAULT_PRESETS["codex"], enabled=True, executable=None),
     }
+    state.provider_usage_cache.refresh_once()
     try:
         request = urllib.request.Request(
             f"{base_url}/providers/usage",
