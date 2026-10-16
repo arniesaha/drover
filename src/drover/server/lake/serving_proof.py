@@ -60,6 +60,18 @@ def write_proof(spec, con, tables, *, fence, snapshot):
     return hashlib.sha256(payload).hexdigest()
 
 
+def proof_pin(spec) -> str:
+    """Return the SHA-256 that must be pinned for the published proof."""
+    return hashlib.sha256(
+        (spec.data_root / "verification" / "serving-proof.json").read_bytes()
+    ).hexdigest()
+
+
+def proof_pin_hint(digest: str) -> str:
+    """Return the exact configuration assignment for a proof digest."""
+    return f'[analytics] verification_sha256 = "{digest}"'
+
+
 def check_proof(spec, con, digest):
     from .export_worker import receipt_hash
 
@@ -67,7 +79,11 @@ def check_proof(spec, con, digest):
     try:
         proof, actual_digest = _proof(spec)
         if actual_digest != digest:
-            raise ValueError()
+            raise LakeError(
+                "lake_verification_required",
+                "analytics.verification_sha256 mismatch: "
+                f"expected {digest}; actual {actual_digest}",
+            )
         report = json.loads((directory / "report.json").read_bytes())
         verified = json.loads((directory / "last-verify.json").read_bytes())
         if (

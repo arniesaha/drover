@@ -55,10 +55,18 @@ rather than being deleted by provenance.
    proof before the hub can resume. This is intentionally not a maintenance
    receipt: maintenance receipts attest unchanged logical content, whereas
    deprecation changes it.
-5. Save the JSON report, confirm its verification and serving snapshot fields,
-   then start the hub and check readiness. Do not edit a proof, checkpoint, or
-   evidence file to recover a failed run; restore the verified backup or
-   investigate offline instead.
+5. Save the JSON report and copy its standalone
+   `[analytics] verification_sha256 = "…"` line into the selected hub config.
+   Validate that config with the hub loader, then start the hub and check
+   readiness:
+
+   ```sh
+   "$TOOL_PY" -c 'from drover.server.__main__ import _resolve_config; import sys; _resolve_config(sys.argv[1])' "$CONFIG"
+   ```
+
+   Confirm the report's verification and serving snapshot fields. Do not edit a
+   proof, checkpoint, or evidence file to recover a failed run; restore the
+   verified backup or investigate offline instead.
 
 A second `--apply` is a no-op. The retired `lake import` implementation now
 fails with `lake_legacy_import_deprecated`; use the receipted exporter or

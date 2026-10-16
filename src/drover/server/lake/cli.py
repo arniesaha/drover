@@ -62,6 +62,23 @@ def spec_from_options(data_root, catalog_dsn_env):
     return LakeSpec(catalog_dsn_env, data_root, Path(directory), digest)
 
 
+def _with_proof_pin(report, spec):
+    from .serving_proof import proof_pin, proof_pin_hint
+
+    digest = proof_pin(spec)
+    return {
+        **report,
+        "verification_sha256": digest,
+        "verification_sha256_hint": proof_pin_hint(digest),
+    }
+
+
+def _echo_report_with_proof_pin(report, spec):
+    receipt = _with_proof_pin(report, spec)
+    click.echo(json.dumps(receipt, indent=2))
+    click.echo(receipt["verification_sha256_hint"])
+
+
 @click.group("lake")
 def lake_cmd():
     """Build and verify isolated event lakes; never resolve the hub config."""
@@ -179,15 +196,16 @@ def import_cmd(since, session_id, data_root, catalog_dsn_env, legacy_root):
 )
 @click.option("--catalog-dsn-env", required=True)
 def verify_cmd(data_root, catalog_dsn_env):
+    spec = spec_from_options(data_root, catalog_dsn_env)
     try:
-        report = verify(spec_from_options(data_root, catalog_dsn_env))
+        report = verify(spec)
     except LakeError as exc:
         raise _lake_failure(exc, data_root) from None
     except duckdb.OutOfMemoryException:
         raise click.ClickException(
             "lake_tool_memory_limit_exceeded; incomplete root retained for inspection"
         ) from None
-    click.echo(json.dumps(report, indent=2))
+    _echo_report_with_proof_pin(report, spec)
 
 
 @lake_cmd.command("provision-exporter")
@@ -333,13 +351,15 @@ def deprecate_legacy_cmd(data_root, catalog_dsn_env, apply):
     """Retire unreceipted legacy-import history; dry-run is the default."""
     from .legacy_deprecation import deprecate_legacy
 
+    spec = spec_from_options(data_root, catalog_dsn_env)
     try:
-        report = deprecate_legacy(
-            spec_from_options(data_root, catalog_dsn_env), apply=apply
-        )
+        report = deprecate_legacy(spec, apply=apply)
     except LakeError as exc:
         raise _lake_failure(exc, data_root) from None
-    click.echo(json.dumps(report, indent=2))
+    if apply and not report.get("no_op"):
+        _echo_report_with_proof_pin(report, spec)
+    else:
+        click.echo(json.dumps(report, indent=2))
 
 
 @lake_cmd.command("reconcile")
