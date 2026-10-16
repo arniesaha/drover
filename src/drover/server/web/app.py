@@ -148,6 +148,10 @@ MIRROR_DRAIN_MAX = 256
 MIRROR_DRAIN_SECONDS = 2.0
 _MESSAGE_PAGE_DEFAULT = 200
 _MESSAGE_PAGE_MAX = 500
+# The app-facing stream polls the durable registry. Keep its bounded wait
+# below the structured pusher's live batch window so it does not add a visible
+# one-second cadence after central has accepted a delta.
+_SESSION_STREAM_POLL_INTERVAL_S = 0.2
 _HISTORY_PATH = "/sessions/history"
 _GZIP_MIN_BYTES = 1024
 
@@ -2438,7 +2442,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def _stream_session_messages(self, session_id: str, *, after_seq: int = 0) -> None:
         """WS handler: push new structured events for a session as they land.
 
-        Handshakes at 101, then polls the registry roughly once a second,
+        Handshakes at 101, then polls the registry up to five times per second,
         emitting each new event (seq order) as its own JSON text frame.
         Breaks cleanly on a client close frame, a socket timeout is just an
         empty poll (not an error), and any other socket/protocol failure
@@ -2462,7 +2466,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         sock = self.connection
-        sock.settimeout(0.2)
+        sock.settimeout(_SESSION_STREAM_POLL_INTERVAL_S)
         registry = self._harness_registry()
         last_seq = after_seq
         sent_gaps: set[str] = set()
@@ -2487,7 +2491,6 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 try:
                     frame = recv_frame(sock)
                 except socket.timeout:
-                    time.sleep(0.8)
                     continue
                 if frame.opcode == OPCODE_CLOSE:
                     break

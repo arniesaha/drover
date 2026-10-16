@@ -31,6 +31,9 @@ _RETRY_BACKOFF_SECONDS = 5.0
 _AUTH_BACKOFF_SECONDS = 30.0
 _AUTH_MAX_BACKOFF_SECONDS = 300.0
 _POST_TIMEOUT_SECONDS = 10.0
+# Live transcript deltas should not wait behind a multi-second bulk batch.
+# This remains a short batching window so a token burst is posted together.
+_LIVE_BATCH_INTERVAL_SECONDS = 0.25
 # stop() must outlast one in-flight HTTP attempt (10 s) so the worker can
 # hand back an undelivered batch instead of being orphaned mid-retry.
 _STOP_JOIN_SECONDS = 12.0
@@ -55,7 +58,7 @@ class EventPusher:
         central_url: str,
         token: str,
         *,
-        batch_interval: float = 2.0,
+        batch_interval: float = _LIVE_BATCH_INTERVAL_SECONDS,
     ) -> None:
         self._central_url = central_url.rstrip("/")
         self._token = token

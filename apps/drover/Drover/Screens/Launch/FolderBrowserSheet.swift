@@ -135,7 +135,7 @@ private struct FolderBrowserScreen: View {
                             folderLink(name: root.name, path: root.path, icon: "folder", isGit: false, showsPath: true)
                         }
                         if listing.roots.isEmpty {
-                            Text("No allowed locations. Configure folder roots on this host.")
+                            Text("No allowed locations. Configure DROVER_FOLDER_ROOTS on this host; an empty value disables browsing.")
                         }
                     }
                 } else {

@@ -139,6 +139,25 @@ This direct example is for an unbound/legacy local host. A host with a bound
 per-host credential must add `--relay`; the hub reaches bound hosts only over
 their authenticated outbound relay.
 
+### Folder-picker roots
+
+The New Session folder picker can browse only directories explicitly allowed
+by the host daemon. With no `DROVER_FOLDER_ROOTS` value, its sole location is
+that daemon's Home directory; this is intentional and does not include `/tmp`
+or the filesystem root. To allow a temporary workspace without widening the
+default policy, set the daemon service environment before starting or
+restarting it:
+
+```sh
+export DROVER_FOLDER_ROOTS="$HOME:/tmp"
+uv run drover-harnessd ...
+```
+
+Use the platform path separator (`:` on macOS/Linux, `;` on Windows) between
+absolute roots. An explicitly empty value disables picker locations entirely.
+Roots are host-operator configuration, never app input; symlinked roots and
+hidden/symlinked children are refused.
+
 Run the authenticated hosts request again and confirm the local host appears.
 
 ## Connect The iOS App

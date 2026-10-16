@@ -369,6 +369,22 @@ def test_title_falls_back_and_is_bounded(fleet):
     assert items["repo-only"]["title"] == "arniesaha/drover · main"
 
 
+@pytest.mark.parametrize(
+    "meta_title",
+    [
+        "No coding activity is evident in this session.",
+        "Processing untrusted transcri...",
+    ],
+)
+def test_title_rejects_summarizer_meta_commentary(fleet, meta_title):
+    registry, path = fleet
+    _session(registry, path, "meta", T0, prompt=meta_title)
+
+    item = _page(path)["items"][0]
+
+    assert item["title"] == "arniesaha/drover · main"
+
+
 # --------------------------------------------------------------------------- #
 # Full-text search                                                            #
 # --------------------------------------------------------------------------- #

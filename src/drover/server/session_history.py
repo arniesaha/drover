@@ -24,6 +24,7 @@ from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
+from drover.server.harness.recap_prompt import is_meta_recap
 from drover.server.harness.registry import (
     ARCHIVED_SESSION_STATUSES,
     HarnessRegistry,
@@ -388,7 +389,10 @@ def session_title(row: dict[str, Any]) -> str:
     first_line = next(
         (line.strip() for line in preview.splitlines() if line.strip()), ""
     )
-    if first_line:
+    # The preferred preview can originate in an asynchronous recap on older
+    # sessions. Never render the recap model's process commentary as the
+    # session title; continue into the established repo/cwd/harness fallback.
+    if first_line and not is_meta_recap(first_line):
         return bound_text(" ".join(first_line.split()), TITLE_CHARS) or first_line
     if row.get("repo_name"):
         repo = (

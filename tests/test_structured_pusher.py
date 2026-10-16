@@ -87,6 +87,27 @@ def test_pusher_batches_events_into_one_post():
     assert [event["event_id"] for event in events] == ["e1", "e2"]
 
 
+def test_pusher_default_interval_delivers_live_events_promptly():
+    server = _start_fake_central()
+    try:
+        port = server.server_address[1]
+        pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token")
+        pusher.start()
+        start = monotonic()
+        pusher.push("s1", {"event_id": "e1", "type": "assistant_output", "payload": {}})
+        delivered = _wait_until(
+            lambda: len(_FakeCentralHandler.requests) == 1, timeout=1.0
+        )
+        elapsed = monotonic() - start
+        pusher.stop()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert delivered
+    assert elapsed < 1.0
+
+
 def test_pusher_flushes_immediately_on_turn_complete():
     server = _start_fake_central()
     try:
