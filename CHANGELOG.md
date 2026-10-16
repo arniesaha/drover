@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.13] - 2026-10-15
+
+### Fixed
+
+- `lake verify` now accepts receipted exporter rows written after a rebuild. It checks the live lake against the frozen rebuild baseline plus the exporter receipt chain and still fails closed on any row neither explains (#637).
+- `lake deprecate-legacy --apply` keeps writer RSS bounded. Rows with no same-day version are bulk-deleted; the count-aware delete runs only on days with overlapping versions. A prod-copy apply peaked at 1.45 GB instead of exceeding the rebuild RSS limit (#640).
+
+### Added
+
+- `drover-server lake deprecate-legacy` removes unreceipted legacy rows. It is dry-run by default; `--apply` holds the maintenance fence, deletes the rows, refreshes `activity_daily`, writes a deprecation record and maintenance receipt, then runs verify, proof and checkpoint under the same fence. Runbook: `docs/operations/lake-deprecate-legacy.md` (#639).
+
+### Changed
+
+- `lake import` now fails closed (#639).
+
+### Upgrade notes
+
+- No control migration. Upgrade the hub and the Studio and NAS harnessd hosts.
+- Before `lake deprecate-legacy --apply`, take and verify control, lake-catalog and lake-data backups. The delete commits before verify runs, so a failed verify is recovered by restoring from backup. `import_watermark` is cleared entirely.
+
 ## [0.6.12] - 2026-10-15
 
 ### Fixed
