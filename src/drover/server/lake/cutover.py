@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from drover.server.planned_stop import PlannedStopStore
+
 from .runtime import LakeError, sanitize_detail
 
 NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,23}")
@@ -1058,6 +1060,7 @@ def switch_actions(
     environ = os.environ if environ is None else environ
     cfg = service.config()
     launchd = launchd or Launchd(service)
+    marker_store = PlannedStopStore(service.config_path.parent)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     epoch = read_state(plan).get("epoch") or f"{plan.name}-{stamp}"
     url = service.hub_url(cfg)
@@ -1084,6 +1087,11 @@ def switch_actions(
         )
         return {"changed": changed, "switch_epoch": state["switch_epoch"]}
 
+    def verify_and_clear_marker():
+        result = verify_hub(url, timeout=verify_timeout)
+        marker_store.clear()
+        return result
+
     return [
         Action(
             "require_gate",
@@ -1095,6 +1103,13 @@ def switch_actions(
             "backup",
             _backup_describe(plan, service, cfg, stamp),
             lambda: take_backup(plan, service, cfg, pg_bin=pg_bin, stamp=stamp),
+        ),
+        Action(
+            "record_planned_stop",
+            f"write {marker_store.path} for cutover switch (expires in 2h)",
+            lambda: marker_store.record(
+                step="cutover switch", actor="drover-server cutover"
+            ),
         ),
         Action(
             "stop_service",
@@ -1118,8 +1133,8 @@ def switch_actions(
         ),
         Action(
             "verify",
-            _verify_describe(url, verify_timeout),
-            lambda: verify_hub(url, timeout=verify_timeout),
+            _verify_describe(url, verify_timeout) + f"; clear {marker_store.path}",
+            verify_and_clear_marker,
         ),
     ]
 
@@ -1137,6 +1152,7 @@ def rollback_actions(
     """Backup → stop → flip to legacy → outbox replay → start → verify."""
     cfg = service.config()
     launchd = launchd or Launchd(service)
+    marker_store = PlannedStopStore(service.config_path.parent)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     url = service.hub_url(cfg)
     replay_since = since if since is not None else read_state(plan).get("switch_epoch")
@@ -1175,11 +1191,23 @@ def rollback_actions(
             )
         return {"output": (result.stdout or "").strip()[-300:]}
 
+    def verify_and_clear_marker():
+        result = verify_hub(url, timeout=verify_timeout)
+        marker_store.clear()
+        return result
+
     return [
         Action(
             "backup",
             _backup_describe(plan, service, cfg, stamp),
             lambda: take_backup(plan, service, cfg, pg_bin=pg_bin, stamp=stamp),
+        ),
+        Action(
+            "record_planned_stop",
+            f"write {marker_store.path} for cutover rollback (expires in 2h)",
+            lambda: marker_store.record(
+                step="cutover rollback", actor="drover-server cutover"
+            ),
         ),
         Action(
             "stop_service",
@@ -1205,7 +1233,7 @@ def rollback_actions(
         ),
         Action(
             "verify",
-            _verify_describe(url, verify_timeout),
-            lambda: verify_hub(url, timeout=verify_timeout),
+            _verify_describe(url, verify_timeout) + f"; clear {marker_store.path}",
+            verify_and_clear_marker,
         ),
     ]

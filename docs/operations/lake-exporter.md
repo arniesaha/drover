@@ -264,9 +264,16 @@ inlining options.
 
 1. Verify a current, restorable backup generation. Do not shorten either
    retention window for the first run.
-2. Stop the hub using the normal operator maintenance procedure and confirm
+2. Before stopping the hub for this maintenance window, record the bounded
+   planned stop. It authorizes one check-in recovery attempt only:
+
+   ```sh
+   drover-server planned-stop begin --step lake-maintain --actor maintenance-operator
+   ```
+
+3. Stop the hub using the normal operator maintenance procedure and confirm
    there is no running exporter owner.
-3. In the administrator shell that already supplies the pinned extension
+4. In the administrator shell that already supplies the pinned extension
    variables and catalog admin DSN, inspect the plan:
 
    ```sh
@@ -274,13 +281,15 @@ inlining options.
      --catalog-dsn-env DROVER_LAKE_V2_ADMIN_DSN --dry-run
    ```
 
-4. Run the same command without `--dry-run`. Save its JSON report, including
+5. Run the same command without `--dry-run`. Save its JSON report, including
    per-table file counts and snapshot counts, with the maintenance record.
-5. Save the report and confirm it names a checkpoint snapshot. Start the hub,
+6. Save the report and confirm it names a checkpoint snapshot. Start the hub,
    then confirm `/readyz` reports a running exporter and a later successful
    export. Do not edit a proof or checkpoint to recover a failed maintenance
    run; investigate it and perform offline verification if needed.
-6. Add an operator-owned weekly launchd timer invoking that exact command while
+7. Once the restarted hub's `/readyz` is 200, run
+   `drover-server planned-stop complete`. Add an operator-owned weekly launchd
+   timer invoking the maintenance command while
    the hub is stopped for its maintenance window. Keep the seven-day cleanup
    safety window and the 30-day snapshot retention unless a separately
    verified backup/restore policy authorizes a change.

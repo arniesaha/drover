@@ -25,8 +25,12 @@ rather than being deleted by provenance.
    root. The deprecated source copies intentionally remain available under
    `/Volumes/M2 1/drover-ducklake*`, plus the cutover and rollout backups; this
    procedure does not erase those copies.
-2. Stop the hub for the maintenance window and confirm that no exporter owns
-   the catalog mutation fence.
+2. Record the planned stop, then stop the hub for the maintenance window and
+   confirm that no exporter owns the catalog mutation fence:
+
+   ```sh
+   drover-server planned-stop begin --step lake-deprecate-legacy --actor maintenance-operator
+   ```
 3. In the administrator environment that supplies the independently verified
    DuckLake extension variables and catalog admin DSN, inspect the inventory:
 
@@ -64,7 +68,8 @@ rather than being deleted by provenance.
    "$TOOL_PY" -c 'from drover.server.__main__ import _resolve_config; import sys; _resolve_config(sys.argv[1])' "$CONFIG"
    ```
 
-   Confirm the report's verification and serving snapshot fields. Do not edit a
+   Confirm the report's verification and serving snapshot fields, then run
+   `drover-server planned-stop complete` to clear the marker. Do not edit a
    proof, checkpoint, or evidence file to recover a failed run; restore the
    verified backup or investigate offline instead.
 
