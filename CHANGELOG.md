@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-10-16
+
+### Fixed
+
+- Lake commands that publish a new verification proof (`lake verify`, `lake deprecate-legacy --apply`) now print the new `[analytics] verification_sha256` line and include it in their JSON output. A stale pin now fails startup with the config key and the expected and actual hashes (#642, #645).
+- The hub reaches hosts that have a bound credential only through the relay. A bound host with no attached relay returns `502 host offline: relay not attached` instead of a 401 from a direct dial. harnessd refuses to start without `--relay` when the hub requires it (#574, #644).
+
+### Added
+
+- `drover-server recover-planned-stop` restarts the hub once after a planned stop, then reports `recovered` or the first startup error. `cutover switch` and `cutover rollback` write the planned-stop marker; without a valid marker it does nothing and reports an unplanned outage (#643, #647).
+- `cutover release-preflight` has a `host_proxy` check: every online host must answer `fs/list` through the hub with a 200. It needs a device credential in `DROVER_RELEASE_GATE_DEVICE_TOKEN` (#644, #648).
+- Tests covering the iOS launch folder requirement and double-launch guard (#608, #646).
+
+### Upgrade notes
+
+- No control migration. Upgrade the hub and the Studio and NAS harnessd hosts; bound hosts must run harnessd with `--relay`.
+- Set `DROVER_RELEASE_GATE_DEVICE_TOKEN` before running the preflight. Hosts whose harnessd predates folder listing fail `host_proxy`; upgrade or retire them first.
+
 ## [0.6.13] - 2026-10-15
 
 ### Fixed
