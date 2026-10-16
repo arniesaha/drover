@@ -21,6 +21,7 @@ from drover.server.harness.relay_protocol import (
 from drover.server.harness.websocket import (
     OPCODE_PING,
     OPCODE_PONG,
+    accept_key,
     client_handshake,
     client_recv_json,
     client_send_frame,
@@ -670,3 +671,139 @@ def test_closing_direct_socket_rescues_its_undrained_events():
     finally:
         upstream.close()
         hub.close()
+
+
+def test_direct_terminal_detach_drains_an_unread_event_from_upstream(
+    metrics_server_with_relay_host, monkeypatch
+):
+    """A browser detach cannot discard an event already queued by harnessd.
+
+    The fake direct harness sends the daemon's normal raw-output/event pair.
+    After the output has reached the app, the instrumented direct reader
+    reports one read timeout only after the app reader sees its disconnect.
+    That leaves the event frame unread on the upstream socket when the proxy
+    enters its finally block, exactly the detach window this regression covers.
+    """
+    env = metrics_server_with_relay_host
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    upstream_port = listener.getsockname()[1]
+    harness_errors: list[BaseException] = []
+    raw_output_sent = threading.Event()
+    browser_detached = threading.Event()
+
+    def fake_harness() -> None:
+        connection = None
+        try:
+            connection, _ = listener.accept()
+            request = bytearray()
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(1024)
+                if not chunk:
+                    raise AssertionError("hub closed before its upstream handshake")
+                request.extend(chunk)
+            headers = dict(
+                line.split(": ", 1)
+                for line in request.decode("iso-8859-1").split("\r\n")[1:]
+                if ": " in line
+            )
+            connection.sendall(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept_key(headers['Sec-WebSocket-Key'])}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+            )
+            send_json(connection, {"type": "output", "data": "prompt> "})
+            send_json(connection, _event_message("e-direct-detach", "terminal.output"))
+            raw_output_sent.set()
+            connection.settimeout(5)
+            while connection.recv(1024):
+                pass
+        except BaseException as exc:  # noqa: BLE001 - reported in test thread
+            harness_errors.append(exc)
+        finally:
+            if connection is not None:
+                connection.close()
+
+    harness_thread = threading.Thread(target=fake_harness, daemon=True)
+    harness_thread.start()
+
+    direct_host = HarnessRegistry(env.duckdb_path).register_host(
+        host_id="direct-detach-host",
+        display_name="Direct Detach Host",
+        kind="linux",
+        connection_kind="direct",
+        local_url=f"http://127.0.0.1:{upstream_port}",
+    )
+    monkeypatch.setattr(
+        env.collector,
+        "harness_terminal_route",
+        lambda session_id: (direct_host, f"/sessions/{session_id}/terminal"),
+    )
+
+    real_recv_frame = app_module.recv_frame
+    upstream_reads = 0
+
+    def hold_second_upstream_read(sock, *args, **kwargs):
+        nonlocal upstream_reads
+        if sock.getpeername()[1] == upstream_port:
+            upstream_reads += 1
+            if upstream_reads == 2:
+                assert browser_detached.wait(5), "app detach never reached proxy"
+                raise socket.timeout()
+        return real_recv_frame(sock, *args, **kwargs)
+
+    real_recv_json = app_module._BrowserSocket.recv_json
+
+    def observe_browser_detach(browser):
+        try:
+            return real_recv_json(browser)
+        except Exception:
+            browser_detached.set()
+            raise
+
+    rescued: list[int] = []
+    real_drain = app_module._drain_socket_into_mirror
+
+    def record_drain(*args, **kwargs):
+        result = real_drain(*args, **kwargs)
+        rescued.append(result)
+        return result
+
+    monkeypatch.setattr(app_module, "recv_frame", hold_second_upstream_read)
+    monkeypatch.setattr(app_module._BrowserSocket, "recv_json", observe_browser_detach)
+    monkeypatch.setattr(app_module, "_drain_socket_into_mirror", record_drain)
+
+    app = socket.create_connection((env.host, env.port), timeout=5)
+    try:
+        client_handshake(
+            app,
+            host=f"{env.host}:{env.port}",
+            path="/harness/sessions/s1/terminal",
+            headers={"Authorization": f"Bearer {env.token}"},
+        )
+        app.settimeout(5)
+        assert client_recv_json(app) == {"type": "output", "data": "prompt> "}
+        assert raw_output_sent.is_set()
+    finally:
+        app.close()
+
+    registry = HarnessRegistry(env.duckdb_path)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if registry.get_event("e-direct-detach") is not None:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("hub lost the unread direct terminal event at detach")
+
+    harness_thread.join(timeout=5)
+    listener.close()
+    assert not harness_thread.is_alive(), "fake direct harness did not close"
+    assert not harness_errors, f"fake direct harness raised: {harness_errors}"
+    assert rescued == [1]
+    assert upstream_reads >= 3
