@@ -68,7 +68,9 @@ def test_hub_routes_listing_with_selected_host_identity(tmp_path, base_url, root
 @pytest.mark.parametrize(
     "scope,host_id,expected",
     [
-        ("host", "test-host", 200),
+        # Issuing this bound host credential makes the selected direct host
+        # relay-only, even though this request itself is authorized.
+        ("host", "test-host", 502),
         ("host", "other-host", 403),
         ("host", None, 403),
         ("device", None, 200),
@@ -143,7 +145,7 @@ def post_create(url, root, *, token="operator-token", host="test-host"):
 @pytest.mark.parametrize(
     "scope,host_id,expected",
     [
-        ("host", "test-host", 201),
+        ("host", "test-host", 502),
         ("host", "other-host", 403),
         ("device", None, 201),
         ("profile", None, 401),

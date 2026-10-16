@@ -904,12 +904,14 @@ class Launchd:
             )
 
 
-def http_get(url: str, *, timeout: float = 10) -> tuple[int, str]:
+def http_get(
+    url: str, *, timeout: float = 10, headers: dict[str, str] | None = None
+) -> tuple[int, str]:
     from urllib.error import HTTPError
-    from urllib.request import urlopen
+    from urllib.request import Request, urlopen
 
     try:
-        with urlopen(url, timeout=timeout) as response:
+        with urlopen(Request(url, headers=headers or {}), timeout=timeout) as response:
             return response.status, response.read().decode("utf-8", "replace")
     except HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", "replace")

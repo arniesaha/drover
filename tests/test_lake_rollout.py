@@ -102,11 +102,20 @@ def fixture(tmp_path):
         lock_sha256=hashlib.sha256(lock.read_bytes()).hexdigest(),
         backup=backup,
         min_free_bytes=0,
+        device_token="device-credential",
         probe=probe,
         run=run,
-        fetch=lambda url: (
-            200,
-            "ok\nanalytical=ok" if url.endswith("healthz") else "{}",
+        fetch=lambda url, **kwargs: (
+            (200, "ok\nanalytical=ok")
+            if url.endswith("healthz")
+            else (
+                (
+                    200,
+                    json.dumps({"hosts": [{"host_id": "host-a", "status": "online"}]}),
+                )
+                if url.endswith("/harness/hosts")
+                else (200, "{}")
+            )
         ),
     )
 
@@ -126,6 +135,26 @@ def test_point_release_passes_with_staged_target_not_current(tmp_path):
     assert checks["release_kind"].evidence["rollout_kind"] == "point_release"
     assert layout.active_version() == "0.6.4"
     assert not (layout.root / "pending_verification.json").exists()
+
+
+def test_host_proxy_gate_fails_on_non_200_and_passes_on_200(tmp_path):
+    _, _, _, options, check = fixture(tmp_path)
+    assert check()["host_proxy"].passed
+
+    def failing_fetch(url, **kwargs):
+        if url.endswith("healthz"):
+            return 200, "ok\nanalytical=ok"
+        if url.endswith("/harness/hosts"):
+            assert kwargs["headers"] == {"Authorization": "Bearer device-credential"}
+            return 200, json.dumps(
+                {"hosts": [{"host_id": "host-a", "status": "online"}]}
+            )
+        assert url.endswith("/harness/hosts/host-a/fs/list")
+        return 502, '{"error":"host offline"}'
+
+    gate = check(fetch=failing_fetch)["host_proxy"]
+    assert not gate.passed
+    assert gate.evidence["fs_list_statuses"] == {"host-a": 502}
 
 
 @pytest.mark.parametrize("field", ["migrations", "lake_schema_version", "runtime_pins"])

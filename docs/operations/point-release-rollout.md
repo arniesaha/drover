@@ -43,13 +43,19 @@ checksum manifests from the same published release.
    "$TOOL" cutover release-preflight \
      --lake "$LAKE" --lake-root "$LAKE_ROOT" --plist "$PLIST" \
      --release "$RELEASE" --wheel-sha256 "$WHEEL_SHA256" \
-     --lock-sha256 "$LOCK_SHA256" --backup "$BACKUP" --pg-bin "$PG_BIN"
+     --lock-sha256 "$LOCK_SHA256" --backup "$BACKUP" --pg-bin "$PG_BIN" \
+     --device-token-env DROVER_RELEASE_GATE_DEVICE_TOKEN
    ```
 
    Obtain the two digests from the published checksum manifest, independently
    of the local artifact cache. Defaults: 5 GiB free at the runtime filesystem,
    backup age at most 24 hours. Exit 0 means every check passed, 1 means a failed
    check, and 2 means invalid/unreadable inputs. No failed check is a waiver.
+   Set `DROVER_RELEASE_GATE_DEVICE_TOKEN` in the invoking environment to a
+   device credential before running this command; do not place its value in the
+   shell command, plist, or release evidence. The check lists online hosts and
+   requires an authenticated hub `GET /harness/hosts/<id>/fs/list` to return
+   200 for every one.
 5. If `release_kind` reports `lake_schema`, stop this sequence and follow the
    [full lake cutover gate](lake-cutover.md). Unknown metadata also blocks the
    point-release path. Do not override the selector based on a version label.
@@ -96,6 +102,7 @@ rerun after any configuration, artifact or runtime change.
 | `disk` | Free bytes at configured runtime filesystem meet the threshold. |
 | `backup` | Exact required files, matching lake/control schema, recent timestamp, verified file hashes, readable dump, and unchanged current config/plist. |
 | `health` | Current service liveness includes analytical=ok, and readiness returns 200. |
+| `host_proxy` | A device credential lists the fleet, then each online host answers hub-proxied `GET /harness/hosts/<id>/fs/list` with HTTP 200. |
 
 The repo has no separate numbered lake migration ledger. The selector therefore
 uses a derived lake schema version: a SHA-256 over AST declarations and DDL

@@ -248,6 +248,12 @@ def backup_cmd(lake, lake_root, gate_root, backup_root, plist, pg_bin, dry_run):
 @click.option("--lock-sha256", required=True, help="Published release lock digest.")
 @click.option("--backup", required=True, type=click.Path(path_type=Path))
 @click.option(
+    "--device-token-env",
+    default="DROVER_RELEASE_GATE_DEVICE_TOKEN",
+    show_default=True,
+    help="Environment variable holding a device credential for host proxy checks.",
+)
+@click.option(
     "--min-free-gb", type=click.FloatRange(min=0), default=5, show_default=True
 )
 @click.option(
@@ -267,6 +273,7 @@ def release_preflight_cmd(
     wheel_sha256,
     lock_sha256,
     backup,
+    device_token_env,
     min_free_gb,
     max_backup_age_hours,
     pg_bin,
@@ -277,6 +284,7 @@ def release_preflight_cmd(
     plan = _plan(lake, lake_root, gate_root, backup_root)
     try:
         service = ServiceView.load(plist)
+        device_token = os.environ.get(device_token_env, "")
         checks = run_release_preflight(
             plan,
             service,
@@ -287,6 +295,7 @@ def release_preflight_cmd(
             min_free_bytes=int(min_free_gb * 1024**3),
             max_backup_age_hours=max_backup_age_hours,
             pg_bin=pg_bin,
+            device_token=device_token,
         )
     except (OSError, ValueError, CutoverError):
         _emit(

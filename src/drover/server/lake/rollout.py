@@ -124,6 +124,7 @@ def run_release_preflight(
     min_free_bytes: int = 5 * 1024**3,
     max_backup_age_hours: float = 24,
     pg_bin: Path | None = None,
+    device_token: str = "",
     probe: Callable = probe_runtime,
     run: Callable = subprocess.run,
     fetch: Callable = http_get,
@@ -137,6 +138,8 @@ def run_release_preflight(
         raise CutoverError("release_version_invalid")
     if min_free_bytes < 0 or max_backup_age_hours <= 0:
         raise CutoverError("release_limits_invalid")
+    if not device_token:
+        raise CutoverError("release_device_token_missing")
     want = release.lstrip("v")
     checks = []
     holder = {}
@@ -288,4 +291,37 @@ def run_release_preflight(
         )
 
     checks.append(run_check("health", health))
+
+    def host_proxy():
+        headers = {"Authorization": f"Bearer {device_token}"}
+        hub_url = service.hub_url(cfg)
+        status, body = fetch(hub_url + "/harness/hosts", headers=headers)
+        if status != 200:
+            return False, {"hosts_status": status, "online_hosts": []}
+        try:
+            payload = json.loads(body)
+            hosts = payload["hosts"]
+        except (KeyError, TypeError, ValueError):
+            return False, {"hosts_status": status, "online_hosts": []}
+        online_ids = sorted(
+            str(host.get("host_id"))
+            for host in hosts
+            if isinstance(host, dict)
+            and host.get("status") == "online"
+            and isinstance(host.get("host_id"), str)
+            and host["host_id"]
+        )
+        statuses = {}
+        for host_id in online_ids:
+            proxy_status, _ = fetch(
+                f"{hub_url}/harness/hosts/{host_id}/fs/list", headers=headers
+            )
+            statuses[host_id] = proxy_status
+        return all(status == 200 for status in statuses.values()), {
+            "hosts_status": status,
+            "online_hosts": online_ids,
+            "fs_list_statuses": statuses,
+        }
+
+    checks.append(run_check("host_proxy", host_proxy, device_token))
     return checks

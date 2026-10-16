@@ -1115,6 +1115,10 @@ class MetricsCollector:
     job_streams: Mapping[str, RedisJobStream] = field(default_factory=dict)
     ttl_seconds: float = 60.0
     api_token: str = ""
+    # Installed by the HTTP server from its credential store. Bound host
+    # credentials authenticate the spoke to the hub, not the hub to harnessd,
+    # so those hosts must use the authenticated relay in both directions.
+    host_has_bound_credential: Callable[[str], bool] | None = None
     # New Session sheet "favorite" cwd suggestions, from [harness].favorite_cwds
     # in ~/.drover/config.toml (empty by default — no hardcoded paths). Each
     # carries the host it belongs to, or None for every host.
@@ -1688,6 +1692,10 @@ class MetricsCollector:
         body = {
             "host": host.__dict__,
             "content_consent": self.content_consent_state(),
+            # The daemon needs an explicit startup signal: its token is opaque,
+            # so it cannot otherwise distinguish a bound host credential from
+            # a legacy cluster token before it chooses direct or relay mode.
+            "relay_required": self._host_requires_relay(host_id),
         }
         # Every harnessd already polls this endpoint every 15 seconds, so the
         # fleet's target version rides this response rather than needing a
@@ -2989,7 +2997,8 @@ class MetricsCollector:
         """Single routing choke point for every hub->harnessd API call.
 
         Prefers a live relay connection for ``host``; falls back to a direct
-        URL dial when no relay is live *and the host is not a relay host*;
+        URL dial when no relay is live *and the host is neither a relay host
+        nor a host with a bound credential*;
         reports 502 when neither is available. ``path`` is host-relative (may
         include a query string) and is forwarded verbatim to both the relay
         and the direct-dial path -- callers must not pre-join it to an
@@ -3012,7 +3021,10 @@ class MetricsCollector:
                 dict(payload or {}),
                 timeout_s=max(timeout_s, RELAY_MIN_TIMEOUT_S),
             )
-        if getattr(host, "connection_kind", "direct") == "relay":
+        if (
+            self._host_requires_relay(host)
+            or getattr(host, "connection_kind", "direct") == "relay"
+        ):
             # A relay host is behind NAT by definition: it has no meaningful
             # inbound URL, and its socket is the only way in. Falling through
             # to a dial would be actively dangerous rather than merely
@@ -3024,7 +3036,7 @@ class MetricsCollector:
             # with filesystem access; being unreachable is the safe failure.
             return _json_response(
                 502,
-                {"error": f"relay host is not connected: {host.host_id}"},
+                {"error": (f"host offline: relay not attached: {host.host_id}")},
             )
         endpoint = _harness_endpoint(host)
         if endpoint:
@@ -3039,6 +3051,12 @@ class MetricsCollector:
         return _json_response(
             502, {"error": f"harness host has no reachable endpoint: {host.host_id}"}
         )
+
+    def _host_requires_relay(self, host: Any | str) -> bool:
+        """Return whether a bound host may only be reached over its relay."""
+        host_id = host if isinstance(host, str) else getattr(host, "host_id", "")
+        checker = self.host_has_bound_credential
+        return bool(host_id and checker is not None and checker(host_id))
 
     def _proxy_harness_request(
         self,

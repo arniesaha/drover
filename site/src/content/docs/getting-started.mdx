@@ -143,7 +143,7 @@ advertised_url = "<private-address>:7080"
 
 2. Paste the printed command on the new machine. Its code is single use and expires after fifteen minutes.
 
-The new machine installs only the host daemon. It registers as a **direct** host if the hub can reach it. If not, it registers as a **relay** host and dials out to the hub.
+The new machine installs only the host daemon. A host with a bound per-host credential runs as a **relay** host and dials out to the hub, even if the hub can reach its private address. Direct mode remains only for genuinely unbound legacy hosts.
 
 Enroll only machines that you control. See [Known limits](/docs/security-privacy/#known-limits).
 
@@ -172,6 +172,9 @@ Enroll only machines that you control. See [Known limits](/docs/security-privacy
      --local-url http://127.0.0.1:7081 \
      --central-url http://127.0.0.1:7080
    ```
+
+For a bound host, add `--relay`. The hub never sends its legacy bearer to a
+bound daemon's inbound listener; all host calls use the authenticated relay.
 
 Set `DROVER_CONTROL_DSN` each time you start the hub from source. On first start, the hub creates `~/.drover/api_token` with mode `0600`.
 

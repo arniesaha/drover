@@ -311,6 +311,16 @@ class CredentialStore:
         with self._lock:
             return sorted(self._by_id.values(), key=lambda item: item.created_at)
 
+    def has_active_host_credential(self, host_id: str) -> bool:
+        """Whether ``host_id`` has the bound credential that requires relay."""
+        with self._lock:
+            return any(
+                credential.scope == "host"
+                and credential.host_id == host_id
+                and credential.is_active
+                for credential in self._by_id.values()
+            )
+
     def _index(self, credential: Credential) -> None:
         self._by_id[credential.id] = credential
         if credential.is_active:
@@ -618,6 +628,16 @@ class PostgresCredentialStore:
                 "ORDER BY created_at"
             ).fetchall()
         return [_credential_from_row(row) for row in rows]
+
+    def has_active_host_credential(self, host_id: str) -> bool:
+        with self._connection() as con:
+            row = con.execute(
+                """SELECT 1 FROM control_credentials
+                   WHERE scope = 'host' AND host_id = ? AND revoked_at IS NULL
+                   LIMIT 1""",
+                [host_id],
+            ).fetchone()
+        return row is not None
 
     def _identity(self, key: str, fallback: str) -> str:
         with self._connection() as con:
