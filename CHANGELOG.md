@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-10-16
+
+### Fixed
+
+- harnessd refreshes provider usage in the background every 300s and `GET /providers/usage` serves only the cache, so slow probes no longer stall the request or leave quota stale. A probe that outlives its 60s wait is not re-entered and its late result is still published; failed probes keep the last good quota as `status=stale` with the newest error category (#655, #657).
+- When harness and native events both observed a session, usage totals come from the more complete source (more observed events, then exact over inexact). Affected sessions are re-projected once; no migration (#319, #652).
+- Session recaps and titles no longer show meta-commentary from the summarizer; they fall back to the repo, folder or harness title. Live prompts reach the app faster (harness batch window 2s to 250ms, hub stream poll 1s to 200ms) (#609, #651).
+- iOS: work decisions are shown as compact rows with a count header, collapse to two rows with Show all, expand when a notification opens a hidden item, and expose actions to VoiceOver. Stale items are dimmed and tagged (#653, #654).
+
+### Added
+
+- A regression test for draining trailing terminal output when the app detaches from a direct (non-relay) proxy (#98, #650).
+
+### Upgrade notes
+
+- No control migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`).
+- The faster stream settings raise the harness pusher POST rate (up to 4/s per streaming session) and per-WebSocket registry polling (5/s).
+
 ## [0.6.14] - 2026-10-16
 
 ### Fixed
