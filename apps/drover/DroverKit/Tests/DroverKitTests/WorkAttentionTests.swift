@@ -4,13 +4,14 @@ import UserNotifications
 @testable import DroverKit
 
 func attentionItemJSON(kind: String = "agent_question", uncertain: Bool = false,
-                       refreshedAt: String? = nil) -> String {
+                       refreshedAt: String? = nil, number: Int? = 1,
+                       id: String = "attention-1") -> String {
     """
-    {"id":"attention-1","workspace_id":"workspace","actor_principal":"credential:device",
+    {"id":"\(id)","workspace_id":"workspace","actor_principal":"credential:device",
      "goal_id":"goal","repo":"example/project","kind":"\(kind)",
      "url":"https://github.com/example/project/issues/1","refreshed_at":"\(refreshedAt ?? ISO8601DateFormatter().string(from: Date()))","freshness_seconds":240,
      "stale":false,"actions":\(kind == "agent_question" ? "[\"reject\"]" : "[]"),
-     "number":1,"session_id":"session-1","decision_id":"decision-1","category":"revision",
+     "number":\(number.map(String.init) ?? "null"),"session_id":"session-1","decision_id":"decision-1","category":"revision",
      "uncertain":\(uncertain)}
     """
 }
@@ -106,6 +107,46 @@ struct WorkAttentionTests {
             #expect(item.refreshAge(now: Date(timeIntervalSince1970: 1_792_065_660)).hasPrefix("Refreshed "))
             if kind != "agent_question" { #expect(item.actions.isEmpty) }
         }
+    }
+
+    @Test func rowLabelIncludesNumberWhenAvailable() throws {
+        let item = try #require(attentionResponse([attentionItemJSON(kind: "draft_pr", number: 650)]).items.first)
+        #expect(item.rowLabel == "Draft PR #650")
+    }
+
+    @Test func rowLabelOmitsNumberWhenUnavailable() throws {
+        let item = try #require(attentionResponse([attentionItemJSON(kind: "agent_question", number: nil)]).items.first)
+        #expect(item.rowLabel == "Agent question")
+    }
+
+    @Test func workAttentionListDefaultsToTwoRowsAndCanShowAll() throws {
+        let response = try attentionResponse([
+            attentionItemJSON(), attentionItemJSON(), attentionItemJSON()
+        ])
+        #expect(WorkAttentionListPresentation.displayedItems(response.items, isExpanded: false).count == 2)
+        #expect(WorkAttentionListPresentation.displayedItems(response.items, isExpanded: true).count == 3)
+        #expect(WorkAttentionListPresentation.needsExpansionControl(for: response.items))
+        #expect(!WorkAttentionListPresentation.needsExpansionControl(for: Array(response.items.prefix(2))))
+    }
+
+    @Test func collapsedListReportsAFocusedItemOutsideInitialRowsAsHidden() throws {
+        let response = try attentionResponse([
+            attentionItemJSON(id: "attention-1"),
+            attentionItemJSON(id: "attention-2"),
+            attentionItemJSON(id: "attention-3")
+        ])
+        #expect(WorkAttentionListPresentation.isFocusedItemHidden(
+            "attention-3", in: response.items, isExpanded: false
+        ))
+        #expect(!WorkAttentionListPresentation.isFocusedItemHidden(
+            "attention-2", in: response.items, isExpanded: false
+        ))
+        #expect(!WorkAttentionListPresentation.isFocusedItemHidden(
+            "attention-3", in: response.items, isExpanded: true
+        ))
+        #expect(!WorkAttentionListPresentation.isFocusedItemHidden(
+            nil, in: response.items, isExpanded: false
+        ))
     }
 
     @Test func refreshAgeAndStalenessUseTheReturnedPolicy() throws {
