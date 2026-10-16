@@ -41,15 +41,25 @@ def _per_day(con, sql: str, parameters=()) -> list[dict]:
 
 def _agent_event_selection(con) -> list[dict]:
     """Select surplus legacy copies, reserving exporter rows before legacy ones."""
-    return _per_day(
-        con,
-        """WITH versions AS (
+    days = [
+        row[0]
+        for row in con.execute(
+            "SELECT DISTINCT date FROM lake.agent_events "
+            "WHERE _import_file LIKE ? ORDER BY 1",
+            [LEGACY_PREFIX],
+        ).fetchall()
+    ]
+    selected = []
+    for day in days:
+        rows = _per_day(
+            con,
+            """WITH versions AS (
              SELECT date,_row_sha256,count(*) AS rows
-             FROM lake.export_event_versions GROUP BY 1,2
+             FROM lake.export_event_versions WHERE date=? GROUP BY 1,2
            ), nonlegacy AS (
              SELECT date,_row_sha256,count(*) AS rows
              FROM lake.agent_events
-             WHERE _import_file NOT LIKE ? OR _import_file IS NULL
+             WHERE date=? AND (_import_file NOT LIKE ? OR _import_file IS NULL)
              GROUP BY 1,2
            ), numbered AS (
              SELECT event._import_file,event._import_row,event.date,event._row_sha256,
@@ -62,12 +72,13 @@ def _agent_event_selection(con) -> list[dict]:
              FROM lake.agent_events event
              LEFT JOIN versions USING (date,_row_sha256)
              LEFT JOIN nonlegacy USING (date,_row_sha256)
-             WHERE event._import_file LIKE ?
+             WHERE event.date=? AND event._import_file LIKE ?
            )
-           SELECT date,count(*) FROM numbered WHERE ordinal > legacy_rows
-           GROUP BY 1 ORDER BY 1""",
-        [LEGACY_PREFIX, LEGACY_PREFIX],
-    )
+           SELECT date,count(*) FROM numbered WHERE ordinal > legacy_rows GROUP BY 1""",
+            [day, day, LEGACY_PREFIX, day, LEGACY_PREFIX],
+        )
+        selected.extend(rows)
+    return selected
 
 
 def _selection_plan(con) -> dict:
@@ -154,17 +165,18 @@ def _append_deprecation_record(spec, record, *, fence) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _delete_selected(con, names: set[str]) -> None:
+def _delete_selected(con, names: set[str], agent_days: list[str]) -> None:
     if "agent_events" in names:
-        con.execute(
-            """DELETE FROM lake.agent_events event WHERE EXISTS (
+        for day in agent_days:
+            con.execute(
+                """DELETE FROM lake.agent_events event WHERE EXISTS (
                  WITH versions AS (
                    SELECT date,_row_sha256,count(*) AS rows
-                   FROM lake.export_event_versions GROUP BY 1,2
+                   FROM lake.export_event_versions WHERE date=? GROUP BY 1,2
                  ), nonlegacy AS (
                    SELECT date,_row_sha256,count(*) AS rows
                    FROM lake.agent_events
-                   WHERE _import_file NOT LIKE ? OR _import_file IS NULL
+                   WHERE date=? AND (_import_file NOT LIKE ? OR _import_file IS NULL)
                    GROUP BY 1,2
                  ), numbered AS (
                    SELECT candidate._import_file,candidate._import_row,candidate.date,
@@ -178,7 +190,7 @@ def _delete_selected(con, names: set[str]) -> None:
                    FROM lake.agent_events candidate
                    LEFT JOIN versions USING (date,_row_sha256)
                    LEFT JOIN nonlegacy USING (date,_row_sha256)
-                   WHERE candidate._import_file LIKE ?
+                   WHERE candidate.date=? AND candidate._import_file LIKE ?
                  )
                  SELECT 1 FROM numbered candidate
                  WHERE candidate.ordinal > candidate.legacy_rows
@@ -187,8 +199,8 @@ def _delete_selected(con, names: set[str]) -> None:
                    AND event.date IS NOT DISTINCT FROM candidate.date
                    AND event._row_sha256 IS NOT DISTINCT FROM candidate._row_sha256
                )""",
-            [LEGACY_PREFIX, LEGACY_PREFIX],
-        )
+                [day, day, LEGACY_PREFIX, day, LEGACY_PREFIX],
+            )
     if "control_outbox_batches" in names:
         con.execute(
             "DELETE FROM lake.control_outbox_batches WHERE _import_file LIKE ?",
@@ -217,10 +229,6 @@ def _write_retained_watermark(con, names: set[str]) -> None:
 
 def _precommit_verify_agent_events(spec: LakeSpec, con) -> None:
     """Run #637's baseline-plus-version count invariant before committing."""
-    # This runs in the fenced writer process immediately before the disposable
-    # verification worker. Keep its hash accounting bounded so its allocator
-    # cannot consume the worker's share of the existing aggregate RSS ceiling.
-    con.execute("SET memory_limit='256MB'")
     try:
         report = json.loads(
             (spec.data_root / "verification" / "report.json").read_text()
@@ -293,57 +301,62 @@ def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
     if not apply:
         return deprecation_plan(spec)
     started = monotonic()
-    with (
-        drained_mutation(spec.dsn()) as fence,
-        lake_connection(spec, read_only=False) as con,
-    ):
-        plan = _selection_plan(con)
-        if plan["rows"] == 0:
-            return {
-                "dry_run": False,
-                "no_op": True,
-                **plan,
-                "elapsed_seconds": round(monotonic() - started, 3),
+    with drained_mutation(spec.dsn()) as fence:
+        with lake_connection(
+            spec,
+            read_only=False,
+            settings={
+                "memory_limit": "512MB",
+                "temp_directory": str(spec.data_root / "spill"),
+            },
+        ) as con:
+            plan = _selection_plan(con)
+            if plan["rows"] == 0:
+                return {
+                    "dry_run": False,
+                    "no_op": True,
+                    **plan,
+                    "elapsed_seconds": round(monotonic() - started, 3),
+                }
+            proof_snapshot, proof_digest, proof = _baseline_snapshot(spec)
+            before_snapshot = con.execute(
+                "SELECT max(snapshot_id) FROM lake.snapshots()"
+            ).fetchone()[0]
+            run_id = uuid4().hex
+            intent = {
+                "version": 1,
+                "operation": "deprecate-legacy",
+                "proof_sha256": proof_digest,
+                "catalog_id": proof["catalog_id"],
+                "data_root": proof["data_root"],
+                "before_snapshot": before_snapshot,
+                "selection_rule": SELECTION_RULE,
+                "counts": plan["tables"],
             }
-        proof_snapshot, proof_digest, proof = _baseline_snapshot(spec)
-        before_snapshot = con.execute(
-            "SELECT max(snapshot_id) FROM lake.snapshots()"
-        ).fetchone()[0]
-        run_id = uuid4().hex
-        intent = {
-            "version": 1,
-            "operation": "deprecate-legacy",
-            "proof_sha256": proof_digest,
-            "catalog_id": proof["catalog_id"],
-            "data_root": proof["data_root"],
-            "before_snapshot": before_snapshot,
-            "selection_rule": SELECTION_RULE,
-            "counts": plan["tables"],
-        }
-        intent_digest = hashlib.sha256(
-            json.dumps(intent, sort_keys=True).encode()
-        ).hexdigest()
-        con.execute("BEGIN")
-        try:
-            con.execute(
-                "CALL lake.set_commit_message(?, ?, extra_info => ?)",
-                [MAINTENANCE_AUTHOR, run_id, intent_digest],
-            )
-            _delete_selected(con, _table_names(con))
-            refresh_activity_daily(con, plan["affected_days"])
-            _write_retained_watermark(con, _table_names(con))
-            _precommit_verify_agent_events(spec, con)
-            fence.check()
-            con.execute("COMMIT")
-        except BaseException:
+            intent_digest = hashlib.sha256(
+                json.dumps(intent, sort_keys=True).encode()
+            ).hexdigest()
+            con.execute("BEGIN")
             try:
-                con.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        after_snapshot = con.execute(
-            "SELECT max(snapshot_id) FROM lake.snapshots()"
-        ).fetchone()[0]
+                con.execute(
+                    "CALL lake.set_commit_message(?, ?, extra_info => ?)",
+                    [MAINTENANCE_AUTHOR, run_id, intent_digest],
+                )
+                _delete_selected(con, _table_names(con), plan["affected_days"])
+                refresh_activity_daily(con, plan["affected_days"])
+                _write_retained_watermark(con, _table_names(con))
+                _precommit_verify_agent_events(spec, con)
+                fence.check()
+                con.execute("COMMIT")
+            except BaseException:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            after_snapshot = con.execute(
+                "SELECT max(snapshot_id) FROM lake.snapshots()"
+            ).fetchone()[0]
         if after_snapshot == before_snapshot:
             raise LakeError("lake_deprecation_no_snapshot")
         record = {
@@ -362,8 +375,9 @@ def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
         ).hexdigest()
         from .serving_proof import advance_checkpoint, check_proof
 
-        serving = check_proof(spec, con, proof_after)
-        checkpoint = advance_checkpoint(spec, proof_after, fence=fence, con=con)
+        with lake_connection(spec, read_only=False) as con:
+            serving = check_proof(spec, con, proof_after)
+            checkpoint = advance_checkpoint(spec, proof_after, fence=fence, con=con)
         return {
             "dry_run": False,
             "no_op": False,
