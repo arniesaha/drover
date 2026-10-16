@@ -55,9 +55,8 @@ The existing runtime memory guard exposes `state="over"`, current/peak bytes,
 and budget bytes in readiness/data-quality responses and logs excess RSS.
 
 S2's rollback CLI is specified as `outbox replay --sink legacy` against the
-isolated config's durable control outbox. S4's import CLI options name isolated
-lake/catalog and legacy source roots explicitly. S2 replay is executable; S4 import remains a future contract. A7's lake imports only the last date; the first-day session exists in
-the retained legacy archive and control registry, with its native ID mapping
-and historical start time. This partition boundary is the
-harness's explicit import watermark until S4 persists that metadata; the harness
-does not invent a product watermark table or read path.
+isolated config's durable control outbox. The legacy `lake import` command is
+retired and must fail closed. A7 verifies that a mapped session before the
+recent-lake boundary remains archived, and that an attempted legacy import
+cannot mutate the lake. The deprecation operation owns the retained
+`import_watermark` contract for live lakes.

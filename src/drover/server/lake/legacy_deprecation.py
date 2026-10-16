@@ -217,14 +217,20 @@ def _write_retained_watermark(con, names: set[str]) -> None:
 
 def _precommit_verify_agent_events(spec: LakeSpec, con) -> None:
     """Run #637's baseline-plus-version count invariant before committing."""
+    # This runs in the fenced writer process immediately before the disposable
+    # verification worker. Keep its hash accounting bounded so its allocator
+    # cannot consume the worker's share of the existing aggregate RSS ceiling.
+    con.execute("SET memory_limit='256MB'")
     try:
         report = json.loads(
             (spec.data_root / "verification" / "report.json").read_text()
         )
-        files = [
-            str(spec.data_root / "partitions" / day["day"] / "events.parquet")
+        baseline_files = {
+            day["day"]: str(
+                spec.data_root / "partitions" / day["day"] / "events.parquet"
+            )
             for day in report["days"]
-        ]
+        }
     except (OSError, ValueError, KeyError, TypeError):
         raise LakeError("lake_deprecation_would_fail_verify") from None
     if (
@@ -236,33 +242,45 @@ def _precommit_verify_agent_events(spec: LakeSpec, con) -> None:
         ).fetchone()
     ):
         raise LakeError("lake_deprecation_would_fail_verify")
+    days = {
+        row[0]
+        for row in con.execute("SELECT DISTINCT date FROM lake.agent_events").fetchall()
+    } | {
+        row[0]
+        for row in con.execute(
+            "SELECT DISTINCT date FROM lake.export_event_versions"
+        ).fetchall()
+    }
     try:
-        if files:
-            con.execute(
-                "CREATE TEMP VIEW deprecation_baseline AS SELECT date,_row_sha256 "
-                "FROM read_parquet(" + literal_list(files) + ")"
-            )
-        else:
-            con.execute(
-                "CREATE TEMP VIEW deprecation_baseline AS "
-                "SELECT date,_row_sha256 FROM lake.agent_events WHERE false"
-            )
-        unexpected = con.execute("""WITH allowed AS (
-                 SELECT date,_row_sha256,count(*) AS rows FROM (
-                   SELECT date,_row_sha256 FROM deprecation_baseline
-                   UNION ALL
-                   SELECT date,_row_sha256 FROM lake.export_event_versions
-                 ) GROUP BY 1,2
-               ), actual AS (
-                 SELECT date,_row_sha256,count(*) AS rows FROM lake.agent_events
-                 GROUP BY 1,2
-               )
-               SELECT 1 FROM actual LEFT JOIN allowed USING (date,_row_sha256)
-               WHERE actual.rows > coalesce(allowed.rows,0) LIMIT 1""").fetchone()
+        for day in sorted(days):
+            baseline = baseline_files.get(day)
+            if baseline:
+                baseline_sql = (
+                    "SELECT _row_sha256 FROM read_parquet("
+                    + literal_list([baseline])
+                    + ")"
+                )
+            else:
+                baseline_sql = "SELECT _row_sha256 FROM lake.agent_events WHERE false"
+            unexpected = con.execute(
+                """WITH allowed AS (
+                     SELECT _row_sha256,count(*) AS rows FROM ("""
+                + baseline_sql
+                + """ UNION ALL
+                     SELECT _row_sha256 FROM lake.export_event_versions WHERE date=?
+                     ) GROUP BY 1
+                   ), actual AS (
+                     SELECT _row_sha256,count(*) AS rows FROM lake.agent_events
+                     WHERE date=? GROUP BY 1
+                   )
+                   SELECT 1 FROM actual LEFT JOIN allowed USING (_row_sha256)
+                   WHERE actual.rows > coalesce(allowed.rows,0) LIMIT 1""",
+                [day, day],
+            ).fetchone()
+            if unexpected:
+                raise LakeError("lake_deprecation_would_fail_verify")
     except Exception:
         raise LakeError("lake_deprecation_would_fail_verify") from None
-    if unexpected:
-        raise LakeError("lake_deprecation_would_fail_verify")
 
 
 def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
