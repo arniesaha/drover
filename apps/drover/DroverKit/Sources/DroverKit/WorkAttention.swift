@@ -39,6 +39,23 @@ public struct WorkAttentionItem: Decodable, Identifiable, Sendable, Equatable {
         }
     }
 
+    /// The concise label used when attention is shown among Home's session rows.
+    public var rowLabel: String {
+        let kindLabel: String
+        switch kind {
+        case "environment_approval": kindLabel = "Environment approval"
+        case "draft_pr": kindLabel = "Draft PR"
+        case "pr_review": kindLabel = "PR review"
+        case "agent_question": kindLabel = "Agent question"
+        case "blocked": kindLabel = "Blocked work"
+        case "failed_session": kindLabel = "Failed session"
+        case "failed_check": kindLabel = "Failed check"
+        default: kindLabel = "Work attention"
+        }
+        guard let number else { return kindLabel }
+        return "\(kindLabel) #\(number)"
+    }
+
     public var githubURL: URL? {
         guard let value = URL(string: url), value.scheme == "https",
               value.host == "github.com", value.user == nil, value.password == nil else { return nil }
@@ -59,6 +76,24 @@ public struct WorkAttentionItem: Decodable, Identifiable, Sendable, Equatable {
     public func refreshAge(now: Date = Date()) -> String {
         guard let date = refreshedDate else { return "Refresh age unknown" }
         return "Refreshed \(SnapshotFreshness.ageText(now.timeIntervalSince(date))) ago"
+    }
+}
+
+/// Presentation rules shared by the Home work-attention section and its tests.
+public enum WorkAttentionListPresentation {
+    public static let collapsedRowLimit = 2
+
+    public static func displayedItems(_ items: [WorkAttentionItem], isExpanded: Bool) -> [WorkAttentionItem] {
+        isExpanded ? items : Array(items.prefix(collapsedRowLimit))
+    }
+
+    public static func needsExpansionControl(for items: [WorkAttentionItem]) -> Bool {
+        items.count > collapsedRowLimit
+    }
+
+    public static func isFocusedItemHidden(_ focusedID: String?, in items: [WorkAttentionItem], isExpanded: Bool) -> Bool {
+        guard let focusedID else { return false }
+        return !displayedItems(items, isExpanded: isExpanded).contains { $0.id == focusedID }
     }
 }
 
