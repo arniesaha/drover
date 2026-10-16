@@ -60,6 +60,27 @@ def test_unverified_lake_cannot_open_or_fallback(
             con.execute("SELECT * FROM agent_events")
 
 
+def test_stale_proof_pin_names_config_key_expected_and_actual(verified_lake):
+    import hashlib
+
+    from drover.server.lake.serving_proof import check_proof
+
+    spec, _, _ = verified_lake
+    expected = "0" * 64
+    actual = hashlib.sha256(
+        (spec.data_root / "verification/serving-proof.json").read_bytes()
+    ).hexdigest()
+    with lake_connection(spec) as con:
+        with pytest.raises(LakeError) as caught:
+            check_proof(spec, con, expected)
+
+    assert caught.value.code == "lake_verification_required"
+    assert caught.value.detail == (
+        "analytics.verification_sha256 mismatch: "
+        f"expected {expected}; actual {actual}"
+    )
+
+
 @pytest.fixture
 def verified_lake(lake_spec, postgres_control_store, tmp_path):
     import hashlib

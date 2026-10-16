@@ -43,6 +43,21 @@ Its SHA-256 must be explicitly pinned in the selected configuration; startup
 never enrolls a hash. Older checkpoints lacking this proof are unavailable until
 separately authorized offline verification succeeds.
 
+### After a proof-changing lake command
+
+`lake verify` and a non-no-op `lake deprecate-legacy --apply` publish a new
+`serving-proof.json`. Each command prints the SHA-256 and a
+standalone `[analytics] verification_sha256 = "…"` hint, and includes both in
+its JSON receipt. Before starting the hub, copy that value into the selected
+config, validate the config with the hub loader, then start the hub:
+
+```sh
+"$TOOL_PY" -c 'from drover.server.__main__ import _resolve_config; import sys; _resolve_config(sys.argv[1])' "$CONFIG"
+```
+
+Do not start the hub with the prior pin: it deliberately refuses a mismatched
+proof and names the expected and actual hashes in its failure detail.
+
 Every serving SELECT checks the pinned proof in the same child transaction as
 its read. Dry-run, absent, mismatched, wrong-catalog and unverified snapshots
 are rejected. Post-baseline snapshots are accepted only if tagged
@@ -59,8 +74,9 @@ files are assumed immutable: full content hashes are checked offline, not
 recomputed on every request. Corrupt files encountered by the engine produce
 unavailable responses. Orphans are never discovered by globs. This gate does not
 substitute for immutable backup verification or a storage-integrity monitor.
-Maintenance/provisioning changes are deliberately not certified as exports and
-invalidate serving authorization.
+Provisioning changes are deliberately not certified as exports and invalidate
+serving authorization. Receipted `lake maintain` work preserves the proof and
+advances only its checkpoint, so it does not require a config-pin update.
 
 ## Routed reads and safe failure
 

@@ -59,7 +59,19 @@ checksum manifests from the same published release.
    activation, first use `install_cached_into_venv(layout, RELEASE, venv)` on the
    explicitly configured venv and require success, then flip the runtime record.
    Keep service argv and its environment unchanged.
-7. Start the services, then call `verify_hub(base_url)` or inspect `/healthz`
+7. If any lake command in this release window published a serving proof
+   (`lake verify` or a non-no-op `lake deprecate-legacy --apply`), copy the
+   command's printed
+   `[analytics] verification_sha256 = "…"` line into the selected config.
+   Validate with the hub loader before starting the hub:
+
+   ```sh
+   "$TOOL_PY" -c 'from drover.server.__main__ import _resolve_config; import sys; _resolve_config(sys.argv[1])' "$CONFIG"
+   ```
+
+   Do not start the hub until this succeeds; a stale pin deliberately blocks
+   startup.
+8. Start the services, then call `verify_hub(base_url)` or inspect `/healthz`
    and `/readyz`. Require `ok\nanalytical=ok` and readiness HTTP 200. On failure,
    stop services and explicitly restore the retained prior runtime; in-place
    mode must also reinstall the prior cached wheel. Start and verify again.
