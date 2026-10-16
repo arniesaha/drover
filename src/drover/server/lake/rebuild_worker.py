@@ -484,6 +484,59 @@ def _verify_receipts(con, job):
     }
 
 
+def _deprecate_legacy(con, job):
+    """Own the heavy legacy mutation in this disposable DuckDB engine."""
+    from .activity_daily import refresh_activity_daily
+    from .legacy_deprecation import (
+        _delete_selected,
+        _precommit_verify_agent_events,
+        _selection_plan,
+        _table_names,
+        _write_retained_watermark,
+    )
+
+    spec = _spec(job["spec"])
+    attach_lake(con, spec, read_only=False)
+    con.execute("USE lake")
+    plan = _selection_plan(con)
+    if not job["apply"] or plan["rows"] == 0:
+        return {"plan": plan, "no_op": plan["rows"] == 0}
+    before_snapshot = con.execute(
+        "SELECT max(snapshot_id) FROM lake.snapshots()"
+    ).fetchone()[0]
+    intent = {
+        **job["intent"],
+        "before_snapshot": before_snapshot,
+        "counts": plan["tables"],
+    }
+    digest = hashlib.sha256(json.dumps(intent, sort_keys=True).encode()).hexdigest()
+    con.execute("BEGIN")
+    try:
+        con.execute(
+            "CALL lake.set_commit_message(?, ?, extra_info => ?)",
+            [job["author"], job["run_id"], digest],
+        )
+        _delete_selected(con, _table_names(con), plan["affected_days"])
+        refresh_activity_daily(con, plan["affected_days"])
+        _write_retained_watermark(con, _table_names(con))
+        _precommit_verify_agent_events(spec, con)
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    after_snapshot = con.execute(
+        "SELECT max(snapshot_id) FROM lake.snapshots()"
+    ).fetchone()[0]
+    return {
+        "plan": plan,
+        "no_op": False,
+        "before_snapshot": before_snapshot,
+        "after_snapshot": after_snapshot,
+        "intent": intent,
+        "intent_sha256": digest,
+    }
+
+
 def _spec(value):
     return LakeSpec(
         **{
@@ -520,6 +573,7 @@ def work(job):
             "verify_aggregate": _verify_aggregate,
             "verify_baseline": _verify_baseline,
             "verify_receipts": _verify_receipts,
+            "deprecate_legacy": _deprecate_legacy,
         }[job["operation"]]
         return operation(con, job)
 

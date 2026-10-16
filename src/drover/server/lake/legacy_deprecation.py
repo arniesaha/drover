@@ -8,6 +8,7 @@ from time import monotonic
 from uuid import uuid4
 
 from .activity_daily import refresh_activity_daily
+from .admin_process import run_admin
 from .fence import drained_mutation
 from .maintenance import MAINTENANCE_AUTHOR, _baseline_snapshot
 from .partition_rebuild import verify_partitioned
@@ -20,6 +21,15 @@ SELECTION_RULE = (
     "legacy agent_events in excess of export_event_versions per (date,_row_sha256); "
     "all legacy rows in non-export tables; import_watermark becomes earliest retained day"
 )
+
+
+def _spec(spec: LakeSpec) -> dict:
+    return {
+        "catalog_dsn_env": spec.catalog_dsn_env,
+        "data_root": str(spec.data_root),
+        "extension_dir": str(spec.extension_dir),
+        "engine_sha256": spec.engine_sha256,
+    }
 
 
 def _table_names(con) -> set[str]:
@@ -143,9 +153,18 @@ def _selection_plan(con) -> dict:
 
 def deprecation_plan(spec: LakeSpec) -> dict:
     """Read-only inventory for the default operator dry-run."""
-    with lake_connection(spec) as con:
-        plan = _selection_plan(con)
-    return {"dry_run": True, **plan}
+    result, peak = run_admin(
+        {
+            "operation": "deprecate_legacy",
+            "spec": _spec(spec),
+            "apply": False,
+            "output": str(spec.data_root / "deprecation-plan"),
+            "spill": str(spec.data_root / "spill"),
+        },
+        spec.data_root,
+    )
+    plan = result["plan"]
+    return {"dry_run": True, **plan, "peak_rss_bytes": peak}
 
 
 def _append_deprecation_record(spec, record, *, fence) -> None:
@@ -291,7 +310,7 @@ def _precommit_verify_agent_events(spec: LakeSpec, con) -> None:
         raise LakeError("lake_deprecation_would_fail_verify") from None
 
 
-def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
+def _deprecate_legacy_inprocess(spec: LakeSpec, *, apply: bool = False) -> dict:
     """Deprecate legacy-import rows, then recertify the resulting lake.
 
     The operation intentionally does not accept an allowlist or a trusted
@@ -388,5 +407,77 @@ def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
             "verification": verification,
             "serving_snapshot": serving["snapshot"],
             "checkpoint_snapshot": checkpoint["snapshot"] if checkpoint else None,
+            "elapsed_seconds": round(monotonic() - started, 3),
+        }
+
+
+def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
+    """Run mutation work in a disposable engine while retaining the fence."""
+    if not apply:
+        return deprecation_plan(spec)
+    started = monotonic()
+    with drained_mutation(spec.dsn()) as fence:
+        proof_snapshot, proof_digest, proof = _baseline_snapshot(spec)
+        run_id = uuid4().hex
+        result, child_rss = run_admin(
+            {
+                "operation": "deprecate_legacy",
+                "spec": _spec(spec),
+                "apply": True,
+                "output": str(spec.data_root / "deprecation-mutation"),
+                "spill": str(spec.data_root / "spill"),
+                "run_id": run_id,
+                "author": MAINTENANCE_AUTHOR,
+                "intent": {
+                    "version": 1,
+                    "operation": "deprecate-legacy",
+                    "proof_sha256": proof_digest,
+                    "catalog_id": proof["catalog_id"],
+                    "data_root": proof["data_root"],
+                    "selection_rule": SELECTION_RULE,
+                },
+            },
+            spec.data_root,
+        )
+        fence.check()
+        plan = result["plan"]
+        if result["no_op"]:
+            return {
+                "dry_run": False,
+                "no_op": True,
+                **plan,
+                "child_peak_rss_bytes": child_rss,
+                "elapsed_seconds": round(monotonic() - started, 3),
+            }
+        if result["after_snapshot"] == result["before_snapshot"]:
+            raise LakeError("lake_deprecation_no_snapshot")
+        record = {
+            **result["intent"],
+            "run_id": run_id,
+            "proof_snapshot": proof_snapshot,
+            "after_snapshot": result["after_snapshot"],
+            "affected_days": plan["affected_days"],
+        }
+        _append_deprecation_record(spec, record, fence=fence)
+        verification = verify_partitioned(spec, fence=fence)
+        proof_after = hashlib.sha256(
+            (spec.data_root / "verification" / "serving-proof.json").read_bytes()
+        ).hexdigest()
+        from .serving_proof import advance_checkpoint, check_proof
+
+        with lake_connection(spec, read_only=False) as con:
+            serving = check_proof(spec, con, proof_after)
+            checkpoint = advance_checkpoint(spec, proof_after, fence=fence, con=con)
+        return {
+            "dry_run": False,
+            "no_op": False,
+            **plan,
+            "before_snapshot": result["before_snapshot"],
+            "after_snapshot": result["after_snapshot"],
+            "proof_sha256": proof_after,
+            "verification": verification,
+            "serving_snapshot": serving["snapshot"],
+            "checkpoint_snapshot": checkpoint["snapshot"] if checkpoint else None,
+            "child_peak_rss_bytes": child_rss,
             "elapsed_seconds": round(monotonic() - started, 3),
         }
