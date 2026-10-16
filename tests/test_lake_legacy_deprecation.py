@@ -27,6 +27,8 @@ def _legacy_fixture(verified_lake, postgres_control_store):
         + ")))"
     )
     with lake_connection(spec, read_only=False) as con:
+        con.execute("CREATE TABLE lake.import_watermark(partition_date VARCHAR)")
+        con.execute("INSERT INTO lake.import_watermark VALUES ('2026-01-01')")
         # Model the crossover day: one real exporter row happened to retain an
         # old label, while a distinct legacy row has no version evidence.
         event_id, day = con.execute(
@@ -104,6 +106,131 @@ def test_deprecation_keeps_receipted_crossover_rows_and_recertifies(
 
     repeat = deprecate_legacy(spec, apply=True)
     assert repeat["no_op"] is True
+
+
+def test_deprecation_removes_legacy_hash_duplicates_beyond_receipt_count(
+    verified_lake, postgres_control_store
+):
+    from drover.server.lake.legacy_deprecation import deprecate_legacy
+    from drover.server.lake.runtime import lake_connection
+
+    spec, day, event_id = _legacy_fixture(verified_lake, postgres_control_store)
+    with lake_connection(spec, read_only=False) as con:
+        con.execute(
+            "UPDATE lake.agent_events SET _import_file='outbox:preserved' WHERE id=?",
+            [event_id],
+        )
+        # This copy has the exact exporter-version hash.  Provenance alone is
+        # insufficient: the non-legacy exporter copy must survive and this
+        # legacy duplicate must not consume its receipt capacity.
+        con.execute(
+            "INSERT INTO lake.agent_events BY NAME SELECT * REPLACE "
+            "('legacy-import:duplicate' AS _import_file) "
+            "FROM lake.agent_events WHERE id=?",
+            [event_id],
+        )
+    report = deprecate_legacy(spec, apply=True)
+    assert report["tables"]["agent_events"] == [{"day": day, "rows": 2}]
+    with lake_connection(spec) as con:
+        assert con.execute(
+            "SELECT count(*) FROM lake.agent_events "
+            "WHERE date=? AND _row_sha256 IN "
+            "(SELECT _row_sha256 FROM lake.export_event_versions WHERE id=?)",
+            [day, event_id],
+        ).fetchone() == (1,)
+
+
+def test_deprecation_rolls_back_when_remaining_rows_would_fail_verify(
+    verified_lake, postgres_control_store
+):
+    from drover.server.lake.legacy_deprecation import deprecate_legacy
+    from drover.server.lake.rebuild_worker import POLICY_SCHEMA
+    from drover.server.lake.runtime import LakeError, lake_connection
+
+    spec, _, event_id = _legacy_fixture(verified_lake, postgres_control_store)
+    expression = (
+        "sha256(to_json(struct_pack("
+        + ", ".join(f'"{name}" := "{name}"' for name in POLICY_SCHEMA)
+        + ")))"
+    )
+    with lake_connection(spec, read_only=False) as con:
+        before_snapshot = con.execute(
+            "SELECT max(snapshot_id) FROM lake.snapshots()"
+        ).fetchone()[0]
+        before_rows = con.execute("SELECT count(*) FROM lake.agent_events").fetchone()[
+            0
+        ]
+        con.execute(
+            "INSERT INTO lake.agent_events BY NAME SELECT * REPLACE ("
+            + expression
+            + " AS _row_sha256) FROM (SELECT * REPLACE "
+            "('still-unreceipted' AS id, 'manual:test' AS _import_file) "
+            "FROM lake.agent_events WHERE id=?)",
+            [event_id],
+        )
+        before_rows += 1
+        before_snapshot = con.execute(
+            "SELECT max(snapshot_id) FROM lake.snapshots()"
+        ).fetchone()[0]
+    with pytest.raises(LakeError, match="deprecation_would_fail_verify"):
+        deprecate_legacy(spec, apply=True)
+    with lake_connection(spec) as con:
+        assert (
+            con.execute("SELECT max(snapshot_id) FROM lake.snapshots()").fetchone()[0]
+            == before_snapshot
+        )
+        assert (
+            con.execute("SELECT count(*) FROM lake.agent_events").fetchone()[0]
+            == before_rows
+        )
+
+
+def test_deprecation_keeps_an_archive_watermark_and_survives_export_checkpoint(
+    verified_lake, postgres_control_store
+):
+    import hashlib
+
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.lake.exporter import LakeOutboxExporter
+    from drover.server.lake.fence import MutationFence
+    from drover.server.lake.legacy_deprecation import deprecate_legacy
+    from drover.server.lake.runtime import lake_connection
+    from drover.server.lake.serving_proof import advance_checkpoint, check_proof
+
+    spec, control_path, _ = verified_lake
+    spec, _, _ = _legacy_fixture(verified_lake, postgres_control_store)
+    report = deprecate_legacy(spec, apply=True)
+    with lake_connection(spec) as con:
+        assert (
+            con.execute(
+                "SELECT min(partition_date) FROM lake.import_watermark"
+            ).fetchone()
+            == con.execute(
+                "SELECT min(date) FROM lake.agent_events WHERE date <> '_seed'"
+            ).fetchone()
+        )
+    registry = HarnessRegistry(control_path)
+    registry.append_event(
+        session_id="export-session",
+        event_id="after-deprecation",
+        event_type="assistant_output",
+        payload={"text": "after deprecation"},
+        seq=2,
+        content_preview="after deprecation",
+    )
+    with LakeOutboxExporter(control_path=control_path, spec=spec) as exporter:
+        assert exporter.run_once()["acknowledged"] == 1
+    digest = hashlib.sha256(
+        (spec.data_root / "verification" / "serving-proof.json").read_bytes()
+    ).hexdigest()
+    with (
+        MutationFence(spec.dsn()) as fence,
+        lake_connection(spec, read_only=False) as con,
+    ):
+        checkpoint = advance_checkpoint(spec, digest, fence=fence, con=con)
+        assert checkpoint is not None
+    with lake_connection(spec) as con:
+        assert check_proof(spec, con, digest)["snapshot"] == checkpoint["snapshot"]
 
 
 def test_deprecation_fails_safely_behind_an_existing_mutation_fence(

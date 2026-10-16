@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import defaultdict
 from time import monotonic
 from uuid import uuid4
 
 from .activity_daily import refresh_activity_daily
 from .fence import drained_mutation
-from .maintenance import MAINTENANCE_AUTHOR, _append_receipt, _baseline_snapshot
+from .maintenance import MAINTENANCE_AUTHOR, _baseline_snapshot
 from .partition_rebuild import verify_partitioned
+from .rebuild import literal_list
 from .runtime import LakeError, LakeSpec, lake_connection
 
 DEPRECATION_RECORDS = "legacy-deprecations.json"
 LEGACY_PREFIX = "legacy-import:%"
 SELECTION_RULE = (
-    "_import_file LIKE 'legacy-import:%' AND no exporter receipt/version evidence; "
-    "import_watermark is retired importer state"
+    "legacy agent_events in excess of export_event_versions per (date,_row_sha256); "
+    "all legacy rows in non-export tables; import_watermark becomes earliest retained day"
 )
 
 
@@ -39,41 +39,67 @@ def _per_day(con, sql: str, parameters=()) -> list[dict]:
     ]
 
 
+def _agent_event_selection(con) -> list[dict]:
+    """Select surplus legacy copies, reserving exporter rows before legacy ones."""
+    return _per_day(
+        con,
+        """WITH versions AS (
+             SELECT date,_row_sha256,count(*) AS rows
+             FROM lake.export_event_versions GROUP BY 1,2
+           ), nonlegacy AS (
+             SELECT date,_row_sha256,count(*) AS rows
+             FROM lake.agent_events
+             WHERE _import_file NOT LIKE ? OR _import_file IS NULL
+             GROUP BY 1,2
+           ), numbered AS (
+             SELECT event._import_file,event._import_row,event.date,event._row_sha256,
+               row_number() OVER (
+                 PARTITION BY event.date,event._row_sha256
+                 ORDER BY event._import_file,event._import_row
+               ) AS ordinal,
+               greatest(coalesce(versions.rows,0)-coalesce(nonlegacy.rows,0),0)
+                 AS legacy_rows
+             FROM lake.agent_events event
+             LEFT JOIN versions USING (date,_row_sha256)
+             LEFT JOIN nonlegacy USING (date,_row_sha256)
+             WHERE event._import_file LIKE ?
+           )
+           SELECT date,count(*) FROM numbered WHERE ordinal > legacy_rows
+           GROUP BY 1 ORDER BY 1""",
+        [LEGACY_PREFIX, LEGACY_PREFIX],
+    )
+
+
 def _selection_plan(con) -> dict:
     """Return only rows whose legacy provenance is not independently attested."""
     names = _table_names(con)
     tables: dict[str, list[dict]] = {}
     affected_days: set[str] = set()
 
-    def add(name: str, sql: str, parameters=()):
+    def add(name: str, sql: str, parameters=(), *, affects_activity=True):
         if name not in names:
             tables[name] = []
             return
         rows = _per_day(con, sql, parameters)
         tables[name] = rows
-        affected_days.update(row["day"] for row in rows if row["day"] != "<unknown>")
+        if affects_activity:
+            affected_days.update(
+                row["day"] for row in rows if row["day"] != "<unknown>"
+            )
 
-    add(
-        "agent_events",
-        """SELECT date, count(*) FROM lake.agent_events event
-           WHERE event._import_file LIKE ? AND NOT EXISTS (
-             SELECT 1 FROM lake.export_event_versions version
-             WHERE version._row_sha256=event._row_sha256
-           ) GROUP BY 1 ORDER BY 1""",
-        [LEGACY_PREFIX],
+    tables["agent_events"] = (
+        _agent_event_selection(con) if "agent_events" in names else []
     )
-    # Outbox records have no version row: their only exporter evidence is the
-    # batch receipt named by an outbox import file.  A legacy import can never
-    # satisfy that predicate, but spelling it out keeps the selection rule
-    # conservative if an old catalog used a mixed filename.
+    affected_days.update(
+        row["day"] for row in tables["agent_events"] if row["day"] != "<unknown>"
+    )
+    # Outbox rows have no compatible version identity. A legacy-import row is
+    # therefore not an exporter receipt row and is always deprecated.
     add(
         "control_outbox_batches",
         """SELECT CAST(created_at AS DATE)::VARCHAR, count(*)
            FROM lake.control_outbox_batches row
-           WHERE row._import_file LIKE ? AND NOT EXISTS (
-             SELECT 1 FROM lake.export_batch_receipts receipt
-             WHERE receipt.batch_id=substr(row._import_file, 8)
-           ) GROUP BY 1 ORDER BY 1""",
+           WHERE row._import_file LIKE ? GROUP BY 1 ORDER BY 1""",
         [LEGACY_PREFIX],
     )
     # Provider observations are not exporter output, so no receipt/version can
@@ -85,12 +111,16 @@ def _selection_plan(con) -> dict:
            WHERE _import_file LIKE ? GROUP BY 1 ORDER BY 1""",
         [LEGACY_PREFIX],
     )
-    # This table is solely the retired importer's cursor and has no row-level
-    # lineage.  Removing it prevents history coverage from claiming that the
-    # deprecated import is still part of the live lake.
+    # This table is solely the retired importer's cursor. Replace a stale
+    # cursor with the retained lake boundary so historical windows remain
+    # visibly archived after the importer is gone.
     add(
         "import_watermark",
-        "SELECT partition_date, count(*) FROM lake.import_watermark GROUP BY 1 ORDER BY 1",
+        """SELECT partition_date, count(*) FROM lake.import_watermark
+           WHERE partition_date IS DISTINCT FROM (
+             SELECT min(date) FROM lake.agent_events WHERE date <> '_seed'
+           ) GROUP BY 1 ORDER BY 1""",
+        affects_activity=False,
     )
     return {
         "selection_rule": SELECTION_RULE,
@@ -127,16 +157,41 @@ def _append_deprecation_record(spec, record, *, fence) -> None:
 def _delete_selected(con, names: set[str]) -> None:
     if "agent_events" in names:
         con.execute(
-            """DELETE FROM lake.agent_events event WHERE event._import_file LIKE ?
-               AND NOT EXISTS (SELECT 1 FROM lake.export_event_versions version
-                 WHERE version._row_sha256=event._row_sha256)""",
-            [LEGACY_PREFIX],
+            """DELETE FROM lake.agent_events event WHERE EXISTS (
+                 WITH versions AS (
+                   SELECT date,_row_sha256,count(*) AS rows
+                   FROM lake.export_event_versions GROUP BY 1,2
+                 ), nonlegacy AS (
+                   SELECT date,_row_sha256,count(*) AS rows
+                   FROM lake.agent_events
+                   WHERE _import_file NOT LIKE ? OR _import_file IS NULL
+                   GROUP BY 1,2
+                 ), numbered AS (
+                   SELECT candidate._import_file,candidate._import_row,candidate.date,
+                     candidate._row_sha256,
+                     row_number() OVER (
+                       PARTITION BY candidate.date,candidate._row_sha256
+                       ORDER BY candidate._import_file,candidate._import_row
+                     ) AS ordinal,
+                     greatest(coalesce(versions.rows,0)-coalesce(nonlegacy.rows,0),0)
+                       AS legacy_rows
+                   FROM lake.agent_events candidate
+                   LEFT JOIN versions USING (date,_row_sha256)
+                   LEFT JOIN nonlegacy USING (date,_row_sha256)
+                   WHERE candidate._import_file LIKE ?
+                 )
+                 SELECT 1 FROM numbered candidate
+                 WHERE candidate.ordinal > candidate.legacy_rows
+                   AND event._import_file IS NOT DISTINCT FROM candidate._import_file
+                   AND event._import_row IS NOT DISTINCT FROM candidate._import_row
+                   AND event.date IS NOT DISTINCT FROM candidate.date
+                   AND event._row_sha256 IS NOT DISTINCT FROM candidate._row_sha256
+               )""",
+            [LEGACY_PREFIX, LEGACY_PREFIX],
         )
     if "control_outbox_batches" in names:
         con.execute(
-            """DELETE FROM lake.control_outbox_batches row WHERE row._import_file LIKE ?
-               AND NOT EXISTS (SELECT 1 FROM lake.export_batch_receipts receipt
-                 WHERE receipt.batch_id=substr(row._import_file, 8))""",
+            "DELETE FROM lake.control_outbox_batches WHERE _import_file LIKE ?",
             [LEGACY_PREFIX],
         )
     if "provider_usage_snapshots" in names:
@@ -146,6 +201,68 @@ def _delete_selected(con, names: set[str]) -> None:
         )
     if "import_watermark" in names:
         con.execute("DELETE FROM lake.import_watermark")
+
+
+def _write_retained_watermark(con, names: set[str]) -> None:
+    """Retain one archive boundary after retiring the legacy cursor."""
+    if "import_watermark" not in names:
+        return
+    day = con.execute(
+        "SELECT min(date) FROM lake.agent_events WHERE date <> '_seed'"
+    ).fetchone()[0]
+    if day is None:
+        return
+    con.execute("INSERT INTO lake.import_watermark VALUES (?)", [day])
+
+
+def _precommit_verify_agent_events(spec: LakeSpec, con) -> None:
+    """Run #637's baseline-plus-version count invariant before committing."""
+    try:
+        report = json.loads(
+            (spec.data_root / "verification" / "report.json").read_text()
+        )
+        files = [
+            str(spec.data_root / "partitions" / day["day"] / "events.parquet")
+            for day in report["days"]
+        ]
+    except (OSError, ValueError, KeyError, TypeError):
+        raise LakeError("lake_deprecation_would_fail_verify") from None
+    if (
+        con.execute(
+            "SELECT 1 FROM lake.agent_events WHERE date IS NULL LIMIT 1"
+        ).fetchone()
+        or con.execute(
+            "SELECT 1 FROM lake.export_event_versions WHERE date IS NULL LIMIT 1"
+        ).fetchone()
+    ):
+        raise LakeError("lake_deprecation_would_fail_verify")
+    try:
+        if files:
+            con.execute(
+                "CREATE TEMP VIEW deprecation_baseline AS SELECT date,_row_sha256 "
+                "FROM read_parquet(" + literal_list(files) + ")"
+            )
+        else:
+            con.execute(
+                "CREATE TEMP VIEW deprecation_baseline AS "
+                "SELECT date,_row_sha256 FROM lake.agent_events WHERE false"
+            )
+        unexpected = con.execute("""WITH allowed AS (
+                 SELECT date,_row_sha256,count(*) AS rows FROM (
+                   SELECT date,_row_sha256 FROM deprecation_baseline
+                   UNION ALL
+                   SELECT date,_row_sha256 FROM lake.export_event_versions
+                 ) GROUP BY 1,2
+               ), actual AS (
+                 SELECT date,_row_sha256,count(*) AS rows FROM lake.agent_events
+                 GROUP BY 1,2
+               )
+               SELECT 1 FROM actual LEFT JOIN allowed USING (date,_row_sha256)
+               WHERE actual.rows > coalesce(allowed.rows,0) LIMIT 1""").fetchone()
+    except Exception:
+        raise LakeError("lake_deprecation_would_fail_verify") from None
+    if unexpected:
+        raise LakeError("lake_deprecation_would_fail_verify")
 
 
 def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
@@ -196,6 +313,8 @@ def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
             )
             _delete_selected(con, _table_names(con))
             refresh_activity_daily(con, plan["affected_days"])
+            _write_retained_watermark(con, _table_names(con))
+            _precommit_verify_agent_events(spec, con)
             fence.check()
             con.execute("COMMIT")
         except BaseException:
@@ -217,20 +336,6 @@ def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
             "affected_days": plan["affected_days"],
         }
         _append_deprecation_record(spec, record, fence=fence)
-        _append_receipt(
-            spec,
-            {
-                **intent,
-                "tables": plan["tables"],
-                "after_tables": {"deprecation": plan["tables"]},
-                "after_snapshot": after_snapshot,
-                "commits": [
-                    [after_snapshot, MAINTENANCE_AUTHOR, run_id, intent_digest]
-                ],
-                "intent_sha256": intent_digest,
-            },
-            fence=fence,
-        )
         # Keep the drain through the expensive check: no anonymous snapshot can
         # land between deletion, verification, and proof publication.
         verification = verify_partitioned(spec, fence=fence)
