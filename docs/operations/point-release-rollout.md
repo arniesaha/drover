@@ -59,8 +59,16 @@ checksum manifests from the same published release.
 5. If `release_kind` reports `lake_schema`, stop this sequence and follow the
    [full lake cutover gate](lake-cutover.md). Unknown metadata also blocks the
    point-release path. Do not override the selector based on a version label.
-6. For a passing point release, stop the quiescent server and local harness
-   before activation. For symlink activation, use `RuntimeLayout.flip(RELEASE)`
+6. For a passing point release, record the bounded planned stop **before**
+   stopping the quiescent server and local harness. The marker authorizes one
+   check-in recovery attempt for at most two hours; it does not change config,
+   lake data, or credentials:
+
+   ```sh
+   "$TOOL" planned-stop begin --step point-release-rollout --actor release-operator
+   ```
+
+   For symlink activation, use `RuntimeLayout.flip(RELEASE)`
    with the same home/root that passed preflight. For configured `in_place`
    activation, first use `install_cached_into_venv(layout, RELEASE, venv)` on the
    explicitly configured venv and require success, then flip the runtime record.
@@ -81,7 +89,27 @@ checksum manifests from the same published release.
    and `/readyz`. Require `ok\nanalytical=ok` and readiness HTTP 200. On failure,
    stop services and explicitly restore the retained prior runtime; in-place
    mode must also reinstall the prior cached wheel. Start and verify again.
-   Re-enable updates only after health succeeds and the pin matches the release.
+   Re-enable updates only after health succeeds and the pin matches the release,
+   then clear the marker:
+
+   ```sh
+   "$TOOL" planned-stop complete
+   ```
+
+## Planned-stop check-in recovery
+
+While the marker is active, the thin external check-in should run exactly:
+
+```sh
+drover-server recover-planned-stop
+```
+
+It prints one line. `healthy` clears a stale marker; a down hub gets one
+launchd/service-manager restart only when the unexpired marker has no prior
+attempt. It prints `recovered` on readiness, or `failed: ...` with the first
+server-log startup error. Missing, expired, or already-attempted markers print
+`unplanned outage: human decision required` and return non-zero. Check-ins do
+not decide whether to restart and must not loop or call the service manager.
 
 For the Python API actions above, use the tooling interpreter and import
 `RuntimeLayout` from `drover.server.runtime`, `ReleaseArtifact`,

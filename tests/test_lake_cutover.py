@@ -595,6 +595,7 @@ def test_switch_dry_run_prints_ordered_actions_and_changes_nothing(tmp_path, pla
     assert [a.step for a in actions] == [
         "require_gate",
         "backup",
+        "record_planned_stop",
         "stop_service",
         "flip_backend",
         "start_service",
@@ -609,6 +610,25 @@ def test_switch_dry_run_prints_ordered_actions_and_changes_nothing(tmp_path, pla
     assert launchd.calls == []
     assert service.config_path.read_text() == before
     assert not plan.backup_dir.exists()
+
+
+def test_switch_records_a_marker_before_stopping_the_hub(tmp_path, plan, monkeypatch):
+    _passing_gate_verdict(plan)
+    monkeypatch.setattr(cutover, "take_backup", lambda *args, **kwargs: {})
+    service = write_service(tmp_path)
+    launchd = RecordingLaunchd(service)
+    actions = switch_actions(
+        plan, service, legacy_root=tmp_path, launchd=launchd, environ={}
+    )
+
+    for action in actions[:3]:
+        action.run()
+    marker = json.loads((service.config_path.parent / "planned-stop.json").read_text())
+    assert marker["step"] == "cutover switch"
+    assert marker["attempts"] == 0
+
+    actions[3].run()
+    assert any(call[1] == "bootout" for call in launchd.calls)
 
 
 def test_switch_refuses_without_a_passing_gate_verdict(tmp_path, plan):
@@ -645,6 +665,7 @@ def test_rollback_dry_run_uses_the_recorded_switch_time(tmp_path, plan):
     execute(actions, dry_run=True, echo=lines.append)
     assert [a.step for a in actions] == [
         "backup",
+        "record_planned_stop",
         "stop_service",
         "flip_backend",
         "outbox_replay",
@@ -973,7 +994,7 @@ def test_cutover_cli_dry_runs_print_and_change_nothing(tmp_path, monkeypatch):
         main, ["cutover", "switch", *common, "--legacy-root", str(tmp_path)]
     )
     assert switch.exit_code == 0, switch.output
-    assert switch.output.count("(dry-run)") == 6
+    assert switch.output.count("(dry-run)") == 7
     rollback = CliRunner().invoke(
         main, ["cutover", "rollback", *common, "--since", "1759600000"]
     )
