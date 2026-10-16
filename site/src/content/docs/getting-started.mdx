@@ -164,14 +164,14 @@ Enroll only machines that you control. See [Known limits](/docs/security-privacy
 2. In a second terminal, start a host daemon:
 
    ```bash
-  uv run drover-harnessd \
+   uv run drover-harnessd \
      --host-id local \
      --display-name "Local Mac" \
      --kind macos \
      --listen 127.0.0.1:7081 \
      --local-url http://127.0.0.1:7081 \
-    --central-url http://127.0.0.1:7080
-  ```
+     --central-url http://127.0.0.1:7080
+   ```
 
 For a bound host, add `--relay`. The hub never sends its legacy bearer to a
 bound daemon's inbound listener; all host calls use the authenticated relay.
