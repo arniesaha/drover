@@ -280,16 +280,21 @@ Ordered steps (the dry run prints each one with its exact command or file):
    copies of `config.toml` and the plist, into
    `.cutover-backups/$LAKE/<utc>/`. Verified by the sha256 manifest and
    `pg_restore --list`. `drover-server cutover backup --lake $LAKE` runs it alone.
-3. `stop_service`: `launchctl bootout gui/$UID/com.drover.server` (skipped if
+3. `record_planned_stop`: write the bounded two-hour marker in the service
+   config's Drover state directory before the hub is stopped. It authorizes one
+   `drover-server recover-planned-stop` attempt if this procedure leaves the
+   hub down.
+4. `stop_service`: `launchctl bootout gui/$UID/com.drover.server` (skipped if
    not loaded). Ingest stays durable in the PostgreSQL outbox while stopped.
-4. `flip_backend`: atomically rewrite only `[analytics]`: `backend=ducklake`,
+5. `flip_backend`: atomically rewrite only `[analytics]`: `backend=ducklake`,
    the reader/exporter env names, `data_root`, the extension/engine pins,
    `verification_sha256 = sha256(serving-proof.json)` and `epoch`. The new file
    is loaded before it replaces the old one. The first switch time is recorded
    in `cutover-state.json`.
-5. `start_service`: `launchctl bootstrap gui/$UID <plist>`.
-6. `verify`: `/healthz` must be `ok\nanalytical=ok` and `/readyz` 200 within
-   300 s. The output includes `/readyz` memory.
+6. `start_service`: `launchctl bootstrap gui/$UID <plist>`.
+7. `verify`: `/healthz` must be `ok\nanalytical=ok` and `/readyz` 200 within
+   300 s. The output includes `/readyz` memory and clears the marker only after
+   that health check passes.
 
 Every step is idempotent, so rerun the command after fixing a failure. A
 failure stops the procedure at that step with `<step>_failed: <cause>`.
@@ -321,7 +326,7 @@ $DS cutover rollback --lake $LAKE --dry-run
 $DS cutover rollback --lake $LAKE      # --since EPOCH overrides the recorded switch
 ```
 
-Steps: `backup` → `stop_service` → `flip_backend` (`backend=legacy`) →
+Steps: `backup` → `record_planned_stop` → `stop_service` → `flip_backend` (`backend=legacy`) →
 `outbox_replay` (`drover-server outbox replay --sink legacy --since <switch
 epoch>` in the service's env; it dedupes by `dedup_key`, so it is safe to
 repeat) → `start_service` → `verify`. Replay covers the outbox retention

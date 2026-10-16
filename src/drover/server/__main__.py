@@ -154,6 +154,7 @@ from drover.server.metrics import (
 from drover.server.native_usage_rollup import NativeUsageRollupWorker
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.otlp.receiver import OTLPReceiver
+from drover.server.planned_stop import PlannedStopStore, readyz, recover_planned_stop
 from drover.server.profile_cli import profile as profile_commands
 from drover.server.providers.service import ProviderUsageService
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -906,6 +907,93 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
 
 
 main.add_command(profile_commands)
+
+
+def _planned_stop_state_dir(ctx: click.Context, state_dir: Path | None) -> Path:
+    """Use the config's directory as its state directory, unless explicit."""
+    if state_dir is not None:
+        return state_dir
+    config_path = ctx.obj.get("config_path")
+    return (Path(config_path) if config_path else _DEFAULT_CONFIG_PATH).parent
+
+
+def _planned_stop_ready_url(ctx: click.Context) -> str:
+    """Load only enough config to reach readiness, even after a startup failure."""
+    config_path = (
+        Path(ctx.obj["config_path"])
+        if ctx.obj.get("config_path")
+        else _DEFAULT_CONFIG_PATH
+    )
+    try:
+        cfg = load_config(config_path)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"cannot read recovery config: {exc}") from None
+    host = cfg.server_metrics_host
+    if host in {"", "0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{cfg.metrics_http_port}/readyz"
+
+
+@main.group(name="planned-stop")
+def planned_stop_cmd() -> None:
+    """Record and close bounded, operator-authorized hub stops."""
+
+
+@planned_stop_cmd.command(name="begin")
+@click.option("--step", required=True, help="The rollout or maintenance step.")
+@click.option("--actor", required=True, help="Who or what is performing the step.")
+@click.option(
+    "--expires-in",
+    type=click.IntRange(1, 2 * 60 * 60),
+    default=2 * 60 * 60,
+    show_default=True,
+    help="Maximum seconds this stop may authorize recovery.",
+)
+@click.option("--state-dir", type=click.Path(path_type=Path), default=None)
+@click.pass_context
+def planned_stop_begin_cmd(
+    ctx: click.Context, step: str, actor: str, expires_in: int, state_dir: Path | None
+) -> None:
+    """Write the marker before intentionally stopping the hub."""
+    store = PlannedStopStore(_planned_stop_state_dir(ctx, state_dir))
+    store.record(step=step, actor=actor, expires_in_seconds=expires_in)
+    click.echo("planned stop recorded")
+
+
+@planned_stop_cmd.command(name="complete")
+@click.option("--state-dir", type=click.Path(path_type=Path), default=None)
+@click.pass_context
+def planned_stop_complete_cmd(ctx: click.Context, state_dir: Path | None) -> None:
+    """Clear a marker only after the hub is ready again."""
+    ready_url = _planned_stop_ready_url(ctx)
+    if not readyz(ready_url):
+        click.echo("hub is not healthy; marker retained")
+        ctx.exit(1)
+    PlannedStopStore(_planned_stop_state_dir(ctx, state_dir)).clear()
+    click.echo("healthy")
+
+
+@main.command(name="recover-planned-stop")
+@click.option("--dry-run", is_flag=True, help="Report whether recovery is authorized.")
+@click.option("--state-dir", type=click.Path(path_type=Path), default=None)
+@click.pass_context
+def recover_planned_stop_cmd(
+    ctx: click.Context, dry_run: bool, state_dir: Path | None
+) -> None:
+    """Make one bounded restart attempt for an active planned-stop marker."""
+    state = _planned_stop_state_dir(ctx, state_dir)
+    ready_url = _planned_stop_ready_url(ctx)
+    code, message = recover_planned_stop(
+        PlannedStopStore(state),
+        ready_url=ready_url,
+        log_path=Path.home() / "Library" / "Logs" / "drover" / "server.err.log",
+        dry_run=dry_run,
+    )
+    click.echo(message)
+    if code:
+        ctx.exit(code)
 
 
 @main.command(name="setup-check")
