@@ -45,11 +45,17 @@ SELECT source, host_id, harness, input_tokens, output_tokens,
        exact, usage_observed, source_seq, source_event_count, observed_at
 FROM session_usage_sources
 WHERE session_id = ?
-ORDER BY CASE
-           WHEN source = ? AND usage_observed THEN 0
-           WHEN source = ? AND usage_observed THEN 1
-           WHEN source = ? THEN 2
-           ELSE 3
+ORDER BY CASE WHEN usage_observed THEN 0 ELSE 1 END,
+         CASE WHEN usage_observed THEN source_event_count END DESC,
+         CASE
+           WHEN usage_observed AND exact THEN 0
+           WHEN usage_observed THEN 1
+           ELSE 0
+         END,
+         CASE
+           WHEN source = ? THEN 0
+           WHEN source = ? THEN 1
+           ELSE 2
          END,
          observed_at DESC,
          source
@@ -122,7 +128,6 @@ def upsert_source_usage(
             session_id,
             SOURCE_HARNESS_EVENTS,
             SOURCE_NATIVE_AGENT_EVENTS,
-            SOURCE_HARNESS_EVENTS,
         ],
     ).fetchone()
     if row is None:

@@ -96,9 +96,30 @@ FROM per_session p
 JOIN harness_sessions s USING (session_id)
 LEFT JOIN session_usage_sources u
   ON u.session_id = p.session_id AND u.source = 'harness_events'
+LEFT JOIN session_usage current
+  ON current.session_id = p.session_id
 WHERE u.session_id IS NULL
    OR p.event_count <> u.source_event_count
    OR p.max_seq <> u.source_seq
+   OR (
+     current.source IS DISTINCT FROM 'native_agent_events'
+     AND u.usage_observed
+     AND EXISTS (
+       SELECT 1
+       FROM session_usage_sources native
+       WHERE native.session_id = p.session_id
+         AND native.source = 'native_agent_events'
+         AND native.usage_observed
+         AND (
+           native.source_event_count > u.source_event_count
+           OR (
+             native.source_event_count = u.source_event_count
+             AND native.exact
+             AND NOT u.exact
+           )
+         )
+     )
+   )
 ORDER BY p.session_id
 LIMIT ?
 """
