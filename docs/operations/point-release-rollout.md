@@ -55,7 +55,11 @@ checksum manifests from the same published release.
    device credential before running this command; do not place its value in the
    shell command, plist, or release evidence. The check lists online hosts and
    requires an authenticated hub `GET /harness/hosts/<id>/fs/list` to return
-   200 for every one.
+   200 for every one. A `preflight`-scope credential is not enough; pair a
+   dedicated device (for example labelled `release-gate`), keep its token in a
+   mode-600 file such as `~/.drover/release-gate.env`, and load it first with
+   `set -a; . ~/.drover/release-gate.env; set +a`. Hosts whose harnessd predates
+   folder listing answer 404 and fail this check until they are upgraded.
 5. If `release_kind` reports `lake_schema`, stop this sequence and follow the
    [full lake cutover gate](lake-cutover.md). Unknown metadata also blocks the
    point-release path. Do not override the selector based on a version label.
