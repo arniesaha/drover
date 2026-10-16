@@ -4092,7 +4092,7 @@ def register_daemon_host_remote(state: HarnessDaemonState) -> dict[str, Any] | N
     return _post_central_json(state, "/harness/hosts", payload)
 
 
-def _heartbeat_once(state: HarnessDaemonState) -> None:
+def _heartbeat_once(state: HarnessDaemonState) -> dict[str, Any] | None:
     """One beat: register, then act on whatever the hub said back.
 
     Split out of the loop so the wiring is testable without a thread and a
@@ -4101,7 +4101,7 @@ def _heartbeat_once(state: HarnessDaemonState) -> None:
     """
     body = register_daemon_host_remote(state)
     if body is None:
-        return
+        return None
     # An empty body is a successful registration with nothing to say, so this
     # tests `is None` rather than truthiness; the watchdog reads this flag to
     # decide whether a freshly activated version can talk to the hub at all.
@@ -4111,6 +4111,7 @@ def _heartbeat_once(state: HarnessDaemonState) -> None:
     if updater is not None:
         updater.observe(body)
         updater.maybe_activate()
+    return body
 
 
 def _reconcile_persisted_events(state: HarnessDaemonState) -> bool:
@@ -4426,7 +4427,22 @@ def run_harnessd(
         # watchdog during an otherwise healthy restart.
         pusher = wire_event_pusher(state)
         register_daemon_host(state)
-        _heartbeat_once(state)
+        initial_heartbeat = _heartbeat_once(state)
+        if (
+            not relay
+            and isinstance(initial_heartbeat, dict)
+            and initial_heartbeat.get("relay_required") is True
+        ):
+            log.error(
+                "refusing to start direct harnessd for bound host %s; restart with --relay",
+                state.host_id,
+            )
+            state.pty.close_all()
+            state.auth.close_all()
+            if pusher is not None:
+                pusher.stop()
+            server.server_close()
+            return
         start_remote_heartbeat(state)
         # After create_harness_server, and on its *bound* port: announcing a live
         # relay before the socket is bound gives the hub a window in which every

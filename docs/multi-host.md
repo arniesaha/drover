@@ -67,10 +67,11 @@ can be retried without asking for a fresh one.
 The two sections below describe the same modes for a source install, where you
 pick the mode yourself.
 
-## Direct Hosts
+## Direct Hosts (legacy/unbound only)
 
-Use a direct host when the central server can reach its private address. Bind
-the daemon to the private interface and advertise the same reachable URL:
+Use a direct host only while it has no bound per-host credential and the
+central server can reach its private address. Bind the daemon to the private
+interface and advertise the same reachable URL:
 
 ```bash
 uv run drover-harnessd \
@@ -85,9 +86,16 @@ uv run drover-harnessd \
 Restrict port `7081` to the trusted LAN or tailnet with host firewall rules.
 Do not advertise a public URL.
 
+Once a host has a bound per-host credential, it must run with `--relay` even
+when the hub can dial its private address. Bound credentials authenticate the
+host's outbound relay; they do not authorize the hub's legacy bearer on the
+daemon's inbound HTTP listener. Harnessd refuses direct-mode startup for a
+bound host and names `--relay` as the fix.
+
 ## Relay Hosts
 
-Use relay mode when inbound access to the host is undesirable or unavailable.
+Use relay mode when inbound access to the host is undesirable or unavailable,
+and for every host with a bound per-host credential.
 The daemon opens an outbound WebSocket to the central server, which proxies
 fleet requests over that connection:
 

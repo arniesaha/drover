@@ -2388,6 +2388,30 @@ def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
     assert fake.calls == [("laptop", "GET", "/sessions", {})]
 
 
+def test_bound_host_uses_relay_without_a_legacy_hub_token(
+    collector_with_hosts,
+) -> None:
+    collector = collector_with_hosts
+    collector.api_token = "legacy-hub-token"
+    collector.host_has_bound_credential = lambda host_id: host_id == "mini"
+
+    class _BoundRelay(_FakeRelay):
+        def is_live(self, host_id: str) -> bool:
+            return host_id == "mini"
+
+    relay = _BoundRelay()
+    collector.relay_manager = relay
+    host = collector._harness_host("mini")
+
+    status, _ = collector._harness_request(host, "/fs/list", method="GET")
+
+    assert status == 200
+    assert relay.calls == [("mini", "GET", "/fs/list", {})]
+    # RelayManager receives a method/path/body protocol frame, not HTTP
+    # headers, so the legacy hub bearer cannot reach the bound daemon.
+    assert "legacy-hub-token" not in repr(relay.calls)
+
+
 def test_fetch_advisory_content_bundle_uses_existing_relay_and_returns_bundle(
     collector_with_hosts, caplog
 ) -> None:
@@ -2746,8 +2770,24 @@ def test_harness_request_never_dials_a_relay_host_by_url(collector_with_hosts) -
         thread.join(timeout=5)
 
     assert status == 502
-    assert "not connected" in body
+    assert "relay not attached" in body
     assert hits == [], f"hub dialled a relay host's URL: {hits}"
+
+
+def test_bound_host_without_a_relay_never_dials_its_direct_url(
+    collector_with_hosts,
+) -> None:
+    collector = collector_with_hosts
+    collector.host_has_bound_credential = lambda host_id: host_id == "mini"
+    calls = []
+    collector._proxy_harness_request = lambda *args, **kwargs: calls.append(args)
+    host = collector._harness_host("mini")
+
+    status, body = collector._harness_request(host, "/fs/list", method="GET")
+
+    assert status == 502
+    assert "host offline: relay not attached: mini" in body
+    assert calls == []
 
 
 def test_fleet_json_overrides_relay_status_from_socket(collector_with_hosts) -> None:

@@ -1976,7 +1976,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 session_id, host.host_id, path, relay_manager
             )
             return
-        if getattr(host, "connection_kind", "direct") == "relay":
+        if (
+            self.collector._host_requires_relay(host)
+            or getattr(host, "connection_kind", "direct") == "relay"
+        ):
             # Same rule as _harness_request: never dial a relay host by URL.
             # Its socket is the only way in, and the default listen address
             # everywhere in this repo is 127.0.0.1:7081 -- so a stray URL on a
@@ -1985,7 +1988,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self._send(
                 502,
                 "application/json",
-                json.dumps({"error": f"relay host is not connected: {host.host_id}"})
+                json.dumps(
+                    {"error": f"host offline: relay not attached: {host.host_id}"}
+                )
                 + "\n",
             )
             return
@@ -3499,6 +3504,10 @@ def start_metrics_server(
     host_data_bridge_token: str = "",
 ) -> ThreadingHTTPServer:
     """Start the Drover metrics HTTP server in a daemon thread."""
+    if auth is not None and auth.credentials is not None:
+        collector.host_has_bound_credential = (
+            auth.credentials.has_active_host_credential
+        )
     handler = _metrics_handler(
         collector=collector,
         auth=auth,
@@ -3531,6 +3540,10 @@ def start_resilient_metrics_server(
     capped backoff, and rebinds if the address later disappears and returns
     (#457). Configuration errors still raise immediately.
     """
+    if auth is not None and auth.credentials is not None:
+        collector.host_has_bound_credential = (
+            auth.credentials.has_active_host_credential
+        )
     handler = _metrics_handler(
         collector=collector,
         auth=auth,

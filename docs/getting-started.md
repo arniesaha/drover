@@ -135,6 +135,9 @@ uv run drover-harnessd \
 
 `drover-harnessd` owns the local agent processes and terminal sessions. The
 central server owns the fleet API and proxies app requests to the daemon.
+This direct example is for an unbound/legacy local host. A host with a bound
+per-host credential must add `--relay`; the hub reaches bound hosts only over
+their authenticated outbound relay.
 
 Run the authenticated hosts request again and confirm the local host appears.
 

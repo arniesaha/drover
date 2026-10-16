@@ -123,6 +123,58 @@ def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):
     assert calls == ["pty", "auth", "server"]
 
 
+def test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance(
+    monkeypatch, tmp_path, caplog
+):
+    calls = []
+
+    class _Closer:
+        def close_all(self):
+            calls.append("closed")
+
+    class _State:
+        api_token = ""
+        host_token = None
+        pty = _Closer()
+        auth = _Closer()
+        updater = None
+        host_id = "bound-host"
+
+    class _Server:
+        server_port = 7081
+
+        def server_close(self):
+            calls.append("server")
+
+    monkeypatch.setattr(harness_daemon, "HarnessDaemonState", lambda **kwargs: _State())
+    monkeypatch.setattr(harness_daemon, "resolve_daemon_token", lambda token: "token")
+    monkeypatch.setattr(harness_daemon, "wire_event_pusher", lambda state: None)
+    monkeypatch.setattr(harness_daemon, "register_daemon_host", lambda state: None)
+    monkeypatch.setattr(
+        harness_daemon,
+        "_heartbeat_once",
+        lambda state: {"relay_required": True},
+    )
+    monkeypatch.setattr(
+        harness_daemon, "start_remote_heartbeat", lambda state: pytest.fail("started")
+    )
+    monkeypatch.setattr(
+        harness_daemon, "create_harness_server", lambda **kwargs: _Server()
+    )
+
+    harness_daemon.run_harnessd(
+        host_id="bound-host",
+        display_name="Bound Host",
+        kind="mac",
+        duckdb_path=tmp_path / "drover.duckdb",
+        listen_host="127.0.0.1",
+        listen_port=0,
+    )
+
+    assert "restart with --relay" in caplog.text
+    assert calls == ["closed", "closed", "server"]
+
+
 def test_harnessd_cli_passes_content_consent_config_to_server(monkeypatch, tmp_path):
     target = tmp_path / "AGENTS.md"
     config = type(

@@ -288,14 +288,13 @@ def test_browser_pong_is_sent_under_the_write_lock(metrics_server_with_relay_hos
     assert all(pongs), "pong was written to the app socket without the write lock"
 
 
-def test_terminal_attach_never_dials_a_relay_host_by_url(
+def test_terminal_attach_never_dials_a_bound_host_by_url(
     metrics_server_with_relay_host,
 ):
-    """Same rule as _harness_request, on the interactive path.
+    """A bound host follows the same relay-only rule on the interactive path.
 
-    A relay host whose row carries a URL must not be dialled when its socket
-    is down: 127.0.0.1:7081 is the default listen address everywhere here, so
-    the hub would attach the user's terminal to its own harnessd.
+    Its row deliberately claims to be direct and carries a URL, but a missing
+    relay must still fail offline rather than attaching to that URL.
     """
     env = metrics_server_with_relay_host
     # A decoy standing in for "the hub's own harnessd on 127.0.0.1:7081".
@@ -322,7 +321,7 @@ def test_terminal_attach_never_dials_a_relay_host_by_url(
         host_id="laptop",
         display_name="Laptop",
         kind="mac",
-        connection_kind="relay",
+        connection_kind="direct",
         local_url=f"http://127.0.0.1:{decoy.server_address[1]}",
     )
     env.spoke_sock.close()  # relay socket goes away; the stray URL remains
