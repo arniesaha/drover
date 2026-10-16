@@ -185,8 +185,33 @@ def _append_deprecation_record(spec, record, *, fence) -> None:
 
 
 def _delete_selected(con, names: set[str], agent_days: list[str]) -> None:
-    if "agent_events" in names:
-        for day in agent_days:
+    if "agent_events" in names and agent_days:
+        # Rows without a same-day version cannot consume receipt capacity, so
+        # discard them in one bounded anti-join.  Only the exceptional
+        # version-overlap days need the expensive ordinal accounting below.
+        # This keeps the writer's allocator from retaining one window state
+        # per historical day while preserving count-aware semantics.
+        con.execute(
+            """DELETE FROM lake.agent_events event
+               WHERE event._import_file LIKE ? AND NOT EXISTS (
+                 SELECT 1 FROM lake.export_event_versions version
+                 WHERE version.date=event.date
+                   AND version._row_sha256=event._row_sha256
+               )""",
+            [LEGACY_PREFIX],
+        )
+        overlap_days = [
+            row[0]
+            for row in con.execute(
+                """SELECT DISTINCT event.date FROM lake.agent_events event
+                   JOIN lake.export_event_versions version
+                     USING (date,_row_sha256)
+                   WHERE event._import_file LIKE ?
+                     AND event.date IN """ + literal_list(agent_days),
+                [LEGACY_PREFIX],
+            ).fetchall()
+        ]
+        for day in overlap_days:
             con.execute(
                 """DELETE FROM lake.agent_events event WHERE EXISTS (
                  WITH versions AS (
