@@ -177,7 +177,7 @@ def test_unreporting_harnesses_get_an_unobserved_row_not_zeros(tmp_path):
     assert rollup_pending_sessions(con).candidates == 0
 
 
-def test_source_ledger_preserves_native_usage_until_harness_observes_it(tmp_path):
+def test_more_complete_harness_usage_replaces_native_after_unobserved_update(tmp_path):
     """A no-usage harness update must not erase another source's measured usage."""
     con = registry(tmp_path)
     upsert_source_usage(
@@ -257,6 +257,143 @@ def test_source_ledger_preserves_native_usage_until_harness_observes_it(tmp_path
             (SOURCE_NATIVE_AGENT_EVENTS, 10, True, 2, 2),
         ]
     )
+
+
+def test_more_complete_native_usage_outranks_truncated_harness(tmp_path):
+    con = registry(tmp_path)
+    upsert_source_usage(
+        con,
+        session_id="truncated-harness",
+        source=SOURCE_HARNESS_EVENTS,
+        usage=TokenTotals(input_tokens=20, output_tokens=4),
+        turn_count=2,
+        exact=True,
+        source_seq=2,
+        source_event_count=2,
+    )
+    upsert_source_usage(
+        con,
+        session_id="truncated-harness",
+        source=SOURCE_NATIVE_AGENT_EVENTS,
+        usage=TokenTotals(input_tokens=50, output_tokens=10),
+        turn_count=5,
+        exact=True,
+        source_seq=5,
+        source_event_count=5,
+    )
+
+    assert usage_row(con, "truncated-harness")[:9] == (
+        50,
+        10,
+        None,
+        None,
+        5,
+        True,
+        SOURCE_NATIVE_AGENT_EVENTS,
+        5,
+        5,
+    )
+
+
+def test_equal_source_counts_prefer_exact_then_harness(tmp_path):
+    con = registry(tmp_path)
+    upsert_source_usage(
+        con,
+        session_id="exact-native",
+        source=SOURCE_HARNESS_EVENTS,
+        usage=TokenTotals(input_tokens=20),
+        turn_count=2,
+        exact=False,
+        source_seq=2,
+        source_event_count=2,
+    )
+    upsert_source_usage(
+        con,
+        session_id="exact-native",
+        source=SOURCE_NATIVE_AGENT_EVENTS,
+        usage=TokenTotals(input_tokens=30),
+        turn_count=2,
+        exact=True,
+        source_seq=2,
+        source_event_count=2,
+    )
+    assert usage_row(con, "exact-native")[6] == SOURCE_NATIVE_AGENT_EVENTS
+
+    upsert_source_usage(
+        con,
+        session_id="same-source-quality",
+        source=SOURCE_NATIVE_AGENT_EVENTS,
+        usage=TokenTotals(input_tokens=30),
+        turn_count=2,
+        exact=True,
+        source_seq=2,
+        source_event_count=2,
+    )
+    upsert_source_usage(
+        con,
+        session_id="same-source-quality",
+        source=SOURCE_HARNESS_EVENTS,
+        usage=TokenTotals(input_tokens=20),
+        turn_count=2,
+        exact=True,
+        source_seq=2,
+        source_event_count=2,
+    )
+    assert usage_row(con, "same-source-quality")[6] == SOURCE_HARNESS_EVENTS
+
+
+def test_single_observed_source_remains_selected(tmp_path):
+    con = registry(tmp_path)
+    upsert_source_usage(
+        con,
+        session_id="native-only",
+        source=SOURCE_NATIVE_AGENT_EVENTS,
+        usage=TokenTotals(input_tokens=30),
+        turn_count=3,
+        exact=True,
+        source_seq=3,
+        source_event_count=3,
+    )
+    upsert_source_usage(
+        con,
+        session_id="harness-only",
+        source=SOURCE_HARNESS_EVENTS,
+        usage=TokenTotals(input_tokens=20),
+        turn_count=2,
+        exact=True,
+        source_seq=2,
+        source_event_count=2,
+    )
+
+    assert usage_row(con, "native-only")[6] == SOURCE_NATIVE_AGENT_EVENTS
+    assert usage_row(con, "harness-only")[6] == SOURCE_HARNESS_EVENTS
+
+
+def test_rollup_reprojects_existing_harness_precedence_once(tmp_path):
+    con = registry(tmp_path)
+    add_session(con, "reproject", "claude-code")
+    add_event(con, "reproject", 1, claude_usage("m1", inp=10, out=1))
+    add_event(con, "reproject", 2, claude_usage("m2", inp=10, out=1))
+    rollup_pending_sessions(con)
+    upsert_source_usage(
+        con,
+        session_id="reproject",
+        source=SOURCE_NATIVE_AGENT_EVENTS,
+        usage=TokenTotals(input_tokens=30, output_tokens=3),
+        turn_count=3,
+        exact=True,
+        source_seq=3,
+        source_event_count=3,
+    )
+    # Simulate the compatibility row produced before completeness ranking.
+    con.execute(
+        "UPDATE session_usage SET source = ? WHERE session_id = ?",
+        [SOURCE_HARNESS_EVENTS, "reproject"],
+    )
+
+    assert rollup_pending_sessions(con).candidates == 1
+    assert usage_row(con, "reproject")[6] == SOURCE_NATIVE_AGENT_EVENTS
+    assert rollup_pending_sessions(con).candidates == 0
 
 
 def test_rollup_is_idempotent_and_reacts_only_to_new_events(tmp_path):
