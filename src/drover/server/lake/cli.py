@@ -315,6 +315,33 @@ def maintain_cmd(data_root, catalog_dsn_env, dry_run):
     click.echo(json.dumps(report, indent=2))
 
 
+@lake_cmd.command("deprecate-legacy")
+@click.option(
+    "--data-root", type=click.Path(exists=True, path_type=Path), required=True
+)
+@click.option(
+    "--catalog-dsn-env",
+    required=True,
+    help="Environment variable holding the catalog ADMIN DSN.",
+)
+@click.option(
+    "--apply",
+    is_flag=True,
+    help="Delete only the reported unreceipted legacy-import rows and recertify.",
+)
+def deprecate_legacy_cmd(data_root, catalog_dsn_env, apply):
+    """Retire unreceipted legacy-import history; dry-run is the default."""
+    from .legacy_deprecation import deprecate_legacy
+
+    try:
+        report = deprecate_legacy(
+            spec_from_options(data_root, catalog_dsn_env), apply=apply
+        )
+    except LakeError as exc:
+        raise _lake_failure(exc, data_root) from None
+    click.echo(json.dumps(report, indent=2))
+
+
 @lake_cmd.command("reconcile")
 @click.option(
     "--data-root", type=click.Path(exists=True, path_type=Path), required=True

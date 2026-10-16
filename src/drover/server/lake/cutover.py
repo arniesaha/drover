@@ -1021,23 +1021,6 @@ def lake_spec_for(plan: CutoverPlan, dsn_env: str, environ=None):
     return LakeSpec(dsn_env, plan.data_root, Path(directory), digest)
 
 
-def delta_since(spec) -> str:
-    """Re-import from the newest day already in the lake; dedupe makes it safe."""
-    from .runtime import lake_connection
-
-    with lake_connection(spec) as con:
-        newest = con.execute(
-            "SELECT max(date) FROM lake.agent_events WHERE date <> '_seed'"
-        ).fetchone()[0]
-        if newest is None:
-            newest = con.execute(
-                "SELECT min(partition_date) FROM lake.import_watermark"
-            ).fetchone()[0]
-    if newest is None:
-        raise CutoverError("lake_has_no_import", "run the 60-day import first")
-    return str(newest)
-
-
 def _backup_describe(plan, service, cfg, stamp) -> str:
     return (
         f"pg_dump --format=custom --schema={cfg.control_store.schema} "
@@ -1065,7 +1048,11 @@ def switch_actions(
     launchd: Launchd | None = None,
     environ=None,
 ) -> list[Action]:
-    """Gate verdict → backup → stop → fenced delta import → flip → start → verify."""
+    """Gate verdict → backup → stop → flip → start → verify.
+
+    ``legacy_root`` remains in the public signature for historical callers,
+    but the unreceipted delta-import step was retired with the importer.
+    """
     environ = os.environ if environ is None else environ
     cfg = service.config()
     launchd = launchd or Launchd(service)
@@ -1081,12 +1068,6 @@ def switch_actions(
             "verdict": str(plan.verdict_path),
             "generated_at": document["generated_at"],
         }
-
-    def delta_import():
-        from .legacy_import import run_import
-
-        spec = lake_spec_for(plan, plan.admin_dsn_env, environ)
-        return run_import(spec, Path(legacy_root), since=delta_since(spec))
 
     def flip():
         selection = ducklake_selection(
@@ -1117,13 +1098,6 @@ def switch_actions(
             "stop_service",
             " ".join(launchd.stop_argv()) + " (skipped when not loaded)",
             launchd.stop,
-        ),
-        Action(
-            "fenced_delta_import",
-            "drover-server lake import --since <max(date) in lake.agent_events> "
-            f"--data-root {plan.data_root} --catalog-dsn-env {plan.admin_dsn_env} "
-            f"--legacy-root {legacy_root} (exclusive catalog fence; dedupes)",
-            delta_import,
         ),
         Action(
             "flip_backend",

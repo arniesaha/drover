@@ -596,7 +596,6 @@ def test_switch_dry_run_prints_ordered_actions_and_changes_nothing(tmp_path, pla
         "require_gate",
         "backup",
         "stop_service",
-        "fenced_delta_import",
         "flip_backend",
         "start_service",
         "verify",
@@ -604,7 +603,7 @@ def test_switch_dry_run_prints_ordered_actions_and_changes_nothing(tmp_path, pla
     text = "\n".join(lines)
     assert all("(dry-run)" in line for line in lines)
     assert "launchctl bootout gui/" in text and "launchctl bootstrap gui/" in text
-    assert "--catalog-dsn-env DROVER_LAKE_BLUE_ADMIN_DSN" in text
+    assert "fenced_delta_import" not in text
     assert "catalog_dsn_env=DROVER_LAKE_BLUE_READER_DSN" in text
     assert "http://127.0.0.1:7080/readyz" in text
     assert launchd.calls == []
@@ -623,28 +622,15 @@ def test_switch_refuses_without_a_passing_gate_verdict(tmp_path, plan):
     assert launchd.calls == [] and not plan.backup_dir.exists()
 
 
-def test_switch_runs_backup_first_and_stops_at_the_failing_step(
-    tmp_path, plan, monkeypatch
-):
-    monkeypatch.setattr(cutover, "pg_tool", lambda name, pg_bin=None: f"/pg/{name}")
-    calls = []
-    real_backup = cutover.take_backup
-    monkeypatch.setattr(
-        cutover,
-        "take_backup",
-        lambda *a, **kw: real_backup(*a, **{**kw, "run": fake_pg_tools(calls)}),
-    )
+def test_switch_retires_the_unreceipted_delta_import_step(tmp_path, plan):
     service = write_service(tmp_path)
     _passing_gate_verdict(plan)
     launchd = RecordingLaunchd(service)
     actions = switch_actions(
         plan, service, legacy_root=tmp_path, launchd=launchd, environ={}
     )
-    with pytest.raises(CutoverError, match="fenced_delta_import_failed"):
-        execute(actions, dry_run=False, echo=lambda _: None)
-    assert calls and Path(calls[0][0][0]).name == "pg_dump"
-    assert any(argv[1] == "bootout" for argv in launchd.calls)
-    assert load_config(service.config_path).analytics.backend == "legacy"
+    assert "fenced_delta_import" not in [action.step for action in actions]
+    assert all("lake import" not in action.describe for action in actions)
 
 
 def test_rollback_dry_run_uses_the_recorded_switch_time(tmp_path, plan):
@@ -987,7 +973,7 @@ def test_cutover_cli_dry_runs_print_and_change_nothing(tmp_path, monkeypatch):
         main, ["cutover", "switch", *common, "--legacy-root", str(tmp_path)]
     )
     assert switch.exit_code == 0, switch.output
-    assert switch.output.count("(dry-run)") == 7
+    assert switch.output.count("(dry-run)") == 6
     rollback = CliRunner().invoke(
         main, ["cutover", "rollback", *common, "--since", "1759600000"]
     )

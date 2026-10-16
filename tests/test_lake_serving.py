@@ -678,7 +678,7 @@ def test_verification_lost_fence_never_publishes_proof(verified_lake, monkeypatc
 
     monkeypatch.setattr(fence, "MutationFence", LosingFence)
 
-    def lose_owner(spec):
+    def lose_owner(spec, **_kwargs):
         owners[0].connection.close()
         return {}
 

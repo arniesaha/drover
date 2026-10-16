@@ -238,10 +238,11 @@ success, no child error, every child under 1 GiB, and the truncation note.
 
 ### The live session after the switch (2026-10-06)
 
-The switch ran 7/7, then every summary of the live Claude Code session
-`4c298e83-…` failed with `analytics_unavailable`. That session had 57,936
-events, straddling the fenced delta import and the exporter. A3 had passed
-because it summarizes the largest *imported* session, which is old history.
+The historical switch ran 7/7, then every summary of the live Claude Code
+session `4c298e83-…` failed with `analytics_unavailable`. That session had
+57,936 events and straddled the now-retired delta import and the exporter. A3
+had passed because it summarizes the largest *imported* session, which is old
+history.
 
 The real cause was hidden by the query child. Any non-`LakeError` exception
 was reported as a bare `analytics_unavailable`. Driving the same read path
@@ -281,16 +282,13 @@ Ordered steps (the dry run prints each one with its exact command or file):
    `pg_restore --list`. `drover-server cutover backup --lake $LAKE` runs it alone.
 3. `stop_service`: `launchctl bootout gui/$UID/com.drover.server` (skipped if
    not loaded). Ingest stays durable in the PostgreSQL outbox while stopped.
-4. `fenced_delta_import`: `lake import --since <newest day in the lake>` under
-   the exclusive catalog fence, as the admin role. Dedup keys make it
-   repeatable. A live exporter makes it fail with `lake_mutation_fenced`.
-5. `flip_backend`: atomically rewrite only `[analytics]`: `backend=ducklake`,
+4. `flip_backend`: atomically rewrite only `[analytics]`: `backend=ducklake`,
    the reader/exporter env names, `data_root`, the extension/engine pins,
    `verification_sha256 = sha256(serving-proof.json)` and `epoch`. The new file
    is loaded before it replaces the old one. The first switch time is recorded
    in `cutover-state.json`.
-6. `start_service`: `launchctl bootstrap gui/$UID <plist>`.
-7. `verify`: `/healthz` must be `ok\nanalytical=ok` and `/readyz` 200 within
+5. `start_service`: `launchctl bootstrap gui/$UID <plist>`.
+6. `verify`: `/healthz` must be `ok\nanalytical=ok` and `/readyz` 200 within
    300 s. The output includes `/readyz` memory.
 
 Every step is idempotent, so rerun the command after fixing a failure. A

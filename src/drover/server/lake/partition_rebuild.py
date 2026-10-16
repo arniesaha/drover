@@ -227,23 +227,37 @@ def rebuild_partitioned(
     return report
 
 
-def _verify_jobs(spec, report, work, *, rss_ceiling=None):
+def _verify_jobs(spec, report, work, *, rss_ceiling=None, fence_held=False):
     # Retained-file cleanup must not run between the individual day reads.
+    # A drained mutation already owns the exclusive reader lock, so taking a
+    # second shared lock on another PG connection would self-deadlock.
+    if fence_held:
+        return _verify_days(
+            spec, report, work, rss_ceiling=rss_ceiling, fence_held=True
+        )
     with reader_fence(spec.dsn()):
         return _verify_days(spec, report, work, rss_ceiling=rss_ceiling)
 
 
-def _verify_days(spec, report, work, *, rss_ceiling=None):
+def _verify_days(spec, report, work, *, rss_ceiling=None, fence_held=False):
     peak = 0
     from .query_process import query
 
+    def metadata_rows(statement):
+        # A drained mutation excludes every reader.  Its own verify must not
+        # spawn a child that tries to acquire that lock, but it can safely read
+        # through the already-fenced administrator process.
+        if fence_held:
+            with lake_connection(spec) as con:
+                return con.execute(statement).fetchall()
+        return query(spec, statement)["rows"]
+
     tables = {
         row[0]
-        for row in query(
-            spec,
+        for row in metadata_rows(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_catalog='lake' AND table_schema='main'",
-        )["rows"]
+            "WHERE table_catalog='lake' AND table_schema='main'"
+        )
     }
     export_tables = {"export_batch_receipts", "export_event_versions"}
     if export_tables & tables and not export_tables <= tables:
@@ -282,21 +296,20 @@ def _verify_days(spec, report, work, *, rss_ceiling=None):
 
     baseline_days = {item["day"] for item in report["days"]}
     event_days = {
-        row[0]
-        for row in query(spec, "SELECT DISTINCT date FROM lake.agent_events")["rows"]
+        row[0] for row in metadata_rows("SELECT DISTINCT date FROM lake.agent_events")
     }
     if has_exports:
         event_days |= {
             row[0]
-            for row in query(
-                spec, "SELECT DISTINCT date FROM lake.export_event_versions"
-            )["rows"]
+            for row in metadata_rows(
+                "SELECT DISTINCT date FROM lake.export_event_versions"
+            )
         }
     legacy_days = {
         row[0]
-        for row in query(
-            spec, "SELECT DISTINCT date FROM lake.agent_events_legacy_metadata"
-        )["rows"]
+        for row in metadata_rows(
+            "SELECT DISTINCT date FROM lake.agent_events_legacy_metadata"
+        )
     }
     if None in event_days or None in legacy_days:
         raise LakeError("lake_verification_unexpected_partition")
@@ -384,32 +397,38 @@ def _verify_days(spec, report, work, *, rss_ceiling=None):
     return expected, peak
 
 
-def verify_partitioned(spec):
-    from .fence import MutationFence
+def _verify_partitioned_fenced(spec, fence):
+    """Verify and publish a proof while the caller retains the writer fence."""
     from .runtime import lake_connection
     from .serving_proof import write_proof
 
+    with lake_connection(spec) as con:
+        snapshot = con.execute(
+            "SELECT max(snapshot_id) FROM lake.snapshots()"
+        ).fetchone()[0]
+    fence.check()
+    result = _verify_partitioned(spec, fence_held=True)
+    fence.check()
+    with lake_connection(spec) as con:
+        if (
+            con.execute("SELECT max(snapshot_id) FROM lake.snapshots()").fetchone()[0]
+            != snapshot
+        ):
+            raise LakeError("lake_verification_snapshot_changed")
+        write_proof(spec, con, result, fence=fence, snapshot=snapshot)
+    return result
+
+
+def verify_partitioned(spec, *, fence=None):
+    from .fence import MutationFence
+
+    if fence is not None:
+        return _verify_partitioned_fenced(spec, fence)
     with MutationFence(spec.dsn()) as fence:
-        with lake_connection(spec) as con:
-            snapshot = con.execute(
-                "SELECT max(snapshot_id) FROM lake.snapshots()"
-            ).fetchone()[0]
-        fence.check()
-        result = _verify_partitioned(spec)
-        fence.check()
-        with lake_connection(spec) as con:
-            if (
-                con.execute("SELECT max(snapshot_id) FROM lake.snapshots()").fetchone()[
-                    0
-                ]
-                != snapshot
-            ):
-                raise LakeError("lake_verification_snapshot_changed")
-            write_proof(spec, con, result, fence=fence, snapshot=snapshot)
-        return result
+        return _verify_partitioned_fenced(spec, fence)
 
 
-def _verify_partitioned(spec):
+def _verify_partitioned(spec, *, fence_held=False):
     started = time.monotonic()
     report_path = spec.data_root / "verification/report.json"
     if not report_path.is_file():
@@ -431,7 +450,9 @@ def _verify_partitioned(spec):
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="verify-", dir=spec.data_root) as directory:
-        result, peak = _verify_jobs(spec, report, Path(directory))
+        result, peak = _verify_jobs(
+            spec, report, Path(directory), fence_held=fence_held
+        )
     (spec.data_root / "verification/last-verify.json").write_text(
         json.dumps(
             {
