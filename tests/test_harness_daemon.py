@@ -1448,6 +1448,96 @@ def test_provider_usage_hung_probe_does_not_block_other_providers(tmp_path):
     assert elapsed < 0.5
 
 
+def test_provider_usage_probe_slower_than_old_bound_completes_with_new_bound(tmp_path):
+    """A healthy slow startup must not be mistaken for a hung provider."""
+    observed_at = datetime(2026, 10, 16, tzinfo=timezone.utc)
+
+    class _SlowButHealthyProbe:
+        command = None
+
+        def read(self, *, host_id):
+            time.sleep(0.1)
+            return _provider_snapshot("openai", observed_at, used_percent=40)
+
+    server, state, _ = _start_test_server(tmp_path)
+    try:
+        state.presets = {"codex": replace(DEFAULT_PRESETS["codex"], enabled=True)}
+        state.provider_usage_probe = _SlowButHealthyProbe()
+        # 0.05s models the old bound; 0.2s models the increased bound without
+        # making the suite wait for a real ten-second timeout.
+        cache = ProviderUsageRefreshCache(state, probe_timeout_seconds=0.2)
+        state.provider_usage_cache = cache
+
+        cache.refresh_once()
+        account = cache.accounts()[0]
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert account["status"] == "ok"
+    assert account["windows"][0]["used_percent"] == 40
+
+
+def test_provider_usage_does_not_reenter_hung_probe_and_publishes_late_success(
+    tmp_path,
+):
+    observed_at = datetime(2026, 10, 16, tzinfo=timezone.utc)
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    class _Probe:
+        command = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def read(self, *, host_id):
+            self.calls += 1
+            if self.calls == 1:
+                return _provider_snapshot("openai", observed_at, used_percent=20)
+            started.set()
+            release.wait(1)
+            completed.set()
+            return _provider_snapshot("openai", observed_at, used_percent=40)
+
+    server, state, _ = _start_test_server(tmp_path)
+    try:
+        state.presets = {"codex": replace(DEFAULT_PRESETS["codex"], enabled=True)}
+        probe = _Probe()
+        state.provider_usage_probe = probe
+        cache = ProviderUsageRefreshCache(state, probe_timeout_seconds=0.05)
+        state.provider_usage_cache = cache
+
+        cache.refresh_once()
+        cache.refresh_once()
+        stale = cache.accounts()[0]
+        cache.refresh_once()
+        skipped = cache.accounts()[0]
+        release.set()
+        assert completed.wait(1)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            late = cache.accounts()[0]
+            if late["status"] == "ok" and late["windows"][0]["used_percent"] == 40:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("late successful probe was not published")
+    finally:
+        release.set()
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert probe.calls == 2
+    assert (stale["status"], stale["error_category"]) == ("stale", "timeout")
+    assert (skipped["status"], skipped["error_category"]) == ("stale", "timeout")
+    assert late["status"] == "ok"
+    assert late["windows"][0]["used_percent"] == 40
+
+
 def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
     tmp_path,
 ):

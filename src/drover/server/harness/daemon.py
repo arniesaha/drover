@@ -160,7 +160,7 @@ TERMINAL_MIRROR_BATCH_MAX = 128
 # scheduler indefinitely.  This is deliberately independent of the relay's
 # request timeout: probes are not on the request path.
 PROVIDER_USAGE_REFRESH_INTERVAL_SECONDS = 300.0
-PROVIDER_USAGE_PROBE_TIMEOUT_SECONDS = 10.0
+PROVIDER_USAGE_PROBE_TIMEOUT_SECONDS = 60.0
 
 
 def save_turn_attachments(
@@ -1467,6 +1467,14 @@ class HarnessDaemonState:
         )
 
 
+@dataclass
+class _InFlightProviderProbe:
+    """One provider read that may outlive the scheduler's wait budget."""
+
+    detected: DetectedProvider
+    thread: threading.Thread | None = None
+
+
 class ProviderUsageRefreshCache:
     """Refresh local provider facts without putting probes on an HTTP thread.
 
@@ -1488,6 +1496,7 @@ class ProviderUsageRefreshCache:
         self.interval_seconds = interval_seconds
         self.probe_timeout_seconds = probe_timeout_seconds
         self._snapshots: dict[tuple[str, tuple[str, ...]], ProviderAccountSnapshot] = {}
+        self._in_flight: dict[tuple[str, tuple[str, ...]], _InFlightProviderProbe] = {}
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._wake = threading.Event()
@@ -1519,21 +1528,7 @@ class ProviderUsageRefreshCache:
             return
         try:
             for detected in detect_provider_accounts(self.state.capabilities()):
-                snapshot = self._read_bounded(detected)
-                key = _provider_cache_key(detected)
-                with self._lock:
-                    previous = self._snapshots.get(key)
-                    if _provider_probe_failed(snapshot) and previous is not None:
-                        # Match the hub's last-good projection: preserve useful
-                        # quota facts, carry their original observed_at, and
-                        # surface the newest connector failure on that card.
-                        self._snapshots[key] = replace(
-                            previous,
-                            status="stale",
-                            error_category=snapshot.error_category,
-                        )
-                    else:
-                        self._snapshots[key] = snapshot
+                self._refresh_provider(detected)
         finally:
             self._refresh_lock.release()
 
@@ -1556,20 +1551,28 @@ class ProviderUsageRefreshCache:
                 accounts.append(_provider_snapshot_json(snapshot, detected))
         return accounts
 
-    def _read_bounded(self, detected: DetectedProvider) -> ProviderAccountSnapshot:
-        result: queue.Queue[ProviderAccountSnapshot | Exception] = queue.Queue(1)
+    def _refresh_provider(self, detected: DetectedProvider) -> None:
+        key = _provider_cache_key(detected)
+        with self._lock:
+            in_flight = self._in_flight.get(key)
+            if in_flight is not None and in_flight.thread is not None:
+                if in_flight.thread.is_alive():
+                    self._store_snapshot_locked(
+                        key, _provider_probe_error_snapshot(detected, "timeout")
+                    )
+                    return
+                self._in_flight.pop(key, None)
 
-        def read() -> None:
-            try:
-                result.put(_read_provider_usage_snapshot(self.state, detected))
-            except Exception as exc:  # noqa: BLE001 - isolate one connector
-                result.put(exc)
+            in_flight = _InFlightProviderProbe(detected)
+            worker = threading.Thread(
+                target=self._read_and_publish,
+                args=(key, in_flight),
+                name=f"drover-provider-probe-{detected.provider}",
+                daemon=True,
+            )
+            in_flight.thread = worker
+            self._in_flight[key] = in_flight
 
-        worker = threading.Thread(
-            target=read,
-            name=f"drover-provider-probe-{detected.provider}",
-            daemon=True,
-        )
         worker.start()
         worker.join(self.probe_timeout_seconds)
         if worker.is_alive():
@@ -1578,17 +1581,49 @@ class ProviderUsageRefreshCache:
                 detected.provider,
                 self.probe_timeout_seconds,
             )
-            return _provider_probe_error_snapshot(detected, "timeout")
+            with self._lock:
+                self._store_snapshot_locked(
+                    key, _provider_probe_error_snapshot(detected, "timeout")
+                )
+
+    def _read_and_publish(
+        self,
+        key: tuple[str, tuple[str, ...]],
+        in_flight: _InFlightProviderProbe,
+    ) -> None:
         try:
-            value = result.get_nowait()
-        except queue.Empty:
-            return _provider_probe_error_snapshot(detected, "probe_failed")
-        if isinstance(value, Exception):
+            snapshot = _read_provider_usage_snapshot(self.state, in_flight.detected)
+        except Exception as exc:  # noqa: BLE001 - isolate one connector
             log.warning(
-                "provider usage probe failed for %s: %s", detected.provider, value
+                "provider usage probe failed for %s: %s",
+                in_flight.detected.provider,
+                exc,
             )
-            return _provider_probe_error_snapshot(detected, "probe_failed")
-        return value
+            snapshot = _provider_probe_error_snapshot(
+                in_flight.detected, "probe_failed"
+            )
+        with self._lock:
+            self._store_snapshot_locked(key, snapshot)
+            if self._in_flight.get(key) is in_flight:
+                self._in_flight.pop(key, None)
+
+    def _store_snapshot_locked(
+        self,
+        key: tuple[str, tuple[str, ...]],
+        snapshot: ProviderAccountSnapshot,
+    ) -> None:
+        previous = self._snapshots.get(key)
+        if _provider_probe_failed(snapshot) and previous is not None:
+            # Match the hub's last-good projection: preserve useful quota
+            # facts, carry their original observed_at, and surface the newest
+            # connector failure on that card.
+            self._snapshots[key] = replace(
+                previous,
+                status="stale",
+                error_category=snapshot.error_category,
+            )
+        else:
+            self._snapshots[key] = snapshot
 
     def _run(self) -> None:
         while not self._stop.is_set():
