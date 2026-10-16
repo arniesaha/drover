@@ -90,6 +90,11 @@ public enum WorkAttentionListPresentation {
     public static func needsExpansionControl(for items: [WorkAttentionItem]) -> Bool {
         items.count > collapsedRowLimit
     }
+
+    public static func isFocusedItemHidden(_ focusedID: String?, in items: [WorkAttentionItem], isExpanded: Bool) -> Bool {
+        guard let focusedID else { return false }
+        return !displayedItems(items, isExpanded: isExpanded).contains { $0.id == focusedID }
+    }
 }
 
 public struct WorkAttentionResponse: Decodable, Sendable {

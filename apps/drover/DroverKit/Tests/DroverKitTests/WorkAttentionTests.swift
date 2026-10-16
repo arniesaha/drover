@@ -4,9 +4,10 @@ import UserNotifications
 @testable import DroverKit
 
 func attentionItemJSON(kind: String = "agent_question", uncertain: Bool = false,
-                       refreshedAt: String? = nil, number: Int? = 1) -> String {
+                       refreshedAt: String? = nil, number: Int? = 1,
+                       id: String = "attention-1") -> String {
     """
-    {"id":"attention-1","workspace_id":"workspace","actor_principal":"credential:device",
+    {"id":"\(id)","workspace_id":"workspace","actor_principal":"credential:device",
      "goal_id":"goal","repo":"example/project","kind":"\(kind)",
      "url":"https://github.com/example/project/issues/1","refreshed_at":"\(refreshedAt ?? ISO8601DateFormatter().string(from: Date()))","freshness_seconds":240,
      "stale":false,"actions":\(kind == "agent_question" ? "[\"reject\"]" : "[]"),
@@ -126,6 +127,26 @@ struct WorkAttentionTests {
         #expect(WorkAttentionListPresentation.displayedItems(response.items, isExpanded: true).count == 3)
         #expect(WorkAttentionListPresentation.needsExpansionControl(for: response.items))
         #expect(!WorkAttentionListPresentation.needsExpansionControl(for: Array(response.items.prefix(2))))
+    }
+
+    @Test func collapsedListReportsAFocusedItemOutsideInitialRowsAsHidden() throws {
+        let response = try attentionResponse([
+            attentionItemJSON(id: "attention-1"),
+            attentionItemJSON(id: "attention-2"),
+            attentionItemJSON(id: "attention-3")
+        ])
+        #expect(WorkAttentionListPresentation.isFocusedItemHidden(
+            "attention-3", in: response.items, isExpanded: false
+        ))
+        #expect(!WorkAttentionListPresentation.isFocusedItemHidden(
+            "attention-2", in: response.items, isExpanded: false
+        ))
+        #expect(!WorkAttentionListPresentation.isFocusedItemHidden(
+            "attention-3", in: response.items, isExpanded: true
+        ))
+        #expect(!WorkAttentionListPresentation.isFocusedItemHidden(
+            nil, in: response.items, isExpanded: false
+        ))
     }
 
     @Test func refreshAgeAndStalenessUseTheReturnedPolicy() throws {
