@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -83,12 +86,20 @@ def test_deprecation_keeps_receipted_crossover_rows_and_recertifies(
     from drover.server.lake.legacy_deprecation import deprecate_legacy
     from drover.server.lake.rebuild import verify
     from drover.server.lake.runtime import lake_connection
+    from drover.server.lake.serving import check_selected, configure_analytics
     from drover.server.lake.serving_proof import check_proof
 
+    spec, path, config = verified_lake
     spec, _, event_id = _legacy_fixture(verified_lake, postgres_control_store)
     report = deprecate_legacy(spec, apply=True)
     assert report["no_op"] is False
     assert report["tables"]["agent_events"]
+    digest = hashlib.sha256(
+        (spec.data_root / "verification/serving-proof.json").read_bytes()
+    ).hexdigest()
+    assert report["proof_sha256"] == digest
+    configure_analytics(path, replace(config, verification_sha256=digest))
+    check_selected(path)
     with lake_connection(spec) as con:
         assert con.execute(
             "SELECT count(*) FROM lake.agent_events WHERE id='legacy-unreceipted'"
@@ -106,6 +117,72 @@ def test_deprecation_keeps_receipted_crossover_rows_and_recertifies(
 
     repeat = deprecate_legacy(spec, apply=True)
     assert repeat["no_op"] is True
+
+
+def test_deprecation_cli_prints_published_proof_pin(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from drover.server.lake import cli, legacy_deprecation
+
+    proof = tmp_path / "verification" / "serving-proof.json"
+    proof.parent.mkdir()
+    proof.write_bytes(b"published-proof")
+    digest = hashlib.sha256(proof.read_bytes()).hexdigest()
+    monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(tmp_path))
+    monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", "b" * 64)
+    monkeypatch.setattr(
+        legacy_deprecation,
+        "deprecate_legacy",
+        lambda spec, apply: {"dry_run": False, "no_op": False, "proof_sha256": digest},
+    )
+
+    result = CliRunner().invoke(
+        cli.lake_cmd,
+        [
+            "deprecate-legacy",
+            "--data-root",
+            str(tmp_path),
+            "--catalog-dsn-env",
+            "TEST_DSN",
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    receipt = json.loads("\n".join(lines[:-1]))
+    hint = f'[analytics] verification_sha256 = "{digest}"'
+    assert receipt["verification_sha256"] == digest
+    assert receipt["verification_sha256_hint"] == hint
+    assert lines[-1] == hint
+
+
+def test_rebuild_cli_does_not_print_a_pin_before_verification(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from drover.server.lake import cli
+
+    source = tmp_path / "source.tar"
+    source.write_bytes(b"not-used-by-mocked-rebuild")
+    monkeypatch.setenv("DROVER_LAKE_EXTENSION_DIR", str(tmp_path))
+    monkeypatch.setenv("DROVER_LAKE_ENGINE_SHA256", "b" * 64)
+    monkeypatch.setattr(cli, "rebuild", lambda *args, **kwargs: {"dry_run": False})
+
+    result = CliRunner().invoke(
+        cli.lake_cmd,
+        [
+            "rebuild",
+            "--from-tar",
+            str(source),
+            "--data-root",
+            str(tmp_path),
+            "--catalog-dsn-env",
+            "TEST_DSN",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"dry_run": False}
 
 
 def test_deprecation_removes_legacy_hash_duplicates_beyond_receipt_count(
