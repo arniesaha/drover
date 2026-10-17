@@ -3498,6 +3498,7 @@ def _metrics_handler(
     from drover.server.relay_manager import RelayManager
 
     collector.relay_manager = RelayManager()
+    registry_path = getattr(collector, "duckdb_path", None)
     return type(
         "DroverMetricsHandler",
         (_MetricsHandler,),
@@ -3508,7 +3509,7 @@ def _metrics_handler(
             "analytics_boundary": analytics_boundary,
             "host_data_bridge_token": host_data_bridge_token,
             "unknown_session_retries": _UnknownSessionRetries(
-                HarnessRegistry(collector.duckdb_path)
+                HarnessRegistry(registry_path) if registry_path is not None else None
             ),
             "analytical_slots": _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1),
             "metrics_slots": threading.BoundedSemaphore(ANALYTICS_METRICS_CONCURRENCY),

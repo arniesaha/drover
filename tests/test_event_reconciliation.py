@@ -389,7 +389,9 @@ def test_reconcile_helpers_on_registry_and_pusher(tmp_path):
 
         pusher = EventPusher(f"http://127.0.0.1:{port}", "secret-token")
         assert pusher.reconcile(registry) == 1
-        assert registry.reconcile_unsent_events(pusher) == 1
+        # A hub acknowledgement marks the durable row reconciled, so a later
+        # helper pass has no event left to replay.
+        assert registry.reconcile_unsent_events(pusher) == 0
     finally:
         server.shutdown()
         server.server_close()
