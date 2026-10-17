@@ -1,4 +1,4 @@
-"""Busy-hub synthetic RSS attribution probe (never reads production data).
+"""Busy-hub synthetic footprint attribution probe (never reads production data).
 
 uv sync --extra dev; python scripts/measure_hub_memory.py --prepare /tmp/hub-probe
 DROVER_DUCKDB_MEMORY_DIAGNOSTICS=1 DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT=4GB \
@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import runpy
+import subprocess
+import sys
 import threading
 import time
 import tracemalloc
@@ -74,6 +76,40 @@ def prepare(root, sessions, spans, files):
     (root / "workload.json").write_text(
         json.dumps(dict(sessions=sessions, spans=spans, files_per_view=files))
     )
+    _prepare_legacy_bootstrap_fixture(root, spans=spans, files=files)
+
+
+def _prepare_legacy_bootstrap_fixture(root: Path, *, spans: int, files: int) -> None:
+    """Create a separate, production-shaped source for the legacy view probe."""
+    from drover.schema import bootstrap
+
+    parquet = root / "legacy-bootstrap-parquet"
+    store = root / "legacy-bootstrap.duckdb"
+    bootstrap(parquet_dir=parquet, duckdb_path=store, bind_parquet_views=False)
+    source = duckdb.connect()
+    try:
+        for index in range(files):
+            first = index * spans // files
+            size = (index + 1) * spans // files - first
+            directory = parquet / "spans" / f"date=2026-10-{index % 20 + 1:02d}"
+            directory.mkdir(parents=True, exist_ok=True)
+            source.execute(f"""
+                COPY (
+                  SELECT
+                    'trace-' || i AS trace_id,
+                    'span-' || i AS span_id,
+                    'synthetic' AS name,
+                    'drover' AS service_name,
+                    TIMESTAMPTZ '2026-10-01 00:00:00+00' AS start_time,
+                    TIMESTAMPTZ '2026-10-01 00:00:01+00' AS end_time,
+                    1000.0 AS duration_ms,
+                    'session-' || (i % 20000) AS session_id,
+                    'agent' AS agent_id
+                  FROM range({first}, {first + size}) t(i)
+                ) TO {sql_path_literal(directory / f'part-{index}.parquet')} (FORMAT PARQUET)
+                """)
+    finally:
+        source.close()
 
 
 def _request(base: str, path: str) -> dict:
@@ -107,14 +143,73 @@ def _growth_summary(samples: list[dict]) -> dict[str, dict[str, int]]:
             "calls": len(values),
             "rss_net_growth_bytes": values[-1]["rss_after"] - values[0]["rss_before"],
             "hub_net_growth_bytes": values[-1]["hub_after"] - values[0]["hub_before"],
+            "hub_lifetime_net_growth_bytes": values[-1]["hub_lifetime_after"]
+            - values[0]["hub_lifetime_before"],
             "rss_max_step_growth_bytes": max(
                 value["rss_growth_bytes"] for value in values
             ),
             "hub_max_step_growth_bytes": max(
                 value["hub_growth_bytes"] for value in values
             ),
+            "hub_lifetime_max_step_growth_bytes": max(
+                value["hub_lifetime_growth_bytes"] for value in values
+            ),
         }
         for path, values in grouped.items()
+    }
+
+
+def _hub_lifetime_peak(pid: int) -> int:
+    """Kernel high-water mark on macOS; current budget measurement elsewhere."""
+    if platform == "darwin":
+        return process_footprint(pid)[1]
+    return hub_memory_bytes(pid)
+
+
+def _measure_startup_view_peak_mode(root: Path, *, legacy_views: bool) -> dict:
+    """One fresh-process startup measurement for the selected view-bind mode."""
+    from drover.schema import bootstrap
+
+    process = psutil.Process()
+    store = root / "legacy-bootstrap.duckdb"
+    parquet = root / "legacy-bootstrap-parquet"
+    before = hub_memory_bytes(process.pid)
+    lifetime_before = _hub_lifetime_peak(process.pid)
+    bootstrap(parquet_dir=parquet, duckdb_path=store, bind_parquet_views=legacy_views)
+    after = hub_memory_bytes(process.pid)
+    lifetime_after = _hub_lifetime_peak(process.pid)
+    return {
+        "measurement": HUB_MEASUREMENT,
+        "legacy_views": legacy_views,
+        "current_before": before,
+        "current_after": after,
+        "lifetime_before": lifetime_before,
+        "lifetime_after": lifetime_after,
+    }
+
+
+def measure_startup_view_peak(root: Path) -> dict:
+    """Compare legacy binding and DuckLake's bounded startup in fresh children."""
+
+    def run(mode: str) -> dict:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                str(root),
+                "--startup-view-peak-mode",
+                mode,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(result.stdout)
+
+    return {
+        "measurement": HUB_MEASUREMENT,
+        "legacy_view_bind": run("legacy"),
+        "ducklake_bounded_startup": run("ducklake"),
     }
 
 
@@ -133,11 +228,26 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
     baseline = tracemalloc.take_snapshot()
     process = psutil.Process()
     stop = threading.Event()
-    peaks = {"parent_rss": 0, "children_rss": 0}
+    peaks = {
+        "parent_rss": 0,
+        "children_rss": 0,
+        "parent_hub_memory": 0,
+        "parent_lifetime_peak_hub_memory": 0,
+    }
 
     def monitor():
         while not stop.wait(0.01):
             peaks["parent_rss"] = max(peaks["parent_rss"], process.memory_info().rss)
+            try:
+                peaks["parent_hub_memory"] = max(
+                    peaks["parent_hub_memory"], hub_memory_bytes(process.pid)
+                )
+                peaks["parent_lifetime_peak_hub_memory"] = max(
+                    peaks["parent_lifetime_peak_hub_memory"],
+                    _hub_lifetime_peak(process.pid),
+                )
+            except OSError:
+                pass
             children = 0
             for child in process.children(recursive=True):
                 try:
@@ -242,11 +352,13 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
                 ):
                     before_rss = process.memory_info().rss
                     before_hub = hub_memory_bytes(process.pid)
+                    before_hub_lifetime = _hub_lifetime_peak(process.pid)
                     request = _request(base, path)
                     if "activity_status" in request:
                         assert request["activity_status"] == "ok", request
                     after_rss = process.memory_info().rss
                     after_hub = hub_memory_bytes(process.pid)
+                    after_hub_lifetime = _hub_lifetime_peak(process.pid)
                     requests.append(request)
                     path_growth.append(
                         {
@@ -257,6 +369,11 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
                             "hub_before": before_hub,
                             "hub_after": after_hub,
                             "hub_growth_bytes": after_hub - before_hub,
+                            "hub_lifetime_before": before_hub_lifetime,
+                            "hub_lifetime_after": after_hub_lifetime,
+                            "hub_lifetime_growth_bytes": (
+                                after_hub_lifetime - before_hub_lifetime
+                            ),
                         }
                     )
                     sample(f"request_{index}_{path.split('?', 1)[0][1:]}", live)
@@ -282,6 +399,18 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
         endpoint_requests=requests,
         path_growth=path_growth,
         path_growth_summary=_growth_summary(path_growth),
+        # This is the budget metric: physical footprint on macOS and RSS on
+        # Linux. The lifetime form preserves a short peak between requests.
+        peak_hub_memory=max(
+            [sample["hub_memory"] for sample in samples] + [peaks["parent_hub_memory"]]
+        ),
+        lifetime_peak_hub_memory=max(
+            [
+                sample.get("lifetime_peak_footprint", sample["hub_memory"])
+                for sample in samples
+            ]
+            + [peaks["parent_lifetime_peak_hub_memory"]]
+        ),
         samples=samples,
         # A diff, not merely the largest currently-live Python allocations:
         # this identifies Python-side growth separately from native DuckDB RSS.
@@ -305,6 +434,16 @@ if __name__ == "__main__":
         help="Exercise the non-clone foreground fallback",
     )
     parser.add_argument(
+        "--startup-view-peak",
+        action="store_true",
+        help="Measure removed legacy view binding against bounded DuckLake startup",
+    )
+    parser.add_argument(
+        "--startup-view-peak-mode",
+        choices=("legacy", "ducklake"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--minutes",
         type=float,
         default=1.0,
@@ -322,6 +461,19 @@ if __name__ == "__main__":
     if args.prepare:
         prepare(args.root.resolve(), args.sessions, args.spans, args.files)
     else:
+        if args.startup_view_peak_mode:
+            print(
+                json.dumps(
+                    _measure_startup_view_peak_mode(
+                        args.root.resolve(),
+                        legacy_views=args.startup_view_peak_mode == "legacy",
+                    )
+                )
+            )
+            raise SystemExit(0)
+        if args.startup_view_peak:
+            print(json.dumps(measure_startup_view_peak(args.root.resolve())))
+            raise SystemExit(0)
         print(
             json.dumps(
                 measure(

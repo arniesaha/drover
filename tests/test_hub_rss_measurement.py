@@ -1,4 +1,4 @@
-"""Contracts for the synthetic HTTP RSS measurement harness (#466)."""
+"""Contracts for the synthetic HTTP footprint measurement harness (#466)."""
 
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
     )
     assert report["samples"]
     assert all(sample["hub_memory"] > 0 for sample in report["samples"])
+    assert report["peak_hub_memory"] <= 1024**3
+    assert report["lifetime_peak_hub_memory"] >= report["peak_hub_memory"]
     assert [sample["path"] for sample in report["path_growth"]] == [
         "/cockpit/overview",
         "/analytics",
@@ -45,6 +47,10 @@ def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
         "/analytics",
         "/insights",
     }
+    assert all(
+        entry["hub_lifetime_after"] >= entry["hub_lifetime_before"]
+        for entry in report["path_growth"]
+    )
     assert report["python_growth_top"]
 
 
@@ -59,6 +65,9 @@ def test_growth_summary_keeps_per_route_brackets_separate():
                 "hub_before": 20,
                 "hub_after": 25,
                 "hub_growth_bytes": 5,
+                "hub_lifetime_before": 20,
+                "hub_lifetime_after": 25,
+                "hub_lifetime_growth_bytes": 5,
             },
             {
                 "path": "/insights",
@@ -68,6 +77,9 @@ def test_growth_summary_keeps_per_route_brackets_separate():
                 "hub_before": 25,
                 "hub_after": 24,
                 "hub_growth_bytes": -1,
+                "hub_lifetime_before": 25,
+                "hub_lifetime_after": 25,
+                "hub_lifetime_growth_bytes": 0,
             },
             {
                 "path": "/analytics",
@@ -77,6 +89,9 @@ def test_growth_summary_keeps_per_route_brackets_separate():
                 "hub_before": 24,
                 "hub_after": 30,
                 "hub_growth_bytes": 6,
+                "hub_lifetime_before": 25,
+                "hub_lifetime_after": 30,
+                "hub_lifetime_growth_bytes": 5,
             },
         ]
     )
@@ -86,15 +101,19 @@ def test_growth_summary_keeps_per_route_brackets_separate():
             "calls": 2,
             "rss_net_growth_bytes": 12,
             "hub_net_growth_bytes": 10,
+            "hub_lifetime_net_growth_bytes": 10,
             "rss_max_step_growth_bytes": 8,
             "hub_max_step_growth_bytes": 6,
+            "hub_lifetime_max_step_growth_bytes": 5,
         },
         "/insights": {
             "calls": 1,
             "rss_net_growth_bytes": 1,
             "hub_net_growth_bytes": -1,
+            "hub_lifetime_net_growth_bytes": 0,
             "rss_max_step_growth_bytes": 1,
             "hub_max_step_growth_bytes": -1,
+            "hub_lifetime_max_step_growth_bytes": 0,
         },
     }
 
@@ -108,6 +127,7 @@ def test_selected_ducklake_http_routes_use_bounded_disposable_children(
     extensions. It skips when those deliberately opt-in local artifacts are
     unavailable; it never falls back to a developer's configured hub.
     """
+    from drover.server.advisory.service import InsightsService
     from drover.server.cockpit.service import CockpitService
     from drover.server.lake import read_models
     from drover.server.lake.query_process import QueryLimits
@@ -134,16 +154,26 @@ def test_selected_ducklake_http_routes_use_bounded_disposable_children(
         cockpit_service=CockpitService(
             duckdb_path=control_path, provider_usage=None, cursor_secret=b"x" * 32
         ),
+        # Keep the config/control fixture private; do not let the lazily
+        # constructed insight service discover a developer's hub config.
+        advisory_service=InsightsService(
+            control_path, config_path=tmp_path / "config.toml"
+        ),
     )
     server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
     rss_samples = [process_rss(os.getpid())]
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
-        for path in ("/cockpit/overview?days=30", "/analytics?days=29"):
+        for path in (
+            "/cockpit/overview?days=30",
+            "/analytics?days=29",
+            "/insights",
+        ):
             with urllib.request.urlopen(base + path, timeout=15) as response:
                 payload = json.loads(response.read())
             assert response.status == 200
-            assert payload["activity"]["status"] == "ok", payload["activity"]
+            if "activity" in payload:
+                assert payload["activity"]["status"] == "ok", payload["activity"]
             rss_samples.append(process_rss(os.getpid()))
     finally:
         server.shutdown()

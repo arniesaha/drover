@@ -200,6 +200,29 @@ from drover.task_id import compute_task_id
 log = logging.getLogger("drover.server")
 
 
+def _bind_legacy_parquet_views(cfg: DroverConfig) -> bool:
+    """Bind legacy Parquet views only when the legacy backend serves reads.
+
+    The bounded catalog/control bootstrap has already completed before the
+    listener starts.  Binding legacy views afterwards is intentionally a
+    separate step because DuckDB resolves the broad parquet globs and the
+    span-activity refresh scans every historical span.  A DuckLake-selected
+    hub neither serves these views nor exports through the legacy exporter, so
+    doing that scan only creates a large parent-process startup peak.
+    """
+    if cfg.analytics.backend == "ducklake":
+        log.info("legacy Parquet view bootstrap skipped (DuckLake selected)")
+        return False
+
+    from drover.server.lake.writer_gate import legacy_derived_write
+
+    with legacy_derived_write(cfg.duckdb_path) as allowed:
+        if not allowed:
+            return False
+        bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+    return True
+
+
 def _summarizer_backend_available(backend_cfg: SummarizerBackendConfig) -> bool:
     """Return whether starting summarizer-like workers can make progress.
 
@@ -3100,16 +3123,12 @@ def run(
 
     def _finish_analytical_bootstrap() -> None:
         try:
-            from drover.server.lake.writer_gate import legacy_derived_write
-
-            with legacy_derived_write(cfg.duckdb_path) as allowed:
-                if not allowed:
-                    return
-                bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+            if not _bind_legacy_parquet_views(cfg):
+                return
             from drover.server.process_memory import memory_note
 
-            # On 2026-10-06 both the v2 and the rolled-back hub crossed the
-            # RSS budget within seconds of this line: say what it cost.
+            # Legacy startup may bind broad parquet globs. Record its physical
+            # footprint cost where this path is still selected.
             log.info("analytical Parquet views ready (%s)", memory_note())
         except Exception:  # noqa: BLE001
             log.exception("analytical Parquet view bootstrap failed")

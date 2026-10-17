@@ -1,10 +1,11 @@
-# Hub RSS fixture measurement (#466)
+# Hub physical-footprint fixture measurement (#466)
 
 This is a local, synthetic measurement only. It never opens `~/.drover`, a
 live hub, a mounted production volume, or PostgreSQL. It creates an isolated
 DuckDB/Parquet fixture and starts the normal loopback HTTP handler, then polls
-`/cockpit/overview` and `/analytics` with changing day filters so the cockpit
-response cache cannot hide a query.
+the app routes: `/cockpit/overview` (including popular projects), `/analytics`
+(including distributions), and `/insights`. Changing day filters prevents the
+cockpit response cache from hiding an analytical query.
 
 ```sh
 uv sync --extra dev
@@ -13,75 +14,101 @@ uv run python scripts/measure_hub_memory.py --prepare "$WORK/fixture" \
   --sessions 2000 --spans 40000 --files 24
 DROVER_DUCKDB_MEMORY_DIAGNOSTICS=1 \
 DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT=4GB \
-  uv run python scripts/measure_hub_memory.py "$WORK/fixture" --minutes 5
+  uv run python scripts/measure_hub_memory.py "$WORK/fixture" --minutes 5 --interval-seconds 30
+uv run python scripts/measure_hub_memory.py "$WORK/fixture" --startup-view-peak
 ```
 
-The report is one JSON object. It contains current parent RSS at startup and
-after each request, plus the hub's budget measurement (macOS physical footprint
-or Linux RSS), a 10 ms parent/child peak sampler, DuckDB tags from
+The report is one JSON object. Its primary budget metric is current physical
+footprint on macOS and RSS on Linux. It records that metric and its lifetime
+kernel high-water mark before and after every app route, plus a 10 ms
+parent/child sampler, DuckDB tags from
 `duckdb_memory()`, external-file-cache bytes, Arrow-pool bytes, and a
-`tracemalloc` before/after diff. macOS also records the kernel lifetime peak
-footprint: RSS can retain reclaimable allocator pages and is not the budgeted
-value there. With diagnostics enabled, connection close also emits the bounded
+`tracemalloc` before/after diff. macOS RSS can retain freed allocator pages
+(`Malloc Small (empty)`) and therefore over-reports resident ownership; physical
+footprint is the budgeted value there. With diagnostics enabled, connection close also emits the bounded
 `analytical_memory` record. `--minutes 0` is the deterministic smoke mode; it
 still performs one request to each endpoint: `/cockpit/overview`, `/analytics`
 and `/insights`.
 
+## Studio root-cause evidence and fix
+
+Read-only Studio logs from the 0.6.17 restart identify a startup peak rather
+than steady-state ownership. The parent was 221.5 MiB physical footprint when
+the listener completed at 11:55:19, the DuckLake proof checkpoint ran at
+11:55:20, and `analytical Parquet views ready` logged 1.83 GiB at 11:55:26.
+At 11:55:52 the memory guard sampled 5.13 GiB; `vmmap --summary` later showed
+378 MiB current footprint, 5.7 GiB lifetime peak, and 6.8 GiB of reclaimable
+`Malloc Small (empty)` RSS. The only named log events between the proof and
+the guard are the legacy view bind; subsequent unnamed startup work includes a
+best-effort cockpit warm-up, which can resolve those views. No exporter merge,
+embedding, recap, or client insights request is logged in that interval.
+
+The cause is the legacy asynchronous Parquet bootstrap running even when
+DuckLake is selected but legacy-writer retirement is not enabled. It creates
+broad `read_parquet(..., union_by_name=true)` views and
+`_refresh_span_partition_activity()` scans every historical span in the hub
+process. DuckLake serves reads through its disposable reader and exports through
+its own fenced child, so it does not need those views. This branch now skips
+that legacy view bind whenever `analytics.backend == "ducklake"`; the bounded
+catalog/control bootstrap still runs before listeners bind.
+
 ## Fixture result on this branch
 
-On macOS arm64, Python 3.14.7 and DuckDB 1.5.5, using the 2,000-session /
-40,000-span / 24-file fixture above and two uncached HTTP requests:
+All figures below are from a fresh local 20,000-session / 400,000-span /
+100-file fixture on macOS arm64 (Python 3.14.7, DuckDB 1.5.5), with
+`DROVER_DUCKDB_MEMORY_DIAGNOSTICS=1` and
+`DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT=4GB`. No production database, hub,
+home-directory store, or mounted volume was opened.
 
-| Path | RSS after views | RSS after requests | Growth |
+### Startup peak: before and after the DuckLake selection fix
+
+The probe runs each mode in a new process, so the kernel lifetime high-water
+mark is comparable. The *before* mode calls the old legacy view bind; the
+*after* mode is the DuckLake-selected startup, which does not call it.
+
+| Startup mode | Footprint before → after | Lifetime peak |
+| --- | ---: | ---: |
+| Before: legacy Parquet view bind / full span-activity refresh | 50.53 → 73.92 MiB (**+23.39 MiB**) | 73.92 MiB |
+| After: DuckLake-selected bounded startup | 50.59 → 63.80 MiB (**+13.20 MiB**) | 63.80 MiB |
+
+The fixture is deliberately much smaller than Studio, so it does not claim to
+recreate the 5.7 GiB production high-water mark. It does execute the same broad
+view bind: selecting DuckLake lowers this fixture's startup high-water mark by
+10.12 MiB. The log sequence above attributes the production-scale source; the
+regression test prevents a DuckLake-selected server from calling that bind again.
+
+### Five-minute app-route comparison
+
+Each process polled the three exact app routes every 30 seconds for at least
+five minutes. `/cockpit/overview` contains popular projects, `/analytics`
+contains distribution analytics, and `/insights` is the advisory poll. The
+default completed ten cycles (30 requests). A second process deliberately
+disabled clone support (`--live-reader`) to exercise the in-hub fallback;
+because its scans take longer it completed nine cycles (27 requests).
+
+| Reader | Parent footprint, views → idle | Lifetime footprint peak | Parent RSS at idle |
 | --- | ---: | ---: | ---: |
-| Forced in-process legacy reader (`--live-reader`) | 94.97 MiB | 182.94 MiB | 87.98 MiB |
-| Default disposable reader | 97.69 MiB | 109.51 MiB | 11.83 MiB |
+| Selected disposable reader | 59.78 → 67.08 MiB | **73.11 MiB** | 117.91 MiB |
+| Forced in-hub fallback | 57.16 → 76.91 MiB | **305.19 MiB** | 634.06 MiB |
 
-The default child reported 124.1–125.0 MiB RSS at close. Its DuckDB
-buffer-manager usage was 0.25 MiB; the parent live instance was also 0.25 MiB
-after requests. The 10 ms sampler can miss a short child, so the child's own
-supervisor/RSS ceiling—not that sampler—is the enforcement source.
+The table reports the largest before/after physical-footprint bracket for a
+single request. Lifetime steps retain a short spike; route calls are sequential,
+so they are upper observations rather than additive causal totals.
 
-### Five-minute scaled comparison
-
-To test a workload large enough to make retained analytical allocations
-visible, the same local-only harness created a fresh 20,000-session /
-400,000-span / 100-file fixture and polled every route every 30 seconds for at
-least five minutes. It ran with
-`DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT=4GB` and diagnostics enabled. The
-default completed ten cycles (30 requests); the deliberately forced
-non-clone fallback completed nine (27 requests) because its in-process scans
-took longer. No production database, hub, home-directory store, or mounted
-volume was opened.
-
-| Reader | Parent RSS, views → idle | Hub physical footprint, views → idle |
+| Route | Disposable reader: calls / max current step / max lifetime step | Forced fallback: calls / max current step / max lifetime step |
 | --- | ---: | ---: |
-| Forced in-process legacy fallback | 99.31 → 653.98 MiB (**+554.67 MiB**) | 57.47 → 79.99 MiB (**+22.52 MiB**) |
-| Default disposable reader | 101.11 → 116.70 MiB (**+15.59 MiB**) | 59.27 → 66.31 MiB (**+7.05 MiB**) |
+| `/cockpit/overview` (popular projects) | 10 / +3.44 MiB / +4.06 MiB | 9 / +171.11 MiB / +171.73 MiB |
+| `/analytics` (distribution) | 10 / +0.31 MiB / +0.00 MiB | 9 / +65.66 MiB / +65.09 MiB |
+| `/insights` (advisory) | 10 / +0.48 MiB / +0.75 MiB | 9 / +0.25 MiB / +0.73 MiB |
 
-The per-route figures below are the largest single before/after bracket in the
-run. They are useful upper observations, not causal totals: routes run
-sequentially and a bracket can include allocator activity initiated by earlier
-work. The forced fallback makes the owning path clear nevertheless: both
-analytical routes use its one in-process DuckDB instance, whereas `/insights`
-does not scan the lake.
-
-| Route | Default calls / max RSS step / max footprint step | Forced fallback calls / max RSS step / max footprint step |
-| --- | ---: | ---: |
-| `/cockpit/overview` | 10 / +3.6 MiB / +3.6 MiB | 9 / +165.0 MiB / +162.3 MiB |
-| `/analytics` | 10 / +0.3 MiB / +0.3 MiB | 9 / +128.5 MiB / +128.6 MiB |
-| `/insights` | 10 / +1.1 MiB / +1.1 MiB | 9 / +0.2 MiB / +0.2 MiB |
-
-This is the Phase 2 result for the demonstrated growth path: the selected
-default already takes the heavy reads out of the hub into the existing
-disposable reader. Its hard child contract is five seconds, 2 GiB RSS, 1,000
-rows, and 1 MiB response bytes. The test now makes that route selection and
-the restored in-process Insights poll a regression contract. There is no
-additional safe in-process cap to add to the no-clone fallback: its DuckDB
-instance is shared with legacy server work, and lowering its instance-wide
-limit would change those callers. The production Studio volume is expected to
-use the clone-backed default; #482 must verify that fact and attribute any
-remaining growth there.
+The selected path has no endpoint-sized footprint spike on this fixture. The
+fallback can transiently reach 305.19 MiB: overview and analytics materialize
+against its long-lived instance; insights does not scan the lake. The selected
+DuckLake implementation already routes the two heavy reads through the
+existing disposable reader, whose hard contract is five seconds, 2 GiB RSS,
+1,000 rows, and a 1 MiB response. This change fixes the independent startup
+peak source rather than weakening that fallback's shared legacy instance. #482
+must verify clone support and attribute any remaining Studio peak.
 
 ## What was resident in this workload
 
@@ -91,15 +118,16 @@ remaining growth there.
 | DuckDB external-file cache | 0 | `duckdb_external_file_cache()` and `EXTERNAL_FILE_CACHE` tag. |
 | Arrow pool | 0 | `pyarrow.total_allocated_bytes()` at every sample. |
 | Python growth | <1.1 MiB traced | `tracemalloc` diff; mostly import/JSON bookkeeping. |
-| Disposable reader | exits after each request | Child close diagnostics, and the default parent grew 11.83 MiB rather than the forced in-process path's 87.98 MiB. |
-| Remaining parent RSS | about 109 MiB total in this fixture | Not represented by DuckDB/Arrow/traced Python; native libraries and allocator-retained pages remain plausible. |
+| Disposable reader | exits after each request | The selected parent reached 73.11 MiB lifetime footprint; the forced fallback reached 305.19 MiB. |
+| Remaining parent memory | 67.08 MiB footprint / 117.91 MiB RSS at idle | Not represented by DuckDB/Arrow/traced Python; native libraries and allocator-retained pages remain plausible. |
 
 These values are not a production extrapolation and do not claim to explain the
 Studio's 6–8 GB RSS. They establish the equivalent legacy fixture property:
 the clone-backed disposable reader does not retain its analytical allocation in
 the parent. `tests/test_hub_rss_measurement.py` additionally starts the normal
-HTTP handler on a fully private, pinned DuckLake fixture and verifies both
-polling routes return a bounded disposable child. The `QueryLimits` contract
+HTTP handler on a fully private, pinned DuckLake fixture and verifies all three
+app polls, including insights. Its two heavy routes use bounded disposable
+children. The `QueryLimits` contract
 remains the release bound: one admitted child, at most five seconds, 2 GiB
 child RSS, 1,000 rows and 1 MiB result bytes.
 
