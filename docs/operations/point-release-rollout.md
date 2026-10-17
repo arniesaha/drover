@@ -51,6 +51,7 @@ checksum manifests from the same published release.
    of the local artifact cache. Defaults: 5 GiB free at the runtime filesystem,
    backup age at most 24 hours. Exit 0 means every check passed, 1 means a failed
    check, and 2 means invalid/unreadable inputs. No failed check is a waiver.
+   Invalid-input errors name the bad input; quote any path containing spaces.
    Set `DROVER_RELEASE_GATE_DEVICE_TOKEN` in the invoking environment to a
    device credential before running this command; do not place its value in the
    shell command, plist, or release evidence. The check lists online hosts and

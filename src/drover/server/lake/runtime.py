@@ -46,6 +46,12 @@ _CONNINFO_RE = re.compile(
     r"user|host|hostaddr|port|dbname|options)\s*=\s*('(?:[^'\\]|\\.)*'|\S+)",
     re.IGNORECASE,
 )
+_CREDENTIAL_RE = re.compile(
+    r"\b(password|passwd|pwd|token|secret|credential|api[_-]?key|access[_-]?key|"
+    r"private[_-]?key|authorization|bearer)\b\s*(?:=|:|\bis\b)\s*"
+    r"(?:Bearer\s+)?('(?:[^'\\]|\\.)*'|\S+)",
+    re.IGNORECASE,
+)
 
 
 def sanitize_detail(exc: BaseException, *secrets: str | None) -> str:
@@ -67,6 +73,7 @@ def sanitize_detail(exc: BaseException, *secrets: str | None) -> str:
             line = line.replace(value, "***")
     line = _URL_RE.sub("***", line)
     line = _CONNINFO_RE.sub(lambda m: f"{m.group(1)}=***", line)
+    line = _CREDENTIAL_RE.sub(lambda m: f"{m.group(1)}=***", line)
     text = f"{type(exc).__name__}: {line}" if line else type(exc).__name__
     return text[:DETAIL_LIMIT]
 

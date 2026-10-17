@@ -26,6 +26,7 @@ from .cutover import (
     take_backup,
     verdict,
 )
+from .runtime import sanitize_detail
 
 
 def _plan_options(command):
@@ -58,6 +59,35 @@ def _plan(lake, lake_root, gate_root, backup_root) -> CutoverPlan:
 def _emit(document: dict) -> None:
     click.echo(json.dumps(document, indent=2, default=str))
     raise SystemExit(exit_code(document))
+
+
+def _release_preflight_inputs(
+    plan: CutoverPlan,
+    *,
+    plist: Path,
+    wheel_sha256: str,
+    lock_sha256: str,
+    backup: Path,
+) -> None:
+    """Reject malformed release-preflight arguments before running checks."""
+    if not plan.lake_root.is_dir():
+        raise FileNotFoundError(f"lake root does not exist: {plan.lake_root}")
+    if not plan.data_root.is_dir():
+        raise FileNotFoundError(f"lake path does not exist: {plan.data_root}")
+    if not plist.is_file():
+        raise FileNotFoundError(f"plist path does not exist: {plist}")
+    if not backup.is_dir():
+        raise FileNotFoundError(f"backup path does not exist: {backup}")
+    for name, value in (("wheel", wheel_sha256), ("lock", lock_sha256)):
+        if len(value) != 64 or any(
+            char not in "0123456789abcdefABCDEF" for char in value
+        ):
+            raise ValueError(f"{name} sha256 must be 64 hexadecimal characters")
+
+
+def _input_detail(exc: BaseException, *secrets: str | None) -> str:
+    """Format an input error without exposing credentials passed to the command."""
+    return sanitize_detail(exc, *secrets)
 
 
 @click.command("gate")
@@ -145,7 +175,15 @@ def gate_cmd(
         try:
             service = ServiceView.load(plist)
         except (OSError, ValueError) as exc:
-            _emit(verdict("preflight", plan, [], error=f"plist unreadable: {exc}"))
+            _emit(
+                verdict(
+                    "preflight",
+                    plan,
+                    [],
+                    error="preflight input invalid",
+                    detail=_input_detail(exc),
+                )
+            )
         checks = run_preflight(
             plan,
             service,
@@ -283,6 +321,13 @@ def release_preflight_cmd(
 
     plan = _plan(lake, lake_root, gate_root, backup_root)
     try:
+        _release_preflight_inputs(
+            plan,
+            plist=plist,
+            wheel_sha256=wheel_sha256,
+            lock_sha256=lock_sha256,
+            backup=backup,
+        )
         service = ServiceView.load(plist)
         device_token = os.environ.get(device_token_env, "")
         checks = run_release_preflight(
@@ -297,13 +342,16 @@ def release_preflight_cmd(
             pg_bin=pg_bin,
             device_token=device_token,
         )
-    except (OSError, ValueError, CutoverError):
+    except (OSError, ValueError, CutoverError) as exc:
         _emit(
             verdict(
-                "release-preflight", plan, [], error="release preflight input invalid"
+                "release-preflight",
+                plan,
+                [],
+                error="release preflight input invalid",
+                detail=_input_detail(exc, os.environ.get(device_token_env, "")),
             )
         )
-        return
     _emit(verdict("release-preflight", plan, checks))
 
 
