@@ -126,6 +126,24 @@ def _write_spans(parquet_dir: Path, rows: list[dict]) -> None:
         pq.write_table(pa.table(cols, schema=_SPAN_SCHEMA), out / "part.parquet")
 
 
+def test_ducklake_skips_legacy_parquet_view_bootstrap(monkeypatch, tmp_path):
+    """DuckLake's read/export paths must not scan the legacy Parquet lake."""
+    calls = []
+    config = type(
+        "Config",
+        (),
+        {
+            "analytics": type("Analytics", (), {"backend": "ducklake"})(),
+            "duckdb_path": tmp_path / "store.duckdb",
+            "parquet_dir": tmp_path / "parquet",
+        },
+    )()
+    monkeypatch.setattr(server_main, "bootstrap", lambda **kwargs: calls.append(kwargs))
+
+    assert server_main._bind_legacy_parquet_views(config) is False
+    assert calls == []
+
+
 def _insert_legacy_sequence_events(db: Path, *, mixed: bool = False) -> None:
     # `harness_events` lives in the control-plane store since #95.
     with duckdb.connect(str(control_plane_path(db))) as con:
