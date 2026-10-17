@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.17] - 2026-10-17
+
+### Fixed
+
+- Content-consent propagation recovers when a host holds a newer epoch than central. harnessd's 409 now carries `code=stale_consent_epoch` with the host's epoch and state; central advances its epoch past the host's and re-propagates once, a host already in the desired state reports `acknowledged`, and older 409s get a clear reason instead of an endless retry (#664, #666).
+- Expired Claude Code logins are classified instead of reported as probe failures: an expired access token with a usable refresh token is `login_refresh_needed`, a dead refresh token is `login_expired` (last-known usage kept), and a host with no Claude credentials is `not_configured` and left out of fleet quota and connector alerts. Credentials stay read-only; the cockpit shows the per-host repair step (#665, #667).
+
 ## [0.6.16] - 2026-10-16
 
 ### Fixed
