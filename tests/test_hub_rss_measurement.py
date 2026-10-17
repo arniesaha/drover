@@ -10,10 +10,10 @@ from test_control_outbox import postgres_control_store
 from test_lake_runtime import lake_spec
 from test_lake_serving import verified_lake
 
-from scripts.measure_hub_memory import measure, prepare
+from scripts.measure_hub_memory import _growth_summary, measure, prepare
 
 
-def test_harness_polls_both_cockpit_http_routes_and_reports_growth(tmp_path):
+def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
     root = tmp_path / "fixture"
     prepare(root, sessions=40, spans=80, files=3)
 
@@ -25,14 +25,78 @@ def test_harness_polls_both_cockpit_http_routes_and_reports_growth(tmp_path):
     ] == [
         "/cockpit/overview",
         "/analytics",
+        "/insights",
     ]
     assert all(request["status"] == 200 for request in report["endpoint_requests"])
     assert all(
-        request["activity_status"] == "ok" for request in report["endpoint_requests"]
+        request["activity_status"] == "ok"
+        for request in report["endpoint_requests"]
+        if "activity_status" in request
     )
     assert report["samples"]
     assert all(sample["hub_memory"] > 0 for sample in report["samples"])
+    assert [sample["path"] for sample in report["path_growth"]] == [
+        "/cockpit/overview",
+        "/analytics",
+        "/insights",
+    ]
+    assert set(report["path_growth_summary"]) == {
+        "/cockpit/overview",
+        "/analytics",
+        "/insights",
+    }
     assert report["python_growth_top"]
+
+
+def test_growth_summary_keeps_per_route_brackets_separate():
+    summary = _growth_summary(
+        [
+            {
+                "path": "/analytics",
+                "rss_before": 10,
+                "rss_after": 18,
+                "rss_growth_bytes": 8,
+                "hub_before": 20,
+                "hub_after": 25,
+                "hub_growth_bytes": 5,
+            },
+            {
+                "path": "/insights",
+                "rss_before": 18,
+                "rss_after": 19,
+                "rss_growth_bytes": 1,
+                "hub_before": 25,
+                "hub_after": 24,
+                "hub_growth_bytes": -1,
+            },
+            {
+                "path": "/analytics",
+                "rss_before": 19,
+                "rss_after": 22,
+                "rss_growth_bytes": 3,
+                "hub_before": 24,
+                "hub_after": 30,
+                "hub_growth_bytes": 6,
+            },
+        ]
+    )
+
+    assert summary == {
+        "/analytics": {
+            "calls": 2,
+            "rss_net_growth_bytes": 12,
+            "hub_net_growth_bytes": 10,
+            "rss_max_step_growth_bytes": 8,
+            "hub_max_step_growth_bytes": 6,
+        },
+        "/insights": {
+            "calls": 1,
+            "rss_net_growth_bytes": 1,
+            "hub_net_growth_bytes": -1,
+            "rss_max_step_growth_bytes": 1,
+            "hub_max_step_growth_bytes": -1,
+        },
+    }
 
 
 def test_selected_ducklake_http_routes_use_bounded_disposable_children(

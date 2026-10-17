@@ -1,13 +1,14 @@
 """Busy-hub synthetic RSS attribution probe (never reads production data).
 
 uv sync --extra dev; python scripts/measure_hub_memory.py --prepare /tmp/hub-probe
-DROVER_DUCKDB_MEMORY_DIAGNOSTICS=1 DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT=6GB \
+DROVER_DUCKDB_MEMORY_DIAGNOSTICS=1 DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT=4GB \
   python scripts/measure_hub_memory.py /tmp/hub-probe --minutes 5
 
-Starts the real local HTTP handler and alternates the two routes polled by the
-app: ``/cockpit/overview`` and ``/analytics``. The fixture is created only by
-``--prepare``; passing an existing directory to that command is refused. Each
-measurement must use a fresh process.
+Starts the real local HTTP handler and polls the cockpit routes plus the
+advisory route used by the app: ``/cockpit/overview``, ``/analytics`` and
+``/insights``. The fixture is created only by ``--prepare``; passing an
+existing directory to that command is refused. Each measurement must use a
+fresh process.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import threading
 import time
 import tracemalloc
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 from sys import platform
 
@@ -82,7 +84,37 @@ def _request(base: str, path: str) -> dict:
         "path": path,
         "status": response.status,
         "seconds": round(time.monotonic() - started, 3),
-        "activity_status": payload["activity"]["status"],
+        **(
+            {"activity_status": payload["activity"]["status"]}
+            if "activity" in payload
+            else {}
+        ),
+    }
+
+
+def _growth_summary(samples: list[dict]) -> dict[str, dict[str, int]]:
+    """Report bracketed per-route movement without claiming causation.
+
+    Requests are sequential, so an endpoint's last ``after`` includes work
+    done by the routes before it. The raw samples remain the attribution
+    source; these aggregates make a multi-minute run practical to compare.
+    """
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for sample in samples:
+        grouped[sample["path"]].append(sample)
+    return {
+        path: {
+            "calls": len(values),
+            "rss_net_growth_bytes": values[-1]["rss_after"] - values[0]["rss_before"],
+            "hub_net_growth_bytes": values[-1]["hub_after"] - values[0]["hub_before"],
+            "rss_max_step_growth_bytes": max(
+                value["rss_growth_bytes"] for value in values
+            ),
+            "hub_max_step_growth_bytes": max(
+                value["hub_growth_bytes"] for value in values
+            ),
+        }
+        for path, values in grouped.items()
     }
 
 
@@ -163,6 +195,7 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
     server = None
     service = None
     requests = []
+    path_growth = []
     try:
         sample("imports")
         # Retain the live instance as the runtime pin/background workers do.
@@ -173,7 +206,9 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
                     f'CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet({sql_path_literal(str(root / table / "*.parquet"))}, union_by_name=true)'
                 )
             sample("startup_views", live)
-            insights = InsightsService(root / "store.duckdb")
+            insights = InsightsService(
+                root / "store.duckdb", config_path=root / "config.toml"
+            )
             from drover.schema import bootstrap_control_plane_store
 
             bootstrap_control_plane_store(root / "store.duckdb")
@@ -191,21 +226,40 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
                 summarizer_report={},
             )
             collector.cockpit_service = service
+            collector.advisory_service = insights
             server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
             base = f"http://127.0.0.1:{server.server_address[1]}"
             deadline = time.monotonic() + minutes * 60
             index = 0
-            # Always call both routes once. New day values avoid the cockpit
-            # response cache, then a timed run simulates continued app polls.
-            while index < 2 or time.monotonic() < deadline:
-                path = (
-                    f"/cockpit/overview?days={7 + index}"
-                    if index % 2 == 0
-                    else f"/analytics?days={7 + index}"
-                )
-                requests.append(_request(base, path))
-                assert requests[-1]["activity_status"] == "ok", requests[-1]
-                sample(f"request_{index}", live)
+            # Every cycle covers all app-facing cockpit polls. New day values
+            # avoid the activity response cache; /insights restores the
+            # advisory read exercised by the earlier service-only probe.
+            while index < 1 or time.monotonic() < deadline:
+                for path in (
+                    f"/cockpit/overview?days={7 + index}",
+                    f"/analytics?days={8 + index}",
+                    "/insights",
+                ):
+                    before_rss = process.memory_info().rss
+                    before_hub = hub_memory_bytes(process.pid)
+                    request = _request(base, path)
+                    if "activity_status" in request:
+                        assert request["activity_status"] == "ok", request
+                    after_rss = process.memory_info().rss
+                    after_hub = hub_memory_bytes(process.pid)
+                    requests.append(request)
+                    path_growth.append(
+                        {
+                            "path": path.split("?", 1)[0],
+                            "rss_before": before_rss,
+                            "rss_after": after_rss,
+                            "rss_growth_bytes": after_rss - before_rss,
+                            "hub_before": before_hub,
+                            "hub_after": after_hub,
+                            "hub_growth_bytes": after_hub - before_hub,
+                        }
+                    )
+                    sample(f"request_{index}_{path.split('?', 1)[0][1:]}", live)
                 if interval_seconds:
                     time.sleep(interval_seconds)
                 index += 1
@@ -226,6 +280,8 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
         spans_enabled=True,
         duration_minutes=minutes,
         endpoint_requests=requests,
+        path_growth=path_growth,
+        path_growth_summary=_growth_summary(path_growth),
         samples=samples,
         # A diff, not merely the largest currently-live Python allocations:
         # this identifies Python-side growth separately from native DuckDB RSS.
