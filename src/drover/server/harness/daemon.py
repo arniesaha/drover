@@ -162,6 +162,12 @@ TERMINAL_MIRROR_BATCH_MAX = 128
 PROVIDER_USAGE_REFRESH_INTERVAL_SECONDS = 300.0
 PROVIDER_USAGE_PROBE_TIMEOUT_SECONDS = 60.0
 
+# The hub pulls lifecycle reports every five minutes, with a small jitter.
+# Keep Git inspection off the relay-facing request path and give a slow NAS
+# scan enough time to complete without allowing it to overlap the next pass.
+LIFECYCLE_WORKTREE_INVENTORY_REFRESH_INTERVAL_SECONDS = 300.0
+LIFECYCLE_WORKTREE_INVENTORY_RUN_TIMEOUT_SECONDS = 60.0
+
 
 def save_turn_attachments(
     attachments_dir: Path, session_id: str, images: list
@@ -1400,6 +1406,9 @@ class HarnessDaemonState:
     # Constructed with the state so it can detect the enabled local providers,
     # but started only by run_harnessd after the listener has bound.
     provider_usage_cache: Any | None = field(default=None, init=False)
+    # Git inspection can be slow on a NAS, so the lifecycle endpoint only
+    # serves this asynchronously refreshed cache.
+    lifecycle_worktree_inventory_cache: Any | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.auth is None:
@@ -1407,6 +1416,7 @@ class HarnessDaemonState:
         if isinstance(self.structured, StructuredSessionManager):
             self.structured.adapters = self.adapters
         self.provider_usage_cache = ProviderUsageRefreshCache(self)
+        self.lifecycle_worktree_inventory_cache = LifecycleWorktreeInventoryCache(self)
 
     def recovery_lock_for(self, session_id: str) -> threading.Lock:
         with self.recovery_locks_guard:
@@ -1632,6 +1642,132 @@ class ProviderUsageRefreshCache:
             self._wake.clear()
 
 
+@dataclass
+class _InFlightWorktreeInventory:
+    """One Git inventory run that may outlive the scheduler's wait budget."""
+
+    thread: threading.Thread | None = None
+
+
+class LifecycleWorktreeInventoryCache:
+    """Refresh Git worktree facts without holding a relay request open."""
+
+    def __init__(
+        self,
+        state: HarnessDaemonState,
+        *,
+        interval_seconds: float = LIFECYCLE_WORKTREE_INVENTORY_REFRESH_INTERVAL_SECONDS,
+        run_timeout_seconds: float = LIFECYCLE_WORKTREE_INVENTORY_RUN_TIMEOUT_SECONDS,
+    ) -> None:
+        self.state = state
+        self.interval_seconds = interval_seconds
+        self.run_timeout_seconds = run_timeout_seconds
+        self._snapshot: dict[str, Any] | None = None
+        self._observed_at: str | None = None
+        self._last_error: dict[str, str] | None = None
+        self._in_flight: _InFlightWorktreeInventory | None = None
+        self._lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="drover-lifecycle-worktree-inventory",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def refresh_once(self) -> None:
+        """Start one bounded inventory, leaving any late worker un-reentered."""
+        if not self._refresh_lock.acquire(blocking=False):
+            return
+        try:
+            with self._lock:
+                in_flight = self._in_flight
+                if in_flight is not None and in_flight.thread is not None:
+                    if in_flight.thread.is_alive():
+                        return
+                    self._in_flight = None
+                in_flight = _InFlightWorktreeInventory()
+                worker = threading.Thread(
+                    target=self._read_and_publish,
+                    args=(in_flight,),
+                    name="drover-lifecycle-worktree-scan",
+                    daemon=True,
+                )
+                in_flight.thread = worker
+                self._in_flight = in_flight
+
+            worker.start()
+            worker.join(self.run_timeout_seconds)
+            if worker.is_alive():
+                log.warning(
+                    "lifecycle worktree inventory timed out after %.1fs",
+                    self.run_timeout_seconds,
+                )
+                with self._lock:
+                    if self._in_flight is in_flight:
+                        self._store_error_locked("inventory_timeout")
+        finally:
+            self._refresh_lock.release()
+
+    def response(self) -> tuple[int, dict[str, Any]]:
+        """Return the latest complete observation without waiting for Git."""
+        with self._lock:
+            if self._snapshot is None or self._observed_at is None:
+                errors = [self._last_error] if self._last_error is not None else []
+                return HTTPStatus.SERVICE_UNAVAILABLE, {"errors": errors}
+            errors = list(self._snapshot.get("errors", []))
+            if self._last_error is not None:
+                errors.append(self._last_error)
+            return HTTPStatus.OK, {
+                "worktrees": list(self._snapshot["worktrees"]),
+                "errors": errors,
+                "observed_at": self._observed_at,
+            }
+
+    def _read_and_publish(self, in_flight: _InFlightWorktreeInventory) -> None:
+        try:
+            from drover.server.harness.lifecycle_inventory import worktree_inventory
+
+            snapshot = worktree_inventory(
+                self.state.registry.list_sessions(host_id=self.state.host_id),
+                dict(self.state.session_worktrees),
+            )
+        except Exception:  # noqa: BLE001 - inventory must not take down harnessd
+            log.warning("lifecycle worktree inventory failed", exc_info=True)
+            with self._lock:
+                self._store_error_locked("inventory_failed")
+                if self._in_flight is in_flight:
+                    self._in_flight = None
+            return
+        with self._lock:
+            self._snapshot = snapshot
+            self._observed_at = datetime.now(timezone.utc).isoformat()
+            self._last_error = None
+            if self._in_flight is in_flight:
+                self._in_flight = None
+
+    def _store_error_locked(self, reason: str) -> None:
+        self._last_error = {"reason": reason}
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.refresh_once()
+            self._wake.wait(self.interval_seconds)
+            self._wake.clear()
+
+
 class HarnessHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -1692,16 +1828,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/lifecycle/worktrees":
-            from drover.server.harness.lifecycle_inventory import worktree_inventory
-
-            self._write_json(
-                worktree_inventory(
-                    self.server.state.registry.list_sessions(
-                        host_id=self.server.state.host_id
-                    ),
-                    dict(self.server.state.session_worktrees),
+            cache = self.server.state.lifecycle_worktree_inventory_cache
+            if cache is None:
+                self._write_json(
+                    {"errors": [{"reason": "inventory_unavailable"}]},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            )
+            else:
+                status, payload = cache.response()
+                self._write_json(payload, status=status)
             return
         if parsed.path == "/capabilities":
             self._write_json(self.server.state.capabilities())
@@ -4641,6 +4776,11 @@ def run_harnessd(
         provider_usage_cache = getattr(state, "provider_usage_cache", None)
         if provider_usage_cache is not None:
             provider_usage_cache.start()
+        lifecycle_worktree_inventory_cache = getattr(
+            state, "lifecycle_worktree_inventory_cache", None
+        )
+        if lifecycle_worktree_inventory_cache is not None:
+            lifecycle_worktree_inventory_cache.start()
         # Capture only paths from the previous daemon run. The sweep itself runs
         # concurrently with serving, so scanning the directory later could pick
         # up and remove a new session's still-clean worktree.
@@ -4735,6 +4875,11 @@ def run_harnessd(
             provider_usage_cache = getattr(state, "provider_usage_cache", None)
             if provider_usage_cache is not None:
                 provider_usage_cache.stop()
+            lifecycle_worktree_inventory_cache = getattr(
+                state, "lifecycle_worktree_inventory_cache", None
+            )
+            if lifecycle_worktree_inventory_cache is not None:
+                lifecycle_worktree_inventory_cache.stop()
             if relay_client is not None:
                 relay_client.stop()
             if pusher is not None:
