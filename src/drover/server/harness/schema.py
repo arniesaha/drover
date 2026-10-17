@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS harness_events (
 );
 """
 
+_UNKNOWN_SESSION_RETRIES_DDL = """
+CREATE TABLE IF NOT EXISTS harness_unknown_session_retries (
+  host_id       VARCHAR NOT NULL,
+  session_id    VARCHAR NOT NULL,
+  first_seen_at DOUBLE NOT NULL,
+  PRIMARY KEY (host_id, session_id)
+);
+"""
+
 
 @dataclass(frozen=True)
 class LegacySequenceMigrationReport:
@@ -410,6 +419,7 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "content_preview": "VARCHAR",
             "seq": "INTEGER",
             "dedup_key": "VARCHAR",
+            "reconciled_at": "TIMESTAMP",
         },
     )
     # The fence that actually identifies an event. `event_id` is minted per
@@ -425,6 +435,7 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS harness_events_dedup_key "
         "ON harness_events (dedup_key)"
     )
+    con.execute(_UNKNOWN_SESSION_RETRIES_DDL)
     migrate_legacy_harness_event_sequences(con)
     # Dropped, not migrated: every row duplicated a terminal.output event
     # byte-for-byte (verified 1:1 on live data), so there is nothing here

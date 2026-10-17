@@ -91,23 +91,29 @@ log = logging.getLogger("drover.metrics")
 # elapsed hub-observed retries can establish a missing session as an orphan.
 _UNKNOWN_SESSION_RETRY_WINDOW_SECONDS = 24 * 60 * 60
 _MAX_UNKNOWN_SESSION_RETRIES = 4096
-_ownership_retry_clock = time.monotonic
+_ownership_retry_clock = time.time
 
 
 class _UnknownSessionRetries:
     """Bounded, host-scoped observation window, shared by request threads.
 
-    Restart or eviction resets the window conservatively, extending retries
-    instead of risking a fresh session's events. No event content is retained.
+    The central control store persists the production window, so a hub restart
+    cannot indefinitely extend a missing session's retry period.  The optional
+    in-memory mode exists only for focused unit tests.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, registry: HarnessRegistry | None = None) -> None:
+        self._registry = registry
         self._first_seen: dict[tuple[str, str], float] = {}
         self._lock = threading.Lock()
 
     def expired(self, host_id: str, session_id: str) -> bool:
         key = (host_id, session_id)
         now = _ownership_retry_clock()
+        if self._registry is not None:
+            return self._registry.unknown_session_retry_expired(
+                host_id, session_id, now, max_entries=_MAX_UNKNOWN_SESSION_RETRIES
+            )
         with self._lock:
             if key not in self._first_seen:
                 if len(self._first_seen) >= _MAX_UNKNOWN_SESSION_RETRIES:
@@ -117,6 +123,9 @@ class _UnknownSessionRetries:
             return now - self._first_seen[key] >= _UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
 
     def forget(self, host_id: str, session_id: str) -> None:
+        if self._registry is not None:
+            self._registry.forget_unknown_session_retry(host_id, session_id)
+            return
         with self._lock:
             self._first_seen.pop((host_id, session_id), None)
 
@@ -2558,6 +2567,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             # only that session; expired orphans are skipped without trusting
             # their claimed owner.
             known_events = []
+            duplicate_ids = registry.existing_structured_event_ids(
+                [str(event["event_id"]) for event in events]
+            )
+            duplicates = 0
+            orphaned_sessions: list[str] = []
             skipped = 0
             for event in events:
                 session_id = str(event["session_id"])
@@ -2567,6 +2581,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     return
                 session = registry.get_session(session_id)
                 if session is None:
+                    if str(event["event_id"]) in duplicate_ids:
+                        duplicates += 1
+                        continue
                     if not self.unknown_session_retries.expired(
                         credential.host_id, session_id
                     ):
@@ -2574,6 +2591,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                             pending_sessions.append(session_id)
                         continue
                     skipped += 1
+                    if session_id not in orphaned_sessions:
+                        orphaned_sessions.append(session_id)
                     log.debug(
                         "skipping expired orphan event route=/harness/events "
                         "session_id=%s credential_host_id=%s",
@@ -2608,8 +2627,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 return
             events = known_events
             if skipped:
-                log.warning(
-                    "structured event ingest skipped expired orphan sessions: "
+                log.info(
+                    "structured event ingest acknowledged orphan sessions: "
                     "route=/harness/events events=%d credential_host_id=%s",
                     skipped,
                     credential.host_id,
@@ -2646,6 +2665,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             result["pending"] = pending_sessions
         if skipped:
             result["skipped"] = skipped
+        if self.auth.enabled and duplicates:
+            result["duplicates"] = duplicates
+        if self.auth.enabled and orphaned_sessions:
+            result["orphaned"] = orphaned_sessions
         self._send(200, "application/json", json.dumps(result) + "\n")
 
     def _handle_login(self) -> None:
@@ -3476,6 +3499,7 @@ def _metrics_handler(
     from drover.server.relay_manager import RelayManager
 
     collector.relay_manager = RelayManager()
+    registry_path = getattr(collector, "duckdb_path", None)
     return type(
         "DroverMetricsHandler",
         (_MetricsHandler,),
@@ -3485,7 +3509,9 @@ def _metrics_handler(
             "pairing": pairing,
             "analytics_boundary": analytics_boundary,
             "host_data_bridge_token": host_data_bridge_token,
-            "unknown_session_retries": _UnknownSessionRetries(),
+            "unknown_session_retries": _UnknownSessionRetries(
+                HarnessRegistry(registry_path) if registry_path is not None else None
+            ),
             "analytical_slots": _request_slots("DROVER_ANALYTICAL_HTTP_CONCURRENCY", 1),
             "metrics_slots": threading.BoundedSemaphore(ANALYTICS_METRICS_CONCURRENCY),
             "mutation_slots": threading.BoundedSemaphore(
