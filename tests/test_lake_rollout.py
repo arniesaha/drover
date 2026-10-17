@@ -269,6 +269,7 @@ def test_cli_emits_failed_verdict_for_invalid_job(tmp_path):
 
     path = tmp_path / "com.drover.server.plist"
     path.write_bytes(plistlib.dumps(["/example/drover-server", "run"]))
+    (tmp_path / "blue").mkdir()
     result = CliRunner().invoke(
         cutover_cmd,
         [
@@ -290,7 +291,10 @@ def test_cli_emits_failed_verdict_for_invalid_job(tmp_path):
         ],
     )
     assert result.exit_code == 2
-    assert json.loads(result.output)["passed"] is False
+    document = json.loads(result.output)
+    assert document["passed"] is False
+    assert document["error"] == "release preflight input invalid"
+    assert document["detail"].startswith("ValueError:")
 
 
 def test_preflight_rejects_service_outside_checked_runtime(tmp_path):
@@ -417,6 +421,7 @@ def test_cli_emits_failed_verdict_for_malformed_xml(tmp_path):
 
     path = tmp_path / "com.drover.server.plist"
     path.write_text('<?xml version="1.0"?><plist><dict>')
+    (tmp_path / "blue").mkdir()
     result = CliRunner().invoke(
         cutover_cmd,
         [
@@ -438,4 +443,144 @@ def test_cli_emits_failed_verdict_for_malformed_xml(tmp_path):
         ],
     )
     assert result.exit_code == 2
-    assert json.loads(result.output)["passed"] is False
+    document = json.loads(result.output)
+    assert document["passed"] is False
+    assert document["error"] == "release preflight input invalid"
+    assert document["detail"].startswith("ValueError:")
+
+
+def _release_preflight_input_args(tmp_path):
+    from drover.server.service_units import render_launchd
+
+    lake_root = tmp_path / "lake root"
+    (lake_root / "blue").mkdir(parents=True)
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    plist = tmp_path / "com.drover.server.plist"
+    plist.write_text(
+        render_launchd(
+            "com.drover.server",
+            "/example/drover-server",
+            ["--config", str(tmp_path / "config.toml"), "run"],
+            home=tmp_path / "home",
+            path_entries=["/usr/bin"],
+        )
+    )
+    return {
+        "lake_root": lake_root,
+        "plist": plist,
+        "backup": backup,
+        "wheel_sha256": "a" * 64,
+        "lock_sha256": "b" * 64,
+    }
+
+
+def _invoke_release_preflight(runner, arguments, *, env=None, **values):
+    from drover.server.lake.cutover_cli import cutover_cmd
+
+    return runner.invoke(
+        cutover_cmd,
+        [
+            "release-preflight",
+            "--lake",
+            "blue",
+            "--lake-root",
+            str(values["lake_root"]),
+            "--plist",
+            str(values["plist"]),
+            "--release",
+            "0.6.5",
+            "--wheel-sha256",
+            values["wheel_sha256"],
+            "--lock-sha256",
+            values["lock_sha256"],
+            "--backup",
+            str(values["backup"]),
+            *arguments,
+        ],
+        env=env,
+    )
+
+
+def test_release_preflight_missing_plist_names_the_input(tmp_path):
+    from click.testing import CliRunner
+
+    values = _release_preflight_input_args(tmp_path)
+    values["plist"] = tmp_path / "missing.plist"
+    result = _invoke_release_preflight(CliRunner(), [], **values)
+
+    document = json.loads(result.output)
+    assert result.exit_code == 2
+    assert document["error"] == "release preflight input invalid"
+    assert document["detail"] == (
+        f"FileNotFoundError: plist path does not exist: {values['plist']}"
+    )
+
+
+def test_release_preflight_missing_backup_names_the_input(tmp_path):
+    from click.testing import CliRunner
+
+    values = _release_preflight_input_args(tmp_path)
+    values["backup"] = tmp_path / "missing-backup"
+    result = _invoke_release_preflight(CliRunner(), [], **values)
+
+    document = json.loads(result.output)
+    assert result.exit_code == 2
+    assert document["error"] == "release preflight input invalid"
+    assert document["detail"] == (
+        f"FileNotFoundError: backup path does not exist: {values['backup']}"
+    )
+
+
+def test_release_preflight_malformed_sha_names_the_input(tmp_path):
+    from click.testing import CliRunner
+
+    values = _release_preflight_input_args(tmp_path)
+    values["wheel_sha256"] = "not-a-sha"
+    result = _invoke_release_preflight(CliRunner(), [], **values)
+
+    document = json.loads(result.output)
+    assert result.exit_code == 2
+    assert document["error"] == "release preflight input invalid"
+    assert (
+        document["detail"]
+        == "ValueError: wheel sha256 must be 64 hexadecimal characters"
+    )
+
+
+def test_release_preflight_missing_lake_root_names_the_input(tmp_path):
+    from click.testing import CliRunner
+
+    values = _release_preflight_input_args(tmp_path)
+    values["lake_root"] = tmp_path / "missing-lake-root"
+    result = _invoke_release_preflight(CliRunner(), [], **values)
+
+    document = json.loads(result.output)
+    assert result.exit_code == 2
+    assert document["error"] == "release preflight input invalid"
+    assert document["detail"] == (
+        f"FileNotFoundError: lake root does not exist: {values['lake_root']}"
+    )
+
+
+def test_release_preflight_input_error_redacts_token_and_dsn(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from drover.server.lake import rollout
+
+    values = _release_preflight_input_args(tmp_path)
+    token = "device-token-that-must-not-leak"
+    dsn = "postgresql://release:dsn-password@db.example.test/drover"
+
+    def invalid_input(*args, **kwargs):
+        raise ValueError(f"token={token} dsn={dsn} password=dsn-password")
+
+    monkeypatch.setattr(rollout, "run_release_preflight", invalid_input)
+    result = _invoke_release_preflight(
+        CliRunner(), [], **values, env={"DROVER_RELEASE_GATE_DEVICE_TOKEN": token}
+    )
+
+    assert result.exit_code == 2
+    assert token not in result.output
+    assert dsn not in result.output
+    assert "dsn-password" not in result.output

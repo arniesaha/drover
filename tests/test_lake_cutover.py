@@ -488,7 +488,9 @@ def test_preflight_cli_reports_an_unreadable_plist_as_exit_2(tmp_path):
     )
     assert result.exit_code == 2, result.output
     document = json.loads(result.output)
-    assert document["kind"] == "preflight" and "plist unreadable" in document["error"]
+    assert document["kind"] == "preflight"
+    assert document["error"] == "preflight input invalid"
+    assert document["detail"].startswith("FileNotFoundError:")
 
 
 # --- backup, flip, procedures ----------------------------------------------
