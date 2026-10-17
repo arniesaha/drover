@@ -2640,10 +2640,17 @@ class HarnessRegistry:
                         )
                 con.execute(
                     "INSERT INTO harness_unknown_session_retries "
-                    "(host_id, session_id, first_seen_at) VALUES (?, ?, ?)",
+                    "(host_id, session_id, first_seen_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT (host_id, session_id) DO NOTHING",
                     [host_id, session_id, now],
                 )
-                return False
+                row = con.execute(
+                    "SELECT first_seen_at FROM harness_unknown_session_retries "
+                    "WHERE host_id = ? AND session_id = ?",
+                    [host_id, session_id],
+                ).fetchone()
+        if row is None:
+            return False
         return now - float(row[0]) >= 24 * 60 * 60
 
     def forget_unknown_session_retry(self, host_id: str, session_id: str) -> None:
