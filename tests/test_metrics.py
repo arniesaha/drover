@@ -2312,9 +2312,12 @@ def test_content_consent_reports_partial_and_revoke_fails_on_reachable_nack(
 
     class _NackRelay(_FakeRelay):
         def request(self, host_id, method, path, body, timeout_s=15):
-            return 409, '{"error":"epoch conflict"}'
+            self.calls.append((host_id, method, path, body))
+            self.timeouts.append(timeout_s)
+            return 409, '{"error":"stale consent epoch"}'
 
-    collector.relay_manager = _NackRelay()
+    relay = _NackRelay()
+    collector.relay_manager = relay
 
     enabled_status, enabled_body = collector.consent_content_analysis(
         {"backend": "local"}
@@ -2322,9 +2325,173 @@ def test_content_consent_reports_partial_and_revoke_fails_on_reachable_nack(
     revoked_status, revoked_body = collector.revoke_content_analysis({})
 
     assert enabled_status == 207
-    assert json.loads(enabled_body)["propagation"] == "failed"
+    enabled = json.loads(enabled_body)
+    assert enabled["propagation"] == "failed"
+    assert enabled["hosts"] == [
+        {
+            "host_id": "laptop",
+            "state": "failed",
+            "error": "stale consent epoch: host epoch unavailable, central sent 1",
+            "reason": "stale consent epoch: host epoch unavailable, central sent 1",
+            "reason_code": "stale_consent_epoch",
+        }
+    ]
     assert revoked_status == 503
-    assert json.loads(revoked_body)["propagation"] == "failed"
+    revoked = json.loads(revoked_body)
+    assert revoked["propagation"] == "failed"
+    assert revoked["hosts"][0]["error"] == (
+        "stale consent epoch: host epoch unavailable, central sent 2"
+    )
+    # An old daemon has no structured epoch, so central reports the reason
+    # without repeatedly retrying an impossible reconciliation.
+    assert len(relay.calls) == 2
+
+
+def test_central_content_consent_reconciles_newer_host_epoch_once(tmp_path) -> None:
+    """A stale host response advances central then receives exactly one retry."""
+
+    from drover.server.control_consent import ContentConsentState
+
+    class _CentralConsent:
+        def __init__(self):
+            self.value = ContentConsentState(False, 1, "local", False)
+            self.advanced_past: list[int] = []
+
+        def state(self):
+            return self.value
+
+        def advance_past_host_epoch(self, epoch):
+            self.advanced_past.append(epoch)
+            self.value = ContentConsentState(
+                False, max(self.value.epoch, epoch) + 1, "local", False
+            )
+            return self.value
+
+    central = _CentralConsent()
+    calls = []
+
+    def propagate(enabled, epoch):
+        calls.append((enabled, epoch))
+        if len(calls) == 1:
+            return [
+                {
+                    "host_id": "nas",
+                    "state": "failed",
+                    "error": "stale consent epoch: host at 2, central sent 1",
+                    "reason_code": "stale_consent_epoch",
+                    "current_epoch": 2,
+                }
+            ]
+        return [{"host_id": "nas", "state": "acknowledged"}]
+
+    service = InsightsService(
+        _make_collector(tmp_path).duckdb_path,
+        config_path=tmp_path / "config.toml",
+        consent_propagator=propagate,
+        central_consent=central,
+    )
+
+    status = service.content_analysis_status()
+
+    assert central.advanced_past == [2]
+    assert calls == [(False, 1), (False, 3)]
+    assert status["consent_epoch"] == 3
+    assert status["propagation"] == "complete"
+    assert status["hosts"] == [{"host_id": "nas", "state": "acknowledged"}]
+
+
+def test_central_content_consent_accepts_matching_newer_host_before_retry(
+    tmp_path,
+) -> None:
+    """A host already at central's desired policy is converged, never failed."""
+
+    from drover.server.control_consent import ContentConsentState
+
+    class _CentralConsent:
+        def __init__(self):
+            self.value = ContentConsentState(False, 1, "local", False)
+
+        def state(self):
+            return self.value
+
+        def advance_past_host_epoch(self, epoch):
+            self.value = ContentConsentState(
+                False, max(self.value.epoch, epoch) + 1, "local", False
+            )
+            return self.value
+
+    central = _CentralConsent()
+    calls = []
+
+    def propagate(enabled, epoch):
+        calls.append((enabled, epoch))
+        if len(calls) == 1:
+            return [
+                {
+                    "host_id": "nas",
+                    "state": "acknowledged",
+                    "error": "stale consent epoch: host at 2, central sent 1",
+                    "reason_code": "stale_consent_epoch",
+                    "current_epoch": 2,
+                }
+            ]
+        return [{"host_id": "nas", "state": "acknowledged"}]
+
+    service = InsightsService(
+        _make_collector(tmp_path).duckdb_path,
+        config_path=tmp_path / "config.toml",
+        consent_propagator=propagate,
+        central_consent=central,
+    )
+
+    status = service.content_analysis_status()
+
+    assert calls == [(False, 1), (False, 3)]
+    assert status["propagation"] == "complete"
+    assert status["hosts"] == [{"host_id": "nas", "state": "acknowledged"}]
+
+
+def test_stale_matching_host_state_is_acknowledged_with_reconciliation_detail(
+    tmp_path,
+) -> None:
+    """A newer host with the desired state is not reported as a failure."""
+
+    collector = _make_collector(tmp_path)
+    HarnessRegistry(collector.duckdb_path).register_host(
+        host_id="nas",
+        display_name="NAS",
+        kind="linux",
+        connection_kind="relay",
+    )
+
+    class _MatchingEpochRelay(_FakeRelay):
+        def is_live(self, host_id: str) -> bool:
+            return host_id == "nas"
+
+        def request(self, host_id, method, path, body, timeout_s=15):
+            self.calls.append((host_id, method, path, body))
+            return 409, json.dumps(
+                {
+                    "error": "stale consent epoch",
+                    "code": "stale_consent_epoch",
+                    "current_epoch": 2,
+                    "current_enabled": False,
+                }
+            )
+
+    collector.relay_manager = _MatchingEpochRelay()
+    host = collector._harness_host("nas")
+
+    result = collector._push_content_consent(host, {"enabled": False, "epoch": 1})
+
+    assert result == {
+        "host_id": "nas",
+        "state": "acknowledged",
+        "error": "stale consent epoch: host at 2, central sent 1",
+        "reason": "stale consent epoch: host at 2, central sent 1",
+        "reason_code": "stale_consent_epoch",
+        "current_epoch": 2,
+    }
 
 
 def test_offline_registered_host_keeps_consent_and_revoke_partial(tmp_path) -> None:

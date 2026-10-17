@@ -2080,6 +2080,15 @@ def test_running_harnessd_applies_live_consent_and_revoke_without_restart(tmp_pa
 
         with post("/advisory/content-consent", {"enabled": False, "epoch": 8}) as res:
             assert json.loads(res.read()) == {"enabled": False, "epoch": 8}
+        with pytest.raises(urllib.error.HTTPError) as stale:
+            post("/advisory/content-consent", {"enabled": True, "epoch": 7})
+        assert stale.value.code == 409
+        assert json.loads(stale.value.read()) == {
+            "error": "stale consent epoch",
+            "code": "stale_consent_epoch",
+            "current_epoch": 8,
+            "current_enabled": False,
+        }
         with pytest.raises(urllib.error.HTTPError) as revoked:
             post("/advisory/content-bundle", {"target_ids": ["AGENTS.md"]})
         assert revoked.value.code == 403
