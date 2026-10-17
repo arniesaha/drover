@@ -527,6 +527,13 @@ private func totalsPresentation(_ activity: ActivitySummary) -> ActivityTotalsPr
     #expect(value.coverageText == "5.8% token coverage")
 }
 
+@Test func tokenHeadlineCombinesCompactTokensAndSessionCoverage() {
+    let activity = totalsFixture(tokenPercent: 19.3)
+    let value = totalsPresentation(activity)
+
+    #expect(value.tokenHeadlineText == "63M tokens · from 19% of sessions")
+}
+
 @Test func coverageLineSaysSoWhenTokenCoverageIsUnknown() {
     let activity = totalsFixture(tokenPercent: nil, costPercent: 5.0)
 
@@ -621,6 +628,41 @@ private let populatedProjects = #"[{"project_key":"arniesaha/drover","session_co
     #expect(AnalyticsContributorPresentation(
         values: ["codex", "agy"], attributedSessionCount: 2, totalSessionCount: 2
     ).text == "codex, agy")
+}
+
+@Test func projectContributorsAvoidsDuplicatedGapsAndStatesGapOncePerRow() {
+    // Harness has empty string, host has missing attribution: gap stated ONCE without duplicate or leading middot
+    let rowWithHost = ProjectContributorsPresentation(
+        harnesses: [""],
+        harnessAttributedSessionCount: 82,
+        hosts: ["Arnabs-Mac-Studio"],
+        hostAttributedSessionCount: 82,
+        totalSessionCount: 124,
+        tokenAttributedSessionCount: 82
+    )
+    #expect(rowWithHost.text == "Arnabs-Mac-Studio · tokens unavailable for 42 of 124 sessions")
+
+    // Both harnesses and hosts empty: stated ONCE, capitalized
+    let emptyRow = ProjectContributorsPresentation(
+        harnesses: [],
+        harnessAttributedSessionCount: 0,
+        hosts: [],
+        hostAttributedSessionCount: 0,
+        totalSessionCount: 5,
+        tokenAttributedSessionCount: 0
+    )
+    #expect(emptyRow.text == "Tokens unavailable for 5 of 5 sessions")
+
+    // Fully attributed row: lists contributors cleanly
+    let completeRow = ProjectContributorsPresentation(
+        harnesses: ["claude-code"],
+        harnessAttributedSessionCount: 10,
+        hosts: ["Mac-Studio"],
+        hostAttributedSessionCount: 10,
+        totalSessionCount: 10,
+        tokenAttributedSessionCount: 10
+    )
+    #expect(completeRow.text == "claude-code · Mac-Studio")
 }
 
 private func decodeActivitySection(

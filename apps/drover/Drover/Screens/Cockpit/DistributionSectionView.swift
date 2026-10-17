@@ -10,8 +10,32 @@ import SwiftUI
 struct DistributionSectionView: View {
     let section: DistributionSectionPresentation
     let glyph: String
-    let onToggleRank: () -> Void
+    let onSelectRank: (DistributionRank) -> Void
     var trailing: AnyView?
+
+    init(
+        section: DistributionSectionPresentation,
+        glyph: String,
+        onSelectRank: @escaping (DistributionRank) -> Void,
+        trailing: AnyView? = nil
+    ) {
+        self.section = section
+        self.glyph = glyph
+        self.onSelectRank = onSelectRank
+        self.trailing = trailing
+    }
+
+    init(
+        section: DistributionSectionPresentation,
+        glyph: String,
+        onToggleRank: @escaping () -> Void,
+        trailing: AnyView? = nil
+    ) {
+        self.section = section
+        self.glyph = glyph
+        self.onSelectRank = { _ in onToggleRank() }
+        self.trailing = trailing
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -21,20 +45,18 @@ struct DistributionSectionView: View {
             FlowLayout(spacing: 8, lineSpacing: 4) {
                 Text(section.title)
                     .droverText(.h3)
-                // Naming the ranking and offering the other in one control:
-                // sessions and tokens disagree constantly, and the screen
-                // should let you see that rather than pick one silently.
+                // A segmented "Sessions | Tokens" control that displays the
+                // active rank across all dimensions.
                 if section.showsRankToggle {
-                    Button(action: onToggleRank) {
-                        Label(section.rank.toggleTitle, systemImage: "arrow.up.arrow.down")
-                            .font(.system(.caption, design: .default, weight: .medium))
-                            .foregroundStyle(DroverColor.accentHi)
-                            .padding(.horizontal, 10)
-                            .frame(minHeight: 32)
-                            .contentShape(Rectangle())
+                    Picker("Ranking metric", selection: Binding(
+                        get: { section.rank },
+                        set: { onSelectRank($0) }
+                    )) {
+                        Text("Sessions").tag(DistributionRank.sessions)
+                        Text("Tokens").tag(DistributionRank.tokens)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Rank by \(section.rank.other.noun)")
+                    .pickerStyle(.segmented)
+                    .frame(width: 170)
                     .accessibilityIdentifier("analytics-rank-toggle-\(section.title.lowercased())")
                 }
             }

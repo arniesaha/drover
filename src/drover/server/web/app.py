@@ -237,6 +237,7 @@ _COCKPIT_QUERY_FIELDS = frozenset(
         "model",
         "project_key",
         "limit",
+        "metric",
         "project_cursor",
         "harness_cursor",
         "host_cursor",

@@ -6,7 +6,10 @@ public struct AnalyticsContributorPresentation: Sendable, Equatable {
     public init(
         values: [String], attributedSessionCount: Int, totalSessionCount: Int
     ) {
-        let known = values.isEmpty ? nil : values.joined(separator: ", ")
+        let cleanValues = values
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let known = cleanValues.isEmpty ? nil : cleanValues.joined(separator: ", ")
         let unavailable = max(0, totalSessionCount - attributedSessionCount)
         guard unavailable > 0 else {
             text = known ?? "Unavailable"
@@ -14,6 +17,73 @@ public struct AnalyticsContributorPresentation: Sendable, Equatable {
         }
         let missing = "unavailable for \(unavailable) session\(unavailable == 1 ? "" : "s")"
         text = known.map { "\($0) · \(missing)" } ?? missing.prefix(1).uppercased() + missing.dropFirst()
+    }
+}
+
+public struct ProjectContributorsPresentation: Sendable, Equatable {
+    public let text: String
+
+    public init(
+        harnesses: [String],
+        harnessAttributedSessionCount: Int,
+        hosts: [String],
+        hostAttributedSessionCount: Int,
+        totalSessionCount: Int,
+        tokenAttributedSessionCount: Int? = nil
+    ) {
+        let cleanHarnesses = harnesses
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let cleanHosts = hosts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let harnessStr = cleanHarnesses.isEmpty ? nil : cleanHarnesses.joined(separator: ", ")
+        let hostStr = cleanHosts.isEmpty ? nil : cleanHosts.joined(separator: ", ")
+
+        let known: String?
+        if let harnessStr, let hostStr {
+            known = "\(harnessStr) · \(hostStr)"
+        } else {
+            known = harnessStr ?? hostStr
+        }
+
+        let tokenGap = tokenAttributedSessionCount.map { max(0, totalSessionCount - $0) } ?? 0
+        let harnessGap = max(0, totalSessionCount - harnessAttributedSessionCount)
+        let hostGap = max(0, totalSessionCount - hostAttributedSessionCount)
+        let maxAttributionGap = max(harnessGap, hostGap)
+
+        let gapPhrase: String?
+        if tokenGap > 0 {
+            let noun = totalSessionCount == 1 ? "session" : "sessions"
+            gapPhrase = "tokens unavailable for \(tokenGap) of \(totalSessionCount) \(noun)"
+        } else if maxAttributionGap > 0 {
+            let noun = totalSessionCount == 1 ? "session" : "sessions"
+            gapPhrase = "unavailable for \(maxAttributionGap) of \(totalSessionCount) \(noun)"
+        } else {
+            gapPhrase = nil
+        }
+
+        if let known, let gapPhrase {
+            text = "\(known) · \(gapPhrase)"
+        } else if let known {
+            text = known
+        } else if let gapPhrase {
+            text = gapPhrase.prefix(1).uppercased() + gapPhrase.dropFirst()
+        } else {
+            text = "Unavailable"
+        }
+    }
+
+    public init(project: ProjectActivity) {
+        self.init(
+            harnesses: project.harnesses,
+            harnessAttributedSessionCount: project.harnessAttributedSessionCount,
+            hosts: project.hosts,
+            hostAttributedSessionCount: project.hostAttributedSessionCount,
+            totalSessionCount: project.sessionCount,
+            tokenAttributedSessionCount: project.tokenAttributedSessionCount
+        )
     }
 }
 
@@ -133,6 +203,9 @@ public struct ActivityTotalsPresentation: Sendable, Equatable {
     /// token figure left the less-covered number looking like a total. Says it
     /// twice only when the two actually differ.
     public let coverageText: String
+    /// Headline token count and coverage formatted for glance scanning:
+    /// "831M tokens · from 19% of sessions".
+    public let tokenHeadlineText: String
 
     /// `locale` is injected only so the wording can be asserted: the currency
     /// style disambiguates against the reader's region, so the same $0.59
@@ -150,6 +223,12 @@ public struct ActivityTotalsPresentation: Sendable, Equatable {
             ? "\(Self.costLabel) cost not reported"
             : "\(value) \(Self.costLabel) cost"
         coverageText = Self.coverageText(coverage)
+        let compact = CompactNumber.abbreviated(totals.totalTokens)
+        if let tokens = coverage.tokenPercent {
+            tokenHeadlineText = "\(compact) tokens · from \(Int(tokens.rounded()))% of sessions"
+        } else {
+            tokenHeadlineText = "\(compact) tokens"
+        }
     }
 
     /// Zero cost across sessions that definitely ran is not a bill of nothing,
@@ -638,15 +717,19 @@ public struct ProjectActivityPresentation: Sendable, Equatable {
             exactValueText = sessions
             metricText = "Ranked by sessions"
         }
-        coverageText = tokenCoveragePercent.map {
-            "\(Self.percent($0))% token coverage"
-        } ?? "Token coverage unavailable"
+        coverageText = Self.coverageText(for: tokenCoveragePercent)
 
         let harnesses = project.harnesses.joined(separator: ", ")
         let hosts = project.hosts.joined(separator: ", ")
         contributorsText = [harnesses, hosts]
             .filter { !$0.isEmpty }
             .joined(separator: " · ")
+    }
+
+    public static func coverageText(for tokenCoveragePercent: Double?) -> String {
+        tokenCoveragePercent.map {
+            "\(percent($0))% token coverage"
+        } ?? "Token coverage unavailable"
     }
 
     private static func integer(_ value: Int) -> String {

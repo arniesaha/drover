@@ -212,7 +212,7 @@ struct AnalyticsView: View {
                         analyticsMetric(
                             CompactNumber.abbreviated(activity.totals.totalTokens),
                             "Tokens",
-                            accessibilityText: "\(CompactNumber.exact(activity.totals.totalTokens)) tokens",
+                            accessibilityText: totals.tokenHeadlineText,
                             exactValue: "\(CompactNumber.exact(activity.totals.totalTokens)) tokens"
                         )
                         // This screen prints the figures in full, so it is the
@@ -309,7 +309,11 @@ struct AnalyticsView: View {
         DistributionSectionView(
             section: section,
             glyph: glyph,
-            onToggleRank: { rank = rank.other },
+            onSelectRank: { newRank in
+                guard rank != newRank else { return }
+                rank = newRank
+                Task { await reload() }
+            },
             trailing: AnyView(paginationControls(dimension))
         )
         .accessibilityIdentifier("analytics-distribution-\(dimension.rawValue)")
@@ -349,27 +353,7 @@ struct AnalyticsView: View {
     /// Who touched this project. Unlike source/freshness/coverage this is
     /// different on every row, so it is not what the redesign collapses.
     private func projectContributors(_ value: ProjectActivity) -> String {
-        let harnesses = contributors(
-            value.harnesses,
-            attributedSessionCount: value.harnessAttributedSessionCount,
-            totalSessionCount: value.sessionCount
-        )
-        let hosts = contributors(
-            value.hosts,
-            attributedSessionCount: value.hostAttributedSessionCount,
-            totalSessionCount: value.sessionCount
-        )
-        return "\(harnesses) · \(hosts)"
-    }
-
-    private func contributors(
-        _ values: [String], attributedSessionCount: Int, totalSessionCount: Int
-    ) -> String {
-        AnalyticsContributorPresentation(
-            values: values,
-            attributedSessionCount: attributedSessionCount,
-            totalSessionCount: totalSessionCount
-        ).text
+        ProjectContributorsPresentation(project: value).text
     }
 
     private func analyticsMetric(
@@ -393,7 +377,7 @@ struct AnalyticsView: View {
     private func reload() async {
         await store.loadAnalytics(filters: AnalyticsFilters(
             days: days, hostID: host, harness: harness, provider: provider,
-            model: model, projectKey: project
+            model: model, projectKey: project, metric: rank
         ))
     }
 
