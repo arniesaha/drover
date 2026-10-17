@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.18] - 2026-10-17
+
+### Fixed
+
+- Hub startup no longer binds the legacy Parquet views when `analytics.backend = "ducklake"`. That step resolved the broad Parquet globs and scanned every historical span in the hub process, taking the Studio hub from 1.83 to 5.13 GiB at startup for views a DuckLake hub never reads. `scripts/measure_hub_memory.py` now measures RSS through the `/cockpit/overview`, `/analytics` and `/insights` HTTP paths; findings are in `docs/operations/hub-rss-466.md` (#466, #670).
+- Replayed events for pruned sessions are acknowledged instead of retried forever. The hub acks events whose `event_id` already exists centrally even when the session row is gone, persists the unknown-session retry window in the control DB so restarts don't reset it, and returns an explicit orphaned list after 24h. harnessd marks acked or orphaned ledger rows reconciled and logs one info line per orphaned session instead of a warning per batch. New counter `drover_harness_orphaned_events_total` (#669, #671).
+- Analytics: the Sessions | Tokens ranking toggle works. The client now sends a `metric` parameter that flows through the analytics boundary allowlist into the DuckDB ordering and cursor, so top-N pages follow the selection. Token figures use compact K/M/B units, coverage text appears once per row, and Popular Projects coverage is computed across all projects (#672).
+
+### Upgrade notes
+
+- Control DB migration 20 (additive: new `harness_unknown_session_retries` table and a `reconciled_at` column on the harnessd ledger). No lake migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`). iOS changes ship in the next TestFlight build.
+
 ## [0.6.17] - 2026-10-17
 
 ### Fixed
