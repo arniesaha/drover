@@ -2268,18 +2268,28 @@ def test_analytics_metric_filter_re_ranks_dimensions_and_projects():
             )
 
         # Ranked by sessions: host-b, harness-y, beta first
-        by_sessions = activity_analytics(con, AnalyticsFilters(days=7, metric="sessions"), spans_enabled=True)
+        by_sessions = activity_analytics(
+            con, AnalyticsFilters(days=7, metric="sessions"), spans_enabled=True
+        )
         assert by_sessions.project_metric == "sessions"
         assert [h.key for h in by_sessions.hosts] == ["host-b", "host-a"]
         assert [h.key for h in by_sessions.harnesses] == ["harness-y", "harness-x"]
-        assert [p.project_key for p in by_sessions.projects] == ["acme/beta", "acme/alpha"]
+        assert [p.project_key for p in by_sessions.projects] == [
+            "acme/beta",
+            "acme/alpha",
+        ]
 
         # Ranked by tokens: host-a, harness-x, alpha first
-        by_tokens = activity_analytics(con, AnalyticsFilters(days=7, metric="tokens"), spans_enabled=True)
+        by_tokens = activity_analytics(
+            con, AnalyticsFilters(days=7, metric="tokens"), spans_enabled=True
+        )
         assert by_tokens.project_metric == "tokens"
         assert [h.key for h in by_tokens.hosts] == ["host-a", "host-b"]
         assert [h.key for h in by_tokens.harnesses] == ["harness-x", "harness-y"]
-        assert [p.project_key for p in by_tokens.projects] == ["acme/alpha", "acme/beta"]
+        assert [p.project_key for p in by_tokens.projects] == [
+            "acme/alpha",
+            "acme/beta",
+        ]
         assert by_tokens.projects[0].token_attributed_session_count == 1
     finally:
         con.close()
