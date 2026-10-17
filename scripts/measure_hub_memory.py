@@ -1,10 +1,13 @@
-"""Busy-hub synthetic attribution probe (service calls, not a production RSS claim).
+"""Busy-hub synthetic RSS attribution probe (never reads production data).
 
 uv sync --extra dev; python scripts/measure_hub_memory.py --prepare /tmp/hub-probe
 DROVER_DUCKDB_MEMORY_DIAGNOSTICS=1 DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT=6GB \
-  python scripts/measure_hub_memory.py /tmp/hub-probe
-Uses the optional span workload; each measurement must use a fresh process.
-Use this script with compatible current sources, not pre-optional-span revisions.
+  python scripts/measure_hub_memory.py /tmp/hub-probe --minutes 5
+
+Starts the real local HTTP handler and alternates the two routes polled by the
+app: ``/cockpit/overview`` and ``/analytics``. The fixture is created only by
+``--prepare``; passing an existing directory to that command is refused. Each
+measurement must use a fresh process.
 """
 
 from __future__ import annotations
@@ -17,16 +20,24 @@ import runpy
 import threading
 import time
 import tracemalloc
+import urllib.request
 from pathlib import Path
+from sys import platform
 
 import duckdb
 import psutil
 import pyarrow as pa
 
-from drover.server.advisory.service import InsightFilters, InsightsService
-from drover.server.cockpit.analytics import AnalyticsFilters
+from drover.server.advisory.service import InsightsService
 from drover.server.cockpit.service import CockpitService
 from drover.server.db import open_duckdb_connection, sql_path_literal
+from drover.server.metrics import MetricsCollector
+from drover.server.process_memory import (
+    HUB_MEASUREMENT,
+    hub_memory_bytes,
+    process_footprint,
+)
+from drover.server.web.app import start_metrics_server
 
 
 def prepare(root, sessions, spans, files):
@@ -63,9 +74,31 @@ def prepare(root, sessions, spans, files):
     )
 
 
-def measure(root, live_reader=False):
+def _request(base: str, path: str) -> dict:
+    started = time.monotonic()
+    with urllib.request.urlopen(base + path, timeout=30) as response:
+        payload = json.loads(response.read())
+    return {
+        "path": path,
+        "status": response.status,
+        "seconds": round(time.monotonic() - started, 3),
+        "activity_status": payload["activity"]["status"],
+    }
+
+
+def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
+    """Exercise the HTTP poll paths and return a JSON-serializable report.
+
+    ``minutes=0`` is useful for the focused smoke test: it still makes one
+    request to each endpoint. Production-style runs use a positive duration
+    and sample before/after every request rather than treating a lifetime
+    high-water mark as current RSS.
+    """
+    if minutes < 0 or interval_seconds < 0:
+        raise ValueError("minutes and interval_seconds must be non-negative")
     logging.basicConfig(level=logging.INFO)
     tracemalloc.start(10)
+    baseline = tracemalloc.take_snapshot()
     process = psutil.Process()
     stop = threading.Event()
     peaks = {"parent_rss": 0, "children_rss": 0}
@@ -96,10 +129,22 @@ def measure(root, live_reader=False):
             else {}
         )
         current, peak = tracemalloc.get_traced_memory()
+        hub_bytes = hub_memory_bytes(process.pid)
+        footprint = process_footprint(process.pid) if platform == "darwin" else None
         samples.append(
             dict(
                 phase=phase,
                 rss=process.memory_info().rss,
+                hub_measurement=HUB_MEASUREMENT,
+                hub_memory=hub_bytes,
+                **(
+                    {
+                        "physical_footprint": footprint[0],
+                        "lifetime_peak_footprint": footprint[1],
+                    }
+                    if footprint is not None
+                    else {}
+                ),
                 python_traced=current,
                 python_peak=peak,
                 arrow=pa.total_allocated_bytes(),
@@ -115,6 +160,9 @@ def measure(root, live_reader=False):
             )
         )
 
+    server = None
+    service = None
+    requests = []
     try:
         sample("imports")
         # Retain the live instance as the runtime pin/background workers do.
@@ -137,34 +185,54 @@ def measure(root, live_reader=False):
             )
             if live_reader:
                 service._isolated_reader_supported = False
-            for index in range(3):
-                start = time.monotonic()
-                result = service.overview(AnalyticsFilters(days=7 + index))
-                assert result["activity"]["status"] == "ok", result["activity"]
-                sample(f"cockpit_{index}", live)
-                samples[-1]["seconds"] = time.monotonic() - start
-                insights.list_insights(InsightFilters())
-                sample(f"insights_{index}", live)
+            collector = MetricsCollector(
+                duckdb_path=root / "store.duckdb",
+                incoming_dir=root / "incoming",
+                summarizer_report={},
+            )
+            collector.cockpit_service = service
+            server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            deadline = time.monotonic() + minutes * 60
+            index = 0
+            # Always call both routes once. New day values avoid the cockpit
+            # response cache, then a timed run simulates continued app polls.
+            while index < 2 or time.monotonic() < deadline:
+                path = (
+                    f"/cockpit/overview?days={7 + index}"
+                    if index % 2 == 0
+                    else f"/analytics?days={7 + index}"
+                )
+                requests.append(_request(base, path))
+                assert requests[-1]["activity_status"] == "ok", requests[-1]
+                sample(f"request_{index}", live)
+                if interval_seconds:
+                    time.sleep(interval_seconds)
+                index += 1
             sample("idle", live)
         sample("closed")
     finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
         stop.set()
         thread.join()
-    print(
-        json.dumps(
-            dict(
-                synthetic=True,
-                workload=json.loads((root / "workload.json").read_text()),
-                duckdb_version=duckdb.__version__,
-                isolated_reader=service._isolated_reader_supported,
-                spans_enabled=True,
-                samples=samples,
-                python_top=[
-                    dict(bytes=x.size, count=x.count)
-                    for x in tracemalloc.take_snapshot().statistics("lineno")[:10]
-                ],
-            )
-        )
+    after = tracemalloc.take_snapshot()
+    return dict(
+        synthetic=True,
+        workload=json.loads((root / "workload.json").read_text()),
+        duckdb_version=duckdb.__version__,
+        isolated_reader=service is not None and service._isolated_reader_supported,
+        spans_enabled=True,
+        duration_minutes=minutes,
+        endpoint_requests=requests,
+        samples=samples,
+        # A diff, not merely the largest currently-live Python allocations:
+        # this identifies Python-side growth separately from native DuckDB RSS.
+        python_growth_top=[
+            dict(bytes=x.size_diff, count=x.count_diff, traceback=str(x.traceback))
+            for x in after.compare_to(baseline, "lineno")[:10]
+        ],
     )
 
 
@@ -180,10 +248,31 @@ if __name__ == "__main__":
         action="store_true",
         help="Exercise the non-clone foreground fallback",
     )
+    parser.add_argument(
+        "--minutes",
+        type=float,
+        default=1.0,
+        help="How long to poll after the required first request to each route.",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=1.0,
+        help="Delay between polls; zero is useful for a smoke run.",
+    )
     args = parser.parse_args()
     if min(args.sessions, args.spans, args.files) < 1:
         parser.error("sessions, spans and files must be positive")
     if args.prepare:
         prepare(args.root.resolve(), args.sessions, args.spans, args.files)
     else:
-        measure(args.root.resolve(), args.live_reader)
+        print(
+            json.dumps(
+                measure(
+                    args.root.resolve(),
+                    live_reader=args.live_reader,
+                    minutes=args.minutes,
+                    interval_seconds=args.interval_seconds,
+                )
+            )
+        )
