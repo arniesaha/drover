@@ -179,6 +179,12 @@ struct ProviderAccountCard: View {
                     }
                 }
 
+                ForEach(subscription.hosts.compactMap(\.detail), id: \.self) { detail in
+                    Text(detail)
+                        .droverText(.subtitle)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
                 if isExpanded {
                     Text(subscription.freshnessText).droverText(.subtitle)
                     ForEach(Array(subscription.windows.enumerated()), id: \.offset) { _, window in

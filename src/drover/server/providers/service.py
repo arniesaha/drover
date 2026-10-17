@@ -29,7 +29,9 @@ from drover.server.providers.types import (
 )
 
 FetchProviderUsage = Callable[[Any], Mapping[str, Any]]
-_SUCCESS_STATUSES = frozenset({"ok", "usage_unavailable", "observed_exhausted"})
+_SUCCESS_STATUSES = frozenset(
+    {"ok", "usage_unavailable", "not_configured", "observed_exhausted"}
+)
 
 
 def provider_operational_source_version(duckdb_path: str | Path, host_id: str) -> str:
@@ -459,7 +461,11 @@ class ProviderUsageService:
         con = open_duckdb_connection(self.duckdb_path)
         try:
             for snapshot in snapshots:
-                succeeded = snapshot.status in _SUCCESS_STATUSES
+                configured = snapshot.status != "not_configured"
+                succeeded = snapshot.status in _SUCCESS_STATUSES and (
+                    snapshot.error_category
+                    in {None, "no_usage_reported", "not_configured"}
+                )
                 con.execute(
                     """
                     INSERT INTO provider_connections (
@@ -468,9 +474,9 @@ class ProviderUsageService:
                       supports_account_discovery, supports_refresh,
                       capabilities_json, last_attempt_at, last_success_at,
                       error_category, updated_at
-                    ) VALUES (?, ?, ?, TRUE, ?, ?, TRUE, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (provider, account_label, host_id) DO UPDATE SET
-                      enabled = TRUE,
+                      enabled = excluded.enabled,
                       supports_usage = excluded.supports_usage,
                       supports_limits = excluded.supports_limits,
                       supports_account_discovery = TRUE,
@@ -478,7 +484,7 @@ class ProviderUsageService:
                       capabilities_json = excluded.capabilities_json,
                       last_attempt_at = excluded.last_attempt_at,
                       last_success_at = CASE
-                        WHEN excluded.error_category IS NULL
+                        WHEN excluded.enabled AND excluded.error_category IS NULL
                           THEN excluded.last_success_at
                         ELSE provider_connections.last_success_at
                       END,
@@ -489,6 +495,7 @@ class ProviderUsageService:
                         snapshot.provider,
                         snapshot.account_label,
                         snapshot.host_id,
+                        configured,
                         snapshot.status == "ok",
                         bool(snapshot.windows),
                         snapshot.status == "ok",

@@ -40,7 +40,12 @@ class ProviderUsageWindow:
 
 
 ProviderStatus = Literal[
-    "ok", "usage_unavailable", "stale", "error", "observed_exhausted"
+    "ok",
+    "usage_unavailable",
+    "not_configured",
+    "stale",
+    "error",
+    "observed_exhausted",
 ]
 
 
@@ -65,6 +70,7 @@ class ProviderAccountSnapshot:
         if self.status not in {
             "ok",
             "usage_unavailable",
+            "not_configured",
             "stale",
             "error",
             "observed_exhausted",

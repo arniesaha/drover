@@ -88,6 +88,7 @@ extension SectionEnvelope: Equatable where Value: Equatable {}
 public enum ProviderAccountStatus: String, Decodable, Sendable, Equatable {
     case ok
     case usageUnavailable = "usage_unavailable"
+    case notConfigured = "not_configured"
     case stale, error, unknown
 
     public init(from decoder: Decoder) throws {

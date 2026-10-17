@@ -11,19 +11,24 @@ import pytest
 from drover.server.providers.claude import ClaudeUsageProbe
 
 
-def _credentials(tmp_path, *, expires_at_ms: int = 4102444800000):
+def _credentials(
+    tmp_path,
+    *,
+    expires_at_ms: int = 4102444800000,
+    refresh_token: str | None = None,
+    refresh_expires_at_ms: int | None = None,
+):
+    oauth = {
+        "accessToken": "sk-test-token",
+        "expiresAt": expires_at_ms,
+        "subscriptionType": "max",
+    }
+    if refresh_token is not None:
+        oauth["refreshToken"] = refresh_token
+    if refresh_expires_at_ms is not None:
+        oauth["refreshTokenExpiresAt"] = refresh_expires_at_ms
     path = tmp_path / ".credentials.json"
-    path.write_text(
-        json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "sk-test-token",
-                    "expiresAt": expires_at_ms,
-                    "subscriptionType": "max",
-                }
-            }
-        )
-    )
+    path.write_text(json.dumps({"claudeAiOauth": oauth}))
     return path
 
 
@@ -207,7 +212,7 @@ def test_absurd_expires_at_returns_error_snapshot(tmp_path):
     assert snapshot.windows == ()
 
 
-def test_missing_credentials_file_is_unavailable_not_an_error(tmp_path):
+def test_missing_credentials_file_is_not_configured(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=tmp_path / "absent.json",
         opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
@@ -216,15 +221,20 @@ def test_missing_credentials_file_is_unavailable_not_an_error(tmp_path):
 
     snapshot = probe.read(host_id="work-laptop")
 
-    assert snapshot.status == "usage_unavailable"
-    assert snapshot.error_category == "not_authenticated"
+    assert snapshot.status == "not_configured"
+    assert snapshot.error_category == "not_configured"
     assert snapshot.windows == ()
 
 
-def test_expired_token_short_circuits_before_spending_a_request(tmp_path):
+def test_expired_access_token_with_valid_refresh_needs_claude_login_refresh(tmp_path):
     calls = []
     probe = ClaudeUsageProbe(
-        credentials_path=_credentials(tmp_path, expires_at_ms=1000),
+        credentials_path=_credentials(
+            tmp_path,
+            expires_at_ms=1000,
+            refresh_token="refresh-token",
+            refresh_expires_at_ms=4102444800000,
+        ),
         opener=lambda url, headers, timeout: calls.append(url) or (200, USAGE_BODY),
         keychain_reader=lambda: None,
     )
@@ -232,9 +242,27 @@ def test_expired_token_short_circuits_before_spending_a_request(tmp_path):
     snapshot = probe.read(host_id="mac-mini")
 
     assert snapshot.status == "usage_unavailable"
-    assert snapshot.error_category == "token_expired"
+    assert snapshot.error_category == "login_refresh_needed"
     # The point of this test: no request was made at all.
     assert calls == []
+
+
+def test_expired_access_and_refresh_tokens_need_a_new_claude_login(tmp_path):
+    probe = ClaudeUsageProbe(
+        credentials_path=_credentials(
+            tmp_path,
+            expires_at_ms=2000,
+            refresh_token="expired-refresh-token",
+            refresh_expires_at_ms=1000,
+        ),
+        opener=lambda *args: pytest.fail("must not call the network"),
+        keychain_reader=lambda: None,
+    )
+
+    snapshot = probe.read(host_id="nas")
+
+    assert snapshot.status == "usage_unavailable"
+    assert snapshot.error_category == "login_expired"
 
 
 @pytest.mark.parametrize("code", [401, 403])
@@ -380,9 +408,16 @@ def test_the_file_is_used_when_the_keychain_is_empty(tmp_path):
     assert seen["auth"] == "Bearer sk-test-token"
 
 
-def test_both_sources_expired_reports_token_expired(tmp_path):
+def test_both_sources_expired_reports_login_expired(tmp_path):
     expired_keychain = json.dumps(
-        {"claudeAiOauth": {"accessToken": "sk-old", "expiresAt": 1000}}
+        {
+            "claudeAiOauth": {
+                "accessToken": "sk-old",
+                "expiresAt": 1000,
+                "refreshToken": "expired-refresh-token",
+                "refreshTokenExpiresAt": 1000,
+            }
+        }
     )
     probe = ClaudeUsageProbe(
         credentials_path=_credentials(tmp_path, expires_at_ms=1000),
@@ -393,10 +428,10 @@ def test_both_sources_expired_reports_token_expired(tmp_path):
     snapshot = probe.read(host_id="mac-mini")
 
     assert snapshot.status == "usage_unavailable"
-    assert snapshot.error_category == "token_expired"
+    assert snapshot.error_category == "login_expired"
 
 
-def test_no_source_at_all_reports_not_authenticated(tmp_path):
+def test_no_source_at_all_reports_not_configured(tmp_path):
     probe = ClaudeUsageProbe(
         credentials_path=tmp_path / "absent.json",
         opener=lambda url, headers, timeout: pytest.fail("must not call the network"),
@@ -405,11 +440,11 @@ def test_no_source_at_all_reports_not_authenticated(tmp_path):
 
     snapshot = probe.read(host_id="work-laptop")
 
-    assert snapshot.status == "usage_unavailable"
-    assert snapshot.error_category == "not_authenticated"
+    assert snapshot.status == "not_configured"
+    assert snapshot.error_category == "not_configured"
 
 
-def test_a_keychain_that_prompts_or_fails_does_not_break_the_probe(tmp_path):
+def test_a_keychain_that_prompts_or_fails_is_not_configured(tmp_path):
     """A daemon without the Keychain grant must look like a host that was never
     signed in, not like breakage, and must never hang the refresh cycle."""
 
@@ -424,8 +459,8 @@ def test_a_keychain_that_prompts_or_fails_does_not_break_the_probe(tmp_path):
 
     snapshot = probe.read(host_id="mac-mini")
 
-    assert snapshot.status == "usage_unavailable"
-    assert snapshot.error_category == "not_authenticated"
+    assert snapshot.status == "not_configured"
+    assert snapshot.error_category == "not_configured"
 
 
 def test_the_keychain_secret_never_reaches_the_snapshot(tmp_path):
@@ -586,7 +621,7 @@ def test_redirect_is_refused_and_the_token_never_reaches_the_redirect_target(
 def test_expired_keychain_token_wins_over_an_unreadable_file(tmp_path):
     """When the Keychain holds an expired token AND the credentials file is
     unreadable, the file's protocol_error must not pre-empt the more
-    actionable token_expired the Keychain already told us about."""
+    actionable expired-login state the Keychain already told us about."""
     expired_keychain = json.dumps(
         {"claudeAiOauth": {"accessToken": "sk-old", "expiresAt": 1000}}
     )
@@ -602,10 +637,10 @@ def test_expired_keychain_token_wins_over_an_unreadable_file(tmp_path):
     snapshot = probe.read(host_id="mac-mini")
 
     assert snapshot.status == "usage_unavailable"
-    assert snapshot.error_category == "token_expired"
+    assert snapshot.error_category == "login_expired"
 
 
-def test_missing_file_with_empty_keychain_still_reports_not_authenticated(tmp_path):
+def test_missing_file_with_empty_keychain_still_reports_not_configured(tmp_path):
     """Guard against over-correcting the protocol_error fix: a genuinely
     absent file (FileNotFoundError) must still fall through to the next
     source, not be treated as an error."""
@@ -617,8 +652,8 @@ def test_missing_file_with_empty_keychain_still_reports_not_authenticated(tmp_pa
 
     snapshot = probe.read(host_id="mac-mini")
 
-    assert snapshot.status == "usage_unavailable"
-    assert snapshot.error_category == "not_authenticated"
+    assert snapshot.status == "not_configured"
+    assert snapshot.error_category == "not_configured"
 
 
 def _account(tmp_path, email=None, org=None, uuid=None, *, name=".claude.json"):
@@ -710,5 +745,5 @@ def test_the_label_is_reported_even_when_the_probe_fails(tmp_path):
         keychain_reader=lambda: None,
     ).read(host_id="work-laptop")
 
-    assert snapshot.status == "usage_unavailable"
+    assert snapshot.status == "not_configured"
     assert snapshot.account_label == "me@work.example"

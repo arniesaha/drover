@@ -788,6 +788,22 @@ private func providerAccount(
     #expect(label.hasPrefix("work-laptop"))
 }
 
+@Test func expiredClaudeLoginShowsTheRefreshInstructionOnItsHost() throws {
+    let accounts = try [
+        providerAccount(snapshot: "s1", provider: "anthropic", label: "Claude Code",
+                        host: "nas", status: "stale", observedAt: "2026-08-09T18:00:00Z",
+                        errorCategory: "login_refresh_needed"),
+    ]
+
+    let subscription = try #require(ProviderSubscriptionGrouping.group(
+        accounts, hostTitles: ["nas": "NAS"], now: accounts[0].observedAt
+    ).first)
+    let host = try #require(subscription.hosts.first)
+
+    #expect(host.detail == "Claude login on NAS needs a refresh: run `claude` once")
+    #expect(host.accessibilityLabel.contains("run `claude` once"))
+}
+
 @Test func aHealthySubscriptionCarriesNoHostError() throws {
     let accounts = try [
         providerAccount(snapshot: "s1", provider: "google", label: "Antigravity",
