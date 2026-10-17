@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import resource
 import runpy
 import subprocess
 import sys
@@ -160,10 +161,15 @@ def _growth_summary(samples: list[dict]) -> dict[str, dict[str, int]]:
 
 
 def _hub_lifetime_peak(pid: int) -> int:
-    """Kernel high-water mark on macOS; current budget measurement elsewhere."""
+    """Return this process's kernel lifetime memory high-water mark in bytes."""
     if platform == "darwin":
         return process_footprint(pid)[1]
-    return hub_memory_bytes(pid)
+    if pid != os.getpid():
+        raise ValueError("Linux lifetime peak is only available for this process")
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Darwin reports ru_maxrss in bytes, but macOS uses the more accurate
+    # physical-footprint high-water mark above. Linux reports KiB.
+    return peak * 1024 if platform.startswith("linux") else peak
 
 
 def _measure_startup_view_peak_mode(root: Path, *, legacy_views: bool) -> dict:

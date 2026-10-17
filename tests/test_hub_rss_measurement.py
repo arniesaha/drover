@@ -8,6 +8,7 @@ import os
 import sys
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 from test_control_outbox import postgres_control_store
 from test_lake_runtime import lake_spec
@@ -127,6 +128,25 @@ def test_growth_summary_keeps_per_route_brackets_separate():
             "hub_lifetime_max_step_growth_bytes": 0,
         },
     }
+
+
+def test_linux_lifetime_peak_converts_ru_maxrss_kib_to_bytes(monkeypatch):
+    """Linux ru_maxrss is KiB; it must not fall back to current RSS."""
+    pid = 54321
+    monkeypatch.setattr(MODULE, "platform", "linux")
+    monkeypatch.setattr(MODULE.os, "getpid", lambda: pid)
+    monkeypatch.setattr(
+        MODULE,
+        "resource",
+        SimpleNamespace(
+            RUSAGE_SELF=object(),
+            getrusage=lambda _who: SimpleNamespace(ru_maxrss=12_345),
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(MODULE, "hub_memory_bytes", lambda _pid: 1)
+
+    assert MODULE._hub_lifetime_peak(pid) == 12_345 * 1024
 
 
 def test_selected_ducklake_http_routes_use_bounded_disposable_children(
