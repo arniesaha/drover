@@ -462,6 +462,14 @@ Tune with `DROVER_HOST_STALE_AFTER_SECONDS` (default 45) and
 offline is never shorter than stale. A host that has never heartbeat is judged
 by its stored status.
 
+### Content-consent epoch reconciliation
+
+Content-consent writes carry a monotonic epoch. If a reachable harnessd reports
+a newer epoch, central advances beyond the highest reported value and retries
+the fleet write once; a host already at the requested policy is treated as
+converged. Older harnessd versions that cannot report their epoch leave a
+clear per-host failure reason rather than causing an unbounded retry.
+
 ## Retiring a host
 
 After uninstalling Drover from a machine, run `drover-server hosts list`, then

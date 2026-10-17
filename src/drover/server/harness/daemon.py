@@ -2397,7 +2397,19 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         try:
             applied = consent.apply(enabled=body["enabled"], epoch=body["epoch"])
         except ValueError as exc:
-            self._write_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            error = str(exc)
+            response: dict[str, Any] = {"error": error}
+            if error == "stale consent epoch":
+                current = consent.snapshot()
+                # Older daemons only returned ``error``.  Keep it for them,
+                # while giving newer central controllers the durable epoch
+                # needed to issue one strictly newer reconciliation write.
+                response.update(
+                    code="stale_consent_epoch",
+                    current_epoch=current["epoch"],
+                    current_enabled=current["enabled"],
+                )
+            self._write_json(response, status=HTTPStatus.CONFLICT)
             return
         self._write_json(applied)
 

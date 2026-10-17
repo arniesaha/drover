@@ -1156,7 +1156,7 @@ class MetricsCollector:
     # InsightsService (which owns analytical DuckDB work).  All-in-one and
     # worker collectors keep the established service-backed behavior.
     content_consent_reader: Callable[[], Mapping[str, Any]] | None = None
-    content_consent_propagator: Callable[[bool, int], list[dict[str, str]]] | None = (
+    content_consent_propagator: Callable[[bool, int], list[dict[str, Any]]] | None = (
         None
     )
     # Where InsightsService reads config and, beside it, the durable
@@ -1843,14 +1843,14 @@ class MetricsCollector:
 
     def _propagate_content_consent(
         self, enabled: bool, epoch: int
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         try:
             hosts = HarnessRegistry(self.duckdb_path).list_hosts()
         except Exception as exc:  # noqa: BLE001
             log.warning("failed to enumerate hosts for content consent: %s", exc)
             return [{"host_id": "fleet", "state": "failed"}]
         consent = {"enabled": enabled, "epoch": epoch}
-        results: list[dict[str, str]] = []
+        results: list[dict[str, Any]] = []
         for host in hosts:
             if not host_liveness(host).usable:
                 results.append({"host_id": host.host_id, "state": "disconnected"})
@@ -1860,7 +1860,7 @@ class MetricsCollector:
 
     def _push_content_consent(
         self, host: Any, consent: Mapping[str, Any]
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         status, body = self._harness_request(
             host,
             "/advisory/content-consent",
@@ -1873,12 +1873,50 @@ class MetricsCollector:
         )
         if status == 502:
             return {"host_id": host.host_id, "state": "disconnected"}
+        try:
+            response = json.loads(body)
+        except json.JSONDecodeError:
+            response = None
+        if (
+            status == 409
+            and isinstance(response, dict)
+            and response.get("error") == "stale consent epoch"
+        ):
+            sent_epoch = int(consent["epoch"])
+            current_epoch = response.get("current_epoch")
+            if type(current_epoch) is int and current_epoch >= 0:
+                reason = (
+                    "stale consent epoch: "
+                    f"host at {current_epoch}, central sent {sent_epoch}"
+                )
+                result: dict[str, Any] = {
+                    "host_id": host.host_id,
+                    "state": "failed",
+                    "error": reason,
+                    "reason": reason,
+                    "reason_code": "stale_consent_epoch",
+                    "current_epoch": current_epoch,
+                }
+                if response.get("current_enabled") is bool(consent["enabled"]):
+                    # The desired policy is already active on this host.  It
+                    # is converged even though central still needs to advance
+                    # its durable epoch before the one bounded re-propagation.
+                    result["state"] = "acknowledged"
+                return result
+            reason = (
+                "stale consent epoch: host epoch unavailable, "
+                f"central sent {sent_epoch}"
+            )
+            return {
+                "host_id": host.host_id,
+                "state": "failed",
+                "error": reason,
+                "reason": reason,
+                "reason_code": "stale_consent_epoch",
+            }
         if not 200 <= status < 300:
             return {"host_id": host.host_id, "state": "failed"}
-        try:
-            acknowledged = json.loads(body)
-        except json.JSONDecodeError:
-            acknowledged = None
+        acknowledged = response
         expected = {
             "enabled": bool(consent["enabled"]),
             "epoch": int(consent["epoch"]),

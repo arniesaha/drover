@@ -128,6 +128,56 @@ class CentralContentConsent:
             enabled, epoch, backend, external_disclosure_accepted
         )
 
+    def advance_past_host_epoch(self, host_epoch: int) -> ContentConsentState:
+        """Advance the central fence beyond an epoch reported by a host.
+
+        A host may retain a newer durable consent epoch after the central
+        control store was restored or migrated.  Preserve the central user
+        intent, but give its next write an epoch that no host can mistake for
+        an older command.
+        """
+
+        if type(host_epoch) is not int or host_epoch < 0:
+            raise ValueError("host epoch must be a non-negative integer")
+        with control_plane_connection(self.control_path) as con:
+            con.execute("BEGIN")
+            try:
+                current = con.execute("""
+                    SELECT enabled, epoch, backend, external_disclosure_accepted
+                      FROM control_content_consent
+                     WHERE singleton = TRUE FOR UPDATE
+                    """).fetchone()
+                if current is None:
+                    enabled, backend, disclosure = False, "local", False
+                    epoch = host_epoch + 1
+                    con.execute(
+                        """
+                        INSERT INTO control_content_consent
+                          (singleton, enabled, epoch, backend,
+                           external_disclosure_accepted, migrated_from_legacy)
+                        VALUES (TRUE, ?, ?, ?, ?, FALSE)
+                        """,
+                        [enabled, epoch, backend, disclosure],
+                    )
+                else:
+                    enabled = bool(current[0])
+                    epoch = max(int(current[1]), host_epoch) + 1
+                    backend = str(current[2])
+                    disclosure = bool(current[3])
+                    con.execute(
+                        """
+                        UPDATE control_content_consent
+                           SET epoch = ?, updated_at = now()
+                         WHERE singleton = TRUE
+                        """,
+                        [epoch],
+                    )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+        return ContentConsentState(enabled, epoch, backend, disclosure)
+
 
 def central_consent_heartbeat(reader: CentralContentConsent) -> Mapping[str, Any]:
     """Small callback shape used by API-only MetricsCollector instances."""
