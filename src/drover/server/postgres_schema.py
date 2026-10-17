@@ -685,6 +685,20 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS lake_export_restart_requests_recent ON lake_export_restart_requests (requested_at)",
         ),
     ),
+    (
+        20,
+        (
+            "ALTER TABLE harness_events ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ",
+            """
+            CREATE TABLE IF NOT EXISTS harness_unknown_session_retries (
+              host_id TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              first_seen_at DOUBLE PRECISION NOT NULL,
+              PRIMARY KEY (host_id, session_id)
+            )
+            """,
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

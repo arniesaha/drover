@@ -50,6 +50,12 @@ def _record_undelivered(count: int) -> None:
     record_undelivered_events(count)
 
 
+def _record_orphaned(count: int) -> None:
+    from drover.server.harness.daemon import record_orphaned_events
+
+    record_orphaned_events(count)
+
+
 class EventPusher:
     """Batches and pushes structured session events to central."""
 
@@ -85,6 +91,7 @@ class EventPusher:
         # Ownership races delay only their own session, including durable replay.
         # Each entry holds (next attempt time, next exponential delay).
         self._pending_sessions: dict[str, tuple[float, float]] = {}
+        self._orphan_logged_sessions: set[str] = set()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -282,18 +289,21 @@ class EventPusher:
                     "Authorization": f"Bearer {self._token}",
                 },
             )
+            orphaned_sessions: set[str] = set()
             try:
                 with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
                     if not 200 <= response.status < 300:
                         return None
-                    pending_sessions = self._read_pending(response)
+                    pending_sessions, orphaned_sessions = self._read_acknowledgement(
+                        response
+                    )
                     self._authorization_retry_at = 0.0
                     self._authorization_backoff = _AUTH_BACKOFF_SECONDS
             except HTTPError as exc:
                 if exc.code != 403:
                     return None
                 try:
-                    pending_sessions = self._read_pending(exc)
+                    pending_sessions, _ = self._read_acknowledgement(exc)
                 except (OSError, ValueError):
                     pending_sessions = set()
                 # Only the explicit all-pending ownership response is a
@@ -319,6 +329,15 @@ class EventPusher:
             offered_sessions = {e.get("session_id") for e in offered}
             if not pending_sessions <= offered_sessions:
                 return None
+            if not orphaned_sessions <= offered_sessions - pending_sessions:
+                return None
+            for session_id in orphaned_sessions:
+                count = sum(e.get("session_id") == session_id for e in offered)
+                _record_orphaned(count)
+                if session_id in self._orphan_logged_sessions:
+                    continue
+                self._orphan_logged_sessions.add(session_id)
+                log.info("structured event orphaned: events=%d", count)
             for session_id in offered_sessions - pending_sessions:
                 self._pending_sessions.pop(session_id, None)
             for session_id in pending_sessions:
@@ -343,10 +362,10 @@ class EventPusher:
             ]
 
     @staticmethod
-    def _read_pending(response: Any) -> set[str]:
+    def _read_acknowledgement(response: Any) -> tuple[set[str], set[str]]:
         raw = response.read()
         if not raw:
-            return set()
+            return set(), set()
         body = json.loads(raw)
         if not isinstance(body, dict):
             raise ValueError("invalid event acknowledgement")
@@ -355,7 +374,17 @@ class EventPusher:
             isinstance(s, str) for s in pending
         ):
             raise ValueError("invalid pending session acknowledgement")
-        return set(pending)
+        orphaned = body.get("orphaned", [])
+        if not isinstance(orphaned, list) or not all(
+            isinstance(session_id, str) for session_id in orphaned
+        ):
+            raise ValueError("invalid orphaned session acknowledgement")
+        return set(pending), set(orphaned)
+
+    @staticmethod
+    def _read_pending(response: Any) -> set[str]:
+        """Compatibility helper for focused callers that only need pending ids."""
+        return EventPusher._read_acknowledgement(response)[0]
 
 
 def _is_flush_now_event(event: dict[str, Any]) -> bool:
@@ -443,8 +472,17 @@ def reconcile_unsent_events(
             if pending is None:
                 return None
             ownership_pending = ownership_pending or bool(pending)
+            pending_ids = {str(event.get("event_id") or "") for event in pending}
+            acknowledged_ids = [
+                event.event_id for event in events if event.event_id not in pending_ids
+            ]
+            marker = getattr(registry, "mark_events_reconciled", None)
+            if marker is not None:
+                marker(acknowledged_ids)
         elif not pusher.post_batch(records):
             return None
+        elif hasattr(registry, "mark_events_reconciled"):
+            registry.mark_events_reconciled([event.event_id for event in events])
         reconciled_count += len(records)
         final_event = events[-1]
         if final_event.created_at is None:

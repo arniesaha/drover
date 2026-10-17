@@ -571,6 +571,7 @@ def _append_harness_metrics(lines: list[str]) -> None:
     # transcript.gap events.
     from drover.server.harness.daemon import (
         dropped_event_count,
+        orphaned_event_count,
         undelivered_event_count,
     )
 
@@ -584,6 +585,10 @@ def _append_harness_metrics(lines: list[str]) -> None:
             "Harness events the pusher could never deliver to the hub.",
             "# TYPE drover_harness_undelivered_events_total counter",
             f"drover_harness_undelivered_events_total {undelivered_event_count()}",
+            "# HELP drover_harness_orphaned_events_total "
+            "Harness events acknowledged after their central session expired.",
+            "# TYPE drover_harness_orphaned_events_total counter",
+            f"drover_harness_orphaned_events_total {orphaned_event_count()}",
         ]
     )
 

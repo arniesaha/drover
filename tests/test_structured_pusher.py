@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic, sleep
 
 from drover.server.harness.daemon import (
+    orphaned_event_count,
+    reset_orphaned_event_count,
     reset_undelivered_event_count,
     undelivered_event_count,
 )
@@ -507,6 +510,12 @@ def test_reconciliation_retries_forbidden_page_and_preserves_local_ledger(
         now = [100.0]
         monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0], raising=False)
         assert reconcile_unsent_events(registry, pusher, host_id="h1") is None
+        # A pre-#669 hub returns a bare 403.  It remains a retry, not a
+        # terminal acknowledgement that can clear the durable ledger.
+        assert [
+            event.event_id
+            for event in registry.list_events_for_reconciliation(host_id="h1")
+        ] == ["e1"]
         assert reconcile_unsent_events(registry, pusher, host_id="h1") is None
         assert len(_FakeCentralHandler.requests) == 1
         now[0] += 301
@@ -516,10 +525,68 @@ def test_reconciliation_retries_forbidden_page_and_preserves_local_ledger(
             "e1"
         ]
         assert caplog.text.count("authorization backoff") == 1
+        assert registry.list_events_for_reconciliation(host_id="h1") == []
     finally:
         server.shutdown()
         server.server_close()
         reset_undelivered_event_count()
+
+
+def test_terminal_orphan_is_marked_once_without_warning_spam(
+    tmp_path, monkeypatch, caplog
+):
+    from drover.schema import bootstrap
+    from drover.server.harness.registry import HarnessRegistry
+
+    path = tmp_path / "local.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=path)
+    registry = HarnessRegistry(path)
+    registry.create_session(
+        session_id="orphan", host_id="h1", harness="claude", command="claude"
+    )
+    for seq in (1, 2):
+        registry.append_event(
+            session_id="orphan",
+            event_type="assistant_output",
+            payload={"text": "hello"},
+            seq=seq,
+            event_id=f"orphan-{seq}",
+            normalized_source="structured",
+        )
+    now = [100.0]
+    monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0])
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ingested": 0, "orphaned": ["orphan"]}'
+
+    calls = []
+
+    def post(request, *, timeout):
+        calls.append(json.loads(request.data)["events"])
+        return Response()
+
+    monkeypatch.setattr(pusher_module, "urlopen", post)
+    pusher = EventPusher("http://central.invalid", "token")
+    caplog.set_level(logging.INFO, logger="drover.event_pusher")
+    reset_orphaned_event_count()
+    try:
+        assert reconcile_unsent_events(registry, pusher, host_id="h1") == 2
+        assert registry.list_events_for_reconciliation(host_id="h1") == []
+        assert len(calls) == 1
+        assert orphaned_event_count() == 2
+        assert caplog.text.count("structured event orphaned") == 1
+        assert "ownership backoff" not in caplog.text
+    finally:
+        reset_orphaned_event_count()
 
 
 def test_live_worker_waits_through_authorization_backoff(monkeypatch, caplog):

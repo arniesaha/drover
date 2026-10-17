@@ -5154,6 +5154,19 @@ def test_prometheus_exports_undelivered_harness_events(tmp_path):
     daemon_mod.reset_undelivered_event_count()
 
 
+def test_prometheus_exports_orphaned_harness_events(tmp_path):
+    from drover.server.harness import daemon as daemon_mod
+
+    daemon_mod.reset_orphaned_event_count()
+    daemon_mod.record_orphaned_events(3)
+
+    collector = _make_collector(tmp_path)
+    text = collector.render_prometheus()
+
+    assert "drover_harness_orphaned_events_total 3" in text
+    daemon_mod.reset_orphaned_event_count()
+
+
 def test_harness_snapshot_does_not_copy_the_database(tmp_path, monkeypatch):
     """The hub DB is ~483MB; copying it per poll was a 16% disk duty cycle."""
     collector = _make_collector(tmp_path)
