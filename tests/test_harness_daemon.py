@@ -1314,6 +1314,151 @@ def _provider_snapshot(
     )
 
 
+def test_lifecycle_worktree_inventory_is_unavailable_before_first_observation(
+    tmp_path,
+):
+    """The hub already maps a non-200 inventory response to unavailable."""
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _json_request(f"{base_url}/lifecycle/worktrees")
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert error.value.code == 503
+
+
+def test_lifecycle_worktree_inventory_returns_cached_snapshot_while_refresh_is_slow(
+    tmp_path, monkeypatch
+):
+    """A slow inventory must never occupy the relay-facing request thread."""
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def inventory(*_args):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            started.set()
+            release.wait(harness_relay_client.LOOPBACK_TIMEOUT_S + 1)
+        return {"worktrees": [{"path": "/cached"}], "errors": []}
+
+    import drover.server.harness.lifecycle_inventory as inventory_module
+
+    monkeypatch.setattr(inventory_module, "worktree_inventory", inventory)
+    server, state, base_url = _start_test_server(tmp_path)
+    cache = harness_daemon.LifecycleWorktreeInventoryCache(
+        state, run_timeout_seconds=0.05
+    )
+    state.lifecycle_worktree_inventory_cache = cache
+    try:
+        cache.refresh_once()
+        refresh = threading.Thread(target=cache.refresh_once, daemon=True)
+        refresh.start()
+        assert started.wait(1)
+
+        began = time.monotonic()
+        status, body = _json_request(f"{base_url}/lifecycle/worktrees")
+        elapsed = time.monotonic() - began
+    finally:
+        release.set()
+        refresh.join(1)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert elapsed < 0.5
+    assert elapsed < harness_relay_client.LOOPBACK_TIMEOUT_S
+    assert body["worktrees"] == [{"path": "/cached"}]
+    assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
+
+
+def test_lifecycle_worktree_inventory_keeps_last_good_snapshot_on_refresh_failure(
+    tmp_path, monkeypatch
+):
+    """A failed refresh must retain usable inventory and surface its error."""
+    outcomes = iter(
+        [
+            {"worktrees": [{"path": "/last-good"}], "errors": []},
+            RuntimeError("NAS scan failed"),
+        ]
+    )
+
+    def inventory(*_args):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    import drover.server.harness.lifecycle_inventory as inventory_module
+
+    monkeypatch.setattr(inventory_module, "worktree_inventory", inventory)
+    server, state, base_url = _start_test_server(tmp_path)
+    cache = harness_daemon.LifecycleWorktreeInventoryCache(
+        state, run_timeout_seconds=0.05
+    )
+    state.lifecycle_worktree_inventory_cache = cache
+    try:
+        cache.refresh_once()
+        cache.refresh_once()
+        status, body = _json_request(f"{base_url}/lifecycle/worktrees")
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert body["worktrees"] == [{"path": "/last-good"}]
+    assert body["errors"] == [{"reason": "inventory_failed"}]
+    assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
+
+
+def test_lifecycle_worktree_inventory_does_not_overlap_hung_refreshes(
+    tmp_path, monkeypatch
+):
+    """A timed-out run stays the only active run until it finishes."""
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def inventory(*_args):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            started.set()
+            release.wait(1)
+        return {"worktrees": [{"path": f"/scan-{calls}"}], "errors": []}
+
+    import drover.server.harness.lifecycle_inventory as inventory_module
+
+    monkeypatch.setattr(inventory_module, "worktree_inventory", inventory)
+    server, state, _ = _start_test_server(tmp_path)
+    cache = harness_daemon.LifecycleWorktreeInventoryCache(
+        state, run_timeout_seconds=0.05
+    )
+    state.lifecycle_worktree_inventory_cache = cache
+    try:
+        cache.refresh_once()
+        cache.refresh_once()
+        assert started.wait(1)
+        cache.refresh_once()
+        status, body = cache.response()
+    finally:
+        release.set()
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert calls == 2
+    assert status == 200
+    assert body["worktrees"] == [{"path": "/scan-1"}]
+    assert body["errors"] == [{"reason": "inventory_timeout"}]
+
+
 def test_harnessd_provider_usage_returns_cached_snapshot_while_probe_is_slow(tmp_path):
     """A slow probe must never occupy the relay-facing request thread."""
     started = threading.Event()

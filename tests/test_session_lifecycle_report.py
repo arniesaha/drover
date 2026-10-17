@@ -298,6 +298,7 @@ def test_api_health_detail_and_host_inventory_are_authenticated(tmp_path, monkey
         "worktree_inventory",
         lambda *a: {"worktrees": [], "errors": []},
     )
+    state.lifecycle_worktree_inventory_cache.refresh_once()
     try:
         for server, route in (
             (hub, "/harness/lifecycle"),
