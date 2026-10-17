@@ -534,6 +534,16 @@ struct ClientTests {
     ))
 }
 
+@Test func analyticsEncodesMetricFilterWhenSpecified() async throws {
+    mock.handler = { request in
+        #expect(request.url?.path == "/analytics")
+        #expect(request.url?.query == "days=7&metric=tokens")
+        return (200, emptyAnalyticsJSON)
+    }
+
+    _ = try await client().analytics(filters: AnalyticsFilters(metric: .tokens))
+}
+
 @Test func insightsCursorAndFiltersAreEncodedExactlyOnce() async throws {
     mock.handler = { request in
         #expect(request.url?.path == "/insights")

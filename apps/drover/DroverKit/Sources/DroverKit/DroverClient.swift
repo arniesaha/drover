@@ -239,6 +239,7 @@ public actor DroverClient {
             ("model", filters.model),
             ("project_key", filters.projectKey),
             ("limit", filters.limit == 25 ? nil : String(filters.limit)),
+            ("metric", filters.metric?.rawValue),
             ("project_cursor", filters.projectCursor),
             ("harness_cursor", filters.harnessCursor),
             ("host_cursor", filters.hostCursor),

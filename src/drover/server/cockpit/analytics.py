@@ -39,6 +39,7 @@ class AnalyticsFilters:
     model: str | None = None
     project_key: str | None = None
     limit: int = _DEFAULT_BREAKDOWNS
+    metric: Literal["tokens", "sessions"] | None = None
     project_cursor: str | None = None
     harness_cursor: str | None = None
     host_cursor: str | None = None
@@ -53,6 +54,8 @@ class AnalyticsFilters:
             raise ValueError("limit must be an integer")
         if not 1 <= self.limit <= _MAX_BREAKDOWNS:
             raise ValueError(f"limit must be within [1, {_MAX_BREAKDOWNS}]")
+        if self.metric is not None and self.metric not in ("tokens", "sessions"):
+            raise ValueError("metric must be 'tokens' or 'sessions'")
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,7 @@ class ProjectActivity:
     hosts: tuple[str, ...]
     host_attributed_session_count: int
     metadata: AggregateMetadata
+    token_attributed_session_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -524,6 +528,9 @@ def _activity_analytics_from_facts(
         >= _TOKEN_COVERAGE_THRESHOLD
         else "sessions"
     )
+    effective_project_metric: Literal["tokens", "sessions"] = (
+        filters.metric if filters.metric is not None else project_metric
+    )
     totals = ActivityTotals(
         session_count=session_count,
         total_tokens=int(aggregate[1] or 0),
@@ -538,7 +545,7 @@ def _activity_analytics_from_facts(
         con,
         facts,
         filters,
-        project_metric,
+        effective_project_metric,
         codec,
         snapshot_at,
         snapshot_version,
@@ -578,7 +585,7 @@ def _activity_analytics_from_facts(
         harnesses=harnesses,
         hosts=hosts,
         models=models,
-        project_metric=project_metric,
+        project_metric=effective_project_metric,
         coverage=coverage,
         metadata=metadata,
         pagination=AnalyticsPagination(
@@ -1182,6 +1189,7 @@ def _project_breakdowns(
                 ),
                 row[16],
             ),
+            token_attributed_session_count=int(row[12]),
         )
         for row in page_rows
     )
@@ -1212,19 +1220,21 @@ def _dimension_breakdowns(
 ) -> tuple[tuple[ActivityBreakdown, ...], PageMetadata]:
     dimension = {"harness": "harnesses", "host_id": "hosts", "model": "models"}[column]
     cursor_value = getattr(filters, f"{column.removesuffix('_id')}_cursor")
+    sort_metric: Literal["tokens", "sessions"] = filters.metric or "sessions"
+    order_column = "total_tokens" if sort_metric == "tokens" else "session_count"
     cursor = _cursor_position(
         codec,
         cursor_value,
         dimension,
         filters,
-        "sessions",
+        sort_metric,
         snapshot_at,
         snapshot_version,
     )
     having = ""
     query_params: list[Any] = []
     if cursor is not None:
-        having = "HAVING (session_count < ? OR (session_count = ? AND key > ?))"
+        having = f"HAVING ({order_column} < ? OR ({order_column} = ? AND key > ?))"
         query_params.extend([cursor[0], cursor[0], cursor[1]])
     rows = con.execute(
         f"""
@@ -1247,7 +1257,7 @@ def _dimension_breakdowns(
         WHERE {column} IS NOT NULL
         GROUP BY {column}
         {having}
-        ORDER BY session_count DESC, key
+        ORDER BY {order_column} DESC, key
         LIMIT ?
         """,
         [*query_params, filters.limit + 1],
@@ -1284,8 +1294,8 @@ def _dimension_breakdowns(
             codec,
             dimension,
             filters,
-            "sessions",
-            int(row[1]),
+            sort_metric,
+            int(row[2]) if sort_metric == "tokens" else int(row[1]),
             str(row[0]),
             snapshot_at,
             snapshot_version,
@@ -1301,6 +1311,7 @@ def _filter_fingerprint(filters: AnalyticsFilters) -> str:
         "provider": filters.provider,
         "model": filters.model,
         "project_key": filters.project_key,
+        "metric": filters.metric,
     }
     body = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(body).hexdigest()

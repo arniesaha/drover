@@ -2240,3 +2240,68 @@ def test_cockpit_service_forwards_the_span_setting_to_the_query(monkeypatch):
         ).analytics(AnalyticsFilters(days=7))
 
     assert seen == [False, True]
+
+
+def test_analytics_metric_filter_re_ranks_dimensions_and_projects():
+    from drover.server.web.app import _parse_cockpit_query
+
+    con = _analytics_connection()
+    try:
+        # Host A / Harness X / Project Alpha: 1 session, 10,000 tokens
+        _insert_session(
+            con,
+            session_id="token-heavy-1",
+            project="acme/alpha",
+            host="host-a",
+            harness="harness-x",
+            tokens=10_000,
+        )
+        # Host B / Harness Y / Project Beta: 5 sessions, 100 tokens each (500 tokens total)
+        for i in range(5):
+            _insert_session(
+                con,
+                session_id=f"session-heavy-{i}",
+                project="acme/beta",
+                host="host-b",
+                harness="harness-y",
+                tokens=100,
+            )
+
+        # Ranked by sessions: host-b, harness-y, beta first
+        by_sessions = activity_analytics(
+            con, AnalyticsFilters(days=7, metric="sessions"), spans_enabled=True
+        )
+        assert by_sessions.project_metric == "sessions"
+        assert [h.key for h in by_sessions.hosts] == ["host-b", "host-a"]
+        assert [h.key for h in by_sessions.harnesses] == ["harness-y", "harness-x"]
+        assert [p.project_key for p in by_sessions.projects] == [
+            "acme/beta",
+            "acme/alpha",
+        ]
+
+        # Ranked by tokens: host-a, harness-x, alpha first
+        by_tokens = activity_analytics(
+            con, AnalyticsFilters(days=7, metric="tokens"), spans_enabled=True
+        )
+        assert by_tokens.project_metric == "tokens"
+        assert [h.key for h in by_tokens.hosts] == ["host-a", "host-b"]
+        assert [h.key for h in by_tokens.harnesses] == ["harness-x", "harness-y"]
+        assert [p.project_key for p in by_tokens.projects] == [
+            "acme/alpha",
+            "acme/beta",
+        ]
+        assert by_tokens.projects[0].token_attributed_session_count == 1
+    finally:
+        con.close()
+
+    # Query parser accepts metric=tokens and metric=sessions, rejects invalid
+    parsed = _parse_cockpit_query("metric=tokens&days=7")
+    assert parsed.metric == "tokens"
+    parsed_sessions = _parse_cockpit_query("metric=sessions&days=7")
+    assert parsed_sessions.metric == "sessions"
+
+    with pytest.raises(ValueError, match="metric must be 'tokens' or 'sessions'"):
+        _parse_cockpit_query("metric=unknown&days=7")
+
+    with pytest.raises(ValueError, match="metric must be 'tokens' or 'sessions'"):
+        AnalyticsFilters(days=7, metric="invalid")

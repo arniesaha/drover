@@ -241,6 +241,7 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
     public let harnessAttributedSessionCount: Int
     public let hosts: [String]
     public let hostAttributedSessionCount: Int
+    public let tokenAttributedSessionCount: Int
     public let metadata: ObservedAggregateMetadata?
 
     private enum CodingKeys: String, CodingKey {
@@ -255,6 +256,7 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
         case harnesses, hosts, metadata
         case harnessAttributedSessionCount = "harness_attributed_session_count"
         case hostAttributedSessionCount = "host_attributed_session_count"
+        case tokenAttributedSessionCount = "token_attributed_session_count"
     }
 
     public init(from decoder: Decoder) throws {
@@ -275,6 +277,9 @@ public struct ProjectActivity: Decodable, Sendable, Equatable {
         hostAttributedSessionCount = try container.decodeIfPresent(
             Int.self, forKey: .hostAttributedSessionCount
         ) ?? (hosts.isEmpty ? 0 : sessionCount)
+        tokenAttributedSessionCount = try container.decodeIfPresent(
+            Int.self, forKey: .tokenAttributedSessionCount
+        ) ?? sessionCount
         metadata = try container.decodeIfPresent(ObservedAggregateMetadata.self, forKey: .metadata)
     }
 }
@@ -492,6 +497,7 @@ public struct AnalyticsFilters: Sendable, Equatable {
     public var model: String?
     public var projectKey: String?
     public var limit: Int
+    public var metric: DistributionRank?
     public var projectCursor: String?
     public var harnessCursor: String?
     public var hostCursor: String?
@@ -500,6 +506,7 @@ public struct AnalyticsFilters: Sendable, Equatable {
     public init(days: Int = 7, hostID: String? = nil, harness: String? = nil,
                 provider: String? = nil, model: String? = nil,
                 projectKey: String? = nil, limit: Int = 25,
+                metric: DistributionRank? = nil,
                 projectCursor: String? = nil, harnessCursor: String? = nil,
                 hostCursor: String? = nil, modelCursor: String? = nil) {
         self.days = days
@@ -509,6 +516,7 @@ public struct AnalyticsFilters: Sendable, Equatable {
         self.model = model
         self.projectKey = projectKey
         self.limit = limit
+        self.metric = metric
         self.projectCursor = projectCursor
         self.harnessCursor = harnessCursor
         self.hostCursor = hostCursor
@@ -524,13 +532,14 @@ public struct AppliedAnalyticsFilters: Decodable, Sendable, Equatable {
     public let model: String?
     public let projectKey: String?
     public let limit: Int?
+    public let metric: String?
 
     private enum CodingKeys: String, CodingKey {
         case days
         case hostID = "host_id"
         case harness, provider, model
         case projectKey = "project_key"
-        case limit
+        case limit, metric
     }
 }
 

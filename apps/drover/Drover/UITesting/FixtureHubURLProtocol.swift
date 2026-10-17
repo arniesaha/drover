@@ -147,7 +147,9 @@ final class FixtureHubURLProtocol: URLProtocol {
         case ("GET", "/cockpit/overview") where state.kind == .observability:
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.overview)
         case ("GET", "/analytics"):
-            return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.analytics)
+            let metric = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "metric" })?.value
+            return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.analytics(metric: metric))
         case ("GET", "/insights"):
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.insights)
         case ("GET", let path) where path == "/insights/\(FixtureScenarioData.insightFindingID)":
