@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-10-16
+
+### Fixed
+
+- harnessd serves `GET /lifecycle/worktrees` from a background inventory cache (300s refresh, 60s per-run bound, one scan in flight) instead of running Git inspection on the request path, so slow hosts like the NAS no longer exceed the hub's 10s relay timeout. Returns 503 before the first scan; failures keep the last good inventory and add an error (#660, #661).
+- `release-preflight` errors now name the bad input (exception type and message, credentials redacted) and validate the lake root, lake path, plist, backup dir and sha256 values up front. Paths with spaces must be quoted (#659, #662).
+
+### Upgrade notes
+
+- No control or lake migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`).
+
 ## [0.6.15] - 2026-10-16
 
 ### Fixed
