@@ -129,6 +129,11 @@ _dropped_events_lock = threading.Lock()
 _undelivered_events_total = 0
 _undelivered_events_lock = threading.Lock()
 
+# Events whose missing central session crossed the bounded orphan window are
+# deliberately acknowledged and removed from the local reconciliation ledger.
+_orphaned_events_total = 0
+_orphaned_events_lock = threading.Lock()
+
 
 _ATTACHMENT_EXTENSIONS = {
     "image/jpeg": "jpg",
@@ -276,6 +281,23 @@ def reset_undelivered_event_count() -> None:
     global _undelivered_events_total
     with _undelivered_events_lock:
         _undelivered_events_total = 0
+
+
+def record_orphaned_events(count: int = 1) -> None:
+    global _orphaned_events_total
+    with _orphaned_events_lock:
+        _orphaned_events_total += count
+
+
+def orphaned_event_count() -> int:
+    with _orphaned_events_lock:
+        return _orphaned_events_total
+
+
+def reset_orphaned_event_count() -> None:
+    global _orphaned_events_total
+    with _orphaned_events_lock:
+        _orphaned_events_total = 0
 
 
 @dataclass(frozen=True)

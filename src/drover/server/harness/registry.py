@@ -2561,6 +2561,7 @@ class HarnessRegistry:
                     OR s.mode = 'structured'
                     OR (e.seq IS NOT NULL AND e.normalized_source IS NULL)
                   )
+                  AND e.reconciled_at IS NULL
                   AND (? IS NULL OR s.host_id IS NULL OR s.host_id = ?)
                   AND (
                     ? IS NULL
@@ -2581,6 +2582,77 @@ class HarnessRegistry:
                 ],
             )
         return [HarnessEvent.from_row(row) for row in rows]
+
+    def existing_structured_event_ids(self, event_ids: list[str]) -> set[str]:
+        """Return supplied event ids already in central's indexed event ledger."""
+        unique_ids = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not unique_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._connect() as con:
+            return {
+                str(row[0])
+                for row in con.execute(
+                    "SELECT event_id FROM harness_events WHERE event_id IN ("
+                    + placeholders
+                    + ")",
+                    unique_ids,
+                ).fetchall()
+            }
+
+    def mark_events_reconciled(self, event_ids: list[str]) -> None:
+        """Record the hub acknowledgement so durable replay does not re-offer it."""
+        unique_ids = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        if not unique_ids:
+            return
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._connect() as con:
+            con.execute(
+                "UPDATE harness_events SET reconciled_at = now() "
+                "WHERE event_id IN (" + placeholders + ")",
+                unique_ids,
+            )
+
+    def unknown_session_retry_expired(
+        self, host_id: str, session_id: str, now: float, *, max_entries: int
+    ) -> bool:
+        """Persist and check the bounded unknown-session observation window."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT first_seen_at FROM harness_unknown_session_retries "
+                "WHERE host_id = ? AND session_id = ?",
+                [host_id, session_id],
+            ).fetchone()
+            if row is None:
+                count = con.execute(
+                    "SELECT count(*) FROM harness_unknown_session_retries"
+                ).fetchone()[0]
+                if int(count) >= max_entries:
+                    oldest = con.execute(
+                        "SELECT host_id, session_id FROM harness_unknown_session_retries "
+                        "ORDER BY first_seen_at, host_id, session_id LIMIT 1"
+                    ).fetchone()
+                    if oldest is not None:
+                        con.execute(
+                            "DELETE FROM harness_unknown_session_retries "
+                            "WHERE host_id = ? AND session_id = ?",
+                            oldest,
+                        )
+                con.execute(
+                    "INSERT INTO harness_unknown_session_retries "
+                    "(host_id, session_id, first_seen_at) VALUES (?, ?, ?)",
+                    [host_id, session_id, now],
+                )
+                return False
+        return now - float(row[0]) >= 24 * 60 * 60
+
+    def forget_unknown_session_retry(self, host_id: str, session_id: str) -> None:
+        with self._connect() as con:
+            con.execute(
+                "DELETE FROM harness_unknown_session_retries "
+                "WHERE host_id = ? AND session_id = ?",
+                [host_id, session_id],
+            )
 
     def reconcile_unsent_events(
         self,
