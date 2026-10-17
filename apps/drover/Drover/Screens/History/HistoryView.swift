@@ -168,6 +168,7 @@ struct HistoryRow: View {
         }
         .frame(minHeight: HistoryRowPlaceholder.height, alignment: .leading)
         .accessibilityElement(children: .combine)
+        .help(item.tokens.map { "\(CompactNumber.exact($0.total)) tokens" } ?? "")
     }
 
     private var meta: String {

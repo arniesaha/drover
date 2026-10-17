@@ -107,7 +107,10 @@ enum ObservabilityFixtureData {
         return shared + others + googleHistory + [darkHost]
     }
 
-    static var analytics: Data {
+    static var analytics: Data { analytics(metric: nil) }
+
+    static func analytics(metric: String? = nil) -> Data {
+        let activeMetric = metric ?? "tokens"
         func metrics(_ sessions: Int, _ tokens: Int) -> [String: Any] {
             ["session_count": sessions, "total_tokens": tokens, "cost_usd": 0,
              "cache_read_tokens": 0, "cache_write_tokens": 0, "total_latency_ms": 0]
@@ -115,12 +118,18 @@ enum ObservabilityFixtureData {
         func breakdown(_ key: String, _ sessions: Int, _ tokens: Int, project: Bool = false) -> [String: Any] {
             var row = metrics(sessions, tokens)
             row[project ? "project_key" : "key"] = key
-            if project { row["harnesses"] = ["codex", "claude-code"]; row["hosts"] = ["studio"] }
+            if project {
+                row["harnesses"] = ["codex", "claude-code"]
+                row["hosts"] = ["studio"]
+                row["harness_attributed_session_count"] = sessions
+                row["host_attributed_session_count"] = sessions
+                row["token_attributed_session_count"] = sessions
+            }
             return row
         }
         let coverage = ["token_percent": 93, "cost_percent": 65]
         return encode([
-            "cockpit_api_version": 1, "filters": ["days": 7],
+            "cockpit_api_version": 1, "filters": ["days": 7, "metric": activeMetric],
             "provider_capacity": ["status": "ok", "data": accountValues],
             "activity": ["status": "ok", "observed_at": reported, "coverage": coverage,
                 "data": ["totals": metrics(128, 4_100_000),
@@ -130,7 +139,7 @@ enum ObservabilityFixtureData {
                     "harnesses": [breakdown("codex", 70, 2_600_000), breakdown("claude-code", 58, 1_500_000)],
                     "hosts": [breakdown("studio", 100, 3_500_000), breakdown("laptop", 28, 600_000)],
                     "models": [breakdown("model-a", 128, 4_100_000)],
-                    "project_metric": "tokens", "coverage": coverage]]
+                    "project_metric": activeMetric, "coverage": coverage]]
         ])
     }
 

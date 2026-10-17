@@ -7,9 +7,15 @@ final class ObservabilityFixtureUITests: XCTestCase {
         let hosts = app.buttons["analytics-dimension-hosts"]
         XCTAssertTrue(hosts.waitForExistence(timeout: 5))
         hosts.tap()
-        XCTAssertTrue(app.buttons["analytics-rank-toggle-hosts"].exists)
-        XCTAssertFalse(app.buttons["analytics-rank-toggle-projects"].exists)
+        let rankToggle = app.segmentedControls["analytics-rank-toggle-hosts"]
+        XCTAssertTrue(rankToggle.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.segmentedControls["analytics-rank-toggle-projects"].exists)
         screenshot("analytics-host-comparison", app)
+
+        rankToggle.buttons["Tokens"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "ranked by tokens")).firstMatch.waitForExistence(timeout: 2))
+        screenshot("analytics-host-comparison-by-tokens", app)
+        rankToggle.buttons["Sessions"].tap()
 
         app.tabBars.buttons["Insights"].tap()
         XCTAssertTrue(app.staticTexts["1 LOADED FINDING"].waitForExistence(timeout: 5))

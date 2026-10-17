@@ -47,11 +47,11 @@ struct PopularProjectsSection: View {
 
     /// The ranking and coverage, said once for the whole section.
     private var subtitle: String? {
-        guard let first = projects.first else { return nil }
-        let value = ProjectActivityPresentation(
-            project: first, tokenCoveragePercent: tokenCoveragePercent
-        )
-        return "\(value.metricText) · \(value.coverageText)"
+        guard !projects.isEmpty else { return nil }
+        let rankedBy = projects.allSatisfy { $0.metric == .tokens }
+            ? "Ranked by tokens" : "Ranked by sessions"
+        let coverage = ProjectActivityPresentation.coverageText(for: tokenCoveragePercent)
+        return "\(rankedBy) · \(coverage)"
     }
 
     /// Share of the busiest project in this section, so a bar means "relative
@@ -101,6 +101,7 @@ private struct ProjectCard: View {
                         .droverText(.subtitle)
                         .monospacedDigit()
                         .layoutPriority(1)
+                        .help(value.exactValueText)
                 }
 
                 if !value.contributorsText.isEmpty {
@@ -116,8 +117,9 @@ private struct ProjectCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
-            "\(value.projectName), \(value.valueText), \(value.metricText), "
+            "\(value.projectName), \(value.exactValueText), \(value.metricText), "
             + "\(value.coverageText), contributors \(value.contributorsText)"
         )
+        .help(value.exactValueText)
     }
 }
