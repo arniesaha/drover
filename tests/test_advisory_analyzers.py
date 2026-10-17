@@ -191,6 +191,22 @@ def test_offline_host_produces_no_connector_findings() -> None:
     assert ConnectorFreshnessAnalyzer().analyze(snapshot) == []
 
 
+def test_not_configured_provider_connection_produces_no_freshness_alert() -> None:
+    """The fleet projection disables providers whose host has no login."""
+    snapshot = _snapshot(
+        providers=(
+            _provider(
+                enabled=False,
+                status="error",
+                error_category="not_configured",
+                last_success_at=None,
+            ),
+        )
+    )
+
+    assert ConnectorFreshnessAnalyzer().analyze(snapshot) == []
+
+
 def test_error_right_after_a_success_stays_silent() -> None:
     snapshot = _snapshot(
         providers=(

@@ -1919,6 +1919,13 @@ def drover_provider_quota(
         raw_snapshots = [
             s for s in raw_snapshots if s.provider.lower() == provider_norm
         ]
+    # A host with an enabled harness but no provider login is inventory, not
+    # capacity. ProviderUsageService normally removes these by disabling the
+    # connection, but keep this public aggregation defensive for alternate
+    # service implementations too.
+    raw_snapshots = [
+        snapshot for snapshot in raw_snapshots if snapshot.status != "not_configured"
+    ]
 
     # Group snapshots by subscription identity
     buckets: dict[str, list[Any]] = {}

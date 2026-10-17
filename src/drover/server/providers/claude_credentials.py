@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import getpass
 import json
 import subprocess
@@ -65,8 +66,9 @@ def load_claude_credential(
     read_keychain = keychain_reader or _read_keychain
     clock = now or (lambda: datetime.now(timezone.utc))
     account_identity, account_label = _load_account_metadata(resolved_account)
+    current_time = clock()
 
-    saw_expired = False
+    expired_category: str | None = None
     saw_malformed = False
     read_failure: ClaudeCredentialError | None = None
     for load in (read_keychain, lambda: _read_file(resolved_credentials)):
@@ -96,8 +98,14 @@ def load_claude_credential(
         expires_at = oauth.get("expiresAt")
         if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
             expiry = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
-            if expiry <= clock():
-                saw_expired = True
+            if expiry <= current_time:
+                category = _expired_access_token_category(oauth, current_time)
+                # A login that cannot be refreshed is more specific than one
+                # that can. Keep looking because another source may still be
+                # usable (notably macOS Keychain), but preserve that result if
+                # neither source is current.
+                if category == "login_expired" or expired_category is None:
+                    expired_category = category
                 continue
         plan = oauth.get("subscriptionType")
         return ClaudeCredential(
@@ -107,13 +115,78 @@ def load_claude_credential(
             subscription_type=plan if isinstance(plan, str) and plan else None,
         )
 
-    if saw_expired:
-        raise ClaudeCredentialError("token_expired", status="usage_unavailable")
+    if expired_category is not None:
+        raise ClaudeCredentialError(expired_category, status="usage_unavailable")
     if read_failure is not None:
         raise read_failure
     if saw_malformed:
         raise ClaudeCredentialError("protocol_error", status="error")
-    raise ClaudeCredentialError("not_authenticated", status="usage_unavailable")
+    # No credential source is normal on a host where Claude Code is enabled
+    # for launching but has never been used. It is not a failed provider
+    # connection and must not make fleet quota data look stale.
+    raise ClaudeCredentialError("not_configured", status="not_configured")
+
+
+def _expired_access_token_category(oauth: Mapping[str, object], now: datetime) -> str:
+    """Classify an expired access token without attempting OAuth refresh.
+
+    Claude Code owns this credential file. Drover deliberately only reads it:
+    refreshing or writing it can race Claude Code and invalidate its login.
+    Some versions record the refresh-token expiry while others only retain the
+    opaque refresh token. An unexpired or unbounded token can still be renewed
+    by running Claude Code once, so both lead to the refresh-needed action.
+    """
+
+    refresh_token = oauth.get("refreshToken")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return "login_expired"
+    expiry = _refresh_token_expiry(oauth, refresh_token)
+    return (
+        "login_expired"
+        if expiry is not None and expiry <= now
+        else "login_refresh_needed"
+    )
+
+
+def _refresh_token_expiry(
+    oauth: Mapping[str, object], refresh_token: str
+) -> datetime | None:
+    """Return the refresh-token expiry recorded by supported Claude clients."""
+
+    for field in (
+        "refreshTokenExpiresAt",
+        "refreshTokenExpiry",
+        "refreshExpiresAt",
+    ):
+        value = oauth.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            # Claude Code writes epoch milliseconds. Accept seconds too for
+            # older/exported credentials without treating a malformed value as
+            # an expired login.
+            try:
+                seconds = value / 1000 if value > 10_000_000_000 else value
+                return datetime.fromtimestamp(seconds, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(value, str) and value:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    # Some Claude Code versions retain an opaque token only; when it is a JWT,
+    # its standard expiry claim gives us the same answer without contacting the
+    # provider or attempting a refresh.
+    try:
+        payload = refresh_token.split(".")[1]
+        padded = payload + "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+        expires_at = claims.get("exp") if isinstance(claims, Mapping) else None
+        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+            return datetime.fromtimestamp(expires_at, tz=timezone.utc)
+    except (IndexError, ValueError, UnicodeDecodeError, OverflowError, OSError):
+        pass
+    return None
 
 
 def _load_account_metadata(account_path: Path) -> tuple[str, str]:

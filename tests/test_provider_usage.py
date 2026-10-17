@@ -603,6 +603,137 @@ def test_empty_provider_inventory_stales_existing_host_accounts(
     assert accounts[0].error_category == "empty_inventory"
 
 
+def test_not_configured_provider_is_excluded_from_fleet_quota_and_alerts(
+    tmp_path, provider_host
+):
+    """A host that has Claude Code enabled but no login is not unhealthy."""
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    now = datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)
+    service = ProviderUsageService(duckdb_path, parquet_dir, clock=lambda: now)
+    configured = {
+        "accounts": [
+            {
+                "snapshot_id": "claude-good",
+                "dedup_key": "claude-good",
+                "provider": "anthropic",
+                "account_label": "Claude Code",
+                "plan_label": "max",
+                "host_id": "mac-mini",
+                "status": "ok",
+                "observed_at": now.isoformat(),
+                "source": "claude-oauth-usage",
+                "error_category": None,
+                "windows": [
+                    {
+                        "kind": "five_hour",
+                        "used_percent": 25.0,
+                        "limit_value": None,
+                        "remaining_value": None,
+                        "unit": None,
+                        "window_minutes": 300,
+                        "starts_at": None,
+                        "resets_at": (now + timedelta(hours=5)).isoformat(),
+                    }
+                ],
+            }
+        ]
+    }
+    not_configured = {
+        "accounts": [
+            {
+                **configured["accounts"][0],
+                "snapshot_id": "claude-not-configured",
+                "dedup_key": "claude-not-configured",
+                "status": "not_configured",
+                "windows": [],
+                "error_category": "not_configured",
+            }
+        ]
+    }
+
+    service.refresh_host(provider_host, fetch=lambda _: configured)
+    service.refresh_host(provider_host, fetch=lambda _: not_configured)
+
+    assert service.latest_accounts() == []
+    with duckdb.connect(str(duckdb_path)) as con:
+        enabled = con.execute("""
+            SELECT enabled FROM provider_connections
+            WHERE provider = 'anthropic' AND host_id = 'mac-mini'
+            """).fetchone()[0]
+    assert enabled is False
+
+    capacity = CockpitService(
+        duckdb_path=None,
+        provider_usage=service,
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity unavailable")),
+    ).overview(AnalyticsFilters(days=7))["provider_capacity"]
+    assert capacity["status"] == "ok"
+    assert capacity["data"] == []
+
+
+def test_login_refresh_needed_keeps_last_known_usage_and_its_age(
+    tmp_path, provider_host
+):
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    clock = [datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)]
+    service = ProviderUsageService(duckdb_path, parquet_dir, clock=lambda: clock[0])
+    configured = {
+        "accounts": [
+            {
+                "snapshot_id": "claude-good",
+                "dedup_key": "claude-good",
+                "provider": "anthropic",
+                "account_label": "Claude Code",
+                "plan_label": "max",
+                "host_id": "mac-mini",
+                "status": "ok",
+                "observed_at": clock[0].isoformat(),
+                "source": "claude-oauth-usage",
+                "error_category": None,
+                "windows": [
+                    {
+                        "kind": "five_hour",
+                        "used_percent": 25.0,
+                        "limit_value": None,
+                        "remaining_value": None,
+                        "unit": None,
+                        "window_minutes": 300,
+                        "starts_at": None,
+                        "resets_at": (clock[0] + timedelta(hours=5)).isoformat(),
+                    }
+                ],
+            }
+        ]
+    }
+    refresh_needed = {
+        "accounts": [
+            {
+                **configured["accounts"][0],
+                "snapshot_id": "claude-refresh-needed",
+                "dedup_key": "claude-refresh-needed",
+                "status": "usage_unavailable",
+                "windows": [],
+                "error_category": "login_refresh_needed",
+            }
+        ]
+    }
+
+    service.refresh_host(provider_host, fetch=lambda _: configured)
+    clock[0] += timedelta(minutes=5)
+    service.refresh_host(provider_host, fetch=lambda _: refresh_needed)
+
+    account = service.latest_accounts()[0]
+    assert account.status == "stale"
+    assert account.error_category == "login_refresh_needed"
+    assert account.windows[0].used_percent == 25.0
+    assert account.observed_at == datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)
+    assert account.freshness_age_seconds == 300
+
+
 def test_provider_refresh_is_atomic_deduplicated_and_records_every_attempt(
     provider_service, provider_host
 ):

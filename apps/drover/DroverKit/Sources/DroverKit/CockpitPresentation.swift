@@ -356,6 +356,7 @@ public struct ProviderSectionPresentation: Sendable, Equatable {
             switch accountStatus {
             case .ok: return "Live"
             case .usageUnavailable: return "Unavailable"
+            case .notConfigured: return "Not configured"
             case .stale: return "Stale"
             case .error: return "Error"
             case .unknown: return "Unknown"
@@ -853,6 +854,9 @@ public struct ProviderHostPresentation: Sendable, Equatable, Identifiable {
     /// "NAS, stale, last reported 5 days ago, couldn't reach host". The chip
     /// shows only icon and name, so the per-host detail lives here.
     public let accessibilityLabel: String
+    /// A repair instruction for the small set of provider states where a host
+    /// can resolve the problem locally.
+    public let detail: String?
 
     public init(
         id: String, title: String, status: ProviderAccountStatus, errorCategory: String?,
@@ -871,7 +875,9 @@ public struct ProviderHostPresentation: Sendable, Equatable, Identifiable {
         formatter.unitsStyle = .full
         formatter.dateTimeStyle = .named
         let reported = "last reported \(formatter.localizedString(for: min(observedAt, now), relativeTo: now))"
-        let detail = status == .ok && !isStale ? nil : errorCategory.flatMap(Self.explain)
+        detail = status == .ok && !isStale ? nil : errorCategory.flatMap {
+            Self.explain($0, host: title)
+        }
         accessibilityLabel = ([title, state, reported] + [detail].compactMap { $0 })
             .joined(separator: ", ")
     }
@@ -894,7 +900,7 @@ public struct ProviderHostPresentation: Sendable, Equatable, Identifiable {
     /// restarting daemon looks like from here. Saying "provider CLI
     /// unavailable" read as "the tool is not installed" and sent a reader to
     /// reinstall CLIs that were on PATH the whole time.
-    static func explain(_ category: String) -> String? {
+    static func explain(_ category: String, host: String) -> String? {
         switch category {
         case "unavailable", "host_offline": return "couldn't reach host"
         // Not a reachability or sign-in problem: the daemon resolved no path to
@@ -904,6 +910,9 @@ public struct ProviderHostPresentation: Sendable, Equatable, Identifiable {
         case "process_error": return "usage probe failed"
         case "empty_inventory": return "no accounts detected"
         case "freshness_expired", "provider_window_expired": return "reading expired"
+        case "login_refresh_needed":
+            return "Claude login on \(host) needs a refresh: run `claude` once"
+        case "login_expired": return "Log in to Claude Code on \(host)"
         default: return nil
         }
     }
@@ -949,6 +958,7 @@ public enum ProviderSubscriptionGrouping {
     public static func isCollapsedHost(_ account: ProviderAccount, now: Date) -> Bool {
         account.errorCategory == "host_retired"
             || (account.status != .ok && account.status != .usageUnavailable
+                && account.status != .notConfigured
                 && now.timeIntervalSince(account.observedAt) > staleHostThreshold)
     }
 

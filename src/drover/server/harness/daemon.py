@@ -4169,10 +4169,12 @@ def _provider_probe_failed(snapshot: ProviderAccountSnapshot) -> bool:
     """Whether a probe result should overlay, rather than replace, good data."""
     if snapshot.status == "error":
         return True
-    # Claude's expired/missing OAuth credential is a failed attempt even
-    # though its established wire status is usage_unavailable.  A genuine
-    # provider answer with no published quota windows is not a failure and
-    # should still replace an obsolete cached quota.
+    # Claude's expired OAuth credential is a failed attempt even though its
+    # established wire status is usage_unavailable. A host with no Claude
+    # credential is instead explicitly not configured, so it must replace
+    # old data rather than make that host look silently stale. A genuine
+    # provider answer with no published quota windows is likewise not a
+    # failure and should replace an obsolete cached quota.
     return snapshot.status == "usage_unavailable" and snapshot.error_category not in {
         None,
         "no_usage_reported",

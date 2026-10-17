@@ -1740,7 +1740,10 @@ def test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts(
         "supported",
         "usage_unavailable",
     }
-    assert {account["status"] for account in body["accounts"]} == {"usage_unavailable"}
+    assert {account["provider"]: account["status"] for account in body["accounts"]} == {
+        "anthropic": "not_configured",
+        "google": "usage_unavailable",
+    }
     assert all(account["windows"] == [] for account in body["accounts"])
     assert datetime.fromisoformat(body["observed_at"]).tzinfo is not None
 

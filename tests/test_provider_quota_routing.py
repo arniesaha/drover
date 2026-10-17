@@ -101,6 +101,33 @@ def test_google_without_windows_remains_configured():
     )
 
 
+def test_not_configured_hosts_do_not_count_as_fleet_quota_accounts(tmp_path):
+    snapshot = ProviderAccountSnapshot(
+        snapshot_id="claude-not-configured",
+        dedup_key="claude-not-configured",
+        provider="anthropic",
+        account_label="Claude Code",
+        plan_label=None,
+        host_id="nas",
+        status="not_configured",
+        observed_at=NOW,
+        windows=(),
+        source="claude-oauth-usage",
+        error_category="not_configured",
+    )
+
+    class Service:
+        def latest_accounts(self):
+            return [snapshot]
+
+    result = drover_provider_quota(
+        duckdb_path=tmp_path / "quota.duckdb", service=Service(), now=NOW
+    )
+
+    assert result["accounts"] == []
+    assert result["routing_hint"] == "no provider accounts configured"
+
+
 @pytest.mark.parametrize("used", [0, 99, 100])
 def test_unknown_kinds_cannot_establish_headroom_or_exhaustion(used):
     assert (
