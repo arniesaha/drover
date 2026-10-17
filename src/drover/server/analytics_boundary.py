@@ -820,7 +820,7 @@ class HostDataBridgeClient:
 
     def propagate_content_consent(
         self, *, enabled: bool, epoch: int
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         response = self._request(
             "POST",
             "/_internal/analytics/content-consent",
@@ -838,13 +838,21 @@ class HostDataBridgeClient:
             not isinstance(item, dict) for item in hosts
         ):
             raise HostDataBridgeUnavailable("API host bridge unavailable")
-        return [
-            {
+        results: list[dict[str, Any]] = []
+        for item in hosts:
+            result: dict[str, Any] = {
                 "host_id": str(item.get("host_id", "")),
                 "state": str(item.get("state", "failed")),
             }
-            for item in hosts
-        ]
+            for key in ("error", "reason", "reason_code"):
+                value = item.get(key)
+                if isinstance(value, str):
+                    result[key] = value
+            current_epoch = item.get("current_epoch")
+            if type(current_epoch) is int and current_epoch >= 0:
+                result["current_epoch"] = current_epoch
+            results.append(result)
+        return results
 
     def _json_request(
         self,

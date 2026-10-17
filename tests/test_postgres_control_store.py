@@ -577,7 +577,11 @@ def test_postgres_central_content_consent_is_fail_closed_and_monotonic(
 
     assert enabled.heartbeat() == {"enabled": True, "epoch": 1}
     assert revoked.heartbeat() == {"enabled": False, "epoch": 2}
-    assert reader.state().heartbeat() == {"enabled": False, "epoch": 2}
+    assert reader.advance_past_host_epoch(2).heartbeat() == {
+        "enabled": False,
+        "epoch": 3,
+    }
+    assert reader.state().heartbeat() == {"enabled": False, "epoch": 3}
 
 
 def test_postgres_client_session_id_concurrency_returns_the_insert_winner(

@@ -208,7 +208,7 @@ class InsightsService:
         duckdb_path: str | Path,
         *,
         config_path: str | Path | None = None,
-        consent_propagator: Callable[[bool, int], list[dict[str, str]]] | None = None,
+        consent_propagator: Callable[[bool, int], list[dict[str, Any]]] | None = None,
         central_consent: Any | None = None,
         isolated_snapshots: bool = False,
     ) -> None:
@@ -239,7 +239,7 @@ class InsightsService:
         self._central_consent = central_consent
 
     def set_content_consent_propagator(
-        self, propagator: Callable[[bool, int], list[dict[str, str]]]
+        self, propagator: Callable[[bool, int], list[dict[str, Any]]]
     ) -> None:
         self._consent_propagator = propagator
 
@@ -481,7 +481,7 @@ class InsightsService:
 
     def _propagate_content_consent(
         self, consent: Mapping[str, Any]
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         if self._consent_propagator is None:
             return []
         try:
@@ -496,12 +496,14 @@ class InsightsService:
         result: dict[str, Any],
         consent: Mapping[str, Any],
         *,
-        hosts: list[dict[str, str]] | None = None,
+        hosts: list[dict[str, Any]] | None = None,
     ) -> None:
         if self._consent_propagator is None:
             return
         if hosts is None:
             hosts = self._propagate_content_consent(consent)
+        if self._central_consent is not None:
+            consent, hosts = self._reconcile_central_host_epoch(consent, hosts)
         states = {host.get("state") for host in hosts}
         if "failed" in states:
             propagation = "failed"
@@ -514,6 +516,29 @@ class InsightsService:
             propagation=propagation,
             hosts=hosts,
         )
+
+    def _reconcile_central_host_epoch(
+        self,
+        consent: Mapping[str, Any],
+        hosts: list[dict[str, Any]],
+    ) -> tuple[Mapping[str, Any], list[dict[str, Any]]]:
+        """Advance central once past newer host epochs, then re-propagate once."""
+
+        sent_epoch = int(consent["epoch"])
+        observed_epochs = [
+            epoch
+            for host in hosts
+            if host.get("reason_code") == "stale_consent_epoch"
+            and type(epoch := host.get("current_epoch")) is int
+            and epoch > sent_epoch
+        ]
+        if not observed_epochs:
+            return consent, hosts
+        state = self._central_consent.advance_past_host_epoch(max(observed_epochs))
+        # A newer epoch fences work which may have begun under the prior
+        # central epoch, even when the enabled value did not change.
+        _CONTENT_CONSENT_COORDINATOR.advance_generation()
+        return state.heartbeat(), self._propagate_content_consent(state.heartbeat())
 
     @staticmethod
     def _append_repair_failure(
