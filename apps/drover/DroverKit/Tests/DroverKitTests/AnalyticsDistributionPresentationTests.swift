@@ -87,12 +87,45 @@ private func build(
     let bySessions = build(entries, rank: .sessions)
     let byTokens = build(entries, rank: .tokens)
 
-    // The whole point of the toggle: the leader changes.
-    #expect(bySessions.rows[0].shareFraction == 1.0)
-    #expect(byTokens.rows[1].shareFraction == 1.0)
+    // When ranked by sessions, claude-code leads with 22 sessions.
+    #expect(bySessions.rows[0].title == "claude-code")
     #expect(bySessions.rows[0].valueText == "22")
-    #expect(byTokens.rows[0].valueText == "167,310")
+    #expect(bySessions.rows[0].exactValueText == "22")
+    #expect(bySessions.rows[0].detailText == "167K tokens")
+    #expect(bySessions.rows[0].shareFraction == 1.0)
+
+    #expect(bySessions.rows[1].title == "openclaw")
+    #expect(bySessions.rows[1].valueText == "14")
+    #expect(bySessions.rows[1].detailText == "24M tokens")
+
+    // When ranked by tokens, openclaw leads with 24M tokens.
+    #expect(byTokens.rows[0].title == "openclaw")
+    #expect(byTokens.rows[0].valueText == "24M")
+    #expect(byTokens.rows[0].exactValueText == "23,832,216")
+    #expect(byTokens.rows[0].detailText == "14 sessions")
+    #expect(byTokens.rows[0].shareFraction == 1.0)
+
+    #expect(byTokens.rows[1].title == "claude-code")
+    #expect(byTokens.rows[1].valueText == "167K")
+    #expect(byTokens.rows[1].exactValueText == "167,310")
+    #expect(byTokens.rows[1].detailText == "22 sessions")
+    #expect(byTokens.rows[1].shareFraction < 0.01)
 }
+
+@Test func toggleHiddenWhenAllTokensUnreportedOrEmpty() {
+    let empty = build([])
+    #expect(!empty.showsRankToggle)
+
+    let unreported = build([entry("codex", sessions: 19, tokens: 0)], fallbackTokenPercent: 0)
+    #expect(!unreported.showsRankToggle)
+
+    let zeroTokens = build([entry("idle", sessions: 3, tokens: 0)])
+    #expect(!zeroTokens.showsRankToggle)
+
+    let reported = build([entry("openclaw", sessions: 14, tokens: 23_832_216)])
+    #expect(reported.showsRankToggle)
+}
+
 
 // MARK: - Share bars
 
@@ -156,7 +189,7 @@ private func build(
     let section = build([entry("openclaw", sessions: 14, tokens: 23_832_216)])
 
     #expect(!section.rows[0].tokensUnreported)
-    #expect(section.rows[0].detailText == "23,832,216 tokens")
+    #expect(section.rows[0].detailText == "24M tokens")
 }
 
 // MARK: - Say it once

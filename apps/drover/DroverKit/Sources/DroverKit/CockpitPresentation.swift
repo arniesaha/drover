@@ -620,6 +620,7 @@ public struct ProviderHeadline: Sendable, Equatable {
 public struct ProjectActivityPresentation: Sendable, Equatable {
     public let projectName: String
     public let valueText: String
+    public let exactValueText: String
     public let metricText: String
     public let coverageText: String
     public let contributorsText: String
@@ -628,10 +629,13 @@ public struct ProjectActivityPresentation: Sendable, Equatable {
         projectName = project.projectKey
         switch project.metric {
         case .tokens:
-            valueText = "\(Self.integer(project.totalTokens)) tokens"
+            valueText = "\(CompactNumber.abbreviated(project.totalTokens)) tokens"
+            exactValueText = "\(Self.integer(project.totalTokens)) tokens"
             metricText = "Ranked by tokens"
         case .sessions:
-            valueText = "\(project.sessionCount) \(project.sessionCount == 1 ? "session" : "sessions")"
+            let sessions = "\(project.sessionCount) \(project.sessionCount == 1 ? "session" : "sessions")"
+            valueText = sessions
+            exactValueText = sessions
             metricText = "Ranked by sessions"
         }
         coverageText = tokenCoveragePercent.map {

@@ -37,6 +37,8 @@ public struct DistributionRowPresentation: Sendable, Equatable, Identifiable {
     /// The ranked quantity, always printed beside the bar so the bar is never
     /// the only way to read it.
     public let valueText: String
+    /// The unabbreviated exact quantity for accessibility and tooltips.
+    public let exactValueText: String
     /// Share of the section's largest value, 0...1.
     public let shareFraction: Double
     /// The single detail line: token count, or the unreported notice.
@@ -62,6 +64,7 @@ public struct DistributionRowPresentation: Sendable, Equatable, Identifiable {
         id: String,
         title: String,
         valueText: String,
+        exactValueText: String? = nil,
         shareFraction: Double,
         detailText: String,
         secondaryText: String?,
@@ -73,6 +76,7 @@ public struct DistributionRowPresentation: Sendable, Equatable, Identifiable {
         self.id = id
         self.title = title
         self.valueText = valueText
+        self.exactValueText = exactValueText ?? valueText
         self.shareFraction = shareFraction
         self.detailText = detailText
         self.secondaryText = secondaryText
@@ -93,6 +97,7 @@ public struct DistributionSectionPresentation: Sendable, Equatable {
     public let subtitle: String
     public let rank: DistributionRank
     public let rows: [DistributionRowPresentation]
+    public let showsRankToggle: Bool
 
     public var isEmpty: Bool { rows.isEmpty }
 
@@ -100,12 +105,14 @@ public struct DistributionSectionPresentation: Sendable, Equatable {
         title: String,
         subtitle: String,
         rank: DistributionRank,
-        rows: [DistributionRowPresentation]
+        rows: [DistributionRowPresentation],
+        showsRankToggle: Bool = true
     ) {
         self.title = title
         self.subtitle = subtitle
         self.rank = rank
         self.rows = rows
+        self.showsRankToggle = showsRankToggle
     }
 }
 
@@ -148,12 +155,42 @@ public enum DistributionPresentationBuilder {
         let sectionAge = shortAge(sectionMetadata?.observedAt, now: now)
         let sectionFreshness = sectionMetadata?.freshness
 
+        // Sort entries by the active ranking metric.
+        let sortedEntries: [Entry]
+        switch rank {
+        case .sessions:
+            sortedEntries = entries.sorted { lhs, rhs in
+                if lhs.sessionCount != rhs.sessionCount {
+                    return lhs.sessionCount > rhs.sessionCount
+                }
+                if lhs.totalTokens != rhs.totalTokens {
+                    return lhs.totalTokens > rhs.totalTokens
+                }
+                return lhs.key < rhs.key
+            }
+        case .tokens:
+            sortedEntries = entries.sorted { lhs, rhs in
+                if lhs.totalTokens != rhs.totalTokens {
+                    return lhs.totalTokens > rhs.totalTokens
+                }
+                if lhs.sessionCount != rhs.sessionCount {
+                    return lhs.sessionCount > rhs.sessionCount
+                }
+                return lhs.key < rhs.key
+            }
+        }
+
         // Share is against the section's own largest value, so a bar means
         // "relative to the biggest thing here" and never implies a global
         // scale the screen has not shown.
-        let largest = entries.map { rankedValue($0, rank: rank) }.max() ?? 0
+        let largest = sortedEntries.map { rankedValue($0, rank: rank) }.max() ?? 0
 
-        let rows = entries.map { entry -> DistributionRowPresentation in
+        let allTokensUnreported = entries.allSatisfy {
+            tokensAreUnreported(entry: $0, fallbackCoverage: fallbackCoverage) || $0.totalTokens == 0
+        }
+        let showsRankToggle = !entries.isEmpty && !allTokensUnreported
+
+        let rows = sortedEntries.map { entry -> DistributionRowPresentation in
             let unreported = tokensAreUnreported(
                 entry: entry, fallbackCoverage: fallbackCoverage
             )
@@ -164,14 +201,27 @@ public enum DistributionPresentationBuilder {
                 && (rowAge != sectionAge || entry.metadata?.freshness != sectionFreshness)
             let isStale = (entry.metadata?.freshness ?? .fresh) != .fresh
 
+            let valueText: String
+            let exactValueText: String
+
+            switch rank {
+            case .sessions:
+                valueText = number(entry.sessionCount)
+                exactValueText = number(entry.sessionCount)
+            case .tokens:
+                valueText = CompactNumber.abbreviated(entry.totalTokens)
+                exactValueText = CompactNumber.exact(entry.totalTokens)
+            }
+
             return DistributionRowPresentation(
                 id: entry.key,
                 title: entry.key,
-                valueText: number(value),
+                valueText: valueText,
+                exactValueText: exactValueText,
                 // A section where everything is zero draws no bars at all
                 // rather than five full ones.
                 shareFraction: largest > 0 ? Double(value) / Double(largest) : 0,
-                detailText: detail(entry: entry, unreported: unreported),
+                detailText: detail(entry: entry, unreported: unreported, rank: rank),
                 secondaryText: entry.secondaryText,
                 tokensUnreported: unreported,
                 ageText: differs ? rowAge : nil,
@@ -179,6 +229,7 @@ public enum DistributionPresentationBuilder {
                 accessibilityLabel: accessibilityLabel(
                     entry: entry,
                     unreported: unreported,
+                    rank: rank,
                     metadata: entry.metadata,
                     fallbackCoverage: fallbackCoverage,
                     now: now
@@ -188,9 +239,10 @@ public enum DistributionPresentationBuilder {
 
         return DistributionSectionPresentation(
             title: title,
-            subtitle: subtitle(count: entries.count, singular: singular, rank: rank),
+            subtitle: subtitle(count: sortedEntries.count, singular: singular, rank: rank),
             rank: rank,
-            rows: rows
+            rows: rows,
+            showsRankToggle: showsRankToggle
         )
     }
 
@@ -212,9 +264,14 @@ public enum DistributionPresentationBuilder {
         return (coverage.tokenPercent ?? 0) == 0
     }
 
-    static func detail(entry: Entry, unreported: Bool) -> String {
-        if unreported { return "tokens not reported" }
-        return "\(number(entry.totalTokens)) tokens"
+    static func detail(entry: Entry, unreported: Bool, rank: DistributionRank = .sessions) -> String {
+        switch rank {
+        case .sessions:
+            if unreported { return "tokens not reported" }
+            return "\(CompactNumber.abbreviated(entry.totalTokens)) tokens"
+        case .tokens:
+            return "\(entry.sessionCount) \(pluralize(entry.sessionCount, "session"))"
+        }
     }
 
     /// The full wording the shipped caption used, kept intact for VoiceOver
@@ -222,6 +279,7 @@ public enum DistributionPresentationBuilder {
     static func accessibilityLabel(
         entry: Entry,
         unreported: Bool,
+        rank: DistributionRank = .sessions,
         metadata: ObservedAggregateMetadata?,
         fallbackCoverage: Coverage,
         now: Date
@@ -230,10 +288,17 @@ public enum DistributionPresentationBuilder {
             metadata: metadata, fallbackCoverage: fallbackCoverage, now: now
         )
         let sessions = "\(entry.sessionCount) \(pluralize(entry.sessionCount, "session"))"
+        let exactTokens = CompactNumber.exact(entry.totalTokens)
         let tokens = unreported
             ? "tokens not reported"
-            : "\(number(entry.totalTokens)) tokens"
-        return [entry.key, sessions, tokens, entry.secondaryText, aggregate.freshnessText]
+            : "\(exactTokens) tokens"
+        let parts: [String?]
+        if rank == .tokens {
+            parts = [entry.key, tokens, sessions, entry.secondaryText, aggregate.freshnessText]
+        } else {
+            parts = [entry.key, sessions, tokens, entry.secondaryText, aggregate.freshnessText]
+        }
+        return parts
             .compactMap { $0 }
             .joined(separator: ", ")
     }

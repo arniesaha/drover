@@ -206,9 +206,15 @@ struct AnalyticsView: View {
                     ) {
                         analyticsMetric(
                             format(activity.totals.sessionCount),
-                            "Observed sessions"
+                            "Observed sessions",
+                            exactValue: "\(format(activity.totals.sessionCount)) sessions"
                         )
-                        analyticsMetric(format(activity.totals.totalTokens), "Tokens")
+                        analyticsMetric(
+                            CompactNumber.abbreviated(activity.totals.totalTokens),
+                            "Tokens",
+                            accessibilityText: "\(CompactNumber.exact(activity.totals.totalTokens)) tokens",
+                            exactValue: "\(CompactNumber.exact(activity.totals.totalTokens)) tokens"
+                        )
                         // This screen prints the figures in full, so it is the
                         // one place a 5%-coverage cost most looks like a total.
                         // Same wording and same unmeasured rule as the cockpit
@@ -367,7 +373,7 @@ struct AnalyticsView: View {
     }
 
     private func analyticsMetric(
-        _ value: String, _ label: String, accessibilityText: String? = nil
+        _ value: String, _ label: String, accessibilityText: String? = nil, exactValue: String? = nil
     ) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(value).droverText(.h2).monospacedDigit()
@@ -377,6 +383,7 @@ struct AnalyticsView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .help(exactValue ?? accessibilityText ?? "\(value) \(label)")
         // Combined rather than left as two elements: VoiceOver otherwise reads
         // "Not reported" as a standalone phrase with the label a swipe away.
         .accessibilityElement(children: .combine)

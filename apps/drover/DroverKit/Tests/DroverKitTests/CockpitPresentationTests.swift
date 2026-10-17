@@ -189,7 +189,8 @@ import Testing
 
     let value = ProjectActivityPresentation(project: project, tokenCoveragePercent: 86.4)
 
-    #expect(value.valueText == "1,234 tokens")
+    #expect(value.valueText == "1.2K tokens")
+    #expect(value.exactValueText == "1,234 tokens")
     #expect(value.metricText == "Ranked by tokens")
     #expect(value.coverageText == "86.4% token coverage")
 }

@@ -24,25 +24,34 @@ struct DistributionSectionView: View {
                 // Naming the ranking and offering the other in one control:
                 // sessions and tokens disagree constantly, and the screen
                 // should let you see that rather than pick one silently.
-                Button(action: onToggleRank) {
-                    Label(section.rank.toggleTitle, systemImage: "arrow.up.arrow.down")
-                        .font(.system(.caption, design: .default, weight: .medium))
-                        .foregroundStyle(DroverColor.accentHi)
-                        .padding(.horizontal, 10)
-                        .frame(minHeight: 32)
-                        .contentShape(Rectangle())
+                if section.showsRankToggle {
+                    Button(action: onToggleRank) {
+                        Label(section.rank.toggleTitle, systemImage: "arrow.up.arrow.down")
+                            .font(.system(.caption, design: .default, weight: .medium))
+                            .foregroundStyle(DroverColor.accentHi)
+                            .padding(.horizontal, 10)
+                            .frame(minHeight: 32)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Rank by \(section.rank.other.noun)")
+                    .accessibilityIdentifier("analytics-rank-toggle-\(section.title.lowercased())")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Rank by \(section.rank.other.noun)")
-                .accessibilityIdentifier("analytics-rank-toggle-\(section.title.lowercased())")
             }
 
             Text(section.subtitle)
                 .droverText(.subtitle)
                 .fixedSize(horizontal: false, vertical: true)
 
-            ForEach(section.rows) { row in
-                DistributionRow(row: row, glyph: glyph)
+            if section.isEmpty {
+                Text("No \(section.title.lowercased()) recorded")
+                    .droverText(.subtitle)
+                    .foregroundStyle(DroverColor.faint)
+                    .padding(.vertical, 8)
+            } else {
+                ForEach(section.rows) { row in
+                    DistributionRow(row: row, glyph: glyph)
+                }
             }
 
             if let trailing {
@@ -84,6 +93,7 @@ struct DistributionRow: View {
                     Text(row.valueText)
                         .droverText(.body)
                         .monospacedDigit()
+                        .help(row.exactValueText)
                 }
 
                 // `nil` draws CapacityBar's dashed track: "unreported" and
@@ -95,7 +105,7 @@ struct DistributionRow: View {
                 )
 
                 HStack(spacing: 6) {
-                    Text(row.tokensUnreported ? "· \(row.detailText)" : row.detailText)
+                    Text(row.detailText)
                         .droverText(.subtitle)
                         .fixedSize(horizontal: false, vertical: true)
                     // A row only carries its own age when it disagrees with
@@ -127,5 +137,6 @@ struct DistributionRow: View {
         .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(row.accessibilityLabel)
+        .help(row.exactValueText)
     }
 }

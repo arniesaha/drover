@@ -101,6 +101,7 @@ private struct ProjectCard: View {
                         .droverText(.subtitle)
                         .monospacedDigit()
                         .layoutPriority(1)
+                        .help(value.exactValueText)
                 }
 
                 if !value.contributorsText.isEmpty {
@@ -116,8 +117,9 @@ private struct ProjectCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
-            "\(value.projectName), \(value.valueText), \(value.metricText), "
+            "\(value.projectName), \(value.exactValueText), \(value.metricText), "
             + "\(value.coverageText), contributors \(value.contributorsText)"
         )
+        .help(value.exactValueText)
     }
 }

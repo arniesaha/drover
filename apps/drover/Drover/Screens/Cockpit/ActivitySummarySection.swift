@@ -31,16 +31,17 @@ struct ActivitySummarySection: View {
                     ) {
                         ActivityMetric(
                             value: format(activity.totals.sessionCount),
-                            label: "Observed sessions"
+                            label: "Observed sessions",
+                            exactValue: "\(format(activity.totals.sessionCount)) sessions"
                         )
                         // Abbreviated: the exact figure is nine digits, a
                         // shape you count rather than see, and it crowded the
-                        // third metric off the row. Analytics still prints it
-                        // in full, where the number *is* the content.
+                        // third metric off the row.
                         ActivityMetric(
                             value: CompactNumber.abbreviated(activity.totals.totalTokens),
                             label: "Tokens",
-                            spokenValue: "\(format(activity.totals.totalTokens)) tokens"
+                            spokenValue: "\(CompactNumber.exact(activity.totals.totalTokens)) tokens",
+                            exactValue: "\(CompactNumber.exact(activity.totals.totalTokens)) tokens"
                         )
                         // "API cost" next to a token count reads as "this is
                         // what those tokens cost", which is false: subscription
@@ -79,7 +80,7 @@ struct ActivitySummarySection: View {
 private struct ActivityMetric: View {
     let value: String
     let label: String
-    /// What VoiceOver reads when the shown value is abbreviated. "63.1M" is a
+    /// What VoiceOver reads when the shown value is abbreviated. "63M" is a
     /// glance aid for sighted scanning; it should not be the only form of the
     /// number available.
     var spokenValue: String?
@@ -87,14 +88,16 @@ private struct ActivityMetric: View {
     /// the label: "Not reported API-billed" is not a sentence, and reading the
     /// cost slot as a number at all is exactly the claim #150 is about.
     var accessibilityText: String?
+    var exactValue: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            // One line, always: "63.1M" wrapping into "63.1" / "M" is not a
+            // One line, always: "63M" wrapping into "63" / "M" is not a
             // smaller number, it is a broken one.
             Text(value).droverText(.h2).monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
+                .help(exactValue ?? spokenValue ?? value)
             Text(label).droverText(.subtitle)
                 .fixedSize(horizontal: false, vertical: true)
         }
