@@ -52,6 +52,84 @@ def test_bootstrap_creates_harness_tables(tmp_path):
     }.issubset(tables)
 
 
+def test_unknown_session_retry_keeps_first_seen_timestamp(tmp_path):
+    registry, duckdb_path = _registry(tmp_path)
+
+    assert not registry.unknown_session_retry_expired(
+        "nas", "missing", 100.0, max_entries=4096
+    )
+    assert registry.unknown_session_retry_expired(
+        "nas", "missing", 100.0 + 24 * 60 * 60, max_entries=4096
+    )
+
+    with control_plane_connection(duckdb_path) as con:
+        row = con.execute(
+            "SELECT first_seen_at FROM harness_unknown_session_retries "
+            "WHERE host_id = ? AND session_id = ?",
+            ["nas", "missing"],
+        ).fetchone()
+    assert row == (100.0,)
+
+
+def test_unknown_session_retry_handles_concurrent_first_observation(
+    tmp_path, monkeypatch
+):
+    """A competing insert after our read must keep the other request's start."""
+    from contextlib import contextmanager
+
+    registry, _ = _registry(tmp_path)
+    original_connect = registry._connect
+    injected = False
+    connection = None
+
+    class Result:
+        def __init__(self, cursor, *, inject=False):
+            self._cursor = cursor
+            self._inject = inject
+
+        def fetchone(self):
+            nonlocal injected
+
+            row = self._cursor.fetchone()
+            if self._inject and row is None and not injected:
+                injected = True
+                assert connection is not None
+                connection.execute(
+                    "INSERT INTO harness_unknown_session_retries "
+                    "(host_id, session_id, first_seen_at) VALUES (?, ?, ?)",
+                    ["nas", "missing", 100.0],
+                )
+            return row
+
+    class Connection:
+        def __init__(self, con):
+            self._con = con
+
+        def execute(self, sql, parameters=None):
+            cursor = self._con.execute(sql, parameters)
+            return Result(
+                cursor,
+                inject=(
+                    "SELECT first_seen_at FROM harness_unknown_session_retries" in sql
+                    and not injected
+                ),
+            )
+
+    @contextmanager
+    def racy_connect():
+        nonlocal connection
+
+        with original_connect() as con:
+            connection = Connection(con)
+            yield connection
+
+    monkeypatch.setattr(registry, "_connect", racy_connect)
+
+    assert registry.unknown_session_retry_expired(
+        "nas", "missing", 100.0 + 24 * 60 * 60, max_entries=4096
+    )
+
+
 def test_bootstrap_adds_recap_reconcile_marker_to_existing_sessions(tmp_path):
     """Removing the additive marker migration breaks existing Drover databases."""
     duckdb_path = tmp_path / "pre-marker.duckdb"

@@ -339,6 +339,21 @@ def _post(metrics_server, path, payload, token=None):
         return exc.code
 
 
+def _post_json(metrics_server, path, payload):
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"http://{metrics_server.host}:{metrics_server.port}" + path,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {metrics_server.token}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(request) as response:
+        return response.status, json.loads(response.read())
+
+
 @pytest.mark.parametrize("path", ["/harness/hosts", "/harness/hosts/host-b/heartbeat"])
 def test_host_cannot_register_or_heartbeat_another_host(metrics_server, path, caplog):
     assert _post(metrics_server, path, {"host_id": "host-b"}) == 403
@@ -455,8 +470,77 @@ def test_unknown_session_is_skipped_only_after_observed_retry_window(
     now[0] += 24 * 60 * 60 - 1
     assert _post(metrics_server, "/harness/events", batch) == 403
     now[0] += 1
-    assert _post(metrics_server, "/harness/events", batch) == 200
+    # A fresh request-handler class simulates a hub process restart.  It must
+    # recover the original observation time from the control-plane store.
+    metrics_server.server.RequestHandlerClass.unknown_session_retries = (
+        app_module._UnknownSessionRetries(registry)
+    )
+    status, response = _post_json(metrics_server, "/harness/events", batch)
+    assert status == 200
+    assert response["orphaned"] == ["absent-session"]
     assert registry.list_events_after("absent-session", 0) == []
+
+
+def test_unknown_session_retry_window_survives_hub_restart(metrics_server, monkeypatch):
+    from drover.server.harness.registry import HarnessRegistry
+
+    now = [100.0]
+    monkeypatch.setattr(app_module, "_ownership_retry_clock", lambda: now[0])
+    registry = HarnessRegistry(metrics_server.collector.duckdb_path)
+    first_hub = app_module._UnknownSessionRetries(registry)
+    assert not first_hub.expired("host-a", "missing")
+    now[0] += 24 * 60 * 60
+    restarted_hub = app_module._UnknownSessionRetries(registry)
+    assert restarted_hub.expired("host-a", "missing")
+
+
+def test_reconciliation_acks_pruned_duplicates_and_marks_local_ledger(
+    metrics_server, tmp_path, caplog
+):
+    from datetime import datetime, timezone
+
+    from drover.schema import bootstrap
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.structured.pusher import EventPusher
+
+    central = HarnessRegistry(metrics_server.collector.duckdb_path)
+    central.ingest_structured_events(
+        [
+            {
+                "event_id": "pruned-duplicate",
+                "session_id": "pruned-session",
+                "event_type": "assistant_output",
+                "payload": {"event_id": "pruned-duplicate", "type": "assistant_output"},
+                "seq": 1,
+                "created_at": datetime.now(timezone.utc),
+            }
+        ]
+    )
+    local_path = tmp_path / "local.duckdb"
+    bootstrap(parquet_dir=tmp_path / "local-parquet", duckdb_path=local_path)
+    local = HarnessRegistry(local_path)
+    local.create_session(
+        session_id="pruned-session",
+        host_id="host-a",
+        harness="claude",
+        command="synthetic",
+        mode="structured",
+    )
+    local.append_event(
+        session_id="pruned-session",
+        event_type="assistant_output",
+        event_id="pruned-duplicate",
+        seq=1,
+        payload={"event_id": "pruned-duplicate", "type": "assistant_output"},
+        normalized_source="structured",
+    )
+    pusher = EventPusher(
+        f"http://{metrics_server.host}:{metrics_server.port}", metrics_server.token
+    )
+
+    assert pusher.reconcile(local, host_id="host-a") == 1
+    assert local.list_events_for_reconciliation(host_id="host-a") == []
+    assert "ownership backoff" not in caplog.text
 
 
 def test_rejection_log_identifies_route_and_session_owner(metrics_server, caplog):
