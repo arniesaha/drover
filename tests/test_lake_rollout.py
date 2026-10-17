@@ -86,7 +86,7 @@ def fixture(tmp_path):
     def probe(python, wheel=None):
         return {
             "version": "0.6.5" if "0.6.5" in str(python) else "0.6.4",
-            "migrations": [[1, "create table fixture"]],
+            "migrations": [[1, ["CREATE TABLE fixture (id INTEGER)"]]],
             "lake_schema_version": "schema-1",
             "runtime_pins": "pins-1",
             "installed_hash_verified": wheel is not None,
@@ -157,8 +157,8 @@ def test_host_proxy_gate_fails_on_non_200_and_passes_on_200(tmp_path):
     assert gate.evidence["fs_list_statuses"] == {"host-a": 502}
 
 
-@pytest.mark.parametrize("field", ["migrations", "lake_schema_version", "runtime_pins"])
-def test_schema_or_engine_change_requires_full_gate(tmp_path, field):
+@pytest.mark.parametrize("field", ["lake_schema_version", "runtime_pins"])
+def test_lake_schema_or_engine_change_requires_full_gate(tmp_path, field):
     _, _, _, options, check = fixture(tmp_path)
     original = options["probe"]
 
@@ -171,6 +171,162 @@ def test_schema_or_engine_change_requires_full_gate(tmp_path, field):
     result = check(probe=changed)["release_kind"]
     assert not result.passed
     assert result.evidence["rollout_kind"] == "lake_schema"
+
+
+def _release_metadata(migrations, *, schema="schema-1", pins="pins-1"):
+    return {
+        "version": "0.6.18",
+        "migrations": migrations,
+        "lake_schema_version": schema,
+        "runtime_pins": pins,
+    }
+
+
+def _migration_20_fixture():
+    from drover.server.postgres_schema import _MIGRATIONS
+
+    target = [[version, list(statements)] for version, statements in _MIGRATIONS]
+    assert target[-1][0] == 20
+    return target[:-1], target
+
+
+def test_additive_control_migration_20_uses_point_release_path():
+    from drover.server.lake.rollout import classify_release_kind
+
+    current, target = _migration_20_fixture()
+    allowed, evidence = classify_release_kind(
+        _release_metadata(current), _release_metadata(target)
+    )
+
+    assert allowed
+    assert evidence["rollout_kind"] == "control_migration"
+    assert evidence["new_migration_ids"] == [20]
+    assert evidence["migration_verdicts"] == [
+        {
+            "migration_id": 20,
+            "statement_index": 1,
+            "allowed": True,
+            "verdict": "alter_table_add_nullable_column",
+        },
+        {
+            "migration_id": 20,
+            "statement_index": 2,
+            "allowed": True,
+            "verdict": "create_table",
+        },
+    ]
+
+
+def test_control_migration_accepts_only_the_documented_additive_ddl_subset():
+    from drover.server.lake.rollout import classify_release_kind
+
+    current, _ = _migration_20_fixture()
+    target = [
+        *current,
+        [
+            20,
+            [
+                "CREATE SCHEMA IF NOT EXISTS release_fixture",
+                "CREATE TABLE release_fixture.entries (id INTEGER PRIMARY KEY)",
+                "CREATE INDEX CONCURRENTLY entries_id ON release_fixture.entries (id)",
+                "ALTER TABLE harness_events ADD COLUMN rollout_state TEXT NOT NULL DEFAULT 'pending'",
+                "GRANT SELECT ON TABLE release_fixture.entries TO release_reader",
+            ],
+        ],
+    ]
+    allowed, evidence = classify_release_kind(
+        _release_metadata(current), _release_metadata(target)
+    )
+
+    assert allowed
+    assert evidence["rollout_kind"] == "control_migration"
+    assert [item["verdict"] for item in evidence["migration_verdicts"]] == [
+        "create_schema_if_not_exists",
+        "create_table",
+        "create_index",
+        "alter_table_add_column_constant_default",
+        "grant",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("statement", "verdict"),
+    [
+        ("DROP TABLE old_events", "statement_not_additive_ddl"),
+        (
+            "ALTER TABLE harness_events RENAME COLUMN old TO new",
+            "alter_table_not_add_column",
+        ),
+        (
+            "ALTER TABLE harness_events ALTER COLUMN payload_json SET NOT NULL",
+            "alter_table_not_add_column",
+        ),
+        ("UPDATE harness_events SET payload_json = NULL", "statement_not_additive_ddl"),
+        (
+            "ALTER TABLE harness_events ADD COLUMN required_value TEXT NOT NULL",
+            "add_column_not_null_without_constant_default",
+        ),
+    ],
+)
+def test_non_additive_control_migration_is_refused(statement, verdict):
+    from drover.server.lake.rollout import classify_release_kind
+
+    current, _ = _migration_20_fixture()
+    target = [*current, [20, [statement]]]
+    allowed, evidence = classify_release_kind(
+        _release_metadata(current), _release_metadata(target)
+    )
+
+    assert not allowed
+    assert evidence["rollout_kind"] == "control_migration"
+    assert evidence["new_migration_ids"] == [20]
+    assert evidence["migration_verdicts"][0]["allowed"] is False
+    assert evidence["migration_verdicts"][0]["verdict"] == verdict
+
+
+def test_edited_shipped_control_migration_is_refused():
+    from drover.server.lake.rollout import classify_release_kind
+
+    current, _ = _migration_20_fixture()
+    target = [[version, list(statements)] for version, statements in current]
+    target[0][1][0] = "CREATE TABLE changed_shipped_migration (id INTEGER)"
+    allowed, evidence = classify_release_kind(
+        _release_metadata(current), _release_metadata(target)
+    )
+
+    assert not allowed
+    assert evidence["rollout_kind"] == "control_migration"
+    assert evidence["new_migration_ids"] == []
+    assert (
+        evidence["control_migration_reason"] == "migration_ledger_not_strictly_appended"
+    )
+
+
+@pytest.mark.parametrize("field", ["lake_schema_version", "runtime_pins"])
+def test_lake_schema_or_runtime_pin_change_stays_on_full_gate(field):
+    from drover.server.lake.rollout import classify_release_kind
+
+    current, _ = _migration_20_fixture()
+    target = _release_metadata(current)
+    target[field] = "changed"
+    allowed, evidence = classify_release_kind(_release_metadata(current), target)
+
+    assert not allowed
+    assert evidence["rollout_kind"] == "lake_schema"
+
+
+def test_combined_control_and_lake_change_stays_on_full_gate():
+    from drover.server.lake.rollout import classify_release_kind
+
+    current, target = _migration_20_fixture()
+    allowed, evidence = classify_release_kind(
+        _release_metadata(current), _release_metadata(target, schema="changed")
+    )
+
+    assert not allowed
+    assert evidence["rollout_kind"] == "lake_schema"
+    assert evidence["new_migration_ids"] == [20]
+    assert all(verdict["allowed"] for verdict in evidence["migration_verdicts"])
 
 
 @pytest.mark.parametrize(
