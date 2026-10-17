@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import sys
 import urllib.request
+from pathlib import Path
 
 from test_control_outbox import postgres_control_store
 from test_lake_runtime import lake_spec
 from test_lake_serving import verified_lake
 
-from scripts.measure_hub_memory import _growth_summary, measure, prepare
+SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "measure_hub_memory.py"
+SPEC = importlib.util.spec_from_file_location("measure_hub_memory", SCRIPT_PATH)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+_growth_summary = MODULE._growth_summary
+measure = MODULE.measure
+prepare = MODULE.prepare
 
 
 def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
