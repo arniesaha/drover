@@ -51,15 +51,15 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` |
 | `test_harnessd_provider_usage_reports_codex_cli_not_found` | `test_harnessd_provider_usage_reports_codex_cli_not_found_is_never_silent` |
 | `test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default` | `test_public_http_routing_contract` |
-| `test_harnessd_content_bundle_requires_configured_token_even_when_enabled` | dropped: the launcher always passes `--host-token`; a no-token fixture is needed to exercise `/advisory/content-bundle` after enabling consent |
-| `test_running_harnessd_applies_live_consent_and_revoke_without_restart` | dropped: requires pre-seeding or faulting durable daemon state before startup |
+| `test_harnessd_content_bundle_requires_configured_token_even_when_enabled` | `test_content_consent_control_is_fail_closed_without_daemon_token` |
+| `test_running_harnessd_applies_live_consent_and_revoke_without_restart` | `test_running_harnessd_applies_live_consent_and_revoke_without_restart` |
 | `test_content_consent_override_survives_restart_and_rejects_stale_enable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_unknown_epoch_is_idempotent_disabled_and_cannot_enable` | dropped: no public consent-control route is enabled by the launcher configuration, so no HTTP request can submit an unknown consent epoch |
 | `test_standalone_config_bootstrap_cannot_override_durable_revoke` | dropped: the `--config` fixture starts from an empty consent file and has no pre-launch durable-revoke seed hook |
-| `test_content_consent_control_is_fail_closed_without_daemon_token` | dropped: the shared launcher always supplies `--host-token`; a no-token process fixture is required to exercise the consent control route's fail-closed branch |
-| `test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral` | dropped: `/advisory/content-bundle` is intentionally disabled in the fixture and no advisory target list is written into its config TOML |
-| `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` | dropped: `/advisory/content-version` needs enabled advisory targets in the launcher config; the current config supplies only paths and no content policy |
-| `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` | dropped: `/advisory/content-bundle` returns consent-disabled before parsing under the fixture, so it cannot observe the request-size guard |
+| `test_content_consent_control_is_fail_closed_without_daemon_token` | `test_content_consent_control_is_fail_closed_without_daemon_token` |
+| `test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral` | `test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral` |
+| `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` | `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` |
+| `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` | `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` |
 | `test_harnessd_auth_status_route` | `test_public_route_validation` |
 | `test_harnessd_auth_start_poll_and_cancel` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_harnessd_auth_routes_require_bearer_token` | `test_public_http_routing_contract` |

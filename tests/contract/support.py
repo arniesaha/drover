@@ -160,6 +160,11 @@ class Daemon:
 @pytest.fixture
 def daemon(tmp_path, fake_hub, fake_clis, request):
     """Launch the selected implementation with an isolated home and store."""
+    options = getattr(request, "param", {})
+    if options is True:
+        options = {"relay": True}
+    if not isinstance(options, dict):
+        raise pytest.UsageError("daemon fixture parameters must be a mapping")
     impl = os.environ.get("HARNESSD_IMPL", "py")
     if impl == "rs":
         binary = Path("target/release/drover-harnessd")
@@ -175,12 +180,28 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
     home.mkdir()
     data = tmp_path / "data"
     config = tmp_path / "config.toml"
+    advisory_target = None
+    advisory = ""
+    if "advisory_target_text" in options:
+        advisory_target = tmp_path / "AGENTS.md"
+        advisory_target.write_text(options["advisory_target_text"])
+        advisory = (
+            "\n[advisory_content]\n"
+            "enabled = true\n"
+            'backend_policy = "local"\n'
+            "external_consent = false\n"
+            f"targets = [{json.dumps(str(advisory_target))}]\n"
+            f"allowed_roots = [{json.dumps(str(tmp_path))}]\n"
+            "max_file_bytes = 131072\n"
+            "max_bundle_bytes = 524288\n"
+            "excerpt_max_chars = 320\n"
+        )
     config.write_text(
         "[paths]\n"
         f"incoming_dir = {json.dumps(str(data / 'incoming'))}\n"
         f"parquet_dir = {json.dumps(str(data / 'parquet'))}\n"
         f"duckdb_path = {json.dumps(str(data / 'drover.duckdb'))}\n"
-        f"worktrees_dir = {json.dumps(str(tmp_path / 'worktrees'))}\n"
+        f"worktrees_dir = {json.dumps(str(tmp_path / 'worktrees'))}\n" + advisory
     )
     bin_dir, log = fake_clis
     environment = os.environ.copy()
@@ -194,23 +215,25 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
             + environment.get("PYTHONPATH", ""),
         }
     )
+    launch = [
+        *command,
+        "--config",
+        str(config),
+        "--host-id",
+        "contract-host",
+        "--display-name",
+        "Contract Host",
+        "--listen",
+        "127.0.0.1:0",
+    ]
+    if not options.get("no_token"):
+        launch.extend(["--host-token", "contract-token"])
+    if not options.get("no_central"):
+        launch.extend(["--central-url", fake_hub.url])
+    if options.get("relay"):
+        launch.append("--relay")
     process = subprocess.Popen(
-        [
-            *command,
-            "--config",
-            str(config),
-            "--host-id",
-            "contract-host",
-            "--display-name",
-            "Contract Host",
-            "--listen",
-            "127.0.0.1:0",
-            "--host-token",
-            "contract-token",
-            "--central-url",
-            fake_hub.url,
-            *(["--relay"] if getattr(request, "param", False) else []),
-        ],
+        launch,
         cwd=Path.cwd(),
         env=environment,
         text=True,
