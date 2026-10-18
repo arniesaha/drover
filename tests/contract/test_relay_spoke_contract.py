@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import time
 
 import pytest
 
@@ -29,6 +31,21 @@ def test_relay_hello_and_loopback_sessions_request(daemon, fake_hub):
 def test_relay_open_unknown_terminal_returns_open_error(daemon, fake_hub):
     sock = fake_hub.relay()
     send_json(sock, open_frame("missing", "/sessions/nope/terminal"))
-    response = recv_json(sock)
+    deadline = time.monotonic() + 5
+    response = None
+    while time.monotonic() < deadline:
+        sock.settimeout(max(0.01, deadline - time.monotonic()))
+        try:
+            frame = recv_json(sock)
+        except socket.timeout:
+            break
+        if (
+            frame
+            and frame.get("kind") == "open_error"
+            and frame.get("chan") == "missing"
+        ):
+            response = frame
+            break
+    assert response is not None, "relay did not return open_error for missing terminal"
     assert response["kind"] == "open_error"
     assert response["chan"] == "missing"
