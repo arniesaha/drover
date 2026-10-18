@@ -8,6 +8,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from _timeouts import scale_timeout
 
 from drover.schema import bootstrap
 from drover.server.analytics_maintenance import AnalyticalMaintenanceGate
@@ -33,6 +34,16 @@ def request(port, path, method="GET"):
         )
         result = response.status, body, response.headers
     return result, time.monotonic() - started
+
+
+def _wait_for_maintenance(gate: AnalyticalMaintenanceGate) -> bool:
+    """Acquire maintenance after the HTTP handler has unwound its foreground scope."""
+    deadline = time.monotonic() + scale_timeout(1.0)
+    while time.monotonic() < deadline:
+        if gate.try_begin_maintenance():
+            return True
+        time.sleep(0.005)
+    return gate.try_begin_maintenance()
 
 
 @pytest.fixture
@@ -116,7 +127,7 @@ def test_long_analytics_keeps_fleet_fast_and_rejects_excess_work(
                 release.set()
             assert pending.result()[0][0] == 200
         assert request(port, "/analytics")[0][0] == 200
-        assert gate.try_begin_maintenance()
+        assert _wait_for_maintenance(gate)
         gate.end_maintenance()
     finally:
         server.shutdown()

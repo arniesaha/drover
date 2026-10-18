@@ -70,6 +70,7 @@ from drover.server.db import (
     control_plane_connection,
     open_duckdb_connection,
 )
+from drover.server.runtime_observability import activity
 
 log = logging.getLogger("drover.advisory")
 SnapshotFactory = Callable[[str, str, str], AnalysisSnapshot]
@@ -349,7 +350,8 @@ class ContentAnalysisWorker:
         def _run() -> None:
             while not shutdown_event.is_set():
                 try:
-                    self.run_once()
+                    with activity("content_advisory_sweep", kind="background"):
+                        self.run_once()
                 except Exception:  # noqa: BLE001 - keep daemon alive degraded
                     log.warning("content advisory worker loop failed")
                 shutdown_event.wait(poll_interval_seconds)
@@ -744,13 +746,14 @@ class AdvisoryWorker:
         *,
         scheduler: AdvisoryScheduler | None = None,
     ) -> AdvisoryRunResult:
-        with self._admission.admit() as admitted:
-            if not admitted:
-                log.debug("advisory sweep deferred: a request is in flight")
-                return AdvisoryRunResult(succeeded=0, failed=0, skipped=0)
-            if scheduler is not None:
-                scheduler.enqueue_due_full_review()
-            return self._run_once_admitted(analyzers)
+        with activity("advisory_sweep", kind="background"):
+            with self._admission.admit() as admitted:
+                if not admitted:
+                    log.debug("advisory sweep deferred: a request is in flight")
+                    return AdvisoryRunResult(succeeded=0, failed=0, skipped=0)
+                if scheduler is not None:
+                    scheduler.enqueue_due_full_review()
+                return self._run_once_admitted(analyzers)
 
     @property
     def deferred_sweeps(self) -> int:

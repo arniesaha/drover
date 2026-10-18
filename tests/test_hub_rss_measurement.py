@@ -24,6 +24,7 @@ _growth_summary = MODULE._growth_summary
 measure = MODULE.measure
 prepare = MODULE.prepare
 PRODUCTION_ENDPOINTS = MODULE.PRODUCTION_ENDPOINTS
+CONCURRENT_GATE_ENDPOINTS = MODULE.CONCURRENT_GATE_ENDPOINTS
 
 
 def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
@@ -45,6 +46,17 @@ def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
     assert report["samples"]
     assert all(sample["hub_memory"] > 0 for sample in report["samples"])
     assert report["peak_hub_memory"] < report["hub_peak_budget_bytes"]
+    assert [
+        request["path"] for request in report["concurrent_endpoint_requests"]
+    ] == list(CONCURRENT_GATE_ENDPOINTS)
+    assert all(
+        request["status"] in {200, 503}
+        for request in report["concurrent_endpoint_requests"]
+    )
+    assert (
+        max(request["seconds"] for request in report["concurrent_endpoint_requests"])
+        < report["concurrent_lock_hold_budget_seconds"]
+    )
     assert report["lifetime_peak_hub_memory"] >= report["peak_hub_memory"]
     assert report["harness_event_limit_probe"]["status"] == 413
     assert report["harness_event_limit_probe"]["declared_bytes"] == (

@@ -16,19 +16,20 @@ struct SettingsSupportLinkTests {
     @Test func supportLinksPointAtThePublishedDocs() {
         #expect(
             SettingsView.privacyURL.absoluteString
-                == "https://github.com/arniesaha/drover/blob/main/docs/privacy.md"
+                == "https://drover.fyi/privacy"
         )
         #expect(
             SettingsView.supportURL.absoluteString
-                == "https://github.com/arniesaha/drover/blob/main/docs/support.md"
+                == "https://drover.fyi/support"
         )
     }
 
     @Test func supportLinksAreHttpsAndCarryAHost() {
         for url in [SettingsView.privacyURL, SettingsView.supportURL] {
             #expect(url.scheme == "https")
-            #expect(url.host() == "github.com")
-            #expect(url.pathExtension == "md")
+            #expect(url.host() == "drover.fyi")
         }
+        #expect(SettingsView.privacyURL.path == "/privacy")
+        #expect(SettingsView.supportURL.path == "/support")
     }
 }
