@@ -330,6 +330,7 @@ struct ChatView: View {
         }
         .onAppear {
             NotificationVisibility.shared.show(sessionID: sessionID, owner: visibilityOwner)
+            Task { await SessionNotificationDelivery.clear(sessionID: sessionID) }
         }
         .onDisappear {
             NotificationVisibility.shared.hide(owner: visibilityOwner)

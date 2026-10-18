@@ -24,7 +24,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +42,8 @@ _AWAITING_TITLES = {
     "approval": "approval required",
     "input": "your turn",
 }
+_BODY_MAX_CHARS = 140
+_APNS_MAX_BYTES = 4096
 
 # --- rejection classification ------------------------------------------------
 #
@@ -188,6 +190,18 @@ class AwaitingTransition:
     status: str = ""
     private: bool = False
     repo_name: str | None = None
+    #: Human-facing host label. This is metadata and remains safe when content
+    #: consent is off.
+    host: str = ""
+    #: A compact, already-redacted approval description (if this is one).
+    approval_summary: str = ""
+    #: Content previews and prompt-derived titles are opt-in. ``private`` is
+    #: retained for profile-scoped sessions; both gates fail closed.
+    content_allowed: bool = True
+    #: Number of state changes folded into this delivery.
+    update_count: int = 1
+    #: Count of sessions currently waiting for the person, not event count.
+    badge_count: int | None = None
 
     @property
     def needs_user(self) -> bool:
@@ -220,16 +234,18 @@ class AwaitingTransition:
         return mode == "action" and self.needs_user
 
     def alert_title(self) -> str:
+        if not self.allows_content:
+            return self._metadata_prefix()
+        project = self.project_name()
         if self.private:
-            return (
-                self._safe_text(self.repo_name) or self._safe_text(_basename(self.cwd))
-            )[:60] or "Session"
-        return (self._safe_text(self.title) or self._safe_text(_basename(self.cwd)))[
-            :60
-        ] or "Session"
+            return project or "Session"
+        session = self._safe_text(self.title)
+        if project and session:
+            return f"{project} · {session}"[:120]
+        return (project or session or "Session")[:120]
 
     def alert_subtitle(self) -> str:
-        return ""
+        return self._safe_text(self.host)[:60]
 
     def alert_body(self) -> str:
         prefix = {
@@ -248,13 +264,38 @@ class AwaitingTransition:
             "failed": "open the session for details",
             "progress": "work is continuing",
         }[self.kind]
-        # Approval text is deliberately fixed: raw command details belong in the app.
+        if not self.allows_content:
+            metadata = [prefix, self.project_name(), self._safe_text(self.host)]
+            return _condense(
+                " · ".join(part for part in metadata if part), _BODY_MAX_CHARS
+            )
+        if self.private:
+            return _condense(f"{prefix}: {fallback}", _BODY_MAX_CHARS)
         summary = (
-            ""
-            if self.private or (self.needs_user and self.awaiting == "approval")
-            else self.summary()
+            self.approval_summary if self.awaiting == "approval" else self.summary()
         )
-        return _condense(f"{prefix}: {summary or fallback}")
+        if self.awaiting == "approval" and summary:
+            return _condense(summary, _BODY_MAX_CHARS, keep_code=True)
+        if self.kind == "input" and summary:
+            return _condense(summary, _BODY_MAX_CHARS)
+        return _condense(f"{prefix}: {summary or fallback}", _BODY_MAX_CHARS)
+
+    @property
+    def allows_content(self) -> bool:
+        return self.content_allowed
+
+    def project_name(self) -> str:
+        return (
+            self._safe_text(self.repo_name) or self._safe_text(_basename(self.cwd))
+        )[:60]
+
+    def _metadata_prefix(self) -> str:
+        return {
+            "input": "Needs your input",
+            "finished": "Finished",
+            "failed": "Failed",
+            "progress": "Update",
+        }[self.kind]
 
     def summary(self) -> str:
         # Git delivery details and command transcripts belong in the session.
@@ -276,11 +317,12 @@ class AwaitingTransition:
         return _condense(text)
 
 
-def _collapse_id(session_id: str) -> str:
+def _collapse_id(session_id: str, kind: str = "") -> str:
     # APNs limits bytes, not characters. Hash long/non-ASCII IDs without collisions.
-    if session_id.isascii() and len(session_id) <= 64:
-        return session_id
-    return hashlib.sha256(session_id.encode()).hexdigest()
+    value = f"{session_id}:{kind}" if kind else session_id
+    if value.isascii() and len(value.encode()) <= 64:
+        return value
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 def _basename(cwd: str | None) -> str:
@@ -294,7 +336,9 @@ def _basename(cwd: str | None) -> str:
 _SUMMARY_MAX_CHARS = 220
 
 
-def _condense(text: str | None) -> str:
+def _condense(
+    text: str | None, maximum: int = _SUMMARY_MAX_CHARS, *, keep_code: bool = False
+) -> str:
     """Flatten an agent message into one notification-shaped line.
 
     Assistant output is markdown over many lines ("Here's where things
@@ -324,20 +368,24 @@ def _condense(text: str | None) -> str:
         "",
         text,
     )
-    text = text.replace("—", ":").replace("`", "")
+    text = text.replace("—", ":")
+    if not keep_code:
+        text = text.replace("`", "")
     condensed = " ".join(str(text).split())
     condensed = condensed.replace("**", "").replace("__", "")
+    # Markdown emphasis around a word, but not underscores inside identifiers.
+    condensed = re.sub(r"(?<!\w)[*_](?=\S)|(?<=\S)[*_](?!\w)", "", condensed)
     # Leading list/heading markers survive the whitespace fold as stray
     # punctuation once the line breaks are gone.
     condensed = re.sub(r"(?:^|(?<= ))[#>]+ (?=\S)", "", condensed)
     condensed = re.sub(r"(?:^|(?<= ))[-*+] (?=\S)", "• ", condensed)
     condensed = condensed.strip()
-    if len(condensed) <= _SUMMARY_MAX_CHARS:
+    if len(condensed) <= maximum:
         return condensed
     # Cut on a word boundary; a mid-word truncation reads like corruption.
-    cut = condensed[: _SUMMARY_MAX_CHARS - 1]
+    cut = condensed[: maximum - 1]
     space = cut.rfind(" ")
-    if space > _SUMMARY_MAX_CHARS // 2:
+    if space > maximum // 2:
         cut = cut[:space]
     cut = cut.rstrip(" ,;:—-•")
     # A cut that happens to land on a sentence end is already a clean stop;
@@ -420,7 +468,7 @@ class APNsSender:
         clock=time.time,
         timer_factory=threading.Timer,
         batch_seconds: float = 60,
-        input_batch_seconds: float = 5,
+        input_batch_seconds: float = 60,
     ):
         self._clock = clock
         self._timer_factory = timer_factory
@@ -428,6 +476,11 @@ class APNsSender:
         self._input_batch_seconds = input_batch_seconds
         self._pending_lock = threading.Lock()
         self._pending = {}
+        # Per device/session cooldowns: the first question gets through now;
+        # follow-ups are folded into one replacement push at the end of this
+        # window. It is deliberately in-memory: losing it on a hub restart is
+        # preferable to persisting notification content.
+        self._recent: dict[str, dict[str, float]] = {}
         self._timer = None
         self._closed = False
         self._config = config
@@ -520,26 +573,50 @@ class APNsSender:
         return self._client
 
     def notify(self, transition: AwaitingTransition) -> None:
-        """Coalesce each device's latest session states in a fixed window."""
+        """Send the first urgent state now, then coalesce per session.
+
+        APNs collapse IDs replace an undelivered payload; this small server
+        window also stops repeated *delivered* banners while an agent emits a
+        burst of related state changes.
+        """
         if not self._config.is_usable:
             return
         now = self._clock()
+        immediate = []
         with self._pending_lock:
             if self._closed:
                 return
             for credential in self._targets():
                 mode = credential.notification_mode
                 entry = self._pending.get(credential.id)
+                cooldown_deadline = None
                 if not transition.allowed(mode):
                     if entry:
                         entry[2].pop(transition.session_id, None)
+                    self._recent.get(credential.id, {}).pop(transition.session_id, None)
                     continue
+                if mode != "digest" and transition.needs_user:
+                    recent = self._recent.setdefault(credential.id, {})
+                    expired = [key for key, until in recent.items() if until <= now]
+                    for key in expired:
+                        recent.pop(key, None)
+                    if transition.session_id not in recent:
+                        # Promptly deliver the first actionable request. A
+                        # later one for this session takes the debounce path.
+                        if entry:
+                            # A just-cleared/progress update must not arrive
+                            # after the newer actionable request.
+                            entry[2].pop(transition.session_id, None)
+                        recent[transition.session_id] = now + self._input_batch_seconds
+                        immediate.append((credential, transition))
+                        continue
+                    cooldown_deadline = recent[transition.session_id]
                 delay = (
                     (86400 - now % 86400)
                     if mode == "digest"
                     else (
-                        min(self._batch_seconds, self._input_batch_seconds)
-                        if transition.needs_user
+                        max(0, cooldown_deadline - now)
+                        if cooldown_deadline is not None
                         else self._batch_seconds
                     )
                 )
@@ -550,8 +627,14 @@ class APNsSender:
                     # An urgent state can advance a normal batch's deadline;
                     # subsequent updates can never postpone that deadline.
                     entry[0] = min(entry[0], now + delay)
-                entry[2][transition.session_id] = transition
+                previous = entry[2].get(transition.session_id)
+                entry[2][transition.session_id] = [
+                    transition,
+                    (previous[1] + 1) if previous else 1,
+                ]
             self._schedule_locked()
+        for credential, state in immediate:
+            self._send_one(credential, state, self._needs_user_count(state))
 
     def _schedule_locked(self):
         if self._timer is not None:
@@ -587,14 +670,24 @@ class APNsSender:
             if credential.notification_mode != mode:
                 # A preference change must never send an alert under the old mode.
                 continue
-            transitions = [state for state in states.values() if state.allowed(mode)]
+            transitions = [
+                replace(state, update_count=count)
+                for state, count in states.values()
+                if state.allowed(mode)
+            ]
             if transitions:
-                for offset in range(0, len(transitions), 20):
-                    self._send_one(
-                        credential,
-                        transitions[offset : offset + 20],
-                        self._needs_user_count(),
-                    )
+                if mode == "digest":
+                    for offset in range(0, len(transitions), 20):
+                        self._send_one(
+                            credential,
+                            transitions[offset : offset + 20],
+                            self._needs_user_count(transitions[0]),
+                        )
+                else:
+                    # One APNs thread and collapse key per session. Do not
+                    # turn a burst across sessions into a generic summary.
+                    for state in transitions:
+                        self._send_one(credential, state, self._needs_user_count(state))
 
     def _targets(self):
         for credential in self._credentials.list_all():
@@ -623,8 +716,12 @@ class APNsSender:
             ):
                 self._send_one(credential, transition, badge)
 
-    def _needs_user_count(self) -> int | None:
+    def _needs_user_count(
+        self, transition: AwaitingTransition | None = None
+    ) -> int | None:
         """Best-effort badge value; ``None`` leaves the app's badge alone."""
+        if transition is not None and transition.badge_count is not None:
+            return max(0, int(transition.badge_count))
         counter = getattr(self, "_badge_source", None)
         if counter is None:
             return None
@@ -642,9 +739,18 @@ class APNsSender:
         states = transition if isinstance(transition, list) else [transition]
         ids = sorted(state.session_id for state in states)
         if len(states) == 1 and not summary:
-            alert = {"title": states[0].alert_title(), "body": states[0].alert_body()}
+            body = states[0].alert_body()
+            if states[0].update_count > 1:
+                body = _condense(
+                    f"{states[0].update_count} updates · latest: {body}",
+                    _BODY_MAX_CHARS,
+                )
+            alert = {"title": states[0].alert_title(), "body": body}
+            subtitle = states[0].alert_subtitle()
+            if subtitle:
+                alert["subtitle"] = subtitle
             route = {"session_id": ids[0]}
-            thread = _collapse_id(ids[0])
+            thread = ids[0]
         else:
             counts = {
                 kind: sum(state.kind == kind for state in states)
@@ -672,6 +778,13 @@ class APNsSender:
             ),
             "sound": "default",
             "thread-id": thread,
+            "summary-arg": (
+                states[0].project_name() if len(states) == 1 else "sessions"
+            )
+            or "Drover",
+            "summary-arg-count": (
+                states[0].update_count if len(states) == 1 else len(states)
+            ),
             "interruption-level": (
                 "time-sensitive"
                 if any(state.needs_user for state in states)
@@ -680,13 +793,27 @@ class APNsSender:
         }
         if badge is not None:
             aps["badge"] = badge
-        return json.dumps({"aps": aps, **route}, separators=(",", ":")).encode("utf-8")
+        payload = json.dumps({"aps": aps, **route}, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        # A malformed/upstream title must never make APNs reject a useful
+        # notification. The normal builders are far below this ceiling; this
+        # is a final fail-safe for long metadata and digest IDs.
+        if len(payload) > _APNS_MAX_BYTES:
+            aps["alert"] = {"title": "Drover", "body": "Session updates available"}
+            route = (
+                {"session_ids": ids[:20]} if len(ids) > 1 else {"session_id": ids[0]}
+            )
+            payload = json.dumps({"aps": aps, **route}, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        return payload
 
     def _device_payload(self, credential, transition, badge):
         is_digest = credential.notification_mode == "digest"
         payload = json.loads(self._payload(transition, badge, summary=is_digest))
         if is_digest:
-            payload["aps"]["interruption-level"] = "active"
+            payload["aps"]["interruption-level"] = "passive"
         return json.dumps(payload, separators=(",", ":")).encode()
 
     def _send_one(self, credential, transition: AwaitingTransition, badge) -> None:
@@ -705,10 +832,10 @@ class APNsSender:
             # through three transitions wakes to the latest state, not three
             # stacked banners for the same session.
             "apns-collapse-id": (
-                _collapse_id(transition.session_id)
+                _collapse_id(transition.session_id, transition.kind)
                 if not isinstance(transition, list)
                 else (
-                    _collapse_id(transition[0].session_id)
+                    _collapse_id(transition[0].session_id, transition[0].kind)
                     if len(transition) == 1
                     else hashlib.sha256(
                         "\0".join(
