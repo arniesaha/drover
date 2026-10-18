@@ -160,6 +160,7 @@ from drover.server.providers.service import ProviderUsageService
 from drover.server.quality import format_prometheus, quality_snapshot
 from drover.server.rollup import rollup_tasks
 from drover.server.runtime import RuntimeLayout
+from drover.server.runtime_observability import FootprintWatchdog, activity
 from drover.server.session_graph import (
     delegation_graph_payload,
     format_ascii,
@@ -267,10 +268,11 @@ def _warm_cockpit(service: "CockpitService") -> None:
     """
 
     def run() -> None:
-        try:
-            service.overview(AnalyticsFilters(days=7))
-        except Exception:  # noqa: BLE001 - warming is best effort
-            log.debug("cockpit warm-up failed; the first request pays instead")
+        with activity("cockpit_warmup", kind="background"):
+            try:
+                service.overview(AnalyticsFilters(days=7))
+            except Exception:  # noqa: BLE001 - warming is best effort
+                log.debug("cockpit warm-up failed; the first request pays instead")
 
     threading.Thread(target=run, name="cockpit-warmup", daemon=True).start()
 
@@ -286,10 +288,11 @@ def _warm_metrics(collector: MetricsCollector) -> None:
     """
 
     def run() -> None:
-        try:
-            collector.warm()
-        except Exception:  # noqa: BLE001 - warming is best effort
-            log.debug("metrics warm-up failed; the first scrape pays instead")
+        with activity("metrics_warmup", kind="background"):
+            try:
+                collector.warm()
+            except Exception:  # noqa: BLE001 - warming is best effort
+                log.debug("metrics warm-up failed; the first scrape pays instead")
 
     threading.Thread(target=run, name="metrics-warmup", daemon=True).start()
 
@@ -638,18 +641,19 @@ def _backfill_day_summaries(
     while not stop.is_set():
         delay = _DAY_SUMMARY_REFRESH_SECONDS
         try:
-            with admission.admit() as admitted:
-                if admitted:
-                    with legacy_derived_write(duckdb_path) as allowed:
-                        if not allowed:
-                            return
-                        summarised = backfill_agent_event_day_summary(duckdb_path)
-                    if summarised:
-                        log.info("summarised %d event partition(s)", summarised)
-                else:
-                    # A busy cockpit must not postpone the projection that
-                    # makes its next build cheap by another full 15 minutes.
-                    delay = _DAY_SUMMARY_RETRY_SECONDS
+            with activity("day_summary_backfill", kind="background"):
+                with admission.admit() as admitted:
+                    if admitted:
+                        with legacy_derived_write(duckdb_path) as allowed:
+                            if not allowed:
+                                return
+                            summarised = backfill_agent_event_day_summary(duckdb_path)
+                        if summarised:
+                            log.info("summarised %d event partition(s)", summarised)
+                    else:
+                        # A busy cockpit must not postpone the projection that
+                        # makes its next build cheap by another full 15 minutes.
+                        delay = _DAY_SUMMARY_RETRY_SECONDS
         except Exception:  # noqa: BLE001 - a cold cache only costs speed
             log.exception("event day summary backfill failed; reads will scan")
         stop.wait(delay)
@@ -2792,6 +2796,8 @@ def run(
     from drover.server.process_memory import configure_memory_guard
 
     configure_memory_guard(cfg.memory)
+    footprint_watchdog = FootprintWatchdog()
+    footprint_watchdog.start()
     runtime_config_path = (
         Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     )
@@ -3122,16 +3128,17 @@ def run(
             mcp_thread = None
 
     def _finish_analytical_bootstrap() -> None:
-        try:
-            if not _bind_legacy_parquet_views(cfg):
-                return
-            from drover.server.process_memory import memory_note
+        with activity("analytical_bootstrap", kind="background"):
+            try:
+                if not _bind_legacy_parquet_views(cfg):
+                    return
+                from drover.server.process_memory import memory_note
 
-            # Legacy startup may bind broad parquet globs. Record its physical
-            # footprint cost where this path is still selected.
-            log.info("analytical Parquet views ready (%s)", memory_note())
-        except Exception:  # noqa: BLE001
-            log.exception("analytical Parquet view bootstrap failed")
+                # Legacy startup may bind broad parquet globs. Record its physical
+                # footprint cost where this path is still selected.
+                log.info("analytical Parquet views ready (%s)", memory_note())
+            except Exception:  # noqa: BLE001
+                log.exception("analytical Parquet view bootstrap failed")
 
     threading.Thread(
         target=_finish_analytical_bootstrap,
@@ -3540,6 +3547,7 @@ def run(
     try:
         stop.wait()
     finally:
+        footprint_watchdog.stop()
         if content_advisory_worker is not None:
             content_advisory_worker.join(timeout=10.0)
         if advisory_worker is not None:

@@ -57,6 +57,7 @@ from drover.server.memory_store import (
     VectorStoreUnavailable,
 )
 from drover.server.postgres_schema import EMBEDDING_DIM
+from drover.server.runtime_observability import activity
 from drover.server.summarizer.backends import SummarizerBackendConfig
 from drover.server.summarizer.backends.types import BackendError
 
@@ -166,7 +167,8 @@ class EmbedWorker:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self.drain_batch()
+                with activity("embeddings_drain", kind="background"):
+                    self.drain_batch()
             except Exception:  # noqa: BLE001
                 log.exception("embed drain loop crashed (will retry)")
             self._stop.wait(self.poll_interval_s)

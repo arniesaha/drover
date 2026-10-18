@@ -483,10 +483,10 @@ struct SettingsView: View {
     // trust the app with a token. Both were confirmed to resolve when this
     // shipped; the test guards the shape, not the network.
     static let privacyURL = URL(
-        string: "https://github.com/arniesaha/drover/blob/main/docs/privacy.md"
+        string: "https://drover.fyi/privacy"
     )!
     static let supportURL = URL(
-        string: "https://github.com/arniesaha/drover/blob/main/docs/support.md"
+        string: "https://drover.fyi/support"
     )!
 
     private func testAndSave() async {
