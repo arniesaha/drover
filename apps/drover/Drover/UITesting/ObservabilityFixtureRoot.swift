@@ -19,21 +19,30 @@ struct ObservabilityFixtureRoot: View {
     var body: some View {
         TabView {
             NavigationStack { AnalyticsView(store: store) }
-                .tabItem { Label("Analytics", systemImage: "chart.bar") }
+                .tabItem { Label(AppTab.analytics.title, systemImage: AppTab.analytics.systemImage) }
+                .tag(AppTab.analytics)
+                .accessibilityIdentifier(AppTab.analytics.accessibilityIdentifier)
             NavigationStack { InsightsView(client: client, store: store) }
-                .tabItem { Label("Insights", systemImage: "lightbulb") }
+                .tabItem { Label(AppTab.insights.title, systemImage: AppTab.insights.systemImage) }
+                .tag(AppTab.insights)
+                .accessibilityIdentifier(AppTab.insights.accessibilityIdentifier)
             NavigationStack {
                 ProviderAccountsView(accounts: ObservabilityFixtureData.accounts, status: .ok,
                     statusMessage: nil, hostTitles: ObservabilityFixtureData.hostTitles)
             }
-            .tabItem { Label("Accounts", systemImage: "person.crop.circle") }
+            .tabItem { Label(AppTab.accounts.title, systemImage: AppTab.accounts.systemImage) }
+            .tag(AppTab.accounts)
+            .accessibilityIdentifier(AppTab.accounts.accessibilityIdentifier)
             NavigationStack {
                 SessionsView(client: client, notifier: FixtureNotifier(), recoveryStore: nil,
                     recoveryWriteGate: ChatRecoveryWriteGate(), recoveryGeneration: 0)
             }
-            .tabItem { Label("Home", systemImage: "rectangle.stack") }
+            .tabItem { Label(AppTab.home.title, systemImage: AppTab.home.systemImage) }
+            .tag(AppTab.home)
+            .accessibilityIdentifier(AppTab.home.accessibilityIdentifier)
 
         }
+        .tabViewStyle(.sidebarAdaptable)
         .environment(appearance)
         .preferredColorScheme(appearance.appearance.colorScheme)
         .droverTint()
@@ -45,9 +54,122 @@ enum ObservabilityFixtureData {
         "laptop": "Work laptop with a long descriptive host name", "nas": "NAS"]
 
     static var homeSnapshot: Data {
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_FLEET_FILTERS"] == "1" {
+            return fleetSnapshot
+        }
         var value = try! JSONSerialization.jsonObject(with: FixtureScenarioData.snapshotData()) as! [String: Any]
         value["cockpit_api_version"] = 1
         value["cockpit_sections"] = ["provider_capacity", "activity", "insights"]
+        return encode(value)
+    }
+
+    static var fleetSnapshot: Data {
+        let codexRow: [String: Any] = [
+            "name": "codex",
+            "enabled": true,
+            "default_model": "gemini-2.5-pro",
+            "models": ["gemini-2.5-pro", "gemini-2.5-flash"],
+        ]
+        let hosts: [[String: Any]] = [
+            [
+                "host_id": "studio",
+                "status": "online",
+                "connection_kind": "direct",
+                "capabilities": [
+                    "display_name": "Arnabs-Mac-Studio",
+                    "harnesses": [codexRow],
+                ],
+            ],
+            [
+                "host_id": "gpu-pc",
+                "status": "online",
+                "connection_kind": "direct",
+                "capabilities": [
+                    "display_name": "GPU PC",
+                    "harnesses": [codexRow],
+                ],
+            ],
+            [
+                "host_id": "nas",
+                "status": "offline",
+                "connection_kind": "direct",
+                "capabilities": [
+                    "display_name": "NAS",
+                    "harnesses": [codexRow],
+                ],
+            ],
+        ]
+
+        let sessions: [[String: Any]] = [
+            [
+                "session_id": "studio-drover-approval",
+                "host_id": "studio",
+                "harness": "codex",
+                "mode": "structured",
+                "status": "working",
+                "awaiting": "approval",
+                "repo_name": "arniesaha/drover",
+                "cwd": "/Users/arnab/code/drover",
+                "preview": "Fix reorder glitch and fleet filters",
+                "last_activity": "2026-10-17T21:00:00Z",
+            ],
+            [
+                "session_id": "studio-openclaw-running",
+                "host_id": "studio",
+                "harness": "codex",
+                "mode": "structured",
+                "status": "working",
+                "repo_name": "arniesaha/openclaw",
+                "cwd": "/Users/arnab/code/openclaw",
+                "preview": "Autonomous claw controller agent",
+                "last_activity": "2026-10-17T20:50:00Z",
+            ],
+            [
+                "session_id": "gpu-drover-running",
+                "host_id": "gpu-pc",
+                "harness": "codex",
+                "mode": "structured",
+                "status": "working",
+                "repo_name": "arniesaha/drover",
+                "cwd": "/workspace/drover",
+                "preview": "Run integration tests across matrix",
+                "last_activity": "2026-10-17T20:45:00Z",
+            ],
+            [
+                "session_id": "gpu-models-input",
+                "host_id": "gpu-pc",
+                "harness": "codex",
+                "mode": "structured",
+                "status": "working",
+                "awaiting": "input",
+                "repo_name": "arniesaha/models",
+                "cwd": "/workspace/models",
+                "preview": "Evaluate llama-3-checkpoint",
+                "last_activity": "2026-10-17T20:30:00Z",
+            ],
+            [
+                "session_id": "studio-drover-finished",
+                "host_id": "studio",
+                "harness": "codex",
+                "mode": "structured",
+                "status": "completed",
+                "repo_name": "arniesaha/drover",
+                "cwd": "/Users/arnab/code/drover",
+                "preview": "Clean up unused dependencies",
+                "last_activity": "2026-10-17T19:00:00Z",
+            ],
+        ]
+
+        let value: [String: Any] = [
+            "cockpit_api_version": 1,
+            "cockpit_sections": ["provider_capacity", "activity", "insights"],
+            "hosts": hosts,
+            "sessions": sessions,
+            "cwd_suggestions": [
+                ["path": "/Users/arnab/code/drover", "source": "fixture", "host_id": "studio"],
+                ["path": "/workspace/drover", "source": "fixture", "host_id": "gpu-pc"],
+            ],
+        ]
         return encode(value)
     }
 

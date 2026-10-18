@@ -100,6 +100,9 @@ struct DroverApp: App {
         if let scenario {
             _environment = State(initialValue: scenario.environment)
             notifier = FixtureNotifier()
+            if let pendingID = ProcessInfo.processInfo.environment["DROVER_UI_TEST_PENDING_SESSION_ID"] {
+                NotificationRoute.shared.open(sessionID: pendingID)
+            }
             return
         }
 #endif
@@ -231,19 +234,14 @@ private struct RootView: View {
     var body: some View {
         Group {
             if let client = environment.client {
-                NavigationStack {
-                    SessionsView(
-                        client: client,
-                        isDemoMode: environment.isDemoMode,
-                        notifier: notifier,
-                        recoveryStore: environment.chatRecoveryStore,
-                        recoveryWriteGate: environment.chatRecoveryWriteGate,
-                        recoveryGeneration: environment.chatRecoveryGeneration,
-                        chatModelFactory: chatModelFactory,
-                        defaults: defaults,
-                        onOpenSettings: { showSettings = true }
-                    )
-                }
+                MainTabView(
+                    client: client,
+                    environment: environment,
+                    notifier: notifier,
+                    defaults: defaults,
+                    chatModelFactory: chatModelFactory,
+                    onOpenSettings: { showSettings = true }
+                )
                 .id(environment.generation)
                 .sheet(isPresented: $showSettings) {
                     NavigationStack {
@@ -351,6 +349,7 @@ private struct FixturePreparedRoot: View {
                                 .accessibilityIdentifier("fixture-turn-submission-count")
                         }
                         .font(.caption2)
+                        .foregroundStyle(.clear)
                         .allowsHitTesting(false)
                     }
                 }

@@ -69,7 +69,7 @@ struct StoreTests {
     #expect(store.isReachable)
 }
 
-@Test @MainActor func activeSessionsAreSortedByMostRecentActivityAcrossStates() async throws {
+@Test @MainActor func activeSessionsAreSortedNeedsYouFirstThenRunning() async throws {
     let newestRunning = SessionSummary(
         id: "new-running",
         hostID: "mac-mini",
@@ -101,11 +101,13 @@ struct StoreTests {
         lastActivity: Date(timeIntervalSince1970: 100)
     )
 
+    // Needs-you sessions always precede running sessions.
+    // Within needs-you, approval takes priority over input.
     #expect(SessionStore.activeSessions(from: [
         olderInput,
         newestRunning,
         oldestApproval,
-    ]).map(\.id) == ["new-running", "older-input", "oldest-approval"])
+    ]).map(\.id) == ["oldest-approval", "older-input", "new-running"])
 }
 
 /// The inbox list is one run, newest first, with nothing in between. The screen
@@ -113,7 +115,7 @@ struct StoreTests {
 /// between them (#80), which read as a sort bug — a session touched minutes ago
 /// rendered below one last touched two days ago, with three sections in the gap.
 /// Pinning capacity closed the gap; ordering by recency closed the rest.
-@Test @MainActor func inboxSessionsAreOneContiguousRunNewestFirst() async throws {
+@Test @MainActor func inboxSessionsAreOrderedNeedsYouFirstThenRunning() async throws {
     let waitingTwoDaysAgo = SessionSummary(
         id: "old-input", hostID: "mac-mini", harness: "claude-code", mode: "structured",
         status: "running", awaiting: "input", cwd: nil,
@@ -144,16 +146,14 @@ struct StoreTests {
         runningEarlier, finished, waitingTwoDaysAgo, runningMinutesAgo, approvalYesterday,
     ])
 
-    // Newest first, regardless of bucket. The two-day-old question sorts
-    // below live work rather than above it. Finished is not here: it has its
-    // own collapsed section under the list.
-    #expect(inbox.map(\.id) == ["new-running", "old-running", "approval", "old-input"])
+    // Needs-you first (approval, then input), followed by running (newest first).
+    // Finished is excluded from the active inbox.
+    #expect(inbox.map(\.id) == ["approval", "old-input", "new-running", "old-running"])
 }
 
-/// The ordering itself, stated as the invariant rather than as one example:
-/// activity never increases as you go down the list, whatever the buckets do.
-/// Interleaving is now expected — that is the point of ordering by recency.
-@Test @MainActor func inboxSessionsAreOrderedByRecencyAcrossBuckets() async throws {
+/// The ordering invariant: needs-you sessions always sort above running sessions.
+/// Within each tier, activity recency orders newest first.
+@Test @MainActor func inboxSessionsTierNeedsYouAboveRunning() async throws {
     let sessions = (0..<12).map { index in
         SessionSummary(
             id: "s\(index)", hostID: "mac-mini", harness: "codex", mode: "structured",
@@ -165,17 +165,12 @@ struct StoreTests {
     }
 
     let inbox = SessionStore.inboxSessions(from: sessions)
-    let activity = inbox.compactMap(\.activityDate)
 
     #expect(inbox.count == sessions.count)
-    #expect(activity == activity.sorted(by: >),
-            "inbox is not newest-first: \(inbox.map(\.id))")
-    // And the buckets really are allowed to mix now, so this corpus proves
-    // the ordering is doing work rather than accidentally agreeing with a
-    // bucket-first result.
-    let needsYouFlags = inbox.map { $0.attention == .needsApproval || $0.attention == .needsInput }
-    #expect(needsYouFlags != needsYouFlags.sorted(by: { $0 && !$1 }),
-            "expected interleaving with recency ordering")
+
+    // Check that all needs-you items precede all running items
+    let tiers = inbox.map { SessionOrdering.attentionTier($0) }
+    #expect(tiers == tiers.sorted(), "needs-you must always sort before running: \(inbox.map(\.id))")
 }
 
 @Test @MainActor func refreshFailureKeepsSnapshotSetsError() async throws {

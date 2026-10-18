@@ -41,6 +41,8 @@ struct SessionRow: View {
         HStack(alignment: .top, spacing: 11) {
             StateDot(attention: session.attention, isStale: card.isStale)
                 .padding(.top, 5)
+                .id("dot-\(session.id)")
+                .transaction { $0.animation = nil }
 
             VStack(alignment: .leading, spacing: 5) {
                 // The timestamp rides the kicker row, not the title row.
@@ -144,6 +146,7 @@ struct SessionRow: View {
                 .strokeBorder(DroverColor.line, lineWidth: 1)
         }
         .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("session-row-\(session.id)")
         .accessibilityLabel(accessibilityLabel(for: card))
         .accessibilityHint(accessibilityHint(for: card))
     }
@@ -151,10 +154,11 @@ struct SessionRow: View {
     /// A dashed ring is invisible to VoiceOver, so staleness is said out loud
     /// — before the state phrase it is qualifying, not after it.
     private func accessibilityLabel(for card: SessionCardPresentation) -> String {
+        let status = SessionStatusPresentation(attention: session.attention, isStale: card.isStale)
         guard let note = card.staleNote else {
-            return "\(card.title). \(card.subtitle)"
+            return "\(card.title). \(status.kind.accessibilityLabel). \(card.subtitle)"
         }
-        return "\(note). \(card.title). \(card.subtitle)"
+        return "\(note). \(card.title). \(status.kind.accessibilityLabel). \(card.subtitle)"
     }
 
     private func accessibilityHint(for card: SessionCardPresentation) -> String {
@@ -169,9 +173,16 @@ struct SessionRow: View {
     }
 }
 
-/// Session and host state as *form*: filled = wants you, hollow ring =
-/// working, faint ring = finished — and a broken ring when the state itself is
-/// last-known rather than current.
+/// ============================================================================
+/// STATUS ICON LEGEND (Session Cards & Host Chips)
+/// ============================================================================
+/// - Needs You:  Solid amber disc (DroverColor.warn). Urgency: high, operator action required.
+/// - Running:    Pulsing filled teal disc (DroverColor.accentHi). Urgency: normal, executing.
+/// - Finished:   Solid neutral disc (DroverColor.muted). Urgency: low, completed/resting.
+/// - Failed:     Warning indicator (DroverColor.warn). Urgency: moderate, exited with error.
+/// - Offline:    Hollow line ring (DroverColor.line). Machine currently disconnected.
+/// - Stale:      Dashed line ring (DroverColor.muted). Cached data from unreachable hub.
+/// ============================================================================
 struct StateDot: View {
     let attention: AttentionState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -193,16 +204,20 @@ struct StateDot: View {
             } else {
                 switch attention {
                 case .needsApproval, .needsInput:
-                    Circle().fill(DroverColor.accent)
+                    // Urgency: Needs You -> Amber filled disc
+                    Circle().fill(DroverColor.warn)
                 case .working:
-                    Circle().strokeBorder(DroverColor.accentHi, lineWidth: 1.5)
-                        .phaseAnimator(reduceMotion ? [false] : [false, true]) { ring, faded in
-                            ring.opacity(faded ? 0.45 : 1)
-                        } animation: { _ in
-                            .easeInOut(duration: 1.2)
+                    // In-progress: Running -> Vibrant filled accent disc
+                    Circle().fill(DroverColor.accentHi)
+                case .done:
+                    // Complete: Solid neutral disc
+                    Circle().fill(DroverColor.muted)
+                case .errored:
+                    // Errored: Warn border with small center dot
+                    Circle().strokeBorder(DroverColor.warn, lineWidth: 1.5)
+                        .overlay {
+                            Circle().fill(DroverColor.warn).frame(width: max(2, diameter * 0.4), height: max(2, diameter * 0.4))
                         }
-                case .done, .errored:
-                    Circle().strokeBorder(DroverColor.line, lineWidth: 1)
                 }
             }
         }

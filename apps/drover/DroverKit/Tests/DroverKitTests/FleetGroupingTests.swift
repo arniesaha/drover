@@ -72,4 +72,22 @@ struct FleetGroupingTests {
         #expect(groups[0].host.presence == .offline)
         #expect(groups[0].sessions.map(\.id) == ["orphan"])
     }
+
+    @Test func hostChipCountIsExplicitlyActiveSessionsOnly() {
+        let hosts = [HostSummary.fixture(id: "studio")]
+        let sessions = [
+            SessionSummary.fixture(id: "r1", status: "running", awaiting: nil, hostID: "studio"),
+            SessionSummary.fixture(id: "r2", status: "running", awaiting: nil, hostID: "studio"),
+            SessionSummary.fixture(id: "r3", status: "running", awaiting: nil, hostID: "studio"),
+            SessionSummary.fixture(id: "w1", status: "running", awaiting: "approval", hostID: "studio"),
+            SessionSummary.fixture(id: "w2", status: "running", awaiting: "input", hostID: "studio"),
+            // 24 finished sessions (which must not be counted in the host chip active count)
+            SessionSummary.fixture(id: "d1", status: "completed", awaiting: nil, hostID: "studio"),
+            SessionSummary.fixture(id: "d2", status: "completed", awaiting: nil, hostID: "studio"),
+            SessionSummary.fixture(id: "d3", status: "completed", awaiting: nil, hostID: "studio"),
+        ]
+        let groups = SessionStore.hostGroups(hosts: hosts, sessions: sessions)
+        // 3 running + 2 needs-you = 5 active; finished sessions (3) are excluded
+        #expect(groups[0].sessions.count == 5)
+    }
 }
