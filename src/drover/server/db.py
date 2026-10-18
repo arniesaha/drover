@@ -1266,6 +1266,10 @@ _ANALYTICAL_STATE_GUARD = threading.Lock()
 _ANALYTICAL_RECOVERY_FAST_ATTEMPTS = 3
 _ANALYTICAL_RECOVERY_BACKOFF_SECONDS = 0.25
 _ANALYTICAL_RECOVERY_MAX_BACKOFF_SECONDS = 60.0
+# A request must never sit behind a stalled in-process DuckDB open forever.
+# The owner is separately diagnosed by readiness; callers get the stable 503
+# mapped from AnalyticalStoreBusy instead of tying up a web thread.
+ANALYTICAL_CONNECT_LOCK_WAIT_SECONDS = 30.0
 
 
 def analytical_store_health(duckdb_path: str | Path) -> dict[str, object]:
@@ -1468,8 +1472,13 @@ def _analytical_open_lock(
 ) -> Iterator[None]:
     lock = duckdb_connect_lock(duckdb_path)
     if timeout is None:
-        while not lock.acquire(timeout=0.05):
+        deadline = time.monotonic() + ANALYTICAL_CONNECT_LOCK_WAIT_SECONDS
+        while not lock.acquire(
+            timeout=min(0.05, max(0.0, deadline - time.monotonic()))
+        ):
             require_analytical_store(duckdb_path, generation)
+            if time.monotonic() >= deadline:
+                raise AnalyticalStoreBusy("analytical connect lock is busy")
     elif not lock.acquire(timeout=max(0.0, timeout)):
         raise AnalyticalStoreBusy("analytical connect lock is busy")
     try:

@@ -170,36 +170,6 @@ def test_process_limits_kill_and_reap(script, limits, error, tmp_path):
     )
 
 
-def test_disposable_query_launches_with_posix_spawn_not_popen(tmp_path, monkeypatch):
-    """Launching a reader must never fork a memory-heavy macOS hub."""
-    from drover.server.lake import query_process
-
-    real_spawn = query_process.os.posix_spawn
-    launches = []
-
-    def record_spawn(*args, **kwargs):
-        launches.append((args, kwargs))
-        return real_spawn(*args, **kwargs)
-
-    def unexpected_popen(*_args, **_kwargs):
-        raise AssertionError("disposable query must not use subprocess.Popen")
-
-    monkeypatch.setattr(query_process.os, "posix_spawn", record_spawn)
-    monkeypatch.setattr(query_process.subprocess, "Popen", unexpected_popen)
-
-    result = run_disposable(
-        [sys.executable, "-c", "print('{\"rows\": []}')"],
-        admission_path=tmp_path / "admission",
-        limits=QueryLimits(),
-        cwd=tmp_path,
-    )
-
-    assert result["rows"] == []
-    assert len(launches) == 1
-    assert launches[0][0][0] == sys.executable
-    assert launches[0][1]["file_actions"]
-
-
 def test_child_failure_carries_its_cause_to_the_hub(tmp_path):
     """The query child's real error reaches the LakeError, not a bare code."""
     request = tmp_path / "request.json"

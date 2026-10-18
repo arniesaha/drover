@@ -139,6 +139,21 @@ def test_readiness_cannot_cache_ok_during_recovery(tmp_path, monkeypatch):
     )
 
 
+def test_analytical_connect_open_wait_is_capped(tmp_path, monkeypatch):
+    """A stalled in-process open becomes AnalyticalStoreBusy, not a hung thread."""
+    path = tmp_path / "analytics.duckdb"
+    first = db.open_duckdb_connection(path)
+    lock = db.duckdb_connect_lock(path)
+    assert lock.acquire(blocking=False)
+    monkeypatch.setattr(db, "ANALYTICAL_CONNECT_LOCK_WAIT_SECONDS", 0.01)
+    try:
+        with pytest.raises(db.AnalyticalStoreBusy, match="connect lock is busy"):
+            db.open_duckdb_connection(path, read_only=True)
+    finally:
+        lock.release()
+        first.close()
+
+
 @pytest.mark.parametrize("state", ["ok", "recovering", "failed-retrying"])
 def test_healthz_preserves_liveness_contract_in_every_store_state(
     tmp_path, monkeypatch, state
