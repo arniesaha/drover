@@ -163,14 +163,16 @@ def test_three_pending_lock_conflicts_spend_93_seconds_in_prebind_retry(tmp_path
         parquet_dir=tmp_path / "parquet",
         duckdb_path=tmp_path / "private.duckdb",
     )
+    clock = Mock(wraps=watcher_module.time)
+    clock.sleep = Mock()
     with patch.object(
         w._handler, "_ingest_once", side_effect=duckdb.IOException("Could not set lock")
     ) as ingest:
-        with patch.object(watcher_module.time, "sleep") as sleep:
+        with patch.object(watcher_module, "time", clock):
             w._ingest_backlog()
     assert ingest.call_count == 18
-    assert [call.args[0] for call in sleep.call_args_list] == [1, 2, 4, 8, 16] * 3
-    assert sum(call.args[0] for call in sleep.call_args_list) == 93
+    assert [call.args[0] for call in clock.sleep.call_args_list] == [1, 2, 4, 8, 16] * 3
+    assert sum(call.args[0] for call in clock.sleep.call_args_list) == 93
     assert len(list(incoming.glob("*.jsonl"))) == 3
 
 
