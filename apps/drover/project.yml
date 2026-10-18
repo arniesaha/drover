@@ -26,6 +26,7 @@ targets:
     dependencies:
       - package: DroverKit
       - package: SwiftTerm
+      - target: DroverWidget
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.arnab.drover
@@ -146,12 +147,52 @@ targets:
     # push, which needs no background mode. `remote-notification` would only
     # be required for silent content-available pushes, and adding it without
     # implementing didReceiveRemoteNotification would be dead config.
+  DroverWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: DroverWidget
+        excludes: [Info.plist]
+    dependencies:
+      - package: DroverKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.arnab.drover.widget
+        DEVELOPMENT_TEAM: DK2PC4RH5G
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: DroverWidget/DroverWidget.entitlements
+        GENERATE_INFOPLIST_FILE: YES
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: "0.1.0"
+        SWIFT_VERSION: 6.0
+      configs:
+        StoreRelease:
+          CODE_SIGN_STYLE: "$(DROVER_CODE_SIGN_STYLE)"
+          DEVELOPMENT_TEAM: "$(DROVER_DEVELOPMENT_TEAM)"
+          CODE_SIGN_IDENTITY: "$(DROVER_CODE_SIGN_IDENTITY)"
+          PROVISIONING_PROFILE_SPECIFIER: "$(DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER)"
+          OTHER_CODE_SIGN_FLAGS: "$(DROVER_OTHER_CODE_SIGN_FLAGS)"
+          CODE_SIGN_ENTITLEMENTS: DroverWidget/DroverWidget-AppStore.entitlements
+    info:
+      path: DroverWidget/Info.plist
+      properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: >-
+          Drover connects to your Drover server on your local network to
+          manage agent sessions.
   DroverTests:
     type: bundle.unit-test
     platform: iOS
     sources:
       - DroverKit/Tests/DroverKitTests
       - DroverTests
+      - path: DroverWidget
+        excludes: [DroverWidget.swift, Info.plist]
     dependencies:
       - target: Drover
     settings:
