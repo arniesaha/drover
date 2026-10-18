@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import DroverKit
+import WidgetKit
 
 enum UITestOverrides {
     static func pairingDeviceName(
@@ -91,7 +92,7 @@ final class AppEnvironment {
 
     init(
         defaults: UserDefaults = .standard,
-        tokenStore: TokenStore = TokenStore(),
+        tokenStore: TokenStore = TokenStore(accessGroup: TokenStore.sharedAccessGroup),
         recoveryBindingStore: RecoveryBindingStore? = nil,
         recoveryStore: (any ChatRecoveryPersisting)? = nil,
         validator: @escaping @Sendable (ServerConfig, String) async -> String? = { config, token in
@@ -114,8 +115,15 @@ final class AppEnvironment {
             try? tokenStore.delete()
             try? resolvedBindingStore.clear()
             defaults.removeObject(forKey: ServerConfig.defaultsKey)
+            if let groupDefaults = UserDefaults(suiteName: WidgetSnapshotStore.appGroupID) {
+                groupDefaults.removeObject(forKey: ServerConfig.defaultsKey)
+            }
+            WidgetSnapshotStore.deleteSnapshot()
         }
         let savedConfig = ServerConfig.load(defaults: defaults)
+        if let savedConfig, let groupDefaults = UserDefaults(suiteName: WidgetSnapshotStore.appGroupID) {
+            savedConfig.save(defaults: groupDefaults)
+        }
         let savedToken = tokenStore.load()
         let startupBindingID: UUID?
         let shouldSweepRecovery: Bool
@@ -283,6 +291,9 @@ final class AppEnvironment {
         }
 
         newConfig.save(defaults: defaults)
+        if let groupDefaults = UserDefaults(suiteName: WidgetSnapshotStore.appGroupID) {
+            newConfig.save(defaults: groupDefaults)
+        }
         config = newConfig
         client = DroverClient(
             config: newConfig,
@@ -353,6 +364,11 @@ final class AppEnvironment {
         }
 
         defaults.removeObject(forKey: ServerConfig.defaultsKey)
+        if let groupDefaults = UserDefaults(suiteName: WidgetSnapshotStore.appGroupID) {
+            groupDefaults.removeObject(forKey: ServerConfig.defaultsKey)
+        }
+        WidgetSnapshotStore.deleteSnapshot()
+        WidgetCenter.shared.reloadAllTimelines()
         // Persist the destructive cleanup intent before the first cleanup
         // suspension. A process death while the store waits on protected I/O
         // must still authorize the next uncredentialed launch to remove a

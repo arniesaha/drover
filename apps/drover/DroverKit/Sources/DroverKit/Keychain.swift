@@ -8,28 +8,36 @@ import Security
 /// The token is never written to `UserDefaults` or logged.
 public struct TokenStore: Sendable {
     public static let defaultService = "com.arnab.drover.token"
+    public static let sharedAccessGroup = "group.com.arnab.drover"
     public let service: String
+    public let accessGroup: String?
     private static let account = "api-token"
     private let updateStatusOverride: OSStatus?
 
-    public init(service: String = Self.defaultService) {
+    public init(service: String = Self.defaultService, accessGroup: String? = nil) {
         self.service = service
+        self.accessGroup = accessGroup
         updateStatusOverride = nil
     }
 
     /// Test-only fault seam. Production callers use the public initializer,
     /// which always invokes Security directly.
-    init(service: String, updateStatusOverride: OSStatus?) {
+    init(service: String, accessGroup: String? = nil, updateStatusOverride: OSStatus?) {
         self.service = service
+        self.accessGroup = accessGroup
         self.updateStatusOverride = updateStatusOverride
     }
 
-    private func baseQuery() -> [String: Any] {
-        [
+    private func baseQuery(includeAccessGroup: Bool = true) -> [String: Any] {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: Self.account
         ]
+        if includeAccessGroup, let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+        return query
     }
 
     /// Upserts the raw UTF-8 token. Existing credentials are updated in place
@@ -43,10 +51,16 @@ public struct TokenStore: Sendable {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
         ]
-        let updateStatus = updateStatusOverride ?? SecItemUpdate(
+        var updateStatus = updateStatusOverride ?? SecItemUpdate(
             baseQuery() as CFDictionary,
             updateAttributes as CFDictionary
         )
+        if updateStatus == errSecMissingEntitlement, accessGroup != nil {
+            updateStatus = SecItemUpdate(
+                baseQuery(includeAccessGroup: false) as CFDictionary,
+                updateAttributes as CFDictionary
+            )
+        }
         if updateStatus == errSecSuccess {
             return
         }
@@ -58,7 +72,13 @@ public struct TokenStore: Sendable {
         addQuery[kSecValueData as String] = data
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
 
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        var addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus == errSecMissingEntitlement, accessGroup != nil {
+            var fallbackQuery = baseQuery(includeAccessGroup: false)
+            fallbackQuery[kSecValueData as String] = data
+            fallbackQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            addStatus = SecItemAdd(fallbackQuery as CFDictionary, nil)
+        }
         guard addStatus == errSecSuccess else {
             throw KeychainError.osStatus(addStatus)
         }
@@ -70,7 +90,13 @@ public struct TokenStore: Sendable {
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        var status = SecItemCopyMatching(query as CFDictionary, &result)
+        if (status == errSecItemNotFound || status == errSecMissingEntitlement), accessGroup != nil {
+            var fallbackQuery = baseQuery(includeAccessGroup: false)
+            fallbackQuery[kSecReturnData as String] = true
+            fallbackQuery[kSecMatchLimit as String] = kSecMatchLimitOne
+            status = SecItemCopyMatching(fallbackQuery as CFDictionary, &result)
+        }
         guard status == errSecSuccess,
               let data = result as? Data,
               let token = String(data: data, encoding: .utf8)
@@ -81,7 +107,10 @@ public struct TokenStore: Sendable {
     }
 
     public func delete() throws {
-        let status = SecItemDelete(baseQuery() as CFDictionary)
+        var status = SecItemDelete(baseQuery() as CFDictionary)
+        if (status == errSecMissingEntitlement), accessGroup != nil {
+            status = SecItemDelete(baseQuery(includeAccessGroup: false) as CFDictionary)
+        }
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.osStatus(status)
         }
