@@ -211,7 +211,9 @@ def test_archive_production_channel_requires_local_networking_ats(chain):
         json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
     ]
     invocation = next(call["args"] for call in calls if "archive" in call["args"])
-    assert not any("DROVER_ALLOW_ARBITRARY_LOADS" in argument for argument in invocation)
+    assert not any(
+        "DROVER_ALLOW_ARBITRARY_LOADS" in argument for argument in invocation
+    )
     record = json.loads((root / "output" / "archive-record.json").read_text())
     assert record["channel"] == "testflight-production"
 

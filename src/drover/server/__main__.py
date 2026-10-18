@@ -552,9 +552,8 @@ def _is_pairable_private_ip(value: str) -> bool:
     except ValueError:
         return False
     return (
-        (address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10"))
-        or (address.is_private and not address.is_loopback)
-    )
+        address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10")
+    ) or (address.is_private and not address.is_loopback)
 
 
 def _private_pairing_ip(cfg: DroverConfig) -> str | None:

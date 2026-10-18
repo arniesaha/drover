@@ -171,9 +171,7 @@ def test_verify_app_rejects_broken_local_networking_policy(
     else:
         info[field] = value
 
-    with pytest.raises(
-        verifier.ArtifactVerificationError, match="local|arbitrary"
-    ):
+    with pytest.raises(verifier.ArtifactVerificationError, match="local|arbitrary"):
         verifier.verify_app(
             write_bundle(tmp_path, info=info),
             expected_version="1.2.3",
