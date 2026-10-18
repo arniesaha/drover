@@ -1,16 +1,18 @@
 """DuckDB connection helpers for live Drover workers and diagnostics.
 
 Every in-process open of the central database must go through
-``open_duckdb_connection`` (or hold ``duckdb_connect_lock`` around a plain
-``duckdb.connect``). Two rules keep concurrent workers, drain loops, and
-diagnostics from crashing each other (issue #2):
+``open_duckdb_connection``.  The hub pins the instance with a bounded
+connect-time configuration, so a bare ``duckdb.connect`` is no longer a safe
+alternative even when held behind ``duckdb_connect_lock``. Two rules keep
+concurrent workers, drain loops, and diagnostics from crashing each other
+(issue #2):
 
 1. **One connection configuration per file.** DuckDB's in-process instance
    cache only shares a database between connections whose configs match
    exactly; a ``read_only=True`` open beside a live read-write connection
    raises "Can't open a connection to same database file with a different
-   configuration". So every connection opens read-write with no
-   ``config=``, and role settings are applied via ``SET`` afterwards.
+   configuration". So every live analytical connection uses the shared
+   bounded ``config=`` before role settings are applied via ``SET``.
 2. **Serialized connects.** Two threads calling ``duckdb.connect()`` on the
    same file at nearly the same instant race the instance cache and the
    loser raises "Binder Error: Unique file handle conflict". The connect
@@ -523,6 +525,32 @@ def _effective_analytical_instance_setting(setting: str) -> str:
     return next(iter(configured.values()), ANALYTICAL_INSTANCE_DEFAULTS[setting])
 
 
+def analytical_instance_connect_config() -> dict[str, str]:
+    """Configuration used before DuckDB creates an analytical instance.
+
+    ``SET threads`` after ``duckdb.connect`` limits query parallelism but is
+    too late to prevent DuckDB from starting its default-sized scheduler.  A
+    cold hub used to make and destroy that default instance for each short
+    advisory ledger window, briefly allocating a native scheduler and an
+    unbounded checkpoint buffer every time.  The config must agree for every
+    live analytical handle, hence it is deliberately derived from the same
+    shared settings as :func:`_apply_role_settings`.
+    """
+    memory_limit = validate_duckdb_size(
+        _effective_analytical_instance_setting("memory_limit"),
+        name="DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT",
+    )
+    threads = int(_effective_analytical_instance_setting("threads"))
+    cap = int(os.environ.get("DROVER_DUCKDB_ANALYTICAL_MAX_THREADS", "1"))
+    if threads < 1 or cap < 1:
+        raise ValueError("DROVER_DUCKDB_ANALYTICAL_MAX_THREADS must be positive")
+    return {
+        "memory_limit": memory_limit,
+        "threads": str(min(threads, cap)),
+        "preserve_insertion_order": "false",
+    }
+
+
 def startup_analytical_checkpoint(duckdb_path: str | Path) -> bool:
     """Drain any leftover WAL under a raised limit before opening the store."""
     checkpoint_limit = os.environ.get("DROVER_ANALYTICAL_CHECKPOINT_MEMORY_LIMIT")
@@ -786,7 +814,9 @@ def startup_control_plane_checkpoint(duckdb_path: str | Path) -> bool:
     return True
 
 
-def pin_analytical_connection(duckdb_path: str | Path) -> bool:
+def pin_analytical_connection(
+    duckdb_path: str | Path, *, enabled: bool | None = None
+) -> bool:
     """Keep the analytical instance open across short worker write windows.
 
     The last writable connection closing checkpoints DuckDB's WAL. On the
@@ -799,11 +829,13 @@ def pin_analytical_connection(duckdb_path: str | Path) -> bool:
     other processes. The hub must own this analytical file exclusively. The
     control-plane store and harnessd are unaffected.
     """
-    if os.environ.get("DROVER_ANALYTICAL_PIN", "0").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-    }:
+    if enabled is None:
+        enabled = os.environ.get("DROVER_ANALYTICAL_PIN", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+    if not enabled:
         return False
     path = Path(duckdb_path)
     key = _path_key(path)
@@ -1445,7 +1477,19 @@ class _AnalyticalHandle:
 
 
 def _open_analytical_handle(path, role, settings_overrides, *, generation=None):
-    con = duckdb.connect(str(path))
+    # Instance settings must be supplied at connect time.  Applying them with
+    # SET afterwards leaves a transient instance with DuckDB's host-RAM and
+    # host-CPU defaults, exactly the native allocation that made startup peak.
+    try:
+        con = duckdb.connect(str(path), config=analytical_instance_connect_config())
+    except duckdb.ConnectionException as exc:
+        # A diagnostic process may already have opened this file with DuckDB's
+        # defaults.  Joining that existing instance is safer than failing an
+        # otherwise valid request; the hub-owned path is pinned first and
+        # therefore always takes the bounded branch above.
+        if "different configuration" not in str(exc).lower():
+            raise
+        con = duckdb.connect(str(path))
     if generation is not None:
         con = _AnalyticalHandle(con, _path_key(path), generation)
         remember_live_connection(path, con)

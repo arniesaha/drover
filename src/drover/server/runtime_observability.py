@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -180,6 +182,105 @@ class FootprintWatchdog:
         self.sample_once()
         self._thread = threading.Thread(
             target=run, name="hub-footprint-watchdog", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1)
+
+
+def native_thread_hint(pid: int | None = None) -> str:
+    """Return a small, redacted native-stack signature on macOS."""
+    if sys.platform != "darwin":
+        return "native_sample=unsupported"
+    pid = os.getpid() if pid is None else pid
+    try:
+        result = subprocess.run(
+            ["sample", str(pid), "1"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "native_sample=unavailable"
+    frames = []
+    for pattern, label in (
+        (r"duckdb::TaskScheduler::ExecuteForever", "duckdb_task_scheduler"),
+        (r"duckdb::SingleFileStorageManager::CreateCheckpoint", "duckdb_checkpoint"),
+        (r"duckdb::CheckpointReader", "duckdb_checkpoint_reader"),
+        (r"parquet|arrow", "arrow_or_parquet"),
+        (r"onnx", "onnxruntime"),
+    ):
+        if re.search(pattern, result.stdout, flags=re.IGNORECASE):
+            frames.append(label)
+    threads = len(re.findall(r"^\s*\d+\s+Thread_", result.stdout, flags=re.MULTILINE))
+    return "native_threads=%d native_frames=%s" % (
+        threads,
+        ",".join(frames) if frames else "none",
+    )
+
+
+class StartupFootprintSampler:
+    """One-second startup samples, with a native hint for material growth."""
+
+    def __init__(
+        self,
+        *,
+        duration_seconds: float = 120.0,
+        interval_seconds: float = 1.0,
+        growth_bytes: int = 64 * 1024**2,
+        footprint_reader: Callable[[], int] | None = None,
+        activities: Callable[[], list[dict[str, str]]] = active_activities,
+        native_hinter: Callable[[], str] = native_thread_hint,
+    ) -> None:
+        self.duration_seconds = duration_seconds
+        self.interval_seconds = interval_seconds
+        self.growth_bytes = growth_bytes
+        self._reader = footprint_reader or _default_footprint_reader
+        self._activities = activities
+        self._native_hinter = native_hinter
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+
+        def run() -> None:
+            previous = _footprint(self._reader)
+            deadline = time.monotonic() + self.duration_seconds
+            while (
+                not self._stop.wait(self.interval_seconds)
+                and time.monotonic() < deadline
+            ):
+                current = _footprint(self._reader)
+                if current is None:
+                    continue
+                delta = None if previous is None else current - previous
+                active = self._activities()
+                log.info(
+                    "hub_startup_footprint footprint=%d footprint_delta=%s active=%s",
+                    current,
+                    delta if delta is not None else "unavailable",
+                    active,
+                )
+                if delta is not None and delta >= self.growth_bytes:
+                    log.warning(
+                        "hub_startup_native_growth footprint=%d footprint_delta=%d "
+                        "outside_activities=%s active=%s %s",
+                        current,
+                        delta,
+                        not active,
+                        active,
+                        self._native_hinter(),
+                    )
+                previous = current
+
+        self._thread = threading.Thread(
+            target=run, name="hub-startup-footprint", daemon=True
         )
         self._thread.start()
 

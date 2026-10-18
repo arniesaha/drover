@@ -160,7 +160,11 @@ from drover.server.providers.service import ProviderUsageService
 from drover.server.quality import format_prometheus, quality_snapshot
 from drover.server.rollup import rollup_tasks
 from drover.server.runtime import RuntimeLayout
-from drover.server.runtime_observability import FootprintWatchdog, activity
+from drover.server.runtime_observability import (
+    FootprintWatchdog,
+    StartupFootprintSampler,
+    activity,
+)
 from drover.server.session_graph import (
     delegation_graph_payload,
     format_ascii,
@@ -2893,6 +2897,8 @@ def run(
     configure_memory_guard(cfg.memory)
     footprint_watchdog = FootprintWatchdog()
     footprint_watchdog.start()
+    startup_footprint_sampler = StartupFootprintSampler()
+    startup_footprint_sampler.start()
     runtime_config_path = (
         Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     )
@@ -2959,6 +2965,15 @@ def run(
         with _startup_phase("activate_legacy_writer_retirement"):
             require_control_store_ready(cfg.duckdb_path)
             activate_retirement(cfg.duckdb_path)
+        # DuckLake serving work is disposable, but the advisory ledger still
+        # has short, in-process windows against the analytical database.  If
+        # the last one closes, DuckDB tears down the instance and checkpoints
+        # the whole legacy store.  On the Studio that happened repeatedly at
+        # startup, creating the multi-GiB native spike.  This hub owns the
+        # retired analytical file exclusively, so retain one bounded handle
+        # for its lifetime; the normal shutdown path releases it last.
+        with _startup_phase("pin_retired_analytical_connection"):
+            pin_analytical_connection(cfg.duckdb_path, enabled=True)
     else:
         with _startup_phase("pin_analytical_connection"):
             pin_analytical_connection(cfg.duckdb_path)
@@ -3652,6 +3667,7 @@ def run(
     try:
         stop.wait()
     finally:
+        startup_footprint_sampler.stop()
         footprint_watchdog.stop()
         if content_advisory_worker is not None:
             content_advisory_worker.join(timeout=10.0)
