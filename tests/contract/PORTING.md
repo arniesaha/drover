@@ -74,7 +74,7 @@ missing public seam rather than importing daemon internals.
 | `test_resolve_harness_presets_clears_the_executable_when_the_cli_disappears` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_resolve_harness_presets_discovers_nvm_clis_and_preserves_node_path` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_resolve_harness_presets_enables_versioned_claude_cli` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_native_resume_launches_through_the_structured_adapter` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
+| `test_native_resume_launches_through_the_structured_adapter` | `test_native_resume_launches_through_the_structured_adapter` |
 | `test_discovers_claude_native_resume_sessions` | `test_discovers_claude_native_resume_sessions` |
 | `test_reads_claude_jsonl_native_transcript` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_reads_codex_jsonl_native_transcript` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |

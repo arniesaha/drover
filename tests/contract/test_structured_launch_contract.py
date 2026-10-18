@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
 from .test_harnessd_contract import request
+from .support import wait_until
 
 
 def test_structured_launch_cannot_bypass_a_missing_adapter(daemon):
@@ -75,6 +77,41 @@ def test_structured_claude_session_stays_in_place(daemon):
     )
     assert status == 201
     assert created["cwd"] == str(daemon.root)
+
+
+def test_native_resume_launches_through_the_structured_adapter(daemon):
+    status, created = request(
+        daemon,
+        "/sessions",
+        payload={
+            "harness": "claude-code",
+            "mode": "structured",
+            "cwd": str(daemon.root),
+            "native_resume": {"session_id": "claude-native-1", "label": "work"},
+        },
+    )
+    assert status == 201
+    assert created["mode"] == "structured"
+    log = daemon.root / "fake-cli.jsonl"
+    wait_until(lambda: log.exists() and "--resume" in log.read_text())
+    launches = [
+        row["argv"]
+        for line in log.read_text().splitlines()
+        if "argv" in (row := json.loads(line))
+    ]
+    assert any(argv[-2:] == ["--resume", "claude-native-1"] for argv in launches)
+    for native_resume in ({"latest": True}, {"mode": "continue"}):
+        status, body = request(
+            daemon,
+            "/sessions",
+            payload={
+                "harness": "claude-code",
+                "mode": "structured",
+                "cwd": str(daemon.root),
+                "native_resume": native_resume,
+            },
+        )
+        assert (status, body["error"]) == (400, "native_resume requires a session_id")
 
 
 def test_missing_structured_executable_turn_returns_json_and_marks_session_errored(
