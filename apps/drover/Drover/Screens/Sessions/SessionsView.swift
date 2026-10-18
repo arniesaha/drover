@@ -38,6 +38,7 @@ struct SessionsView: View {
     private let chatModelFactory: ChatModelFactory?
     private let defaults: UserDefaults
     private let onOpenSettings: () -> Void
+    private let onOpenAccountsTab: (() -> Void)?
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
     @State private var exporterFreshness = ExporterFreshnessGate()
@@ -60,7 +61,10 @@ struct SessionsView: View {
         recoveryGeneration: Int,
         chatModelFactory: ChatModelFactory? = nil,
         defaults: UserDefaults = .standard,
-        onOpenSettings: @escaping () -> Void = {}
+        sessionStore: SessionStore? = nil,
+        cockpitStore: CockpitStore? = nil,
+        onOpenSettings: @escaping () -> Void = {},
+        onOpenAccountsTab: (() -> Void)? = nil
     ) {
         self.client = client
         self.notifier = notifier
@@ -70,10 +74,11 @@ struct SessionsView: View {
         self.chatModelFactory = chatModelFactory
         self.defaults = defaults
         self.onOpenSettings = onOpenSettings
+        self.onOpenAccountsTab = onOpenAccountsTab
         _filterState = State(initialValue: FleetFilterState.load(from: defaults))
         _workStore = State(initialValue: WorkAttentionStore(service: client))
-        _store = State(initialValue: SessionStore(client: client))
-        _cockpitStore = State(initialValue: CockpitStore(client: client))
+        _store = State(initialValue: sessionStore ?? SessionStore(client: client))
+        _cockpitStore = State(initialValue: cockpitStore ?? CockpitStore(client: client))
     }
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -666,7 +671,13 @@ struct SessionsView: View {
                 status: providerSectionStatus,
                 statusMessage: cockpitStore.providerError,
                 hostTitles: hostTitles,
-                onOpenAccounts: { showAccounts = true }
+                onOpenAccounts: {
+                    if let onOpenAccountsTab {
+                        onOpenAccountsTab()
+                    } else {
+                        showAccounts = true
+                    }
+                }
             )
         }
     }

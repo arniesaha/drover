@@ -82,6 +82,7 @@ struct ProviderCapacitySection: View {
         }
         .padding(.vertical, 9)
         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
         .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10))
         .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(DroverColor.line, lineWidth: 1) }
         .clipShape(RoundedRectangle(cornerRadius: 10))

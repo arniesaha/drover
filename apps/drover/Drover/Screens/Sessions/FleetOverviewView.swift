@@ -33,6 +33,7 @@ struct FleetOverviewView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
+        .fixedSize(horizontal: false, vertical: true)
         .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)

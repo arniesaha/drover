@@ -299,6 +299,125 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    private func launchRealApp(large: Bool = false, dark: Bool = false, pendingSessionID: String? = nil) -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
+        app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        if let pendingSessionID {
+            app.launchEnvironment["DROVER_UI_TEST_PENDING_SESSION_ID"] = pendingSessionID
+        }
+        if large {
+            app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        }
+        if dark { app.launchArguments += ["-drover.appearance", "dark"] }
+        app.launch()
+        return app
+    }
+
+    @MainActor
+    func testRealAppRootTabNavigationAndDeepLink() {
+        // 1. Launch against real app root (core-journey scenario)
+        let app = launchRealApp()
+        let tabBar = app.tabBars.element
+        XCTAssertTrue(tabBar.waitForExistence(timeout: 10))
+
+        // 2. Verify all four tabs exist
+        let homeTab = app.tabBars.buttons["Home"]
+        let analyticsTab = app.tabBars.buttons["Analytics"]
+        let insightsTab = app.tabBars.buttons["Insights"]
+        let accountsTab = app.tabBars.buttons["Accounts"]
+
+        XCTAssertTrue(homeTab.exists)
+        XCTAssertTrue(analyticsTab.exists)
+        XCTAssertTrue(insightsTab.exists)
+        XCTAssertTrue(accountsTab.exists)
+
+        // 3. Switch through all four tabs
+        analyticsTab.tap()
+        XCTAssertTrue(app.navigationBars["Analytics"].waitForExistence(timeout: 5) || app.descendants(matching: .any)["analytics-filters"].waitForExistence(timeout: 5))
+
+        insightsTab.tap()
+        XCTAssertTrue(app.navigationBars["Insights"].waitForExistence(timeout: 5) || app.staticTexts["1 LOADED FINDING"].waitForExistence(timeout: 5))
+
+        accountsTab.tap()
+        XCTAssertTrue(app.navigationBars["Accounts"].waitForExistence(timeout: 5))
+
+        homeTab.tap()
+        let fleetList = app.scrollViews["fleet-list"]
+        XCTAssertTrue(fleetList.waitForExistence(timeout: 8))
+
+        // 4. Verify dock does not cover the last list row or New Session button
+        let newSessionButton = app.buttons["launch-button"]
+        XCTAssertTrue(newSessionButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(newSessionButton.isHittable)
+
+        screenshot("real-app-home-dock-light", app)
+    }
+
+    @MainActor
+    func testRealAppHomeDockDarkMode() {
+        let app = launchRealApp(dark: true)
+        let homeTab = app.tabBars.buttons["Home"]
+        XCTAssertTrue(homeTab.waitForExistence(timeout: 8))
+        let newSessionButton = app.buttons["launch-button"]
+        XCTAssertTrue(newSessionButton.waitForExistence(timeout: 5))
+        screenshot("real-app-home-dock-dark", app)
+    }
+
+    @MainActor
+    func testRealAppHomeDockLargestText() {
+        let app = launchRealApp(large: true, dark: true)
+        let homeTab = app.tabBars.buttons["Home"]
+        XCTAssertTrue(homeTab.waitForExistence(timeout: 8))
+        let newSessionButton = app.buttons["launch-button"]
+        XCTAssertTrue(newSessionButton.waitForExistence(timeout: 5))
+        screenshot("real-app-home-dock-largest-text", app)
+    }
+
+    @MainActor
+    func testRealAppIPadDock() {
+        let app = launchRealApp(dark: true)
+        let homeTab = app.descendants(matching: .any)["tab-home"].firstMatch
+        XCTAssertTrue(homeTab.waitForExistence(timeout: 10))
+        screenshot("real-app-ipad-dock", app)
+    }
+
+    @MainActor
+    func testDeepLinkOpensSessionDirectly() {
+        let app = launchRealApp(pendingSessionID: "fixture-session")
+        let chatMenu = app.buttons["chat-menu"]
+        let codexBar = app.navigationBars["Codex"]
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 10) || codexBar.waitForExistence(timeout: 10))
+    }
+
+    @MainActor
+    func testOverviewNoClippingOfAccountsCard() {
+        let app = launch(dark: true, fleetFilters: true)
+        let homeTab = app.tabBars.buttons["Home"]
+        XCTAssertTrue(homeTab.waitForExistence(timeout: 8))
+        homeTab.tap()
+
+        let allChip = app.buttons["host-chip-all"]
+        XCTAssertTrue(allChip.waitForExistence(timeout: 10))
+
+        let overviewToggle = app.buttons["overview-toggle"]
+        XCTAssertTrue(overviewToggle.waitForExistence(timeout: 8))
+        overviewToggle.tap()
+
+        let accountsCard = app.descendants(matching: .any)["provider-capacity-summary"]
+        XCTAssertTrue(accountsCard.waitForExistence(timeout: 5))
+
+        let hostChips = app.buttons["host-chip-all"]
+        XCTAssertTrue(hostChips.waitForExistence(timeout: 5))
+
+        // Verify accounts card is not clipped under the host chips
+        XCTAssertGreaterThanOrEqual(accountsCard.frame.minY, hostChips.frame.maxY)
+
+        screenshot("overview-no-clipping-dark", app)
+    }
+
+    @MainActor
     private func screenshot(_ name: String, _ app: XCUIApplication) {
         let screenshot = app.screenshot()
         let attachment = XCTAttachment(screenshot: screenshot)

@@ -19,21 +19,30 @@ struct ObservabilityFixtureRoot: View {
     var body: some View {
         TabView {
             NavigationStack { AnalyticsView(store: store) }
-                .tabItem { Label("Analytics", systemImage: "chart.bar") }
+                .tabItem { Label(AppTab.analytics.title, systemImage: AppTab.analytics.systemImage) }
+                .tag(AppTab.analytics)
+                .accessibilityIdentifier(AppTab.analytics.accessibilityIdentifier)
             NavigationStack { InsightsView(client: client, store: store) }
-                .tabItem { Label("Insights", systemImage: "lightbulb") }
+                .tabItem { Label(AppTab.insights.title, systemImage: AppTab.insights.systemImage) }
+                .tag(AppTab.insights)
+                .accessibilityIdentifier(AppTab.insights.accessibilityIdentifier)
             NavigationStack {
                 ProviderAccountsView(accounts: ObservabilityFixtureData.accounts, status: .ok,
                     statusMessage: nil, hostTitles: ObservabilityFixtureData.hostTitles)
             }
-            .tabItem { Label("Accounts", systemImage: "person.crop.circle") }
+            .tabItem { Label(AppTab.accounts.title, systemImage: AppTab.accounts.systemImage) }
+            .tag(AppTab.accounts)
+            .accessibilityIdentifier(AppTab.accounts.accessibilityIdentifier)
             NavigationStack {
                 SessionsView(client: client, notifier: FixtureNotifier(), recoveryStore: nil,
                     recoveryWriteGate: ChatRecoveryWriteGate(), recoveryGeneration: 0)
             }
-            .tabItem { Label("Home", systemImage: "rectangle.stack") }
+            .tabItem { Label(AppTab.home.title, systemImage: AppTab.home.systemImage) }
+            .tag(AppTab.home)
+            .accessibilityIdentifier(AppTab.home.accessibilityIdentifier)
 
         }
+        .tabViewStyle(.sidebarAdaptable)
         .environment(appearance)
         .preferredColorScheme(appearance.appearance.colorScheme)
         .droverTint()
