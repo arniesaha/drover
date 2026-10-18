@@ -370,4 +370,3 @@ struct DemoHubTests {
         #expect(chatModel.activity.phase != .connecting)
     }
 }
-

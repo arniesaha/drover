@@ -528,10 +528,15 @@ public final class ChatModel {
         if let session = snapshot.sessions.first(where: { $0.id == sessionID }) {
             self.applySessionMetadata(snapshot, session: session)
         } else {
+            let hostID = DemoHubData.hostStudio
+            let fallbackHarness = snapshot.hosts.first(where: { $0.id == hostID })?.launchableOffers.first?.name
+                ?? DemoHubData.defaultHarness
+            let resolvedHarness = harness ?? fallbackHarness
+            self.harnessPresentation = HarnessPresentation(resolvedHarness)
             self.controls = HarnessControls(
                 snapshot: snapshot,
-                hostID: DemoHubData.hostStudio,
-                harness: harness ?? "claude-code"
+                hostID: hostID,
+                harness: resolvedHarness
             )
         }
         rebuildApprovals()

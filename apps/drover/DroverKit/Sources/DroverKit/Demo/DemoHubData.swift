@@ -25,6 +25,7 @@ public enum DemoHubData: Sendable {
     public static let sessionLaunched = "demo-session-launched"
 
     public static let approvalRequestID = "demo-req-migration-004"
+    public static let defaultHarness = "claude-code"
 
     // MARK: - Harness Capability Rows
 
