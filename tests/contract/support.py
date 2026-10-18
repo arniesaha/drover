@@ -113,13 +113,28 @@ def fake_hub():
 def _fake_cli(path: Path, fixture: Path, log: Path) -> None:
     path.write_text(
         "#!" + sys.executable + "\n"
-        "import json, os, sys\n"
+        "import json, os, sys, time\n"
+        "from pathlib import Path\n"
         "if '--version' in sys.argv:\n"
         " print('contract-cli 1.0')\n"
         " raise SystemExit(0)\n"
         "log = os.environ['HARNESSD_FAKE_CLI_LOG']\n"
         "with open(log, 'a') as out:\n"
         " out.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if '--device-auth' in sys.argv:\n"
+        " print('Open https://example.test/device and enter ABCD-EFGH', flush=True)\n"
+        " time.sleep(60)\n"
+        " raise SystemExit(0)\n"
+        "if 'auth' in sys.argv and 'status' in sys.argv:\n"
+        " logged_in = Path(os.environ['HARNESSD_FAKE_AUTH_STATE']).exists()\n"
+        " print(json.dumps({'loggedIn': logged_in, 'email': 'contract@example.test'}))\n"
+        " raise SystemExit(0 if logged_in else 1)\n"
+        "if 'auth' in sys.argv and 'login' in sys.argv:\n"
+        " print('Paste your code:', flush=True)\n"
+        " sys.stdin.readline()\n"
+        " Path(os.environ['HARNESSD_FAKE_AUTH_STATE']).write_text('authenticated')\n"
+        " print('Signed in', flush=True)\n"
+        " raise SystemExit(0)\n"
         "for line in sys.stdin:\n"
         " with open(log, 'a') as out: out.write(json.dumps({'stdin': line.rstrip()}) + '\\n')\n"
         " request = json.loads(line)\n"
@@ -241,6 +256,7 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
             "HOME": str(home),
             "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
             "HARNESSD_FAKE_CLI_LOG": str(log),
+            "HARNESSD_FAKE_AUTH_STATE": str(tmp_path / "fake-auth-state"),
             "PYTHONPATH": str(Path.cwd() / "src")
             + os.pathsep
             + environment.get("PYTHONPATH", ""),

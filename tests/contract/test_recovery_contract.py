@@ -96,3 +96,39 @@ def test_live_structured_termination_persists_in_inventory(daemon):
     assert [(item["session_id"], item["status"]) for item in sessions] == [
         (session_id, "terminated")
     ]
+
+
+def test_recovery_rejects_terminated_and_terminal_sessions(daemon):
+    _, structured = request(
+        daemon,
+        "/sessions",
+        payload={
+            "harness": "claude-code",
+            "mode": "structured",
+            "cwd": str(daemon.root),
+        },
+    )
+    assert (
+        request(daemon, f"/sessions/{structured['session_id']}/terminate", payload={})[
+            0
+        ]
+        == 200
+    )
+    status, terminated = request(
+        daemon, f"/sessions/{structured['session_id']}/recover", payload={}
+    )
+    assert (status, terminated["error"]) == (
+        409,
+        "Session cannot be resumed after the harness restart. Continue it in a new session.",
+    )
+
+    _, terminal = request(
+        daemon, "/sessions", payload={"harness": "shell", "cwd": str(daemon.root)}
+    )
+    status, unsupported = request(
+        daemon, f"/sessions/{terminal['session_id']}/recover", payload={}
+    )
+    assert (status, unsupported["error"]) == (
+        409,
+        "Session cannot be resumed after the harness restart. Continue it in a new session.",
+    )

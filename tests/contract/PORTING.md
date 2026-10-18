@@ -61,7 +61,7 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` | `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` |
 | `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` | `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` |
 | `test_harnessd_auth_status_route` | `test_public_route_validation` |
-| `test_harnessd_auth_start_poll_and_cancel` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
+| `test_harnessd_auth_start_poll_and_cancel` | `test_harnessd_auth_start_poll_and_cancel` |
 | `test_harnessd_auth_routes_require_bearer_token` | `test_public_http_routing_contract` |
 | `test_harnessd_auth_status_unknown_harness_returns_404` | `test_public_http_routing_contract` |
 | `test_harnessd_auth_status_unavailable_returns_404` | dropped: even after removing the fixture `agy` executable from `PATH`, `GET /auth/agy/status` returns the public `200` `unknown` status rather than the source's injected unavailable adapter 404; emitting unavailable needs an internal auth adapter |
@@ -89,7 +89,7 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_session_listing_rejects_a_forged_cursor` | `test_public_query_error_contract` |
 | `test_harnessd_session_listing_cap_matches_the_hub_fleet_render` | dropped: `GET /sessions?archived=` exposes the daemon cap but cannot expose the hub MetricsCollector default it is compared against |
 | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` |
-| `test_harnessd_reconciles_orphaned_structured_sessions_on_startup` | dropped: startup reconciliation needs an orphaned structured row preseeded in the registry before the launched process begins; the fixture only starts with an empty store |
+| `test_harnessd_reconciles_orphaned_structured_sessions_on_startup` | `test_structured_session_can_recover_after_daemon_restart` |
 | `test_harnessd_reconciles_orphaned_pty_sessions_on_startup` | dropped: startup reconciliation needs a dead PTY registry row preseeded before `drover-harnessd --listen`, which the public launcher fixture cannot create |
 | `test_harnessd_recovers_restart_lost_structured_session` | `test_structured_session_can_recover_after_daemon_restart` |
 | `test_harnessd_recovery_is_idempotent_when_session_is_live` | `test_structured_session_can_recover_after_daemon_restart` |
@@ -98,8 +98,8 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_refuses_turns_while_draining_for_an_update` | dropped: `POST /sessions/<id>/turns` has no public switch to place the daemon in updater draining state; the fixture does not configure `[update]` |
 | `test_harnessd_concurrent_recovery_creates_one_driver` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_terminate_waits_for_recovery_and_wins` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_recovery_rejects_unsupported_or_incomplete_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_recovery_rejects_terminated_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
+| `test_harnessd_recovery_rejects_unsupported_or_incomplete_session` | `test_recovery_rejects_terminated_and_terminal_sessions` |
+| `test_harnessd_recovery_rejects_terminated_session` | `test_recovery_rejects_terminated_and_terminal_sessions` |
 | `test_harnessd_recovery_rejects_generic_errored_session` | `test_structured_session_can_recover_after_daemon_restart` |
 | `test_harnessd_can_terminate_restart_lost_structured_session` | `test_restart_lost_session_can_be_terminated` |
 | `test_harnessd_terminates_live_session_and_updates_registry` | `test_live_structured_termination_persists_in_inventory` |
@@ -136,8 +136,8 @@ missing public seam rather than importing daemon internals.
 | `test_structured_session_stores_default_permission_mode` | `test_public_session_mutation_contract` |
 | `test_structured_session_stores_explicit_auto_permission_mode` | `test_public_session_mutation_contract` |
 | `test_structured_session_rejects_unknown_permission_mode` | `test_structured_launch_validation_contract` |
-| `test_harnessd_routes_typed_code_into_a_pty_login_flow` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
-| `test_harnessd_refuses_to_start_a_terminal_only_sign_in` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
+| `test_harnessd_routes_typed_code_into_a_pty_login_flow` | `test_harnessd_routes_typed_code_into_a_pty_login_flow` |
+| `test_harnessd_refuses_to_start_a_terminal_only_sign_in` | `test_harnessd_refuses_to_start_a_terminal_only_sign_in` |
 | `test_every_offered_preset_can_actually_be_driven` | dropped: `GET /capabilities` lists offered presets, but exercising every listed provider requires distinct interactive/auth fixture protocols not supplied by the shared fake CLI |
 | `test_observe_only_sources_are_never_drive_targets` | dropped: the public launch endpoint can reject known unsupported modes, but it has no fixture-provided observe-only preset to distinguish source-only from absent harnesses |
 | `test_a_repeated_handoff_create_returns_the_session_it_already_made` | `test_handoff_source_is_idempotent_but_parent_is_not` |
