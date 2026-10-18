@@ -338,6 +338,7 @@ private struct FixturePreparedRoot: View {
                                 .accessibilityIdentifier("fixture-turn-submission-count")
                         }
                         .font(.caption2)
+                        .foregroundStyle(.clear)
                         .allowsHitTesting(false)
                     }
                 }

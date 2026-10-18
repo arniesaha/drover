@@ -207,13 +207,8 @@ struct StateDot: View {
                     // Urgency: Needs You -> Amber filled disc
                     Circle().fill(DroverColor.warn)
                 case .working:
-                    // In-progress: Running -> Vibrant filled accent disc with smooth pulse
+                    // In-progress: Running -> Vibrant filled accent disc
                     Circle().fill(DroverColor.accentHi)
-                        .phaseAnimator(reduceMotion ? [false] : [false, true]) { dot, faded in
-                            dot.opacity(faded ? 0.45 : 1)
-                        } animation: { _ in
-                            .easeInOut(duration: 1.2)
-                        }
                 case .done:
                     // Complete: Solid neutral disc
                     Circle().fill(DroverColor.muted)

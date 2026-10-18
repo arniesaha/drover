@@ -70,11 +70,11 @@ struct FleetOverviewView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 6) {
                 // Column headers: Project | Host 1 | Host 2 ... | Total
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Text("Project")
                         .font(.system(.caption2, design: .monospaced, weight: .semibold))
                         .foregroundStyle(DroverColor.faint)
-                        .frame(width: 120, alignment: .leading)
+                        .frame(width: 100, alignment: .leading)
 
                     ForEach(overview.hosts) { host in
                         OverviewHostHeaderCell(
@@ -87,7 +87,7 @@ struct FleetOverviewView: View {
                     Text("Total")
                         .font(.system(.caption2, design: .monospaced, weight: .semibold))
                         .foregroundStyle(DroverColor.faint)
-                        .frame(width: 44, alignment: .trailing)
+                        .frame(width: 38, alignment: .trailing)
                 }
                 .padding(.bottom, 2)
 
@@ -95,7 +95,7 @@ struct FleetOverviewView: View {
 
                 // Project Rows
                 ForEach(overview.projects) { project in
-                    HStack(spacing: 8) {
+                    HStack(spacing: 6) {
                         Button {
                             onSelectProject(project.name)
                         } label: {
@@ -104,7 +104,7 @@ struct FleetOverviewView: View {
                                 .foregroundStyle(filterState.project == project.name ? DroverColor.accentHi : DroverColor.text)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                                .frame(width: 120, alignment: .leading)
+                                .frame(width: 100, alignment: .leading)
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Filter by project \(project.name), \(project.activeCount) active")
@@ -128,7 +128,7 @@ struct FleetOverviewView: View {
                             Text("\(project.activeCount)")
                                 .font(.system(.caption, design: .monospaced, weight: .semibold))
                                 .foregroundStyle(filterState.project == project.name ? DroverColor.accentHi : DroverColor.muted)
-                                .frame(width: 44, alignment: .trailing)
+                                .frame(width: 38, alignment: .trailing)
                         }
                         .buttonStyle(.plain)
                     }
@@ -138,11 +138,11 @@ struct FleetOverviewView: View {
                 Divider().background(DroverColor.line)
 
                 // Totals Row
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Text("Active")
                         .font(.system(.caption2, design: .monospaced, weight: .semibold))
                         .foregroundStyle(DroverColor.faint)
-                        .frame(width: 120, alignment: .leading)
+                        .frame(width: 100, alignment: .leading)
 
                     ForEach(overview.hosts) { host in
                         Button {
@@ -151,7 +151,7 @@ struct FleetOverviewView: View {
                             Text("\(host.activeCount)")
                                 .font(.system(.caption, design: .monospaced, weight: .semibold))
                                 .foregroundStyle(filterState.hostID == host.id ? DroverColor.accentHi : DroverColor.muted)
-                                .frame(minWidth: 64, alignment: .center)
+                                .frame(minWidth: 54, alignment: .center)
                         }
                         .buttonStyle(.plain)
                     }
@@ -159,10 +159,11 @@ struct FleetOverviewView: View {
                     Text("\(overview.totalActiveSessions)")
                         .font(.system(.caption, design: .monospaced, weight: .bold))
                         .foregroundStyle(DroverColor.accentHi)
-                        .frame(width: 44, alignment: .trailing)
+                        .frame(width: 38, alignment: .trailing)
                 }
                 .padding(.top, 2)
             }
+            .padding(.trailing, 8)
         }
     }
 
@@ -263,7 +264,7 @@ private struct OverviewHostHeaderCell: View {
                 }
             }
             .foregroundStyle(isSelected ? AnyShapeStyle(DroverColor.accentHi) : AnyShapeStyle(DroverColor.muted))
-            .frame(minWidth: 64, alignment: .center)
+            .frame(minWidth: 54, alignment: .center)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -302,7 +303,7 @@ private struct OverviewMatrixCell: View {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .strokeBorder(isSelected ? AnyShapeStyle(DroverColor.accentHi) : AnyShapeStyle(DroverColor.accent.opacity(0.3)), lineWidth: 1)
                     }
-                    .frame(minWidth: 64, alignment: .center)
+                    .frame(minWidth: 54, alignment: .center)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -312,7 +313,7 @@ private struct OverviewMatrixCell: View {
             Text("–")
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(DroverColor.line)
-                .frame(minWidth: 64, minHeight: 26, alignment: .center)
+                .frame(minWidth: 54, minHeight: 26, alignment: .center)
         }
     }
 }

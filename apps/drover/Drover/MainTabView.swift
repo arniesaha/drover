@@ -24,7 +24,6 @@ struct MainTabView: View {
     @State private var cockpitStore: CockpitStore
     @State private var selectedTab: AppTab
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-    @Environment(\.scenePhase) private var scenePhase
 
     init(
         client: DroverClient,
@@ -76,7 +75,9 @@ struct MainTabView: View {
     var body: some View {
         TabView(selection: $selectedTab) {
             NavigationStack {
-                AnalyticsView(store: cockpitStore)
+                LazyTabRoot(isSelected: selectedTab == .analytics) {
+                    AnalyticsView(store: cockpitStore)
+                }
             }
             .tabItem { tabLabel(for: .analytics) }
             .tag(AppTab.analytics)
@@ -84,7 +85,9 @@ struct MainTabView: View {
             .accessibilityIdentifier(AppTab.analytics.accessibilityIdentifier)
 
             NavigationStack {
-                InsightsView(client: client, store: cockpitStore)
+                LazyTabRoot(isSelected: selectedTab == .insights) {
+                    InsightsView(client: client, store: cockpitStore)
+                }
             }
             .tabItem { tabLabel(for: .insights) }
             .tag(AppTab.insights)
@@ -92,18 +95,20 @@ struct MainTabView: View {
             .accessibilityIdentifier(AppTab.insights.accessibilityIdentifier)
 
             NavigationStack {
-                ProviderAccountsView(
-                    accounts: cockpitStore.providerAccounts,
-                    status: providerSectionStatus,
-                    statusMessage: cockpitStore.providerError,
-                    hostTitles: hostTitles,
-                    onRefresh: {
-                        await sessionStore.refresh()
-                        if let snapshot = sessionStore.snapshot {
-                            await cockpitStore.refresh(for: snapshot)
+                LazyTabRoot(isSelected: selectedTab == .accounts) {
+                    ProviderAccountsView(
+                        accounts: cockpitStore.providerAccounts,
+                        status: providerSectionStatus,
+                        statusMessage: cockpitStore.providerError,
+                        hostTitles: hostTitles,
+                        onRefresh: {
+                            await sessionStore.refresh()
+                            if let snapshot = sessionStore.snapshot {
+                                await cockpitStore.refresh(for: snapshot)
+                            }
                         }
-                    }
-                )
+                    )
+                }
             }
             .tabItem { tabLabel(for: .accounts) }
             .tag(AppTab.accounts)
@@ -152,39 +157,30 @@ struct MainTabView: View {
                 selectedTab.save(to: defaults)
             }
         }
-        .task {
-            sessionStore.startPolling()
-        }
-        .task(id: scenePhase) {
-            guard scenePhase == .active else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
-                await sessionStore.refresh()
-            }
-        }
-        .task(id: sessionStore.snapshot?.cockpitAPIVersion) {
-            guard let snapshot = sessionStore.snapshot else {
-                cockpitStore.updateCapability(from: nil)
-                return
-            }
-            cockpitStore.startForegroundPolling(for: snapshot)
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                sessionStore.startPolling()
-                if let snapshot = sessionStore.snapshot {
-                    cockpitStore.startForegroundPolling(for: snapshot)
-                }
-            } else {
-                sessionStore.stopPolling()
-                cockpitStore.stopForegroundPolling()
-            }
-        }
         .onAppear {
             if NotificationRoute.shared.pendingSessionID != nil
                 || NotificationRoute.shared.pendingAttentionRef != nil
                 || NotificationRoute.shared.pendingSessionIDs != nil {
                 selectedTab = .home
+            }
+        }
+    }
+}
+
+/// Defers constructing and loading a tab's view hierarchy until the tab is first visited,
+/// preventing unneeded network requests, tasks, and accessibility snapshot overhead on launch.
+private struct LazyTabRoot<Content: View>: View {
+    let isSelected: Bool
+    @ViewBuilder let content: () -> Content
+    @State private var hasAppeared = false
+
+    var body: some View {
+        Group {
+            if hasAppeared || isSelected {
+                content()
+                    .onAppear { hasAppeared = true }
+            } else {
+                Color.clear
             }
         }
     }

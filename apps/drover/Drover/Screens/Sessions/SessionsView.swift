@@ -353,23 +353,27 @@ struct SessionsView: View {
             .presentationCornerRadius(24)
         }
         .navigationDestination(item: $launchedSession) { launched in
-            if launched.isStructured {
-                ChatView(
-                    client: client,
-                    sessionID: launched.id,
-                    harness: launched.harness,
-                    recoveryStore: recoveryStore,
-                    recoveryWriteGate: recoveryWriteGate,
-                    recoveryGeneration: recoveryGeneration,
-                    chatModelFactory: chatModelFactory,
-                    onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) }
-                )
-            } else {
-                TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
+            Group {
+                if launched.isStructured {
+                    ChatView(
+                        client: client,
+                        sessionID: launched.id,
+                        harness: launched.harness,
+                        recoveryStore: recoveryStore,
+                        recoveryWriteGate: recoveryWriteGate,
+                        recoveryGeneration: recoveryGeneration,
+                        chatModelFactory: chatModelFactory,
+                        onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) }
+                    )
+                } else {
+                    TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
+                }
             }
+            .toolbar(.hidden, for: .tabBar)
         }
         .navigationDestination(isPresented: $showAnalytics) {
             AnalyticsView(store: cockpitStore)
+                .toolbar(.hidden, for: .tabBar)
         }
         .navigationDestination(isPresented: $showAccounts) {
             ProviderAccountsView(
@@ -382,12 +386,15 @@ struct SessionsView: View {
                     if let snapshot = store.snapshot { await cockpitStore.refresh(for: snapshot) }
                 }
             )
+            .toolbar(.hidden, for: .tabBar)
         }
         .navigationDestination(isPresented: $showInsights) {
             InsightsView(client: client, store: cockpitStore)
+                .toolbar(.hidden, for: .tabBar)
         }
         .navigationDestination(isPresented: $showHistory) {
             HistoryView(client: client)
+                .toolbar(.hidden, for: .tabBar)
         }
     }
 
@@ -769,6 +776,7 @@ struct SessionsView: View {
                     TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
                 }
             }
+            .toolbar(.hidden, for: .tabBar)
             // Opening the session is what clears it from the badge. Marked
             // here rather than inside the destination screens because this is
             // the only place that holds the snapshot the count is derived

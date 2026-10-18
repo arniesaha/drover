@@ -179,13 +179,7 @@ private struct AllHostsChip: View {
         } else if hasWaiting {
             Circle().fill(DroverColor.warn).frame(width: 7, height: 7)
         } else if hasRunning {
-            Circle().fill(DroverColor.accentHi)
-                .frame(width: 7, height: 7)
-                .phaseAnimator(reduceMotion ? [false] : [false, true]) { dot, faded in
-                    dot.opacity(faded ? 0.45 : 1)
-                } animation: { _ in
-                    .easeInOut(duration: 1.2)
-                }
+            Circle().fill(DroverColor.accentHi).frame(width: 7, height: 7)
         } else {
             Circle().fill(DroverColor.muted).frame(width: 7, height: 7)
         }
@@ -240,7 +234,7 @@ private struct HostChip: View {
     /// - Stale: dashed line ring
     /// - Offline: dimmed hollow line ring
     /// - Needs You (hasWaiting): solid amber disc
-    /// - Running (hasRunning): pulsing filled teal disc
+    /// - Running (hasRunning): filled accent teal disc
     /// - Idle: solid neutral disc
     @ViewBuilder
     private var presenceDot: some View {
@@ -255,13 +249,7 @@ private struct HostChip: View {
         } else if hasWaiting {
             Circle().fill(DroverColor.warn).frame(width: 7, height: 7)
         } else if hasRunning {
-            Circle().fill(DroverColor.accentHi)
-                .frame(width: 7, height: 7)
-                .phaseAnimator(reduceMotion ? [false] : [false, true]) { dot, faded in
-                    dot.opacity(faded ? 0.45 : 1)
-                } animation: { _ in
-                    .easeInOut(duration: 1.2)
-                }
+            Circle().fill(DroverColor.accentHi).frame(width: 7, height: 7)
         } else {
             Circle().fill(DroverColor.muted).frame(width: 7, height: 7)
         }
