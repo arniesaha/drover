@@ -20,7 +20,7 @@ missing public seam rather than importing daemon internals.
 | `test_model_preference_validation_rejects_launch_before_side_effects` | `test_model_preference_validation_rejects_launch_before_side_effects` |
 | `test_model_preference_validation_keeps_null_launch_defaults` | `test_model_preference_validation_keeps_null_launch_defaults` |
 | `test_model_preference_validation_passes_codex_turn_preferences_unchanged` | `test_model_preference_validation_passes_codex_turn_preferences_unchanged` |
-| `test_duplicate_turn_skips_attachment_and_preference_side_effects` | dropped: `POST /sessions/<id>/turns` can show a replayed `turn_id`, but the fixture does not expose persisted preference writes or a stable attachment filename count after a replay race |
+| `test_duplicate_turn_skips_attachment_and_preference_side_effects` | `test_duplicate_turn_skips_attachment_and_preference_side_effects` |
 | `test_model_preference_validation_preserves_opaque_identifier_whitespace` | `test_model_preference_validation_preserves_opaque_identifier_whitespace` |
 | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` |
 | `test_initial_structured_executable_error_closes_entry_and_cleans_worktree` | dropped: requires pre-seeding or faulting durable daemon state before startup |
@@ -115,7 +115,7 @@ missing public seam rather than importing daemon internals.
 | `test_structured_session_full_lifecycle` | `test_public_session_mutation_contract` |
 | `test_structured_session_inventory_includes_run_preferences` | `test_public_session_mutation_contract` |
 | `test_claude_turn_cannot_change_persistent_session_preferences` | `test_model_preference_validation_discards_claude_turn_overrides` |
-| `test_structured_turn_appends_user_input_and_seq_is_monotonic` | dropped: fake-hub `/harness/events` records events, but the replay CLI exits after one fixture stream and cannot provide deterministic two-turn event ordering |
+| `test_structured_turn_appends_user_input_and_seq_is_monotonic` | `test_structured_turn_appends_user_input_and_seq_is_monotonic` |
 | `test_initial_prompt_with_image_saves_file_and_records_attachment` | `test_initial_prompt_with_image_saves_file_and_records_attachment` |
 | `test_structured_command_preferences_map_to_cli_flags` | dropped: fake-cli JSONL records argv, but the Codex structured adapter uses its app-server protocol and the current fixture does not decode a launch command into comparable CLI flags |
 | `test_turn_with_image_saves_file_and_appends_path` | `test_turn_with_image_saves_file_and_appends_path` |
