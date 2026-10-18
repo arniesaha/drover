@@ -72,7 +72,7 @@ def verified(app, args):
             expected_version=args.version,
             expected_build=args.build,
             sdk_floor="26.0",
-            expected_unrestricted_hubs=args.unrestricted_hubs,
+            expected_local_networking=True,
         )
     except ArtifactVerificationError as error:
         raise Rejected("signed artifact verification failed") from error
@@ -164,7 +164,6 @@ def main():
     parser.add_argument("--export-options", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--build", required=True)
-    parser.add_argument("--unrestricted-hubs", action="store_true", required=True)
     args = parser.parse_args()
     require(
         VERSION_PATTERN.fullmatch(args.version)

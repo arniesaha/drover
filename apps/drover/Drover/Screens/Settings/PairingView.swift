@@ -15,6 +15,11 @@ final class PairingModel: ObservableObject {
     @Published var statusMessage: String?
     @Published var statusIsError = false
     @Published var isPairing = false
+    @Published private(set) var requiresHTTPSRePairing = false
+
+    static let transportGuideURL = URL(
+        string: "https://github.com/arniesaha/drover/blob/main/docs/getting-started.md#remote-tailscale-https"
+    )!
 
     init(serverURLString: String = "") {
         self.serverURLString = serverURLString
@@ -23,6 +28,26 @@ final class PairingModel: ObservableObject {
     func prefill(_ payload: PairingPayload) {
         serverURLString = payload.serverURL.absoluteString
         manualCode = payload.code
+        _ = allowsPairing(payload)
+    }
+
+    /// Reject before redeeming a single-use pairing code. Waiting for ATS to
+    /// reject the network request would burn the code and leave no actionable
+    /// recovery path.
+    func allowsPairing(_ payload: PairingPayload) -> Bool {
+        let requiresHTTPS = ServerConfig(urlString: payload.serverURL.absoluteString)?
+            .requiresHTTPSForAppTransportSecurity == true
+        requiresHTTPSRePairing = requiresHTTPS
+        if requiresHTTPS {
+            statusMessage = ServerConfig.httpsRePairMessage
+            statusIsError = true
+            return false
+        }
+        if statusMessage == ServerConfig.httpsRePairMessage {
+            statusMessage = nil
+            statusIsError = false
+        }
+        return true
     }
 
     var canSubmitManualCode: Bool {
@@ -71,6 +96,7 @@ struct PairingView: View {
                     QRScannerView { scanned in
                         guard !model.isPairing, let payload = PairingPayload(scanned: scanned) else { return }
                         model.prefill(payload)
+                        guard model.allowsPairing(payload) else { return }
                         pendingPayload = payload
                         showPairConfirmation = true
                     }
@@ -102,6 +128,11 @@ struct PairingView: View {
                 if let statusMessage = model.statusMessage {
                     statusRow(statusMessage)
                 }
+                if model.requiresHTTPSRePairing {
+                    Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.accentHi)
+                }
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 14)
@@ -110,6 +141,7 @@ struct PairingView: View {
             VStack(spacing: 8) {
                 Button {
                     guard let payload = model.manualPayload() else { return }
+                    guard model.allowsPairing(payload) else { return }
                     pendingPayload = payload
                     showPairConfirmation = true
                 } label: {
@@ -226,6 +258,7 @@ struct PairingView: View {
 
     private func pair(_ payload: PairingPayload) async {
         guard !model.isPairing else { return }
+        guard model.allowsPairing(payload) else { return }
         model.isPairing = true
         model.statusMessage = "Pairing..."
         model.statusIsError = false

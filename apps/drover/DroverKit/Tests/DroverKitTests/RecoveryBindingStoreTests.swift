@@ -63,7 +63,7 @@ struct RecoveryBindingStoreTests {
             try? tokenStore.delete()
             defaults.removePersistentDomain(forName: suite)
         }
-        ServerConfig(urlString: "http://private.example:7080")!.save(defaults: defaults)
+        ServerConfig(urlString: "http://100.99.1.2:7080")!.save(defaults: defaults)
         try tokenStore.save("synthetic-token")
         let binding = UUID(uuidString: "00000000-0000-0000-0000-000000000100")!
 

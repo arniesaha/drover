@@ -39,6 +39,8 @@
 	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
+		<!-- Debug template only. The derived Release and StoreRelease plist removes
+		     this and adds NSAllowsLocalNetworking instead (project.yml). -->
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>

@@ -119,9 +119,9 @@ public struct PairResponse: Decodable, Sendable, Equatable {
 
 // MARK: - DroverClient
 
-/// Talks to the central Drover server's harness REST API over plain HTTP
-/// (encrypted at the WireGuard/Tailscale hop, not at this layer — see
-/// `NSAllowsArbitraryLoads` in the app's Info.plist).
+/// Talks to the central Drover server's harness REST API. Store builds allow
+/// plain HTTP only for local-networking ATS host classes; named remote hubs
+/// must use HTTPS (see `ServerConfig.requiresHTTPSForAppTransportSecurity`).
 public actor DroverClient {
     private static let cockpitRequestTimeout: TimeInterval = 60
     /// Completion runs while someone types and uses the hub's short budget.

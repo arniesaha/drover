@@ -98,6 +98,25 @@ final class OnboardingTests: XCTestCase {
         XCTAssertEqual(payload.serverURL.absoluteString, "http://192.168.1.100:7080")
     }
 
+    func testStoredPlainHTTPFQDNRequiresRePair() throws {
+        let suiteName = "drover-stored-fqdn-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let tokenStore = TokenStore(service: suiteName)
+        defer {
+            try? tokenStore.delete()
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        ServerConfig(urlString: "http://studio.tailnet.ts.net:7080")!.save(defaults: defaults)
+        try tokenStore.save("synthetic-token")
+
+        let environment = AppEnvironment(
+            defaults: defaults, tokenStore: tokenStore, launchEnvironment: [:]
+        )
+
+        XCTAssertEqual(environment.rePairRequiredURL?.host, "studio.tailnet.ts.net")
+        XCTAssertNil(environment.client)
+    }
+
     func testUITestDeviceNameOverridesTheSimulatorName() {
         XCTAssertEqual(
             UITestOverrides.pairingDeviceName(

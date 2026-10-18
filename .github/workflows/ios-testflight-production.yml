@@ -138,8 +138,7 @@ jobs:
           --archive "$RUNNER_TEMP/drover-ios-candidate/Drover.xcarchive" \
           --output "$RUNNER_TEMP/drover-ios-export" \
           --export-options "$RUNNER_TEMP/drover-distribution-signing/ExportOptions.plist" \
-          --version "$CANDIDATE_VERSION" --build "$CANDIDATE_BUILD" \
-          --unrestricted-hubs
+          --version "$CANDIDATE_VERSION" --build "$CANDIDATE_BUILD"
     - name: Install ASC signing dependency
       run: python3 -m pip install 'cryptography>=42,<47'
     - name: Upload, wait for Apple processing and assign internal group

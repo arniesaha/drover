@@ -64,6 +64,20 @@ private func rawTokenData(service: String) throws -> Data {
     #expect(ServerConfig.load(defaults: defaults) == config)
 }
 
+@Test func httpHostClassificationMatchesStoreATSBoundary() {
+    #expect(ServerConfig.classifyHTTPHost("192.168.1.10") == .ipAddress)
+    #expect(ServerConfig.classifyHTTPHost("100.99.1.2") == .tailscaleIP)
+    #expect(ServerConfig.classifyHTTPHost("studio.local") == .localDomain)
+    #expect(ServerConfig.classifyHTTPHost("studio") == .singleLabel)
+    #expect(ServerConfig.classifyHTTPHost("studio.tailnet.ts.net") == .fullyQualifiedDomain)
+
+    #expect(!ServerConfig(urlString: "http://100.99.1.2:7080")!.requiresHTTPSForAppTransportSecurity)
+    #expect(!ServerConfig(urlString: "http://studio.local:7080")!.requiresHTTPSForAppTransportSecurity)
+    #expect(!ServerConfig(urlString: "http://studio:7080")!.requiresHTTPSForAppTransportSecurity)
+    #expect(ServerConfig(urlString: "http://studio.tailnet.ts.net:7080")!.requiresHTTPSForAppTransportSecurity)
+    #expect(!ServerConfig(urlString: "https://studio.tailnet.ts.net")!.requiresHTTPSForAppTransportSecurity)
+}
+
 
 @Test func tailscaleAddressDetectionIPv4() {
     // Valid Tailscale IPv4 CGNAT range: 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
