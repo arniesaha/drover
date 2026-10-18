@@ -4,7 +4,7 @@ import Observation
 @MainActor
 @Observable
 public final class HarnessModelCatalogState {
-    private let client: DroverClient
+    private let client: DroverClient?
     private let store: HarnessModelCatalogStore
     private var selectionGeneration = 0
     private var refreshGeneration = 0
@@ -23,7 +23,7 @@ public final class HarnessModelCatalogState {
     public var selectedModel = "" { didSet { selectionDidChange() } }
     public var thinkingEffort = "" { didSet { selectionDidChange() } }
 
-    public init(client: DroverClient, store: HarnessModelCatalogStore) {
+    public init(client: DroverClient? = nil, store: HarnessModelCatalogStore = HarnessModelCatalogStore()) {
         self.client = client
         self.store = store
     }
@@ -110,6 +110,11 @@ public final class HarnessModelCatalogState {
                expectedSelectionGeneration == selectionGeneration {
                 isRefreshing = false
             }
+        }
+
+        guard let client else {
+            isRefreshing = false
+            return
         }
 
         do {

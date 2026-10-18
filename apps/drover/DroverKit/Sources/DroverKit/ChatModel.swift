@@ -137,9 +137,10 @@ public final class ChatModel {
         case unavailable
     }
 
-    private let client: DroverClient
-    private let sessionID: String
-    private let stream: MessageStream
+    public let client: DroverClient?
+    public let sessionID: String
+    private let stream: MessageStream?
+    public let isDemoMode: Bool
     private let recoveryStore: (any ChatRecoveryPersisting)?
     private let recoveryKey: ChatRecoveryKey?
     private let recoveryWriteGate: ChatRecoveryWriteGate?
@@ -265,6 +266,10 @@ public final class ChatModel {
         }
         if isEnded { return base.overriding(phase: .completed, title: "Session ended") }
         if isStopping { return base.overriding(phase: .stopping, title: "Stopping...") }
+        if isDemoMode {
+            if pendingApproval != nil { return base.overriding(phase: .approval, title: "Needs approval") }
+            return base
+        }
         guard isConnected else {
             return base.overriding(phase: hasConnectedOnce ? .reconnecting : .connecting,
                                    title: hasConnectedOnce ? "Reconnecting" : "Connecting")
@@ -447,6 +452,7 @@ public final class ChatModel {
         self.recoveryStore = recoveryStore
         self.recoveryWriteGate = recoveryWriteGate
         self.recoveryGeneration = recoveryGeneration
+        self.isDemoMode = false
         if let credentialBindingID = client.credentialBindingID {
             self.recoveryKey = ChatRecoveryKey(
                 serverURL: client.config.baseURL,
@@ -471,9 +477,62 @@ public final class ChatModel {
             return MessageStream(client: c, sessionID: s)
         }
         self.stream = factory(client, sessionID)
-        if !canPersistRecovery {
+        if !isDemoMode && !canPersistRecovery {
             recoveryStatusMessage = "Chat recovery is unavailable. Check local storage in Settings."
             recoveryFailureOrigin = .unavailable
+        }
+        rebuildApprovals()
+    }
+
+    /// Creates an entirely offline, fictional demo chat model with no network client.
+    public static func makeDemo(
+        sessionID: String,
+        harness: String? = nil,
+        recap: String? = nil
+    ) -> ChatModel {
+        ChatModel(
+            sessionID: sessionID,
+            harness: harness,
+            recap: recap,
+            isDemoMode: true
+        )
+    }
+
+    public init(
+        sessionID: String,
+        harness: String? = nil,
+        recap: String? = nil,
+        isDemoMode: Bool = true
+    ) {
+        self.client = nil
+        self.sessionID = sessionID
+        self.isDemoMode = true
+        self.recoveryStore = nil
+        self.recoveryWriteGate = nil
+        self.recoveryGeneration = 0
+        self.recoveryKey = nil
+        self.runPreferences = HarnessModelCatalogState(client: nil, store: HarnessModelCatalogStore())
+        self.messages = DemoHub.shared.harnessMessages(for: sessionID)
+        self.isConnected = true
+        self.hasConnectedOnce = true
+        self.harnessPresentation = HarnessPresentation(harness ?? "")
+        self.recap = recap
+        self.recapSourceSeq = nil
+        self.recapPollInterval = .seconds(1)
+        self.recapPollAttempts = 30
+        self.deliveryConfirmationTimeout = .seconds(20)
+        self.stream = nil
+        self.messagesVersion = 1
+
+        let snapshot = DemoHub.shared.snapshot()
+        if let session = snapshot.sessions.first(where: { $0.id == sessionID }) {
+            self.applySessionMetadata(snapshot, session: session)
+        } else {
+            self.controls = HarnessControls(
+                snapshot: snapshot,
+                hostID: DemoHubData.hostStudio,
+                harness: harness ?? "claude-code"
+            )
         }
         rebuildApprovals()
     }
@@ -491,6 +550,7 @@ public final class ChatModel {
     // MARK: - Streaming
 
     public func start() {
+        guard !isDemoMode else { return }
         guard pumpTask == nil else { return }
         pumpGeneration += 1
         let generation = pumpGeneration
@@ -564,7 +624,7 @@ public final class ChatModel {
         isLoadingOlderHistory = true
         defer { isLoadingOlderHistory = false }
         do {
-            guard let page = try await stream.loadOlderHistory() else { return false }
+            guard let stream, let page = try await stream.loadOlderHistory() else { return false }
             mergeHistory(page.messages)
             hasOlderHistory = page.hasOlder
             if hint == "Could not load earlier messages · try again." {
@@ -735,6 +795,18 @@ public final class ChatModel {
             return
         }
         guard !text.isEmpty || !images.isEmpty else { return }
+
+        if isDemoMode {
+            composerText = ""
+            pendingAttachments = []
+            hint = nil
+            DemoHub.shared.submitTurn(sessionID: sessionID, text: text)
+            messages = DemoHub.shared.harnessMessages(for: sessionID)
+            messagesVersion += 1
+            rebuildApprovals()
+            return
+        }
+
         let clientTurnID = UUID().uuidString
         let turn = ChatPendingTurn(
             text: text,
@@ -1066,6 +1138,7 @@ public final class ChatModel {
         isSending = true
         defer { isSending = false }
         let preferences = turnPreferences
+        guard let client else { return }
         do {
             _ = try await client.sendTurn(
                 sessionID: sessionID,
@@ -1349,6 +1422,7 @@ public final class ChatModel {
     }
 
     private var canPersistRecovery: Bool {
+        if isDemoMode { return true }
         guard recoveryStore != nil, recoveryKey != nil, let recoveryWriteGate else { return false }
         return recoveryWriteGate.generation == recoveryGeneration
     }
@@ -1495,6 +1569,17 @@ public final class ChatModel {
         guard controls.showsApprovals else { return }
         guard !isAnswering else { return }
         guard let requestID = pendingApproval?.payload["request_id"]?.stringValue else { return }
+        if isDemoMode {
+            isAnswering = true
+            defer { isAnswering = false }
+            DemoHub.shared.decidePermission(sessionID: sessionID, requestID: requestID, decision: decision)
+            messages = DemoHub.shared.harnessMessages(for: sessionID)
+            messagesVersion += 1
+            rebuildApprovals()
+            hint = nil
+            return
+        }
+        guard let client else { return }
         isAnswering = true
         defer { isAnswering = false }
         do {
@@ -1517,6 +1602,7 @@ public final class ChatModel {
             hint = HarnessCapabilityCopy.noLaunchableHarness
             return nil
         }
+        guard let client else { return nil }
         do {
             let continued = try await client.continueSession(sessionID: sessionID,
                                                              targetHarness: targetHarness)
@@ -1543,7 +1629,7 @@ public final class ChatModel {
     /// Asks the host for resume candidates, only for an advertised harness.
     public func loadNativeResumeCandidates() async {
         let harness = harnessPresentation.harness
-        guard canResumeNatively, let hostID = sessionHostID else {
+        guard canResumeNatively, let hostID = sessionHostID, let client else {
             nativeResumeCandidates = []
             return
         }
@@ -1563,7 +1649,7 @@ public final class ChatModel {
     /// this harness and the candidate belongs to it.
     public func resumeNatively(_ candidate: NativeResumeCandidate) async -> ContinuedSession? {
         let harness = harnessPresentation.harness
-        guard canResumeNatively, candidate.harness == harness else {
+        guard canResumeNatively, candidate.harness == harness, let client else {
             hint = HarnessCapabilityCopy.nativeResumeUnsupported
             return nil
         }
@@ -1596,6 +1682,14 @@ public final class ChatModel {
     /// has no good text yet, so a pending or failed recap generation cannot
     /// erase a summary that was already visible.
     public func loadSessionMetadata() async {
+        if isDemoMode {
+            let snapshot = DemoHub.shared.snapshot()
+            if let session = snapshot.sessions.first(where: { $0.id == sessionID }) {
+                applySessionMetadata(snapshot, session: session)
+            }
+            return
+        }
+        guard let client else { return }
         guard let metadata = await Self.fetchSessionMetadata(client: client, sessionID: sessionID)
         else { return }
         applySessionMetadata(metadata.snapshot, session: metadata.session)
@@ -1618,8 +1712,9 @@ public final class ChatModel {
     /// discard a late snapshot after cancellation or supersession, before it
     /// changes any observable chat state.
     private nonisolated static func fetchSessionMetadata(
-        client: DroverClient, sessionID: String
+        client: DroverClient?, sessionID: String
     ) async -> (snapshot: HarnessSnapshot, session: SessionSummary)? {
+        guard let client else { return nil }
         while !Task.isCancelled {
             do {
                 let snapshot = try await client.snapshot()
@@ -1705,6 +1800,15 @@ public final class ChatModel {
             hint = reason
             return
         }
+        if isDemoMode {
+            DemoHub.shared.interruptSession(sessionID: sessionID)
+            messages = DemoHub.shared.harnessMessages(for: sessionID)
+            messagesVersion += 1
+            rebuildApprovals()
+            hint = nil
+            return
+        }
+        guard let client else { return }
         isStopping = true
         do {
             try await client.interrupt(sessionID: sessionID)
@@ -1717,6 +1821,18 @@ public final class ChatModel {
 
     public func terminate() async {
         guard !isEnded else { return }
+        if isDemoMode {
+            isEnded = true
+            isStopping = false
+            endedMessage = "Session ended. Start or continue a session to send a message."
+            pendingApproval = nil
+            hint = nil
+            DemoHub.shared.terminateSession(sessionID: sessionID)
+            messages = DemoHub.shared.harnessMessages(for: sessionID)
+            messagesVersion += 1
+            return
+        }
+        guard let client else { return }
         isEnded = true
         isStopping = false
         endedMessage = "Ending session. The composer is disabled."

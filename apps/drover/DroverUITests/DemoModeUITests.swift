@@ -48,6 +48,26 @@ final class DemoModeUITests: XCTestCase {
     }
 
     @MainActor
+    private func signalAndCapture(name: String, app: XCUIApplication) {
+        let shotsDir = URL(fileURLWithPath: "/tmp/drover-demo-mode-shots")
+        try? FileManager.default.createDirectory(at: shotsDir, withIntermediateDirectories: true)
+        let readyFile = shotsDir.appendingPathComponent("ready_\(name).txt")
+        let doneFile = shotsDir.appendingPathComponent("done_\(name).txt")
+        try? "ready".write(to: readyFile, atomically: true, encoding: .utf8)
+
+        let deadline = Date().addingTimeInterval(3.0)
+        while Date() < deadline && !FileManager.default.fileExists(atPath: doneFile.path) {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+
+        let screenshot = app.screenshot()
+        let directFile = shotsDir.appendingPathComponent("\(name).png")
+        if !FileManager.default.fileExists(atPath: directFile.path) {
+            try? screenshot.pngRepresentation.write(to: directFile)
+        }
+    }
+
+    @MainActor
     func testDemoModeFullJourney() throws {
         let app = makeApp()
         app.launch()
@@ -74,6 +94,32 @@ final class DemoModeUITests: XCTestCase {
         XCTAssertTrue(chatTitle.waitForExistence(timeout: 5))
         let validationText = app.staticTexts.containing(NSPredicate(format: "label CONTAINS 'checkout validation'")).firstMatch
         _ = validationText.waitForExistence(timeout: 3)
+
+        // Assert no reconnecting pill or reconnecting indicator
+        let reconnectingPill = app.descendants(matching: .any)["chat-reconnecting"]
+        XCTAssertFalse(reconnectingPill.exists, "Demo session should never show reconnecting pill")
+        let reconnectingText = app.staticTexts["Reconnecting"]
+        XCTAssertFalse(reconnectingText.exists, "Demo session should never show reconnecting status")
+
+        signalAndCapture(name: "04_demo_session_chat", app: app)
+
+        // Test sending a follow-up turn in demo mode
+        let composer = app.textFields["composer-input"]
+        if composer.waitForExistence(timeout: 3) {
+            composer.tap()
+            composer.typeText("Check unit tests")
+            let sendButton = app.buttons["composer-send"]
+            if sendButton.waitForExistence(timeout: 3) {
+                sendButton.tap()
+                let simulatedReply = app.staticTexts.containing(NSPredicate(format: "label CONTAINS 'Demo mode: replies are simulated'")).firstMatch
+                XCTAssertTrue(simulatedReply.waitForExistence(timeout: 5), "Expected simulated demo reply")
+            }
+        }
+        XCTAssertFalse(reconnectingPill.exists)
+        XCTAssertFalse(reconnectingText.exists)
+
+        signalAndCapture(name: "04b_demo_session_chat_sent", app: app)
+
         captureScreenshot(named: "03_Session_Streaming", in: app)
 
         // Back to fleet

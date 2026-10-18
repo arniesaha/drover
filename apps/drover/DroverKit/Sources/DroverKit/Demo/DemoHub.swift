@@ -28,7 +28,7 @@ public struct DemoHubResponse: Sendable {
 public final class DemoHub: @unchecked Sendable {
     public static let shared = DemoHub()
 
-    private let lock = NSLock()
+    private let lock = NSRecursiveLock()
     private var hosts: [[String: Any]] = []
     private var sessions: [[String: Any]] = []
     private var cwdSuggestions: [[String: Any]] = []
@@ -88,6 +88,34 @@ public final class DemoHub: @unchecked Sendable {
     public func currentMessages(for sessionID: String) -> [[String: Any]] {
         lock.withLock {
             messagesBySessionID[sessionID] ?? defaultMessages(for: sessionID)
+        }
+    }
+
+    public func harnessMessages(for sessionID: String) -> [HarnessMessage] {
+        lock.withLock {
+            let list = messagesBySessionID[sessionID] ?? defaultMessages(for: sessionID)
+            guard let data = try? JSONSerialization.data(withJSONObject: list),
+                  let msgs = try? JSONDecoder().decode([HarnessMessage].self, from: data) else {
+                return []
+            }
+            return msgs
+        }
+    }
+
+    public func snapshot() -> HarnessSnapshot {
+        lock.withLock {
+            let dict: [String: Any] = [
+                "hosts": hosts,
+                "sessions": sessions,
+                "cwd_suggestions": cwdSuggestions,
+                "cockpit_api_version": 1,
+                "cockpit_sections": ["provider_capacity", "activity", "insights"],
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: dict),
+                  let snap = try? JSONDecoder().decode(HarnessSnapshot.self, from: data) else {
+                preconditionFailure("Failed to decode demo snapshot")
+            }
+            return snap
         }
     }
 
@@ -617,6 +645,43 @@ public final class DemoHub: @unchecked Sendable {
         return .json(status: 200, response)
     }
 
+    public func submitTurn(sessionID: String, text: String) {
+        lock.withLock {
+            var list = messagesBySessionID[sessionID] ?? defaultMessages(for: sessionID)
+            let nextSeq = (list.map { ($0["seq"] as? Int) ?? 0 }.max() ?? 0) + 1
+
+            let userMsg: [String: Any] = [
+                "event_id": "turn-user-\(nextSeq)",
+                "seq": nextSeq,
+                "type": "user_input",
+                "role": "user",
+                "text": text,
+                "payload": [:] as [String: Any],
+            ]
+            list.append(userMsg)
+            broadcastToStreamLocked(sessionID: sessionID, message: userMsg)
+
+            let replySeq = nextSeq + 1
+            let replyMsg: [String: Any] = [
+                "event_id": "turn-reply-\(replySeq)",
+                "seq": replySeq,
+                "type": "assistant_output",
+                "role": "assistant",
+                "text": "I've added the benchmark tests in `benchmarks/json_bench.rs`. The throughput is ~120 MB/s. Everything looks ready to commit!\n\n_Demo mode: replies are simulated._",
+                "payload": [:] as [String: Any],
+            ]
+            list.append(replyMsg)
+            broadcastToStreamLocked(sessionID: sessionID, message: replyMsg)
+
+            messagesBySessionID[sessionID] = list
+
+            if let idx = sessions.firstIndex(where: { ($0["session_id"] as? String) == sessionID }) {
+                sessions[idx]["awaiting"] = NSNull()
+                sessions[idx]["last_activity"] = ISO8601DateFormatter().string(from: Date())
+            }
+        }
+    }
+
     private func handleTurnSubmission(sessionID: String, request: URLRequest) -> DemoHubResponse {
         var userText = "Sample follow-up message"
         if let body = request.bodyData(),
@@ -625,40 +690,83 @@ public final class DemoHub: @unchecked Sendable {
             userText = text
         }
 
-        var list = messagesBySessionID[sessionID] ?? defaultMessages(for: sessionID)
-        let nextSeq = (list.map { ($0["seq"] as? Int) ?? 0 }.max() ?? 0) + 1
-
-        let userMsg: [String: Any] = [
-            "event_id": "turn-user-\(nextSeq)",
-            "seq": nextSeq,
-            "type": "user_input",
-            "role": "user",
-            "text": userText,
-            "payload": [:] as [String: Any],
-        ]
-        list.append(userMsg)
-        broadcastToStreamLocked(sessionID: sessionID, message: userMsg)
-
-        let replySeq = nextSeq + 1
-        let replyMsg: [String: Any] = [
-            "event_id": "turn-reply-\(replySeq)",
-            "seq": replySeq,
-            "type": "assistant_output",
-            "role": "assistant",
-            "text": "I've added the benchmark tests in `benchmarks/json_bench.rs`. The throughput is ~120 MB/s. Everything looks ready to commit!",
-            "payload": [:] as [String: Any],
-        ]
-        list.append(replyMsg)
-        broadcastToStreamLocked(sessionID: sessionID, message: replyMsg)
-
-        messagesBySessionID[sessionID] = list
-
-        if let idx = sessions.firstIndex(where: { ($0["session_id"] as? String) == sessionID }) {
-            sessions[idx]["awaiting"] = NSNull()
-            sessions[idx]["last_activity"] = ISO8601DateFormatter().string(from: Date())
-        }
-
+        submitTurn(sessionID: sessionID, text: userText)
         return .json(status: 202, ["turn_id": "demo-turn-\(UUID().uuidString)"])
+    }
+
+    public func decidePermission(sessionID: String, requestID: String, decision: String) {
+        lock.withLock {
+            var list = messagesBySessionID[sessionID] ?? defaultMessages(for: sessionID)
+            let nextSeq = (list.map { ($0["seq"] as? Int) ?? 0 }.max() ?? 0) + 1
+
+            let respMsg: [String: Any] = [
+                "event_id": "appr-resp-\(nextSeq)",
+                "seq": nextSeq,
+                "type": "approval_response",
+                "role": "user",
+                "text": decision,
+                "payload": [
+                    "request_id": requestID,
+                    "decision": decision,
+                ] as [String: Any],
+            ]
+            list.append(respMsg)
+            broadcastToStreamLocked(sessionID: sessionID, message: respMsg)
+
+            let resultSeq = nextSeq + 1
+            if decision == "allow" {
+                let toolResMsg: [String: Any] = [
+                    "event_id": "tool-res-\(resultSeq)",
+                    "seq": resultSeq,
+                    "type": "tool_result",
+                    "role": "tool",
+                    "text": "CREATE TABLE user_sessions (id UUID PRIMARY KEY, user_id UUID NOT NULL, expires_at TIMESTAMP WITH TIME ZONE);\nCREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id);\nCOMMIT;\n1 migration applied.",
+                    "payload": [:] as [String: Any],
+                ]
+                list.append(toolResMsg)
+                broadcastToStreamLocked(sessionID: sessionID, message: toolResMsg)
+
+                let assistMsg: [String: Any] = [
+                    "event_id": "assist-\(resultSeq + 1)",
+                    "seq": resultSeq + 1,
+                    "type": "assistant_output",
+                    "role": "assistant",
+                    "text": "Migration 004 applied successfully. 3 tables and index created.",
+                    "payload": [:] as [String: Any],
+                ]
+                list.append(assistMsg)
+                broadcastToStreamLocked(sessionID: sessionID, message: assistMsg)
+            } else {
+                let toolResMsg: [String: Any] = [
+                    "event_id": "tool-res-\(resultSeq)",
+                    "seq": resultSeq,
+                    "type": "tool_result",
+                    "role": "tool",
+                    "text": "Permission denied by operator.",
+                    "payload": [:] as [String: Any],
+                ]
+                list.append(toolResMsg)
+                broadcastToStreamLocked(sessionID: sessionID, message: toolResMsg)
+
+                let assistMsg: [String: Any] = [
+                    "event_id": "assist-\(resultSeq + 1)",
+                    "seq": resultSeq + 1,
+                    "type": "assistant_output",
+                    "role": "assistant",
+                    "text": "Database migration skipped. Proceeding without database schema update.",
+                    "payload": [:] as [String: Any],
+                ]
+                list.append(assistMsg)
+                broadcastToStreamLocked(sessionID: sessionID, message: assistMsg)
+            }
+
+            messagesBySessionID[sessionID] = list
+
+            if let idx = sessions.firstIndex(where: { ($0["session_id"] as? String) == sessionID }) {
+                sessions[idx]["awaiting"] = NSNull()
+                sessions[idx]["last_activity"] = ISO8601DateFormatter().string(from: Date())
+            }
+        }
     }
 
     private func handlePermissionDecision(sessionID: String, request: URLRequest) -> DemoHubResponse {
@@ -671,105 +779,46 @@ public final class DemoHub: @unchecked Sendable {
             if let r = payload["request_id"] as? String { requestID = r }
         }
 
-        var list = messagesBySessionID[sessionID] ?? defaultMessages(for: sessionID)
-        let nextSeq = (list.map { ($0["seq"] as? Int) ?? 0 }.max() ?? 0) + 1
-
-        let respMsg: [String: Any] = [
-            "event_id": "appr-resp-\(nextSeq)",
-            "seq": nextSeq,
-            "type": "approval_response",
-            "role": "user",
-            "text": decision,
-            "payload": [
-                "request_id": requestID,
-                "decision": decision,
-            ] as [String: Any],
-        ]
-        list.append(respMsg)
-        broadcastToStreamLocked(sessionID: sessionID, message: respMsg)
-
-        let resultSeq = nextSeq + 1
-        if decision == "allow" {
-            let toolResMsg: [String: Any] = [
-                "event_id": "tool-res-\(resultSeq)",
-                "seq": resultSeq,
-                "type": "tool_result",
-                "role": "tool",
-                "text": "CREATE TABLE user_sessions (id UUID PRIMARY KEY, user_id UUID NOT NULL, expires_at TIMESTAMP WITH TIME ZONE);\nCREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id);\nCOMMIT;\n1 migration applied.",
-                "payload": [:] as [String: Any],
-            ]
-            list.append(toolResMsg)
-            broadcastToStreamLocked(sessionID: sessionID, message: toolResMsg)
-
-            let assistMsg: [String: Any] = [
-                "event_id": "assist-\(resultSeq + 1)",
-                "seq": resultSeq + 1,
-                "type": "assistant_output",
-                "role": "assistant",
-                "text": "Migration 004 applied successfully. 3 tables and index created.",
-                "payload": [:] as [String: Any],
-            ]
-            list.append(assistMsg)
-            broadcastToStreamLocked(sessionID: sessionID, message: assistMsg)
-        } else {
-            let toolResMsg: [String: Any] = [
-                "event_id": "tool-res-\(resultSeq)",
-                "seq": resultSeq,
-                "type": "tool_result",
-                "role": "tool",
-                "text": "Permission denied by operator.",
-                "payload": [:] as [String: Any],
-            ]
-            list.append(toolResMsg)
-            broadcastToStreamLocked(sessionID: sessionID, message: toolResMsg)
-
-            let assistMsg: [String: Any] = [
-                "event_id": "assist-\(resultSeq + 1)",
-                "seq": resultSeq + 1,
-                "type": "assistant_output",
-                "role": "assistant",
-                "text": "Database migration skipped. Proceeding without database schema update.",
-                "payload": [:] as [String: Any],
-            ]
-            list.append(assistMsg)
-            broadcastToStreamLocked(sessionID: sessionID, message: assistMsg)
-        }
-
-        messagesBySessionID[sessionID] = list
-
-        if let idx = sessions.firstIndex(where: { ($0["session_id"] as? String) == sessionID }) {
-            sessions[idx]["awaiting"] = NSNull()
-            sessions[idx]["last_activity"] = ISO8601DateFormatter().string(from: Date())
-        }
-
+        decidePermission(sessionID: sessionID, requestID: requestID, decision: decision)
         return .json(status: 200, ["status": "ok"])
+    }
+
+    public func interruptSession(sessionID: String) {
+        lock.withLock {
+            var list = messagesBySessionID[sessionID] ?? defaultMessages(for: sessionID)
+            let nextSeq = (list.map { ($0["seq"] as? Int) ?? 0 }.max() ?? 0) + 1
+
+            let intrMsg: [String: Any] = [
+                "event_id": "intr-\(nextSeq)",
+                "seq": nextSeq,
+                "type": "assistant_output",
+                "role": "assistant",
+                "text": "Process interrupted by user (SIGINT delivered).",
+                "payload": [:] as [String: Any],
+            ]
+            list.append(intrMsg)
+            broadcastToStreamLocked(sessionID: sessionID, message: intrMsg)
+            messagesBySessionID[sessionID] = list
+        }
     }
 
     private func handleInterrupt(sessionID: String) -> DemoHubResponse {
-        var list = messagesBySessionID[sessionID] ?? defaultMessages(for: sessionID)
-        let nextSeq = (list.map { ($0["seq"] as? Int) ?? 0 }.max() ?? 0) + 1
-
-        let intrMsg: [String: Any] = [
-            "event_id": "intr-\(nextSeq)",
-            "seq": nextSeq,
-            "type": "assistant_output",
-            "role": "assistant",
-            "text": "Process interrupted by user (SIGINT delivered).",
-            "payload": [:] as [String: Any],
-        ]
-        list.append(intrMsg)
-        broadcastToStreamLocked(sessionID: sessionID, message: intrMsg)
-        messagesBySessionID[sessionID] = list
-
+        interruptSession(sessionID: sessionID)
         return .json(status: 200, ["status": "ok"])
     }
 
-    private func handleTerminate(sessionID: String) -> DemoHubResponse {
-        if let idx = sessions.firstIndex(where: { ($0["session_id"] as? String) == sessionID }) {
-            sessions[idx]["status"] = "terminated"
-            sessions[idx]["awaiting"] = NSNull()
-            sessions[idx]["last_activity"] = ISO8601DateFormatter().string(from: Date())
+    public func terminateSession(sessionID: String) {
+        lock.withLock {
+            if let idx = sessions.firstIndex(where: { ($0["session_id"] as? String) == sessionID }) {
+                sessions[idx]["status"] = "terminated"
+                sessions[idx]["awaiting"] = NSNull()
+                sessions[idx]["last_activity"] = ISO8601DateFormatter().string(from: Date())
+            }
         }
+    }
+
+    private func handleTerminate(sessionID: String) -> DemoHubResponse {
+        terminateSession(sessionID: sessionID)
         return .json(status: 200, ["status": "ok", "state": "terminated"])
     }
 

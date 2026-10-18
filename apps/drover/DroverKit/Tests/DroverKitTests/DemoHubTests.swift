@@ -327,4 +327,47 @@ struct DemoHubTests {
             #expect(["studio", "workstation", "build-box"].contains(id))
         }
     }
+
+    @Test("Demo chat model has no network client, never shows reconnecting indicator, and produces simulated replies")
+    @MainActor
+    func testDemoChatModelOfflineAndSimulatedReplies() async throws {
+        let hub = DemoHub.shared
+        hub.reset()
+
+        let chatModel = ChatModel.makeDemo(
+            sessionID: DemoHubData.sessionStreaming,
+            harness: "claude-code"
+        )
+
+        // 1. Assert no network client is created
+        #expect(chatModel.client == nil)
+        #expect(chatModel.isDemoMode == true)
+
+        // 2. Assert connected and no reconnecting or connecting indicator
+        #expect(chatModel.isConnected == true)
+        #expect(chatModel.hasConnectedOnce == true)
+        #expect(chatModel.activity.phase != .reconnecting)
+        #expect(chatModel.activity.phase != .connecting)
+        #expect(chatModel.activity.title != "Reconnecting")
+        #expect(chatModel.activity.title != "Connecting")
+
+        // 3. Assert sending a turn produces a canned fictional reply without any network calls
+        let initialMessageCount = chatModel.messages.count
+        chatModel.composerText = "Can you check the test coverage?"
+        await chatModel.sendTurn()
+
+        #expect(chatModel.messages.count == initialMessageCount + 2)
+        let lastUserMessage = chatModel.messages[chatModel.messages.count - 2]
+        let lastAssistantMessage = chatModel.messages[chatModel.messages.count - 1]
+
+        #expect(lastUserMessage.type == .userInput)
+        #expect(lastUserMessage.text == "Can you check the test coverage?")
+        #expect(lastAssistantMessage.type == .assistantOutput)
+        #expect(lastAssistantMessage.text.contains("Demo mode: replies are simulated"))
+
+        // Still no reconnecting indicator
+        #expect(chatModel.activity.phase != .reconnecting)
+        #expect(chatModel.activity.phase != .connecting)
+    }
 }
+
