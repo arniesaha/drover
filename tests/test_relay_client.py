@@ -40,6 +40,10 @@ def _wait_for(sock, kinds, timeout_s=20.0):
     raise AssertionError(f"timed out waiting for {kinds}")
 
 
+def test_loopback_session_requests_allow_the_startup_budget():
+    assert relay_client.LOOPBACK_TIMEOUT_S == 120.0
+
+
 @pytest.fixture
 def harnessd_server(tmp_path):
     """In-process harnessd on a loopback ephemeral port (api_token test-token)."""
@@ -471,11 +475,9 @@ def test_inflight_reqs_are_bounded_and_excess_is_refused(harnessd_server, monkey
         hub_side.close()
 
 
-def test_loopback_timeout_does_not_outlive_the_hub_budget():
-    """Orphaned work must die near the hub's deadline, not long after it."""
+def test_loopback_timeout_matches_the_session_startup_budget():
+    """A cold session launch can legitimately occupy the relay for two minutes."""
     from drover.server.metrics import RELAY_MIN_TIMEOUT_S
 
     assert relay_client.LOOPBACK_TIMEOUT_S >= RELAY_MIN_TIMEOUT_S
-    # 15s is RelayManager.request's own default budget: work outlives the
-    # tightest relay budgets but is not left running long past the widest.
-    assert relay_client.LOOPBACK_TIMEOUT_S <= 15.0
+    assert relay_client.LOOPBACK_TIMEOUT_S == 120.0

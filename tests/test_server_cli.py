@@ -577,26 +577,30 @@ def test_cli_init_does_not_overwrite_existing(tmp_path):
     assert "already exists" in res.output.lower()
 
 
-def test_harnessd_schema_bootstrap_tolerates_live_duckdb_lock(monkeypatch, tmp_path):
+def test_harnessd_schema_bootstrap_tolerates_live_control_registry_lock(
+    monkeypatch, tmp_path
+):
     cfg = _make_config(tmp_path)
     loaded = server_main.load_config(cfg)
 
-    def locked_bootstrap(**kwargs):
+    def locked_bootstrap(*args, **kwargs):
         raise duckdb.IOException("IO Error: Could not set lock: Conflicting lock")
 
-    monkeypatch.setattr(harness_cli, "bootstrap", locked_bootstrap)
+    monkeypatch.setattr(harness_cli, "bootstrap_control_plane_store", locked_bootstrap)
 
     assert _bootstrap_harnessd_schema(loaded) is False
 
 
-def test_harnessd_schema_bootstrap_reraises_other_duckdb_io(monkeypatch, tmp_path):
+def test_harnessd_schema_bootstrap_reraises_other_control_registry_io(
+    monkeypatch, tmp_path
+):
     cfg = _make_config(tmp_path)
     loaded = server_main.load_config(cfg)
 
-    def failing_bootstrap(**kwargs):
+    def failing_bootstrap(*args, **kwargs):
         raise duckdb.IOException("IO Error: corrupted database")
 
-    monkeypatch.setattr(harness_cli, "bootstrap", failing_bootstrap)
+    monkeypatch.setattr(harness_cli, "bootstrap_control_plane_store", failing_bootstrap)
 
     try:
         _bootstrap_harnessd_schema(loaded)
@@ -604,6 +608,21 @@ def test_harnessd_schema_bootstrap_reraises_other_duckdb_io(monkeypatch, tmp_pat
         assert "corrupted database" in str(exc)
     else:
         raise AssertionError("non-lock DuckDB failures should still fail startup")
+
+
+def test_harnessd_bootstrap_skips_lakehouse_schema_and_views(monkeypatch, tmp_path):
+    cfg = _make_config(tmp_path)
+    loaded = server_main.load_config(cfg)
+    calls = []
+
+    monkeypatch.setattr(
+        harness_cli,
+        "bootstrap_control_plane_store",
+        lambda path: calls.append(path),
+    )
+    assert _bootstrap_harnessd_schema(loaded) is True
+    assert "bootstrap" not in harness_cli.__dict__
+    assert calls == [loaded.duckdb_path]
 
 
 def test_cli_status_shows_config_and_counts(tmp_path):

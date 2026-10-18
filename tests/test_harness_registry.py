@@ -52,6 +52,139 @@ def test_bootstrap_creates_harness_tables(tmp_path):
     }.issubset(tables)
 
 
+def test_control_registry_adds_event_sequence_and_pending_reconciliation_indexes(
+    tmp_path,
+):
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        indexes = {
+            row[0]
+            for row in con.execute(
+                "SELECT index_name FROM duckdb_indexes() "
+                "WHERE table_name = 'harness_events'"
+            ).fetchall()
+        }
+
+    assert {
+        "harness_events_session_seq",
+        "harness_events_reconciliation_pending",
+    }.issubset(indexes)
+
+
+def test_reconciliation_pending_predicate_excludes_acknowledged_events(tmp_path):
+    registry, duckdb_path = _registry(tmp_path)
+    registry.create_session(
+        host_id="host", harness="codex", command="test", session_id="session"
+    )
+    registry.append_event(
+        session_id="session",
+        event_id="pending",
+        event_type="status",
+        payload={"turn_complete": True},
+        normalized_source="structured",
+        seq=1,
+    )
+    registry.append_event(
+        session_id="session",
+        event_id="acknowledged",
+        event_type="status",
+        payload={"turn_complete": True},
+        normalized_source="structured",
+        seq=2,
+    )
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute(
+            "UPDATE harness_events SET reconciled_at = now(), reconcile_pending = FALSE "
+            "WHERE event_id = 'acknowledged'"
+        )
+
+    assert [event.event_id for event in registry.list_events_for_reconciliation()] == [
+        "pending"
+    ]
+
+
+def test_reconciled_event_retention_keeps_recent_500_per_session(tmp_path):
+    registry, duckdb_path = _registry(tmp_path)
+    registry.create_session(
+        host_id="host", harness="codex", command="test", session_id="session"
+    )
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute("""
+            INSERT INTO harness_events (
+              event_id, session_id, event_type, payload_json, created_at, seq, reconciled_at,
+              reconcile_pending
+            )
+            SELECT 'event-' || i::VARCHAR, 'session', 'status', '{}',
+                   now() - (i || ' minutes')::INTERVAL, i,
+                   now() - (i || ' minutes')::INTERVAL, FALSE
+              FROM range(502) AS events(i)
+            """)
+
+    assert registry.prune_reconciled_events() == 2
+    with duckdb.connect(str(duckdb_path)) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM harness_events WHERE session_id = 'session'"
+            ).fetchone()[0]
+            == 500
+        )
+
+
+def test_reconciled_retention_removes_legacy_host_outbox_copies(tmp_path):
+    registry, duckdb_path = _registry(tmp_path)
+    registry.create_session(
+        host_id="host", harness="codex", command="test", session_id="session"
+    )
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute("""
+            INSERT INTO harness_events (
+              event_id, session_id, event_type, payload_json, created_at, reconciled_at,
+              reconcile_pending
+            ) VALUES ('expired', 'session', 'status', '{}', now() - INTERVAL 8 DAYS,
+                      now() - INTERVAL 8 DAYS, FALSE)
+            """)
+        con.execute(
+            "INSERT INTO harness_event_payloads (event_id, payload_json) VALUES ('expired', '{}')"
+        )
+        con.execute("INSERT INTO control_outbox_events (event_id) VALUES ('expired')")
+
+    assert registry.prune_reconciled_events() == 1
+    with duckdb.connect(str(duckdb_path)) as con:
+        assert (
+            con.execute("SELECT count(*) FROM harness_event_payloads").fetchone()[0]
+            == 0
+        )
+        assert (
+            con.execute("SELECT count(*) FROM control_outbox_events").fetchone()[0] == 0
+        )
+
+
+def test_host_registry_does_not_write_unconsumed_outbox_rows(tmp_path):
+    lake_path = tmp_path / "host.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=lake_path)
+    registry = HarnessRegistry(lake_path, write_outbox=False)
+    registry.create_session(
+        host_id="host", harness="codex", command="test", session_id="session"
+    )
+    registry.append_event(
+        session_id="session",
+        event_id="event",
+        event_type="status",
+        payload={"turn_complete": True},
+        normalized_source="structured",
+        seq=1,
+    )
+
+    with duckdb.connect(str(control_plane_path(lake_path))) as con:
+        assert (
+            con.execute("SELECT count(*) FROM harness_event_payloads").fetchone()[0]
+            == 0
+        )
+        assert (
+            con.execute("SELECT count(*) FROM control_outbox_events").fetchone()[0] == 0
+        )
+
+
 def test_unknown_session_retry_keeps_first_seen_timestamp(tmp_path):
     registry, duckdb_path = _registry(tmp_path)
 
