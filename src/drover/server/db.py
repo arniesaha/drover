@@ -1,16 +1,18 @@
 """DuckDB connection helpers for live Drover workers and diagnostics.
 
 Every in-process open of the central database must go through
-``open_duckdb_connection`` (or hold ``duckdb_connect_lock`` around a plain
-``duckdb.connect``). Two rules keep concurrent workers, drain loops, and
-diagnostics from crashing each other (issue #2):
+``open_duckdb_connection``.  The hub pins the instance with a bounded
+connect-time configuration, so a bare ``duckdb.connect`` is no longer a safe
+alternative even when held behind ``duckdb_connect_lock``. Two rules keep
+concurrent workers, drain loops, and diagnostics from crashing each other
+(issue #2):
 
 1. **One connection configuration per file.** DuckDB's in-process instance
    cache only shares a database between connections whose configs match
    exactly; a ``read_only=True`` open beside a live read-write connection
    raises "Can't open a connection to same database file with a different
-   configuration". So every connection opens read-write with no
-   ``config=``, and role settings are applied via ``SET`` afterwards.
+   configuration". So every live analytical connection uses the shared
+   bounded ``config=`` before role settings are applied via ``SET``.
 2. **Serialized connects.** Two threads calling ``duckdb.connect()`` on the
    same file at nearly the same instant race the instance cache and the
    loser raises "Binder Error: Unique file handle conflict". The connect
