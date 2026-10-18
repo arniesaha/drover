@@ -53,9 +53,9 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default` | `test_public_http_routing_contract` |
 | `test_harnessd_content_bundle_requires_configured_token_even_when_enabled` | `test_content_consent_control_is_fail_closed_without_daemon_token` |
 | `test_running_harnessd_applies_live_consent_and_revoke_without_restart` | `test_running_harnessd_applies_live_consent_and_revoke_without_restart` |
-| `test_content_consent_override_survives_restart_and_rejects_stale_enable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_unknown_epoch_is_idempotent_disabled_and_cannot_enable` | dropped: no public consent-control route is enabled by the launcher configuration, so no HTTP request can submit an unknown consent epoch |
-| `test_standalone_config_bootstrap_cannot_override_durable_revoke` | dropped: the `--config` fixture starts from an empty consent file and has no pre-launch durable-revoke seed hook |
+| `test_content_consent_override_survives_restart_and_rejects_stale_enable` | `test_content_consent_revoke_survives_process_restart` |
+| `test_unknown_epoch_is_idempotent_disabled_and_cannot_enable` | `test_epoch_zero_consent_is_idempotently_disabled_and_cannot_enable` |
+| `test_standalone_config_bootstrap_cannot_override_durable_revoke` | `test_content_consent_revoke_survives_process_restart` |
 | `test_content_consent_control_is_fail_closed_without_daemon_token` | `test_content_consent_control_is_fail_closed_without_daemon_token` |
 | `test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral` | `test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral` |
 | `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` | `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` |

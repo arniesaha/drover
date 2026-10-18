@@ -155,6 +155,28 @@ class Daemon:
     token: str
     process: subprocess.Popen
     root: Path
+    launch: list[str]
+    environment: dict[str, str]
+
+    def restart(self) -> None:
+        """Restart the shipped entry point against its existing on-disk state."""
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=10)
+        self.process = subprocess.Popen(
+            self.launch,
+            cwd=Path.cwd(),
+            env=self.environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        line = self.process.stdout.readline().strip()
+        assert line.startswith("LISTENING 127.0.0.1:"), self.process.stderr.read()
+        self.url = f"http://127.0.0.1:{int(line.rsplit(':', 1)[1])}"
 
 
 @pytest.fixture
@@ -252,16 +274,23 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
     line = process.stdout.readline().strip()
     assert line.startswith("LISTENING 127.0.0.1:"), process.stderr.read()
     port = int(line.rsplit(":", 1)[1])
-    launched = Daemon(f"http://127.0.0.1:{port}", "contract-token", process, tmp_path)
+    launched = Daemon(
+        f"http://127.0.0.1:{port}",
+        "contract-token",
+        process,
+        tmp_path,
+        launch,
+        environment,
+    )
     try:
         yield launched
     finally:
-        process.terminate()
+        launched.process.terminate()
         try:
-            process.wait(timeout=10)
+            launched.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
+            launched.process.kill()
+            launched.process.wait(timeout=10)
 
 
 def wait_until(predicate, timeout: float = 5) -> None:
