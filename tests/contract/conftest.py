@@ -19,12 +19,15 @@ from pathlib import Path
 
 import pytest
 
+from drover.server.harness.websocket import accept_key, recv_json, send_json
+
 
 @dataclass
 class FakeHub:
     server: ThreadingHTTPServer
     requests: list[dict] = field(default_factory=list)
     responses: dict[str, list[tuple[int, dict]]] = field(default_factory=dict)
+    relay_connections: list[object] = field(default_factory=list)
 
     @property
     def url(self) -> str:
@@ -33,12 +36,48 @@ class FakeHub:
     def script(self, path: str, status: int, body: dict) -> None:
         self.responses.setdefault(path, []).append((status, body))
 
+    def relay(self, timeout: float = 5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.relay_connections:
+                return self.relay_connections[-1]
+            time.sleep(0.02)
+        raise AssertionError("daemon did not establish relay websocket")
+
 
 @pytest.fixture
 def fake_hub():
     hub: FakeHub
 
     class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path != "/harness/relay":
+                self.send_error(404)
+                return
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key or self.headers.get("Authorization") != "Bearer contract-token":
+                self.send_error(401)
+                return
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept_key(key))
+            self.end_headers()
+            hub.relay_connections.append(self.connection)
+            try:
+                hello = recv_json(self.connection)
+                hub.requests.append(
+                    {
+                        "path": self.path,
+                        "body": hello,
+                        "authorization": self.headers.get("Authorization"),
+                    }
+                )
+                while True:
+                    time.sleep(0.1)
+            except Exception:
+                return
+
         def do_POST(self):  # noqa: N802
             raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             body = json.loads(raw or b"{}")
@@ -107,7 +146,7 @@ class Daemon:
 
 
 @pytest.fixture
-def daemon(tmp_path, fake_hub, fake_clis):
+def daemon(tmp_path, fake_hub, fake_clis, request):
     """Launch the selected implementation with an isolated home and store."""
     impl = os.environ.get("HARNESSD_IMPL", "py")
     if impl == "rs":
@@ -158,6 +197,7 @@ def daemon(tmp_path, fake_hub, fake_clis):
             "contract-token",
             "--central-url",
             fake_hub.url,
+            *(["--relay"] if getattr(request, "param", False) else []),
         ],
         cwd=Path.cwd(),
         env=environment,
