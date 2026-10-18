@@ -58,7 +58,8 @@ def test_production_testflight_is_manual_local_networking_and_credential_isolate
     upload_step = next(
         s
         for s in upload["steps"]
-        if s.get("name") == "Upload, wait for Apple processing and assign internal group"
+        if s.get("name")
+        == "Upload, wait for Apple processing and assign internal group"
     )
     assert upload_step["if"] == "${{ inputs.upload }}"
 

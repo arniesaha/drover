@@ -44,7 +44,9 @@ def chain(tmp_path: Path):
     (app / "embedded.mobileprovision").write_bytes(b"synthetic profile fixture")
     widget = app / "PlugIns" / "DroverWidget.appex"
     widget.mkdir(parents=True)
-    (widget / "embedded.mobileprovision").write_bytes(b"synthetic widget profile fixture")
+    (widget / "embedded.mobileprovision").write_bytes(
+        b"synthetic widget profile fixture"
+    )
     archive = tmp_path / "Drover.xcarchive"
     archived = archive / "Products" / "Applications"
     archived.mkdir(parents=True)
