@@ -17,6 +17,9 @@ dist/
 .eggs/
 *.egg
 
+# Rust
+target/
+
 # OS
 .DS_Store
 
