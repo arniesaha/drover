@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.20] - 2026-10-17
+
+### Fixed
+
+- The hub rejects `/harness/events` request bodies over 16 MiB with 413 before reading them, so one oversized replay can't balloon hub memory (a 1 GiB envelope went from 3.1 GB to 123 MB peak in the repro). The harnessd event pusher now sends byte-bounded pages (15 MiB), splits a page and retries on 413, and replaces a single event too large to send with a size-capped tombstone that keeps its `event_id` and sequence, logging a warning and counting it as undelivered (#466, #676).
+
+### Upgrade notes
+
+- No control or lake migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`). Measured real replay pages are under 2 MB, so 0.6.19 pushers stay compatible with the new hub limit. iOS changes from #672 ship in the next TestFlight build.
+
 ## [0.6.19] - 2026-10-17
 
 Supersedes 0.6.18, which was tagged but never rolled out: its strict release preflight refused control migration 20 as a lake schema change. 0.6.19 ships the 0.6.18 changes plus the classifier fix below.
