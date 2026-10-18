@@ -11,10 +11,24 @@ import duckdb
 import pytest
 
 from drover.server.db import (
+    analytical_instance_connect_config,
     open_duckdb_connection,
     startup_analytical_checkpoint,
     validate_duckdb_size,
 )
+
+
+def test_analytical_instance_config_is_bounded_before_connect(monkeypatch):
+    """No cold hub handle may first allocate DuckDB's host-sized defaults."""
+    monkeypatch.setenv("DROVER_DUCKDB_ANALYTICAL_MEMORY_LIMIT", "768MB")
+    monkeypatch.setenv("DROVER_DUCKDB_ANALYTICAL_THREADS", "8")
+    monkeypatch.setenv("DROVER_DUCKDB_ANALYTICAL_MAX_THREADS", "2")
+
+    assert analytical_instance_connect_config() == {
+        "memory_limit": "768MB",
+        "threads": "2",
+        "preserve_insertion_order": "false",
+    }
 
 
 def test_env_validation_fails_loudly_on_garbage(tmp_path, monkeypatch):

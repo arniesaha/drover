@@ -268,6 +268,22 @@ def test_analytical_pin_is_opt_in_and_can_recover_after_invalidation(
     assert not wal.exists()
 
 
+def test_analytical_pin_can_be_forced_for_an_exclusive_ducklake_hub(
+    tmp_path, monkeypatch
+):
+    """DuckLake startup owns the retired analytical file and pins it itself."""
+    probe = tmp_path / "clone-probe"
+    probe.write_bytes(b"probe")
+    if not db_module.supports_atomic_duckdb_clone(probe):
+        pytest.skip("atomic database/WAL cloning requires APFS")
+    monkeypatch.delenv("DROVER_ANALYTICAL_PIN", raising=False)
+    source = tmp_path / "analytical.duckdb"
+    try:
+        assert db_module.pin_analytical_connection(source, enabled=True) is True
+    finally:
+        db_module.close_analytical_connections()
+
+
 def test_analytical_pin_declines_without_atomic_cloning(tmp_path, monkeypatch):
     monkeypatch.setenv("DROVER_ANALYTICAL_PIN", "1")
     monkeypatch.setattr(db_module, "supports_atomic_duckdb_clone", lambda _: False)
