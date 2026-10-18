@@ -203,6 +203,11 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
         f"duckdb_path = {json.dumps(str(data / 'drover.duckdb'))}\n"
         f"worktrees_dir = {json.dumps(str(tmp_path / 'worktrees'))}\n" + advisory
     )
+    for path, status, body in options.get("hub_responses", []):
+        fake_hub.script(path, status, body)
+    if "preseed_consent" in options:
+        consent_path = config.with_name(f".{config.name}.harness-content-consent.json")
+        consent_path.write_text(json.dumps(options["preseed_consent"]) + "\n")
     bin_dir, log = fake_clis
     environment = os.environ.copy()
     environment.update(

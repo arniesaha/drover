@@ -7,7 +7,7 @@ missing public seam rather than importing daemon internals.
 | Source test | Contract test / disposition |
 | --- | --- |
 | `test_run_harnessd_closes_auth_flows_on_shutdown` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
-| `test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance` | dropped: the launcher fixture can only script `POST /harness/hosts`; direct-mode refusal needs a heartbeat response containing `relay_required` before `serve_forever`, which the fake hub does not expose |
+| `test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance` | `test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance` |
 | `test_harnessd_cli_passes_content_consent_config_to_server` | dropped: `drover-harnessd --config` exposes no endpoint that reports the parsed advisory-content object; `/advisory/content-bundle` only reports disabled consent under the current fixture |
 | `test_model_catalog_route_is_host_scoped_and_forceable` | `test_model_catalog_route_is_host_scoped_and_forceable` |
 | `test_model_catalog_service_is_created_lazily_once` | dropped: `GET /model-catalog` can establish its response and refresh semantics but cannot reveal service allocation count; observing this needs an injected catalog factory |
@@ -30,10 +30,10 @@ missing public seam rather than importing daemon internals.
 | `test_cli_harnessd_help_documents_core_options` | `test_harnessd_cli_help_documents_core_options` |
 | `test_skinny_harnessd_entrypoint_documents_core_options` | `test_skinny_harnessd_entrypoint_documents_core_options` |
 | `test_daemon_can_register_host_with_central_server` | `test_launcher_announces_bound_port_and_registers` |
-| `test_reconnecting_daemon_reconciles_revoked_consent_from_registration` | dropped: fake-hub `POST /harness/hosts` responses can be scripted, but the launcher has no fixture hook to preseed the durable consent epoch before registration |
+| `test_reconnecting_daemon_reconciles_revoked_consent_from_registration` | `test_reconnecting_daemon_reconciles_revoked_consent_from_registration` |
 | `test_relay_daemon_registers_itself_as_relay_connected` | `test_relay_hello_and_loopback_sessions_request` |
 | `test_wire_event_pusher_pushes_structured_events_to_central` | `test_structured_lifecycle_and_event_push_contract` |
-| `test_wire_event_pusher_is_noop_without_central_url_or_token` | dropped: the launcher fixture always supplies both `--central-url` and `--host-token`; proving the no-op requires a second launch topology without either value |
+| `test_wire_event_pusher_is_noop_without_central_url_or_token` | `test_wire_event_pusher_is_noop_without_central_url_or_token` |
 | `test_harnessd_health_and_capabilities` | `test_harnessd_health_and_capabilities` |
 | `test_lifecycle_worktree_inventory_is_unavailable_before_first_observation` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_lifecycle_worktree_inventory_returns_cached_snapshot_while_refresh_is_slow` | dropped: requires deterministic control of an internal dependency or timing window |
