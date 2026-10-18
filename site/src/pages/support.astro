@@ -1,0 +1,142 @@
+---
+import { Code } from 'astro:components';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { LINKS } from '../site';
+
+const themes = { light: 'vitesse-light', dark: 'vitesse-dark' } as const;
+
+const setupCheck = `drover-server setup-check --host HOST --harness HARNESS --project PROJECT`;
+const setupCheckConfig = `[setup_check]
+spawn_timeout_seconds = 20.0
+request_timeout_seconds = 5.0`;
+
+const hubDiagnostics = `drover-server status
+drover-server doctor`;
+
+const revokeCredential = `drover-server credentials list
+drover-server credentials revoke <credential-id>`;
+---
+
+<!-- Source of truth: docs/support.md in the repo root -->
+<BaseLayout
+  title="Support"
+  description="Troubleshooting pointers, connection checks, and how to get help with Drover."
+>
+  <section class="page-hero">
+    <div class="wrap">
+      <span class="eyebrow">Support</span>
+      <h1>Help and troubleshooting.</h1>
+      <p class="lede">
+        Drover is self-hosted software for one trusted operator and their coding-agent fleet. Keep credentials and private work content out of public channels.
+      </p>
+      <div class="btn-row" style="margin-top:1.5rem">
+        <a class="btn" href={LINKS.issues} rel="noopener">Open a GitHub issue</a>
+        <a class="btn ghost" href="/faq/">Read the FAQ</a>
+        <a class="btn ghost" href="/docs/getting-started/">Getting started</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-tight">
+    <div class="wrap-narrow prose">
+      <p class="muted">Source of truth: <a href={LINKS.doc('support.md')} rel="noopener">docs/support.md</a>.</p>
+
+      <h2 id="start-here">Start here</h2>
+      <ol>
+        <li>
+          Follow <a href="/docs/getting-started/">Getting started</a> to install the hub and a local harness on the first computer.
+        </li>
+        <li>
+          Build the phone app with the <a href={LINKS.file('apps/drover/README.md')} rel="noopener">iOS guide</a>, then pair it with a private server address.
+        </li>
+        <li>
+          Confirm an authenticated supported agent and readable project can complete a small task before adding another host.
+        </li>
+      </ol>
+      <p>
+        The supported network boundary is localhost, a trusted private LAN, or a private Tailscale network. Do not expose the hub directly to the public internet. See the <a href="/docs/security-privacy/">security guide</a> and <a href={LINKS.doc('multi-host.md')} rel="noopener">multi-host guide</a> for details.
+      </p>
+
+      <h2 id="pairing-and-connections">Pairing and connection problems</h2>
+      <p>
+        A pairing code is single use and expires after ten minutes. Generate a fresh one if it has expired. You can scan the QR code or use <strong>Or enter it by hand</strong> in <strong>Pair &amp; Connect</strong> when the camera is unavailable.
+      </p>
+      <p>
+        For a physical phone, the pairing address must be reachable from that phone. The first-computer setup stores the advertised address in the hub configuration; loopback works only for a simulator on the same computer. If the connection path is unclear, run the read-only check below after selecting the host, harness, and project:
+      </p>
+      <Code code={setupCheck} lang="sh" themes={themes} defaultColor={false} />
+      <p>
+        Add <code>--json</code> when you need structured local diagnostics. The check does not change services or credentials.
+      </p>
+      <p>
+        Each setup-check request starts a fresh worker. Worker startup and the hub response have independent timeouts, configurable in the existing TOML config:
+      </p>
+      <Code code={setupCheckConfig} lang="toml" themes={themes} defaultColor={false} />
+      <p>
+        These defaults apply separately to each of at most five requests; there is no shared 25-second deadline. Values must be finite positive numbers.
+      </p>
+
+      <h2 id="notifications">Notifications</h2>
+      <p>
+        Notifications require the iOS permission, a device token from Apple, and a hub that has been configured to send APNs alerts. They are best effort; an alert is not a promise of immediate background delivery. The app also refreshes its session view while it is running and through scheduled background refreshes when iOS permits them.
+      </p>
+      <p>
+        An APNs alert can show a session identifier, project directory name, harness name, and a shortened agent-response preview. Treat notification surfaces as potentially visible to others. Disable Drover notifications in iOS if that is not suitable for your work.
+      </p>
+
+      <h2 id="removing-a-phone">Removing a phone connection</h2>
+      <p>
+        Use <strong>Sign Out</strong> in the app to remove the local credential, saved server address, and local chat-recovery data. Sign Out also asks the hub to revoke this device's credential and clear its APNs registration. If the hub cannot be reached, local sign-out still completes and the app shows a warning; it retains no credential or queued retry. In that case, disable Drover notifications in iOS to stop alerts from being displayed, and have the hub operator revoke the credential to stop hub-sent alerts:
+      </p>
+      <Code code={revokeCredential} lang="sh" themes={themes} defaultColor={false} />
+      <p>
+        This is the recommended step for a lost, sold, or shared phone. The hub's session history, context data, backups, and any optional-provider data remain under the operator's control; see the <a href="/privacy/">privacy page</a> for details.
+      </p>
+
+      <h2 id="before-opening-an-issue">Before opening a public issue</h2>
+      <p>Check the hub first:</p>
+      <Code code={hubDiagnostics} lang="sh" themes={themes} defaultColor={false} />
+      <p>
+        If the hub reports an issue, check the <a href="/faq/">FAQ</a> and the <a href="/docs/operations/">operations guide</a>.
+      </p>
+
+      <h2 id="reporting-an-issue">How to get help</h2>
+      <p>
+        When opening an issue on GitHub, include:
+      </p>
+      <ul>
+        <li>
+          <strong>Drover hub version:</strong> run <code>drover-server --version</code>.
+        </li>
+        <li>
+          <strong>iOS app version:</strong> in the app, see <strong>Settings</strong> or the build info on the pairing screen. Also include your iOS version and device model.
+        </li>
+        <li>
+          <strong>Network environment:</strong> indicate whether the phone and hub are on localhost, a private LAN, or a private Tailscale network.
+        </li>
+        <li>
+          <strong>Harness and model:</strong> which agent harness (Claude Code, Codex, Antigravity, DeepSeek) was running.
+        </li>
+        <li>
+          <strong>Behavior:</strong> expected behavior, observed behavior, and minimal steps to reproduce.
+        </li>
+      </ul>
+      <div class="callout warn">
+        <strong>Sanitize before posting:</strong> Remove bearer tokens, pairing codes, private hostnames or addresses, internal logs, prompts, terminal output, and screenshots containing private work content.
+      </div>
+      <p>
+        File non-sensitive bugs and feature requests in the{' '}
+        <a href={LINKS.issues} rel="noopener">public issue tracker on GitHub</a>.
+      </p>
+      <p>
+        <em>Note on email:</em> Drover does not operate a public support email inbox. All community support and bug tracking occur on GitHub issues. For sensitive security vulnerabilities, do not use public issues; follow the private reporting instructions in{' '}
+        <a href={LINKS.securityPolicy} rel="noopener">SECURITY.md</a>.
+      </p>
+
+      <h2 id="current-scope">Current scope</h2>
+      <p>
+        Drover is designed for a trusted personal fleet. It does not provide a hosted control plane, multi-user isolation, RBAC, or SSO. Optional context, model, and archive integrations are configured by the hub operator and can have their own service terms and support channels.
+      </p>
+    </div>
+  </section>
+</BaseLayout>
