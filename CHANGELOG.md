@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-10-18
+
+### Fixed
+
+- harnessd startup no longer does unbounded control registry work: startup is bounded, acked events are pruned (7 days / 500 per session), hosts run with `write_outbox=False`, and the loopback timeout is 120s. Control migration 21 adds `harness_events.reconcile_pending` plus two indexes (#690 phase 0, #696).
+- iOS store builds tighten App Transport Security: arbitrary loads are removed from Release/StoreRelease (local networking stays allowed); plain-http FQDN hub URLs get a re-pair prompt explaining HTTPS, and the pairing QR prefers the Tailscale or LAN IP (#684 phase 1, #687).
+
+### Added
+
+- iOS home screen: stable session ordering, host and project filters, and a bird's-eye fleet overview matrix that filters on tap (#688).
+- iOS offline demo mode for App Store review: an in-process demo hub with fictional data; saved config and Keychain token are left untouched (#683, #692).
+- iOS home-screen widget (small and medium) for account quotas and active fleet hosts, fed by an App Group snapshot with an optional fresh hub fetch (#695).
+- drover.fyi `/how-it-works` and `/quickstart` pages (Claude Code, Codex, OpenClaw, Hermes) and a Stories section (#694).
+
+### Upgrade notes
+
+- Control migration 21 (additive DDL plus a one-time `reconcile_pending` backfill over `harness_events`, atomic with the migration). Time the backfill against the real control DB before the hub flip. No lake migration. Upgrade the hub and the Studio, NAS and GPU PC harnessd hosts (NAS keeps `--relay`). iOS changes ship in the next TestFlight build; the widget needs its provisioning profile.
+
 ## [0.6.21] - 2026-10-17
 
 ### Fixed
