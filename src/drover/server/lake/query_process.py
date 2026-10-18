@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,79 @@ def _rss(pid: int) -> int:
         raise LakeError("analytics_rss_monitor_unavailable") from None
 
 
+class _SpawnedQueryProcess:
+    """The small ``Popen`` surface the disposable-reader supervisor needs.
+
+    ``subprocess.Popen`` is permitted to take its fork/exec path on macOS even
+    when its arguments look suitable for ``posix_spawn``.  Forking a large,
+    long-lived hub transiently charges copy-on-write allocator pages to the
+    hub's physical-footprint high-water mark.  Use ``posix_spawn`` directly so
+    a reader launch can never copy the hub address space.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+
+    @staticmethod
+    def _returncode(status: int) -> int:
+        if os.WIFEXITED(status):
+            return os.WEXITSTATUS(status)
+        if os.WIFSIGNALED(status):
+            return -os.WTERMSIG(status)
+        return status
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            return self.returncode
+        if pid:
+            self.returncode = self._returncode(status)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.returncode is None:
+            self.poll()
+            if self.returncode is not None:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(["disposable-query"], timeout)
+            time.sleep(0.005)
+        return self.returncode
+
+    def kill(self) -> None:
+        os.kill(self.pid, signal.SIGKILL)
+
+
+def _spawn_disposable_query(
+    command: list[str], *, environment: dict[str, str] | None, output
+) -> _SpawnedQueryProcess:
+    """Exec a query child without ever forking the hub process.
+
+    The worker receives only absolute paths and does not need a changed
+    working directory.  New descriptors are non-inheritable (PEP 446); stdout
+    is the bounded temporary file and stderr is deliberately discarded.
+    """
+
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        actions = [
+            (os.POSIX_SPAWN_DUP2, output.fileno(), 1),
+            (os.POSIX_SPAWN_DUP2, devnull, 2),
+        ]
+        env = os.environ if environment is None else environment
+        spawn = os.posix_spawn if os.path.sep in command[0] else os.posix_spawnp
+        return _SpawnedQueryProcess(
+            spawn(command[0], command, env, file_actions=actions)
+        )
+    finally:
+        os.close(devnull)
+
+
 def run_disposable(
     command: list[str],
     *,
@@ -76,14 +150,10 @@ def run_disposable(
         # File-backed stdout avoids a pipe deadlock. Growth is checked each
         # sample; successful results are never read beyond the hard byte cap.
         with tempfile.TemporaryFile() as output:
-            child = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=env,
-                stdout=output,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            # ``cwd`` is intentionally not passed through: each caller gives
+            # the child absolute request/scratch paths.  Changing it would
+            # force subprocess' fork path, defeating the hub-footprint guard.
+            child = _spawn_disposable_query(command, environment=env, output=output)
             from drover.server.process_memory import memory_guard
 
             guard = memory_guard()
@@ -137,10 +207,8 @@ def run_disposable(
                 }
             finally:
                 if child.poll() is None:
-                    import signal
-
                     try:
-                        os.killpg(child.pid, signal.SIGKILL)
+                        child.kill()
                     except ProcessLookupError:
                         pass
                     except PermissionError:

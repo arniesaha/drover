@@ -36,6 +36,7 @@ from drover.server.analytics_boundary import (
     analytics_request_lane,
 )
 from drover.server.db import (
+    AnalyticalStoreBusy,
     AnalyticalStoreUnavailable,
     analytical_store_health,
     control_plane_checkpoint_health,
@@ -1042,6 +1043,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 dispatch()
         except AnalyticalStoreUnavailable:
             self._send_analytical_unavailable()
+        except AnalyticalStoreBusy:
+            self._send_analytical_busy()
         except HarnessRenderBusy:
             self._send(
                 503,
@@ -3428,6 +3431,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             extra_headers={"Retry-After": "1"},
         )
 
+    def _send_analytical_busy(self) -> None:
+        """Make bounded analytical admission visible instead of dropping HTTP."""
+        self._send(
+            503,
+            "application/json",
+            '{"error":"analytical_store_busy","detail":"analytical connect lock is busy"}\n',
+            extra_headers={"Retry-After": "1"},
+        )
+
     def _send(
         self,
         status: int,
@@ -3657,6 +3669,12 @@ def analytics_boundary_dispatcher(
         except AnalyticalStoreUnavailable:
             return response(
                 503, "application/json", '{"error":"analytical_store_unavailable"}\n'
+            )
+        except AnalyticalStoreBusy:
+            return response(
+                503,
+                "application/json",
+                '{"error":"analytical_store_busy","detail":"analytical connect lock is busy"}\n',
             )
         finally:
             if lane == "heavy":
