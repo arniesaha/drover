@@ -15,6 +15,11 @@ final class PairingModel: ObservableObject {
     @Published var statusMessage: String?
     @Published var statusIsError = false
     @Published var isPairing = false
+    @Published private(set) var requiresHTTPSRePairing = false
+
+    static let transportGuideURL = URL(
+        string: "https://github.com/arniesaha/drover/blob/main/docs/getting-started.md#remote-tailscale-https"
+    )!
 
     init(serverURLString: String = "") {
         self.serverURLString = serverURLString
@@ -23,6 +28,26 @@ final class PairingModel: ObservableObject {
     func prefill(_ payload: PairingPayload) {
         serverURLString = payload.serverURL.absoluteString
         manualCode = payload.code
+        _ = allowsPairing(payload)
+    }
+
+    /// Reject before redeeming a single-use pairing code. Waiting for ATS to
+    /// reject the network request would burn the code and leave no actionable
+    /// recovery path.
+    func allowsPairing(_ payload: PairingPayload) -> Bool {
+        let requiresHTTPS = ServerConfig(urlString: payload.serverURL.absoluteString)?
+            .requiresHTTPSForAppTransportSecurity == true
+        requiresHTTPSRePairing = requiresHTTPS
+        if requiresHTTPS {
+            statusMessage = ServerConfig.httpsRePairMessage
+            statusIsError = true
+            return false
+        }
+        if statusMessage == ServerConfig.httpsRePairMessage {
+            statusMessage = nil
+            statusIsError = false
+        }
+        return true
     }
 
     var canSubmitManualCode: Bool {
@@ -71,6 +96,7 @@ struct PairingView: View {
                     QRScannerView { scanned in
                         guard !model.isPairing, let payload = PairingPayload(scanned: scanned) else { return }
                         model.prefill(payload)
+                        guard model.allowsPairing(payload) else { return }
                         pendingPayload = payload
                         showPairConfirmation = true
                     }
@@ -102,28 +128,58 @@ struct PairingView: View {
                 if let statusMessage = model.statusMessage {
                     statusRow(statusMessage)
                 }
+                if model.requiresHTTPSRePairing {
+                    Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.accentHi)
+                }
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 14)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            Button {
-                guard let payload = model.manualPayload() else { return }
-                pendingPayload = payload
-                showPairConfirmation = true
-            } label: {
-                Text(model.isPairing ? "Pairing..." : "Pair")
-                    .droverText(.h3)
+            VStack(spacing: 8) {
+                Button {
+                    guard let payload = model.manualPayload() else { return }
+                    guard model.allowsPairing(payload) else { return }
+                    pendingPayload = payload
+                    showPairConfirmation = true
+                } label: {
+                    Text(model.isPairing ? "Pairing..." : "Pair")
+                        .droverText(.h3)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .disabled(!model.canSubmitManualCode || model.isPairing)
+                .foregroundStyle(DroverColor.accentHi)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+                }
+                .accessibilityIdentifier("pairing-submit")
+
+                Button {
+                    environment.enterDemoMode()
+                    dismiss()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("Try a demo — no computer needed")
+                            .font(.system(.subheadline, design: .default, weight: .medium))
+                    }
+                    .foregroundStyle(DroverColor.accentHi)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 11)
+                    .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(DroverColor.line, lineWidth: 1)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("pairing-view-try-demo-button")
             }
-            .disabled(!model.canSubmitManualCode || model.isPairing)
-            .foregroundStyle(DroverColor.accentHi)
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(DroverColor.accentHi, lineWidth: 1)
-            }
-            .accessibilityIdentifier("pairing-submit")
             .padding(.horizontal, 18)
             .padding(.vertical, 10)
             .background(DroverColor.bg)
@@ -202,6 +258,7 @@ struct PairingView: View {
 
     private func pair(_ payload: PairingPayload) async {
         guard !model.isPairing else { return }
+        guard model.allowsPairing(payload) else { return }
         model.isPairing = true
         model.statusMessage = "Pairing..."
         model.statusIsError = false

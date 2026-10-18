@@ -119,9 +119,9 @@ public struct PairResponse: Decodable, Sendable, Equatable {
 
 // MARK: - DroverClient
 
-/// Talks to the central Drover server's harness REST API over plain HTTP
-/// (encrypted at the WireGuard/Tailscale hop, not at this layer — see
-/// `NSAllowsArbitraryLoads` in the app's Info.plist).
+/// Talks to the central Drover server's harness REST API. Store builds allow
+/// plain HTTP only for local-networking ATS host classes; named remote hubs
+/// must use HTTPS (see `ServerConfig.requiresHTTPSForAppTransportSecurity`).
 public actor DroverClient {
     private static let cockpitRequestTimeout: TimeInterval = 60
     /// Completion runs while someone types and uses the hub's short budget.
@@ -132,6 +132,7 @@ public actor DroverClient {
     /// Foreground-only recovery scope. A client without a verified binding can
     /// still make normal authenticated requests, but cannot restore chat data.
     public nonisolated let credentialBindingID: UUID?
+    public nonisolated let webSocketConnector: (any WebSocketConnecting)?
     private let token: String
     private let session: URLSession
     private let retryGate: HubRetryGate
@@ -141,13 +142,15 @@ public actor DroverClient {
         token: String,
         credentialBindingID: UUID? = nil,
         session: URLSession = .shared,
-        retryGate: HubRetryGate = .shared
+        retryGate: HubRetryGate = .shared,
+        webSocketConnector: (any WebSocketConnecting)? = nil
     ) {
         self.config = config
         self.credentialBindingID = credentialBindingID
         self.token = token
         self.session = session
         self.retryGate = retryGate
+        self.webSocketConnector = webSocketConnector
     }
 
     // MARK: Pairing

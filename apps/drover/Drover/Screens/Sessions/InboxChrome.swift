@@ -14,6 +14,7 @@ import SwiftUI
 /// squares rather than bare glyphs — at this size the outline is what makes
 /// them read as controls on either ground.
 struct InboxChromeRow: View {
+    var isDemoMode: Bool = false
     let onToggleTheme: () -> Void
     let onOpenSettings: () -> Void
 
@@ -27,6 +28,16 @@ struct InboxChromeRow: View {
                 .textCase(.uppercase)
                 .foregroundStyle(DroverColor.faint)
                 .accessibilityIdentifier("drover-wordmark")
+
+            if isDemoMode {
+                Text("DEMO")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.orange))
+                    .accessibilityIdentifier("demo-badge")
+            }
 
             Spacer(minLength: 8)
 

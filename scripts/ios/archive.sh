@@ -140,11 +140,9 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 CHANNEL_SETTINGS=()
-CHANNEL_VERIFY_ARGS=()
+CHANNEL_VERIFY_ARGS=(--expected-local-networking)
 case "$CHANNEL" in
   testflight-production)
-    CHANNEL_SETTINGS=("DROVER_ALLOW_ARBITRARY_LOADS=YES")
-    CHANNEL_VERIFY_ARGS=(--expected-unrestricted-hubs)
     ;;
   distribution)
     ;;

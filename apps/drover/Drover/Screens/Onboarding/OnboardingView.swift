@@ -38,6 +38,17 @@ struct OnboardingView: View {
                     .padding()
                     .accessibilityIdentifier("sign-out-revocation-warning")
             }
+            if environment.rePairRequiredURL != nil {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(ServerConfig.httpsRePairMessage)
+                    Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                }
+                .font(.subheadline)
+                .foregroundStyle(DroverColor.warn)
+                .padding(.horizontal, 18)
+                .padding(.bottom, 8)
+                .accessibilityIdentifier("stored-hub-repair-required")
+            }
 
             TabView(selection: $step) {
                 welcomeStep
@@ -180,6 +191,27 @@ struct OnboardingView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("onboarding-already-have-server-button")
+
+                    Button {
+                        environment.enterDemoMode()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text("Try a demo — no computer needed")
+                                .font(.system(.subheadline, design: .default, weight: .medium))
+                        }
+                        .foregroundStyle(DroverColor.accentHi)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 13)
+                        .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(DroverColor.line, lineWidth: 1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("onboarding-try-demo-button")
                 }
             }
             .padding(.horizontal, 20)
@@ -266,28 +298,56 @@ struct OnboardingView: View {
                 if let statusMessage = pairingModel.statusMessage {
                     statusRow(statusMessage)
                 }
+                if pairingModel.requiresHTTPSRePairing {
+                    Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.accentHi)
+                }
             }
             .padding(.horizontal, 18)
             .padding(.top, 10)
             .padding(.bottom, 28)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            Button {
-                guard let payload = pairingModel.manualPayload() else { return }
-                Task { await pair(payload) }
-            } label: {
-                Text(pairingModel.isPairing ? "Pairing..." : "Pair")
-                    .droverText(.h3)
+            VStack(spacing: 8) {
+                Button {
+                    guard let payload = pairingModel.manualPayload() else { return }
+                    Task { await pair(payload) }
+                } label: {
+                    Text(pairingModel.isPairing ? "Pairing..." : "Pair")
+                        .droverText(.h3)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .disabled(!pairingModel.canSubmitManualCode || pairingModel.isPairing)
+                .foregroundStyle(DroverColor.accentHi)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+                }
+                .accessibilityIdentifier("onboarding-pair-submit-button")
+
+                Button {
+                    environment.enterDemoMode()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("Try a demo — no computer needed")
+                            .font(.system(.subheadline, design: .default, weight: .medium))
+                    }
+                    .foregroundStyle(DroverColor.accentHi)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 11)
+                    .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(DroverColor.line, lineWidth: 1)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("pairing-try-demo-button")
             }
-            .disabled(!pairingModel.canSubmitManualCode || pairingModel.isPairing)
-            .foregroundStyle(DroverColor.accentHi)
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(DroverColor.accentHi, lineWidth: 1)
-            }
-            .accessibilityIdentifier("onboarding-pair-submit-button")
             .padding(.horizontal, 18)
             .padding(.vertical, 10)
             .background(DroverColor.bg)
@@ -338,6 +398,7 @@ struct OnboardingView: View {
 
     private func pair(_ payload: PairingPayload) async {
         guard !pairingModel.isPairing else { return }
+        guard pairingModel.allowsPairing(payload) else { return }
         pairingModel.isPairing = true
         pairingModel.statusMessage = "Pairing..."
         pairingModel.statusIsError = false

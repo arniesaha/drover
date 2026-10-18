@@ -1,5 +1,17 @@
 import Foundation
 
+/// The host classes ATS permits for plain HTTP when
+/// `NSAllowsLocalNetworking` is enabled. Keep this separate from reachability:
+/// a Tailscale DNS name can be reachable, but a fully-qualified name still
+/// needs HTTPS under the Store build's ATS policy.
+public enum HTTPHostClassification: Sendable, Equatable {
+    case ipAddress
+    case tailscaleIP
+    case localDomain
+    case singleLabel
+    case fullyQualifiedDomain
+}
+
 /// The central server's base URL, persisted in `UserDefaults` (not sensitive —
 /// the bearer token lives in the Keychain via `TokenStore`, never here).
 public struct ServerConfig: Sendable, Equatable {
@@ -30,6 +42,43 @@ public struct ServerConfig: Sendable, Equatable {
     /// The host part if `baseURL` is a Tailscale address, else `nil`.
     public var tailscaleHost: String? {
         isTailscaleAddress ? baseURL.host : nil
+    }
+
+    /// Host category used to decide whether a plain-HTTP endpoint remains
+    /// valid in the Release and StoreRelease ATS policy.
+    public var httpHostClassification: HTTPHostClassification? {
+        guard let host = baseURL.host else { return nil }
+        return Self.classifyHTTPHost(host)
+    }
+
+    /// Store builds intentionally permit HTTP only for IP literals,
+    /// unqualified names, and `.local` names. A named remote endpoint must use
+    /// HTTPS so ATS can validate its transport.
+    public var requiresHTTPSForAppTransportSecurity: Bool {
+        baseURL.scheme?.lowercased() == "http"
+            && httpHostClassification == .fullyQualifiedDomain
+    }
+
+    /// User-facing copy shared by QR/manual pairing and saved-config recovery.
+    public static let httpsRePairMessage = "This hub uses plain HTTP on a named address. Re-pair with its Tailscale or LAN IP, or enable HTTPS with Tailscale Serve."
+
+    public static func classifyHTTPHost(_ host: String) -> HTTPHostClassification {
+        let cleaned = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        let lower = cleaned.lowercased()
+        if isTailscaleIPv4(lower) {
+            return .tailscaleIP
+        }
+        if isIPv4(lower) || lower.contains(":") {
+            return .ipAddress
+        }
+        if lower.hasSuffix(".local") {
+            return .localDomain
+        }
+        if !lower.contains(".") {
+            return .singleLabel
+        }
+        return .fullyQualifiedDomain
     }
 
     /// Detects if a host string is a Tailscale IPv4 address (CGNAT 100.64.0.0/10)
@@ -84,6 +133,11 @@ public struct ServerConfig: Sendable, Equatable {
             return false
         }
         return octet0 == 100 && (64...127).contains(octet1)
+    }
+
+    private static func isIPv4(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count == 4 && parts.allSatisfy { UInt8($0) != nil }
     }
 
     public static let defaultsKey = "drover.server.url"

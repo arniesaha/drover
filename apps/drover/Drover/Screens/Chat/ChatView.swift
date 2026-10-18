@@ -42,8 +42,9 @@ struct ChatHeaderContent: View {
 /// composer. Interrupt/terminate live in the toolbar. All state and network
 /// calls are delegated to `ChatModel` — this view only renders it.
 struct ChatView: View {
-    private let client: DroverClient
+    private let client: DroverClient?
     private let sessionID: String
+    private let isDemoMode: Bool
     private let recoveryStore: (any ChatRecoveryPersisting)?
     private let recoveryWriteGate: ChatRecoveryWriteGate
     private let recoveryGeneration: Int
@@ -74,34 +75,42 @@ struct ChatView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     init(
-        client: DroverClient,
+        client: DroverClient? = nil,
         sessionID: String,
         harness: String? = nil,
         recap: String? = nil,
         recapSourceSeq: Int? = nil,
-        recoveryStore: (any ChatRecoveryPersisting)?,
-        recoveryWriteGate: ChatRecoveryWriteGate,
-        recoveryGeneration: Int,
+        recoveryStore: (any ChatRecoveryPersisting)? = nil,
+        recoveryWriteGate: ChatRecoveryWriteGate = ChatRecoveryWriteGate(),
+        recoveryGeneration: Int = 0,
         chatModelFactory: ChatModelFactory? = nil,
-        onSessionEnded: ((String, Bool) -> Void)? = nil
+        onSessionEnded: ((String, Bool) -> Void)? = nil,
+        isDemoMode: Bool = false
     ) {
         self.client = client
         self.sessionID = sessionID
+        self.isDemoMode = isDemoMode
         self.recoveryStore = recoveryStore
         self.recoveryWriteGate = recoveryWriteGate
         self.recoveryGeneration = recoveryGeneration
         self.chatModelFactory = chatModelFactory
         self.onSessionEnded = onSessionEnded
-        _model = State(initialValue: chatModelFactory?(client, sessionID, harness) ?? ChatModel(
-            client: client,
-            sessionID: sessionID,
-            harness: harness,
-            recap: recap,
-            recapSourceSeq: recapSourceSeq,
-            recoveryStore: recoveryStore,
-            recoveryWriteGate: recoveryWriteGate,
-            recoveryGeneration: recoveryGeneration
-        ))
+        if isDemoMode {
+            _model = State(initialValue: ChatModel.makeDemo(sessionID: sessionID, harness: harness, recap: recap))
+        } else if let client {
+            _model = State(initialValue: chatModelFactory?(client, sessionID, harness) ?? ChatModel(
+                client: client,
+                sessionID: sessionID,
+                harness: harness,
+                recap: recap,
+                recapSourceSeq: recapSourceSeq,
+                recoveryStore: recoveryStore,
+                recoveryWriteGate: recoveryWriteGate,
+                recoveryGeneration: recoveryGeneration
+            ))
+        } else {
+            fatalError("ChatView requires a client unless isDemoMode is true")
+        }
     }
 
     var body: some View {
@@ -111,7 +120,7 @@ struct ChatView: View {
             // Only once a connection has existed is a disconnect worth a
             // "Reconnecting…" pill; during the initial connect it would just
             // flash misleading chrome.
-            if !model.isEnded && model.hasConnectedOnce && !model.isConnected {
+            if !model.isDemoMode && !model.isEnded && model.hasConnectedOnce && !model.isConnected {
                 ReconnectingPill(accessibilityID: "chat-reconnecting")
             }
 
@@ -347,17 +356,20 @@ struct ChatView: View {
         .navigationDestination(item: $handoffSession) { handoff in
             if handoff.isStructured {
                 ChatView(
-                    client: client,
+                    client: isDemoMode ? nil : client,
                     sessionID: handoff.id,
                     harness: handoff.harness,
                     recoveryStore: recoveryStore,
                     recoveryWriteGate: recoveryWriteGate,
                     recoveryGeneration: recoveryGeneration,
                     chatModelFactory: chatModelFactory,
-                    onSessionEnded: onSessionEnded
+                    onSessionEnded: onSessionEnded,
+                    isDemoMode: isDemoMode
                 )
             } else {
-                TerminalScreen(client: client, sessionID: handoff.id, harness: handoff.harness)
+                if let client {
+                    TerminalScreen(client: client, sessionID: handoff.id, harness: handoff.harness)
+                }
             }
         }
     }
@@ -678,13 +690,20 @@ struct ChatView: View {
     }
 
     private var showsFloatingActivity: Bool {
-        model.isStopping || (model.hasConnectedOnce && model.isConnected
+        model.isStopping || (!model.isDemoMode && model.hasConnectedOnce && model.isConnected
             && model.pendingTurn == nil && model.pendingApproval == nil
             && model.activity.isActive)
     }
 
     private var showsInlineActivity: Bool {
-        model.hasConnectedOnce && !showsFloatingActivity
+        guard !model.isDemoMode else {
+            return !showsFloatingActivity
+                && model.pendingTurn == nil && model.pendingApproval == nil
+                && model.activity.phase != .ready
+                && model.activity.phase != .reconnecting
+                && model.activity.phase != .connecting
+        }
+        return model.hasConnectedOnce && !showsFloatingActivity
             && model.pendingTurn == nil && model.pendingApproval == nil
             && model.activity.phase != .ready
     }

@@ -9,7 +9,9 @@ import yaml
 WORKFLOWS_DIR = Path(__file__).parents[1] / ".github" / "workflows"
 
 
-def test_production_testflight_is_manual_unrestricted_and_credential_isolated() -> None:
+def test_production_testflight_is_manual_local_networking_and_credential_isolated() -> (
+    None
+):
     path = WORKFLOWS_DIR / "ios-testflight-production.yml"
     assert path.exists(), "production TestFlight workflow is missing"
     workflow = load_workflow(path.name)
@@ -33,7 +35,8 @@ def test_production_testflight_is_manual_unrestricted_and_credential_isolated() 
     assert "preflight" not in str(workflow).lower()
     commands = "\n".join(step.get("run", "") for step in upload["steps"])
     assert "--channel testflight-production" in commands
-    assert "--unrestricted-hubs" in commands
+    # archive.sh/export_ipa.sh enforce the Store local-networking ATS posture.
+    assert "--unrestricted-hubs" not in commands
     assert "--staging-url" not in commands
     for script in (
         "setup_distribution_signing.sh",
