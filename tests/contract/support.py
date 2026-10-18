@@ -39,10 +39,12 @@ class FakeHub:
     def relay(self, timeout: float = 5):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.relay_connections:
+            if self.relay_connections and any(
+                item["path"] == "/harness/relay" for item in self.requests
+            ):
                 return self.relay_connections[-1]
             time.sleep(0.02)
-        raise AssertionError("daemon did not establish relay websocket")
+        raise AssertionError("daemon did not send relay hello")
 
 
 @pytest.fixture
