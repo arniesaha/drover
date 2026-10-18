@@ -47,6 +47,7 @@ final class AppEnvironment {
     /// Keep its credentials intact until the user completes a replacement
     /// pairing, but do not construct a client that would only fail at ATS.
     private(set) var rePairRequiredURL: URL?
+    private(set) var isDemoMode: Bool = false
 
     /// Bumped on every successful `configure()` so views that hold a
     /// `SessionStore` built from `client` can force-recreate it (SwiftUI
@@ -421,6 +422,47 @@ final class AppEnvironment {
         pendingCleanupBindingIDs.removeAll()
         hasPendingLocalCleanup = false
         recoveryStatusMessage = nil
+    }
+
+    // MARK: - Demo Mode
+
+    func enterDemoMode() {
+        guard !isDemoMode else { return }
+        DemoHub.shared.reset()
+        isDemoMode = true
+        config = ServerConfig(urlString: DemoHubData.syntheticURLString)
+        client = DemoHub.shared.makeClient()
+        generation += 1
+    }
+
+    func exitDemoMode() {
+        guard isDemoMode else { return }
+        isDemoMode = false
+        DemoHub.shared.reset()
+        let savedConfig = ServerConfig.load(defaults: defaults)
+        let savedToken = tokenStore.load()
+        let startupBindingID: UUID?
+        if let savedConfig, let savedToken {
+            startupBindingID = try? recoveryBindingStore.binding(
+                forToken: savedToken,
+                serverURL: savedConfig.baseURL,
+                rotate: false
+            )
+        } else {
+            startupBindingID = nil
+        }
+        if let built = ClientFactory.make(
+            defaults: defaults,
+            tokenStore: tokenStore,
+            credentialBindingID: startupBindingID
+        ) {
+            client = built.client
+            config = built.config
+        } else {
+            client = nil
+            config = nil
+        }
+        generation += 1
     }
 
     private static func defaultRecoveryStore() -> (any ChatRecoveryPersisting)? {
