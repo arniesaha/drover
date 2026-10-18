@@ -127,6 +127,7 @@ def _fake_cli(path: Path, fixture: Path, log: Path) -> None:
         "  method = request['method']\n"
         "  result = {'userAgent': 'contract'}\n"
         "  if method == 'account/read': result = {'account': {'email': 'contract@example.com', 'planType': 'plus'}}\n"
+        "  if method == 'account/rateLimits/read': result = {'rateLimits': {'primary': {'usedPercent': 25}}}\n"
         "  if method == 'model/list': result = {'data': [{'id': 'contract-model', 'displayName': 'Contract model', 'isDefault': True, 'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}], 'defaultReasoningEffort': 'low'}], 'nextCursor': None}\n"
         "  print(json.dumps({'id': request['id'], 'result': result}), flush=True)\n"
         "  continue\n"

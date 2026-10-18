@@ -44,12 +44,12 @@ missing public seam rather than importing daemon internals.
 | `test_provider_usage_hung_probe_does_not_block_other_providers` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_provider_usage_probe_slower_than_old_bound_completes_with_new_bound` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_provider_usage_does_not_reenter_hung_probe_and_publishes_late_success` | dropped: requires deterministic control of an internal dependency or timing window |
-| `test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts` | `test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts` |
 | `test_harnessd_provider_usage_uses_configured_agy_probe` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_provider_usage_reports_claude_windows` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_provider_usage_reports_codex_cli_not_found` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` |
+| `test_harnessd_provider_usage_reports_codex_cli_not_found` | `test_harnessd_provider_usage_reports_codex_cli_not_found_is_never_silent` |
 | `test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default` | `test_auth_and_top_level_error_envelopes` |
 | `test_harnessd_content_bundle_requires_configured_token_even_when_enabled` | dropped: the launcher always passes `--host-token`; a no-token fixture is needed to exercise `/advisory/content-bundle` after enabling consent |
 | `test_running_harnessd_applies_live_consent_and_revoke_without_restart` | dropped: requires pre-seeding or faulting durable daemon state before startup |
@@ -103,7 +103,7 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_recovery_rejects_generic_errored_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_can_terminate_restart_lost_structured_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_terminates_live_session_and_updates_registry` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_delete_terminates_live_session` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_delete_terminates_live_session` | `test_public_session_mutation_contract` |
 | `test_harnessd_sessions_cors_preflight_and_post_headers` | `test_harnessd_sessions_cors_preflight_and_post_headers` |
 | `test_harnessd_creates_in_memory_session_when_registry_is_locked` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_rejects_disabled_harness` | `test_public_route_validation` |
@@ -112,9 +112,9 @@ missing public seam rather than importing daemon internals.
 | `test_daemon_accepts_bearer` | `test_auth_and_top_level_error_envelopes` |
 | `test_daemon_healthz_open` | `test_launcher_announces_bound_port_and_registers` |
 | `test_daemon_terminal_attach_rejects_unauthenticated` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_structured_session_full_lifecycle` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_structured_session_inventory_includes_run_preferences` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_claude_turn_cannot_change_persistent_session_preferences` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_structured_session_full_lifecycle` | `test_public_session_mutation_contract` |
+| `test_structured_session_inventory_includes_run_preferences` | `test_public_session_mutation_contract` |
+| `test_claude_turn_cannot_change_persistent_session_preferences` | `test_model_preference_validation_discards_claude_turn_overrides` |
 | `test_structured_turn_appends_user_input_and_seq_is_monotonic` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_initial_prompt_with_image_saves_file_and_records_attachment` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_structured_command_preferences_map_to_cli_flags` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
@@ -128,23 +128,23 @@ missing public seam rather than importing daemon internals.
 | `test_structured_launch_rejects_unknown_worktree_policy` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_structured_permission_without_approval_channel_returns_400` | `test_unknown_session_errors_are_wire_stable` |
 | `test_structured_interrupt_unknown_session_is_404` | `test_unknown_session_errors_are_wire_stable` |
-| `test_structured_terminate_closes_driver_and_marks_terminated` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_structured_terminate_closes_driver_and_marks_terminated` | `test_public_session_mutation_contract` |
 | `test_structured_codex_session_runs_in_worktree` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_structured_codex_session_non_git_cwd_runs_in_place` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_structured_claude_session_stays_in_place` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_structured_session_rejects_ask_permission_mode` | `test_structured_launch_validation_contract` |
-| `test_structured_session_stores_default_permission_mode` | `test_structured_lifecycle_and_event_push_contract` |
-| `test_structured_session_stores_explicit_auto_permission_mode` | `test_structured_lifecycle_and_event_push_contract` |
+| `test_structured_session_stores_default_permission_mode` | `test_public_session_mutation_contract` |
+| `test_structured_session_stores_explicit_auto_permission_mode` | `test_public_session_mutation_contract` |
 | `test_structured_session_rejects_unknown_permission_mode` | `test_structured_launch_validation_contract` |
 | `test_harnessd_routes_typed_code_into_a_pty_login_flow` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_harnessd_refuses_to_start_a_terminal_only_sign_in` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_every_offered_preset_can_actually_be_driven` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_observe_only_sources_are_never_drive_targets` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_a_repeated_handoff_create_returns_the_session_it_already_made` | `test_handoff_source_is_idempotent_but_parent_is_not` |
-| `test_a_handoff_from_a_different_source_still_creates_its_own_session` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_delegated_children_of_one_parent_are_separate_sessions` | `test_handoff_source_is_idempotent_but_parent_is_not` |
+| `test_a_handoff_from_a_different_source_still_creates_its_own_session` | `test_public_session_mutation_contract` |
+| `test_delegated_children_of_one_parent_are_separate_sessions` | `test_public_session_mutation_contract` |
 | `test_a_repeat_create_with_a_client_key_does_not_spawn_a_second_session` | `test_client_session_key_is_idempotent` |
-| `test_structured_create_retry_with_ios_client_key_returns_one_session` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_structured_create_retry_with_ios_client_key_returns_one_session` | `test_public_session_mutation_contract` |
 | `test_creates_without_a_client_key_are_still_independent` | `test_unkeyed_creates_are_distinct` |
 | `test_create_session_answers_400_when_the_staging_key_is_unusable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_recover_answers_409_when_the_staging_key_is_unusable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
