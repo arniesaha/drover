@@ -1,9 +1,10 @@
 # Point-release rollout
 
-Use this path for a release with unchanged control migrations, lake schema and
-analytical runtime. A patch version number alone does not establish compatibility.
-This runbook describes operator actions; the preflight itself changes no service,
-runtime symlink, config, lake catalog or database.
+Use this path for a release with unchanged lake schema and analytical runtime.
+It also admits a strictly appended control-DB migration only when every new SQL
+statement is mechanically proven additive. A patch version number alone does not
+establish compatibility. This runbook describes operator actions; the preflight
+itself changes no service, runtime symlink, config, lake catalog or database.
 
 Run tooling from a build containing `cutover release-preflight`. An older running
 service cannot expose a command added by a newer build. Set `TOOL` to that build's
@@ -62,8 +63,12 @@ checksum manifests from the same published release.
    `set -a; . ~/.drover/release-gate.env; set +a`. Hosts whose harnessd predates
    folder listing answer 404 and fail this check until they are upgraded.
 5. If `release_kind` reports `lake_schema`, stop this sequence and follow the
-   [full lake cutover gate](lake-cutover.md). Unknown metadata also blocks the
-   point-release path. Do not override the selector based on a version label.
+   [full lake cutover gate](lake-cutover.md). `control_migration` is eligible
+   for this path only when its `control_migrations_allowed` evidence is true.
+   The evidence records `new_migration_ids` and one verdict per SQL statement;
+   retain it in the release ledger. A refused statement, edited/removed shipped
+   migration, non-appended id, or unknown metadata blocks this path. Do not
+   override the selector based on a version label.
 6. For a passing point release, record the bounded planned stop **before**
    stopping the quiescent server and local harness. The marker authorizes one
    check-in recovery attempt for at most two hours; it does not change config,
@@ -90,12 +95,17 @@ checksum manifests from the same published release.
 
    Do not start the hub until this succeeds; a stale pin deliberately blocks
    startup.
-8. Start the services, then call `verify_hub(base_url)` or inspect `/healthz`
-   and `/readyz`. Require `ok\nanalytical=ok` and readiness HTTP 200. On failure,
-   stop services and explicitly restore the retained prior runtime; in-place
-   mode must also reinstall the prior cached wheel. Start and verify again.
-   Re-enable updates only after health succeeds and the pin matches the release,
-   then clear the marker:
+8. Start the services. Hub bootstrap runs the normal ordered PostgreSQL control
+   migration runner before workers start, applying each missing approved version
+   transactionally and recording it in `control_schema_migrations`; no separate
+   rollout command is needed. Then call `verify_hub(base_url)` or inspect
+   `/healthz` and `/readyz`. Require `ok\nanalytical=ok` and readiness HTTP 200.
+   On failure, stop services and explicitly restore the retained prior runtime;
+   in-place mode must also reinstall the prior cached wheel. Do not attempt to
+   reverse an approved additive control migration: the prior runtime ignores the
+   extra nullable column and new table, so it remains rollback-compatible. Start
+   and verify again. Re-enable updates only after health succeeds and the pin
+   matches the release, then clear the marker:
 
    ```sh
    "$TOOL" planned-stop complete
@@ -131,7 +141,7 @@ rerun after any configuration, artifact or runtime change.
 | `plist_validity` | Complete parsed job dict with Label, nonempty argv, HOME/PATH environment, boolean KeepAlive/RunAtLoad, timeout and log paths. |
 | `updater_state` | Updates disabled or pin equals target, and no verification marker. |
 | `runtime_installed` | Cached wheel/lock match independently supplied SHA-256 values; target interpreter reports target version; installed Drover files equal the wheel. DuckLake deployments also verify target engine against configured digest and extension files against pinned digests. |
-| `release_kind` | Checked current interpreter is the one named by service argv and activation config. Current and target migration definitions, derived lake schema version and engine/runtime pins match. |
+| `release_kind` | Checked current interpreter is the one named by service argv and activation config. Lake schema and engine/runtime pins must match. A control-only change must be a strict append whose new SQL statements are each admitted as additive; evidence includes migration ids and statement verdicts. |
 | `disk` | Free bytes at configured runtime filesystem meet the threshold. |
 | `backup` | Exact required files, matching lake/control schema, recent timestamp, verified file hashes, readable dump, and unchanged current config/plist. |
 | `health` | Current service liveness includes analytical=ok, and readiness returns 200. |
@@ -141,13 +151,20 @@ The repo has no separate numbered lake migration ledger. The selector therefore
 uses a derived lake schema version: a SHA-256 over AST declarations and DDL
 producer functions across installed lake modules, including calls to
 `create_table` and `configure_catalog`. Comments and whitespace do not change
-it. Control migrations include versions and statements, so modifying an existing
-migration also routes to the full gate. Runtime compatibility includes declared
-DuckDB/extension pins and the installed DuckDB binary hash. Different engine
-bytes, including a changed interpreter ABI, require the full gate. Changes to
-DDL-producing functions can conservatively require the full gate even when
-resulting SQL is unchanged. New schema helpers must be added to this detection
-contract and its source-mutation tests.
+it. A changed lake schema or runtime pin always requires the full gate.
+
+Control migrations are compared as an ordered ledger. Existing entries must be
+byte-for-byte unchanged and new ids must be strictly appended above the current
+maximum. The point-release classifier allows only `CREATE TABLE`, `CREATE INDEX`
+(including `CONCURRENTLY`), `CREATE SCHEMA IF NOT EXISTS`, `GRANT`, and `ALTER
+TABLE ... ADD COLUMN` when the column is nullable or has a constant default. It
+refuses drops, renames, type/constraint changes, data writes/backfills,
+functions, triggers, and any SQL it cannot parse into that subset. Runtime
+compatibility includes declared DuckDB/extension pins and the installed DuckDB
+binary hash. Different engine bytes, including a changed interpreter ABI,
+require the full gate. Changes to DDL-producing functions can conservatively
+require the full gate even when resulting SQL is unchanged. New schema helpers
+must be added to this detection contract and its source-mutation tests.
 
 The selector runs the same read-only script in both installed interpreters with
 `-I -B`, avoiding checkout/PYTHONPATH substitution and bytecode writes. It does

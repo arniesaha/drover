@@ -113,6 +113,378 @@ def probe_runtime(python: Path, wheel: Path | None = None) -> dict:
     return data
 
 
+def _sql_tokens(statement: str) -> list[str]:
+    """Tokenize the small, deliberately conservative DDL subset we admit.
+
+    This is not a general PostgreSQL parser.  A token stream we cannot account
+    for is intentionally a rejection: the point-release path needs a proof of
+    additivity, not a best-effort guess about DDL.
+    """
+    tokens: list[str] = []
+    index = 0
+    length = len(statement)
+    while index < length:
+        character = statement[index]
+        if character.isspace():
+            index += 1
+        elif statement.startswith("--", index):
+            newline = statement.find("\n", index + 2)
+            index = length if newline == -1 else newline + 1
+        elif statement.startswith("/*", index):
+            end = statement.find("*/", index + 2)
+            if end == -1:
+                raise ValueError("unterminated_comment")
+            index = end + 2
+        elif character == "'":
+            index += 1
+            while index < length:
+                if statement[index] == "'":
+                    if index + 1 < length and statement[index + 1] == "'":
+                        index += 2
+                    else:
+                        index += 1
+                        break
+                else:
+                    index += 1
+            else:
+                raise ValueError("unterminated_string")
+            tokens.append("STRING")
+        elif character == '"':
+            index += 1
+            while index < length:
+                if statement[index] == '"':
+                    if index + 1 < length and statement[index + 1] == '"':
+                        index += 2
+                    else:
+                        index += 1
+                        break
+                else:
+                    index += 1
+            else:
+                raise ValueError("unterminated_identifier")
+            tokens.append("IDENT")
+        elif character == "$":
+            tag = re.match(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$", statement[index:])
+            if tag is not None:
+                delimiter = tag.group(0)
+                end = statement.find(delimiter, index + len(delimiter))
+                if end == -1:
+                    raise ValueError("unterminated_dollar_string")
+                tokens.append("STRING")
+                index = end + len(delimiter)
+            else:
+                tokens.append("$")
+                index += 1
+        elif character.isalnum() or character == "_":
+            end = index + 1
+            while end < length and (statement[end].isalnum() or statement[end] in "_$"):
+                end += 1
+            tokens.append(statement[index:end].upper())
+            index = end
+        elif statement.startswith("::", index):
+            tokens.append("::")
+            index += 2
+        else:
+            tokens.append(character)
+            index += 1
+    return tokens
+
+
+def _constant_default(tokens: list[str]) -> bool:
+    """Return whether *tokens* are a SQL literal with optional type casts."""
+    if not tokens:
+        return False
+    index = 0
+    if tokens[index] in {"+", "-"}:
+        index += 1
+    if index == len(tokens):
+        return False
+    value = tokens[index]
+    if not (
+        value == "STRING"
+        or value in {"NULL", "TRUE", "FALSE"}
+        or re.fullmatch(r"\d+(?:\.\d+)?", value)
+    ):
+        return False
+    index += 1
+    while index < len(tokens):
+        if tokens[index] != "::":
+            return False
+        index += 1
+        if index == len(tokens) or tokens[index] in {"(", ")", ",", ";"}:
+            return False
+        index += 1
+        # Type modifiers such as numeric(10, 2) are part of a literal cast.
+        if index < len(tokens) and tokens[index] == "(":
+            depth = 0
+            while index < len(tokens):
+                token = tokens[index]
+                depth += token == "("
+                depth -= token == ")"
+                index += 1
+                if depth == 0:
+                    break
+                if depth < 0:
+                    return False
+            if depth:
+                return False
+        while index < len(tokens) and tokens[index] == "[":
+            if index + 1 >= len(tokens) or tokens[index + 1] != "]":
+                return False
+            index += 2
+    return True
+
+
+def _top_level_comma(tokens: list[str]) -> bool:
+    depth = 0
+    for token in tokens:
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            depth -= 1
+            if depth < 0:
+                return True
+        elif token == "," and depth == 0:
+            return True
+    return depth != 0
+
+
+def _qualified_name(tokens: list[str]) -> bool:
+    """Accept a simple possibly-qualified PostgreSQL identifier."""
+    if not tokens or tokens[0] == "." or tokens[-1] == ".":
+        return False
+    return all(
+        (
+            token == "."
+            if index % 2
+            else token == "IDENT" or bool(re.fullmatch(r"[A-Z_][A-Z0-9_$]*", token))
+        )
+        for index, token in enumerate(tokens)
+    )
+
+
+def _classify_control_statement(statement: object) -> tuple[bool, str]:
+    """Mechanically prove that one migration statement is additive DDL."""
+    if not isinstance(statement, str) or not statement.strip():
+        return False, "invalid_statement"
+    try:
+        tokens = _sql_tokens(statement)
+    except ValueError as exc:
+        return False, str(exc)
+    if tokens and tokens[-1] == ";":
+        tokens = tokens[:-1]
+    if not tokens or ";" in tokens:
+        return False, "multiple_or_empty_statement"
+
+    if tokens[:2] == ["CREATE", "TABLE"]:
+        table = tokens[2:]
+        if table[:3] == ["IF", "NOT", "EXISTS"]:
+            table = table[3:]
+        if "(" not in table:
+            return False, "create_table_unparsed"
+        opening = table.index("(")
+        if not _qualified_name(table[:opening]) or _top_level_comma(table[opening:]):
+            return False, "create_table_unparsed"
+        return True, "create_table"
+    if tokens[:2] == ["CREATE", "INDEX"] or (
+        len(tokens) > 2 and tokens[:3] == ["CREATE", "UNIQUE", "INDEX"]
+    ):
+        index = tokens[2:] if tokens[1] == "INDEX" else tokens[3:]
+        if index[:1] == ["CONCURRENTLY"]:
+            index = index[1:]
+        if index[:3] == ["IF", "NOT", "EXISTS"]:
+            index = index[3:]
+        if "ON" not in index:
+            return False, "create_index_unparsed"
+        on = index.index("ON")
+        if not _qualified_name(index[:on]) or len(index[on + 1 :]) < 2:
+            return False, "create_index_unparsed"
+        return True, "create_index"
+    if tokens[:5] == ["CREATE", "SCHEMA", "IF", "NOT", "EXISTS"]:
+        if _qualified_name(tokens[5:]):
+            return True, "create_schema_if_not_exists"
+        return False, "create_schema_unparsed"
+    if tokens[0] == "GRANT":
+        if (
+            "ON" in tokens
+            and "TO" in tokens
+            and tokens.index("ON") < tokens.index("TO")
+        ):
+            return True, "grant"
+        return False, "grant_unparsed"
+
+    if tokens[:2] != ["ALTER", "TABLE"]:
+        return False, "statement_not_additive_ddl"
+    try:
+        add = tokens.index("ADD", 2)
+    except ValueError:
+        return False, "alter_table_not_add_column"
+    relation = tokens[2:add]
+    if relation[:2] == ["IF", "EXISTS"]:
+        relation = relation[2:]
+    if relation[:1] == ["ONLY"]:
+        relation = relation[1:]
+    if relation[-1:] == ["*"]:
+        relation = relation[:-1]
+    if not _qualified_name(relation):
+        return False, "alter_table_relation_unparsed"
+    remaining = tokens[add + 1 :]
+    if remaining[:1] == ["COLUMN"]:
+        remaining = remaining[1:]
+    if remaining[:3] == ["IF", "NOT", "EXISTS"]:
+        remaining = remaining[3:]
+    if len(remaining) < 2 or _top_level_comma(remaining):
+        return False, "alter_table_add_column_unparsed"
+    column, definition = remaining[0], remaining[1:]
+    if column in {"(", ")", ",", ";"}:
+        return False, "alter_table_add_column_unparsed"
+    forbidden = {
+        "CHECK",
+        "CONSTRAINT",
+        "GENERATED",
+        "PRIMARY",
+        "REFERENCES",
+        "UNIQUE",
+    }
+    if forbidden.intersection(definition):
+        return False, "alter_table_add_column_unparsed"
+    default_positions = [
+        index for index, token in enumerate(definition) if token == "DEFAULT"
+    ]
+    if len(default_positions) > 1:
+        return False, "alter_table_add_column_unparsed"
+    if not default_positions:
+        if any(
+            definition[index : index + 2] == ["NOT", "NULL"]
+            for index in range(len(definition) - 1)
+        ):
+            return False, "add_column_not_null_without_constant_default"
+        return True, "alter_table_add_nullable_column"
+
+    default = default_positions[0]
+    suffix = definition[default + 1 :]
+    if suffix[-2:] == ["NOT", "NULL"]:
+        suffix = suffix[:-2]
+    elif suffix[-1:] == ["NULL"]:
+        suffix = suffix[:-1]
+    if not _constant_default(suffix):
+        return False, "add_column_default_not_constant"
+    return True, "alter_table_add_column_constant_default"
+
+
+def classify_control_migrations(current: object, target: object) -> dict:
+    """Compare migration ledgers and prove newly appended DDL is additive."""
+    evidence = {
+        "changed": current != target,
+        "new_migration_ids": [],
+        "migration_verdicts": [],
+        "control_migrations_allowed": True,
+    }
+    if not isinstance(current, (list, tuple)) or not isinstance(target, (list, tuple)):
+        evidence["control_migrations_allowed"] = False
+        evidence["control_migration_reason"] = "migration_ledger_invalid"
+        return evidence
+
+    def valid(migration: object) -> bool:
+        return (
+            isinstance(migration, (list, tuple))
+            and len(migration) == 2
+            and isinstance(migration[0], int)
+            and not isinstance(migration[0], bool)
+            and isinstance(migration[1], (list, tuple))
+            and all(isinstance(statement, str) for statement in migration[1])
+        )
+
+    if not all(valid(migration) for migration in [*current, *target]):
+        evidence["control_migrations_allowed"] = False
+        evidence["control_migration_reason"] = "migration_ledger_invalid"
+        return evidence
+    if current == target:
+        return evidence
+    current_ids = [migration[0] for migration in current]
+    target_ids = [migration[0] for migration in target]
+    if (
+        current_ids != sorted(set(current_ids))
+        or target_ids != sorted(set(target_ids))
+        or list(target[: len(current)]) != list(current)
+    ):
+        evidence["control_migrations_allowed"] = False
+        evidence["control_migration_reason"] = "migration_ledger_not_strictly_appended"
+        return evidence
+
+    new_migrations = target[len(current) :]
+    if not new_migrations or any(
+        migration[0] <= current_ids[-1] if current_ids else migration[0] <= 0
+        for migration in new_migrations
+    ):
+        evidence["control_migrations_allowed"] = False
+        evidence["control_migration_reason"] = "migration_ledger_not_strictly_appended"
+        return evidence
+
+    for migration_id, statements in new_migrations:
+        evidence["new_migration_ids"].append(migration_id)
+        if not statements:
+            evidence["control_migrations_allowed"] = False
+            evidence["migration_verdicts"].append(
+                {
+                    "migration_id": migration_id,
+                    "statement_index": 0,
+                    "allowed": False,
+                    "verdict": "migration_has_no_statements",
+                }
+            )
+        for statement_index, statement in enumerate(statements, start=1):
+            allowed, verdict = _classify_control_statement(statement)
+            evidence["migration_verdicts"].append(
+                {
+                    "migration_id": migration_id,
+                    "statement_index": statement_index,
+                    "allowed": allowed,
+                    "verdict": verdict,
+                }
+            )
+            if not allowed:
+                evidence["control_migrations_allowed"] = False
+    if not evidence["control_migrations_allowed"]:
+        evidence["control_migration_reason"] = "migration_contains_non_additive_ddl"
+    return evidence
+
+
+def classify_release_kind(current: dict, target: dict) -> tuple[bool, dict]:
+    """Classify a staged release without weakening the lake-schema gate."""
+    keys = ("migrations", "lake_schema_version", "runtime_pins")
+    if not all(current.get(key) and target.get(key) for key in keys):
+        raise CutoverError("release_schema_metadata_missing")
+    migration_evidence = classify_control_migrations(
+        current["migrations"], target["migrations"]
+    )
+    lake_changed = [
+        key
+        for key in ("lake_schema_version", "runtime_pins")
+        if current[key] != target[key]
+    ]
+    changed = [
+        *(["migrations"] if migration_evidence["changed"] else []),
+        *lake_changed,
+    ]
+    evidence = {
+        "changed": changed,
+        "current_version": current.get("version"),
+        "release": target.get("version"),
+        "lake_schema_version": target["lake_schema_version"],
+        **{key: value for key, value in migration_evidence.items() if key != "changed"},
+    }
+    if lake_changed:
+        return False, evidence | {"rollout_kind": "lake_schema"}
+    if not migration_evidence["control_migrations_allowed"]:
+        return False, evidence | {"rollout_kind": "control_migration"}
+    if migration_evidence["changed"]:
+        return migration_evidence["control_migrations_allowed"], evidence | {
+            "rollout_kind": "control_migration"
+        }
+    return True, evidence | {"rollout_kind": "point_release"}
+
+
 def run_release_preflight(
     plan: CutoverPlan,
     service: ServiceView,
@@ -229,17 +601,8 @@ def run_release_preflight(
         if current.get("version") != active:
             raise CutoverError("release_current_version_mismatch")
         target = holder.get("target", {})
-        keys = ("migrations", "lake_schema_version", "runtime_pins")
-        if not all(current.get(k) and target.get(k) for k in keys):
-            raise CutoverError("release_schema_metadata_missing")
-        changed = [k for k in keys if current[k] != target[k]]
-        return not changed, {
-            "rollout_kind": "lake_schema" if changed else "point_release",
-            "changed": changed,
-            "current_version": active,
-            "release": want,
-            "lake_schema_version": target["lake_schema_version"],
-        }
+        allowed, evidence = classify_release_kind(current, target)
+        return allowed, evidence | {"current_version": active, "release": want}
 
     checks.append(run_check("release_kind", kind))
 
