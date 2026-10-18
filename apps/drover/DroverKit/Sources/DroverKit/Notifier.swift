@@ -49,8 +49,8 @@ public struct LocalNotifier: Notifying {
     }
 
     public func notify(kind: SessionNotificationKind, id: String) async {
+        guard NotificationMode.saved().allowsImmediate(kind) else { return }
         let content = Self.content(kind: kind, id: id)
-        guard NotificationMode.saved() != .digest else { return }
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         try? await UNUserNotificationCenter.current().add(request)
     }

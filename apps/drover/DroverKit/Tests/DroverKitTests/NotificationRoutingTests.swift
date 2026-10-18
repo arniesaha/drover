@@ -98,6 +98,16 @@ import Testing
     #expect(NotificationMode.saved(in: defaults) == .action)
 }
 
+@Test func notificationModeFiltersImmediateLocalAlerts() {
+    #expect(NotificationMode.all.allowsImmediate(.input))
+    #expect(NotificationMode.all.allowsImmediate(.finished))
+    #expect(NotificationMode.all.allowsImmediate(.failed))
+    #expect(NotificationMode.action.allowsImmediate(.input))
+    #expect(!NotificationMode.action.allowsImmediate(.finished))
+    #expect(!NotificationMode.action.allowsImmediate(.failed))
+    #expect(!NotificationMode.digest.allowsImmediate(.input))
+}
+
 @Test func summaryPayloadRoutesOnlyToItsSessions() {
     let payload: [AnyHashable: Any] = ["session_ids": [" second ", "first", "first", " "]]
     #expect(NotificationRoute.sessionIDs(userInfo: payload) == ["first", "second"])
