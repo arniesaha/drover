@@ -1,5 +1,6 @@
 import BackgroundTasks
 import DroverKit
+import WidgetKit
 
 /// Owns the `com.arnab.drover.refresh` BGAppRefreshTask lifecycle: register
 /// the handler once at app init (BGTaskScheduler requires this before the app
@@ -59,6 +60,16 @@ enum BackgroundRefresh {
                 success = await watcher.check(client: built.client)
                 if let response = try? await built.client.workAttention(), !response.stale {
                     await WorkAttentionNotifications.evaluate(response.items, notifier: notifier)
+                }
+                if let snapshot = try? await built.client.snapshot() {
+                    let overview = try? await built.client.cockpitOverview()
+                    let accounts = overview?.providerCapacity.data ?? []
+                    let widgetSnapshot = WidgetFleetSnapshot.build(
+                        snapshot: snapshot,
+                        accounts: accounts
+                    )
+                    try? WidgetSnapshotStore.writeSnapshot(widgetSnapshot)
+                    WidgetCenter.shared.reloadAllTimelines()
                 }
                 schedule()
             }
