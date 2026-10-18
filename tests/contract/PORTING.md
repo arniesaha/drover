@@ -91,18 +91,18 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` |
 | `test_harnessd_reconciles_orphaned_structured_sessions_on_startup` | dropped: startup reconciliation needs an orphaned structured row preseeded in the registry before the launched process begins; the fixture only starts with an empty store |
 | `test_harnessd_reconciles_orphaned_pty_sessions_on_startup` | dropped: startup reconciliation needs a dead PTY registry row preseeded before `drover-harnessd --listen`, which the public launcher fixture cannot create |
-| `test_harnessd_recovers_restart_lost_structured_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_recovery_is_idempotent_when_session_is_live` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_recovers_claude_with_native_resume_command` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
+| `test_harnessd_recovers_restart_lost_structured_session` | `test_structured_session_can_recover_after_daemon_restart` |
+| `test_harnessd_recovery_is_idempotent_when_session_is_live` | `test_structured_session_can_recover_after_daemon_restart` |
+| `test_harnessd_recovers_claude_with_native_resume_command` | `test_structured_session_can_recover_after_daemon_restart` |
 | `test_harnessd_recovers_agy_onto_its_conversation` | dropped: recovery requires a stored Agy native conversation id and a configured Agy resume fixture; neither is accepted by the public launch request alone |
 | `test_harnessd_refuses_turns_while_draining_for_an_update` | dropped: `POST /sessions/<id>/turns` has no public switch to place the daemon in updater draining state; the fixture does not configure `[update]` |
 | `test_harnessd_concurrent_recovery_creates_one_driver` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_terminate_waits_for_recovery_and_wins` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_recovery_rejects_unsupported_or_incomplete_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_recovery_rejects_terminated_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_recovery_rejects_generic_errored_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_can_terminate_restart_lost_structured_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_terminates_live_session_and_updates_registry` | dropped: requires pre-seeding or faulting durable daemon state before startup |
+| `test_harnessd_recovery_rejects_generic_errored_session` | `test_structured_session_can_recover_after_daemon_restart` |
+| `test_harnessd_can_terminate_restart_lost_structured_session` | `test_restart_lost_session_can_be_terminated` |
+| `test_harnessd_terminates_live_session_and_updates_registry` | `test_live_structured_termination_persists_in_inventory` |
 | `test_harnessd_delete_terminates_live_session` | `test_public_session_mutation_contract` |
 | `test_harnessd_sessions_cors_preflight_and_post_headers` | `test_harnessd_sessions_cors_preflight_and_post_headers` |
 | `test_harnessd_creates_in_memory_session_when_registry_is_locked` | dropped: requires pre-seeding or faulting durable daemon state before startup |
