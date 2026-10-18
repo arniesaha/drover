@@ -178,6 +178,47 @@ jobs:
         HARNESSD_IMPL: ${{ matrix.impl }}
       run: pytest tests/contract -q
 
+  harnessd-rust-phase2:
+    name: harnessd Rust phase 2 (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            static: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+            static: false
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+        components: rustfmt, clippy
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: "pip"
+    - name: Install contract dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+    - name: Format and lint
+      run: |
+        cargo fmt --check
+        cargo clippy -p drover-harnessd --target ${{ matrix.target }} -- -D warnings
+    - name: Build, test, and run Rust MVP contracts
+      env:
+        RUSTFLAGS: ${{ matrix.static && '-C target-feature=+crt-static' || '' }}
+      run: |
+        cargo test -p drover-harnessd --target ${{ matrix.target }}
+        cargo build --release -p drover-harnessd --target ${{ matrix.target }}
+        mkdir -p target/release
+        cp target/${{ matrix.target }}/release/drover-harnessd target/release/drover-harnessd
+        pytest tests/contract --daemon=rust -m rust_phase2 -q
+
   postgres-integration:
     # This job is intentionally unconditional. A documentation-only change may
     # skip the general Python suite, but the PostgreSQL serving contract must
