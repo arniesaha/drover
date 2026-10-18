@@ -306,6 +306,7 @@ private struct RootView: View {
     }
 
     private func requestNotificationPermissionIfConfigured() async {
+        guard !environment.isDemoMode else { return }
         guard backgroundActivityEnabled else { return }
         PushRegistrar.shared.updateClient(environment.client)
         guard environment.client != nil else { return }

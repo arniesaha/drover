@@ -118,6 +118,7 @@ struct MainTabView: View {
             NavigationStack {
                 SessionsView(
                     client: client,
+                    isDemoMode: environment.isDemoMode,
                     notifier: notifier,
                     recoveryStore: environment.chatRecoveryStore,
                     recoveryWriteGate: environment.chatRecoveryWriteGate,

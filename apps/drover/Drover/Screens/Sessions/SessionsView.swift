@@ -49,6 +49,7 @@ struct SessionsView: View {
     @State private var showAnalytics = false
     @State private var showAccounts = false
     @State private var showInsights = false
+    let isDemoMode: Bool
     @State private var showHistory = false
     @State private var notificationSessionIDs: Set<String>?
     @State private var filterState: FleetFilterState
@@ -56,6 +57,7 @@ struct SessionsView: View {
 
     init(
         client: DroverClient,
+        isDemoMode: Bool = false,
         notifier: Notifying = LocalNotifier(),
         recoveryStore: (any ChatRecoveryPersisting)?,
         recoveryWriteGate: ChatRecoveryWriteGate,
@@ -68,6 +70,7 @@ struct SessionsView: View {
         onOpenAccountsTab: (() -> Void)? = nil
     ) {
         self.client = client
+        self.isDemoMode = isDemoMode
         self.notifier = notifier
         self.recoveryStore = recoveryStore
         self.recoveryWriteGate = recoveryWriteGate
@@ -364,14 +367,15 @@ struct SessionsView: View {
             Group {
                 if launched.isStructured {
                     ChatView(
-                        client: client,
+                        client: isEffectiveDemoMode ? nil : client,
                         sessionID: launched.id,
                         harness: launched.harness,
                         recoveryStore: recoveryStore,
                         recoveryWriteGate: recoveryWriteGate,
                         recoveryGeneration: recoveryGeneration,
                         chatModelFactory: chatModelFactory,
-                        onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) }
+                        onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) },
+                        isDemoMode: isEffectiveDemoMode
                     )
                 } else {
                     TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
@@ -666,10 +670,15 @@ struct SessionsView: View {
         return responseStatus
     }
 
+    private var isEffectiveDemoMode: Bool {
+        isDemoMode || client.config.baseURL.host == DemoHubData.syntheticHost
+    }
+
     // MARK: - Pieces
 
     private var chromeRow: some View {
         InboxChromeRow(
+            isDemoMode: isEffectiveDemoMode,
             onToggleTheme: { appearance.toggle(displaying: colorScheme) },
             onOpenSettings: onOpenSettings
         )
@@ -769,7 +778,7 @@ struct SessionsView: View {
             Group {
                 if session.isStructured {
                     ChatView(
-                        client: client,
+                        client: isEffectiveDemoMode ? nil : client,
                         sessionID: session.id,
                         harness: session.harness,
                         recap: session.recap ?? session.preview,
@@ -778,7 +787,8 @@ struct SessionsView: View {
                         recoveryWriteGate: recoveryWriteGate,
                         recoveryGeneration: recoveryGeneration,
                         chatModelFactory: chatModelFactory,
-                        onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) }
+                        onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) },
+                        isDemoMode: isEffectiveDemoMode
                     )
                 } else {
                     TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
