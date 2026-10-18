@@ -62,7 +62,7 @@ simulator fixtures and local test servers. The supported Store matrix is:
 | HTTPS server | ATS default trust evaluation; `wss` streams. | Preferred. Bearer traffic is encrypted in transit. |
 | HTTP IP address, including Tailscale `100.64.0.0/10` | Allowed by `NSAllowsLocalNetworking`; `ws` follows the same ATS boundary. | HTTP does not encrypt bearer traffic. |
 | HTTP unqualified name or `.local` name | Allowed by `NSAllowsLocalNetworking`. | HTTP does not encrypt bearer traffic. |
-| HTTP fully-qualified domain, including `*.ts.net` | Refused before pairing/configuration; the app asks the user to re-pair with an IP or configure HTTPS. | Use [Tailscale Serve HTTPS](../../docs/getting-started.md#remote-tailscale-https) for remote access. |
+| HTTP fully-qualified domain, including `*.ts.net` | Refused before pairing/configuration; the app asks the user to re-pair with an IP or configure HTTPS. | Use [Tailscale Serve HTTPS](../../../docs/getting-started.md#remote-tailscale-https) for remote access. |
 
 The hub QR generator avoids plain-HTTP MagicDNS names where it can discover a
 Tailscale or LAN IP. Existing stored HTTP FQDN configurations intentionally
