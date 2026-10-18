@@ -25,6 +25,18 @@ PORTED = {
     "test_structured_session_stores_default_permission_mode": "test_structured_lifecycle_and_event_push_contract",
     "test_structured_session_stores_explicit_auto_permission_mode": "test_structured_lifecycle_and_event_push_contract",
     "test_structured_session_rejects_unknown_permission_mode": "test_structured_launch_validation_contract",
+    "test_model_catalog_route_rejects_malformed_query": "test_model_catalog_rejects_malformed_query",
+    "test_model_catalog_route_rejects_unknown_or_disabled_harness": "test_model_catalog_refuses_unknown_harness",
+    "test_model_catalog_route_requires_bearer_token": "test_model_catalog_requires_bearer_token",
+    "test_harnessd_auth_routes_require_bearer_token": "test_auth_routes_require_bearer_token",
+    "test_harnessd_auth_status_unknown_harness_returns_404": "test_auth_public_error_routes",
+    "test_harnessd_auth_flow_unknown_id_returns_404": "test_auth_public_error_routes",
+    "test_harnessd_auth_start_unsupported_returns_400": "test_auth_public_error_routes",
+    "test_structured_permission_without_approval_channel_returns_400": "test_unknown_session_errors_are_wire_stable",
+    "test_harnessd_session_listing_rejects_a_forged_cursor": "test_inventory_cursor_and_cors_contract",
+    "test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default": "test_auth_and_top_level_error_envelopes",
+    "test_turn_with_bad_base64_is_rejected": "test_structured_launch_validation_contract",
+    "test_turn_with_unsupported_media_type_is_rejected": "test_structured_launch_validation_contract",
 }
 
 
@@ -45,7 +57,7 @@ def reason(name: str) -> str:
         token in name for token in ("auth_start", "auth_flow", "typed_code", "sign_in")
     ):
         return "dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet"
-    return "dropped: public behavior not yet represented; retain source test until an observable fixture is added"
+    return "dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant"
 
 
 def main() -> None:
