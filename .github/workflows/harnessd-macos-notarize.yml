@@ -55,18 +55,23 @@ jobs:
     - name: Build the aarch64 Rust binary
       run: |
         set -euo pipefail
-        # The Rust harnessd crate is supplied by the harnessd release work.
-        # Keep the manifest explicit so a second Cargo project cannot silently
-        # become the signed executable.
-        manifest="harnessd/Cargo.toml"
+        # Build from the repository workspace so Cargo resolves the locked
+        # harnessd-rs dependencies exactly as the Rust CI job does. Keep both
+        # package and binary explicit so a future workspace member cannot
+        # silently become the signed executable.
+        manifest="Cargo.toml"
         test -f "$manifest" || {
-          echo "expected Rust harnessd manifest at $manifest" >&2
+          echo "expected Rust workspace manifest at $manifest" >&2
+          exit 1
+        }
+        test -f harnessd-rs/Cargo.toml || {
+          echo "expected Rust harnessd crate at harnessd-rs/Cargo.toml" >&2
           exit 1
         }
         rustup target add "$HARNESSD_TARGET"
         cargo build --locked --release --target "$HARNESSD_TARGET" \
-          --manifest-path "$manifest" --bin harnessd
-        binary="target/$HARNESSD_TARGET/release/harnessd"
+          --manifest-path "$manifest" -p drover-harnessd --bin drover-harnessd
+        binary="target/$HARNESSD_TARGET/release/drover-harnessd"
         test -x "$binary"
         mkdir -p "$RUNNER_TEMP/harnessd-release"
         cp "$binary" "$RUNNER_TEMP/harnessd-release/$HARNESSD_ASSET"

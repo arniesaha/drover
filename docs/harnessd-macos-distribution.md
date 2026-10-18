@@ -1,10 +1,11 @@
 # macOS harnessd distribution
 
-`Harnessd macOS notarization` builds the Rust `harnessd` command for
-`aarch64-apple-darwin`, signs it as `fyi.drover.harnessd` with Developer ID
-Application identity `DK2PC4RH5G`, and submits a ZIP of that signed command to
-Apple's notary service. The command has no entitlements: it is a standalone
-daemon and does not need an entitlement to perform its supported work.
+`Harnessd macOS notarization` builds workspace package and command
+`drover-harnessd` (`harnessd-rs/`) for `aarch64-apple-darwin`, signs it as
+`fyi.drover.harnessd` with Developer ID Application identity `DK2PC4RH5G`, and
+submits a ZIP of that signed command to Apple's notary service. The command has
+no entitlements: it is a standalone daemon and does not need an entitlement to
+perform its supported work.
 
 The callable workflow is invoked from `release.yml` only after the GitHub
 release exists, then uploads the signed binary and its SHA-256 companion. A
