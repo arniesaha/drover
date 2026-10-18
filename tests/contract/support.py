@@ -127,7 +127,7 @@ def _fake_cli(path: Path, fixture: Path, log: Path) -> None:
         " raise SystemExit(0)\n"
         "if 'auth' in sys.argv and 'status' in sys.argv:\n"
         " logged_in = Path(os.environ['HARNESSD_FAKE_AUTH_STATE']).exists()\n"
-        " print(json.dumps({'loggedIn': logged_in, 'email': 'contract@example.test'}))\n"
+        " print(json.dumps({'loggedIn': logged_in, 'email': 'contract@example.test', 'subscriptionType': 'max'}))\n"
         " raise SystemExit(0 if logged_in else 1)\n"
         "if 'auth' in sys.argv and 'login' in sys.argv:\n"
         " print('Paste your code:', flush=True)\n"

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from .test_harnessd_contract import request
 from .support import wait_until
+from .test_harnessd_contract import request
 
 
 @pytest.mark.parametrize(

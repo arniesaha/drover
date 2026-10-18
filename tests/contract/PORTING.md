@@ -6,9 +6,9 @@ missing public seam rather than importing daemon internals.
 
 | Source test | Contract test / disposition |
 | --- | --- |
-| `test_run_harnessd_closes_auth_flows_on_shutdown` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
+| `test_run_harnessd_closes_auth_flows_on_shutdown` | `test_run_harnessd_closes_auth_flows_on_shutdown` |
 | `test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance` | `test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance` |
-| `test_harnessd_cli_passes_content_consent_config_to_server` | dropped: `drover-harnessd --config` exposes no endpoint that reports the parsed advisory-content object; `/advisory/content-bundle` only reports disabled consent under the current fixture |
+| `test_harnessd_cli_passes_content_consent_config_to_server` | `test_harnessd_cli_passes_content_consent_config_to_server` |
 | `test_model_catalog_route_is_host_scoped_and_forceable` | `test_model_catalog_route_is_host_scoped_and_forceable` |
 | `test_model_catalog_service_is_created_lazily_once` | dropped: `GET /model-catalog` can establish its response and refresh semantics but cannot reveal service allocation count; observing this needs an injected catalog factory |
 | `test_model_catalog_route_rejects_malformed_query` | `test_public_query_error_contract` |
@@ -16,15 +16,15 @@ missing public seam rather than importing daemon internals.
 | `test_model_catalog_route_requires_bearer_token` | `test_public_http_routing_contract` |
 | `test_model_catalog_route_returns_safe_degraded_envelope` | `test_model_catalog_route_returns_safe_degraded_envelope` |
 | `test_default_model_catalog_service_uses_only_enabled_resolved_presets` | dropped: `GET /model-catalog` exposes catalog output but not the private adapter command tuples selected for disabled presets; this needs an injected catalog factory |
-| `test_model_catalog_is_invalidated_after_auth_mutations_and_successful_poll` | dropped: `/auth/<harness>/start` requires a real interactive login protocol; the fake CLI has no controllable authenticated poll transition to make catalog cache invalidation observable |
+| `test_model_catalog_is_invalidated_after_auth_mutations_and_successful_poll` | dropped: the fixture can authenticate `POST /auth/claude-code/start`, but `GET /model-catalog?harness=claude-code` has no wire field for its cache generation or refresh count; observing invalidation needs the catalog service instance |
 | `test_model_preference_validation_rejects_launch_before_side_effects` | `test_model_preference_validation_rejects_launch_before_side_effects` |
 | `test_model_preference_validation_keeps_null_launch_defaults` | `test_model_preference_validation_keeps_null_launch_defaults` |
 | `test_model_preference_validation_passes_codex_turn_preferences_unchanged` | `test_model_preference_validation_passes_codex_turn_preferences_unchanged` |
 | `test_duplicate_turn_skips_attachment_and_preference_side_effects` | `test_duplicate_turn_skips_attachment_and_preference_side_effects` |
 | `test_model_preference_validation_preserves_opaque_identifier_whitespace` | `test_model_preference_validation_preserves_opaque_identifier_whitespace` |
 | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` |
-| `test_initial_structured_executable_error_closes_entry_and_cleans_worktree` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_missing_structured_executable_turn_returns_json_and_marks_session_errored` | dropped: `POST /sessions/<id>/turns` can force an executable error, but the launched fake driver exits before a deterministic second-turn spawn; a configurable long-lived missing-executable fixture is needed |
+| `test_initial_structured_executable_error_closes_entry_and_cleans_worktree` | `test_initial_structured_executable_error_closes_entry_and_cleans_worktree` |
+| `test_missing_structured_executable_turn_returns_json_and_marks_session_errored` | `test_missing_structured_executable_turn_returns_json_and_marks_session_errored` |
 | `test_client_turn_id_requires_a_uuid` | `test_client_turn_id_requires_a_uuid` |
 | `test_model_preference_validation_discards_claude_turn_overrides` | `test_model_preference_validation_discards_claude_turn_overrides` |
 | `test_cli_harnessd_help_documents_core_options` | `test_harnessd_cli_help_documents_core_options` |
@@ -36,18 +36,18 @@ missing public seam rather than importing daemon internals.
 | `test_wire_event_pusher_is_noop_without_central_url_or_token` | `test_wire_event_pusher_is_noop_without_central_url_or_token` |
 | `test_harnessd_health_and_capabilities` | `test_harnessd_health_and_capabilities` |
 | `test_lifecycle_worktree_inventory_is_unavailable_before_first_observation` | dropped: `GET /lifecycle/worktrees` on a newly launched daemon eagerly returns the empty 200 snapshot, not the source test's injected-unavailable 503; producing 503 needs an internal cache fault |
-| `test_lifecycle_worktree_inventory_returns_cached_snapshot_while_refresh_is_slow` | dropped: requires deterministic control of an internal dependency or timing window |
-| `test_lifecycle_worktree_inventory_keeps_last_good_snapshot_on_refresh_failure` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_lifecycle_worktree_inventory_does_not_overlap_hung_refreshes` | dropped: requires deterministic control of an internal dependency or timing window |
-| `test_harnessd_provider_usage_returns_cached_snapshot_while_probe_is_slow` | dropped: requires deterministic control of an internal dependency or timing window |
+| `test_lifecycle_worktree_inventory_returns_cached_snapshot_while_refresh_is_slow` | dropped: `GET /lifecycle/worktrees` exposes a completed snapshot only; the launcher has no fixture hook to hold its internal `worktree_inventory` refresh while serving the request |
+| `test_lifecycle_worktree_inventory_keeps_last_good_snapshot_on_refresh_failure` | dropped: `GET /lifecycle/worktrees` has no route or launcher config that injects a first successful and then failing worktree inventory backend |
+| `test_lifecycle_worktree_inventory_does_not_overlap_hung_refreshes` | dropped: overlap is an internal refresh-call count; `/lifecycle/worktrees` does not expose in-flight refreshes and the fixture cannot block its worktree backend |
+| `test_harnessd_provider_usage_returns_cached_snapshot_while_probe_is_slow` | dropped: `GET /providers/usage` does not expose probe duration or cache generation, and the fake Codex app-server has no delayed response mode for the refresh worker |
 | `test_provider_usage_background_refresh_keeps_last_good_snapshot_on_failure` | dropped: `GET /providers/usage` exposes snapshots, but fake CLIs cannot schedule a successful probe followed by a failing refresh without a configurable probe response sequence |
-| `test_provider_usage_hung_probe_does_not_block_other_providers` | dropped: requires deterministic control of an internal dependency or timing window |
-| `test_provider_usage_probe_slower_than_old_bound_completes_with_new_bound` | dropped: requires deterministic control of an internal dependency or timing window |
-| `test_provider_usage_does_not_reenter_hung_probe_and_publishes_late_success` | dropped: requires deterministic control of an internal dependency or timing window |
+| `test_provider_usage_hung_probe_does_not_block_other_providers` | dropped: `/providers/usage` cannot configure a hung Codex probe plus an independently successful Claude probe; that requires injected probe objects |
+| `test_provider_usage_probe_slower_than_old_bound_completes_with_new_bound` | dropped: the public `/providers/usage` route has no timeout parameter or elapsed-time field; the old/new timeout bound is only supplied by the internal cache constructor |
+| `test_provider_usage_does_not_reenter_hung_probe_and_publishes_late_success` | dropped: re-entry is observable only through internal probe call counts; `/providers/usage` has no scripted delayed-success probe sequence |
 | `test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts` | `test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts` |
 | `test_harnessd_provider_usage_uses_configured_agy_probe` | dropped: `GET /providers/usage` is covered, but the launcher config has no public flag for replacing the Agy probe with a fixture account/window response |
 | `test_harnessd_provider_usage_reports_claude_windows` | dropped: `GET /providers/usage` cannot make the Claude OAuth probe return deterministic windows; the temp HOME lacks a supported fixture credential endpoint |
-| `test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card` | dropped: `/providers/usage` returns degraded cards, but the fake CLI cannot combine Claude auth detail `max` with a failing Anthropic usage probe |
+| `test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card` | `test_provider_usage_keeps_plan_label_on_a_failing_anthropic_card` |
 | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` |
 | `test_harnessd_provider_usage_reports_codex_cli_not_found` | `test_harnessd_provider_usage_reports_codex_cli_not_found_is_never_silent` |
 | `test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default` | `test_public_http_routing_contract` |
@@ -68,36 +68,36 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_auth_status_decodes_harness_path` | `test_public_route_validation` |
 | `test_harnessd_auth_flow_unknown_id_returns_404` | `test_public_http_routing_contract` |
 | `test_harnessd_auth_start_unsupported_returns_400` | `test_auth_public_error_routes` |
-| `test_harnessd_auth_start_launch_failure_returns_structured_500` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
-| `test_resolve_harness_presets_enables_available_login_shell_clis` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_resolve_harness_presets_records_resolved_executable` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_resolve_harness_presets_clears_the_executable_when_the_cli_disappears` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_resolve_harness_presets_discovers_nvm_clis_and_preserves_node_path` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_resolve_harness_presets_enables_versioned_claude_cli` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
+| `test_harnessd_auth_start_launch_failure_returns_structured_500` | dropped: `POST /auth/codex/start` launches through a resolved login shell; a broken fixture executable yields a child exit, not the source test's `Popen` OSError/500, which needs an injected auth adapter command |
+| `test_resolve_harness_presets_enables_available_login_shell_clis` | `test_every_offered_preset_can_actually_be_driven` |
+| `test_resolve_harness_presets_records_resolved_executable` | dropped: `GET /capabilities` deliberately returns an empty `command` for structured presets, so it cannot reveal the private resolved executable field |
+| `test_resolve_harness_presets_clears_the_executable_when_the_cli_disappears` | dropped: preset resolution runs only before `drover-harnessd --listen`; no HTTP route reloads presets after a fixture CLI is removed from `PATH` |
+| `test_resolve_harness_presets_discovers_nvm_clis_and_preserves_node_path` | dropped: `GET /capabilities` omits the resolved NVM node-path environment; observing it requires the preset resolver result rather than a launched daemon route |
+| `test_resolve_harness_presets_enables_versioned_claude_cli` | dropped: the launcher can place a versioned binary under temporary HOME, but `/capabilities` omits which Claude path resolution selected |
 | `test_native_resume_launches_through_the_structured_adapter` | `test_native_resume_launches_through_the_structured_adapter` |
 | `test_discovers_claude_native_resume_sessions` | `test_discovers_claude_native_resume_sessions` |
-| `test_reads_claude_jsonl_native_transcript` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_reads_codex_jsonl_native_transcript` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
+| `test_reads_claude_jsonl_native_transcript` | dropped: `GET /sessions/<id>/native-transcript` requires a live terminal session launched as Claude, but Claude advertises no PTY launch mode in the fixture |
+| `test_reads_codex_jsonl_native_transcript` | dropped: `GET /sessions/<id>/native-transcript` requires a live terminal session launched as Codex, but Codex advertises no PTY launch mode in the fixture |
 | `test_discovers_codex_native_resume_sessions` | `test_discovers_codex_native_resume_sessions` |
 | `test_native_history_metadata_refuses_sources_beyond_its_configured_hard_cap` | `test_native_session_inventory_enforces_its_public_hard_cap` |
 | `test_harnessd_creates_shell_session` | `test_shell_create_get_list_and_terminate` |
 | `test_harnessd_lists_and_gets_live_sessions` | `test_shell_create_get_list_and_terminate` |
-| `test_harnessd_listing_merges_pty_registry_and_manager_only_sessions` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_listing_registry_lookups_do_not_scale_with_session_count` | dropped: requires deterministic control of an internal dependency or timing window |
+| `test_harnessd_listing_merges_pty_registry_and_manager_only_sessions` | `test_harnessd_listing_merges_terminal_and_structured_sessions` |
+| `test_harnessd_listing_registry_lookups_do_not_scale_with_session_count` | dropped: `GET /sessions` returns inventory but no registry-query count; measuring lookup scaling needs an instrumented registry |
 | `test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first` | `test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first` |
 | `test_harnessd_session_listing_cursor_pages_through_history_once` | `test_harnessd_session_listing_cursor_pages_through_history_once` |
 | `test_harnessd_session_listing_rejects_a_forged_cursor` | `test_public_query_error_contract` |
 | `test_harnessd_session_listing_cap_matches_the_hub_fleet_render` | dropped: `GET /sessions?archived=` exposes the daemon cap but cannot expose the hub MetricsCollector default it is compared against |
 | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` |
 | `test_harnessd_reconciles_orphaned_structured_sessions_on_startup` | `test_structured_session_can_recover_after_daemon_restart` |
-| `test_harnessd_reconciles_orphaned_pty_sessions_on_startup` | dropped: startup reconciliation needs a dead PTY registry row preseeded before `drover-harnessd --listen`, which the public launcher fixture cannot create |
+| `test_harnessd_reconciles_orphaned_pty_sessions_on_startup` | `test_orphaned_pty_session_is_reconciled_on_restart` |
 | `test_harnessd_recovers_restart_lost_structured_session` | `test_structured_session_can_recover_after_daemon_restart` |
 | `test_harnessd_recovery_is_idempotent_when_session_is_live` | `test_structured_session_can_recover_after_daemon_restart` |
 | `test_harnessd_recovers_claude_with_native_resume_command` | `test_structured_session_can_recover_after_daemon_restart` |
 | `test_harnessd_recovers_agy_onto_its_conversation` | dropped: recovery requires a stored Agy native conversation id and a configured Agy resume fixture; neither is accepted by the public launch request alone |
 | `test_harnessd_refuses_turns_while_draining_for_an_update` | dropped: `POST /sessions/<id>/turns` has no public switch to place the daemon in updater draining state; the fixture does not configure `[update]` |
-| `test_harnessd_concurrent_recovery_creates_one_driver` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_terminate_waits_for_recovery_and_wins` | dropped: requires pre-seeding or faulting durable daemon state before startup |
+| `test_harnessd_concurrent_recovery_creates_one_driver` | `test_concurrent_recovery_creates_one_driver` |
+| `test_harnessd_terminate_waits_for_recovery_and_wins` | `test_harnessd_terminate_waits_for_recovery_and_wins` |
 | `test_harnessd_recovery_rejects_unsupported_or_incomplete_session` | `test_recovery_rejects_terminated_and_terminal_sessions` |
 | `test_harnessd_recovery_rejects_terminated_session` | `test_recovery_rejects_terminated_and_terminal_sessions` |
 | `test_harnessd_recovery_rejects_generic_errored_session` | `test_structured_session_can_recover_after_daemon_restart` |
@@ -105,7 +105,7 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_terminates_live_session_and_updates_registry` | `test_live_structured_termination_persists_in_inventory` |
 | `test_harnessd_delete_terminates_live_session` | `test_public_session_mutation_contract` |
 | `test_harnessd_sessions_cors_preflight_and_post_headers` | `test_harnessd_sessions_cors_preflight_and_post_headers` |
-| `test_harnessd_creates_in_memory_session_when_registry_is_locked` | dropped: requires pre-seeding or faulting durable daemon state before startup |
+| `test_harnessd_creates_in_memory_session_when_registry_is_locked` | dropped: `POST /sessions` cannot configure the DuckDB registry to reject writes; reproducing the locked-registry fallback needs an injected registry fault |
 | `test_harnessd_rejects_disabled_harness` | `test_public_route_validation` |
 | `test_enabled_preset_is_not_terminal_launchable_without_advertised_pty` | `test_public_route_validation` |
 | `test_daemon_rejects_unauthenticated_when_token_set` | `test_auth_and_top_level_error_envelopes` |
@@ -125,7 +125,7 @@ missing public seam rather than importing daemon internals.
 | `test_empty_turn_still_rejected` | `test_empty_turn_still_rejected` |
 | `test_structured_unknown_harness_rejected` | `test_structured_launch_validation_contract` |
 | `test_structured_launch_cannot_bypass_a_missing_adapter` | `test_structured_launch_cannot_bypass_a_missing_adapter` |
-| `test_structured_launch_rejects_unknown_worktree_policy` | dropped: requires pre-seeding or faulting durable daemon state before startup |
+| `test_structured_launch_rejects_unknown_worktree_policy` | dropped: `POST /sessions` has no worktree-policy request field; the unknown policy in the source is injected from the Codex adapter |
 | `test_structured_permission_without_approval_channel_returns_400` | `test_public_query_error_contract` |
 | `test_structured_interrupt_unknown_session_is_404` | `test_public_query_error_contract` |
 | `test_structured_terminate_closes_driver_and_marks_terminated` | `test_public_session_mutation_contract` |
@@ -138,7 +138,7 @@ missing public seam rather than importing daemon internals.
 | `test_structured_session_rejects_unknown_permission_mode` | `test_structured_launch_validation_contract` |
 | `test_harnessd_routes_typed_code_into_a_pty_login_flow` | `test_harnessd_routes_typed_code_into_a_pty_login_flow` |
 | `test_harnessd_refuses_to_start_a_terminal_only_sign_in` | `test_harnessd_refuses_to_start_a_terminal_only_sign_in` |
-| `test_every_offered_preset_can_actually_be_driven` | dropped: `GET /capabilities` lists offered presets, but exercising every listed provider requires distinct interactive/auth fixture protocols not supplied by the shared fake CLI |
+| `test_every_offered_preset_can_actually_be_driven` | `test_every_offered_preset_can_actually_be_driven` |
 | `test_observe_only_sources_are_never_drive_targets` | dropped: the public launch endpoint can reject known unsupported modes, but it has no fixture-provided observe-only preset to distinguish source-only from absent harnesses |
 | `test_a_repeated_handoff_create_returns_the_session_it_already_made` | `test_handoff_source_is_idempotent_but_parent_is_not` |
 | `test_a_handoff_from_a_different_source_still_creates_its_own_session` | `test_public_session_mutation_contract` |
@@ -146,7 +146,7 @@ missing public seam rather than importing daemon internals.
 | `test_a_repeat_create_with_a_client_key_does_not_spawn_a_second_session` | `test_client_session_key_is_idempotent` |
 | `test_structured_create_retry_with_ios_client_key_returns_one_session` | `test_public_session_mutation_contract` |
 | `test_creates_without_a_client_key_are_still_independent` | `test_unkeyed_creates_are_distinct` |
-| `test_create_session_answers_400_when_the_staging_key_is_unusable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_recover_answers_409_when_the_staging_key_is_unusable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_structured_launch_refuses_when_worktree_isolation_fails` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_work_run_key_lookup_is_read_only_and_includes_archived_session` | dropped: requires deterministic control of an internal dependency or timing window |
+| `test_create_session_answers_400_when_the_staging_key_is_unusable` | dropped: `POST /sessions` does not accept a staging credential override; the unusable key is an injected adapter `default_command` failure |
+| `test_recover_answers_409_when_the_staging_key_is_unusable` | dropped: `POST /sessions/<id>/recover` has no staging-key configuration; the source failure is an injected adapter command error |
+| `test_structured_launch_refuses_when_worktree_isolation_fails` | dropped: the fixture can create a real git worktree but cannot make its internal isolation helper raise `WorktreeIsolationUnavailable` without daemon code injection |
+| `test_work_run_key_lookup_is_read_only_and_includes_archived_session` | dropped: no daemon HTTP route exposes work-run-key lookup; `GET /sessions` cannot report whether the private lookup mutated its registry row |

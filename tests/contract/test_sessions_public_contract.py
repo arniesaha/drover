@@ -86,3 +86,26 @@ def test_handoff_source_is_idempotent_but_parent_is_not(daemon):
     )
     assert one_status == two_status == 201
     assert one["session_id"] != two["session_id"]
+
+
+def test_harnessd_listing_merges_terminal_and_structured_sessions(daemon):
+    _, terminal = _shell(daemon)
+    _, structured = request(
+        daemon,
+        "/sessions",
+        payload={
+            "harness": "claude-code",
+            "mode": "structured",
+            "cwd": str(daemon.root),
+        },
+    )
+    status, inventory = request(daemon, "/sessions")
+    assert status == 200
+    listed = {item["session_id"]: item for item in inventory["sessions"]}
+    assert (
+        listed[terminal["session_id"]]["mode"],
+        listed[structured["session_id"]]["mode"],
+    ) == (
+        "pty",
+        "structured",
+    )

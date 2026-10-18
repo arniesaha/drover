@@ -6,8 +6,8 @@ import json
 import subprocess
 import sys
 
-from .test_harnessd_contract import request
 from .support import wait_until
+from .test_harnessd_contract import request
 
 
 def test_structured_launch_cannot_bypass_a_missing_adapter(daemon):
@@ -134,3 +134,37 @@ def test_missing_structured_executable_turn_returns_json_and_marks_session_error
     assert status in {202, 502}
     if status == 502:
         assert body["error"].startswith("structured harness launch failed:")
+
+
+def test_initial_structured_executable_error_closes_entry_and_cleans_worktree(daemon):
+    repo = daemon.root / "failing-repo"
+    repo.mkdir()
+    (repo / "file.txt").write_text("base\n")
+    for command in (
+        ["git", "init", str(repo)],
+        ["git", "-C", str(repo), "config", "user.email", "contract@example.test"],
+        ["git", "-C", str(repo), "config", "user.name", "Contract"],
+        ["git", "-C", str(repo), "add", "file.txt"],
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+    ):
+        subprocess.run(command, check=True, capture_output=True)
+    status, created = request(
+        daemon,
+        "/sessions",
+        payload={
+            "harness": "codex",
+            "mode": "structured",
+            "cwd": str(repo),
+            "command": ["/definitely/not-a-command"],
+        },
+    )
+    assert status == 201
+    worktree = daemon.root / "worktrees" / created["session_id"]
+    status, body = request(
+        daemon, f"/sessions/{created['session_id']}/turns", payload={"text": "start"}
+    )
+    assert (status, body["error"].startswith("structured harness launch failed:")) == (
+        502,
+        True,
+    )
+    assert not worktree.exists()

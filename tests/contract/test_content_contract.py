@@ -114,6 +114,19 @@ def test_content_consent_control_is_fail_closed_without_daemon_token(daemon):
 
 @pytest.mark.parametrize(
     "daemon",
+    [{"advisory_target_text": "configured content\n", "no_central": True}],
+    indirect=True,
+)
+def test_harnessd_cli_passes_content_consent_config_to_server(daemon):
+    status, bundle = request(
+        daemon, "/advisory/content-bundle", payload={"target_ids": ["AGENTS.md"]}
+    )
+    assert status == 200
+    assert bundle["targets"][0]["redacted_content"] == "configured content\n"
+
+
+@pytest.mark.parametrize(
+    "daemon",
     [
         {
             "advisory_target_text": "content\n",

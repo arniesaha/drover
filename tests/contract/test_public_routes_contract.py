@@ -140,3 +140,33 @@ def test_harnessd_health_and_capabilities(daemon):
     harnesses = {harness["name"]: harness for harness in body["harnesses"]}
     assert harnesses["shell"]["enabled"] is True
     assert harnesses["codex"]["enabled"] is True
+
+
+def test_every_offered_preset_can_actually_be_driven(daemon):
+    status, capabilities = request(daemon, "/capabilities")
+    assert status == 200
+    offered = {item["name"] for item in capabilities["harnesses"] if item["enabled"]}
+    assert {"shell", "claude-code", "codex", "agy"} <= offered
+
+    for harness in ("claude-code", "codex", "agy"):
+        status, created = request(
+            daemon,
+            "/sessions",
+            payload={"harness": harness, "mode": "structured", "cwd": str(daemon.root)},
+        )
+        assert status == 201
+        assert (
+            request(daemon, f"/sessions/{created['session_id']}/terminate", payload={})[
+                0
+            ]
+            == 200
+        )
+
+    status, shell = request(
+        daemon, "/sessions", payload={"harness": "shell", "cwd": str(daemon.root)}
+    )
+    assert status == 201
+    assert (
+        request(daemon, f"/sessions/{shell['session_id']}/terminate", payload={})[0]
+        == 200
+    )
