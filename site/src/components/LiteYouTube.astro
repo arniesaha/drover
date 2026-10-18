@@ -3,55 +3,57 @@
 // Does not load third-party scripts, stylesheets, or iframes until the user explicitly clicks play.
 // This preserves zero runtime third-party requests on initial page load and keeps mobile Lighthouse >= 90.
 
+import { SITE } from '../site';
+
 interface Props {
-  videoId?: string;
+  videoId?: string | null;
   title?: string;
   caption?: string;
 }
 
-// TODO: Replace placeholder YouTube video ID with production walkthrough video ID when recorded.
 const {
-  videoId = 'placeholder-drover-walkthrough',
+  videoId = SITE.walkthroughVideoId,
   title = 'Drover in 3 minutes: Multi-machine fleet and continuity walkthrough',
   caption = '3-minute walkthrough: Orchestrators, fleet execution, and iOS control',
 } = Astro.props;
 ---
 
-<!-- TODO: Replace placeholder YouTube video ID with production video ID when recorded -->
-<div class="lyt-wrapper">
-  <div
-    class="lyt-container"
-    data-video-id={videoId}
-    data-video-title={title}
-    role="region"
-    aria-label={title}
-  >
-    <div class="lyt-poster" aria-hidden="true">
-      <div class="lyt-poster-glow"></div>
-      <div class="lyt-poster-content">
-        <div class="lyt-badge">
-          <span class="dot"></span>
-          <span>Drover Product Walkthrough</span>
+{videoId && (
+  <div class="lyt-wrapper">
+    <div
+      class="lyt-container"
+      data-video-id={videoId}
+      data-video-title={title}
+      role="region"
+      aria-label={title}
+    >
+      <div class="lyt-poster" aria-hidden="true">
+        <div class="lyt-poster-glow"></div>
+        <div class="lyt-poster-content">
+          <div class="lyt-badge">
+            <span class="dot"></span>
+            <span>Drover Product Walkthrough</span>
+          </div>
+          <p class="lyt-title">Drive your coding fleet from your pocket</p>
+          <p class="lyt-subtitle">Claude Code · Codex · OpenClaw · Hermes</p>
         </div>
-        <p class="lyt-title">Drive your coding fleet from your pocket</p>
-        <p class="lyt-subtitle">Claude Code · Codex · OpenClaw · Hermes</p>
+        <div class="lyt-time">3:18</div>
       </div>
-      <div class="lyt-time">3:18</div>
-    </div>
 
-    <button type="button" class="lyt-play" aria-label={`Play video: ${title}`}>
-      <svg viewBox="0 0 68 48" width="68" height="48" aria-hidden="true">
-        <path
-          class="lyt-play-bg"
-          d="M66.52 7.74c-.78-2.93-2.49-5.41-5.42-6.19C55.79.13 34 0 34 0S12.21.13 6.9 1.55c-2.93.78-4.63 3.26-5.42 6.19C.06 13.05 0 24 0 24s.06 10.95 1.48 16.26c.78 2.93 2.49 5.41 5.42 6.19C12.21 47.87 34 48 34 48s21.79-.13 27.1-1.55c2.93-.78 4.64-3.26 5.42-6.19C67.94 34.95 68 24 68 24s-.06-10.95-1.48-16.26z"
-          fill="#1d667a"
-        ></path>
-        <path d="M45 24 27 14v20" fill="#f7ebd8"></path>
-      </svg>
-    </button>
+      <button type="button" class="lyt-play" aria-label={`Play video: ${title}`}>
+        <svg viewBox="0 0 68 48" width="68" height="48" aria-hidden="true">
+          <path
+            class="lyt-play-bg"
+            d="M66.52 7.74c-.78-2.93-2.49-5.41-5.42-6.19C55.79.13 34 0 34 0S12.21.13 6.9 1.55c-2.93.78-4.63 3.26-5.42 6.19C.06 13.05 0 24 0 24s.06 10.95 1.48 16.26c.78 2.93 2.49 5.41 5.42 6.19C12.21 47.87 34 48 34 48s21.79-.13 27.1-1.55c2.93-.78 4.64-3.26 5.42-6.19C67.94 34.95 68 24 68 24s-.06-10.95-1.48-16.26z"
+            fill="#1d667a"
+          ></path>
+          <path d="M45 24 27 14v20" fill="#f7ebd8"></path>
+        </svg>
+      </button>
+    </div>
+    {caption && <p class="lyt-caption">{caption}</p>}
   </div>
-  {caption && <p class="lyt-caption">{caption}</p>}
-</div>
+)}
 
 <script>
   // Dynamic iframe injection only after user click.

@@ -5,6 +5,8 @@ import { LINKS } from '../site';
 
 // Quickstart for connected orchestrators: Claude Code, Codex, OpenClaw, and Hermes.
 // Sourced strictly from repo docs/ and MCP server code.
+// OpenClaw owner plugin and launch bridge are experimental; see docs/openclaw-owner-protocol.md
+// Hermes native client configuration schema is not yet standardized in repo docs; see docs/integrations/openclaw-hermes.md for the generic HTTP/MCP bearer protocol
 ---
 
 <BaseLayout
@@ -291,7 +293,6 @@ state_dir = "~/.openclaw"</code></pre>
           <p>
             Copy this note into the orchestration layer's session bootstrap prompt:
           </p>
-          <!-- TODO: OpenClaw owner plugin and launch bridge are experimental; see docs/openclaw-owner-protocol.md -->
           <div class="term">
             <div class="term-bar"><i></i><i></i><i></i><span>OpenClaw system instructions</span></div>
             <pre><code>{`Before the first task in a new agent session, call the connected Drover MCP tool
@@ -365,7 +366,6 @@ root    = "~/.hermes/profiles/jenny/sessions"</code></pre>
           <p>
             Hermes scripts and adapters can connect to Drover's loopback MCP server using the bundled client:
           </p>
-          <!-- TODO: Hermes native client configuration schema is not yet standardized in repo docs; see docs/integrations/openclaw-hermes.md for the generic HTTP/MCP bearer protocol -->
           <div class="term">
             <div class="term-bar"><i></i><i></i><i></i><span>python / hermes adapter</span></div>
             <pre><code>{`import os

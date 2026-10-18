@@ -4,7 +4,7 @@ import LiteYouTube from '../components/LiteYouTube.astro';
 import HowItWorksDiagram from '../components/HowItWorksDiagram.astro';
 import StoriesSection from '../components/StoriesSection.astro';
 import Icon from '../components/Icon.astro';
-import { LINKS } from '../site';
+import { LINKS, SITE } from '../site';
 
 // The positioning: You meet your orchestrator first (Claude Code, Codex, OpenClaw, Hermes).
 // Drover is the layer below it:
@@ -33,16 +33,17 @@ import { LINKS } from '../site';
     </div>
   </section>
 
-  <section class="section-tight band">
-    <div class="wrap-narrow">
-      <!-- TODO: Replace placeholder YouTube video ID with production video ID when recorded -->
-      <LiteYouTube
-        videoId="placeholder-drover-walkthrough"
-        title="Drover in 3 minutes: Multi-machine fleet and continuity walkthrough"
-        caption="A 3-minute tour of orchestrator dispatch, multi-host execution, and lock-screen approvals."
-      />
-    </div>
-  </section>
+  {SITE.walkthroughVideoId && (
+    <section class="section-tight band">
+      <div class="wrap-narrow">
+        <LiteYouTube
+          videoId={SITE.walkthroughVideoId}
+          title="Drover in 3 minutes: Multi-machine fleet and continuity walkthrough"
+          caption="A 3-minute tour of orchestrator dispatch, multi-host execution, and lock-screen approvals."
+        />
+      </div>
+    </section>
+  )}
 
   <section class="section" id="architecture">
     <div class="wrap">
@@ -243,7 +244,7 @@ import { LINKS } from '../site';
     </div>
   </section>
 
-  <StoriesSection />
+  {SITE.storiesPostUrl && <StoriesSection />}
 
   <section class="section cta">
     <div class="wrap-narrow center">

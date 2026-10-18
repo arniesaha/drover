@@ -9,7 +9,7 @@ import shotLaunch from '../assets/screenshots/ios-launch.png';
 import shotCockpit from '../assets/screenshots/ios-cockpit.png';
 import shotAnalytics from '../assets/screenshots/ios-analytics.png';
 import StoriesSection from '../components/StoriesSection.astro';
-import { LINKS } from '../site';
+import { LINKS, SITE } from '../site';
 
 // The story on this page follows the author's launch article (LINKS.article).
 const tax = [
@@ -287,7 +287,7 @@ const shots = [
     </div>
   </section>
 
-  <StoriesSection />
+  {SITE.storiesPostUrl && <StoriesSection />}
 
   <section class="section cta">
     <div class="wrap-narrow center">

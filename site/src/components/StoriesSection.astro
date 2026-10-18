@@ -1,40 +1,47 @@
 ---
-// Stories stub section linking to real-world experience posts.
-// Placeholder URL marked TODO until Arnab's post is live.
+// Stories section linking to real-world experience posts.
+import { SITE } from '../site';
+
+interface Props {
+  url?: string | null;
+}
+
+const { url = SITE.storiesPostUrl } = Astro.props;
 ---
 
-<!-- TODO: Placeholder URL until published: https://arnabsaha.com/posts/a-saturday-with-drover -->
-<section class="section stories-section" id="stories">
-  <div class="wrap">
-    <div class="stories-head">
-      <span class="eyebrow">Field stories</span>
-      <h2>How people actually use Drover.</h2>
-      <p class="lede">Real notes from developers running multi-machine agent fleets in daily work.</p>
-    </div>
+{url && (
+  <section class="section stories-section" id="stories">
+    <div class="wrap">
+      <div class="stories-head">
+        <span class="eyebrow">Field stories</span>
+        <h2>How people actually use Drover.</h2>
+        <p class="lede">Real notes from developers running multi-machine agent fleets in daily work.</p>
+      </div>
 
-    <div class="grid cols-3 stories-grid">
-      <a
-        class="card story-card"
-        href="https://arnabsaha.com/posts/a-saturday-with-drover"
-        target="_blank"
-        rel="noopener"
-      >
-        <div class="story-tag-row">
-          <span class="tag beta">Story</span>
-          <span class="story-meta">Weekend field test</span>
-        </div>
-        <h3 class="story-title">A Saturday with Drover</h3>
-        <p class="story-desc">
-          Driving a coding-agent fleet from a phone while away from the desk: starting tasks on a home workstation, answering Claude Code approvals on the go, and handing off to Codex when provider quota was exhausted.
-        </p>
-        <div class="story-footer">
-          <span class="story-author">Arnab Saha</span>
-          <span class="story-read">Read post <span aria-hidden="true">-></span></span>
-        </div>
-      </a>
+      <div class="grid cols-3 stories-grid">
+        <a
+          class="card story-card"
+          href={url}
+          target="_blank"
+          rel="noopener"
+        >
+          <div class="story-tag-row">
+            <span class="tag beta">Story</span>
+            <span class="story-meta">Weekend field test</span>
+          </div>
+          <h3 class="story-title">A Saturday with Drover</h3>
+          <p class="story-desc">
+            Driving a coding-agent fleet from a phone while away from the desk: starting tasks on a home workstation, answering Claude Code approvals on the go, and handing off to Codex when provider quota was exhausted.
+          </p>
+          <div class="story-footer">
+            <span class="story-author">Arnab Saha</span>
+            <span class="story-read">Read post <span aria-hidden="true">-></span></span>
+          </div>
+        </a>
+      </div>
     </div>
-  </div>
-</section>
+  </section>
+)}
 
 <style>
   .stories-section {
