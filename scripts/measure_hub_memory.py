@@ -27,6 +27,7 @@ import time
 import tracemalloc
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from sys import platform
 
@@ -54,10 +55,22 @@ PRODUCTION_ENDPOINTS = tuple(
     for metric in ("tokens", "sessions")
 ) + ("/cockpit/overview?days=365", "/insights")
 
+# Opening Analytics starts the selected 365-day rank and the independently
+# rendered overview/insights sections together.  The full sequence above
+# retains the other selectable windows; this batch preserves the contention
+# shape which uncovered the macOS hub-footprint spike.
+CONCURRENT_GATE_ENDPOINTS = (
+    "/analytics?days=365&metric=tokens",
+    "/analytics?days=365&metric=sessions",
+    "/cockpit/overview?days=365",
+    "/insights",
+)
+
 # macOS budgets physical footprint, Linux RSS. The fixture is intentionally
 # lower than the release gate: crossing this value means a hub-owned allocation
 # escaped the disposable reader and needs investigation before rollout.
-HUB_PEAK_BUDGET_BYTES = int(1.5 * 1024**3)
+HUB_PEAK_BUDGET_BYTES = 1024**3
+LOCK_HOLD_BUDGET_SECONDS = 30.0
 
 
 def prepare(root, sessions, spans, files):
@@ -142,6 +155,33 @@ def _request(base: str, path: str) -> dict:
             else {}
         ),
     }
+
+
+def _concurrent_requests(base: str, paths: tuple[str, ...]) -> list[dict]:
+    """Exercise the sections that the app opens concurrently.
+
+    A saturated heavy lane may return its documented 503 immediately.  What
+    matters for the hub guard is that no request remains blocked behind an
+    analytical lock long enough to recreate the historical five-minute hold.
+    """
+
+    def request(path: str) -> dict:
+        try:
+            return _request(base, path)
+        except urllib.error.HTTPError as exc:
+            return {
+                "path": path,
+                "status": exc.code,
+                "seconds": round(time.monotonic() - started[path], 3),
+            }
+
+    started = {path: time.monotonic() for path in paths}
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(paths)) as executor:
+        pending = {executor.submit(request, path): path for path in paths}
+        for future in as_completed(pending):
+            results.append(future.result())
+    return sorted(results, key=lambda result: paths.index(result["path"]))
 
 
 def _oversized_harness_event(server) -> dict:
@@ -352,6 +392,7 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
     requests = []
     path_growth = []
     harness_event_limit_probe = None
+    concurrent_endpoint_requests: list[dict] = []
     try:
         sample("imports")
         # Retain the live instance as the runtime pin/background workers do.
@@ -385,6 +426,13 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
             collector.advisory_service = insights
             server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
             base = f"http://127.0.0.1:{server.server_address[1]}"
+            concurrent_endpoint_requests = _concurrent_requests(
+                base, CONCURRENT_GATE_ENDPOINTS
+            )
+            if max(item["seconds"] for item in concurrent_endpoint_requests) > (
+                LOCK_HOLD_BUDGET_SECONDS
+            ):
+                raise TimeoutError("concurrent analytical request exceeded lock budget")
             deadline = time.monotonic() + minutes * 60
             index = 0
             # Every cycle covers the same 7/30/90/365 ranking shape as the
@@ -445,6 +493,8 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
         spans_enabled=True,
         duration_minutes=minutes,
         endpoint_requests=requests,
+        concurrent_endpoint_requests=concurrent_endpoint_requests,
+        concurrent_lock_hold_budget_seconds=LOCK_HOLD_BUDGET_SECONDS,
         path_growth=path_growth,
         path_growth_summary=_growth_summary(path_growth),
         harness_event_limit_probe=harness_event_limit_probe,

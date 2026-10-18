@@ -113,26 +113,28 @@ const isActive = (href: string) => path === href || path.startsWith(href);
         </div>
         <div class="foot-cols">
           <div>
-            <h4>Product</h4>
+            <h2 class="foot-title">Product</h2>
             <a href="/features/">Features</a>
             <a href="/use-cases/">Use cases</a>
             <a href="/architecture/">Architecture</a>
             <a href="/faq/">FAQ</a>
           </div>
           <div>
-            <h4>Docs</h4>
+            <h2 class="foot-title">Docs</h2>
             <a href="/docs/getting-started/">Getting started</a>
             <a href="/docs/api/">HTTP API</a>
             <a href="/docs/mcp/">MCP</a>
             <a href="/docs/security-privacy/">Security and privacy</a>
           </div>
           <div>
-            <h4>Project</h4>
+            <h2 class="foot-title">Project</h2>
             <a href={LINKS.repo} rel="noopener">GitHub</a>
             <a href={LINKS.article} rel="noopener">Launch article</a>
             <a href={LINKS.changelog} rel="noopener">Changelog</a>
             <a href="/contribute/">Contribute</a>
             <a href={LINKS.securityPolicy} rel="noopener">Security policy</a>
+            <a href="/privacy/">Privacy</a>
+            <a href="/support/">Support</a>
           </div>
         </div>
       </div>
@@ -320,6 +322,7 @@ const isActive = (href: string) => path === href || path.startsWith(href);
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 1.5rem;
   }
+  .foot-cols h2,
   .foot-cols h4 {
     font-family: var(--font-mono);
     font-size: 0.72rem;
@@ -327,6 +330,7 @@ const isActive = (href: string) => path === href || path.startsWith(href);
     text-transform: uppercase;
     color: var(--muted);
     margin-bottom: 0.8rem;
+    font-weight: 600;
   }
   .foot-cols a {
     display: block;

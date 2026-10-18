@@ -207,7 +207,17 @@ class AwaitingTransition:
         return "input" if self.needs_user else "progress"
 
     def allowed(self, mode: str) -> bool:
-        return mode == "all" or self.kind != "progress"
+        """Whether this transition belongs in a device's selected mode.
+
+        ``action`` deliberately means only a live input/approval request.  A
+        terminal state is useful, but it is not an action the person can take;
+        treating it as one made the default mode behave like a reduced version
+        of ``all``.  A digest is a delayed summary of the same state changes as
+        ``all``.
+        """
+        if mode in {"all", "digest"}:
+            return True
+        return mode == "action" and self.needs_user
 
     def alert_title(self) -> str:
         if self.private:
@@ -626,10 +636,12 @@ class APNsSender:
     def set_badge_source(self, counter) -> None:
         self._badge_source = counter
 
-    def _payload(self, transition, badge: int | None) -> bytes:
+    def _payload(
+        self, transition, badge: int | None, *, summary: bool = False
+    ) -> bytes:
         states = transition if isinstance(transition, list) else [transition]
         ids = sorted(state.session_id for state in states)
-        if len(states) == 1:
+        if len(states) == 1 and not summary:
             alert = {"title": states[0].alert_title(), "body": states[0].alert_body()}
             route = {"session_id": ids[0]}
             thread = _collapse_id(ids[0])
@@ -671,8 +683,9 @@ class APNsSender:
         return json.dumps({"aps": aps, **route}, separators=(",", ":")).encode("utf-8")
 
     def _device_payload(self, credential, transition, badge):
-        payload = json.loads(self._payload(transition, badge))
-        if credential.notification_mode == "digest":
+        is_digest = credential.notification_mode == "digest"
+        payload = json.loads(self._payload(transition, badge, summary=is_digest))
+        if is_digest:
             payload["aps"]["interruption-level"] = "active"
         return json.dumps(payload, separators=(",", ":")).encode()
 

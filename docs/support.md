@@ -1,5 +1,7 @@
 # Drover support
 
+A web version of this page is available at https://drover.fyi/support/.
+
 Drover is self-hosted software for one trusted operator and their coding-agent
 fleet. The most useful support report starts with the local setup path and
 keeps credentials and work content out of public channels.
