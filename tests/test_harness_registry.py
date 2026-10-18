@@ -71,6 +71,45 @@ def test_control_registry_adds_event_sequence_and_pending_reconciliation_indexes
     }.issubset(indexes)
 
 
+def test_control_registry_rebuilds_event_indexes_for_legacy_dedup_column(tmp_path):
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        for index_name in (
+            "harness_events_dedup_key",
+            "harness_events_session_seq",
+            "harness_events_reconciliation_pending",
+        ):
+            con.execute(f"DROP INDEX {index_name}")
+        con.execute("ALTER TABLE harness_events DROP COLUMN dedup_key")
+        con.execute(
+            "CREATE INDEX harness_events_session_seq ON harness_events (session_id, seq)"
+        )
+        con.execute(
+            "CREATE INDEX harness_events_reconciliation_pending "
+            "ON harness_events (reconcile_pending, created_at, event_id)"
+        )
+
+        bootstrap_harness_tables(con)
+
+        columns = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('harness_events')").fetchall()
+        }
+        indexes = {
+            row[0]
+            for row in con.execute(
+                "SELECT index_name FROM duckdb_indexes() "
+                "WHERE table_name = 'harness_events'"
+            ).fetchall()
+        }
+    assert "dedup_key" in columns
+    assert {
+        "harness_events_dedup_key",
+        "harness_events_session_seq",
+        "harness_events_reconciliation_pending",
+    }.issubset(indexes)
+
+
 def test_reconciliation_pending_predicate_excludes_acknowledged_events(tmp_path):
     registry, duckdb_path = _registry(tmp_path)
     registry.create_session(

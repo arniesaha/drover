@@ -412,12 +412,15 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
         "normalized_source": "VARCHAR",
         "content_preview": "VARCHAR",
         "seq": "INTEGER",
-        "dedup_key": "VARCHAR",
         "reconciled_at": "TIMESTAMP",
         # A non-null materialized predicate lets DuckDB's ART index service
         # the host outbox cursor.  ART indexes do not index NULL values, so an
         # index beginning with reconciled_at cannot accelerate IS NULL.
         "reconcile_pending": "BOOLEAN NOT NULL DEFAULT TRUE",
+        # Keep the dedupe identity last. DuckDB cannot drop a column while an
+        # index uses a later physical column; the repair command must be able
+        # to add this legacy column back under the reconciliation indexes.
+        "dedup_key": "VARCHAR",
     }
     existing_event_columns = {
         row[1] for row in con.execute("PRAGMA table_info('harness_events')").fetchall()
