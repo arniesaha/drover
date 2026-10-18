@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 
-
 pytestmark = pytest.mark.rust_phase2
 
 
@@ -41,7 +40,9 @@ def _run(binary: Path, home: Path, handoff: Path, *extra: str) -> str:
     return completed.stdout
 
 
-def test_rust_imports_drain_handoff_idempotently_and_dry_run_writes_no_records(tmp_path):
+def test_rust_imports_drain_handoff_idempotently_and_dry_run_writes_no_records(
+    tmp_path,
+):
     binary = _binary()
     handoff = tmp_path / "import.jsonl"
     session = {
@@ -72,7 +73,10 @@ def test_rust_imports_drain_handoff_idempotently_and_dry_run_writes_no_records(t
     home = tmp_path / "home"
     assert "sessions=1 events=1" in _run(binary, home, handoff)
     db = sqlite3.connect(home / ".drover/harnessd/harnessd.sqlite")
-    assert db.execute("SELECT session_id, data FROM sessions").fetchone()[0] == "python-session-1"
+    assert (
+        db.execute("SELECT session_id, data FROM sessions").fetchone()[0]
+        == "python-session-1"
+    )
     assert db.execute("SELECT event_id, dedup_key, seq FROM events").fetchall() == [
         ("python-event-1", "python-dedup-1", 7)
     ]

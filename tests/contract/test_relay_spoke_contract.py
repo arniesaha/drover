@@ -10,6 +10,7 @@ import pytest
 
 from drover.server.harness.relay_protocol import data_frame, open_frame, req_frame
 from drover.server.harness.websocket import recv_json, send_json
+
 from .test_harnessd_contract import request
 
 
@@ -65,13 +66,21 @@ def test_relay_terminal_channel_streams_shell_output_and_input(daemon, fake_hub)
     assert recv_json(sock) == {"kind": "opened", "chan": "shell"}
     attached = recv_json(sock)
     assert attached["kind"] == "data"
-    assert attached["message"] == {"type": "attached", "session_id": session["session_id"]}
+    assert attached["message"] == {
+        "type": "attached",
+        "session_id": session["session_id"],
+    }
     typed = "printf 'relay-%s\\n' ok\n"
     send_json(sock, data_frame("shell", {"type": "input", "data": typed}))
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         message = recv_json(sock)
         data = message.get("message", {}).get("data", "") if message else ""
-        if message and message.get("kind") == "data" and "relay-ok" in data and data != typed:
+        if (
+            message
+            and message.get("kind") == "data"
+            and "relay-ok" in data
+            and data != typed
+        ):
             return
     raise AssertionError("terminal output did not traverse the relay")
