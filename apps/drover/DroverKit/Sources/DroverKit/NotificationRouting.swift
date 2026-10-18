@@ -56,6 +56,20 @@ public enum NotificationMode: String, CaseIterable, Codable, Sendable {
     public func save(in store: UserDefaults = .standard) {
         store.set(rawValue, forKey: "drover.push.mode")
     }
+
+    /// Whether an immediate, on-device session alert belongs to this mode.
+    /// Daily digest is produced by the hub; it must not leak an immediate
+    /// local alert while the app is polling in the foreground.
+    public func allowsImmediate(_ kind: SessionNotificationKind) -> Bool {
+        switch self {
+        case .all:
+            true
+        case .action:
+            kind == .input
+        case .digest:
+            false
+        }
+    }
 }
 
 /// Where a tapped notification puts the session it was about, until a screen
