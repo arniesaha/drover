@@ -19,7 +19,7 @@ missing public seam rather than importing daemon internals.
 | `test_model_catalog_is_invalidated_after_auth_mutations_and_successful_poll` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_model_preference_validation_rejects_launch_before_side_effects` | `test_model_preference_validation_rejects_launch_before_side_effects` |
 | `test_model_preference_validation_keeps_null_launch_defaults` | `test_model_preference_validation_keeps_null_launch_defaults` |
-| `test_model_preference_validation_passes_codex_turn_preferences_unchanged` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_model_preference_validation_passes_codex_turn_preferences_unchanged` | `test_model_preference_validation_passes_codex_turn_preferences_unchanged` |
 | `test_duplicate_turn_skips_attachment_and_preference_side_effects` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_model_preference_validation_preserves_opaque_identifier_whitespace` | `test_model_preference_validation_preserves_opaque_identifier_whitespace` |
 | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` |
