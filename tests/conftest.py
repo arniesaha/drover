@@ -38,10 +38,50 @@ _HOMEBREW_BINDIRS = (
 
 def pytest_addoption(parser):
     parser.addoption(
+        "--daemon",
+        choices=("py", "rust"),
+        default=None,
+        help="Select the black-box harnessd implementation (py or rust).",
+    )
+    parser.addoption(
         "--require-pgvector",
         action="store_true",
         help="Require an explicit disposable PostgreSQL DSN and fail on any skip.",
     )
+
+
+# These are intentionally existing public contracts, not a parallel Rust-only
+# test suite.  The MVP advertises only shell and Codex, so Claude/Agy/auth and
+# advisory cases remain outside its capability envelope until later slices.
+_RUST_PHASE2 = (
+    "test_fs_contract.py::test_fs_",
+    "test_model_selection_contract.py::test_",
+    "test_sessions_public_contract.py::test_shell_",
+    "test_sessions_public_contract.py::test_client_session_key_",
+    "test_sessions_public_contract.py::test_unkeyed_",
+    "test_harnessd_contract.py::test_launcher_announces_",
+    "test_harnessd_contract.py::test_auth_and_top_level_",
+    "test_harnessd_contract.py::test_inventory_cursor_",
+    "test_structured_launch_contract.py::test_structured_launch_cannot_",
+    "test_structured_launch_contract.py::test_structured_codex_session_",
+    "test_request_validation_contract.py::test_harnessd_sessions_cors_",
+    "test_native_history_contract.py::test_discovers_codex_",
+    "test_native_history_contract.py::test_native_sessions_query_",
+    "test_relay_spoke_contract.py::test_relay_",
+)
+
+
+def pytest_configure(config):
+    selected = config.getoption("--daemon")
+    if selected:
+        os.environ["HARNESSD_IMPL"] = "rs" if selected == "rust" else "py"
+    config.addinivalue_line("markers", "rust_phase2: shell + Codex Rust MVP contract")
+
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if any(fragment in item.nodeid for fragment in _RUST_PHASE2):
+            item.add_marker(pytest.mark.rust_phase2)
 
 
 @pytest.hookimpl(hookwrapper=True)
