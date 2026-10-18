@@ -2,6 +2,8 @@
 
 Last reviewed: 2026-09-05
 
+A web version of this page is available at https://drover.fyi/privacy/.
+
 Drover is self-hosted software for a trusted personal fleet of coding agents.
 The iOS app connects to a Drover hub that you or another operator run; it does
 not require a Drover-operated cloud account. This page describes the data
