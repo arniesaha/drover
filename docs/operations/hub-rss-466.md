@@ -78,14 +78,16 @@ view bind: selecting DuckLake lowers this fixture's startup high-water mark by
 10.12 MiB. The log sequence above attributes the production-scale source; the
 regression test prevents a DuckLake-selected server from calling that bind again.
 
-### Five-minute app-route comparison
+### Baseline app-route comparison
 
-Each process polled the three exact app routes every 30 seconds for at least
-five minutes. `/cockpit/overview` contains popular projects, `/analytics`
-contains distribution analytics, and `/insights` is the advisory poll. The
-default completed ten cycles (30 requests). A second process deliberately
-disabled clone support (`--live-reader`) to exercise the in-hub fallback;
-because its scans take longer it completed nine cycles (27 requests).
+The historical figures below are a three-route baseline: each process polled
+`/cockpit/overview`, `/analytics`, and `/insights` every 30 seconds for at
+least five minutes. The current harness is stricter: it runs both analytics
+rankings for every production day window, then the 365-day overview and
+insights. The baseline default completed ten cycles (30 requests). A second
+process deliberately disabled clone support (`--live-reader`) to exercise the
+in-hub fallback; because its scans take longer it completed nine cycles (27
+requests).
 
 | Reader | Parent footprint, views → idle | Lifetime footprint peak | Parent RSS at idle |
 | --- | ---: | ---: | ---: |
@@ -126,9 +128,9 @@ These values are not a production extrapolation and do not claim to explain the
 Studio's 6–8 GB RSS. They establish the equivalent legacy fixture property:
 the clone-backed disposable reader does not retain its analytical allocation in
 the parent. `tests/test_hub_rss_measurement.py` additionally starts the normal
-HTTP handler on a fully private, pinned DuckLake fixture and verifies all three
-app polls, including insights. Its two heavy routes use bounded disposable
-children. The `QueryLimits` contract
+HTTP handler on a fully private, pinned DuckLake fixture and verifies every
+configured app poll, including insights. Its two heavy route families use
+bounded disposable children. The `QueryLimits` contract
 remains the release bound: one admitted child, at most five seconds, 2 GiB
 child RSS, 1,000 rows and 1 MiB result bytes.
 
@@ -150,7 +152,8 @@ left to the production instrumentation below.
 | Legacy control exporter, day-summary/usage maintenance | Can open the live analytical instance | Not the selected DuckLake serving path; retirement/gates disable legacy derived writes after selected activation. |
 | Metrics, readiness, cockpit/provider responses | In-process, bounded single-entry/finite-variant caches | Cockpit holds one activity and one provider response; readiness one verdict; harness rendering has finite variants. |
 
-The harness prints `path_growth_summary` for the three exercised routes. It is
+The harness prints `path_growth_summary` for the three exercised route
+families. It is
 bracketed observation, not causal attribution: requests are sequential and one
 route's final sample includes prior routes' work. The individual before/after
 samples remain in `path_growth`.
