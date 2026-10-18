@@ -178,6 +178,10 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
 
     home = tmp_path / "home"
     home.mkdir()
+    for relative, contents in options.get("home_files", {}).items():
+        path = home / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
     data = tmp_path / "data"
     config = tmp_path / "config.toml"
     advisory_target = None

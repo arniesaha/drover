@@ -75,10 +75,10 @@ missing public seam rather than importing daemon internals.
 | `test_resolve_harness_presets_discovers_nvm_clis_and_preserves_node_path` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_resolve_harness_presets_enables_versioned_claude_cli` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_native_resume_launches_through_the_structured_adapter` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_discovers_claude_native_resume_sessions` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
+| `test_discovers_claude_native_resume_sessions` | `test_discovers_claude_native_resume_sessions` |
 | `test_reads_claude_jsonl_native_transcript` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_reads_codex_jsonl_native_transcript` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_discovers_codex_native_resume_sessions` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
+| `test_discovers_codex_native_resume_sessions` | `test_discovers_codex_native_resume_sessions` |
 | `test_native_history_metadata_refuses_sources_beyond_its_configured_hard_cap` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_harnessd_creates_shell_session` | `test_shell_create_get_list_and_terminate` |
 | `test_harnessd_lists_and_gets_live_sessions` | `test_shell_create_get_list_and_terminate` |
