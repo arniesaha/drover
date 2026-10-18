@@ -8,7 +8,8 @@ import shotFleet from '../assets/screenshots/ios-fleet.png';
 import shotLaunch from '../assets/screenshots/ios-launch.png';
 import shotCockpit from '../assets/screenshots/ios-cockpit.png';
 import shotAnalytics from '../assets/screenshots/ios-analytics.png';
-import { LINKS } from '../site';
+import StoriesSection from '../components/StoriesSection.astro';
+import { LINKS, SITE } from '../site';
 
 // The story on this page follows the author's launch article (LINKS.article).
 const tax = [
@@ -286,13 +287,16 @@ const shots = [
     </div>
   </section>
 
+  {SITE.storiesPostUrl && <StoriesSection />}
+
   <section class="section cta">
     <div class="wrap-narrow center">
       <h2>Keep the path from thought to action short.</h2>
       <div class="btn-row cta-row">
-        <a class="btn" href="/docs/getting-started/">Get started</a>
+        <a class="btn" href="/how-it-works/">How it works</a>
+        <a class="btn ghost" href="/quickstart/">Quickstart</a>
+        <a class="btn ghost" href="/docs/getting-started/">Get started</a>
         <a class="btn ghost" href={LINKS.repo} rel="noopener">GitHub</a>
-        <a class="btn ghost" href={LINKS.article} rel="noopener">Launch article</a>
       </div>
     </div>
   </section>
