@@ -41,7 +41,8 @@ public struct SessionCardPresentation: Sendable, Equatable {
     /// The one loud thing on the row.
     public let title: String
 
-    /// `harness · host · state`, quiet. Never repeats what the title says.
+    /// `state · host · harness`, quiet. Never repeats what the title says.
+    /// State is placed first so it is never truncated on narrow screens.
     public let subtitle: String
 
     /// The single verb the card offers — or `nil` when the snapshot it was
@@ -95,8 +96,11 @@ public struct SessionCardPresentation: Sendable, Equatable {
 
         let attention = session.attention
         let state = Self.statePhrase(attention, species: species)
+        let shortHost = Self.shortHostTitle(hostTitle)
         let path = Self.abbreviatedPath(session.cwd)
-        var subtitleParts = [Self.nonEmpty(harness.name), Self.nonEmpty(hostTitle)].compactMap { $0 }
+        let harnessName = Self.nonEmpty(harness.name)
+        let hostName = Self.nonEmpty(shortHost)
+        var subtitleParts: [String] = []
 
         switch species {
         case .conversation:
@@ -109,10 +113,17 @@ public struct SessionCardPresentation: Sendable, Equatable {
             case .done, .errored: .resume
             }
             action = freshness.isStale ? nil : verb
-            if let titleText = Self.firstLine(of: session.recap) ?? Self.firstLine(of: session.preview) {
-                title = titleText
-                isTitlePlaceholder = false
-                subtitleParts.append(state)
+            if let rawTitle = Self.firstLine(of: session.recap) ?? Self.firstLine(of: session.preview) {
+                let cleaned = Self.cleanMarkdownTitle(rawTitle)
+                if !cleaned.isEmpty {
+                    title = cleaned
+                    isTitlePlaceholder = false
+                    subtitleParts = [state, hostName, harnessName].compactMap { $0 }
+                } else {
+                    title = state.capitalizedFirst
+                    isTitlePlaceholder = true
+                    subtitleParts = [harnessName, hostName].compactMap { $0 }
+                }
             } else {
                 // With no preview the state *is* the only real information, so
                 // it gets promoted to the loud line rather than duplicated into
@@ -120,6 +131,7 @@ public struct SessionCardPresentation: Sendable, Equatable {
                 // the row still says exactly one thing.
                 title = state.capitalizedFirst
                 isTitlePlaceholder = true
+                subtitleParts = [harnessName, hostName].compactMap { $0 }
             }
 
         case .terminal:
@@ -130,7 +142,7 @@ public struct SessionCardPresentation: Sendable, Equatable {
                 kicker = path
                 title = lastLine
                 isTitlePlaceholder = false
-                subtitleParts.append(state)
+                subtitleParts = [state, hostName, harnessName].compactMap { $0 }
             } else {
                 // Nothing has been printed yet, so the working directory is
                 // the loudest true thing about this shell. It moves up into
@@ -139,8 +151,7 @@ public struct SessionCardPresentation: Sendable, Equatable {
                 kicker = nil
                 title = path ?? "\(harness.name) session"
                 isTitlePlaceholder = true
-                subtitleParts.append(state)
-                subtitleParts.append("no output yet")
+                subtitleParts = [state, hostName, harnessName, "no output yet"].compactMap { $0 }
             }
         }
 
@@ -208,6 +219,75 @@ public struct SessionCardPresentation: Sendable, Equatable {
     private static func nonEmpty(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    // MARK: - Markdown Title Cleaning
+
+    /// Strips leading markdown headings (`# `, `## `, etc.) and emphasis wrappers
+    /// (`**`, `*`, `__`, `_`, `` ` ``, `~~`) from derived card titles so raw
+    /// formatting syntax does not leak into the inbox view.
+    public static func cleanMarkdownTitle(_ text: String) -> String {
+        var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        // Strip leading markdown headings: #, ##, ###, etc.
+        if trimmed.hasPrefix("#") {
+            let withoutHashes = trimmed.drop(while: { $0 == "#" })
+            trimmed = withoutHashes.trimmingCharacters(in: .whitespaces)
+        }
+
+        // Strip blockquote markers if present
+        while trimmed.hasPrefix(">") {
+            trimmed = trimmed.dropFirst().trimmingCharacters(in: .whitespaces)
+        }
+
+        // Strip matching pairs of wrapping emphasis / formatting
+        let wrappers = ["***", "___", "**", "__", "*", "_", "```", "`", "~~"]
+        var changed = true
+        while changed {
+            changed = false
+            for w in wrappers {
+                if trimmed.count >= w.count * 2 && trimmed.hasPrefix(w) && trimmed.hasSuffix(w) {
+                    trimmed = String(trimmed.dropFirst(w.count).dropLast(w.count)).trimmingCharacters(in: .whitespaces)
+                    changed = true
+                    break
+                }
+            }
+        }
+
+        // Strip any remaining dangling leading/trailing emphasis markers
+        for w in wrappers {
+            if trimmed.hasPrefix(w) {
+                trimmed = String(trimmed.dropFirst(w.count)).trimmingCharacters(in: .whitespaces)
+            }
+            if trimmed.hasSuffix(w) {
+                trimmed = String(trimmed.dropLast(w.count)).trimmingCharacters(in: .whitespaces)
+            }
+        }
+
+        return trimmed
+    }
+
+    // MARK: - Host Shortening
+
+    /// Shortens machine titles so the footer subtitle never truncates the state
+    /// on iPhone screen widths (e.g. "Arnabs-Mac-Studio" -> "Studio").
+    public static func shortHostTitle(_ title: String) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+
+        // Hyphenated names e.g. "Arnabs-Mac-Studio" -> "Studio"
+        let parts = trimmed.split(separator: "-").map(String.init)
+        if parts.count > 1, let last = parts.last, !last.isEmpty, last.count <= 10 {
+            return last
+        }
+
+        // Space-separated names containing "Studio" e.g. "Arnab's Mac Studio" -> "Studio"
+        if trimmed.localizedCaseInsensitiveContains("Studio") {
+            return "Studio"
+        }
+
+        return trimmed
     }
 }
 

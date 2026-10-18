@@ -30,6 +30,7 @@ struct ProviderCapacitySection: View {
                     .foregroundStyle(DroverColor.muted)
                     .accessibilityHidden(true)
             }
+            .padding(.horizontal, 10)
             .accessibilityHidden(true)
             .overlay {
                 // Enlarge the navigation target without growing the pinned pane.
@@ -51,11 +52,13 @@ struct ProviderCapacitySection: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .padding(.horizontal, 10)
                 .accessibilityLabel(preview.meters.first.map { meterLabel($0, degraded: degraded) } ?? "Capacity unavailable")
                 .accessibilityIdentifier("lowest-account-meter")
             } else if preview.meters.isEmpty {
                 Text(degraded ? "Capacity unavailable · View details" : "No reported accounts")
                     .droverText(.subtitle)
+                    .padding(.horizontal, 10)
             } else {
                 ScrollView(.horizontal) {
                     HStack(alignment: .top, spacing: 16) {
@@ -72,15 +75,17 @@ struct ProviderCapacitySection: View {
                         }
                     }
                 }
+                .contentMargins(.horizontal, 10, for: .scrollContent)
                 .scrollIndicators(.hidden)
                 .accessibilityIdentifier("account-meter-strip")
             }
         }
-        .padding(.horizontal, 10)
         .padding(.vertical, 9)
         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
         .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10))
         .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(DroverColor.line, lineWidth: 1) }
+        .clipShape(RoundedRectangle(cornerRadius: 10))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("provider-capacity-summary")
     }
