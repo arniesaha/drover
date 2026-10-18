@@ -204,6 +204,10 @@ def _dispatch_awaiting_push(
     status: str = "",
     private: bool = False,
     repo_name: str | None = None,
+    host: str = "",
+    approval_summary: str = "",
+    content_allowed: bool = True,
+    badge_count: int | None = None,
 ) -> None:
     """Tell the push layer a session changed awaiting state.
 
@@ -225,6 +229,10 @@ def _dispatch_awaiting_push(
                 status=status,
                 private=private,
                 repo_name=repo_name,
+                host=host,
+                approval_summary=approval_summary,
+                content_allowed=content_allowed,
+                badge_count=badge_count,
             )
         )
     except Exception:  # noqa: BLE001 - never break activity recording
@@ -1098,7 +1106,11 @@ class HarnessRegistry:
         try:
             with self._connect() as con:
                 row = con.execute(
-                    "SELECT status, repo_name, cwd FROM harness_sessions WHERE session_id = ?",
+                    """SELECT s.status, s.repo_name, s.cwd, h.display_name,
+                               h.capabilities_json
+                         FROM harness_sessions s
+                    LEFT JOIN harness_hosts h ON h.host_id = s.host_id
+                        WHERE s.session_id = ?""",
                     [session_id],
                 ).fetchone()
                 if row is None:
@@ -1134,7 +1146,9 @@ class HarnessRegistry:
                 # Profile reads taint only the conversation that made the call.
                 # Until tools carry result tiers, any profile read is conservative.
                 private = self._session_read_profile(con, session_id)
+                content_allowed = self._notification_content_allowed(row[4])
                 title = ""
+                approval_summary = ""
                 if not private:
                     prompt = con.execute(
                         "SELECT content_preview FROM harness_events WHERE session_id = ? AND event_type = 'user_input' "
@@ -1152,6 +1166,15 @@ class HarnessRegistry:
                         "errored",
                     }:
                         preview = self._attention_preview(con, session_id)
+                    if awaiting == "approval":
+                        approval_summary = self._approval_notification_summary(
+                            con, session_id, str(row[1] or row[2] or "")
+                        )
+                badge_row = con.execute(
+                    """SELECT count(*) FROM harness_sessions
+                         WHERE awaiting IN ('input', 'approval')
+                           AND status NOT IN ('completed', 'terminated', 'errored', 'failed')"""
+                ).fetchone()
                 _dispatch_awaiting_push(
                     session_id=session_id,
                     awaiting=awaiting,
@@ -1162,6 +1185,10 @@ class HarnessRegistry:
                     status=notification_status,
                     private=private,
                     repo_name=row[1],
+                    host=str(row[3] or harness or ""),
+                    approval_summary=approval_summary,
+                    content_allowed=content_allowed,
+                    badge_count=int(badge_row[0] or 0),
                 )
         except Exception:  # Notification privacy checks fail closed.
             _dispatch_awaiting_push(
@@ -1171,7 +1198,77 @@ class HarnessRegistry:
                 cwd=None,
                 status=status or "",
                 private=True,
+                content_allowed=False,
             )
+
+    @staticmethod
+    def _approval_notification_summary(con, session_id: str, project: str) -> str:
+        """Return the smallest useful approval description, never raw payload.
+
+        Harnesses disagree on the nesting and names of approval fields. This
+        intentionally recognizes only command/tool + target shapes and leaves
+        the app as the authority for everything else.
+        """
+        payload_expr = event_payload_expression(con)
+        row = con.execute(
+            f"""SELECT {payload_expr} FROM harness_events e {event_payload_join(con)}
+                  WHERE e.session_id = ? AND e.event_type = 'approval_prompt'
+               ORDER BY COALESCE(e.seq, 0) DESC, e.created_at DESC, e.event_id DESC
+                  LIMIT 1""",
+            [session_id],
+        ).fetchone()
+        if row is None:
+            return ""
+        try:
+            value = json.loads(str(row[0] or "{}"))
+        except (TypeError, ValueError):
+            return ""
+        while isinstance(value, dict) and isinstance(value.get("payload"), dict):
+            value = value["payload"]
+        if not isinstance(value, dict):
+            return ""
+        input_value = value.get("input")
+        if not isinstance(input_value, dict):
+            input_value = {}
+        command = value.get("command") or input_value.get("command")
+        tool = value.get("tool") or value.get("tool_name") or value.get("name")
+        target = value.get("target") or input_value.get("target") or project
+        if isinstance(command, str) and command.strip():
+            return f"Approve: run `{command.strip()}`" + (
+                f" in {str(target).strip()}" if target else ""
+            )
+        if isinstance(tool, str) and tool.strip():
+            return f"Approve: {tool.strip()}" + (
+                f" in {str(target).strip()}" if target else ""
+            )
+        return ""
+
+    @staticmethod
+    def _notification_content_allowed(capabilities: Any) -> bool:
+        """Honor an explicit host notification-content consent denial.
+
+        The hub's durable consent reader is the authoritative gate. Hosts
+        currently do not normally advertise this optional marker, so an
+        absent or malformed capability must defer to that reader rather than
+        pretending the host made a consent decision. An explicit false still
+        wins as the more-specific restriction.
+        """
+        try:
+            value = (
+                json.loads(capabilities)
+                if isinstance(capabilities, str)
+                else capabilities
+            )
+        except (TypeError, ValueError):
+            return True
+        if not isinstance(value, dict):
+            return True
+        marker = value.get("notification_content_consent", value.get("content_consent"))
+        if marker is None:
+            return True
+        if isinstance(marker, dict):
+            marker = marker.get("enabled")
+        return marker is not False
 
     @staticmethod
     def _session_read_profile(con, session_id: str) -> bool:
