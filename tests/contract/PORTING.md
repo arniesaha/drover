@@ -51,7 +51,7 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_provider_usage_reports_codex_cli_not_found` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default` | `test_auth_and_top_level_error_envelopes` |
-| `test_harnessd_content_bundle_requires_configured_token_even_when_enabled` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_content_bundle_requires_configured_token_even_when_enabled` | dropped: the launcher always passes `--host-token`; a no-token fixture is needed to exercise `/advisory/content-bundle` after enabling consent |
 | `test_running_harnessd_applies_live_consent_and_revoke_without_restart` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_content_consent_override_survives_restart_and_rejects_stale_enable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_unknown_epoch_is_idempotent_disabled_and_cannot_enable` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
@@ -60,12 +60,12 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_auth_status_route` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_auth_status_route` | `test_public_route_validation` |
 | `test_harnessd_auth_start_poll_and_cancel` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_harnessd_auth_routes_require_bearer_token` | `test_auth_routes_require_bearer_token` |
 | `test_harnessd_auth_status_unknown_harness_returns_404` | `test_auth_public_error_routes` |
-| `test_harnessd_auth_status_unavailable_returns_404` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_auth_status_decodes_harness_path` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_auth_status_unavailable_returns_404` | dropped: fake `claude` and `agy` executables make both providers available; a configurable unavailable-auth CLI fixture is needed |
+| `test_harnessd_auth_status_decodes_harness_path` | `test_public_route_validation` |
 | `test_harnessd_auth_flow_unknown_id_returns_404` | `test_auth_public_error_routes` |
 | `test_harnessd_auth_start_unsupported_returns_400` | `test_auth_public_error_routes` |
 | `test_harnessd_auth_start_launch_failure_returns_structured_500` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
@@ -104,10 +104,10 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_can_terminate_restart_lost_structured_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_terminates_live_session_and_updates_registry` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_delete_terminates_live_session` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_sessions_cors_preflight_and_post_headers` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_sessions_cors_preflight_and_post_headers` | `test_harnessd_sessions_cors_preflight_and_post_headers` |
 | `test_harnessd_creates_in_memory_session_when_registry_is_locked` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_harnessd_rejects_disabled_harness` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_enabled_preset_is_not_terminal_launchable_without_advertised_pty` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_rejects_disabled_harness` | `test_public_route_validation` |
+| `test_enabled_preset_is_not_terminal_launchable_without_advertised_pty` | `test_public_route_validation` |
 | `test_daemon_rejects_unauthenticated_when_token_set` | `test_auth_and_top_level_error_envelopes` |
 | `test_daemon_accepts_bearer` | `test_auth_and_top_level_error_envelopes` |
 | `test_daemon_healthz_open` | `test_launcher_announces_bound_port_and_registers` |
@@ -120,9 +120,9 @@ missing public seam rather than importing daemon internals.
 | `test_structured_command_preferences_map_to_cli_flags` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_turn_with_image_saves_file_and_appends_path` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_image_only_turn_is_accepted` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_turn_with_bad_base64_is_rejected` | `test_structured_launch_validation_contract` |
-| `test_turn_with_unsupported_media_type_is_rejected` | `test_structured_launch_validation_contract` |
-| `test_empty_turn_still_rejected` | `test_structured_launch_validation_contract` |
+| `test_turn_with_bad_base64_is_rejected` | `test_structured_launch_rejects_invalid_turn_input` |
+| `test_turn_with_unsupported_media_type_is_rejected` | `test_structured_launch_rejects_invalid_turn_input` |
+| `test_empty_turn_still_rejected` | `test_empty_turn_still_rejected` |
 | `test_structured_unknown_harness_rejected` | `test_structured_launch_validation_contract` |
 | `test_structured_launch_cannot_bypass_a_missing_adapter` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_structured_launch_rejects_unknown_worktree_policy` | dropped: requires pre-seeding or faulting durable daemon state before startup |
