@@ -699,6 +699,15 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        21,
+        (
+            "ALTER TABLE harness_events ADD COLUMN IF NOT EXISTS reconcile_pending BOOLEAN NOT NULL DEFAULT TRUE",
+            "UPDATE harness_events SET reconcile_pending = reconciled_at IS NULL WHERE reconcile_pending IS DISTINCT FROM (reconciled_at IS NULL)",
+            "CREATE INDEX IF NOT EXISTS harness_events_session_seq ON harness_events (session_id, seq)",
+            "CREATE INDEX IF NOT EXISTS harness_events_reconciliation_pending ON harness_events (reconcile_pending, created_at, event_id)",
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

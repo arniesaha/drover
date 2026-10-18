@@ -46,6 +46,68 @@ def postgres_control_store(tmp_path: Path, monkeypatch, postgres_dsn):
             con.execute(f'DROP SCHEMA IF EXISTS "{config.schema}" CASCADE')
 
 
+def test_postgres_harness_reconciliation_pending_and_retention(
+    postgres_control_store,
+):
+    """The Phase-0 host ledger path works against the PostgreSQL registry."""
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.registry import HarnessRegistry
+
+    path, _ = postgres_control_store
+    registry = HarnessRegistry(path)
+    registry.register_host(host_id="reconcile-host", display_name="Host", kind="test")
+    registry.create_session(
+        session_id="reconcile-session",
+        host_id="reconcile-host",
+        harness="codex",
+        command="codex",
+        mode="structured",
+    )
+    for event_id, seq in (("pending", 1), ("acknowledged", 2)):
+        registry.append_event(
+            session_id="reconcile-session",
+            event_id=event_id,
+            event_type="assistant_output",
+            payload={"text": event_id},
+            seq=seq,
+        )
+
+    assert [event.event_id for event in registry.list_events_for_reconciliation()] == [
+        "pending",
+        "acknowledged",
+    ]
+    registry.mark_events_reconciled(["acknowledged"])
+    assert [event.event_id for event in registry.list_events_for_reconciliation()] == [
+        "pending"
+    ]
+
+    with control_plane_connection(path) as con:
+        assert con.execute(
+            "SELECT reconcile_pending FROM harness_events WHERE event_id = ?",
+            ["acknowledged"],
+        ).fetchone() == (False,)
+        con.execute(
+            "UPDATE harness_events SET reconciled_at = now() - INTERVAL '8 days' "
+            "WHERE event_id = ?",
+            ["acknowledged"],
+        )
+        indexes = {
+            row[0]
+            for row in con.execute(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = current_schema() AND tablename = 'harness_events'"
+            ).fetchall()
+        }
+
+    assert {
+        "harness_events_session_seq",
+        "harness_events_reconciliation_pending",
+    }.issubset(indexes)
+    assert registry.prune_reconciled_events() == 1
+    assert registry.get_event("acknowledged") is None
+    assert registry.get_event("pending") is not None
+
+
 @pytest.fixture
 def postgres_single_connection_control_store(tmp_path: Path, monkeypatch, postgres_dsn):
     """A one-slot store proves archive RPCs cannot hold API connections."""

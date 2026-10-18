@@ -26,6 +26,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    21: "42d91d83f3d63eb950e383968934737fe439429c0be69362ad5d1b01e04b463c",
     20: "c95db9e518f8e9ea47ee4dc79dfbea63b48993a027b61613f0a6f88845920d13",
     EXPORTER_RESTART_GUARD_MIGRATION: "095352196aeecf2c6f86e819465f33f993e54b4bcfceda46dc65f9bb245d31b8",
     18: "6e9b1d706f78fd8674e913da95ca6bc5ceb88112b0c7c5766f434f5eceed01dc",
@@ -161,6 +162,46 @@ def test_lake_export_batches_migration_11_forward(pg_control_path):
         if vector_extension_schema(con) is not None:
             expected.add(VECTOR_MIGRATION)
         assert versions == sorted(expected)
+
+
+def test_harness_events_reconciliation_migration_21_forward(pg_control_path):
+    """An existing PostgreSQL registry receives the pending cursor additively."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute("ALTER TABLE harness_events DROP COLUMN reconcile_pending")
+        con.execute("DELETE FROM control_schema_migrations WHERE version = 21")
+        con.execute(
+            "INSERT INTO harness_events "
+            "(event_id, session_id, event_type, payload_json, reconciled_at) "
+            "VALUES (?, ?, ?, ?, now())",
+            ["previously-reconciled", "legacy-session", "status", "{}"],
+        )
+
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+
+    with store.connection() as con:
+        assert con.execute(
+            "SELECT reconcile_pending FROM harness_events WHERE event_id = ?",
+            ["previously-reconciled"],
+        ).fetchone() == (False,)
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = 21"
+        ).fetchone() == (1,)
+        indexes = {
+            row[0]
+            for row in con.execute(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = current_schema() AND tablename = 'harness_events'"
+            ).fetchall()
+        }
+    assert {
+        "harness_events_session_seq",
+        "harness_events_reconciliation_pending",
+    }.issubset(indexes)
 
 
 def test_lifecycle_13_fresh_existing_and_rerun(pg_control_path):

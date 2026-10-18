@@ -2667,9 +2667,9 @@ class HarnessRegistry:
                   )
                   AND e.reconcile_pending
                   AND e.reconciled_at IS NULL
-                  AND (? IS NULL OR s.host_id IS NULL OR s.host_id = ?)
+                  AND (CAST(? AS TEXT) IS NULL OR s.host_id IS NULL OR s.host_id = ?)
                   AND (
-                    ? IS NULL
+                    CAST(? AS TIMESTAMPTZ) IS NULL
                     OR e.created_at > ?
                     OR (e.created_at = ? AND e.event_id > ?)
                   )
