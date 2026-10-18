@@ -1,0 +1,388 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import LiteYouTube from '../components/LiteYouTube.astro';
+import HowItWorksDiagram from '../components/HowItWorksDiagram.astro';
+import StoriesSection from '../components/StoriesSection.astro';
+import Icon from '../components/Icon.astro';
+import { LINKS } from '../site';
+
+// The positioning: You meet your orchestrator first (Claude Code, Codex, OpenClaw, Hermes).
+// Drover is the layer below it:
+// 1. Execution on any host with clean worktrees and quota checks.
+// 2. Continuity that survives sessions, models, and machines (the differentiator).
+// 3. Control from your phone (needs-you, approvals, notifications, analytics).
+---
+
+<BaseLayout
+  title="How it works"
+  description="How Drover operates below Claude Code, Codex, OpenClaw and Hermes: multi-host execution, durable continuity across models and machines, and phone control."
+>
+  <section class="page-hero">
+    <div class="wrap">
+      <span class="eyebrow">How it works</span>
+      <h1>You meet your orchestrator first. <span class="hl">Drover is the layer below.</span></h1>
+      <p class="lede">
+        You choose the orchestrator that fits your thinking: Claude Code, OpenClaw, Hermes, or Codex.
+        Drover supplies the execution fleet, continuity across sessions, and your phone control surface.
+      </p>
+      <div class="btn-row hiw-actions">
+        <a class="btn" href="/quickstart/">Orchestrator quickstart</a>
+        <a class="btn ghost" href="#architecture">Architecture flow</a>
+        <a class="btn ghost" href="#continuity">See continuity before and after</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section-tight band">
+    <div class="wrap-narrow">
+      <!-- TODO: Replace placeholder YouTube video ID with production video ID when recorded -->
+      <LiteYouTube
+        videoId="placeholder-drover-walkthrough"
+        title="Drover in 3 minutes: Multi-machine fleet and continuity walkthrough"
+        caption="A 3-minute tour of orchestrator dispatch, multi-host execution, and lock-screen approvals."
+      />
+    </div>
+  </section>
+
+  <section class="section" id="architecture">
+    <div class="wrap">
+      <div class="center-intro">
+        <span class="eyebrow">End-to-end pipeline</span>
+        <h2>From orchestrator prompt to phone approval.</h2>
+        <p class="lede">
+          Four stages connect your high-level intent to hardware execution and mobile steering.
+        </p>
+      </div>
+
+      <HowItWorksDiagram />
+    </div>
+  </section>
+
+  <section class="section band" id="execution">
+    <div class="wrap">
+      <div class="split-head">
+        <div>
+          <span class="eyebrow">01 · Execution</span>
+          <h2>Sessions on any host, with worktrees and quota checks.</h2>
+        </div>
+        <p class="lede">
+          Your orchestrator should not be locked to the machine you are sitting at. Drover lets you run tasks anywhere in your fleet.
+        </p>
+      </div>
+
+      <div class="grid cols-2 exec-grid">
+        <div class="card">
+          <div class="icon"><Icon name="fleet" /></div>
+          <h3>Sessions on any host</h3>
+          <p>
+            Start work on your Mac Studio, a Linux workstation, a remote GPU box, or your laptop.{' '}
+            <code>drover-harnessd</code> runs natively on each host and manages the local agent processes.
+          </p>
+          <p class="card-fine">No fragile remote desktops or manual terminal multiplexing required.</p>
+        </div>
+
+        <div class="card">
+          <div class="icon ember"><Icon name="loop" /></div>
+          <h3>Isolated Git worktrees</h3>
+          <p>
+            Every session in a repository gets its own isolated Git worktree. Concurrent agents can fix bugs, 
+            run tests, and refactor code without stepping on your working branch or each other.
+          </p>
+          <p class="card-fine">Clean branches, clean working copies, and zero file clobbering.</p>
+        </div>
+
+        <div class="card">
+          <div class="icon wheat"><Icon name="profile" /></div>
+          <h3>Harness and model choice</h3>
+          <p>
+            Choose the right harness for the task: Claude Code for interactive turns with permission approvals, 
+            Codex for background worktree automation, Antigravity (<code>agy</code>) for Gemini models, or DeepSeek Harness.
+          </p>
+          <p class="card-fine">Switch models without restructuring your project or prompts.</p>
+        </div>
+
+        <div class="card">
+          <div class="icon"><Icon name="chart" /></div>
+          <h3>Quota-aware routing</h3>
+          <p>
+            Avoid sudden rate limit walls mid-task. Drover tracks provider capacity windows in real time so 
+            your orchestrator can inspect quota before dispatching heavy refactoring jobs.
+          </p>
+          <p class="card-fine">Check quota via MCP <code>drover_provider_quota</code> before you launch.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="continuity">
+    <div class="wrap">
+      <div class="center-intro">
+        <span class="eyebrow">02 · Continuity</span>
+        <h2>Context that survives sessions, models and machines.</h2>
+        <p class="lede">
+          This is Drover's core differentiator. Ordinary agent sessions die when a window closes or quota runs out. 
+          Drover preserves facts, briefs, and files so any agent can pick up where another left off.
+        </p>
+      </div>
+
+      <div class="compare-container">
+        <div class="compare-card before">
+          <div class="compare-header">
+            <span class="compare-badge bad">Without Drover</span>
+            <h3>The retelling tax</h3>
+          </div>
+          <ul class="compare-list">
+            <li>
+              <strong>Context is lost on exit:</strong> When a session hits a rate limit or your laptop closes, the terminal state is gone.
+            </li>
+            <li>
+              <strong>Manual reconstruction:</strong> You have to re-explain the entire task, copy-paste terminal errors, and list which files were edited.
+            </li>
+            <li>
+              <strong>Wasted tokens and churn:</strong> The next model starts from scratch, often repeating attempts that already failed.
+            </li>
+            <li>
+              <strong>Siloed tools:</strong> What Claude Code learned on your laptop remains completely unknown to Codex on your desktop.
+            </li>
+          </ul>
+        </div>
+
+        <div class="compare-card after">
+          <div class="compare-header">
+            <span class="compare-badge good">With Drover</span>
+            <h3>Continuous memory</h3>
+          </div>
+          <ul class="compare-list">
+            <li>
+              <strong>Automatic handoff briefs:</strong> <code>drover_active_handoff</code> captures current objective, files touched, blockers, and next actions.
+            </li>
+            <li>
+              <strong>Instant handoff:</strong> Switch from Claude Code on your laptop to Codex on your workstation in one click. Drover injects the brief.
+            </li>
+            <li>
+              <strong>Cross-model recall:</strong> Any agent can call <code>drover_recall_bundle</code> or <code>drover_search</code> to retrieve past decisions.
+            </li>
+            <li>
+              <strong>Durable event lake:</strong> Every turn, tool invocation, and diff is archived in PostgreSQL and DuckLake parquet files.
+            </li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="grid cols-3 cont-tools">
+        <div class="card">
+          <h3>Handoff briefs</h3>
+          <p>
+            Generate compact summaries with <code>drover_active_handoff</code> while a task is still in flight, 
+            or <code>drover_handoff</code> when closing.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Historical recall</h3>
+          <p>
+            Search prior solutions, error logs, and touched files across the fleet using <code>drover_search</code> 
+            and <code>drover_files_touched</code>.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Portable profile</h3>
+          <p>
+            Inject your developer habits, coding standards, and project constraints into each new session 
+            via <code>drover_profile</code>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section band" id="control">
+    <div class="wrap">
+      <div class="split-head">
+        <div>
+          <span class="eyebrow">03 · Control</span>
+          <h2>The phone as your pocket control surface.</h2>
+        </div>
+        <p class="lede">
+          Coding agents need periodic human steering. The phone is where you make decisions while your fleet runs.
+        </p>
+      </div>
+
+      <div class="grid cols-4 control-grid">
+        <div class="card">
+          <div class="icon ember"><Icon name="phone" /></div>
+          <h3>Needs-you queue</h3>
+          <p>
+            A dedicated triage view in the iOS app highlights sessions that are blocked or waiting on your answer.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="icon teal"><Icon name="shield" /></div>
+          <h3>1-tap approvals</h3>
+          <p>
+            Approve Claude Code bash commands and dangerous file edits directly from notification banners or the app.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="icon wheat"><Icon name="loop" /></div>
+          <h3>Instant alerts</h3>
+          <p>
+            Receive push notifications when a multi-hour build completes, tests fail, or an agent finishes a task.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="icon"><Icon name="chart" /></div>
+          <h3>Fleet analytics</h3>
+          <p>
+            Inspect real-time provider quota windows, token burn per project, and active session distribution across machines.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <StoriesSection />
+
+  <section class="section cta">
+    <div class="wrap-narrow center">
+      <span class="eyebrow">Get started</span>
+      <h2>Ready to connect your orchestrator?</h2>
+      <p class="lede">
+        Follow our quickstart guides for Claude Code, Codex, OpenClaw, and Hermes.
+      </p>
+      <div class="btn-row cta-row">
+        <a class="btn" href="/quickstart/">Orchestrator quickstart</a>
+        <a class="btn ghost" href="/docs/getting-started/">Install Drover hub</a>
+        <a class="btn ghost" href={LINKS.repo} rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .hl {
+    color: var(--ember);
+    font-style: italic;
+  }
+  .hiw-actions {
+    margin-top: 1.6rem;
+  }
+  .center-intro {
+    text-align: center;
+    max-width: 68ch;
+    margin-inline: auto;
+    margin-bottom: 2.5rem;
+  }
+  .split-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+    gap: 2rem;
+    align-items: baseline;
+    margin-bottom: 2.5rem;
+  }
+  .exec-grid {
+    gap: 1.4rem;
+  }
+  .card-fine {
+    font-size: 0.82rem;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    margin-top: 0.6rem;
+  }
+
+  .compare-container {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  .compare-card {
+    background: var(--surface);
+    border: 1.5px solid var(--line);
+    border-radius: var(--radius-l);
+    padding: 1.8rem;
+    box-shadow: var(--shadow);
+  }
+  .compare-card.before {
+    border-color: color-mix(in srgb, var(--ember) 35%, var(--line));
+    background: color-mix(in srgb, var(--ember-soft) 25%, var(--surface));
+  }
+  .compare-card.after {
+    border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+    background: color-mix(in srgb, var(--surface) 90%, var(--teal-soft));
+  }
+  .compare-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1.2rem;
+    padding-bottom: 0.8rem;
+    border-bottom: 1px dashed var(--line);
+  }
+  .compare-header h3 {
+    margin: 0;
+    font-size: 1.3rem;
+  }
+  .compare-badge {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 0.25rem 0.65rem;
+    border-radius: 999px;
+  }
+  .compare-badge.bad {
+    background: var(--ember-soft);
+    color: var(--ember);
+    border: 1px solid var(--ember);
+  }
+  .compare-badge.good {
+    background: color-mix(in srgb, var(--ok) 20%, transparent);
+    color: var(--ok);
+    border: 1px solid var(--ok);
+  }
+  .compare-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+    font-size: 0.94rem;
+  }
+  .compare-list li {
+    line-height: 1.5;
+    color: var(--text-2);
+  }
+  .compare-list strong {
+    color: var(--text);
+  }
+
+  .cont-tools {
+    margin-top: 1.5rem;
+  }
+  .control-grid {
+    gap: 1.2rem;
+  }
+
+  .cta {
+    background: var(--glow);
+  }
+  .cta-row {
+    justify-content: center;
+    margin-top: 1.5rem;
+  }
+
+  @media (max-width: 900px) {
+    .split-head {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 1rem;
+    }
+    .compare-container {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

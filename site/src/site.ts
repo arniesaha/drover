@@ -31,6 +31,8 @@ export const LINKS = {
 };
 
 export const NAV = [
+  { href: '/how-it-works/', label: 'How it works' },
+  { href: '/quickstart/', label: 'Quickstart' },
   { href: '/features/', label: 'Features' },
   { href: '/use-cases/', label: 'Use cases' },
   { href: '/architecture/', label: 'Architecture' },

@@ -1,0 +1,393 @@
+---
+// Step-by-step architecture flow diagram:
+// Orchestrator -> Drover hub -> hosts (Mac/Linux, harnesses: Claude Code, Codex, Antigravity...) -> phone
+// Progressive enhancement with scroll-driven build-up, zero heavy animation libraries,
+// and full prefers-reduced-motion support.
+
+interface Step {
+  id: string;
+  num: string;
+  badge: string;
+  title: string;
+  summary: string;
+  points: string[];
+  tone: 'teal' | 'ember' | 'wheat';
+}
+
+const steps: Step[] = [
+  {
+    id: 'orchestrator',
+    num: '01',
+    badge: 'Intent & Planning',
+    title: 'Orchestrators',
+    summary: 'You meet your orchestrator first. It plans tasks, writes prompts, and decides what to build.',
+    points: [
+      'Claude Code (lead interactive orchestrator)',
+      'OpenClaw (multi-agent loops & research)',
+      'Hermes and custom automation scripts',
+      'Queries Drover MCP (:7077) for past context',
+    ],
+    tone: 'teal',
+  },
+  {
+    id: 'hub',
+    num: '02',
+    badge: 'Coordination & Memory',
+    title: 'Drover Hub',
+    summary: 'The layer below. drover-server coordinates the fleet, routes operations, and holds durable memory.',
+    points: [
+      'Fleet Router: routes turns; never runs remote commands itself',
+      'PostgreSQL control store: fleet state, sessions, outbox',
+      'DuckLake analytical lake: append-only facts & parquet receipts',
+      'Portable profile: carries preferences across sessions',
+    ],
+    tone: 'ember',
+  },
+  {
+    id: 'hosts',
+    num: '03',
+    badge: 'Execution Fleet',
+    title: 'Hosts & Harnesses',
+    summary: 'drover-harnessd runs on your Mac or Linux machines, managing agent processes and files.',
+    points: [
+      'Any host: Mac Studio, Linux server, laptop, GPU box',
+      'Isolated Git worktrees per session',
+      'Harness choice: Claude Code, Codex, Antigravity, DeepSeek',
+      'Provider quota routing: route to capacity, not rate limits',
+    ],
+    tone: 'teal',
+  },
+  {
+    id: 'phone',
+    num: '04',
+    badge: 'Control Surface',
+    title: 'Phone in Your Pocket',
+    summary: 'The iOS app is where you make decisions while machines do the heavy lifting.',
+    points: [
+      'Needs-you queue: instant view of blocked agents',
+      '1-tap tool approvals for Claude Code turns',
+      'Push alerts when runs finish, fail, or request guidance',
+      'Live cockpit: provider quota windows & token analytics',
+    ],
+    tone: 'wheat',
+  },
+];
+---
+
+<div class="hiw-diagram" id="architecture-flow" role="region" aria-label="Drover architecture and execution flow">
+  <div class="flow-header">
+    <span class="flow-eyebrow">Interactive architecture</span>
+    <p class="flow-lede">Scroll to trace how intent moves from orchestrator to machines and back to your pocket.</p>
+  </div>
+
+  <div class="flow-nav" role="tablist" aria-label="Architecture steps">
+    {steps.map((s, i) => (
+      <button
+        type="button"
+        class={`flow-tab ${i === 0 ? 'is-active' : ''}`}
+        role="tab"
+        aria-selected={i === 0 ? 'true' : 'false'}
+        aria-controls={`step-card-${s.id}`}
+        data-step-target={s.id}
+      >
+        <span class="tab-num">{s.num}</span>
+        <span class="tab-title">{s.title}</span>
+      </button>
+    ))}
+  </div>
+
+  <div class="flow-track" role="list">
+    {steps.map((s, i) => (
+      <article
+        class={`flow-card card tone-${s.tone} ${i === 0 ? 'is-active' : ''}`}
+        id={`step-card-${s.id}`}
+        data-step={s.id}
+        data-index={i}
+        role="listitem"
+      >
+        <div class="card-bar">
+          <span class="card-num">{s.num}</span>
+          <span class="card-badge">{s.badge}</span>
+        </div>
+
+        <h3 class="card-title">{s.title}</h3>
+        <p class="card-summary">{s.summary}</p>
+
+        <ul class="card-points">
+          {s.points.map((p) => (
+            <li>
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <path d="M13.5 4.5 6.5 11.5 2.5 7.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+              <span>{p}</span>
+            </li>
+          ))}
+        </ul>
+
+        {i < steps.length - 1 && (
+          <div class="card-connector" aria-hidden="true">
+            <svg viewBox="0 0 24 36" width="24" height="36">
+              <path d="M12 2 V30 M6 24 L12 30 L18 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+          </div>
+        )}
+      </article>
+    ))}
+  </div>
+</div>
+
+<script>
+  function setupArchitectureFlow() {
+    const root = document.getElementById('architecture-flow');
+    if (!root) return;
+
+    const cards = root.querySelectorAll<HTMLElement>('.flow-card');
+    const tabs = root.querySelectorAll<HTMLButtonElement>('.flow-tab');
+
+    function setActiveStep(targetId: string) {
+      cards.forEach((card) => {
+        const matches = card.getAttribute('data-step') === targetId;
+        card.classList.toggle('is-active', matches);
+      });
+      tabs.forEach((tab) => {
+        const matches = tab.getAttribute('data-step-target') === targetId;
+        tab.classList.toggle('is-active', matches);
+        tab.setAttribute('aria-selected', matches ? 'true' : 'false');
+      });
+    }
+
+    tabs.forEach((tab) => {
+      tab.addEventListener('click', () => {
+        const targetId = tab.getAttribute('data-step-target');
+        if (targetId) {
+          setActiveStep(targetId);
+          const card = root.querySelector(`#step-card-${targetId}`);
+          card?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      });
+    });
+
+    if ('IntersectionObserver' in window) {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) {
+              const stepId = entry.target.getAttribute('data-step');
+              if (stepId) {
+                setActiveStep(stepId);
+              }
+            }
+          });
+        },
+        { rootMargin: '-20% 0px -40% 0px', threshold: 0.2 }
+      );
+
+      cards.forEach((card) => observer.observe(card));
+    }
+  }
+
+  setupArchitectureFlow();
+  document.addEventListener('astro:page-load', setupArchitectureFlow);
+</script>
+
+<style>
+  .hiw-diagram {
+    position: relative;
+    width: 100%;
+    margin-block: 1rem 2rem;
+  }
+  .flow-header {
+    text-align: center;
+    margin-bottom: 1.5rem;
+  }
+  .flow-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--teal);
+  }
+  .flow-lede {
+    font-size: 0.98rem;
+    color: var(--text-2);
+    margin-top: 0.4rem;
+    margin-inline: auto;
+    max-width: 58ch;
+  }
+
+  .flow-nav {
+    display: flex;
+    justify-content: center;
+    gap: 0.5rem;
+    margin-bottom: 2rem;
+    flex-wrap: wrap;
+  }
+  .flow-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.45rem 0.85rem;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .flow-tab:hover {
+    color: var(--ember);
+    border-color: var(--ember);
+  }
+  .flow-tab.is-active {
+    background: var(--text);
+    color: var(--bg);
+    border-color: var(--text);
+    box-shadow: 2px 2px 0 var(--ember);
+  }
+  .tab-num {
+    font-weight: 800;
+    color: var(--ember);
+  }
+  .flow-tab.is-active .tab-num {
+    color: var(--ember-soft);
+  }
+
+  .flow-track {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1.2rem;
+    align-items: stretch;
+  }
+
+  .flow-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    padding: 1.4rem;
+    background: var(--surface);
+    border: 1.5px solid var(--line);
+    border-radius: var(--radius-l);
+    transition: transform 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+  }
+  .flow-card.tone-teal.is-active {
+    border-color: var(--teal);
+    box-shadow: 0 0 0 1px var(--teal), var(--shadow);
+    transform: translateY(-4px);
+  }
+  .flow-card.tone-ember.is-active {
+    border-color: var(--ember);
+    box-shadow: 0 0 0 1px var(--ember), var(--shadow);
+    transform: translateY(-4px);
+  }
+  .flow-card.tone-wheat.is-active {
+    border-color: var(--wheat);
+    box-shadow: 0 0 0 1px var(--wheat), var(--shadow);
+    transform: translateY(-4px);
+  }
+
+  .card-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.8rem;
+  }
+  .card-num {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    font-weight: 800;
+    color: var(--ember);
+  }
+  .card-badge {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 0.15rem 0.5rem;
+    background: var(--surface-2);
+    border-radius: 999px;
+    border: 1px solid var(--line);
+  }
+
+  .card-title {
+    font-size: 1.25rem;
+    margin-bottom: 0.4rem;
+  }
+  .card-summary {
+    font-size: 0.88rem;
+    color: var(--text-2);
+    line-height: 1.5;
+    margin-bottom: 1rem;
+    flex-grow: 0;
+  }
+
+  .card-points {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    font-size: 0.82rem;
+    color: var(--text-2);
+    border-top: 1px dashed var(--line);
+    padding-top: 0.9rem;
+    flex-grow: 1;
+  }
+  .card-points li {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.45rem;
+    line-height: 1.4;
+  }
+  .card-points svg {
+    flex-shrink: 0;
+    margin-top: 2px;
+    color: var(--ok);
+  }
+
+  .card-connector {
+    display: none;
+    color: var(--line-strong);
+    justify-content: center;
+    margin-top: 0.8rem;
+  }
+
+  @media (max-width: 1024px) {
+    .flow-track {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1.2rem;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .flow-track {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 1rem;
+    }
+    .flow-card {
+      transform: none !important;
+    }
+    .card-connector {
+      display: flex;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .flow-card,
+    .flow-tab {
+      transition: none !important;
+      transform: none !important;
+    }
+    .flow-card {
+      border-color: var(--line-strong) !important;
+      box-shadow: none !important;
+    }
+  }
+</style>
