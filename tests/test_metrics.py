@@ -934,6 +934,35 @@ def test_analytics_endpoint_returns_snapshot_changed_conflict(tmp_path):
         server.server_close()
 
 
+def test_analytical_connect_lock_returns_clear_busy_response(tmp_path, monkeypatch):
+    """A held analytical connect lock is a bounded 503, never a reset."""
+    import drover.server.web.app as web_app
+    from drover.server.db import AnalyticalStoreBusy
+
+    collector = _make_collector(tmp_path)
+
+    def busy(_path):
+        raise AnalyticalStoreBusy("analytical connect lock is busy")
+
+    monkeypatch.setattr(web_app, "require_analytical_store", busy)
+    server = start_metrics_server(
+        host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
+    )
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.raises(HTTPError) as caught:
+            _authed_get(base + "/insights")
+        assert caught.value.code == 503
+        assert caught.value.headers["Retry-After"] == "1"
+        assert json.loads(caught.value.read()) == {
+            "detail": "analytical connect lock is busy",
+            "error": "analytical_store_busy",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_insights_endpoints_require_auth_and_reject_unknown_filters(tmp_path):
     collector = _make_collector(tmp_path)
     _observe_insight(collector)

@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from drover.server.runtime_observability import activity
+
 from .export_guard import GUARD_SCHEMA
 from .exporter import LakeOutboxExporter
 from .freshness import freshness_status, read_freshness
@@ -392,21 +394,22 @@ class ExporterLifecycle:
     def _export_batch(self, exporter):
         # Only this operation owns the registered cancellable control borrow
         # and isolated publisher. Projection/checkpoint have separate deadlines.
-        with self._owner_lock:
-            self._batch_started_at = time.monotonic()
-        try:
-            result = exporter.run_once()
+        with activity("ducklake_export_batch", kind="background"):
             with self._owner_lock:
-                cancelled = self._cancel_requested_at is not None
-                self._batch_started_at = None
-            if cancelled:
-                # Cancellation may race a completed acknowledgement. The
-                # durable ack is retained, but this owner must still unwind.
-                raise LakeError("lake_export_recovery_deadline")
-            return result
-        finally:
-            with self._owner_lock:
-                self._batch_started_at = None
+                self._batch_started_at = time.monotonic()
+            try:
+                result = exporter.run_once()
+                with self._owner_lock:
+                    cancelled = self._cancel_requested_at is not None
+                    self._batch_started_at = None
+                if cancelled:
+                    # Cancellation may race a completed acknowledgement. The
+                    # durable ack is retained, but this owner must still unwind.
+                    raise LakeError("lake_export_recovery_deadline")
+                return result
+            finally:
+                with self._owner_lock:
+                    self._batch_started_at = None
 
     def _checkpoint(self, exporter):
         """Advance the serving checkpoint; a failure leaves serving to the
@@ -414,19 +417,20 @@ class ExporterLifecycle:
         from .serving_proof import advance_checkpoint
 
         self._exports_since_checkpoint = 0
-        try:
-            record = advance_checkpoint(
-                lake_spec(self.config.analytics),
-                self.config.analytics.verification_sha256,
-                fence=exporter.fence,
-            )
-        except Exception as exc:  # noqa: BLE001 - exports must keep running
-            log.warning(
-                "serving proof checkpoint not advanced: %s (%s)",
-                exc.code if isinstance(exc, LakeError) else "unexpected",
-                _cause(exc, self.config),
-            )
-            return
+        with activity("ducklake_serving_checkpoint", kind="background"):
+            try:
+                record = advance_checkpoint(
+                    lake_spec(self.config.analytics),
+                    self.config.analytics.verification_sha256,
+                    fence=exporter.fence,
+                )
+            except Exception as exc:  # noqa: BLE001 - exports must keep running
+                log.warning(
+                    "serving proof checkpoint not advanced: %s (%s)",
+                    exc.code if isinstance(exc, LakeError) else "unexpected",
+                    _cause(exc, self.config),
+                )
+                return
         if record is not None:
             log.info(
                 "serving proof checkpoint at snapshot %s (%s exports since proof)",

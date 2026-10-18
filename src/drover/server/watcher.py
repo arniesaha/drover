@@ -29,6 +29,7 @@ from drover.server.db import control_plane_connection, open_duckdb_connection
 from drover.server.ingest import ingest_file
 from drover.server.providers.service import compact_closed_snapshot_partitions
 from drover.server.redis_shadow import ShadowPublisher
+from drover.server.runtime_observability import activity
 
 log = logging.getLogger("drover.watcher")
 
@@ -541,31 +542,34 @@ class IncomingWatcher:
 
         def loop() -> None:
             while not self._stopping.is_set():
-                try:
-                    sweep_processed(self._incoming, retention_days=self._retention_days)
-                except Exception as exc:  # noqa: BLE001 - never kill the watcher
-                    log.warning("processed sweep failed: %s", exc)
-                try:
-                    sweep_receipts(
-                        self._duckdb_path,
-                        retention_days=self._receipt_retention_days,
-                    )
-                except Exception as exc:  # noqa: BLE001 - never kill the watcher
-                    log.warning("receipt sweep failed: %s", exc)
-                try:
-                    sweep_advisory_occurrences(
-                        self._duckdb_path,
-                        retention_days=self._advisory_occurrence_retention_days,
-                    )
-                except Exception as exc:  # noqa: BLE001 - never kill the watcher
-                    log.warning("advisory occurrence sweep failed: %s", exc)
-                try:
-                    # Closed days only, so this never races the writer, which
-                    # only appends to today. Without it the tree returns to the
-                    # 18,583 files that cost 325.9 s at every start (#382).
-                    compact_closed_snapshot_partitions(self._parquet_dir)
-                except Exception as exc:  # noqa: BLE001 - never kill the watcher
-                    log.warning("snapshot partition compaction failed: %s", exc)
+                with activity("watcher_maintenance_sweep", kind="background"):
+                    try:
+                        sweep_processed(
+                            self._incoming, retention_days=self._retention_days
+                        )
+                    except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                        log.warning("processed sweep failed: %s", exc)
+                    try:
+                        sweep_receipts(
+                            self._duckdb_path,
+                            retention_days=self._receipt_retention_days,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                        log.warning("receipt sweep failed: %s", exc)
+                    try:
+                        sweep_advisory_occurrences(
+                            self._duckdb_path,
+                            retention_days=self._advisory_occurrence_retention_days,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                        log.warning("advisory occurrence sweep failed: %s", exc)
+                    try:
+                        # Closed days only, so this never races the writer, which
+                        # only appends to today. Without it the tree returns to the
+                        # 18,583 files that cost 325.9 s at every start (#382).
+                        compact_closed_snapshot_partitions(self._parquet_dir)
+                    except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                        log.warning("snapshot partition compaction failed: %s", exc)
                 self._stopping.wait(_SWEEP_INTERVAL_SECONDS)
 
         self._sweeper = threading.Thread(

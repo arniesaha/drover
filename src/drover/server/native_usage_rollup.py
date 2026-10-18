@@ -21,6 +21,7 @@ from drover.server.harness.usage_sources import (
     SOURCE_NATIVE_AGENT_EVENTS,
     upsert_source_usage,
 )
+from drover.server.runtime_observability import activity
 
 log = logging.getLogger("drover.native_usage_rollup")
 
@@ -318,8 +319,9 @@ class NativeUsageRollupWorker:
             self._stop.wait(self.poll_interval_s)
 
     def drain_once(self) -> NativeUsageRollupReport:
-        with self._admission.admit() as admitted:
-            if not admitted:
-                log.debug("native usage rollup deferred: a request is in flight")
-                return NativeUsageRollupReport(partitions=0, sessions=0)
-            return rollup_pending_native_usage(self.duckdb_path)
+        with activity("native_usage_rollup", kind="background"):
+            with self._admission.admit() as admitted:
+                if not admitted:
+                    log.debug("native usage rollup deferred: a request is in flight")
+                    return NativeUsageRollupReport(partitions=0, sessions=0)
+                return rollup_pending_native_usage(self.duckdb_path)

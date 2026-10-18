@@ -30,6 +30,7 @@ from drover.server.harness.usage_sources import (
     SOURCE_HARNESS_EVENTS,
     upsert_source_usage,
 )
+from drover.server.runtime_observability import activity
 
 log = logging.getLogger("drover.harness.usage_rollup")
 
@@ -430,6 +431,10 @@ class UsageRollupWorker:
             self._stop.wait(self.poll_interval_s)
 
     def drain_once(self) -> RollupReport:
+        with activity("usage_rollup", kind="background"):
+            return self._drain_once()
+
+    def _drain_once(self) -> RollupReport:
         global _last_pass_seconds
         started = time.monotonic()
         registry_path = control_plane_path(self.duckdb_path)

@@ -8,6 +8,7 @@ import urllib.request
 
 import duckdb
 import pytest
+from _timeouts import scale_timeout
 
 from drover.server import db
 from drover.server.cockpit.service import CockpitService
@@ -31,6 +32,16 @@ def request(port, path, method="GET"):
         )
     assert time.monotonic() - started < 1
     return result
+
+
+def _wait_for_log(caplog, message: str) -> bool:
+    """Wait for a handler thread's ``finally`` record while capture is active."""
+    deadline = time.monotonic() + scale_timeout(1.0)
+    while time.monotonic() < deadline:
+        if message in caplog.text:
+            return True
+        time.sleep(0.005)
+    return message in caplog.text
 
 
 def test_detection_health_and_fast_http_errors_until_recovered(tmp_path, monkeypatch):
@@ -137,6 +148,40 @@ def test_readiness_cannot_cache_ok_during_recovery(tmp_path, monkeypatch):
     assert any(
         s.store == STORE_ANALYTICAL and s.state == STATE_FAILED for s in report.stores
     )
+
+
+def test_analytical_connect_open_wait_is_capped(tmp_path, monkeypatch):
+    """A stalled in-process open becomes AnalyticalStoreBusy, not a hung thread."""
+    path = tmp_path / "analytics.duckdb"
+    first = db.open_duckdb_connection(path)
+    lock = db.duckdb_connect_lock(path)
+    assert lock.acquire(blocking=False)
+    monkeypatch.setattr(db, "ANALYTICAL_CONNECT_LOCK_WAIT_SECONDS", 0.01)
+    try:
+        with pytest.raises(db.AnalyticalStoreBusy, match="connect lock is busy"):
+            db.open_duckdb_connection(path, read_only=True)
+    finally:
+        lock.release()
+        first.close()
+
+
+def test_http_request_logs_activity_footprint_delta(tmp_path, caplog):
+    collector = MetricsCollector(
+        duckdb_path=tmp_path / "analytics.duckdb",
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+    )
+    server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
+    try:
+        with caplog.at_level("INFO", logger="drover.runtime_observability"):
+            assert request(server.server_address[1], "/healthz")[0] == 200
+            assert "hub_activity start kind=request name=GET /healthz" in caplog.text
+            assert _wait_for_log(
+                caplog, "hub_activity end kind=request name=GET /healthz"
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 @pytest.mark.parametrize("state", ["ok", "recovering", "failed-retrying"])
