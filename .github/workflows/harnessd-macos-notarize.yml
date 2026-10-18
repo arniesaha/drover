@@ -1,0 +1,201 @@
+name: Harnessd macOS notarization
+
+# This is deliberately both dispatchable and callable.  A dispatch is a
+# credentialed smoke test only; release.yml calls it after it has created a
+# tagged release and supplies release_tag to attach the two public assets.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref containing the Rust harnessd crate to sign (never publishes)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref containing the Rust harnessd crate to sign"
+        required: true
+        type: string
+      release_tag:
+        description: "Existing GitHub release to receive the signed assets; empty never publishes"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  # The Developer ID key is imported into an ephemeral keychain, but serialize
+  # signing anyway so a notary investigation has one unambiguous submission.
+  group: harnessd-macos-notarization
+  cancel-in-progress: false
+
+jobs:
+  sign-notarize:
+    name: Build, sign and notarize harnessd (aarch64)
+    # This is the same protected environment that holds the existing App Store
+    # Connect API key. Environment approval is the boundary that permits a
+    # dispatch to use signing material; this workflow never runs on a PR.
+    environment: ios-testflight-upload
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      HARNESSD_TARGET: aarch64-apple-darwin
+      HARNESSD_ASSET: drover-harnessd-aarch64-apple-darwin
+      HARNESSD_IDENTIFIER: fyi.drover.harnessd
+      SIGNING_IDENTITY: "Developer ID Application: Arnab Saha (DK2PC4RH5G)"
+      SIGNING_TEAM_ID: DK2PC4RH5G
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        persist-credentials: false
+
+    - name: Build the aarch64 Rust binary
+      run: |
+        set -euo pipefail
+        # The Rust harnessd crate is supplied by the harnessd release work.
+        # Keep the manifest explicit so a second Cargo project cannot silently
+        # become the signed executable.
+        manifest="harnessd/Cargo.toml"
+        test -f "$manifest" || {
+          echo "expected Rust harnessd manifest at $manifest" >&2
+          exit 1
+        }
+        rustup target add "$HARNESSD_TARGET"
+        cargo build --locked --release --target "$HARNESSD_TARGET" \
+          --manifest-path "$manifest" --bin harnessd
+        binary="target/$HARNESSD_TARGET/release/harnessd"
+        test -x "$binary"
+        mkdir -p "$RUNNER_TEMP/harnessd-release"
+        cp "$binary" "$RUNNER_TEMP/harnessd-release/$HARNESSD_ASSET"
+        lipo -archs "$RUNNER_TEMP/harnessd-release/$HARNESSD_ASSET" | grep -qx arm64
+
+    - name: Import the Developer ID certificate into an ephemeral keychain
+      env:
+        DROVER_DEVELOPER_ID_P12_BASE64: ${{ secrets.DROVER_DEVELOPER_ID_P12_BASE64 }}
+        DROVER_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DROVER_DEVELOPER_ID_P12_PASSWORD }}
+      run: |
+        set -euo pipefail
+        workspace="$RUNNER_TEMP/drover-harnessd-signing"
+        p12="$workspace/developer-id.p12"
+        keychain="$workspace/developer-id.keychain-db"
+        mkdir -p -m 700 "$workspace"
+        chmod 700 "$workspace"
+        echo "::add-mask::$DROVER_DEVELOPER_ID_P12_PASSWORD"
+        keychain_password="$(openssl rand -hex 32)"
+        echo "::add-mask::$keychain_password"
+        umask 077
+        printf '%s' "$DROVER_DEVELOPER_ID_P12_BASE64" | base64 -D > "$p12"
+        security create-keychain -p "$keychain_password" "$keychain"
+        security set-keychain-settings -lut 21600 "$keychain"
+        security unlock-keychain -p "$keychain_password" "$keychain"
+        security import "$p12" -k "$keychain" -P "$DROVER_DEVELOPER_ID_P12_PASSWORD" \
+          -T /usr/bin/codesign
+        security set-key-partition-list -S apple-tool:,apple: -s \
+          -k "$keychain_password" "$keychain"
+        security find-identity -v -p codesigning "$keychain" | \
+          grep -Fq "$SIGNING_IDENTITY"
+        rm -f "$p12"
+        printf 'HARNESSD_KEYCHAIN=%s\n' "$keychain" >> "$GITHUB_ENV"
+
+    - name: Sign the binary with hardened runtime
+      run: |
+        set -euo pipefail
+        binary="$RUNNER_TEMP/harnessd-release/$HARNESSD_ASSET"
+        # harnessd is a standalone command-line Mach-O. It needs no entitlements;
+        # adding an entitlement would widen its capability surface unnecessarily.
+        codesign --force --options runtime --timestamp \
+          --identifier "$HARNESSD_IDENTIFIER" \
+          --sign "$SIGNING_IDENTITY" --keychain "$HARNESSD_KEYCHAIN" "$binary"
+
+    - name: Notarize the signed binary
+      env:
+        DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
+        DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
+        DROVER_APPSTORE_API_PRIVATE_KEY_BASE64: ${{ secrets.DROVER_APPSTORE_API_PRIVATE_KEY_BASE64 }}
+      run: |
+        set -euo pipefail
+        workspace="$RUNNER_TEMP/drover-harnessd-signing"
+        key="$workspace/AuthKey_${DROVER_APPSTORE_API_KEY_ID}.p8"
+        archive="$RUNNER_TEMP/harnessd-release/$HARNESSD_ASSET.zip"
+        result="$RUNNER_TEMP/harnessd-release/notary-result.json"
+        mkdir -p -m 700 "$workspace"
+        umask 077
+        printf '%s' "$DROVER_APPSTORE_API_PRIVATE_KEY_BASE64" | base64 -D > "$key"
+        chmod 600 "$key"
+        ditto -c -k --keepParent "$RUNNER_TEMP/harnessd-release/$HARNESSD_ASSET" "$archive"
+        unset DROVER_APPSTORE_API_PRIVATE_KEY_BASE64
+        if ! xcrun notarytool submit "$archive" --key "$key" \
+          --key-id "$DROVER_APPSTORE_API_KEY_ID" --issuer "$DROVER_APPSTORE_API_ISSUER_ID" \
+          --wait --output-format json > "$result"; then
+          submission_id="$(/usr/bin/python3 -c \
+            'import json, sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$result" \
+            2>/dev/null || true)"
+          if [ -n "$submission_id" ]; then
+            xcrun notarytool log "$submission_id" --key "$key" \
+              --key-id "$DROVER_APPSTORE_API_KEY_ID" \
+              --issuer "$DROVER_APPSTORE_API_ISSUER_ID" || true
+          fi
+          exit 1
+        fi
+        status="$(/usr/bin/python3 -c \
+          'import json, sys; print(json.load(open(sys.argv[1]))["status"])' "$result")"
+        submission_id="$(/usr/bin/python3 -c \
+          'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$result")"
+        printf 'notarytool submission %s: %s\n' "$submission_id" "$status"
+        printf '### harnessd notarization\n\nSubmission `%s`: **%s**\n' \
+          "$submission_id" "$status" >> "$GITHUB_STEP_SUMMARY"
+        if [ "$status" != Accepted ]; then
+          xcrun notarytool log "$submission_id" --key "$key" \
+            --key-id "$DROVER_APPSTORE_API_KEY_ID" \
+            --issuer "$DROVER_APPSTORE_API_ISSUER_ID"
+          exit 1
+        fi
+        rm -f "$key"
+
+    - name: Verify signature and Gatekeeper assessment
+      run: |
+        set -euo pipefail
+        binary="$RUNNER_TEMP/harnessd-release/$HARNESSD_ASSET"
+        codesign --verify --strict --verbose=2 "$binary"
+        details="$(codesign -dv --verbose=4 "$binary" 2>&1)"
+        printf '%s\n' "$details"
+        printf '%s\n' "$details" | grep -qx "TeamIdentifier=$SIGNING_TEAM_ID"
+        printf '%s\n' "$details" | grep -Eq 'flags=.*runtime'
+        # A bare Mach-O cannot carry a stapled ticket. Gatekeeper therefore
+        # performs its normal online notarization check here and at install time.
+        spctl -a -t execute -vv "$binary" 2>&1 | tee "$RUNNER_TEMP/harnessd-release/spctl.txt"
+        grep -q 'accepted' "$RUNNER_TEMP/harnessd-release/spctl.txt"
+        grep -q 'Notarized Developer ID' "$RUNNER_TEMP/harnessd-release/spctl.txt"
+
+    - name: Generate release checksum
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/harnessd-release"
+        shasum -a 256 "$HARNESSD_ASSET" > "$HARNESSD_ASSET.sha256"
+        shasum -a 256 -c "$HARNESSD_ASSET.sha256"
+
+    - name: Attach signed binary to the existing release
+      if: inputs.release_tag != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: ${{ inputs.release_tag }}
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/harnessd-release"
+        gh release upload "$RELEASE_TAG" \
+          "$HARNESSD_ASSET" "$HARNESSD_ASSET.sha256" --clobber
+
+    - name: Remove temporary signing credentials
+      if: always()
+      run: |
+        set -euo pipefail
+        workspace="$RUNNER_TEMP/drover-harnessd-signing"
+        keychain="$workspace/developer-id.keychain-db"
+        if [ -f "$keychain" ]; then
+          security delete-keychain "$keychain"
+        fi
+        rm -f "$workspace/developer-id.p12" "$workspace"/*.p8
+        rmdir "$workspace" 2>/dev/null || rm -rf "$workspace"
