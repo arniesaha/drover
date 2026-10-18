@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-10-17
+
+### Fixed
+
+- Hub analytical connections are admitted through a bounded lock: a caller waits at most 30s for the analytical connect lock and then gets 503 busy instead of piling up behind a long holder. Lake readers are spawned without forking the hub process (#466, #679).
+- Notification modes behave as labelled. "Action needed only" alerts only on live input or approval requests (finished and failed no longer alert), and "Daily digest" no longer sends immediate local alerts; a one-item digest is always a `Session updates` summary (#680).
+
+### Added
+
+- Hub memory attribution: `hub_activity` start/end log lines with footprint, delta and duration for requests and background passes (including the DuckLake export batch), analytical lock acquire/release logging with holder and hold time (warning over 30s), and a one-shot all-thread stack dump the first time current footprint crosses 1 GiB (#466, #679).
+- Push notifications carry per-session content and grouping: title and body from the session (repo, session title, condensed question or approval), one thread per session, a collapse id per session and kind, a 60s per-session debounce, interruption levels and an Open category. Content is gated by the hub's durable content consent and fails closed to the generic text; approval commands are redacted before they reach APNs (#689).
+- drover.fyi `/privacy` and `/support` pages; the iOS app's privacy and support links point at them (#681).
+
+### Upgrade notes
+
+- No control or lake migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`). iOS changes from #680/#681 ship in the next TestFlight build.
+
 ## [0.6.20] - 2026-10-17
 
 ### Fixed
