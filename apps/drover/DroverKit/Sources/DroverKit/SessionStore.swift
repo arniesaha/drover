@@ -50,7 +50,14 @@ public final class SessionStore {
         }
     }
 
-    public private(set) var snapshot: HarnessSnapshot?
+    @ObservationIgnored
+    private var cachedInboxSessions: [SessionSummary] = []
+
+    public private(set) var snapshot: HarnessSnapshot? {
+        didSet {
+            cachedInboxSessions = Self.activeSessions(from: snapshot?.sessions ?? [], existing: cachedInboxSessions)
+        }
+    }
     public private(set) var lastError: String?
     public private(set) var lastRefreshFailure: RefreshFailure?
     public private(set) var isReachable: Bool = false
@@ -101,12 +108,11 @@ public final class SessionStore {
         return sessions.sorted(by: Self.needsYouOrdering)
     }
 
-    private var cachedInboxSessions: [SessionSummary] = []
-
     public var activeSessions: [SessionSummary] {
-        let active = Self.activeSessions(from: snapshot?.sessions ?? [], existing: cachedInboxSessions)
-        cachedInboxSessions = active
-        return active
+        if cachedInboxSessions.isEmpty, let sessions = snapshot?.sessions, !sessions.isEmpty {
+            cachedInboxSessions = Self.activeSessions(from: sessions, existing: cachedInboxSessions)
+        }
+        return cachedInboxSessions
     }
 
     public nonisolated static func activeSessions(
