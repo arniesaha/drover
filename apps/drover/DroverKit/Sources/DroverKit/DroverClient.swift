@@ -132,6 +132,7 @@ public actor DroverClient {
     /// Foreground-only recovery scope. A client without a verified binding can
     /// still make normal authenticated requests, but cannot restore chat data.
     public nonisolated let credentialBindingID: UUID?
+    public nonisolated let webSocketConnector: (any WebSocketConnecting)?
     private let token: String
     private let session: URLSession
     private let retryGate: HubRetryGate
@@ -141,13 +142,15 @@ public actor DroverClient {
         token: String,
         credentialBindingID: UUID? = nil,
         session: URLSession = .shared,
-        retryGate: HubRetryGate = .shared
+        retryGate: HubRetryGate = .shared,
+        webSocketConnector: (any WebSocketConnecting)? = nil
     ) {
         self.config = config
         self.credentialBindingID = credentialBindingID
         self.token = token
         self.session = session
         self.retryGate = retryGate
+        self.webSocketConnector = webSocketConnector
     }
 
     // MARK: Pairing

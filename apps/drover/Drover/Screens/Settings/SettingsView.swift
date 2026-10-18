@@ -1,5 +1,6 @@
 import SwiftUI
 import DroverKit
+import UserNotifications
 
 /// Server URL + token onboarding/reconfiguration. The token field is never
 /// pre-filled (Keychain contents don't round-trip into the UI); a caption
@@ -25,40 +26,26 @@ struct SettingsView: View {
     @State private var statusIsError = false
     @State private var showSignOutConfirmation = false
     @State private var showServerSetupGuide = false
+    @State private var demoNotificationSent = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                // Scanning is the intended route; the two fields below are the
-                // recovery path for when a camera is unavailable.
-                NavigationLink {
-                    PairingView(environment: environment)
-                } label: {
-                    HStack(spacing: 9) {
-                        Image(systemName: "qrcode.viewfinder")
-                            .font(.system(size: 15, weight: .medium))
-                        Text("Scan pairing code").droverText(.h3)
-                        Spacer(minLength: 0)
-                    }
-                    .foregroundStyle(DroverColor.accentHi)
-                    .padding(.horizontal, 13)
-                    .padding(.vertical, 13)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(DroverColor.accentHi, lineWidth: 1)
-                    }
-                }
-                .accessibilityIdentifier("settings-scan-pairing")
+                if environment.isDemoMode {
+                    demoSection
+                    supportLinks
+                } else {
+                    enterDemoButton
 
-                if environment.client != nil {
-                    Button {
-                        showServerSetupGuide = true
+                    // Scanning is the intended route; the two fields below are the
+                    // recovery path for when a camera is unavailable.
+                    NavigationLink {
+                        PairingView(environment: environment)
                     } label: {
                         HStack(spacing: 9) {
-                            Image(systemName: "server.rack")
+                            Image(systemName: "qrcode.viewfinder")
                                 .font(.system(size: 15, weight: .medium))
-                            Text("Set Up Another Host").droverText(.h3)
+                            Text("Scan pairing code").droverText(.h3)
                             Spacer(minLength: 0)
                         }
                         .foregroundStyle(DroverColor.accentHi)
@@ -67,56 +54,78 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .overlay {
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .strokeBorder(DroverColor.line, lineWidth: 1)
+                                .strokeBorder(DroverColor.accentHi, lineWidth: 1)
                         }
                     }
-                    .accessibilityIdentifier("settings-server-setup-guide")
-                    .sheet(isPresented: $showServerSetupGuide) {
-                        NavigationStack {
-                            ServerSetupGuideView(
-                                context: .connectedFleet,
-                                initialMode: .host
-                            )
+                    .accessibilityIdentifier("settings-scan-pairing")
+
+                    if environment.client != nil {
+                        Button {
+                            showServerSetupGuide = true
+                        } label: {
+                            HStack(spacing: 9) {
+                                Image(systemName: "server.rack")
+                                    .font(.system(size: 15, weight: .medium))
+                                Text("Set Up Another Host").droverText(.h3)
+                                Spacer(minLength: 0)
+                            }
+                            .foregroundStyle(DroverColor.accentHi)
+                            .padding(.horizontal, 13)
+                            .padding(.vertical, 13)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .strokeBorder(DroverColor.line, lineWidth: 1)
+                            }
                         }
-                        .presentationCornerRadius(24)
+                        .accessibilityIdentifier("settings-server-setup-guide")
+                        .sheet(isPresented: $showServerSetupGuide) {
+                            NavigationStack {
+                                ServerSetupGuideView(
+                                    context: .connectedFleet,
+                                    initialMode: .host
+                                )
+                            }
+                            .presentationCornerRadius(24)
+                        }
                     }
-                }
 
-                field(label: "Server", hint: "Where drover-server is listening.") {
-                    TextField("http://host:7080", text: $urlString)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                }
+                    field(label: "Server", hint: "Where drover-server is listening.") {
+                        TextField("http://host:7080", text: $urlString)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.URL)
+                    }
 
-                field(label: "Token", hint: tokenHint) {
-                    SecureField("API token", text: $token)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        // A shared cluster bearer token is not a website
-                        // password; .oneTimeCode keeps iOS from offering to
-                        // "Save Password" (and from autofilling unrelated
-                        // Keychain entries) every time the user reconfigures.
-                        .textContentType(.oneTimeCode)
-                }
+                    field(label: "Token", hint: tokenHint) {
+                        SecureField("API token", text: $token)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            // A shared cluster bearer token is not a website
+                            // password; .oneTimeCode keeps iOS from offering to
+                            // "Save Password" (and from autofilling unrelated
+                            // Keychain entries) every time the user reconfigures.
+                            .textContentType(.oneTimeCode)
+                    }
 
-                if let client = environment.client {
-                    NotificationPreferences(client: client)
-                    ContentAnalysisSettings(client: client)
-                }
+                    if let client = environment.client {
+                        NotificationPreferences(client: client)
+                        ContentAnalysisSettings(client: client)
+                    }
 
-                if let statusMessage {
-                    statusRow(statusMessage)
-                }
+                    if let statusMessage {
+                        statusRow(statusMessage)
+                    }
 
-                saveButton
-                supportLinks
+                    saveButton
+                    supportLinks
 
-                // Credential-deletion and local-cleanup failures retain an
-                // explicit retry path even after the app disconnects.
-                if environment.client != nil || environment.hasTokenConfigured
-                    || environment.hasPendingLocalCleanup {
-                    signOutButton
+                    // Credential-deletion and local-cleanup failures retain an
+                    // explicit retry path even after the app disconnects.
+                    if environment.client != nil || environment.hasTokenConfigured
+                        || environment.hasPendingLocalCleanup {
+                        signOutButton
+                    }
                 }
             }
             .padding(.horizontal, 18)
@@ -288,6 +297,141 @@ struct SettingsView: View {
         .accessibilityIdentifier(identifier)
         .accessibilityLabel(label)
         .accessibilityHint("Opens the Drover \(label.lowercased()) page.")
+    }
+
+    private var enterDemoButton: some View {
+        Button {
+            environment.enterDemoMode()
+            dismiss()
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 15, weight: .medium))
+                Text("Try a demo — no computer needed").droverText(.h3)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(DroverColor.accentHi)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 13)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.line, lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("settings-enter-demo-button")
+    }
+
+    private var demoSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Text("DEMO")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.orange))
+                    .accessibilityIdentifier("settings-demo-badge")
+
+                Text("Demo Mode Active")
+                    .font(.system(.subheadline, design: .default, weight: .semibold))
+                    .foregroundStyle(DroverColor.text)
+
+                Spacer()
+            }
+
+            Text("You are exploring Drover in offline demo mode with simulated data. No computer, server, or network connection is required. Real credentials and pairing state remain untouched.")
+                .droverText(.body)
+                .foregroundStyle(DroverColor.muted)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                Task { await previewSampleNotification() }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "bell.badge")
+                        .font(.system(size: 14, weight: .medium))
+                    Text("Preview Sample Notification")
+                        .font(.system(.subheadline, design: .default, weight: .medium))
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(DroverColor.accentHi)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(DroverColor.line, lineWidth: 1)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("settings-preview-notification-button")
+
+            if demoNotificationSent {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.green)
+                    Text("Sample notification scheduled!")
+                        .font(.caption)
+                        .foregroundStyle(DroverColor.text)
+                }
+                .accessibilityIdentifier("settings-notification-sent-label")
+            }
+
+            Button {
+                dismiss()
+                Task { @MainActor in
+                    environment.exitDemoMode()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.backward.circle")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Exit Demo")
+                        .font(.system(.subheadline, design: .default, weight: .semibold))
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+                .background(Color.orange, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("settings-exit-demo-button")
+        }
+        .padding(14)
+        .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+        }
+    }
+
+    private func previewSampleNotification() async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        if settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional {
+            let content = UNMutableNotificationContent()
+            content.title = "Drover (Demo)"
+            content.subtitle = "Needs Approval"
+            content.body = "Database migration 004_sessions.sql on Linux Workstation"
+            content.sound = .default
+            content.interruptionLevel = .timeSensitive
+            content.userInfo = [NotificationPayloadKey.sessionID: DemoHubData.sessionApproval]
+            let request = UNNotificationRequest(
+                identifier: "demo-notification-preview",
+                content: content,
+                trigger: nil
+            )
+            try? await center.add(request)
+        }
+        await MainActor.run {
+            withAnimation {
+                demoNotificationSent = true
+            }
+        }
     }
 
     /// Quieter than "Test & Save": this is a recovery action, not the primary

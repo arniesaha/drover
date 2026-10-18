@@ -107,23 +107,47 @@ struct PairingView: View {
             .padding(.vertical, 14)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            Button {
-                guard let payload = model.manualPayload() else { return }
-                pendingPayload = payload
-                showPairConfirmation = true
-            } label: {
-                Text(model.isPairing ? "Pairing..." : "Pair")
-                    .droverText(.h3)
+            VStack(spacing: 8) {
+                Button {
+                    guard let payload = model.manualPayload() else { return }
+                    pendingPayload = payload
+                    showPairConfirmation = true
+                } label: {
+                    Text(model.isPairing ? "Pairing..." : "Pair")
+                        .droverText(.h3)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .disabled(!model.canSubmitManualCode || model.isPairing)
+                .foregroundStyle(DroverColor.accentHi)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+                }
+                .accessibilityIdentifier("pairing-submit")
+
+                Button {
+                    environment.enterDemoMode()
+                    dismiss()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("Try a demo — no computer needed")
+                            .font(.system(.subheadline, design: .default, weight: .medium))
+                    }
+                    .foregroundStyle(DroverColor.accentHi)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 11)
+                    .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(DroverColor.line, lineWidth: 1)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("pairing-view-try-demo-button")
             }
-            .disabled(!model.canSubmitManualCode || model.isPairing)
-            .foregroundStyle(DroverColor.accentHi)
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(DroverColor.accentHi, lineWidth: 1)
-            }
-            .accessibilityIdentifier("pairing-submit")
             .padding(.horizontal, 18)
             .padding(.vertical, 10)
             .background(DroverColor.bg)

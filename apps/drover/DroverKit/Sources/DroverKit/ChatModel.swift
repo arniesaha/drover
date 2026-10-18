@@ -464,7 +464,12 @@ public final class ChatModel {
         self.recapPollInterval = recapPollInterval
         self.recapPollAttempts = recapPollAttempts
         self.deliveryConfirmationTimeout = deliveryConfirmationTimeout
-        let factory = streamFactory ?? { c, s in MessageStream(client: c, sessionID: s) }
+        let factory = streamFactory ?? { c, s in
+            if let connector = c.webSocketConnector {
+                return MessageStream(client: c, sessionID: s, connector: connector)
+            }
+            return MessageStream(client: c, sessionID: s)
+        }
         self.stream = factory(client, sessionID)
         if !canPersistRecovery {
             recoveryStatusMessage = "Chat recovery is unavailable. Check local storage in Settings."

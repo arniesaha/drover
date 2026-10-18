@@ -668,7 +668,7 @@ struct NoHarnessNameBranchingTests {
         "shell", "gemini", "openclaw", "hermes",
     ]
     private static let retiredPolicyNames = ["structuredCapableHarnesses", "interactiveAuthHarnesses"]
-    private static let exemptFiles: Set<String> = ["HarnessPresentation.swift"]
+    private static let exemptFiles: Set<String> = ["HarnessPresentation.swift", "DemoHubData.swift", "DemoHub.swift"]
 
     private static var appsRoot: URL {
         URL(fileURLWithPath: #filePath)

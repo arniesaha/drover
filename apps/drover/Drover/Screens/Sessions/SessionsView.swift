@@ -47,11 +47,13 @@ struct SessionsView: View {
     @State private var showAnalytics = false
     @State private var showAccounts = false
     @State private var showInsights = false
+    let isDemoMode: Bool
     @State private var showHistory = false
     @State private var notificationSessionIDs: Set<String>?
 
     init(
         client: DroverClient,
+        isDemoMode: Bool = false,
         notifier: Notifying = LocalNotifier(),
         recoveryStore: (any ChatRecoveryPersisting)?,
         recoveryWriteGate: ChatRecoveryWriteGate,
@@ -61,6 +63,7 @@ struct SessionsView: View {
         onOpenSettings: @escaping () -> Void = {}
     ) {
         self.client = client
+        self.isDemoMode = isDemoMode
         self.notifier = notifier
         self.recoveryStore = recoveryStore
         self.recoveryWriteGate = recoveryWriteGate
@@ -443,6 +446,7 @@ struct SessionsView: View {
 
     private var chromeRow: some View {
         InboxChromeRow(
+            isDemoMode: isDemoMode || client.config.baseURL.host == DemoHubData.syntheticHost,
             onToggleTheme: { appearance.toggle(displaying: colorScheme) },
             onOpenSettings: onOpenSettings
         )
