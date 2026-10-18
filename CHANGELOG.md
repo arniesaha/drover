@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.19] - 2026-10-17
+
+Supersedes 0.6.18, which was tagged but never rolled out: its strict release preflight refused control migration 20 as a lake schema change. 0.6.19 ships the 0.6.18 changes plus the classifier fix below.
+
+### Fixed
+
+- `release-preflight` classifies additive control DB migrations (new tables, `ADD COLUMN IF NOT EXISTS` nullable or defaulted columns, new indexes) as `control_migration`, allowed on the point-release path. Drops, renames, type or nullability changes, data rewrites, edited existing migrations, and any lake schema or runtime pin change still require the full cutover (#674).
+
+### Upgrade notes
+
+- Same as 0.6.18: control DB migration 20 (additive), no lake migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`). iOS changes from #672 ship in the next TestFlight build.
+
 ## [0.6.18] - 2026-10-17
 
 ### Fixed
