@@ -36,6 +36,7 @@ from drover.server.analytics_boundary import (
     analytics_request_lane,
 )
 from drover.server.db import (
+    AnalyticalStoreBusy,
     AnalyticalStoreUnavailable,
     analytical_store_health,
     control_plane_checkpoint_health,
@@ -972,9 +973,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         return bool(allowed)
 
     def _dispatch_request(self, dispatch: Callable[[], None]) -> None:
-        from drover.server.metrics import HarnessRenderBusy
+        from drover.server.runtime_observability import activity
 
         path = urlparse(self.path).path
+        # Deliberately omit the query: it may contain an opaque cursor and is
+        # unnecessary to identify the route responsible for a memory delta.
+        with activity(f"{self.command} {path}", kind="request"):
+            self._dispatch_request_attributed(dispatch, path)
+
+    def _dispatch_request_attributed(
+        self, dispatch: Callable[[], None], path: str
+    ) -> None:
+        from drover.server.metrics import HarnessRenderBusy
+
         # Profile bearers must pass their allowlist before any dispatch, including
         # public pairing/login routes, internal bridges and device self-revocation.
         # Those handlers can deliberately bypass the ordinary authentication gate.
@@ -1042,6 +1053,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 dispatch()
         except AnalyticalStoreUnavailable:
             self._send_analytical_unavailable()
+        except AnalyticalStoreBusy:
+            self._send_analytical_busy()
         except HarnessRenderBusy:
             self._send(
                 503,
@@ -3428,6 +3441,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             extra_headers={"Retry-After": "1"},
         )
 
+    def _send_analytical_busy(self) -> None:
+        """Make bounded analytical admission visible instead of dropping HTTP."""
+        self._send(
+            503,
+            "application/json",
+            '{"error":"analytical_store_busy","detail":"analytical connect lock is busy"}\n',
+            extra_headers={"Retry-After": "1"},
+        )
+
     def _send(
         self,
         status: int,
@@ -3657,6 +3679,12 @@ def analytics_boundary_dispatcher(
         except AnalyticalStoreUnavailable:
             return response(
                 503, "application/json", '{"error":"analytical_store_unavailable"}\n'
+            )
+        except AnalyticalStoreBusy:
+            return response(
+                503,
+                "application/json",
+                '{"error":"analytical_store_busy","detail":"analytical connect lock is busy"}\n',
             )
         finally:
             if lane == "heavy":

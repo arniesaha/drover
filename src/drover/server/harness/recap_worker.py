@@ -38,6 +38,7 @@ from drover.server.ledger import (
     transaction,
 )
 from drover.server.memory_store import MemoryRepository
+from drover.server.runtime_observability import activity
 from drover.server.summarizer.backends import (
     BackendError,
     LLMBackend,
@@ -113,7 +114,8 @@ class LiveRecapWorker:
         while not self._stop.is_set():
             handled = 0
             try:
-                handled = self.drain_once()
+                with activity("live_recap_drain", kind="background"):
+                    handled = self.drain_once()
             except Exception:  # noqa: BLE001 - a later poll must still run.
                 log.exception("live recap drain loop crashed")
             interval = (

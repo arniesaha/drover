@@ -67,6 +67,11 @@ from drover.server.control_store import (
     postgres_control_store,
 )
 from drover.server.postgres_control_store import ControlStoreBusy
+from drover.server.runtime_observability import (
+    current_activity_holder,
+    track_analytical_lock_acquire,
+    track_analytical_lock_release,
+)
 
 log = logging.getLogger("drover.db")
 
@@ -1266,6 +1271,10 @@ _ANALYTICAL_STATE_GUARD = threading.Lock()
 _ANALYTICAL_RECOVERY_FAST_ATTEMPTS = 3
 _ANALYTICAL_RECOVERY_BACKOFF_SECONDS = 0.25
 _ANALYTICAL_RECOVERY_MAX_BACKOFF_SECONDS = 60.0
+# A request must never sit behind a stalled in-process DuckDB open forever.
+# The owner is separately diagnosed by readiness; callers get the stable 503
+# mapped from AnalyticalStoreBusy instead of tying up a web thread.
+ANALYTICAL_CONNECT_LOCK_WAIT_SECONDS = 30.0
 
 
 def analytical_store_health(duckdb_path: str | Path) -> dict[str, object]:
@@ -1467,15 +1476,44 @@ def _analytical_open_lock(
     duckdb_path: str | Path, generation: int, *, timeout: float | None = None
 ) -> Iterator[None]:
     lock = duckdb_connect_lock(duckdb_path)
+    waiting_started_at = time.monotonic()
     if timeout is None:
-        while not lock.acquire(timeout=0.05):
+        deadline = time.monotonic() + ANALYTICAL_CONNECT_LOCK_WAIT_SECONDS
+        while not lock.acquire(
+            timeout=min(0.05, max(0.0, deadline - time.monotonic()))
+        ):
             require_analytical_store(duckdb_path, generation)
+            if time.monotonic() >= deadline:
+                raise AnalyticalStoreBusy("analytical connect lock is busy")
     elif not lock.acquire(timeout=max(0.0, timeout)):
         raise AnalyticalStoreBusy("analytical connect lock is busy")
+    holder = current_activity_holder()
+    hold_token = track_analytical_lock_acquire(
+        holder=holder, path=_path_key(duckdb_path)
+    )
+    log.info(
+        "analytical_connect_lock acquire holder=%s wait_s=%.3f path=%s",
+        holder,
+        time.monotonic() - waiting_started_at,
+        _path_key(duckdb_path),
+    )
     try:
         require_analytical_store(duckdb_path, generation)
         yield
     finally:
+        hold_seconds = track_analytical_lock_release(hold_token)
+        log_level = (
+            logging.WARNING
+            if hold_seconds is not None and hold_seconds > 30
+            else logging.INFO
+        )
+        log.log(
+            log_level,
+            "analytical_connect_lock release holder=%s hold_s=%.3f path=%s",
+            holder,
+            hold_seconds or 0.0,
+            _path_key(duckdb_path),
+        )
         lock.release()
 
 

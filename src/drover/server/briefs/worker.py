@@ -36,6 +36,7 @@ from drover.server.ledger import (
     transaction,
 )
 from drover.server.memory_store import MemoryRepository, ProjectBrief, SessionSummary
+from drover.server.runtime_observability import activity
 from drover.server.summarizer.backends import (
     BackendError,
     BackendReadinessError,
@@ -110,7 +111,8 @@ class BriefWorker:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self.drain_once()
+                with activity("briefs_drain", kind="background"):
+                    self.drain_once()
             except Exception:  # noqa: BLE001
                 log.exception("brief drain loop crashed (will retry)")
             self._stop.wait(self.poll_interval_s)
