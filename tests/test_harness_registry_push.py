@@ -7,6 +7,7 @@ are what guarantee issue #20's "one transition, at most one notification".
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -148,6 +149,28 @@ def test_alert_carries_what_the_agent_last_said(registry, sender):
     registry.update_session_activity("sess-1", awaiting="input")
 
     assert sender.sent[0].preview == "Ready to deploy. Want me to push?"
+
+
+def test_host_content_consent_off_never_exports_session_text(registry, sender):
+    with registry._connect() as con:
+        con.execute(
+            "UPDATE harness_hosts SET capabilities_json = ? WHERE host_id = 'mac-mini'",
+            [json.dumps({"content_consent": False})],
+        )
+    registry.append_event(
+        session_id="sess-1",
+        event_type="user_input",
+        payload={"text": "**Secret migration**"},
+    )
+    _assistant_says(registry, "Deploy using private token", seq=1)
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    transition = sender.sent[0]
+    assert not transition.content_allowed
+    assert transition.alert_title() == "Needs your input"
+    assert transition.alert_body() == "Needs your input · drover · Mac Mini"
+    assert "Secret" not in transition.alert_body()
+    assert "token" not in transition.alert_body()
 
 
 def test_newest_message_wins(registry, sender):
@@ -310,7 +333,7 @@ def test_other_sessions_private_profiles_do_not_hide_title_or_summary(registry, 
     _assistant_says(registry, "Capture is ready for review", seq=1)
     registry.update_session_status("sess-1", "completed")
     assert not sender.sent[0].private
-    assert sender.sent[0].alert_title() == "Fix capture preview"
+    assert sender.sent[0].alert_title() == "drover · Fix capture preview"
     assert sender.sent[0].alert_body() == "Finished: Capture is ready for review"
 
 
@@ -393,8 +416,8 @@ def test_notification_privacy_exception_fails_closed(registry, sender, monkeypat
         preview="Synthetic private text",
     )
     assert sender.sent[0].private
-    assert sender.sent[0].alert_title() == "Session"
-    assert sender.sent[0].alert_body() == "Finished: ready for review"
+    assert sender.sent[0].alert_title() == "Finished"
+    assert sender.sent[0].alert_body() == "Finished"
 
 
 @pytest.mark.parametrize("exit_code,kind", [(0, "finished"), (1, "failed")])
@@ -424,7 +447,7 @@ def test_title_is_derived_from_first_prompt(registry, sender):
         payload={"text": "Fix capture preview"},
     )
     registry.update_session_activity("sess-1", awaiting="input")
-    assert sender.sent[0].alert_title() == "Fix capture preview"
+    assert sender.sent[0].alert_title() == "drover · Fix capture preview"
 
 
 @pytest.mark.parametrize("is_error,kind", [(False, "finished"), (True, "failed")])
