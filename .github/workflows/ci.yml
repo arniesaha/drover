@@ -186,17 +186,16 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            static: true
+            target: x86_64-unknown-linux-musl
           - os: macos-14
             target: aarch64-apple-darwin
-            static: false
     steps:
     - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
-        components: rustfmt, clippy
+    - name: Install Rust toolchain
+      run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable && rustup target add ${{ matrix.target }}
+    - name: Install Linux musl tools
+      if: matrix.target == 'x86_64-unknown-linux-musl'
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
     - uses: actions/setup-python@v5
       with:
         python-version: "3.11"
@@ -210,8 +209,6 @@ jobs:
         cargo fmt --check
         cargo clippy -p drover-harnessd --target ${{ matrix.target }} -- -D warnings
     - name: Build, test, and run Rust MVP contracts
-      env:
-        RUSTFLAGS: ${{ matrix.static && '-C target-feature=+crt-static' || '' }}
       run: |
         cargo test -p drover-harnessd --target ${{ matrix.target }}
         cargo build --release -p drover-harnessd --target ${{ matrix.target }}
