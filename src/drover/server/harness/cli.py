@@ -11,7 +11,7 @@ import duckdb
 
 from drover.config import DroverConfig, default_config, default_config_path, load_config
 from drover.schema import bootstrap_control_plane_store
-from drover.server.db import pin_control_plane_connection
+from drover.server.db import duckdb_connect_lock, pin_control_plane_connection
 from drover.server.harness.daemon import run_harnessd
 
 log = logging.getLogger("drover.harnessd")
@@ -28,6 +28,18 @@ def resolve_config(path: str | None) -> DroverConfig:
 
 def bootstrap_harnessd_schema(cfg: DroverConfig) -> bool:
     try:
+        # Keep the configured host spool a valid, local DuckDB file even when
+        # its inherited config names PostgreSQL for the hub.  The harness
+        # registry lives in the sibling control store, but a bare ``touch``
+        # would leave an invalid database for a later local lake bootstrap.
+        # This only initializes DuckDB's empty catalog; it deliberately does
+        # not call the lakehouse bootstrap or create lake schemas/views.
+        if not cfg.duckdb_path.exists():
+            cfg.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
+            with duckdb_connect_lock(cfg.duckdb_path):
+                if not cfg.duckdb_path.exists():
+                    con = duckdb.connect(str(cfg.duckdb_path))
+                    con.close()
         # harnessd owns only a control registry/spool.  Never open the
         # lakehouse here: catalog/view bootstrap scans historical data and is
         # neither needed by the daemon nor safe on its startup path.
