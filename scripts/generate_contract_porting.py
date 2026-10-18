@@ -6,7 +6,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 SOURCE = Path("tests/test_harness_daemon.py")
 TARGET = Path("tests/contract/PORTING.md")
 PORTED = {
@@ -30,13 +29,21 @@ PORTED = {
 
 
 def reason(name: str) -> str:
-    if any(token in name for token in ("monkeypatch", "cache", "hung", "slow", "overlap", "lookup")):
+    if any(
+        token in name
+        for token in ("monkeypatch", "cache", "hung", "slow", "overlap", "lookup")
+    ):
         return "dropped: requires deterministic control of an internal dependency or timing window"
     if any(token in name for token in ("native_", "discovers_", "reads_", "resolve_")):
         return "dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation"
-    if any(token in name for token in ("worktree", "recovery", "restart", "staging", "registry")):
+    if any(
+        token in name
+        for token in ("worktree", "recovery", "restart", "staging", "registry")
+    ):
         return "dropped: requires pre-seeding or faulting durable daemon state before startup"
-    if any(token in name for token in ("auth_start", "auth_flow", "typed_code", "sign_in")):
+    if any(
+        token in name for token in ("auth_start", "auth_flow", "typed_code", "sign_in")
+    ):
         return "dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet"
     return "dropped: public behavior not yet represented; retain source test until an observable fixture is added"
 
@@ -55,7 +62,9 @@ def main() -> None:
     ]
     for name in names:
         result = PORTED.get(name)
-        lines.append(f"| `{name}` | `{result}` |" if result else f"| `{name}` | {reason(name)} |")
+        lines.append(
+            f"| `{name}` | `{result}` |" if result else f"| `{name}` | {reason(name)} |"
+        )
     TARGET.write_text("\n".join(lines) + "\n")
 
 
