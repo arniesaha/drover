@@ -1,5 +1,6 @@
 import SwiftUI
 import DroverKit
+import WidgetKit
 
 /// The fleet inbox: a wordmark row carrying the two app-level controls, a
 /// pinned status header (the count that says how much wants you, the host
@@ -165,6 +166,7 @@ struct SessionsView: View {
                     if let snapshot = store.snapshot {
                         await cockpitStore.refresh(for: snapshot)
                     }
+                    syncWidgetSnapshot()
                 }
                 .overlay {
                     if !store.hasLoadedOnce {
@@ -314,6 +316,12 @@ struct SessionsView: View {
         // id cannot resolve to a session yet. Try again when the list arrives.
         .onChange(of: store.snapshot?.sessions.count) { _, _ in
             openSessionFromNotification()
+        }
+        .onChange(of: store.lastSuccessfulRefresh) { _, _ in
+            syncWidgetSnapshot()
+        }
+        .onChange(of: cockpitStore.providerAccounts) { _, _ in
+            syncWidgetSnapshot()
         }
         .onAppear { openSessionFromNotification(); openAttentionFromNotification() }
         .sheet(isPresented: $showLaunch) {
@@ -673,6 +681,16 @@ struct SessionsView: View {
         launchedSession = LaunchedSession(id: continued.sessionID,
                                           isStructured: continued.isStructured,
                                           harness: harness)
+    }
+
+    private func syncWidgetSnapshot() {
+        guard let snapshot = store.snapshot else { return }
+        let widgetSnapshot = WidgetFleetSnapshot.build(
+            snapshot: snapshot,
+            accounts: cockpitStore.providerAccounts
+        )
+        try? WidgetSnapshotStore.writeSnapshot(widgetSnapshot)
+        WidgetCenter.shared.reloadAllTimelines()
     }
 }
 
