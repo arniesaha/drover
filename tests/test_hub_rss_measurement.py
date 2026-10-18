@@ -27,9 +27,16 @@ PRODUCTION_ENDPOINTS = MODULE.PRODUCTION_ENDPOINTS
 CONCURRENT_GATE_ENDPOINTS = MODULE.CONCURRENT_GATE_ENDPOINTS
 
 
-def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
+def test_startup_memory_harness_stays_below_one_gib_on_lake_shaped_fixture(tmp_path):
+    """Cold handler startup plus the concurrent cockpit warmup stays bounded.
+
+    This is intentionally many files rather than a toy in-memory relation: it
+    exercises the connection/instance path that the hub starts before serving
+    traffic.  The harness samples its full cold-to-warm window, which must fit
+    under the same first-120-second hub ceiling as the release gate.
+    """
     root = tmp_path / "fixture"
-    prepare(root, sessions=40, spans=80, files=3)
+    prepare(root, sessions=400, spans=8_000, files=32)
 
     report = measure(root, minutes=0, interval_seconds=0)
 

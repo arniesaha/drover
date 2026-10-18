@@ -6,11 +6,9 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-import duckdb
-import pytest
-
 from drover.config import default_config
 from drover.schema import bootstrap
+from drover.server.db import open_duckdb_connection
 from drover.server.lake.lifecycle import selected_exporter
 from drover.server.watcher import IncomingWatcher
 
@@ -65,7 +63,10 @@ def test_e2e_drop_file_appears_in_duckdb(tmp_path):
         deadline = time.monotonic() + 15
         n = 0
         while time.monotonic() < deadline:
-            con = duckdb.connect(str(db_path))
+            # This is an in-process reader of the live analytical store.  The
+            # hub pins that store with its bounded instance configuration, so
+            # use the same supported opener rather than a bare DuckDB open.
+            con = open_duckdb_connection(db_path, role="diagnostic")
             try:
                 n = con.execute(
                     "SELECT count(*) FROM agent_events WHERE id = 'e2e-001'"
@@ -84,7 +85,7 @@ def test_e2e_drop_file_appears_in_duckdb(tmp_path):
 
         assert n == 1, "event never landed"
 
-        con = duckdb.connect(str(db_path))
+        con = open_duckdb_connection(db_path, role="diagnostic")
         try:
             row = con.execute(
                 "SELECT task_id, repo_owner, repo_name, branch, principal_id "
@@ -100,7 +101,7 @@ def test_e2e_drop_file_appears_in_duckdb(tmp_path):
         assert len(task_id) == 16
 
         # tasks row was upserted
-        con = duckdb.connect(str(db_path))
+        con = open_duckdb_connection(db_path, role="diagnostic")
         try:
             t = con.execute(
                 "SELECT repo_owner, repo_name, branch FROM tasks WHERE task_id = ?",
