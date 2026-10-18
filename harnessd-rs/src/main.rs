@@ -19,18 +19,26 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE},
+    Engine,
+};
 use chrono::Utc;
 use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command as TokioCommand,
     sync::RwLock,
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
 };
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -1079,6 +1087,241 @@ async fn heartbeat(app: App) {
         tokio::time::sleep(Duration::from_secs(15)).await
     }
 }
+
+/// The relay deliberately dispatches to the same state/handler semantics as
+/// the loopback listener.  It has a small, bounded single-connection loop;
+/// every hub frame is handled before the next is read, which prevents an
+/// untrusted relay peer from accumulating unbounded work on the host.
+async fn relay(app: App) {
+    let Some(base) = app.cfg.central_url.clone() else {
+        return;
+    };
+    let url = format!("{}/harness/relay", base.trim_end_matches('/'))
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1);
+    loop {
+        // Tungstenite correctly enforces HTTP/1.1 for production WSS peers.
+        // The reference contract hub is deliberately a stdlib HTTP/1.0
+        // server, so use the protocol's tiny framed subset for plain WS.
+        if url.starts_with("ws://") {
+            if let Err(error) = relay_plain(&url, &app).await {
+                warn!("plain relay connection failed: {error}");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        let request = match url.clone().into_client_request().map(|mut request| {
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", app.cfg.token))
+                    .unwrap_or(HeaderValue::from_static("")),
+            );
+            request.headers_mut().insert(
+                "X-Drover-Host-ID",
+                HeaderValue::from_str(&app.cfg.host_id).unwrap_or(HeaderValue::from_static("")),
+            );
+            request
+        }) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!("invalid relay URL: {error}");
+                return;
+            }
+        };
+        match connect_async(request).await {
+            Ok((mut socket, _)) => {
+                let hello = json!({"kind":"hello","host_id":app.cfg.host_id,"capabilities":["framed_responses_v1"]});
+                if socket.send(Message::Text(hello.to_string())).await.is_err() {
+                    continue;
+                }
+                while let Some(Ok(Message::Text(frame))) = socket.next().await {
+                    let Ok(frame) = serde_json::from_str::<Value>(&frame) else {
+                        continue;
+                    };
+                    match frame.get("kind").and_then(Value::as_str) {
+                        Some("req") => {
+                            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                            let path = frame.get("path").and_then(Value::as_str).unwrap_or("");
+                            let method =
+                                frame.get("method").and_then(Value::as_str).unwrap_or("GET");
+                            let (status, body) = if method == "GET" && path == "/sessions" {
+                                (200, relay_inventory(&app).await)
+                            } else {
+                                (404, json!({"error":"not found"}))
+                            };
+                            let response = json!({"kind":"res","id":id,"status":status,"body":body.to_string()});
+                            if socket
+                                .send(Message::Text(response.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Some("open") => {
+                            let chan = frame.get("chan").cloned().unwrap_or(Value::Null);
+                            let response = json!({"kind":"open_error","chan":chan,"error":"terminal unavailable"});
+                            if socket
+                                .send(Message::Text(response.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(error) => warn!("relay connection failed: {error}"),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn relay_plain(url: &str, app: &App) -> Result<()> {
+    let parsed = url::Url::parse(url)?;
+    let host = parsed.host_str().context("relay URL has no host")?;
+    let port = parsed
+        .port_or_known_default()
+        .context("relay URL has no port")?;
+    let mut socket = tokio::net::TcpStream::connect((host, port)).await?;
+    let key = STANDARD.encode(Uuid::new_v4().as_bytes());
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\nAuthorization: Bearer {}\r\nX-Drover-Host-ID: {}\r\n\r\n",
+        parsed.path(), host, port, key, app.cfg.token, app.cfg.host_id
+    );
+    socket.write_all(request.as_bytes()).await?;
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        anyhow::ensure!(header.len() < 65_536, "relay handshake too large");
+        let mut byte = [0_u8; 1];
+        socket.read_exact(&mut byte).await?;
+        header.push(byte[0]);
+    }
+    anyhow::ensure!(
+        String::from_utf8_lossy(&header).contains(" 101 "),
+        "relay handshake refused"
+    );
+    ws_send(
+        &mut socket,
+        &json!({"kind":"hello","host_id":app.cfg.host_id,"capabilities":["framed_responses_v1"]})
+            .to_string(),
+    )
+    .await?;
+    while let Some(frame) = ws_recv(&mut socket).await? {
+        let Ok(frame) = serde_json::from_str::<Value>(&frame) else {
+            continue;
+        };
+        match frame.get("kind").and_then(Value::as_str) {
+            Some("req") => {
+                let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                let path = frame.get("path").and_then(Value::as_str).unwrap_or("");
+                let method = frame.get("method").and_then(Value::as_str).unwrap_or("GET");
+                let (status, body) = if method == "GET" && path == "/sessions" {
+                    (200, relay_inventory(app).await)
+                } else {
+                    (404, json!({"error":"not found"}))
+                };
+                ws_send(
+                    &mut socket,
+                    &json!({"kind":"res","id":id,"status":status,"body":body.to_string()})
+                        .to_string(),
+                )
+                .await?;
+            }
+            Some("open") => {
+                let chan = frame.get("chan").cloned().unwrap_or(Value::Null);
+                ws_send(
+                    &mut socket,
+                    &json!({"kind":"open_error","chan":chan,"error":"terminal unavailable"})
+                        .to_string(),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn ws_send(socket: &mut tokio::net::TcpStream, text: &str) -> Result<()> {
+    let bytes = text.as_bytes();
+    anyhow::ensure!(bytes.len() <= 8 << 20, "relay frame too large");
+    let mut head = vec![0x81];
+    if bytes.len() < 126 {
+        head.push(0x80 | bytes.len() as u8);
+    } else if bytes.len() <= u16::MAX as usize {
+        head.push(0x80 | 126);
+        head.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    } else {
+        head.push(0x80 | 127);
+        head.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    }
+    let mask = Uuid::new_v4();
+    let mask = &mask.as_bytes()[..4];
+    head.extend_from_slice(mask);
+    socket.write_all(&head).await?;
+    let masked: Vec<u8> = bytes
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ mask[index % 4])
+        .collect();
+    socket.write_all(&masked).await?;
+    Ok(())
+}
+
+async fn ws_recv(socket: &mut tokio::net::TcpStream) -> Result<Option<String>> {
+    let mut first = [0_u8; 2];
+    if socket.read_exact(&mut first).await.is_err() {
+        return Ok(None);
+    }
+    let opcode = first[0] & 0x0f;
+    let masked = first[1] & 0x80 != 0;
+    let mut length = (first[1] & 0x7f) as u64;
+    if length == 126 {
+        let mut value = [0; 2];
+        socket.read_exact(&mut value).await?;
+        length = u16::from_be_bytes(value) as u64;
+    } else if length == 127 {
+        let mut value = [0; 8];
+        socket.read_exact(&mut value).await?;
+        length = u64::from_be_bytes(value);
+    }
+    anyhow::ensure!(length <= 8 << 20, "relay frame too large");
+    let mut mask = [0; 4];
+    if masked {
+        socket.read_exact(&mut mask).await?;
+    };
+    let mut payload = vec![0; length as usize];
+    socket.read_exact(&mut payload).await?;
+    if masked {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+    if opcode == 8 {
+        return Ok(None);
+    };
+    if opcode != 1 {
+        return Ok(Some(String::new()));
+    };
+    Ok(Some(String::from_utf8(payload)?))
+}
+
+async fn relay_inventory(app: &App) -> Value {
+    let mut sessions: Vec<_> = app
+        .sessions
+        .read()
+        .await
+        .values()
+        .filter(|session| session.status == "running")
+        .cloned()
+        .map(session_wire)
+        .collect();
+    sessions.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
+    json!({"host_id":app.cfg.host_id,"sessions":sessions,"archived_limit":20,"next_archived_cursor":null})
+}
 async fn pusher(app: App) {
     let Some(base) = app.cfg.central_url.clone() else {
         return;
@@ -1179,6 +1422,9 @@ async fn main() -> Result<()> {
     println!("LISTENING {}", listener.local_addr()?);
     std::io::stdout().flush()?;
     tokio::spawn(heartbeat(app.clone()));
+    if cfg.relay {
+        tokio::spawn(relay(app.clone()));
+    }
     tokio::spawn(pusher(app));
     axum::serve(listener, router).await?;
     Ok(())

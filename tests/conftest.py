@@ -67,6 +67,7 @@ _RUST_PHASE2 = (
     "test_request_validation_contract.py::test_harnessd_sessions_cors_",
     "test_native_history_contract.py::test_discovers_codex_",
     "test_native_history_contract.py::test_native_sessions_query_",
+    "test_relay_spoke_contract.py::test_relay_",
 )
 
 
