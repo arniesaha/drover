@@ -93,7 +93,6 @@ def run_harnessd_from_options(
     resolved_config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     bootstrap_harnessd_schema(cfg)
     listen_host, listen_port = parse_listen_address(listen)
-    click.echo(f"drover-harnessd {host_id} listening on {listen_host}:{listen_port}")
     run_harnessd(
         host_id=host_id,
         display_name=display_name or host_id,

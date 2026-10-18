@@ -154,6 +154,30 @@ jobs:
         done
         exit "$status"
 
+  harnessd-contract:
+    name: harnessd contract (${{ matrix.impl }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep the Rust lane visible now: its launcher skips until the Phase 2
+        # binary exists, then starts exercising exactly the same black-box API.
+        impl: [py, rs]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: "pip"
+    - name: Install contract dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+    - name: Run harnessd black-box contract suite
+      env:
+        HARNESSD_IMPL: ${{ matrix.impl }}
+      run: pytest tests/contract -q
+
   postgres-integration:
     # This job is intentionally unconditional. A documentation-only change may
     # skip the general Python suite, but the PostgreSQL serving contract must
