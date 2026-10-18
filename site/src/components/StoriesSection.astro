@@ -1,0 +1,111 @@
+---
+// Stories section linking to real-world experience posts.
+import { SITE } from '../site';
+
+interface Props {
+  url?: string | null;
+}
+
+const { url = SITE.storiesPostUrl } = Astro.props;
+---
+
+{url && (
+  <section class="section stories-section" id="stories">
+    <div class="wrap">
+      <div class="stories-head">
+        <span class="eyebrow">Field stories</span>
+        <h2>How people actually use Drover.</h2>
+        <p class="lede">Real notes from developers running multi-machine agent fleets in daily work.</p>
+      </div>
+
+      <div class="grid cols-3 stories-grid">
+        <a
+          class="card story-card"
+          href={url}
+          target="_blank"
+          rel="noopener"
+        >
+          <div class="story-tag-row">
+            <span class="tag beta">Story</span>
+            <span class="story-meta">Weekend field test</span>
+          </div>
+          <h3 class="story-title">A Saturday with Drover</h3>
+          <p class="story-desc">
+            Driving a coding-agent fleet from a phone while away from the desk: starting tasks on a home workstation, answering Claude Code approvals on the go, and handing off to Codex when provider quota was exhausted.
+          </p>
+          <div class="story-footer">
+            <span class="story-author">Arnab Saha</span>
+            <span class="story-read">Read post <span aria-hidden="true">-></span></span>
+          </div>
+        </a>
+      </div>
+    </div>
+  </section>
+)}
+
+<style>
+  .stories-section {
+    border-top: 1px solid var(--line);
+    background: color-mix(in srgb, var(--surface) 40%, var(--bg));
+  }
+  .stories-head {
+    margin-bottom: 2rem;
+  }
+  .stories-grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  }
+  .story-card {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    text-decoration: none;
+    color: inherit;
+    border-color: var(--line-strong);
+    background: var(--surface);
+    transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  }
+  .story-card:hover {
+    transform: translateY(-3px);
+    border-color: var(--ember);
+    box-shadow: var(--shadow), 0 8px 24px -8px rgba(0, 0, 0, 0.3);
+  }
+  .story-tag-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.8rem;
+  }
+  .story-meta {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+  .story-title {
+    font-size: 1.35rem;
+    margin-bottom: 0.6rem;
+    color: var(--text);
+  }
+  .story-desc {
+    font-size: 0.94rem;
+    color: var(--text-2);
+    line-height: 1.55;
+    margin-bottom: 1.4rem;
+    flex-grow: 1;
+  }
+  .story-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-top: 0.9rem;
+    border-top: 1px dashed var(--line);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+  }
+  .story-author {
+    color: var(--muted);
+  }
+  .story-read {
+    font-weight: 600;
+    color: var(--ember);
+  }
+</style>
