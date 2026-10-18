@@ -7,6 +7,10 @@ export const SITE = {
   url: 'https://drover.fyi',
   repo: 'https://github.com/arniesaha/drover',
   license: 'Apache-2.0',
+  // TODO: Replace with walkthrough YouTube video ID when recorded
+  walkthroughVideoId: null as string | null,
+  // TODO: Replace with published field post URL when live (https://arnabsaha.com/posts/a-saturday-with-drover)
+  storiesPostUrl: null as string | null,
 };
 
 const blob = `${SITE.repo}/blob/main`;
@@ -31,6 +35,8 @@ export const LINKS = {
 };
 
 export const NAV = [
+  { href: '/how-it-works/', label: 'How it works' },
+  { href: '/quickstart/', label: 'Quickstart' },
   { href: '/features/', label: 'Features' },
   { href: '/use-cases/', label: 'Use cases' },
   { href: '/architecture/', label: 'Architecture' },

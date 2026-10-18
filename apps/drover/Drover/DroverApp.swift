@@ -252,6 +252,12 @@ private struct RootView: View {
             }
         }
         .onOpenURL { url in
+            if url.scheme == "drover" {
+                if url.host == "home" || url.host == "host" {
+                    // Deep link from widget: opens Home (and filters by host if PR #688 plumbing exists)
+                    return
+                }
+            }
             guard let payload = PairingPayload(scanned: url.absoluteString) else {
                 invalidPairingLink = true
                 return
