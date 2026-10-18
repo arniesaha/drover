@@ -104,13 +104,23 @@ struct Terminal {
 
 impl Terminal {
     fn write(&self, data: &[u8]) -> Result<()> {
-        self.writer.lock().unwrap().write_all(data)?;
-        self.writer.lock().unwrap().flush()?;
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        writer.write_all(data)?;
+        writer.flush()?;
         Ok(())
     }
 
     fn replay(&self) -> Option<Value> {
-        let bytes: Vec<u8> = self.scrollback.lock().unwrap().iter().copied().collect();
+        let bytes: Vec<u8> = self
+            .scrollback
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .copied()
+            .collect();
         let text = String::from_utf8_lossy(&bytes).into_owned();
         (!text.is_empty()).then(|| json!({"type":"output","data":text}))
     }
@@ -243,6 +253,40 @@ impl App {
         db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE pushed_at IS NOT NULL AND ts < datetime('now', ?1) AND id NOT IN (SELECT id FROM events e2 WHERE e2.session_id=events.session_id ORDER BY id DESC LIMIT ?2))",params![format!("-{} days",RETENTION_DAYS),RETENTION_PER_SESSION])?;
         db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY id DESC LIMIT -1 OFFSET ?1)", [OUTBOX_LIMIT])?;
         Ok(())
+    }
+    /// Preserve handoff identity exactly: Python's event ID and dedup key are
+    /// already the hub fence, so recomputing either would make replay unsafe.
+    fn import_event(&self, event: &Value) -> Result<bool> {
+        let event_id = event
+            .get("event_id")
+            .and_then(Value::as_str)
+            .context("import event_id missing")?;
+        let dedup_key = event
+            .get("dedup_key")
+            .and_then(Value::as_str)
+            .context("import dedup_key missing")?;
+        let session_id = event
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("import event session_id missing")?;
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .context("import event type missing")?;
+        let seq = event
+            .get("seq")
+            .and_then(Value::as_i64)
+            .context("import event seq missing")?;
+        let ts = event
+            .get("ts")
+            .or_else(|| event.get("created_at"))
+            .and_then(Value::as_str)
+            .context("import event timestamp missing")?;
+        let changed = self.db.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO events(event_id,session_id,seq,type,text,payload,turn_id,ts,dedup_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![event_id, session_id, seq, kind, event.get("text").and_then(Value::as_str), serde_json::to_string(event.get("payload").unwrap_or(&Value::Null))?, event.get("turn_id").and_then(Value::as_str), ts, dedup_key],
+        )?;
+        Ok(changed == 1)
     }
 }
 
@@ -684,7 +728,10 @@ fn spawn_pty(command: Vec<String>, cwd: &str) -> Result<(u32, Arc<Terminal>)> {
                     Ok(count) => {
                         let bytes = &buffer[..count];
                         {
-                            let mut scrollback = terminal_for_reader.scrollback.lock().unwrap();
+                            let mut scrollback = terminal_for_reader
+                                .scrollback
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
                             scrollback.extend(bytes);
                             while scrollback.len() > TERMINAL_SCROLLBACK_BYTES {
                                 scrollback.pop_front();
@@ -1683,22 +1730,12 @@ fn import_jsonl(app: &App, path: &FsPath, dry_run: bool) -> Result<(usize, usize
             skipped += 1;
             continue;
         }
-        let sid = v
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("migrated");
-        let kind = v.get("type").and_then(Value::as_str).unwrap_or("raw");
-        events += 1;
-        if !dry_run {
-            app.emit(
-                sid,
-                kind,
-                v.get("text").and_then(Value::as_str),
-                v.get("payload")
-                    .cloned()
-                    .unwrap_or(Value::Object(Default::default())),
-                v.get("turn_id").and_then(Value::as_str),
-            )?;
+        if v.get("event_id").is_none() || v.get("dedup_key").is_none() {
+            skipped += 1;
+            continue;
+        }
+        if dry_run || app.import_event(&v)? {
+            events += 1;
         }
     }
     Ok((sessions, events, skipped))

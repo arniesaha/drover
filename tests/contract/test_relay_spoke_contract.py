@@ -66,10 +66,12 @@ def test_relay_terminal_channel_streams_shell_output_and_input(daemon, fake_hub)
     attached = recv_json(sock)
     assert attached["kind"] == "data"
     assert attached["message"] == {"type": "attached", "session_id": session["session_id"]}
-    send_json(sock, data_frame("shell", {"type": "input", "data": "printf relay-ok\\n"}))
+    typed = "printf 'relay-%s\\n' ok\n"
+    send_json(sock, data_frame("shell", {"type": "input", "data": typed}))
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         message = recv_json(sock)
-        if message and message.get("kind") == "data" and "relay-ok" in message.get("message", {}).get("data", ""):
+        data = message.get("message", {}).get("data", "") if message else ""
+        if message and message.get("kind") == "data" and "relay-ok" in data and data != typed:
             return
     raise AssertionError("terminal output did not traverse the relay")
