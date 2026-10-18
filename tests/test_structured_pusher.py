@@ -111,6 +111,149 @@ def test_pusher_default_interval_delivers_live_events_promptly():
     assert elapsed < 1.0
 
 
+def test_pusher_splits_a_413_page_and_retries_each_half(monkeypatch):
+    """A lower-limit/newer hub must not let one rejected page halt replay."""
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    calls: list[list[dict]] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ingested": 1}'
+
+    def post(request, *, timeout):
+        del timeout
+        events = json.loads(request.data)["events"]
+        calls.append(events)
+        if len(events) > 1:
+            raise HTTPError(request.full_url, 413, "too large", {}, BytesIO(b"{}"))
+        return Response()
+
+    monkeypatch.setattr(pusher_module, "urlopen", post)
+    pusher = EventPusher("http://central.invalid", "test-token")
+    batch = [
+        {"event_id": f"e{number}", "session_id": f"s{number}", "type": "status"}
+        for number in range(4)
+    ]
+
+    assert pusher.post_batch(batch)
+    assert [len(events) for events in calls] == [4, 2, 1, 1, 2, 1, 1]
+    assert [event["event_id"] for index in (2, 3, 5, 6) for event in calls[index]] == [
+        "e0",
+        "e1",
+        "e2",
+        "e3",
+    ]
+
+
+def test_pusher_size_caps_one_event_without_blocking_later_events(monkeypatch, caplog):
+    """One huge tool result is represented by its identity, then replay moves on."""
+    calls: list[list[dict]] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ingested": 1}'
+
+    def post(request, *, timeout):
+        del timeout
+        calls.append(json.loads(request.data)["events"])
+        return Response()
+
+    monkeypatch.setattr(pusher_module, "urlopen", post)
+    monkeypatch.setattr(pusher_module, "_MAX_EVENT_REQUEST_BYTES", 512)
+    pusher = EventPusher("http://central.invalid", "test-token")
+    huge = {
+        "event_id": "huge",
+        "session_id": "s1",
+        "type": "tool_result",
+        "seq": 9,
+        "payload": {"text": "x" * 4096},
+    }
+    later = {"event_id": "later", "session_id": "s2", "type": "status", "seq": 1}
+    reset_undelivered_event_count()
+    try:
+        assert pusher.post_batch_pending([huge, later]) == []
+        assert [event["event_id"] for page in calls for event in page] == [
+            "huge",
+            "later",
+        ]
+        delivered_huge = calls[0][0]
+        assert delivered_huge["seq"] == 9
+        assert delivered_huge["payload"]["truncated"] is True
+        assert undelivered_event_count() == 1
+        assert "structured event size capped: original_bytes=" in caplog.text
+    finally:
+        reset_undelivered_event_count()
+
+
+def test_rejected_size_capped_event_does_not_block_later_events(monkeypatch, caplog):
+    """Even a hub below the compact-envelope size cannot stall the replay."""
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    calls: list[list[dict]] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ingested": 1}'
+
+    def post(request, *, timeout):
+        del timeout
+        events = json.loads(request.data)["events"]
+        calls.append(events)
+        if events[0]["event_id"] == "huge":
+            raise HTTPError(request.full_url, 413, "too large", {}, BytesIO(b"{}"))
+        return Response()
+
+    monkeypatch.setattr(pusher_module, "urlopen", post)
+    monkeypatch.setattr(pusher_module, "_MAX_EVENT_REQUEST_BYTES", 512)
+    pusher = EventPusher("http://central.invalid", "test-token")
+    huge = {
+        "event_id": "huge",
+        "session_id": "s1",
+        "type": "tool_result",
+        "seq": 9,
+        "payload": {"text": "x" * 4096},
+    }
+    later = {"event_id": "later", "session_id": "s2", "type": "status", "seq": 1}
+    reset_undelivered_event_count()
+    try:
+        assert pusher.post_batch_pending([huge, later]) == []
+        assert [event["event_id"] for page in calls for event in page] == [
+            "huge",
+            "later",
+        ]
+        assert undelivered_event_count() == 1
+        assert "structured event rejected after size cap" in caplog.text
+    finally:
+        reset_undelivered_event_count()
+
+
 def test_pusher_flushes_immediately_on_turn_complete():
     server = _start_fake_central()
     try:
