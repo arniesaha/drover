@@ -1,0 +1,4 @@
+{"event_id": "<event_id>", "payload": {"native_session_id": "019f38e0-c232-7233-85d0-980957a5f7f1", "thread_id": "019f38e0-c232-7233-85d0-980957a5f7f1", "type": "thread.started"}, "role": "system", "text": "thread started", "ts": "<ts>", "turn_id": null, "type": "status"}
+{"event_id": "<event_id>", "payload": {"type": "turn.started"}, "role": "system", "text": "turn.started", "ts": "<ts>", "turn_id": null, "type": "status"}
+{"event_id": "<event_id>", "payload": {}, "role": "assistant", "text": "hello nexus", "ts": "<ts>", "turn_id": null, "type": "assistant_output"}
+{"event_id": "<event_id>", "payload": {"awaiting": "input", "turn_complete": true, "usage": {"cached_input_tokens": 4992, "input_tokens": 18240, "output_tokens": 67, "reasoning_output_tokens": 59}}, "role": "system", "text": "turn complete", "ts": "<ts>", "turn_id": null, "type": "status"}

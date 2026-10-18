@@ -4808,6 +4808,14 @@ def run_harnessd(
             listen_port=listen_port,
             state=state,
         )
+        # This deliberately goes to stdout, rather than the logger, so a
+        # supervisor can discover an ephemeral port without scraping its log
+        # format.  It is emitted only after bind() succeeded.
+        # `server_port` is supplied by the production HTTPServer.  Keep the
+        # startup lifecycle test doubles deliberately small: they exercise
+        # ordering, not socket binding.
+        bound_port = getattr(server, "server_port", listen_port)
+        print(f"LISTENING {listen_host}:{bound_port}", flush=True)
         # The first pass is asynchronous: a slow Codex app-server startup
         # must not hold either daemon startup or a future relay request open.
         provider_usage_cache = getattr(state, "provider_usage_cache", None)
@@ -4863,7 +4871,7 @@ def run_harnessd(
                     state.central_url,
                     state.host_id,
                     state.api_token,
-                    server.server_port,
+                    bound_port,
                 )
                 relay_client.start()
             else:

@@ -94,6 +94,8 @@ def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):
         updater = None
 
     class _Server:
+        server_port = 43123
+
         def serve_forever(self):
             raise RuntimeError("stop")
 

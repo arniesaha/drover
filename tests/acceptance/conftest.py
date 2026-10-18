@@ -44,6 +44,12 @@ def is_pgvector_supported(dsn: str) -> bool:
         return False
 
 
+# Some root integration tests import this helper from pytest's historical
+# bare ``conftest`` module.  When acceptance fixtures are collected first,
+# that name resolves here, so retain the root helper's compatible surface.
+pgvector_available = is_pgvector_supported
+
+
 def restore_prod_control_schema(
     dsn: str,
     target_schema: str = "drover_control",

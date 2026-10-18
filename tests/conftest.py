@@ -24,6 +24,11 @@ from uuid import uuid4
 
 import pytest
 
+# Contract fixtures live in a normally named module rather than a nested
+# conftest.py.  Nested conftests are imported as bare ``conftest`` by pytest
+# and can shadow this module for unrelated integration tests.
+pytest_plugins = ("contract.support",)
+
 _HOMEBREW_BINDIRS = (
     "/opt/homebrew/opt/postgresql@17/bin",
     "/usr/local/opt/postgresql@17/bin",
