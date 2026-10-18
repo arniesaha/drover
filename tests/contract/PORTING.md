@@ -111,15 +111,15 @@ missing public seam rather than importing daemon internals.
 | `test_daemon_rejects_unauthenticated_when_token_set` | `test_auth_and_top_level_error_envelopes` |
 | `test_daemon_accepts_bearer` | `test_auth_and_top_level_error_envelopes` |
 | `test_daemon_healthz_open` | `test_launcher_announces_bound_port_and_registers` |
-| `test_daemon_terminal_attach_rejects_unauthenticated` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_daemon_terminal_attach_rejects_unauthenticated` | `test_daemon_terminal_attach_rejects_unauthenticated` |
 | `test_structured_session_full_lifecycle` | `test_public_session_mutation_contract` |
 | `test_structured_session_inventory_includes_run_preferences` | `test_public_session_mutation_contract` |
 | `test_claude_turn_cannot_change_persistent_session_preferences` | `test_model_preference_validation_discards_claude_turn_overrides` |
 | `test_structured_turn_appends_user_input_and_seq_is_monotonic` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_initial_prompt_with_image_saves_file_and_records_attachment` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_initial_prompt_with_image_saves_file_and_records_attachment` | `test_initial_prompt_with_image_saves_file_and_records_attachment` |
 | `test_structured_command_preferences_map_to_cli_flags` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_turn_with_image_saves_file_and_appends_path` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_image_only_turn_is_accepted` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_turn_with_image_saves_file_and_appends_path` | `test_turn_with_image_saves_file_and_appends_path` |
+| `test_image_only_turn_is_accepted` | `test_image_only_turn_is_accepted` |
 | `test_turn_with_bad_base64_is_rejected` | `test_structured_launch_rejects_invalid_turn_input` |
 | `test_turn_with_unsupported_media_type_is_rejected` | `test_structured_launch_rejects_invalid_turn_input` |
 | `test_empty_turn_still_rejected` | `test_empty_turn_still_rejected` |
