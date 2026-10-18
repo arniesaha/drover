@@ -731,7 +731,7 @@ def _bootstrap_if_missing(cfg: DroverConfig) -> None:
         bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
 
 
-def _configure_push(cfg: DroverConfig, auth) -> None:
+def _configure_push(cfg: DroverConfig, auth, content_consent_reader=None) -> None:
     """Register the APNs sender, if one is configured and auth is on.
 
     Push targets device credentials, which only exist when auth is enabled --
@@ -742,7 +742,7 @@ def _configure_push(cfg: DroverConfig, auth) -> None:
     try:
         from drover.server.push import configure as configure_push
 
-        configure_push(cfg, auth.credentials)
+        configure_push(cfg, auth.credentials, content_consent_reader)
     except Exception:  # noqa: BLE001
         log.exception("APNs push failed to configure; continuing without it")
 
@@ -2585,7 +2585,7 @@ def _run_api_role(
     # inserted disabled, so separating roles never expands content consent.
     consent.initialize(cfg.advisory_content)
     auth = load_auth(cfg)
-    _configure_push(cfg, auth)
+    _configure_push(cfg, auth, lambda: consent.state().heartbeat())
     stop = threading.Event()
     boundary = AnalyticsBoundaryClient(
         cfg.analytics_boundary,
@@ -3146,6 +3146,16 @@ def run(
     config_path = (
         Path(ctx.obj["config_path"]) if ctx.obj["config_path"] else _DEFAULT_CONFIG_PATH
     )
+
+    def push_content_consent_state():
+        if central_consent is not None:
+            return central_consent.state().heartbeat()
+        return InsightsService(
+            cfg.duckdb_path,
+            config_path=config_path,
+            isolated_snapshots=True,
+        ).content_consent_state()
+
     if not no_metrics and cfg.metrics_http_port > 0:
         try:
             with _startup_phase("load_metrics_auth"):
@@ -3154,7 +3164,7 @@ def run(
             # harness events, so the first awaiting transition after boot is
             # already deliverable.
             with _startup_phase("configure_metrics_push"):
-                _configure_push(cfg, auth)
+                _configure_push(cfg, auth, push_content_consent_state)
             with _startup_phase("construct_metrics_services"):
                 metrics_collector = MetricsCollector(
                     duckdb_path=cfg.duckdb_path,
@@ -3308,7 +3318,7 @@ def run(
             auth = load_auth(cfg)
             # Metrics off, but harnessd's local emit() path still records
             # awaiting transitions through the registry, so push still applies.
-            _configure_push(cfg, auth)
+            _configure_push(cfg, auth, push_content_consent_state)
             metrics_collector = MetricsCollector(
                 duckdb_path=cfg.duckdb_path,
                 incoming_dir=cfg.incoming_dir,

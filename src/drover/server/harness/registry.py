@@ -1247,9 +1247,11 @@ class HarnessRegistry:
     def _notification_content_allowed(capabilities: Any) -> bool:
         """Honor an explicit host notification-content consent denial.
 
-        Older hosts do not advertise this capability, so their established
-        behaviour remains unchanged. A malformed or explicit false value is
-        fail-closed for notification text.
+        The hub's durable consent reader is the authoritative gate. Hosts
+        currently do not normally advertise this optional marker, so an
+        absent or malformed capability must defer to that reader rather than
+        pretending the host made a consent decision. An explicit false still
+        wins as the more-specific restriction.
         """
         try:
             value = (
@@ -1258,15 +1260,15 @@ class HarnessRegistry:
                 else capabilities
             )
         except (TypeError, ValueError):
-            return False
+            return True
         if not isinstance(value, dict):
-            return False
+            return True
         marker = value.get("notification_content_consent", value.get("content_consent"))
         if marker is None:
             return True
         if isinstance(marker, dict):
             marker = marker.get("enabled")
-        return marker is True
+        return marker is not False
 
     @staticmethod
     def _session_read_profile(con, session_id: str) -> bool:

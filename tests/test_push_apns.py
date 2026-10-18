@@ -205,7 +205,12 @@ def test_push_available_reports_registered_usable_sender(config, tmp_path):
 def test_alert_carries_time_sensitive_payload_and_collapse_id(tmp_path, config):
     store, credential = _paired_device(tmp_path)
     client = FakeClient()
-    sender = APNsSender(config, store, client=client)
+    sender = APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )
 
     sender._deliver(_transition())
 
@@ -240,7 +245,12 @@ def test_production_environment_uses_the_production_host(tmp_path, config):
 def test_input_and_approval_read_differently(tmp_path, config):
     store, _ = _paired_device(tmp_path)
     client = FakeClient()
-    sender = APNsSender(config, store, client=client)
+    sender = APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )
 
     sender._deliver(_transition(awaiting="input"))
 
@@ -583,7 +593,12 @@ def test_dispatch_survives_a_broken_sender():
 def test_body_quotes_the_agent_rather_than_a_generic_phrase(tmp_path, config):
     store, _ = _paired_device(tmp_path)
     client = FakeClient()
-    sender = APNsSender(config, store, client=client)
+    sender = APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )
 
     sender._deliver(
         _transition(awaiting="input", preview="Ready to deploy. Want me to push?")
@@ -599,7 +614,12 @@ def test_without_a_preview_the_old_wording_survives(tmp_path, config):
     store, _ = _paired_device(tmp_path)
     client = FakeClient()
 
-    APNsSender(config, store, client=client)._deliver(_transition(preview=""))
+    APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )._deliver(_transition(preview=""))
 
     alert = json.loads(client.posts[0]["content"])["aps"]["alert"]
     assert alert["body"] == "Needs your input: approve a command"
@@ -658,7 +678,12 @@ def _batch_sender(config, store):
     now = [100.0]
     client = FakeClient()
     sender = APNsSender(
-        config, store, client=client, clock=lambda: now[0], timer_factory=ManualTimer
+        config,
+        store,
+        client=client,
+        clock=lambda: now[0],
+        timer_factory=ManualTimer,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
     )
     return sender, client, now
 
@@ -761,6 +786,113 @@ def test_content_consent_off_uses_metadata_only(tmp_path, config):
     assert "Secret" not in json.dumps(payload)
     assert "npm test" not in json.dumps(payload)
     assert payload["aps"]["badge"] == 2
+    sender.close()
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        None,
+        lambda: {"enabled": False, "epoch": 2},
+        lambda: {"enabled": True, "epoch": 0},
+        lambda: {"enabled": True},
+        lambda: (_ for _ in ()).throw(RuntimeError("consent unavailable")),
+    ],
+    ids=["missing", "disabled", "unreconciled", "malformed", "unreadable"],
+)
+def test_consent_reader_fails_closed_for_notification_content(tmp_path, config, reader):
+    store, credential = _paired_device(tmp_path)
+    sender = APNsSender(config, store, content_consent_reader=reader)
+    payload = json.loads(
+        sender._device_payload(
+            credential,
+            _transition(
+                title="Secret session title",
+                preview="Secret question text",
+                approval_summary="Approve: run `npm test --token super-secret`",
+                repo_name="acme/web-app",
+                host="studio",
+            ),
+            None,
+        )
+    )
+    encoded = json.dumps(payload)
+    assert payload["aps"]["alert"]["title"] == "Needs your input"
+    assert payload["aps"]["alert"]["body"] == "Needs your input · acme/web-app · studio"
+    assert "Secret" not in encoded
+    assert "npm test" not in encoded
+    assert "super-secret" not in encoded
+    sender.close()
+
+
+def test_consent_reader_allows_notification_content_when_reconciled(tmp_path, config):
+    store, credential = _paired_device(tmp_path)
+    sender = APNsSender(
+        config,
+        store,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 2},
+    )
+    payload = json.loads(
+        sender._device_payload(
+            credential,
+            _transition(
+                title="Release candidate",
+                preview="May I deploy it?",
+                repo_name="acme/web-app",
+                host="studio",
+            ),
+            None,
+        )
+    )
+    assert payload["aps"]["alert"]["title"] == "acme/web-app · Release candidate"
+    assert payload["aps"]["alert"]["body"] == "Needs your input: approve a command"
+    sender.close()
+
+
+def test_configured_sender_uses_the_durable_consent_reader(tmp_path, config):
+    class Cfg:
+        apns_enabled = config.enabled
+        apns_key_path = str(config.key_path)
+        apns_key_id = config.key_id
+        apns_team_id = config.team_id
+        apns_bundle_id = config.bundle_id
+
+    store, credential = _paired_device(tmp_path)
+    sender = configure(Cfg(), store, lambda: {"enabled": False, "epoch": 1})
+    assert sender is not None
+    try:
+        payload = json.loads(sender._device_payload(credential, _transition(), None))
+        assert payload["aps"]["alert"]["title"] == "Needs your input"
+    finally:
+        sender.close()
+        set_sender(None)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "FOO_TOKEN=topsecret",
+        "API_KEY=topsecret",
+        "PASSWORD=topsecret",
+        "Authorization: Basic abcdef",
+        "Bearer topsecret",
+        "--token topsecret",
+        "--password topsecret",
+        "-p topsecret",
+        "https://alice:topsecret@example.test/repo",
+        "0123456789abcdef0123456789abcdef",
+    ],
+)
+def test_approval_command_redacts_lock_screen_secrets(tmp_path, config, secret):
+    store, _ = _paired_device(tmp_path)
+    sender = APNsSender(config, store)
+    body = json.loads(
+        sender._payload(
+            _transition(approval_summary=f"Approve: run `npm test {secret}`"), None
+        )
+    )["aps"]["alert"]["body"]
+    assert secret not in body
+    assert "…" in body
     sender.close()
 
 

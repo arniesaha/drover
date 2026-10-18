@@ -44,6 +44,19 @@ _AWAITING_TITLES = {
 }
 _BODY_MAX_CHARS = 140
 _APNS_MAX_BYTES = 4096
+_APPROVAL_FLAG_SECRET_RE = re.compile(
+    r"(?i)(?<!\S)(--(?:token|password)|-p)(?:=|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s`]+)"
+)
+_APPROVAL_URL_USERINFO_RE = re.compile(r"https?://[^\s/@:]+:[^@\s]+@[^\s`]+")
+_HIGH_ENTROPY_SECRET_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_=-]{32,}(?![A-Za-z0-9+/_=-])"
+)
+
+
+def _unavailable_content_consent() -> dict:
+    """The safe default when a sender was not given the hub consent reader."""
+    return {}
+
 
 # --- rejection classification ------------------------------------------------
 #
@@ -275,7 +288,12 @@ class AwaitingTransition:
             self.approval_summary if self.awaiting == "approval" else self.summary()
         )
         if self.awaiting == "approval" and summary:
-            return _condense(summary, _BODY_MAX_CHARS, keep_code=True)
+            return _condense(
+                _redact_approval_summary(summary),
+                _BODY_MAX_CHARS,
+                keep_code=True,
+                already_redacted=True,
+            )
         if self.kind == "input" and summary:
             return _condense(summary, _BODY_MAX_CHARS)
         return _condense(f"{prefix}: {summary or fallback}", _BODY_MAX_CHARS)
@@ -337,7 +355,11 @@ _SUMMARY_MAX_CHARS = 220
 
 
 def _condense(
-    text: str | None, maximum: int = _SUMMARY_MAX_CHARS, *, keep_code: bool = False
+    text: str | None,
+    maximum: int = _SUMMARY_MAX_CHARS,
+    *,
+    keep_code: bool = False,
+    already_redacted: bool = False,
 ) -> str:
     """Flatten an agent message into one notification-shaped line.
 
@@ -353,7 +375,7 @@ def _condense(
     # Keep identifiers, secrets, links, and machine locations off the lock screen.
     from drover.server.harness.auth import redact_auth_text
 
-    text = redact_auth_text(str(text))
+    text = str(text) if already_redacted else redact_auth_text(str(text))
     text = re.sub(
         r"\b(?:run|session|harness)[_ -]?id\s*[:=]\s*[^\s,;]+", "", text, flags=re.I
     )
@@ -391,6 +413,23 @@ def _condense(
     # A cut that happens to land on a sentence end is already a clean stop;
     # "inflated the counts.…" reads like a typo rather than a truncation.
     return cut if cut.endswith((".", "!", "?")) else cut + "…"
+
+
+def _redact_approval_summary(text: str) -> str:
+    """Remove command-shaped secrets before an approval reaches APNs.
+
+    ``redact_auth_text`` is the shared first line of defense. Notifications
+    accept shell commands too, though, so cover flags and generic credential
+    blobs that do not have a key name. Keep the command shape useful while
+    replacing each value with an unambiguous lock-screen-safe marker.
+    """
+    from drover.server.harness.auth import redact_auth_text
+
+    redacted = _APPROVAL_URL_USERINFO_RE.sub("URL(…)", str(text))
+    redacted = redact_auth_text(redacted)
+    redacted = _APPROVAL_FLAG_SECRET_RE.sub(r"\1 …", redacted)
+    redacted = _HIGH_ENTROPY_SECRET_RE.sub("…", redacted)
+    return redacted.replace("<redacted>", "…")
 
 
 def _b64url(raw: bytes) -> str:
@@ -469,11 +508,17 @@ class APNsSender:
         timer_factory=threading.Timer,
         batch_seconds: float = 60,
         input_batch_seconds: float = 60,
+        content_consent_reader=None,
     ):
         self._clock = clock
         self._timer_factory = timer_factory
         self._batch_seconds = batch_seconds
         self._input_batch_seconds = input_batch_seconds
+        # Startup supplies the durable hub reader. A missing reader is not
+        # permission: content-bearing notification text must fail closed.
+        self._content_consent_reader = (
+            content_consent_reader or _unavailable_content_consent
+        )
         self._pending_lock = threading.Lock()
         self._pending = {}
         # Per device/session cooldowns: the first question gets through now;
@@ -810,11 +855,28 @@ class APNsSender:
         return payload
 
     def _device_payload(self, credential, transition, badge):
+        transition = self._consent_gated_transition(transition)
         is_digest = credential.notification_mode == "digest"
         payload = json.loads(self._payload(transition, badge, summary=is_digest))
         if is_digest:
             payload["aps"]["interruption-level"] = "passive"
         return json.dumps(payload, separators=(",", ":")).encode()
+
+    def _consent_gated_transition(self, transition):
+        """Apply the hub's durable content gate immediately before APNs I/O."""
+        reader = self._content_consent_reader
+        try:
+            state = reader()
+            enabled = state.get("enabled") is True
+            epoch = state.get("epoch")
+            allowed = enabled and type(epoch) is int and epoch > 0
+        except Exception:  # noqa: BLE001 - consent reads must fail closed.
+            allowed = False
+        if allowed:
+            return transition
+        if isinstance(transition, list):
+            return [replace(item, content_allowed=False) for item in transition]
+        return replace(transition, content_allowed=False)
 
     def _send_one(self, credential, transition: AwaitingTransition, badge) -> None:
         host = _HOSTS.get(credential.apns_environment or "")
@@ -977,7 +1039,7 @@ def push_status() -> dict:
         return {"state": "unknown"}
 
 
-def configure(cfg, credentials) -> APNsSender | None:
+def configure(cfg, credentials, content_consent_reader=None) -> APNsSender | None:
     """Build and register the sender from a ``DroverConfig``.
 
     Called once at server startup. A configured-but-unusable key (typo'd path,
@@ -1002,7 +1064,9 @@ def configure(cfg, credentials) -> APNsSender | None:
                 config.team_id or "<unset>",
             )
         return None
-    sender = APNsSender(config, credentials)
+    sender = APNsSender(
+        config, credentials, content_consent_reader=content_consent_reader
+    )
     set_sender(sender)
     log.info("apns: push enabled for %s (key %s)", config.bundle_id, config.key_id)
     return sender
