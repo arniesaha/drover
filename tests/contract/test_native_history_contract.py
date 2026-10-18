@@ -92,3 +92,20 @@ def test_discovers_codex_native_resume_sessions(daemon):
 @pytest.mark.parametrize("daemon", [{"home_files": {}}], indirect=True)
 def test_native_sessions_query_is_empty_without_history(daemon):
     assert request(daemon, "/native-sessions?harness=codex")[1]["sessions"] == []
+
+
+def test_native_session_inventory_enforces_its_public_hard_cap(daemon):
+    session_dir = daemon.root / "home" / ".claude" / "projects" / "project"
+    session_dir.mkdir(parents=True)
+    for index in range(101):
+        session_id = f"session-{index:03d}"
+        (session_dir / f"{session_id}.jsonl").write_text(
+            json.dumps({"type": "last-prompt", "sessionId": session_id})
+            + "\n"
+            + json.dumps({"type": "user", "cwd": "/work/project"})
+        )
+    status, body = request(
+        daemon, "/native-sessions?harness=claude-code&cwd=/work/project&limit=1000"
+    )
+    assert status == 200
+    assert len(body["sessions"]) == 100

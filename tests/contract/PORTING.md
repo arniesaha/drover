@@ -79,7 +79,7 @@ missing public seam rather than importing daemon internals.
 | `test_reads_claude_jsonl_native_transcript` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_reads_codex_jsonl_native_transcript` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
 | `test_discovers_codex_native_resume_sessions` | `test_discovers_codex_native_resume_sessions` |
-| `test_native_history_metadata_refuses_sources_beyond_its_configured_hard_cap` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
+| `test_native_history_metadata_refuses_sources_beyond_its_configured_hard_cap` | `test_native_session_inventory_enforces_its_public_hard_cap` |
 | `test_harnessd_creates_shell_session` | `test_shell_create_get_list_and_terminate` |
 | `test_harnessd_lists_and_gets_live_sessions` | `test_shell_create_get_list_and_terminate` |
 | `test_harnessd_listing_merges_pty_registry_and_manager_only_sessions` | dropped: requires pre-seeding or faulting durable daemon state before startup |
