@@ -145,7 +145,7 @@ private struct AllHostsChip: View {
                 Text("All")
                     .font(.system(.caption, design: .default, weight: isSelected ? .medium : .regular))
                     .foregroundStyle(isStale ? DroverColor.faint : (isSelected ? DroverColor.accentHi : DroverColor.text))
-                Text(isStale ? "·" : "\(totalCount)")
+                Text(isStale ? "·" : "\(totalCount) active")
                     .droverText(.marker)
                     .foregroundStyle(isSelected ? AnyShapeStyle(DroverColor.accentHi) : AnyShapeStyle(DroverColor.muted))
             }
@@ -193,8 +193,8 @@ private struct AllHostsChip: View {
 }
 
 /// One host in the strip: presence as form, plus how many of its sessions are
-/// active. Tapping a host filters the inbox list to that machine; tapping again clears.
-/// Offline hosts stay visible but dimmed.
+/// active (running + needs-you). Tapping a host filters the inbox list to that machine;
+/// tapping again clears. Offline hosts stay visible but dimmed.
 private struct HostChip: View {
     let group: HostGroup
     let isSelected: Bool
@@ -211,7 +211,7 @@ private struct HostChip: View {
                     .font(.system(.caption, design: .default, weight: isSelected ? .medium : .regular))
                     .foregroundStyle(isStale ? DroverColor.faint : (isSelected ? DroverColor.accentHi : DroverColor.text))
                     .lineLimit(1)
-                Text(isStale ? "·" : "\(group.sessions.count)")
+                Text(isStale ? "·" : "\(group.sessions.count) active")
                     .droverText(.marker)
                     .foregroundStyle(isSelected ? AnyShapeStyle(DroverColor.accentHi) : countStyle)
             }

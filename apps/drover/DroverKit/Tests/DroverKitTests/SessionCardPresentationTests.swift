@@ -58,7 +58,7 @@ import Testing
     #expect(card.species == .conversation)
     #expect(card.kicker == "drover")
     #expect(card.title == "Rework session cards for iPhone 17 Pro")
-    #expect(card.subtitle == "Codex · Mac Mini · asked a question")
+    #expect(card.subtitle == "asked a question · Mac Mini · Codex")
     #expect(card.action == .answer)
     #expect(card.isTitlePlaceholder == false)
     #expect(card.sigil == nil)
@@ -93,7 +93,7 @@ import Testing
 
     #expect(card.title == "Push the changes and open a PR")
     #expect(card.action == .approve)
-    #expect(card.subtitle == "Codex · Mac Mini · needs approval")
+    #expect(card.subtitle == "needs approval · Mac Mini · Codex")
 }
 
 /// The shipping-build case: the hub sends no preview until the first
@@ -127,7 +127,7 @@ import Testing
     let card = SessionCardPresentation(session: session, hostTitle: "Mac Mini")
 
     #expect(card.action == .resume)
-    #expect(card.subtitle == "Codex · Mac Mini · finished")
+    #expect(card.subtitle == "finished · Mac Mini · Codex")
 }
 
 // MARK: - Terminal cards
@@ -148,7 +148,7 @@ import Testing
     #expect(card.title == "40 passed in 35.61s")
     #expect(card.action == .attach)
     #expect(card.sigil == "$")
-    #expect(card.subtitle == "Shell · Mac Mini · attached")
+    #expect(card.subtitle == "attached · Mac Mini · Shell")
 }
 
 /// Recaps describe structured conversations only; a terminal must retain its
@@ -182,7 +182,7 @@ import Testing
     #expect(card.title == "~/src/drover")
     #expect(card.kicker == nil)
     #expect(card.isTitlePlaceholder == true)
-    #expect(card.subtitle == "Shell · Mac Mini · attached · no output yet")
+    #expect(card.subtitle == "attached · Mac Mini · Shell · no output yet")
 }
 
 @Test func exitedTerminalOffersReopenAndChangesItsSigil() {
@@ -197,7 +197,7 @@ import Testing
     #expect(card.action == .reopen)
     #expect(card.sigil == "‹")
     #expect(card.kicker == "~/src/drover", "linux homes abbreviate too")
-    #expect(card.subtitle == "Shell · nas · exited")
+    #expect(card.subtitle == "exited · nas · Shell")
 }
 
 /// A terminal session can never be in the needs-you bucket, so it must never
@@ -271,7 +271,7 @@ import Testing
     // The card still says what it last heard — it just stops pretending that
     // is current.
     #expect(stale.title == "Yeah go ahead")
-    #expect(stale.subtitle == "Claude · NAS · asked a question")
+    #expect(stale.subtitle == "asked a question · NAS · Claude")
 }
 
 /// Approve/deny and Watch go the same way as Answer: every verb on the card is
@@ -352,4 +352,86 @@ import Testing
     #expect(card.kicker == nil)
     #expect(card.title == "Finished")
     #expect(card.subtitle == "Session · Mac Mini")
+}
+
+// MARK: - Markdown Title Cleaning & Host Shortening
+
+@Test func conversationCardStripsMarkdownHeadingsFromTitle() {
+    let cases = [
+        ("# Verify the app's notification modes…", "Verify the app's notification modes…"),
+        ("# drover.fyi: real Privacy and Support…", "drover.fyi: real Privacy and Support…"),
+        ("## Secondary heading prompt", "Secondary heading prompt"),
+        ("### Deep heading", "Deep heading"),
+        ("#### Level four", "Level four"),
+        ("#   Spaces after hash  ", "Spaces after hash"),
+    ]
+
+    for (input, expected) in cases {
+        let session = SessionSummary(
+            id: "s", hostID: "studio", harness: "antigravity", mode: "structured",
+            status: "running", awaiting: nil, cwd: "/src/drover", lastActivity: nil,
+            preview: input
+        )
+        let card = SessionCardPresentation(session: session, hostTitle: "Arnabs-Mac-Studio")
+        #expect(card.title == expected, "Failed for input: \(input)")
+    }
+}
+
+@Test func conversationCardStripsEmphasisAndFormattingFromTitle() {
+    let cases = [
+        ("**Bold prompt line**", "Bold prompt line"),
+        ("*Italic prompt line*", "Italic prompt line"),
+        ("__Underlined prompt line__", "Underlined prompt line"),
+        ("_Italic underscore prompt line_", "Italic underscore prompt line"),
+        ("`Code command prompt`", "Code command prompt"),
+        ("# **Combined heading and bold**", "Combined heading and bold"),
+        ("## *Heading and italic*", "Heading and italic"),
+        ("### `Heading and code`", "Heading and code"),
+    ]
+
+    for (input, expected) in cases {
+        let session = SessionSummary(
+            id: "s", hostID: "studio", harness: "antigravity", mode: "structured",
+            status: "running", awaiting: nil, cwd: "/src/drover", lastActivity: nil,
+            preview: input
+        )
+        let card = SessionCardPresentation(session: session, hostTitle: "Arnabs-Mac-Studio")
+        #expect(card.title == expected, "Failed for input: \(input)")
+    }
+}
+
+@Test func cleanMarkdownTitleDirectFunctionTests() {
+    #expect(SessionCardPresentation.cleanMarkdownTitle("# Hello") == "Hello")
+    #expect(SessionCardPresentation.cleanMarkdownTitle("### Fix notification") == "Fix notification")
+    #expect(SessionCardPresentation.cleanMarkdownTitle("> Blockquote text") == "Blockquote text")
+    #expect(SessionCardPresentation.cleanMarkdownTitle("**Bold Title**") == "Bold Title")
+    #expect(SessionCardPresentation.cleanMarkdownTitle("***Bold Italic***") == "Bold Italic")
+    #expect(SessionCardPresentation.cleanMarkdownTitle("`Code snippet`") == "Code snippet")
+    #expect(SessionCardPresentation.cleanMarkdownTitle("~~Strikethrough~~") == "Strikethrough")
+    #expect(SessionCardPresentation.cleanMarkdownTitle("#") == "")
+    #expect(SessionCardPresentation.cleanMarkdownTitle("   ") == "")
+}
+
+@Test func shortHostTitleShortensHyphenatedMachineNames() {
+    #expect(SessionCardPresentation.shortHostTitle("Arnabs-Mac-Studio") == "Studio")
+    #expect(SessionCardPresentation.shortHostTitle("Arnab's Mac Studio") == "Studio")
+    #expect(SessionCardPresentation.shortHostTitle("GPU-PC") == "PC")
+    #expect(SessionCardPresentation.shortHostTitle("GPU PC") == "GPU PC")
+    #expect(SessionCardPresentation.shortHostTitle("Mac Mini") == "Mac Mini")
+    #expect(SessionCardPresentation.shortHostTitle("NAS") == "NAS")
+    #expect(SessionCardPresentation.shortHostTitle("nas") == "nas")
+    #expect(SessionCardPresentation.shortHostTitle("Fixture") == "Fixture")
+}
+
+@Test func cardSubtitlePutsStateFirstAndShortensHostSoNeverTruncates() {
+    let session = SessionSummary(
+        id: "s1", hostID: "arnabs-mac-studio", harness: "agy", mode: "structured",
+        status: "running", awaiting: nil, cwd: "/src/drover", lastActivity: nil,
+        preview: "# Verify the app's notification modes…"
+    )
+    let card = SessionCardPresentation(session: session, hostTitle: "Arnabs-Mac-Studio")
+
+    #expect(card.title == "Verify the app's notification modes…")
+    #expect(card.subtitle == "running · Studio · Antigravity")
+    #expect(card.subtitle.hasPrefix("running"), "State must be first in subtitle to avoid truncation")
 }

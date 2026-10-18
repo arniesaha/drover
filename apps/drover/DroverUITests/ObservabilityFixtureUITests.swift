@@ -248,7 +248,8 @@ final class ObservabilityFixtureUITests: XCTestCase {
         clearButton.tap()
 
         XCTAssertFalse(banner.exists)
-        XCTAssertTrue(app.buttons["studio-drover-approval"].waitForExistence(timeout: 3))
+        overviewToggle.tap() // Collapse overview so session list has full viewport
+        XCTAssertTrue(app.buttons["studio-drover-approval"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["gpu-drover-running"].exists)
 
         // 6. Filter by host chip alone
@@ -266,6 +267,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
     func testHomeFleetOverviewLightMode() {
         let app = launch(dark: false, fleetFilters: true)
         app.tabBars.buttons["Home"].tap()
+
+        let allChip = app.buttons["host-chip-all"]
+        XCTAssertTrue(allChip.waitForExistence(timeout: 10))
 
         let overviewToggle = app.buttons["overview-toggle"]
         XCTAssertTrue(overviewToggle.waitForExistence(timeout: 8))

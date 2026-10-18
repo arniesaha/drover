@@ -263,6 +263,7 @@ private struct OverviewHostHeaderCell: View {
             }
             .foregroundStyle(isSelected ? AnyShapeStyle(DroverColor.accentHi) : AnyShapeStyle(DroverColor.muted))
             .frame(minWidth: 64, alignment: .center)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Filter by host \(host.title), \(host.activeCount) active")
@@ -300,9 +301,10 @@ private struct OverviewMatrixCell: View {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .strokeBorder(isSelected ? AnyShapeStyle(DroverColor.accentHi) : AnyShapeStyle(DroverColor.accent.opacity(0.3)), lineWidth: 1)
                     }
+                    .frame(minWidth: 64, alignment: .center)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .frame(minWidth: 64, alignment: .center)
             .accessibilityLabel("\(projectName) on \(host.title), \(count) active sessions")
             .accessibilityIdentifier("overview-cell-\(projectName)-\(host.id)")
         } else {
