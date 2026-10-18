@@ -114,11 +114,22 @@ def _fake_cli(path: Path, fixture: Path, log: Path) -> None:
     path.write_text(
         "#!" + sys.executable + "\n"
         "import json, os, sys\n"
+        "if '--version' in sys.argv:\n"
+        " print('contract-cli 1.0')\n"
+        " raise SystemExit(0)\n"
         "log = os.environ['HARNESSD_FAKE_CLI_LOG']\n"
         "with open(log, 'a') as out:\n"
         " out.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
         "for line in sys.stdin:\n"
         " with open(log, 'a') as out: out.write(json.dumps({'stdin': line.rstrip()}) + '\\n')\n"
+        " request = json.loads(line)\n"
+        " if 'app-server' in sys.argv and 'id' in request:\n"
+        "  method = request['method']\n"
+        "  result = {'userAgent': 'contract'}\n"
+        "  if method == 'account/read': result = {'account': {'email': 'contract@example.com', 'planType': 'plus'}}\n"
+        "  if method == 'model/list': result = {'data': [{'id': 'contract-model', 'displayName': 'Contract model', 'isDefault': True, 'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}], 'defaultReasoningEffort': 'low'}], 'nextCursor': None}\n"
+        "  print(json.dumps({'id': request['id'], 'result': result}), flush=True)\n"
+        "  continue\n"
         f" for event in open({str(fixture)!r}): print(event.rstrip(), flush=True)\n"
     )
     path.chmod(0o755)

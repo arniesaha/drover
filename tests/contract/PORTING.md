@@ -9,32 +9,32 @@ missing public seam rather than importing daemon internals.
 | `test_run_harnessd_closes_auth_flows_on_shutdown` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_cli_passes_content_consent_config_to_server` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_model_catalog_route_is_host_scoped_and_forceable` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_model_catalog_service_is_created_lazily_once` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_model_catalog_route_is_host_scoped_and_forceable` | `test_model_catalog_route_is_host_scoped_and_forceable` |
+| `test_model_catalog_service_is_created_lazily_once` | dropped: `GET /model-catalog` can establish its response and refresh semantics but cannot reveal service allocation count; observing this needs an injected catalog factory |
 | `test_model_catalog_route_rejects_malformed_query` | `test_model_catalog_rejects_malformed_query` |
 | `test_model_catalog_route_rejects_unknown_or_disabled_harness` | `test_model_catalog_refuses_unknown_harness` |
 | `test_model_catalog_route_requires_bearer_token` | `test_model_catalog_requires_bearer_token` |
-| `test_model_catalog_route_returns_safe_degraded_envelope` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_model_catalog_route_returns_safe_degraded_envelope` | `test_model_catalog_route_returns_safe_degraded_envelope` |
 | `test_default_model_catalog_service_uses_only_enabled_resolved_presets` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_model_catalog_is_invalidated_after_auth_mutations_and_successful_poll` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_model_preference_validation_rejects_launch_before_side_effects` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_model_preference_validation_keeps_null_launch_defaults` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_model_preference_validation_rejects_launch_before_side_effects` | `test_model_preference_validation_rejects_launch_before_side_effects` |
+| `test_model_preference_validation_keeps_null_launch_defaults` | `test_model_preference_validation_keeps_null_launch_defaults` |
 | `test_model_preference_validation_passes_codex_turn_preferences_unchanged` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_duplicate_turn_skips_attachment_and_preference_side_effects` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_model_preference_validation_preserves_opaque_identifier_whitespace` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_model_preference_validation_rejects_turn_before_attachment_or_driver` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_model_preference_validation_preserves_opaque_identifier_whitespace` | `test_model_preference_validation_preserves_opaque_identifier_whitespace` |
+| `test_model_preference_validation_rejects_turn_before_attachment_or_driver` | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` |
 | `test_initial_structured_executable_error_closes_entry_and_cleans_worktree` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_missing_structured_executable_turn_returns_json_and_marks_session_errored` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_client_turn_id_requires_a_uuid` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_model_preference_validation_discards_claude_turn_overrides` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_cli_harnessd_help_documents_core_options` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_skinny_harnessd_entrypoint_documents_core_options` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_daemon_can_register_host_with_central_server` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_client_turn_id_requires_a_uuid` | `test_client_turn_id_requires_a_uuid` |
+| `test_model_preference_validation_discards_claude_turn_overrides` | `test_model_preference_validation_discards_claude_turn_overrides` |
+| `test_cli_harnessd_help_documents_core_options` | `test_harnessd_cli_help_documents_core_options` |
+| `test_skinny_harnessd_entrypoint_documents_core_options` | `test_skinny_harnessd_entrypoint_documents_core_options` |
+| `test_daemon_can_register_host_with_central_server` | `test_launcher_announces_bound_port_and_registers` |
 | `test_reconnecting_daemon_reconciles_revoked_consent_from_registration` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_relay_daemon_registers_itself_as_relay_connected` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_wire_event_pusher_pushes_structured_events_to_central` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_wire_event_pusher_is_noop_without_central_url_or_token` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_health_and_capabilities` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_relay_daemon_registers_itself_as_relay_connected` | `test_relay_hello_and_loopback_sessions_request` |
+| `test_wire_event_pusher_pushes_structured_events_to_central` | `test_structured_lifecycle_and_event_push_contract` |
+| `test_wire_event_pusher_is_noop_without_central_url_or_token` | dropped: the launcher fixture always supplies both `--central-url` and `--host-token`; proving the no-op requires a second launch topology without either value |
+| `test_harnessd_health_and_capabilities` | `test_harnessd_health_and_capabilities` |
 | `test_lifecycle_worktree_inventory_is_unavailable_before_first_observation` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_lifecycle_worktree_inventory_returns_cached_snapshot_while_refresh_is_slow` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_lifecycle_worktree_inventory_keeps_last_good_snapshot_on_refresh_failure` | dropped: requires pre-seeding or faulting durable daemon state before startup |
