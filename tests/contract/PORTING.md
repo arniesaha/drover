@@ -84,11 +84,11 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_lists_and_gets_live_sessions` | `test_shell_create_get_list_and_terminate` |
 | `test_harnessd_listing_merges_pty_registry_and_manager_only_sessions` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_listing_registry_lookups_do_not_scale_with_session_count` | dropped: requires deterministic control of an internal dependency or timing window |
-| `test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_session_listing_cursor_pages_through_history_once` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first` | `test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first` |
+| `test_harnessd_session_listing_cursor_pages_through_history_once` | `test_harnessd_session_listing_cursor_pages_through_history_once` |
 | `test_harnessd_session_listing_rejects_a_forged_cursor` | `test_public_query_error_contract` |
 | `test_harnessd_session_listing_cap_matches_the_hub_fleet_render` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` |
 | `test_harnessd_reconciles_orphaned_structured_sessions_on_startup` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_reconciles_orphaned_pty_sessions_on_startup` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_recovers_restart_lost_structured_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
