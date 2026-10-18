@@ -52,23 +52,47 @@ manifest remains the dependency author's declaration.
 ## Transport and ATS
 
 The user can currently configure an HTTPS or HTTP server URL. HTTPS maps to
-`wss` for live streams; HTTP maps to `ws`. The supported matrix is:
+`wss` for live streams; HTTP maps to `ws`. Release and StoreRelease use
+`NSAllowsLocalNetworking = YES` and deliberately omit
+`NSAllowsArbitraryLoads`; Debug retains the broad exception solely for
+simulator fixtures and local test servers. The supported Store matrix is:
 
-| Endpoint | Current configuration | Security consequence |
+| Endpoint | Store configuration | Security consequence |
 | --- | --- | --- |
 | HTTPS server | ATS default trust evaluation; `wss` streams. | Preferred. Bearer traffic is encrypted in transit. |
-| Private-LAN HTTP address, unqualified name, or `.local` name | The existing `NSAllowsArbitraryLoads` exception permits the configurable HTTP path. | HTTP does not encrypt bearer traffic. Use HTTPS when the server supports it. |
-| Tailscale IP or private tailnet hostname | The URL parser recognizes Tailscale addresses, but does not establish TLS itself. The broad ATS exception preserves existing HTTP Tailscale/custom-host use. | A private overlay address alone does not encrypt bearer traffic. Prefer HTTPS/WSS with a trusted certificate. |
+| HTTP IP address, including Tailscale `100.64.0.0/10` | Allowed by `NSAllowsLocalNetworking`; `ws` follows the same ATS boundary. | HTTP does not encrypt bearer traffic. |
+| HTTP unqualified name or `.local` name | Allowed by `NSAllowsLocalNetworking`. | HTTP does not encrypt bearer traffic. |
+| HTTP fully-qualified domain, including `*.ts.net` | Refused before pairing/configuration; the app asks the user to re-pair with an IP or configure HTTPS. | Use [Tailscale Serve HTTPS](../../docs/getting-started.md#remote-tailscale-https) for remote access. |
 
-`NSAllowsArbitraryLoads` is a deliberate temporary broad exception. It remains
-because `ServerConfig` accepts arbitrary user-configured self-hosted HTTP
-hosts, while no functional transport matrix has yet established a safe finite
-set of private IP/CIDR and tailnet-domain exceptions. A local-network exception
-can override the broad key on newer iOS releases and therefore is not added
-until tests prove the complete accepted-host matrix remains functional. Before
-public submission, the release owner must either validate and implement
-narrower exceptions or give App Review the concrete self-hosted-server
-justification required for this broad exception.
+The hub QR generator avoids plain-HTTP MagicDNS names where it can discover a
+Tailscale or LAN IP. Existing stored HTTP FQDN configurations intentionally
+enter a re-pair state rather than attempting a request that ATS will block.
+
+### Device ATS probe
+
+The Debug-only **ATS probe** makes the four on-device checks visible without
+shipping test controls. Build a signed Debug app for a physical phone with the
+same ATS mode as StoreRelease, then install and launch it with the probe flag:
+
+```sh
+xcodebuild -project apps/drover/Drover.xcodeproj -scheme Drover \
+  -configuration Debug -destination 'id=<PHONE-UDID>' \
+  -derivedDataPath /tmp/drover-ats-probe DROVER_ATS_MODE=local build
+
+xcrun devicectl device install app --device <PHONE-UDID> \
+  /tmp/drover-ats-probe/Build/Products/Debug-iphoneos/Drover.app
+xcrun devicectl device process launch --device <PHONE-UDID> \
+  --terminate-existing --environment-variables '{"DROVER_SHOW_ATS_PROBE":"1"}' \
+  com.arnab.drover
+```
+
+Enter the hub's Tailscale IP, LAN IP, its
+MagicDNS `*.ts.net` name, and port 7080, then tap **Run ATS probe**. Expected
+results are passes for HTTP to the Tailscale IP, `ws://` to that IP, and HTTP
+to the LAN IP; HTTP to the MagicDNS FQDN should fail with ATS error `-1022`.
+The WebSocket row uses `/healthz`, which is intentionally not a WebSocket
+route: any handshake failure other than ATS `-1022` means URLSession passed
+the `ws://` request through ATS. Remove the environment variable afterwards.
 
 ## Configurations and build inputs
 
@@ -190,20 +214,17 @@ there is no separate staging hub. Run the required read-only live-hub smoke in
 the [TestFlight runbook](internal-testflight-runbook.md) before upload.
 
 Archive with `--channel testflight-production` and the explicit version, build,
-output and signing configuration above. The command sets
-`DROVER_ALLOW_ARBITRARY_LOADS=YES`. Signed archive and IPA verification require
-`NSAppTransportSecurity.NSAllowsArbitraryLoads=true` with
-`--expected-unrestricted-hubs`. There is no endpoint policy or staging origin in
-the app. QR and manual pairing accept any valid Drover hub (#390), including
-private-network HTTP and HTTPS endpoints. Prefer HTTPS when available.
+output and signing configuration above. Signed archive and IPA verification
+require `NSAppTransportSecurity.NSAllowsLocalNetworking=true` and reject
+`NSAllowsArbitraryLoads`. QR and manual pairing accept HTTPS plus the local
+HTTP endpoint classes documented above.
 
 ```sh
 scripts/ios/export_ipa.sh \
   --archive "$DROVER_IOS_OUTPUT/Drover.xcarchive" \
   --output "$DROVER_IOS_EXPORT_OUTPUT" \
   --export-options "$DROVER_IOS_SIGNING_TEMP/ExportOptions.plist" \
-  --version "$DROVER_APP_VERSION" --build "$DROVER_APP_BUILD" \
-  --unrestricted-hubs
+  --version "$DROVER_APP_VERSION" --build "$DROVER_APP_BUILD"
 ```
 
 The export output directory must be absolute and absent. The export-options

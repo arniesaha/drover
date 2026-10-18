@@ -134,10 +134,10 @@ def test_verify_app_accepts_a_signed_iphoneos_candidate(tmp_path: Path) -> None:
     assert identity.sdk_version == "26.5"
 
 
-def test_verify_app_accepts_unrestricted_hub_metadata(tmp_path: Path) -> None:
+def test_verify_app_accepts_local_networking_store_metadata(tmp_path: Path) -> None:
     verifier = load_verifier()
     info = valid_info() | {
-        "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
+        "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
     }
 
     identity = verifier.verify_app(
@@ -145,7 +145,7 @@ def test_verify_app_accepts_unrestricted_hub_metadata(tmp_path: Path) -> None:
         expected_version="1.2.3",
         expected_build="42",
         sdk_floor="26.0",
-        expected_unrestricted_hubs=True,
+        expected_local_networking=True,
         run=stub_codesign(),
     )
 
@@ -155,16 +155,16 @@ def test_verify_app_accepts_unrestricted_hub_metadata(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("NSAppTransportSecurity", {"NSAllowsArbitraryLoads": False}),
+        ("NSAppTransportSecurity", {"NSAllowsArbitraryLoads": True}),
         ("NSAppTransportSecurity", {}),
     ],
 )
-def test_verify_app_rejects_broken_unrestricted_hub_policy(
+def test_verify_app_rejects_broken_local_networking_policy(
     tmp_path: Path, field, value
 ) -> None:
     verifier = load_verifier()
     info = valid_info() | {
-        "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
+        "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
     }
     if value is None:
         info.pop(field)
@@ -172,14 +172,14 @@ def test_verify_app_rejects_broken_unrestricted_hub_policy(
         info[field] = value
 
     with pytest.raises(
-        verifier.ArtifactVerificationError, match="stag|unrestricted|arbitrary"
+        verifier.ArtifactVerificationError, match="local|arbitrary"
     ):
         verifier.verify_app(
             write_bundle(tmp_path, info=info),
             expected_version="1.2.3",
             expected_build="42",
             sdk_floor="26.0",
-            expected_unrestricted_hubs=True,
+            expected_local_networking=True,
             run=stub_codesign(),
         )
 

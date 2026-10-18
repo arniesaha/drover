@@ -9,7 +9,12 @@ import pytest
 from click.testing import CliRunner
 
 from drover.config import default_config
-from drover.server.__main__ import _advertised_host_port, _local_api_host, main
+from drover.server.__main__ import (
+    _advertised_host_port,
+    _advertised_pairing_endpoint,
+    _local_api_host,
+    main,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -98,6 +103,39 @@ def test_advertised_host_port_falls_back_to_loopback():
     assert _advertised_host_port(cfg) == f"127.0.0.1:{cfg.metrics_http_port}"
 
 
+def test_pairing_prefers_tailscale_ip_over_plain_http_magicdns(monkeypatch):
+    import drover.server.__main__ as server_main
+
+    cfg = dataclasses.replace(
+        default_config(), server_advertised_url="http://studio.tailnet.ts.net:7080"
+    )
+    monkeypatch.setattr(server_main, "_private_pairing_ip", lambda _: "100.99.1.2")
+
+    assert _advertised_pairing_endpoint(cfg) == ("100.99.1.2:7080", False)
+
+
+def test_pairing_falls_back_to_lan_ip_for_plain_http_fqdn(monkeypatch):
+    import drover.server.__main__ as server_main
+
+    cfg = dataclasses.replace(
+        default_config(), server_advertised_url="http://studio.example.test:7080"
+    )
+    monkeypatch.setattr(server_main, "_private_pairing_ip", lambda _: "192.168.1.12")
+
+    assert _advertised_pairing_endpoint(cfg) == ("192.168.1.12:7080", False)
+
+
+def test_pairing_preserves_https_magicdns_name(monkeypatch):
+    import drover.server.__main__ as server_main
+
+    cfg = dataclasses.replace(
+        default_config(), server_advertised_url="https://studio.tailnet.ts.net"
+    )
+    monkeypatch.setattr(server_main, "_private_pairing_ip", lambda _: "100.99.1.2")
+
+    assert _advertised_pairing_endpoint(cfg) == ("studio.tailnet.ts.net", True)
+
+
 def _pair_cli(monkeypatch, cfg):
     """Invoke `pair` against a given config rather than whatever is on disk.
 
@@ -147,6 +185,21 @@ def test_pair_uses_the_configured_advertised_address(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "drover://100.64.0.10:7080?v=1&code=K7QP-2M4X&n=home-fleet" in result.output
     assert "only reachable from this machine" not in result.output
+
+
+def test_pair_uses_a_private_ip_instead_of_plain_http_magicdns(monkeypatch):
+    import drover.server.__main__ as server_main
+
+    cfg = dataclasses.replace(
+        default_config(), server_advertised_url="http://studio.tailnet.ts.net:7080"
+    )
+    monkeypatch.setattr(server_main, "_private_pairing_ip", lambda _: "100.99.1.2")
+
+    result = _pair_cli(monkeypatch, cfg)
+
+    assert result.exit_code == 0, result.output
+    assert "drover://100.99.1.2:7080?v=1&code=K7QP-2M4X" in result.output
+    assert "studio.tailnet.ts.net" not in result.output
 
 
 def test_pair_host_prints_a_pasteable_command(monkeypatch):

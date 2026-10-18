@@ -16,10 +16,10 @@ final class PairingViewTests: XCTestCase {
     }
 
     func testPairingLinkOnlyPrefillsUntilUserSubmits() throws {
-        let payload = try XCTUnwrap(PairingPayload(scanned: "drover://example.test?v=1&code=sample"))
+        let payload = try XCTUnwrap(PairingPayload(scanned: "drover://100.99.1.2:7080?v=1&code=sample"))
         let model = PairingModel()
         model.prefill(payload)
-        XCTAssertEqual(model.serverURLString, "http://example.test")
+        XCTAssertEqual(model.serverURLString, "http://100.99.1.2:7080")
         XCTAssertEqual(model.manualCode, "sample")
         XCTAssertFalse(model.isPairing)
         XCTAssertNil(model.statusMessage)
@@ -66,6 +66,16 @@ final class PairingViewTests: XCTestCase {
         let payload = try XCTUnwrap(model.manualPayload())
         XCTAssertEqual(payload.serverURL.absoluteString, "https://example.test:443")
     }
+
+    func testPlainHTTPFullyQualifiedHubShowsRePairGuidanceBeforePairing() throws {
+        let model = PairingModel(serverURLString: "http://studio.tailnet.ts.net:7080")
+        model.manualCode = "K7QP-2M4X"
+        let payload = try XCTUnwrap(model.manualPayload())
+
+        XCTAssertFalse(model.allowsPairing(payload))
+        XCTAssertTrue(model.requiresHTTPSRePairing)
+        XCTAssertEqual(model.statusMessage, ServerConfig.httpsRePairMessage)
+    }
 }
 
 // Both onboarding and Settings use AppEnvironment's pairing boundary. Keep
@@ -86,7 +96,7 @@ struct AppPairingRequestTests {
             try? store.delete()
             defaults.removePersistentDomain(forName: suiteName)
         }
-        let origin = https ? "https://hub.example.test" : "http://personal.example.test:7080"
+        let origin = https ? "https://hub.example.test" : "http://100.99.1.2:7080"
         let model = PairingModel(serverURLString: origin)
         model.manualCode = "K7QP-2M4X"
         let requested = MockFlag()

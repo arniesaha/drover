@@ -155,8 +155,8 @@ Approve the `ios-testflight-upload` deployment when prompted.
 
 The workflow selects Xcode 26.6 on `macos-26`, runs DroverKit tests, app unit
 tests and deterministic/accessibility UI slices, sets up temporary signing,
-archives with `--channel testflight-production`, exports with
-`--unrestricted-hubs`, confirms upload, waits for processing and internal group
+archives with `--channel testflight-production`, exports with the
+local-networking ATS verification, confirms upload, waits for processing and internal group
 assignment, and cleans temporary credentials in
 `always()`. It retains only sanitized `testflight-production-candidate-metadata`.
 

@@ -40,6 +40,15 @@ struct EnvironmentTests {
     ) == nil)
 }
 
+@Test func factoryRefusesStoredPlainHTTPFQDNForStoreATS() throws {
+    let defaults = UserDefaults(suiteName: "drover-env-\(UUID().uuidString)")!
+    let store = TokenStore(service: "drover-env-\(UUID().uuidString)")
+    ServerConfig(urlString: "http://studio.tailnet.ts.net:7080")!.save(defaults: defaults)
+    try store.save("tok")
+
+    #expect(ClientFactory.make(defaults: defaults, tokenStore: store) == nil)
+}
+
 /// The gate has to live here, not in one caller: `BackgroundRefresh` builds
 /// its own client from the same UserDefaults and Keychain, with no
 /// `AppEnvironment` in the process to ask.

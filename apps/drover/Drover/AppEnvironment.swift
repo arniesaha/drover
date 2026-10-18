@@ -42,6 +42,10 @@ final class AppEnvironment {
 
     private(set) var client: DroverClient?
     private(set) var config: ServerConfig?
+    /// A previously paired HTTP FQDN cannot be used by the Store ATS policy.
+    /// Keep its credentials intact until the user completes a replacement
+    /// pairing, but do not construct a client that would only fail at ATS.
+    private(set) var rePairRequiredURL: URL?
 
     /// Bumped on every successful `configure()` so views that hold a
     /// `SessionStore` built from `client` can force-recreate it (SwiftUI
@@ -140,7 +144,9 @@ final class AppEnvironment {
             // example, a locked Keychain), so it must not orphan-purge files.
             shouldSweepRecovery = savedConfig == nil
         }
-        if let built = ClientFactory.make(
+        if let savedConfig, savedConfig.requiresHTTPSForAppTransportSecurity {
+            rePairRequiredURL = savedConfig.baseURL
+        } else if let built = ClientFactory.make(
             defaults: defaults,
             tokenStore: tokenStore,
             credentialBindingID: startupBindingID
@@ -210,6 +216,10 @@ final class AppEnvironment {
         deviceName: String,
         session: URLSession = .shared
     ) async throws -> PairResponse {
+        if let config = ServerConfig(urlString: payload.serverURL.absoluteString),
+           config.requiresHTTPSForAppTransportSecurity {
+            throw DroverError.badRequest(ServerConfig.httpsRePairMessage)
+        }
         return try await DroverClient.pair(
             payload: payload,
             deviceName: deviceName,
@@ -227,6 +237,9 @@ final class AppEnvironment {
         }
         guard let newConfig = ServerConfig(urlString: urlString) else {
             return .failure("Enter a valid server URL.")
+        }
+        guard !newConfig.requiresHTTPSForAppTransportSecurity else {
+            return .failure(ServerConfig.httpsRePairMessage)
         }
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedToken.isEmpty else {

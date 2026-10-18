@@ -38,6 +38,17 @@ struct OnboardingView: View {
                     .padding()
                     .accessibilityIdentifier("sign-out-revocation-warning")
             }
+            if environment.rePairRequiredURL != nil {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(ServerConfig.httpsRePairMessage)
+                    Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                }
+                .font(.subheadline)
+                .foregroundStyle(DroverColor.warn)
+                .padding(.horizontal, 18)
+                .padding(.bottom, 8)
+                .accessibilityIdentifier("stored-hub-repair-required")
+            }
 
             TabView(selection: $step) {
                 welcomeStep
@@ -266,6 +277,11 @@ struct OnboardingView: View {
                 if let statusMessage = pairingModel.statusMessage {
                     statusRow(statusMessage)
                 }
+                if pairingModel.requiresHTTPSRePairing {
+                    Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.accentHi)
+                }
             }
             .padding(.horizontal, 18)
             .padding(.top, 10)
@@ -338,6 +354,7 @@ struct OnboardingView: View {
 
     private func pair(_ payload: PairingPayload) async {
         guard !pairingModel.isPairing else { return }
+        guard pairingModel.allowsPairing(payload) else { return }
         pairingModel.isPairing = true
         pairingModel.statusMessage = "Pairing..."
         pairingModel.statusIsError = false
