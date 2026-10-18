@@ -13,7 +13,7 @@ missing public seam rather than importing daemon internals.
 | `test_model_catalog_service_is_created_lazily_once` | dropped: `GET /model-catalog` can establish its response and refresh semantics but cannot reveal service allocation count; observing this needs an injected catalog factory |
 | `test_model_catalog_route_rejects_malformed_query` | `test_model_catalog_rejects_malformed_query` |
 | `test_model_catalog_route_rejects_unknown_or_disabled_harness` | `test_model_catalog_refuses_unknown_harness` |
-| `test_model_catalog_route_requires_bearer_token` | `test_model_catalog_requires_bearer_token` |
+| `test_model_catalog_route_requires_bearer_token` | `test_public_http_routing_contract` |
 | `test_model_catalog_route_returns_safe_degraded_envelope` | `test_model_catalog_route_returns_safe_degraded_envelope` |
 | `test_default_model_catalog_service_uses_only_enabled_resolved_presets` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_model_catalog_is_invalidated_after_auth_mutations_and_successful_poll` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
@@ -50,7 +50,7 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` |
 | `test_harnessd_provider_usage_reports_codex_cli_not_found` | `test_harnessd_provider_usage_reports_codex_cli_not_found_is_never_silent` |
-| `test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default` | `test_auth_and_top_level_error_envelopes` |
+| `test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default` | `test_public_http_routing_contract` |
 | `test_harnessd_content_bundle_requires_configured_token_even_when_enabled` | dropped: the launcher always passes `--host-token`; a no-token fixture is needed to exercise `/advisory/content-bundle` after enabling consent |
 | `test_running_harnessd_applies_live_consent_and_revoke_without_restart` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_content_consent_override_survives_restart_and_rejects_stale_enable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
@@ -62,11 +62,11 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_auth_status_route` | `test_public_route_validation` |
 | `test_harnessd_auth_start_poll_and_cancel` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
-| `test_harnessd_auth_routes_require_bearer_token` | `test_auth_routes_require_bearer_token` |
-| `test_harnessd_auth_status_unknown_harness_returns_404` | `test_auth_public_error_routes` |
+| `test_harnessd_auth_routes_require_bearer_token` | `test_public_http_routing_contract` |
+| `test_harnessd_auth_status_unknown_harness_returns_404` | `test_public_http_routing_contract` |
 | `test_harnessd_auth_status_unavailable_returns_404` | dropped: fake `claude` and `agy` executables make both providers available; a configurable unavailable-auth CLI fixture is needed |
 | `test_harnessd_auth_status_decodes_harness_path` | `test_public_route_validation` |
-| `test_harnessd_auth_flow_unknown_id_returns_404` | `test_auth_public_error_routes` |
+| `test_harnessd_auth_flow_unknown_id_returns_404` | `test_public_http_routing_contract` |
 | `test_harnessd_auth_start_unsupported_returns_400` | `test_auth_public_error_routes` |
 | `test_harnessd_auth_start_launch_failure_returns_structured_500` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_resolve_harness_presets_enables_available_login_shell_clis` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
