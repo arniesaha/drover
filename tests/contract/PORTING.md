@@ -7,30 +7,30 @@ missing public seam rather than importing daemon internals.
 | Source test | Contract test / disposition |
 | --- | --- |
 | `test_run_harnessd_closes_auth_flows_on_shutdown` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
-| `test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_cli_passes_content_consent_config_to_server` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance` | dropped: the launcher fixture can only script `POST /harness/hosts`; direct-mode refusal needs a heartbeat response containing `relay_required` before `serve_forever`, which the fake hub does not expose |
+| `test_harnessd_cli_passes_content_consent_config_to_server` | dropped: `drover-harnessd --config` exposes no endpoint that reports the parsed advisory-content object; `/advisory/content-bundle` only reports disabled consent under the current fixture |
 | `test_model_catalog_route_is_host_scoped_and_forceable` | `test_model_catalog_route_is_host_scoped_and_forceable` |
 | `test_model_catalog_service_is_created_lazily_once` | dropped: `GET /model-catalog` can establish its response and refresh semantics but cannot reveal service allocation count; observing this needs an injected catalog factory |
 | `test_model_catalog_route_rejects_malformed_query` | `test_public_query_error_contract` |
 | `test_model_catalog_route_rejects_unknown_or_disabled_harness` | `test_public_query_error_contract` |
 | `test_model_catalog_route_requires_bearer_token` | `test_public_http_routing_contract` |
 | `test_model_catalog_route_returns_safe_degraded_envelope` | `test_model_catalog_route_returns_safe_degraded_envelope` |
-| `test_default_model_catalog_service_uses_only_enabled_resolved_presets` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_model_catalog_is_invalidated_after_auth_mutations_and_successful_poll` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_default_model_catalog_service_uses_only_enabled_resolved_presets` | dropped: `GET /model-catalog` exposes catalog output but not the private adapter command tuples selected for disabled presets; this needs an injected catalog factory |
+| `test_model_catalog_is_invalidated_after_auth_mutations_and_successful_poll` | dropped: `/auth/<harness>/start` requires a real interactive login protocol; the fake CLI has no controllable authenticated poll transition to make catalog cache invalidation observable |
 | `test_model_preference_validation_rejects_launch_before_side_effects` | `test_model_preference_validation_rejects_launch_before_side_effects` |
 | `test_model_preference_validation_keeps_null_launch_defaults` | `test_model_preference_validation_keeps_null_launch_defaults` |
 | `test_model_preference_validation_passes_codex_turn_preferences_unchanged` | `test_model_preference_validation_passes_codex_turn_preferences_unchanged` |
-| `test_duplicate_turn_skips_attachment_and_preference_side_effects` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_duplicate_turn_skips_attachment_and_preference_side_effects` | dropped: `POST /sessions/<id>/turns` can show a replayed `turn_id`, but the fixture does not expose persisted preference writes or a stable attachment filename count after a replay race |
 | `test_model_preference_validation_preserves_opaque_identifier_whitespace` | `test_model_preference_validation_preserves_opaque_identifier_whitespace` |
 | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` | `test_model_preference_validation_rejects_turn_before_attachment_or_driver` |
 | `test_initial_structured_executable_error_closes_entry_and_cleans_worktree` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_missing_structured_executable_turn_returns_json_and_marks_session_errored` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_missing_structured_executable_turn_returns_json_and_marks_session_errored` | dropped: `POST /sessions/<id>/turns` can force an executable error, but the launched fake driver exits before a deterministic second-turn spawn; a configurable long-lived missing-executable fixture is needed |
 | `test_client_turn_id_requires_a_uuid` | `test_client_turn_id_requires_a_uuid` |
 | `test_model_preference_validation_discards_claude_turn_overrides` | `test_model_preference_validation_discards_claude_turn_overrides` |
 | `test_cli_harnessd_help_documents_core_options` | `test_harnessd_cli_help_documents_core_options` |
 | `test_skinny_harnessd_entrypoint_documents_core_options` | `test_skinny_harnessd_entrypoint_documents_core_options` |
 | `test_daemon_can_register_host_with_central_server` | `test_launcher_announces_bound_port_and_registers` |
-| `test_reconnecting_daemon_reconciles_revoked_consent_from_registration` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_reconnecting_daemon_reconciles_revoked_consent_from_registration` | dropped: fake-hub `POST /harness/hosts` responses can be scripted, but the launcher has no fixture hook to preseed the durable consent epoch before registration |
 | `test_relay_daemon_registers_itself_as_relay_connected` | `test_relay_hello_and_loopback_sessions_request` |
 | `test_wire_event_pusher_pushes_structured_events_to_central` | `test_structured_lifecycle_and_event_push_contract` |
 | `test_wire_event_pusher_is_noop_without_central_url_or_token` | dropped: the launcher fixture always supplies both `--central-url` and `--host-token`; proving the no-op requires a second launch topology without either value |
@@ -40,26 +40,26 @@ missing public seam rather than importing daemon internals.
 | `test_lifecycle_worktree_inventory_keeps_last_good_snapshot_on_refresh_failure` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_lifecycle_worktree_inventory_does_not_overlap_hung_refreshes` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_harnessd_provider_usage_returns_cached_snapshot_while_probe_is_slow` | dropped: requires deterministic control of an internal dependency or timing window |
-| `test_provider_usage_background_refresh_keeps_last_good_snapshot_on_failure` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_provider_usage_background_refresh_keeps_last_good_snapshot_on_failure` | dropped: `GET /providers/usage` exposes snapshots, but fake CLIs cannot schedule a successful probe followed by a failing refresh without a configurable probe response sequence |
 | `test_provider_usage_hung_probe_does_not_block_other_providers` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_provider_usage_probe_slower_than_old_bound_completes_with_new_bound` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_provider_usage_does_not_reenter_hung_probe_and_publishes_late_success` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts` | `test_harnessd_provider_usage_requires_auth_and_reports_unavailable_accounts` |
-| `test_harnessd_provider_usage_uses_configured_agy_probe` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_provider_usage_reports_claude_windows` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_provider_usage_uses_configured_agy_probe` | dropped: `GET /providers/usage` is covered, but the launcher config has no public flag for replacing the Agy probe with a fixture account/window response |
+| `test_harnessd_provider_usage_reports_claude_windows` | dropped: `GET /providers/usage` cannot make the Claude OAuth probe return deterministic windows; the temp HOME lacks a supported fixture credential endpoint |
+| `test_harnessd_provider_usage_keeps_plan_label_on_a_failing_anthropic_card` | dropped: `/providers/usage` returns degraded cards, but the fake CLI cannot combine Claude auth detail `max` with a failing Anthropic usage probe |
 | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` | `test_harnessd_provider_usage_probes_codex_at_its_resolved_executable` |
 | `test_harnessd_provider_usage_reports_codex_cli_not_found` | `test_harnessd_provider_usage_reports_codex_cli_not_found_is_never_silent` |
 | `test_harnessd_content_bundle_requires_auth_and_is_disabled_by_default` | `test_public_http_routing_contract` |
 | `test_harnessd_content_bundle_requires_configured_token_even_when_enabled` | dropped: the launcher always passes `--host-token`; a no-token fixture is needed to exercise `/advisory/content-bundle` after enabling consent |
 | `test_running_harnessd_applies_live_consent_and_revoke_without_restart` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_content_consent_override_survives_restart_and_rejects_stale_enable` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_unknown_epoch_is_idempotent_disabled_and_cannot_enable` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_standalone_config_bootstrap_cannot_override_durable_revoke` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_content_consent_control_is_fail_closed_without_daemon_token` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_unknown_epoch_is_idempotent_disabled_and_cannot_enable` | dropped: no public consent-control route is enabled by the launcher configuration, so no HTTP request can submit an unknown consent epoch |
+| `test_standalone_config_bootstrap_cannot_override_durable_revoke` | dropped: the `--config` fixture starts from an empty consent file and has no pre-launch durable-revoke seed hook |
+| `test_content_consent_control_is_fail_closed_without_daemon_token` | dropped: the shared launcher always supplies `--host-token`; a no-token process fixture is required to exercise the consent control route's fail-closed branch |
+| `test_harnessd_content_bundle_accepts_only_configured_target_ids_and_is_ephemeral` | dropped: `/advisory/content-bundle` is intentionally disabled in the fixture and no advisory target list is written into its config TOML |
+| `test_harnessd_content_version_is_authenticated_hashes_only_and_no_store` | dropped: `/advisory/content-version` needs enabled advisory targets in the launcher config; the current config supplies only paths and no content policy |
+| `test_harnessd_content_bundle_rejects_oversized_request_before_parsing` | dropped: `/advisory/content-bundle` returns consent-disabled before parsing under the fixture, so it cannot observe the request-size guard |
 | `test_harnessd_auth_status_route` | `test_public_route_validation` |
 | `test_harnessd_auth_start_poll_and_cancel` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_harnessd_auth_routes_require_bearer_token` | `test_public_http_routing_contract` |
@@ -87,15 +87,15 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first` | `test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first` |
 | `test_harnessd_session_listing_cursor_pages_through_history_once` | `test_harnessd_session_listing_cursor_pages_through_history_once` |
 | `test_harnessd_session_listing_rejects_a_forged_cursor` | `test_public_query_error_contract` |
-| `test_harnessd_session_listing_cap_matches_the_hub_fleet_render` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_session_listing_cap_matches_the_hub_fleet_render` | dropped: `GET /sessions?archived=` exposes the daemon cap but cannot expose the hub MetricsCollector default it is compared against |
 | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` |
-| `test_harnessd_reconciles_orphaned_structured_sessions_on_startup` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_reconciles_orphaned_pty_sessions_on_startup` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_reconciles_orphaned_structured_sessions_on_startup` | dropped: startup reconciliation needs an orphaned structured row preseeded in the registry before the launched process begins; the fixture only starts with an empty store |
+| `test_harnessd_reconciles_orphaned_pty_sessions_on_startup` | dropped: startup reconciliation needs a dead PTY registry row preseeded before `drover-harnessd --listen`, which the public launcher fixture cannot create |
 | `test_harnessd_recovers_restart_lost_structured_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_recovery_is_idempotent_when_session_is_live` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_recovers_claude_with_native_resume_command` | dropped: unit-level filesystem/parser discovery has no daemon HTTP/WS operation |
-| `test_harnessd_recovers_agy_onto_its_conversation` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_refuses_turns_while_draining_for_an_update` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_harnessd_recovers_agy_onto_its_conversation` | dropped: recovery requires a stored Agy native conversation id and a configured Agy resume fixture; neither is accepted by the public launch request alone |
+| `test_harnessd_refuses_turns_while_draining_for_an_update` | dropped: `POST /sessions/<id>/turns` has no public switch to place the daemon in updater draining state; the fixture does not configure `[update]` |
 | `test_harnessd_concurrent_recovery_creates_one_driver` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_terminate_waits_for_recovery_and_wins` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_harnessd_recovery_rejects_unsupported_or_incomplete_session` | dropped: requires pre-seeding or faulting durable daemon state before startup |
@@ -115,9 +115,9 @@ missing public seam rather than importing daemon internals.
 | `test_structured_session_full_lifecycle` | `test_public_session_mutation_contract` |
 | `test_structured_session_inventory_includes_run_preferences` | `test_public_session_mutation_contract` |
 | `test_claude_turn_cannot_change_persistent_session_preferences` | `test_model_preference_validation_discards_claude_turn_overrides` |
-| `test_structured_turn_appends_user_input_and_seq_is_monotonic` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_structured_turn_appends_user_input_and_seq_is_monotonic` | dropped: fake-hub `/harness/events` records events, but the replay CLI exits after one fixture stream and cannot provide deterministic two-turn event ordering |
 | `test_initial_prompt_with_image_saves_file_and_records_attachment` | `test_initial_prompt_with_image_saves_file_and_records_attachment` |
-| `test_structured_command_preferences_map_to_cli_flags` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_structured_command_preferences_map_to_cli_flags` | dropped: fake-cli JSONL records argv, but the Codex structured adapter uses its app-server protocol and the current fixture does not decode a launch command into comparable CLI flags |
 | `test_turn_with_image_saves_file_and_appends_path` | `test_turn_with_image_saves_file_and_appends_path` |
 | `test_image_only_turn_is_accepted` | `test_image_only_turn_is_accepted` |
 | `test_turn_with_bad_base64_is_rejected` | `test_structured_launch_rejects_invalid_turn_input` |
@@ -138,8 +138,8 @@ missing public seam rather than importing daemon internals.
 | `test_structured_session_rejects_unknown_permission_mode` | `test_structured_launch_validation_contract` |
 | `test_harnessd_routes_typed_code_into_a_pty_login_flow` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_harnessd_refuses_to_start_a_terminal_only_sign_in` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
-| `test_every_offered_preset_can_actually_be_driven` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_observe_only_sources_are_never_drive_targets` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_every_offered_preset_can_actually_be_driven` | dropped: `GET /capabilities` lists offered presets, but exercising every listed provider requires distinct interactive/auth fixture protocols not supplied by the shared fake CLI |
+| `test_observe_only_sources_are_never_drive_targets` | dropped: the public launch endpoint can reject known unsupported modes, but it has no fixture-provided observe-only preset to distinguish source-only from absent harnesses |
 | `test_a_repeated_handoff_create_returns_the_session_it_already_made` | `test_handoff_source_is_idempotent_but_parent_is_not` |
 | `test_a_handoff_from_a_different_source_still_creates_its_own_session` | `test_public_session_mutation_contract` |
 | `test_delegated_children_of_one_parent_are_separate_sessions` | `test_public_session_mutation_contract` |
