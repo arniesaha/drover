@@ -35,7 +35,7 @@ missing public seam rather than importing daemon internals.
 | `test_wire_event_pusher_pushes_structured_events_to_central` | `test_structured_lifecycle_and_event_push_contract` |
 | `test_wire_event_pusher_is_noop_without_central_url_or_token` | `test_wire_event_pusher_is_noop_without_central_url_or_token` |
 | `test_harnessd_health_and_capabilities` | `test_harnessd_health_and_capabilities` |
-| `test_lifecycle_worktree_inventory_is_unavailable_before_first_observation` | dropped: requires pre-seeding or faulting durable daemon state before startup |
+| `test_lifecycle_worktree_inventory_is_unavailable_before_first_observation` | dropped: `GET /lifecycle/worktrees` on a newly launched daemon eagerly returns the empty 200 snapshot, not the source test's injected-unavailable 503; producing 503 needs an internal cache fault |
 | `test_lifecycle_worktree_inventory_returns_cached_snapshot_while_refresh_is_slow` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_lifecycle_worktree_inventory_keeps_last_good_snapshot_on_refresh_failure` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_lifecycle_worktree_inventory_does_not_overlap_hung_refreshes` | dropped: requires deterministic control of an internal dependency or timing window |
@@ -64,7 +64,7 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_auth_start_poll_and_cancel` | dropped: requires a purpose-built provider login executable; no stable public fixture protocol yet |
 | `test_harnessd_auth_routes_require_bearer_token` | `test_public_http_routing_contract` |
 | `test_harnessd_auth_status_unknown_harness_returns_404` | `test_public_http_routing_contract` |
-| `test_harnessd_auth_status_unavailable_returns_404` | dropped: fake `claude` and `agy` executables make both providers available; a configurable unavailable-auth CLI fixture is needed |
+| `test_harnessd_auth_status_unavailable_returns_404` | dropped: even after removing the fixture `agy` executable from `PATH`, `GET /auth/agy/status` returns the public `200` `unknown` status rather than the source's injected unavailable adapter 404; emitting unavailable needs an internal auth adapter |
 | `test_harnessd_auth_status_decodes_harness_path` | `test_public_route_validation` |
 | `test_harnessd_auth_flow_unknown_id_returns_404` | `test_public_http_routing_contract` |
 | `test_harnessd_auth_start_unsupported_returns_400` | `test_auth_public_error_routes` |
@@ -129,7 +129,7 @@ missing public seam rather than importing daemon internals.
 | `test_structured_permission_without_approval_channel_returns_400` | `test_public_query_error_contract` |
 | `test_structured_interrupt_unknown_session_is_404` | `test_public_query_error_contract` |
 | `test_structured_terminate_closes_driver_and_marks_terminated` | `test_public_session_mutation_contract` |
-| `test_structured_codex_session_runs_in_worktree` | dropped: requires pre-seeding or faulting durable daemon state before startup |
+| `test_structured_codex_session_runs_in_worktree` | `test_structured_codex_session_runs_in_worktree` |
 | `test_structured_codex_session_non_git_cwd_runs_in_place` | `test_structured_codex_session_non_git_cwd_runs_in_place` |
 | `test_structured_claude_session_stays_in_place` | `test_structured_claude_session_stays_in_place` |
 | `test_structured_session_rejects_ask_permission_mode` | `test_structured_launch_validation_contract` |

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 
 from .test_harnessd_contract import request
@@ -25,6 +26,41 @@ def test_structured_codex_session_non_git_cwd_runs_in_place(daemon):
     )
     assert status == 201
     assert created["cwd"] == str(daemon.root)
+
+
+def test_structured_codex_session_runs_in_worktree(daemon):
+    repo = daemon.root / "repo"
+    repo.mkdir()
+    (repo / "file.txt").write_text("base\n")
+    for command in (
+        ["git", "init", str(repo)],
+        ["git", "-C", str(repo), "config", "user.email", "contract@example.test"],
+        ["git", "-C", str(repo), "config", "user.name", "Contract"],
+        ["git", "-C", str(repo), "add", "file.txt"],
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+    ):
+        subprocess.run(command, check=True, capture_output=True)
+
+    status, created = request(
+        daemon,
+        "/sessions",
+        payload={"harness": "codex", "mode": "structured", "cwd": str(repo)},
+    )
+    assert status == 201
+    session_id = created["session_id"]
+    worktree = daemon.root / "worktrees" / session_id
+    assert created["cwd"] == str(worktree)
+    assert (worktree / "file.txt").read_text() == "base\n"
+
+    assert request(daemon, f"/sessions/{session_id}/terminate", payload={})[0] == 200
+    assert not worktree.exists()
+    branches = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", f"drover/{session_id}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert not branches.strip()
 
 
 def test_structured_claude_session_stays_in_place(daemon):
