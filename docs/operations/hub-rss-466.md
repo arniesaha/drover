@@ -3,9 +3,10 @@
 This is a local, synthetic measurement only. It never opens `~/.drover`, a
 live hub, a mounted production volume, or PostgreSQL. It creates an isolated
 DuckDB/Parquet fixture and starts the normal loopback HTTP handler, then polls
-the app routes: `/cockpit/overview` (including popular projects), `/analytics`
-(including distributions), and `/insights`. Changing day filters prevents the
-cockpit response cache from hiding an analytical query.
+both `/analytics` rankings for 7, 30, 90, and 365 days, followed by
+`/cockpit/overview?days=365` (including popular projects) and `/insights`.
+The distinct query keys prevent a cockpit response cache hit from hiding an
+analytical query.
 
 ```sh
 uv sync --extra dev
@@ -27,8 +28,8 @@ parent/child sampler, DuckDB tags from
 (`Malloc Small (empty)`) and therefore over-reports resident ownership; physical
 footprint is the budgeted value there. With diagnostics enabled, connection close also emits the bounded
 `analytical_memory` record. `--minutes 0` is the deterministic smoke mode; it
-still performs one request to each endpoint: `/cockpit/overview`, `/analytics`
-and `/insights`.
+still performs the complete ranking matrix, overview, and insights. Its
+`peak_hub_memory` must remain below the 1.5 GiB release budget.
 
 ## Studio root-cause evidence and fix
 

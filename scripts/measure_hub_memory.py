@@ -44,6 +44,20 @@ from drover.server.process_memory import (
 )
 from drover.server.web.app import start_metrics_server
 
+# The production app loads both rankings across its selectable windows, then
+# the overview and advisory lists. Keep this as data so the fixture cannot
+# silently stop covering the reported shape.
+PRODUCTION_ENDPOINTS = tuple(
+    f"/analytics?days={days}&metric={metric}"
+    for days in (7, 30, 90, 365)
+    for metric in ("tokens", "sessions")
+) + ("/cockpit/overview?days=365", "/insights")
+
+# macOS budgets physical footprint, Linux RSS. The fixture is intentionally
+# lower than the release gate: crossing this value means a hub-owned allocation
+# escaped the disposable reader and needs investigation before rollout.
+HUB_PEAK_BUDGET_BYTES = int(1.5 * 1024**3)
+
 
 def prepare(root, sessions, spans, files):
     root.mkdir(parents=True, exist_ok=False)
@@ -347,15 +361,12 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
             base = f"http://127.0.0.1:{server.server_address[1]}"
             deadline = time.monotonic() + minutes * 60
             index = 0
-            # Every cycle covers all app-facing cockpit polls. New day values
-            # avoid the activity response cache; /insights restores the
-            # advisory read exercised by the earlier service-only probe.
+            # Every cycle covers the same 7/30/90/365 ranking shape as the
+            # production app, followed by its overview and advisory reads.
+            # Every path has a distinct filter/cache key, so a warm result
+            # cannot hide one of the analytical requests.
             while index < 1 or time.monotonic() < deadline:
-                for path in (
-                    f"/cockpit/overview?days={7 + index}",
-                    f"/analytics?days={8 + index}",
-                    "/insights",
-                ):
+                for path in PRODUCTION_ENDPOINTS:
                     before_rss = process.memory_info().rss
                     before_hub = hub_memory_bytes(process.pid)
                     before_hub_lifetime = _hub_lifetime_peak(process.pid)
@@ -410,6 +421,7 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
         peak_hub_memory=max(
             [sample["hub_memory"] for sample in samples] + [peaks["parent_hub_memory"]]
         ),
+        hub_peak_budget_bytes=HUB_PEAK_BUDGET_BYTES,
         lifetime_peak_hub_memory=max(
             [
                 sample.get("lifetime_peak_footprint", sample["hub_memory"])

@@ -76,13 +76,27 @@ def run_disposable(
         # File-backed stdout avoids a pipe deadlock. Growth is checked each
         # sample; successful results are never read beyond the hard byte cap.
         with tempfile.TemporaryFile() as output:
+            # Do not fork the hub just to launch this reader.  On Darwin a
+            # fork of its long-lived, allocator-heavy address space can make
+            # copy-on-write pages temporarily charge to the *parent* physical
+            # footprint.  That defeats the point of putting this work in a
+            # disposable process: the child exits, but the hub's lifetime
+            # footprint has already crossed the release gate.
+            #
+            # These children receive only absolute paths (the request and its
+            # spill directory), so they do not need a working-directory
+            # change.  Python can therefore use posix_spawn when available.
+            # PEP 446 makes newly-created descriptors non-inheritable; the
+            # explicit false preserves that exec-only fast path instead of
+            # falling back to fork solely to enumerate descriptors.  A query
+            # child never creates further child processes, so killing its
+            # direct PID is sufficient on every failure path below.
             child = subprocess.Popen(
                 command,
-                cwd=cwd,
                 env=env,
                 stdout=output,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,
+                close_fds=False,
             )
             from drover.server.process_memory import memory_guard
 
@@ -137,10 +151,8 @@ def run_disposable(
                 }
             finally:
                 if child.poll() is None:
-                    import signal
-
                     try:
-                        os.killpg(child.pid, signal.SIGKILL)
+                        child.kill()
                     except ProcessLookupError:
                         pass
                     except PermissionError:

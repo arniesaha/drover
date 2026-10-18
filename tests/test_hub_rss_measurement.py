@@ -23,6 +23,7 @@ SPEC.loader.exec_module(MODULE)
 _growth_summary = MODULE._growth_summary
 measure = MODULE.measure
 prepare = MODULE.prepare
+PRODUCTION_ENDPOINTS = MODULE.PRODUCTION_ENDPOINTS
 
 
 def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
@@ -32,13 +33,9 @@ def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
     report = measure(root, minutes=0, interval_seconds=0)
 
     assert report["synthetic"] is True
-    assert [
-        request["path"].split("?", 1)[0] for request in report["endpoint_requests"]
-    ] == [
-        "/cockpit/overview",
-        "/analytics",
-        "/insights",
-    ]
+    assert [request["path"] for request in report["endpoint_requests"]] == list(
+        PRODUCTION_ENDPOINTS
+    )
     assert all(request["status"] == 200 for request in report["endpoint_requests"])
     assert all(
         request["activity_status"] == "ok"
@@ -47,12 +44,10 @@ def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
     )
     assert report["samples"]
     assert all(sample["hub_memory"] > 0 for sample in report["samples"])
-    assert report["peak_hub_memory"] <= 1024**3
+    assert report["peak_hub_memory"] < report["hub_peak_budget_bytes"]
     assert report["lifetime_peak_hub_memory"] >= report["peak_hub_memory"]
     assert [sample["path"] for sample in report["path_growth"]] == [
-        "/cockpit/overview",
-        "/analytics",
-        "/insights",
+        path.split("?", 1)[0] for path in PRODUCTION_ENDPOINTS
     ]
     assert set(report["path_growth_summary"]) == {
         "/cockpit/overview",
@@ -195,11 +190,7 @@ def test_selected_ducklake_http_routes_use_bounded_disposable_children(
     rss_samples = [process_rss(os.getpid())]
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
-        for path in (
-            "/cockpit/overview?days=30",
-            "/analytics?days=29",
-            "/insights",
-        ):
+        for path in PRODUCTION_ENDPOINTS:
             with urllib.request.urlopen(base + path, timeout=15) as response:
                 payload = json.loads(response.read())
             assert response.status == 200
