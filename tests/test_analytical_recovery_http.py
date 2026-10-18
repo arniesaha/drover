@@ -154,6 +154,24 @@ def test_analytical_connect_open_wait_is_capped(tmp_path, monkeypatch):
         first.close()
 
 
+def test_http_request_logs_activity_footprint_delta(tmp_path, caplog):
+    collector = MetricsCollector(
+        duckdb_path=tmp_path / "analytics.duckdb",
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+    )
+    server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
+    try:
+        with caplog.at_level("INFO", logger="drover.runtime_observability"):
+            assert request(server.server_address[1], "/healthz")[0] == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert "hub_activity start kind=request name=GET /healthz" in caplog.text
+    assert "hub_activity end kind=request name=GET /healthz" in caplog.text
+
+
 @pytest.mark.parametrize("state", ["ok", "recovering", "failed-retrying"])
 def test_healthz_preserves_liveness_contract_in_every_store_state(
     tmp_path, monkeypatch, state

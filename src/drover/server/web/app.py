@@ -973,9 +973,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         return bool(allowed)
 
     def _dispatch_request(self, dispatch: Callable[[], None]) -> None:
-        from drover.server.metrics import HarnessRenderBusy
+        from drover.server.runtime_observability import activity
 
         path = urlparse(self.path).path
+        # Deliberately omit the query: it may contain an opaque cursor and is
+        # unnecessary to identify the route responsible for a memory delta.
+        with activity(f"{self.command} {path}", kind="request"):
+            self._dispatch_request_attributed(dispatch, path)
+
+    def _dispatch_request_attributed(
+        self, dispatch: Callable[[], None], path: str
+    ) -> None:
+        from drover.server.metrics import HarnessRenderBusy
+
         # Profile bearers must pass their allowlist before any dispatch, including
         # public pairing/login routes, internal bridges and device self-revocation.
         # Those handlers can deliberately bypass the ordinary authentication gate.
