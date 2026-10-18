@@ -1,5 +1,6 @@
 import XCTest
 
+@MainActor
 final class DemoModeUITests: XCTestCase {
     private let sessionStreaming = "demo-session-streaming"
     private let sessionApproval = "demo-session-approval"
@@ -8,17 +9,16 @@ final class DemoModeUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         addUIInterruptionMonitor(withDescription: "System Alerts") { element in
-            let allow = element.buttons["Allow"]
-            if allow.exists {
-                allow.tap()
-                return true
+            MainActor.assumeIsolated {
+                for label in ["Allow", "OK"] {
+                    let button = element.buttons[label]
+                    if button.exists {
+                        button.tap()
+                        return true
+                    }
+                }
+                return false
             }
-            let ok = element.buttons["OK"]
-            if ok.exists {
-                ok.tap()
-                return true
-            }
-            return false
         }
     }
 
