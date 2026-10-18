@@ -407,21 +407,34 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     for statement in PUBLICATION_MIGRATION:
         con.execute(statement)
     con.execute(_HARNESS_EVENTS_DDL)
-    # Dropped before the column migration below and recreated after, because
-    # DuckDB refuses to drop a column an index depends on positionally.
-    con.execute("DROP INDEX IF EXISTS harness_events_dedup_key")
-    _ensure_harness_columns(
-        con,
-        "harness_events",
-        {
-            "normalized_type": "VARCHAR",
-            "normalized_source": "VARCHAR",
-            "content_preview": "VARCHAR",
-            "seq": "INTEGER",
-            "dedup_key": "VARCHAR",
-            "reconciled_at": "TIMESTAMP",
-        },
-    )
+    event_columns = {
+        "normalized_type": "VARCHAR",
+        "normalized_source": "VARCHAR",
+        "content_preview": "VARCHAR",
+        "seq": "INTEGER",
+        "reconciled_at": "TIMESTAMP",
+        # A non-null materialized predicate lets DuckDB's ART index service
+        # the host outbox cursor.  ART indexes do not index NULL values, so an
+        # index beginning with reconciled_at cannot accelerate IS NULL.
+        "reconcile_pending": "BOOLEAN NOT NULL DEFAULT TRUE",
+        # Keep the dedupe identity last. DuckDB cannot drop a column while an
+        # index uses a later physical column; the repair command must be able
+        # to add this legacy column back under the reconciliation indexes.
+        "dedup_key": "VARCHAR",
+    }
+    existing_event_columns = {
+        row[1] for row in con.execute("PRAGMA table_info('harness_events')").fetchall()
+    }
+    if any(column not in existing_event_columns for column in event_columns):
+        # DuckDB refuses to add a column while its positional index exists.
+        # Only an actual additive migration rebuilds this index: unconditional
+        # rebuilds at every harnessd boot caused catalog reload/checkpoint work.
+        con.execute("DROP INDEX IF EXISTS harness_events_dedup_key")
+        _ensure_harness_columns(con, "harness_events", event_columns)
+        con.execute(
+            "UPDATE harness_events SET reconcile_pending = reconciled_at IS NULL "
+            "WHERE reconcile_pending IS DISTINCT FROM (reconciled_at IS NULL)"
+        )
     # The fence that actually identifies an event. `event_id` is minted per
     # insert, so a replay arriving under a fresh one never conflicted and every
     # harnessd restart re-inserted the whole history (drover#280).
@@ -434,6 +447,17 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS harness_events_dedup_key "
         "ON harness_events (dedup_key)"
+    )
+    # Additive control-registry indexes for the two hot host-ledger paths.
+    # These are deliberately separate from the lake schema: harnessd owns a
+    # local control spool and must not open or migrate analytical tables.
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS harness_events_session_seq "
+        "ON harness_events (session_id, seq)"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS harness_events_reconciliation_pending "
+        "ON harness_events (reconcile_pending, created_at, event_id)"
     )
     con.execute(_UNKNOWN_SESSION_RETRIES_DDL)
     migrate_legacy_harness_event_sequences(con)

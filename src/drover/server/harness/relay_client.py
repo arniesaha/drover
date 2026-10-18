@@ -65,11 +65,10 @@ CONNECT_TIMEOUT_S = 15.0
 # signal, and a missing pong is explicitly not proof of death (the hub drops
 # pongs when its own write path is busy).
 READ_TIMEOUT_S = 90.0
-# Matched to the hub's default request budget rather than exceeding it by 2x.
-# Work the hub has already given up on is work nobody will ever read, and on
-# a polled endpoint every second past the hub's deadline is another orphaned
-# loopback call holding a DuckDB-contending connection open on this machine.
-LOOPBACK_TIMEOUT_S = 15.0
+# Session launch can include a cold local control-registry recovery.  Keep the
+# relay loopback alive for the full host startup budget so the hub does not
+# turn a recoverable first request into a 502.
+LOOPBACK_TIMEOUT_S = 120.0
 # Ceiling on concurrent ``req`` workers. Each one is a loopback HTTP call, so
 # unbounded spawn under a hub burst - or under a polled endpoint whose budget
 # keeps expiring - turns into unbounded threads and unbounded database

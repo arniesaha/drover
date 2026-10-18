@@ -182,37 +182,44 @@ def _release_metadata(migrations, *, schema="schema-1", pins="pins-1"):
     }
 
 
-def _migration_20_fixture():
+def _latest_control_migration_fixture():
     from drover.server.postgres_schema import _MIGRATIONS
 
     target = [[version, list(statements)] for version, statements in _MIGRATIONS]
-    assert target[-1][0] == 20
-    return target[:-1], target
+    versions = [version for version, _ in target]
+    assert versions == sorted(set(versions))
+    return target[:-1], target, target[-1][0]
 
 
-def test_additive_control_migration_20_uses_point_release_path():
+def test_additive_latest_control_migration_uses_point_release_path():
     from drover.server.lake.rollout import classify_release_kind
 
-    current, target = _migration_20_fixture()
+    current, target, migration_id = _latest_control_migration_fixture()
     allowed, evidence = classify_release_kind(
         _release_metadata(current), _release_metadata(target)
     )
 
     assert allowed
     assert evidence["rollout_kind"] == "control_migration"
-    assert evidence["new_migration_ids"] == [20]
+    assert evidence["new_migration_ids"] == [migration_id]
     assert evidence["migration_verdicts"] == [
         {
-            "migration_id": 20,
+            "migration_id": migration_id,
             "statement_index": 1,
             "allowed": True,
-            "verdict": "alter_table_add_nullable_column",
+            "verdict": "alter_table_add_column_constant_default",
         },
         {
-            "migration_id": 20,
+            "migration_id": migration_id,
             "statement_index": 2,
             "allowed": True,
-            "verdict": "create_table",
+            "verdict": "create_index",
+        },
+        {
+            "migration_id": migration_id,
+            "statement_index": 3,
+            "allowed": True,
+            "verdict": "create_index",
         },
     ]
 
@@ -220,11 +227,11 @@ def test_additive_control_migration_20_uses_point_release_path():
 def test_control_migration_accepts_only_the_documented_additive_ddl_subset():
     from drover.server.lake.rollout import classify_release_kind
 
-    current, _ = _migration_20_fixture()
+    current, _, migration_id = _latest_control_migration_fixture()
     target = [
         *current,
         [
-            20,
+            migration_id,
             [
                 "CREATE SCHEMA IF NOT EXISTS release_fixture",
                 "CREATE TABLE release_fixture.entries (id INTEGER PRIMARY KEY)",
@@ -271,15 +278,15 @@ def test_control_migration_accepts_only_the_documented_additive_ddl_subset():
 def test_non_additive_control_migration_is_refused(statement, verdict):
     from drover.server.lake.rollout import classify_release_kind
 
-    current, _ = _migration_20_fixture()
-    target = [*current, [20, [statement]]]
+    current, _, migration_id = _latest_control_migration_fixture()
+    target = [*current, [migration_id, [statement]]]
     allowed, evidence = classify_release_kind(
         _release_metadata(current), _release_metadata(target)
     )
 
     assert not allowed
     assert evidence["rollout_kind"] == "control_migration"
-    assert evidence["new_migration_ids"] == [20]
+    assert evidence["new_migration_ids"] == [migration_id]
     assert evidence["migration_verdicts"][0]["allowed"] is False
     assert evidence["migration_verdicts"][0]["verdict"] == verdict
 
@@ -287,7 +294,7 @@ def test_non_additive_control_migration_is_refused(statement, verdict):
 def test_edited_shipped_control_migration_is_refused():
     from drover.server.lake.rollout import classify_release_kind
 
-    current, _ = _migration_20_fixture()
+    current, _, _ = _latest_control_migration_fixture()
     target = [[version, list(statements)] for version, statements in current]
     target[0][1][0] = "CREATE TABLE changed_shipped_migration (id INTEGER)"
     allowed, evidence = classify_release_kind(
@@ -306,7 +313,7 @@ def test_edited_shipped_control_migration_is_refused():
 def test_lake_schema_or_runtime_pin_change_stays_on_full_gate(field):
     from drover.server.lake.rollout import classify_release_kind
 
-    current, _ = _migration_20_fixture()
+    current, _, _ = _latest_control_migration_fixture()
     target = _release_metadata(current)
     target[field] = "changed"
     allowed, evidence = classify_release_kind(_release_metadata(current), target)
@@ -318,14 +325,14 @@ def test_lake_schema_or_runtime_pin_change_stays_on_full_gate(field):
 def test_combined_control_and_lake_change_stays_on_full_gate():
     from drover.server.lake.rollout import classify_release_kind
 
-    current, target = _migration_20_fixture()
+    current, target, migration_id = _latest_control_migration_fixture()
     allowed, evidence = classify_release_kind(
         _release_metadata(current), _release_metadata(target, schema="changed")
     )
 
     assert not allowed
     assert evidence["rollout_kind"] == "lake_schema"
-    assert evidence["new_migration_ids"] == [20]
+    assert evidence["new_migration_ids"] == [migration_id]
     assert all(verdict["allowed"] for verdict in evidence["migration_verdicts"])
 
 

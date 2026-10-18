@@ -699,6 +699,14 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        21,
+        (
+            "ALTER TABLE harness_events ADD COLUMN IF NOT EXISTS reconcile_pending BOOLEAN NOT NULL DEFAULT TRUE",
+            "CREATE INDEX IF NOT EXISTS harness_events_session_seq ON harness_events (session_id, seq)",
+            "CREATE INDEX IF NOT EXISTS harness_events_reconciliation_pending ON harness_events (reconcile_pending, created_at, event_id)",
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
@@ -829,6 +837,15 @@ def bootstrap_postgres_control_store(store: Any) -> None:
                 started = monotonic()
                 for statement in statements:
                     con.execute(statement)
+                if version == 21:
+                    # Keep the versioned ledger DDL-only so a point release
+                    # can mechanically prove it is additive. This data repair
+                    # is still atomic with migration 21 and runs exactly once:
+                    # the version marker is inserted only after it succeeds.
+                    con.execute(
+                        "UPDATE harness_events SET reconcile_pending = reconciled_at IS NULL "
+                        "WHERE reconcile_pending IS DISTINCT FROM (reconciled_at IS NULL)"
+                    )
                 con.execute(
                     "INSERT INTO control_schema_migrations (version) VALUES (?)",
                     [version],

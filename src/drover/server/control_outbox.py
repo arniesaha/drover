@@ -175,6 +175,7 @@ def record_event_side_effects(
     payload_json: str,
     created_at: datetime,
     seq: int | None,
+    write_export: bool = True,
 ) -> None:
     """Store split payload, narrow preview, and pending export intent.
 
@@ -185,14 +186,15 @@ def record_event_side_effects(
     # which imports these outbox primitives during exporter startup.
     from drover.server.harness.events import is_text_stream_delta
 
-    con.execute(
-        """
-        INSERT INTO harness_event_payloads (event_id, payload_json, payload_sha256)
-        VALUES (?, ?, ?)
-        ON CONFLICT (event_id) DO NOTHING
-        """,
-        [event_id, payload_json, payload_sha256(payload_json)],
-    )
+    if write_export:
+        con.execute(
+            """
+            INSERT INTO harness_event_payloads (event_id, payload_json, payload_sha256)
+            VALUES (?, ?, ?)
+            ON CONFLICT (event_id) DO NOTHING
+            """,
+            [event_id, payload_json, payload_sha256(payload_json)],
+        )
     if event_type in {"user_input", "assistant_output", "terminal.input"} and not (
         event_type == "assistant_output"
         and is_text_stream_delta(json.loads(payload_json))
@@ -243,14 +245,15 @@ def record_event_side_effects(
                 created_at,
             ],
         )
-    con.execute(
-        """
-        INSERT INTO control_outbox_events (event_id, state)
-        VALUES (?, 'pending')
-        ON CONFLICT (event_id) DO NOTHING
-        """,
-        [event_id],
-    )
+    if write_export:
+        con.execute(
+            """
+            INSERT INTO control_outbox_events (event_id, state)
+            VALUES (?, 'pending')
+            ON CONFLICT (event_id) DO NOTHING
+            """,
+            [event_id],
+        )
 
 
 def event_payload_join(con: object, event_alias: str = "e") -> str:

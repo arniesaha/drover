@@ -10,7 +10,8 @@ import click
 import duckdb
 
 from drover.config import DroverConfig, default_config, default_config_path, load_config
-from drover.schema import bootstrap
+from drover.schema import bootstrap_control_plane_store
+from drover.server.db import duckdb_connect_lock, pin_control_plane_connection
 from drover.server.harness.daemon import run_harnessd
 
 log = logging.getLogger("drover.harnessd")
@@ -27,7 +28,31 @@ def resolve_config(path: str | None) -> DroverConfig:
 
 def bootstrap_harnessd_schema(cfg: DroverConfig) -> bool:
     try:
-        bootstrap(parquet_dir=cfg.parquet_dir, duckdb_path=cfg.duckdb_path)
+        # Keep the configured host spool a valid, local DuckDB file even when
+        # its inherited config names PostgreSQL for the hub.  The harness
+        # registry lives in the sibling control store, but a bare ``touch``
+        # would leave an invalid database for a later local lake bootstrap.
+        # This only initializes DuckDB's empty catalog; it deliberately does
+        # not call the lakehouse bootstrap or create lake schemas/views.
+        if not cfg.duckdb_path.exists():
+            cfg.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
+            with duckdb_connect_lock(cfg.duckdb_path):
+                if not cfg.duckdb_path.exists():
+                    con = duckdb.connect(str(cfg.duckdb_path))
+                    con.close()
+        # harnessd owns only a control registry/spool.  Never open the
+        # lakehouse here: catalog/view bootstrap scans historical data and is
+        # neither needed by the daemon nor safe on its startup path.
+        bootstrap_control_plane_store(cfg.duckdb_path)
+        # A PostgreSQL-configured hub cannot be serving this local DuckDB
+        # companion as its control plane. That proves this harnessd owns the
+        # host-local spool, so keep one connection open instead of creating a
+        # DuckDB instance and checkpointing it for every registry window.
+        # Legacy DuckDB hubs may share this file with harnessd (Studio), and
+        # therefore retain the safe connection-per-window fallback.
+        pin_control_plane_connection(
+            cfg.duckdb_path, enabled=cfg.control_store.backend == "postgres"
+        )
         return True
     except duckdb.IOException as exc:
         message = str(exc)

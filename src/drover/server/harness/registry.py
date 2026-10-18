@@ -7,7 +7,7 @@ import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -373,9 +373,13 @@ class HarnessRegistry:
     works -- the resolution is idempotent.
     """
 
-    def __init__(self, duckdb_path: str | Path):
+    def __init__(self, duckdb_path: str | Path, *, write_outbox: bool = True):
         self.duckdb_path = Path(duckdb_path)
         self.control_plane_path = control_plane_path(duckdb_path)
+        # A host ledger reconciles its canonical events directly to the hub.
+        # Its local SQL outbox has no consumer, so retaining a second payload
+        # copy and export intent only grows the long-lived local spool.
+        self.write_outbox = write_outbox
 
     @contextmanager
     def _connect(self) -> Iterator[duckdb.DuckDBPyConnection]:
@@ -1487,6 +1491,7 @@ class HarnessRegistry:
                         payload_json=payload_json,
                         created_at=created_at,
                         seq=seq,
+                        write_export=self.write_outbox,
                     )
                     # Only for a genuinely new event: a re-delivered
                     # completion must not enqueue a second recap for work
@@ -1656,6 +1661,7 @@ class HarnessRegistry:
                         payload_json=payload_json,
                         created_at=created_at,
                         seq=seq,
+                        write_export=self.write_outbox,
                     )
                     _enqueue_recap_if_completion(
                         con,
@@ -1798,6 +1804,7 @@ class HarnessRegistry:
                         payload_json=payload_json,
                         created_at=created_at,
                         seq=seq,
+                        write_export=self.write_outbox,
                     )
                     _enqueue_recap_if_completion(
                         con,
@@ -2658,10 +2665,11 @@ class HarnessRegistry:
                     OR s.mode = 'structured'
                     OR (e.seq IS NOT NULL AND e.normalized_source IS NULL)
                   )
+                  AND e.reconcile_pending
                   AND e.reconciled_at IS NULL
-                  AND (? IS NULL OR s.host_id IS NULL OR s.host_id = ?)
+                  AND (CAST(? AS TEXT) IS NULL OR s.host_id IS NULL OR s.host_id = ?)
                   AND (
-                    ? IS NULL
+                    CAST(? AS TIMESTAMPTZ) IS NULL
                     OR e.created_at > ?
                     OR (e.created_at = ? AND e.event_id > ?)
                   )
@@ -2705,10 +2713,79 @@ class HarnessRegistry:
         placeholders = ", ".join("?" for _ in unique_ids)
         with self._connect() as con:
             con.execute(
-                "UPDATE harness_events SET reconciled_at = now() "
+                "UPDATE harness_events SET reconciled_at = now(), reconcile_pending = FALSE "
                 "WHERE event_id IN (" + placeholders + ")",
                 unique_ids,
             )
+        if not self.write_outbox:
+            self.prune_reconciled_events()
+
+    def prune_reconciled_events(self, *, now: datetime | None = None) -> int:
+        """Bound acknowledged host-ledger history to D3's retention policy.
+
+        Only reconciled records are candidates: an event which has not reached
+        the hub stays durable indefinitely.  Per-session rank keeps the 500
+        newest acknowledgements even when they are younger than seven days.
+        """
+        cutoff = _as_utc_datetime(now) or _now()
+        cutoff -= timedelta(days=7)
+        with self._connect() as con:
+            rows = con.execute(
+                """
+                WITH ranked AS MATERIALIZED (
+                    SELECT event_id, reconciled_at,
+                           row_number() OVER (
+                             PARTITION BY session_id
+                             ORDER BY reconciled_at DESC, created_at DESC, event_id DESC
+                           ) AS retained_rank
+                      FROM harness_events
+                     WHERE reconcile_pending = FALSE AND reconciled_at IS NOT NULL
+                ), evicted AS MATERIALIZED (
+                    SELECT event_id FROM ranked
+                     WHERE reconciled_at < ? OR retained_rank > 500
+                )
+                SELECT event_id FROM evicted
+                """,
+                [cutoff],
+            ).fetchall()
+            event_ids = [str(row[0]) for row in rows]
+            if not event_ids:
+                return 0
+            placeholders = ", ".join("?" for _ in event_ids)
+            con.execute("BEGIN TRANSACTION")
+            try:
+                # Pre-Phase-0 host spools contain these unused duplicates.
+                # Delete children first so the retention job is safe for both
+                # the DuckDB compatibility schema and PostgreSQL's FK shape.
+                con.execute(
+                    "DELETE FROM control_outbox_batch_events WHERE event_id IN ("
+                    + placeholders
+                    + ")",
+                    event_ids,
+                )
+                con.execute(
+                    "DELETE FROM control_outbox_events WHERE event_id IN ("
+                    + placeholders
+                    + ")",
+                    event_ids,
+                )
+                con.execute(
+                    "DELETE FROM harness_event_payloads WHERE event_id IN ("
+                    + placeholders
+                    + ")",
+                    event_ids,
+                )
+                con.execute(
+                    "DELETE FROM harness_events WHERE event_id IN ("
+                    + placeholders
+                    + ")",
+                    event_ids,
+                )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+        return len(event_ids)
 
     def unknown_session_retry_expired(
         self, host_id: str, session_id: str, now: float, *, max_entries: int

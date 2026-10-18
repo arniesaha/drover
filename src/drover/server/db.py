@@ -873,7 +873,9 @@ def control_plane_lock(duckdb_path: str | Path) -> threading.Lock:
         return lock
 
 
-def pin_control_plane_connection(duckdb_path: str | Path) -> bool:
+def pin_control_plane_connection(
+    duckdb_path: str | Path, *, enabled: bool | None = None
+) -> bool:
     """Open and keep the control plane's own connection to its store.
 
     **Off unless ``DROVER_CONTROL_PLANE_PIN=1``, and deliberately so.** A pin
@@ -908,11 +910,13 @@ def pin_control_plane_connection(duckdb_path: str | Path) -> bool:
         postgres_control_store(duckdb_path)
         return True
     duckdb_path = control_plane_path(duckdb_path)
-    if os.environ.get("DROVER_CONTROL_PLANE_PIN", "0").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-    }:
+    if enabled is None:
+        enabled = os.environ.get("DROVER_CONTROL_PLANE_PIN", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+    if not enabled:
         log.info(
             "control-plane connection not pinned (set DROVER_CONTROL_PLANE_PIN=1 "
             "on a hub whose DuckDB file no other process opens); /harness* keeps "

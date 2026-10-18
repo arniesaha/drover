@@ -39,6 +39,7 @@ from drover.config import (
     resolve_api_token_env,
 )
 from drover.native_history_identity import native_source_fingerprint
+from drover.server.db import close_control_plane_connections
 from drover.server.harness.adapters import (
     HarnessAdapter,
     HarnessAdapterRegistry,
@@ -4760,7 +4761,7 @@ def run_harnessd(
         host_id=host_id,
         display_name=display_name,
         kind=kind,
-        registry=HarnessRegistry(duckdb_path),
+        registry=HarnessRegistry(duckdb_path, write_outbox=False),
         pty=PtySessionManager(),
         presets=resolve_harness_presets(),
         local_url=local_url,
@@ -4924,6 +4925,9 @@ def run_harnessd(
     finally:
         if owner_lock_fd is not None:
             os.close(owner_lock_fd)
+        # A pinned host-local spool owns DuckDB's write lock. Release it only
+        # after every daemon worker and server socket have stopped.
+        close_control_plane_connections()
 
 
 def _command_label(command: Any) -> str:
