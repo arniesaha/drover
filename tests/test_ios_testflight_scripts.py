@@ -37,7 +37,7 @@ def chain(tmp_path: Path):
     logs = tmp_path / "scratch"
     logs.mkdir()
     info = valid_info() | {
-        "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
+        "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
     }
     app = write_bundle(tmp_path / "fixture", info=info)
     (app / "embedded.mobileprovision").write_bytes(b"synthetic profile fixture")
@@ -158,7 +158,6 @@ elif name != "xcodegen":
             "1.2.3",
             "--build",
             "42",
-            "--unrestricted-hubs",
             *args,
             **extra,
         )
@@ -182,14 +181,14 @@ elif name != "xcodegen":
     return tmp_path, run, export, upload, config
 
 
-def test_archive_production_channel_enables_unrestricted_hubs(chain):
+def test_archive_production_channel_requires_local_networking_ats(chain):
     root, run, _, _, config = chain
     archived_info_path = (
         root / "Drover.xcarchive/Products/Applications/Drover.app/Info.plist"
     )
     info = plistlib.loads(archived_info_path.read_bytes())
     info |= {
-        "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
+        "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
     }
     archived_info_path.write_bytes(plistlib.dumps(info))
 
@@ -212,7 +211,9 @@ def test_archive_production_channel_enables_unrestricted_hubs(chain):
         json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
     ]
     invocation = next(call["args"] for call in calls if "archive" in call["args"])
-    assert "DROVER_ALLOW_ARBITRARY_LOADS=YES" in invocation
+    assert not any(
+        "DROVER_ALLOW_ARBITRARY_LOADS" in argument for argument in invocation
+    )
     record = json.loads((root / "output" / "archive-record.json").read_text())
     assert record["channel"] == "testflight-production"
 
@@ -259,7 +260,7 @@ def test_export_verifies_unpacked_signed_app(chain, bad):
     if bad == "ats":
         path = root / "fixture" / "Drover.app" / "Info.plist"
         info = plistlib.loads(path.read_bytes())
-        info["NSAppTransportSecurity"] = {"NSAllowsArbitraryLoads": False}
+        info["NSAppTransportSecurity"] = {"NSAllowsArbitraryLoads": True}
         path.write_bytes(plistlib.dumps(info))
     else:
         extra["CODESIGN_EXIT"] = "1"
@@ -295,7 +296,7 @@ def test_export_emits_only_sanitized_ipa_evidence(chain, generate):
     assert HUB not in result.stdout + result.stderr
 
 
-def test_export_verifies_unrestricted_production_ipa(chain):
+def test_export_verifies_local_networking_production_ipa(chain):
     root, run, _, _, _ = chain
     for info_path in (
         root / "fixture/Drover.app/Info.plist",
@@ -303,7 +304,7 @@ def test_export_verifies_unrestricted_production_ipa(chain):
     ):
         info = plistlib.loads(info_path.read_bytes())
         info |= {
-            "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
+            "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
         }
         info_path.write_bytes(plistlib.dumps(info))
 
@@ -319,7 +320,6 @@ def test_export_verifies_unrestricted_production_ipa(chain):
         "1.2.3",
         "--build",
         "42",
-        "--unrestricted-hubs",
     )
 
     assert result.returncode == 0, result.stderr
@@ -581,17 +581,18 @@ def test_upload_accepts_xcode_26_6_named_file_confirmation(chain):
     reason="requires macOS Xcode and XcodeGen for real plist processing",
 )
 @pytest.mark.parametrize(
-    "configuration,allow_loads,expected",
+    "configuration,ats_mode,expected_key",
     [
-        ("StoreRelease", "YES", True),
-        ("Debug", "YES", True),
+        ("StoreRelease", "local", "NSAllowsLocalNetworking"),
+        ("Release", "local", "NSAllowsLocalNetworking"),
+        ("Debug", "arbitrary", "NSAllowsArbitraryLoads"),
     ],
 )
 def test_generated_project_processes_typed_ats_metadata(
     tmp_path: Path,
     configuration: str,
-    allow_loads: str,
-    expected: bool,
+    ats_mode: str,
+    expected_key: str,
 ):
     """Process production metadata in a tiny unsigned app with the real Xcode tools."""
     project = SCRIPTS.parents[1] / "apps" / "drover" / "project.yml"
@@ -630,7 +631,7 @@ def test_generated_project_processes_typed_ats_metadata(
             "-derivedDataPath",
             str(tmp_path / "derived"),
             "CODE_SIGNING_ALLOWED=NO",
-            f"DROVER_ALLOW_ARBITRARY_LOADS={allow_loads}",
+            f"DROVER_ATS_MODE={ats_mode}",
             "build",
         ],
         capture_output=True,
@@ -654,6 +655,6 @@ def test_generated_project_processes_typed_ats_metadata(
         "UIInterfaceOrientationLandscapeLeft",
         "UIInterfaceOrientationLandscapeRight",
     }
-    assert info["NSAppTransportSecurity"]["NSAllowsArbitraryLoads"] is expected
+    assert info["NSAppTransportSecurity"] == {expected_key: True}
     template = plistlib.loads((source / "Info.plist").read_bytes())
     assert template["NSAppTransportSecurity"]["NSAllowsArbitraryLoads"] is True

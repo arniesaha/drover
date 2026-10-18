@@ -51,11 +51,16 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         MARKETING_VERSION: "0.1.0"
         SWIFT_VERSION: 6.0
-        DROVER_ALLOW_ARBITRARY_LOADS: "YES"
+        # Debug keeps broad HTTP only for simulator fixture and local test
+        # servers. Release artifacts must use the Local Networking ATS policy.
+        DROVER_ATS_MODE: arbitrary
       configs:
+        Release:
+          DROVER_ATS_MODE: local
         # Development configurations keep the development APNs entitlement
         # from `base`; only the distribution configuration selects production.
         StoreRelease:
+          DROVER_ATS_MODE: local
           CODE_SIGN_STYLE: "$(DROVER_CODE_SIGN_STYLE)"
           DEVELOPMENT_TEAM: "$(DROVER_DEVELOPMENT_TEAM)"
           CODE_SIGN_IDENTITY: "$(DROVER_CODE_SIGN_IDENTITY)"
@@ -102,18 +107,27 @@ targets:
         BGTaskSchedulerPermittedIdentifiers: [com.arnab.drover.refresh]
     preBuildScripts:
       - name: Prepare typed ATS metadata
-        # String build-setting substitution does not turn YES/NO into a plist
-        # Boolean. Change the typed value in a derived copy, never in source.
+        # Build settings cannot remove a plist key or preserve Bool typing.
+        # Make a derived copy: Debug retains its simulator-fixture exception;
+        # Release and StoreRelease remove it and declare local networking.
         script: |
           set -eu
-          case "$DROVER_ALLOW_ARBITRARY_LOADS" in
-            YES) ats_boolean=true ;;
-            NO) ats_boolean=false ;;
-            *) echo "DROVER_ALLOW_ARBITRARY_LOADS must be YES or NO" >&2; exit 1 ;;
+          case "$DROVER_ATS_MODE" in
+            arbitrary)
+              ats_key=NSAllowsArbitraryLoads
+              ;;
+            local)
+              ats_key=NSAllowsLocalNetworking
+              ;;
+            *) echo "DROVER_ATS_MODE must be arbitrary or local" >&2; exit 1 ;;
           esac
           /bin/cp "$SRCROOT/Drover/Info.plist" "$DERIVED_FILE_DIR/Drover-Info.plist"
-          /usr/bin/plutil -replace NSAppTransportSecurity.NSAllowsArbitraryLoads \
-            -bool "$ats_boolean" "$DERIVED_FILE_DIR/Drover-Info.plist"
+          /usr/bin/plutil -remove NSAppTransportSecurity.NSAllowsArbitraryLoads \
+            "$DERIVED_FILE_DIR/Drover-Info.plist" 2>/dev/null || true
+          /usr/bin/plutil -remove NSAppTransportSecurity.NSAllowsLocalNetworking \
+            "$DERIVED_FILE_DIR/Drover-Info.plist" 2>/dev/null || true
+          /usr/bin/plutil -insert "NSAppTransportSecurity.$ats_key" -bool true \
+            "$DERIVED_FILE_DIR/Drover-Info.plist"
         inputFiles:
           - "$(SRCROOT)/Drover/Info.plist"
         outputFiles:
@@ -153,11 +167,6 @@ targets:
         SWIFT_VERSION: 6.0
       configs:
         StoreRelease:
-          CODE_SIGN_STYLE: "$(DROVER_CODE_SIGN_STYLE)"
-          DEVELOPMENT_TEAM: "$(DROVER_DEVELOPMENT_TEAM)"
-          CODE_SIGN_IDENTITY: "$(DROVER_CODE_SIGN_IDENTITY)"
-          PROVISIONING_PROFILE_SPECIFIER: "$(DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER)"
-          OTHER_CODE_SIGN_FLAGS: "$(DROVER_OTHER_CODE_SIGN_FLAGS)"
           CODE_SIGN_ENTITLEMENTS: DroverWidget/DroverWidget-AppStore.entitlements
     info:
       path: DroverWidget/Info.plist

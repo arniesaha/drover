@@ -18,13 +18,16 @@ public enum ClientFactory {
                              endpointIsAllowed: (URL) -> Bool = { _ in true })
         -> (client: DroverClient, config: ServerConfig)? {
         if let override = ServerConfig.debugOverride() {
-            guard endpointIsAllowed(override.config.baseURL) else { return nil }
+            guard !override.config.requiresHTTPSForAppTransportSecurity,
+                  endpointIsAllowed(override.config.baseURL)
+            else { return nil }
             return (
                 DroverClient(config: override.config, token: override.token, retryGate: .shared),
                 override.config
             )
         }
         guard let config = ServerConfig.load(defaults: defaults),
+              !config.requiresHTTPSForAppTransportSecurity,
               endpointIsAllowed(config.baseURL),
               let token = tokenStore.load()
         else {
@@ -48,6 +51,9 @@ public enum ClientFactory {
     /// here so it's testable against an injected `URLSession`.
     public static func validate(config: ServerConfig, token: String,
                                 session: URLSession = .shared) async -> String? {
+        if config.requiresHTTPSForAppTransportSecurity {
+            return ServerConfig.httpsRePairMessage
+        }
         let client = DroverClient(config: config, token: token, session: session)
         do {
             guard try await client.healthz() else {

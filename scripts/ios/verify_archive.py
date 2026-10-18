@@ -86,7 +86,7 @@ def validate_distribution_metadata(
     expected_build: str,
     sdk_floor: str,
     expected_bundle_identifier: str = DEFAULT_BUNDLE_IDENTIFIER,
-    expected_unrestricted_hubs: bool = False,
+    expected_local_networking: bool = False,
 ) -> ArtifactIdentity:
     """Validate plist data and signed entitlements without reading source settings."""
     bundle_identifier = _required_string(
@@ -156,11 +156,15 @@ def validate_distribution_metadata(
                 "iPad multitasking requires all four orientations"
             )
 
-    if expected_unrestricted_hubs:
+    if expected_local_networking:
         ats = info.get("NSAppTransportSecurity")
-        if not isinstance(ats, dict) or ats.get("NSAllowsArbitraryLoads") is not True:
+        if (
+            not isinstance(ats, dict)
+            or ats.get("NSAllowsArbitraryLoads") is not None
+            or ats.get("NSAllowsLocalNetworking") is not True
+        ):
             raise ArtifactVerificationError(
-                "signed arbitrary loads must be explicitly true for unrestricted hubs"
+                "signed Store artifact must allow local networking without arbitrary loads"
             )
 
     _validate_manifest(manifest)
@@ -279,7 +283,7 @@ def verify_app(
     expected_build: str,
     sdk_floor: str,
     expected_bundle_identifier: str = DEFAULT_BUNDLE_IDENTIFIER,
-    expected_unrestricted_hubs: bool = False,
+    expected_local_networking: bool = False,
     run: Runner = subprocess.run,
 ) -> ArtifactIdentity:
     """Verify an unpacked app bundle or the app stored in an Xcode archive."""
@@ -309,7 +313,7 @@ def verify_app(
         expected_build=expected_build,
         sdk_floor=sdk_floor,
         expected_bundle_identifier=expected_bundle_identifier,
-        expected_unrestricted_hubs=expected_unrestricted_hubs,
+        expected_local_networking=expected_local_networking,
     )
 
 
@@ -320,7 +324,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-build", required=True)
     parser.add_argument("--minimum-ios-sdk", default="26.0")
     parser.add_argument("--expected-bundle-id", default=DEFAULT_BUNDLE_IDENTIFIER)
-    parser.add_argument("--expected-unrestricted-hubs", action="store_true")
+    parser.add_argument("--expected-local-networking", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -333,7 +337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_build=args.expected_build,
             sdk_floor=args.minimum_ios_sdk,
             expected_bundle_identifier=args.expected_bundle_id,
-            expected_unrestricted_hubs=args.expected_unrestricted_hubs,
+            expected_local_networking=args.expected_local_networking,
         )
     except ArtifactVerificationError as error:
         print(f"distribution artifact rejected: {error}")

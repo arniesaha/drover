@@ -546,6 +546,101 @@ def _advertised_host_port(cfg: DroverConfig) -> str:
     return f"127.0.0.1:{cfg.metrics_http_port}"
 
 
+def _is_pairable_private_ip(value: str) -> bool:
+    """Whether an address is safe and useful to put into a pairing QR."""
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return (
+        address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10")
+    ) or (address.is_private and not address.is_loopback)
+
+
+def _private_pairing_ip(cfg: DroverConfig) -> str | None:
+    """Find the best dialable private IP without resolving a MagicDNS name.
+
+    A plain-HTTP fully-qualified host is not valid under the Store ATS policy.
+    Prefer a Tailscale IP because it keeps working off LAN, then an explicit
+    private bind, then the LAN source address selected by the routing table.
+    All probes are local and failure simply leaves the configured URL alone.
+    """
+    import socket
+    import subprocess
+
+    tailscale = shutil.which("tailscale")
+    if tailscale:
+        try:
+            result = subprocess.run(
+                [tailscale, "ip", "-4"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=1,
+            )
+            for line in result.stdout.splitlines():
+                candidate = line.strip()
+                if _is_pairable_private_ip(candidate) and candidate.startswith("100."):
+                    return candidate
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    configured_bind = (cfg.server_metrics_host or "").strip()
+    if _is_pairable_private_ip(configured_bind):
+        return configured_bind
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            # UDP connect selects the outbound LAN interface but sends no
+            # packet, so this does not turn `pair` into a network operation.
+            probe.connect(("192.0.2.1", 9))
+            candidate = probe.getsockname()[0]
+            return candidate if _is_pairable_private_ip(candidate) else None
+    except OSError:
+        return None
+
+
+def _advertised_pairing_endpoint(cfg: DroverConfig) -> tuple[str, bool]:
+    """Return the QR authority and whether it is HTTPS.
+
+    Preserve HTTPS MagicDNS names: they are the recommended remote setup.
+    For an HTTP FQDN, put an actually dialable Tailscale/LAN IP in the QR so
+    the iOS Store build remains inside `NSAllowsLocalNetworking`.
+    """
+    configured = cfg.server_advertised_url.strip()
+    tls = configured.lower().startswith("https://")
+    host_port = _advertised_host_port(cfg)
+    parsed = urlsplit(f"//{host_port}")
+    host = parsed.hostname
+    if host:
+        try:
+            import ipaddress
+
+            ipaddress.ip_address(host)
+            is_ip_literal = True
+        except ValueError:
+            is_ip_literal = False
+    else:
+        is_ip_literal = False
+    is_fqdn = bool(
+        host and "." in host and not host.endswith(".local") and not is_ip_literal
+    )
+    if tls or not is_fqdn:
+        return host_port, tls
+
+    replacement = _private_pairing_ip(cfg)
+    if not replacement:
+        return host_port, False
+    # `urlsplit` already validates the configured port. Preserve its absence
+    # too: an operator who intentionally uses port 80 should not get 7080.
+    return (
+        f"{replacement}:{parsed.port}" if parsed.port is not None else replacement,
+        False,
+    )
+
+
 def _local_api_token(cfg: DroverConfig) -> str:
     token = resolve_api_token_env() or cfg.auth_api_token.strip()
     if token:
@@ -1417,8 +1512,8 @@ def pair_cmd(ctx: click.Context, label: str) -> None:
     minted = _local_api_request(
         cfg, "POST", "/auth/pair-codes", {"scope": "device", "label": label}
     )
-    host_port = _advertised_host_port(cfg)
-    url = pairing_url(host_port, minted["code"], minted["fleet_name"])
+    host_port, tls = _advertised_pairing_endpoint(cfg)
+    url = pairing_url(host_port, minted["code"], minted["fleet_name"], tls=tls)
 
     click.echo("")
     click.echo("  Scan with the Drover app:")
@@ -1452,8 +1547,8 @@ def pair_host_cmd(ctx: click.Context, name: str) -> None:
         "/auth/pair-codes",
         {"scope": "host", "label": name, "host_id": name},
     )
-    host_port = _advertised_host_port(cfg)
-    url = pairing_url(host_port, minted["code"], minted["fleet_name"])
+    host_port, tls = _advertised_pairing_endpoint(cfg)
+    url = pairing_url(host_port, minted["code"], minted["fleet_name"], tls=tls)
     minutes = max(minted["expires_in_seconds"] // 60, 1)
 
     click.echo("")

@@ -179,6 +179,11 @@ physical iPhone. While it is unset, the command prints the loopback address and
 warns that only the simulator on this Mac can reach it. Do not use Tailscale
 Funnel.
 
+For a plain-HTTP hub, `drover-server pair` prefers a detected Tailscale IP and
+then a LAN IP over a configured MagicDNS name. This keeps the QR compatible
+with the iOS Store build's local-network ATS policy. It does not change the
+configured bind or advertise address.
+
 If the camera is unavailable, use **Or enter it by hand** in **Pair & Connect**
 and enter the server URL and pairing code from `drover-server pair`. This keeps
 manual pairing as the recovery path without copying a shared bearer token.
@@ -223,6 +228,30 @@ loopback is not served, so a command assuming `127.0.0.1` would report that the
 server is not running while it is serving normally.
 
 Review [Security](security.md) before changing bind addresses.
+
+### Remote Tailscale HTTPS
+
+For remote access, prefer Tailscale Serve HTTPS over plain HTTP to a MagicDNS
+name. Tailscale terminates the certificate and forwards privately to this hub;
+Drover itself still serves HTTP on port 7080 in this phase.
+
+With the hub reachable on its Tailscale IP, publish its existing listener only
+inside the tailnet:
+
+```bash
+tailscale serve --https=443 http://$(tailscale ip -4):7080
+```
+
+`tailscale serve status` prints the resulting `https://<machine>.<tailnet>.ts.net`
+URL. Set `[server] advertised_url` to that HTTPS URL, then run
+`drover-server pair` again. The pairing QR carries `tls=1` and the iOS app uses
+HTTPS/WSS. Do not use `tailscale funnel`: it would make a private hub public.
+
+If the hub is bound only to a LAN address, replace the command's upstream with
+that private address. A `drover hub serve --tailscale` helper is deliberately
+not part of phase 1; [#686](https://github.com/arniesaha/drover/issues/686)
+tracks that explicit helper while this command remains the documented,
+transparent setup.
 
 ### Hosts With More Than One Network (LAN + VPN)
 

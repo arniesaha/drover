@@ -136,6 +136,10 @@ struct DroverApp: App {
                 "DROVER_UI_TEST_CHAT_HEADER_FIXTURE"
             ] == "1" {
                 ChatHeaderFixtureRoot()
+            } else if ProcessInfo.processInfo.environment[
+                "DROVER_SHOW_ATS_PROBE"
+            ] == "1" {
+                ATSProbeView()
             } else {
                 RootView(environment: environment, notifier: notifier)
             }
