@@ -10,6 +10,21 @@ import Testing
     #expect(NotificationPayloadKey.sessionID == "session_id")
 }
 
+@Test func notificationOpenActionIsExplicitAndApprovalStaysInApp() {
+    #expect(SessionNotificationDelivery.openActionIdentifier == "DROVER_OPEN_SESSION")
+}
+
+@Test func clearingDeliveredNotificationsOnlyTargetsTheOpenedSession() {
+    let delivered = [
+        SessionNotificationDelivery.Delivered(identifier: "remote-a", sessionID: "a"),
+        SessionNotificationDelivery.Delivered(identifier: "remote-b", sessionID: "b"),
+        SessionNotificationDelivery.Delivered(identifier: "unrelated", sessionID: nil),
+        SessionNotificationDelivery.Delivered(identifier: "local-a", sessionID: "a")
+    ]
+    #expect(SessionNotificationDelivery.identifiersToClear(sessionID: "a", delivered: delivered)
+        == ["remote-a", "local-a"])
+}
+
 @Test func aPushPayloadResolvesToItsSession() {
     let id = NotificationRoute.sessionID(
         userInfo: ["session_id": "harness-abc"], requestIdentifier: "ignored"
