@@ -11,8 +11,8 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_cli_passes_content_consent_config_to_server` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_model_catalog_route_is_host_scoped_and_forceable` | `test_model_catalog_route_is_host_scoped_and_forceable` |
 | `test_model_catalog_service_is_created_lazily_once` | dropped: `GET /model-catalog` can establish its response and refresh semantics but cannot reveal service allocation count; observing this needs an injected catalog factory |
-| `test_model_catalog_route_rejects_malformed_query` | `test_model_catalog_rejects_malformed_query` |
-| `test_model_catalog_route_rejects_unknown_or_disabled_harness` | `test_model_catalog_refuses_unknown_harness` |
+| `test_model_catalog_route_rejects_malformed_query` | `test_public_query_error_contract` |
+| `test_model_catalog_route_rejects_unknown_or_disabled_harness` | `test_public_query_error_contract` |
 | `test_model_catalog_route_requires_bearer_token` | `test_public_http_routing_contract` |
 | `test_model_catalog_route_returns_safe_degraded_envelope` | `test_model_catalog_route_returns_safe_degraded_envelope` |
 | `test_default_model_catalog_service_uses_only_enabled_resolved_presets` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
@@ -86,7 +86,7 @@ missing public seam rather than importing daemon internals.
 | `test_harnessd_listing_registry_lookups_do_not_scale_with_session_count` | dropped: requires deterministic control of an internal dependency or timing window |
 | `test_harnessd_session_listing_bounds_history_but_keeps_live_sessions_first` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_session_listing_cursor_pages_through_history_once` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_harnessd_session_listing_rejects_a_forged_cursor` | `test_inventory_cursor_and_cors_contract` |
+| `test_harnessd_session_listing_rejects_a_forged_cursor` | `test_public_query_error_contract` |
 | `test_harnessd_session_listing_cap_matches_the_hub_fleet_render` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_reconciles_exited_sessions_out_of_live_inventory` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_harnessd_reconciles_orphaned_structured_sessions_on_startup` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
@@ -126,8 +126,8 @@ missing public seam rather than importing daemon internals.
 | `test_structured_unknown_harness_rejected` | `test_structured_launch_validation_contract` |
 | `test_structured_launch_cannot_bypass_a_missing_adapter` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
 | `test_structured_launch_rejects_unknown_worktree_policy` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_structured_permission_without_approval_channel_returns_400` | `test_unknown_session_errors_are_wire_stable` |
-| `test_structured_interrupt_unknown_session_is_404` | `test_unknown_session_errors_are_wire_stable` |
+| `test_structured_permission_without_approval_channel_returns_400` | `test_public_query_error_contract` |
+| `test_structured_interrupt_unknown_session_is_404` | `test_public_query_error_contract` |
 | `test_structured_terminate_closes_driver_and_marks_terminated` | `test_public_session_mutation_contract` |
 | `test_structured_codex_session_runs_in_worktree` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_structured_codex_session_non_git_cwd_runs_in_place` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
