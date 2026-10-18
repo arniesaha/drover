@@ -95,6 +95,10 @@ if name == "xcodebuild":
             (dest / f"Drover{i}.ipa").write_bytes(b"synthetic IPA bytes")
         print("private Xcode output " + os.environ["LEAK_SENTINEL"])
     else:
+        if os.getenv("ARCHIVE_SIGNING_ERROR") == "1":
+            print('error: Provisioning profile "Drover Widget AppStore" (66666666-7777-8888-9999-AAAAAAAAAAAA) does not include the com.apple.security.application-groups entitlement. (in target DroverWidget from project Drover)', file=sys.stderr)
+            print('Apple Distribution: Private Organization (TEAMID1234)', file=sys.stderr)
+            sys.exit(1)
         dest = pathlib.Path(args[args.index("-archivePath") + 1])
         shutil.copytree(root / "Drover.xcarchive", dest)
 elif name == "xcrun":
@@ -250,6 +254,31 @@ def test_archive_consumes_complete_xcode_version_output(chain):
         XCODE_VERSION_STRESS="1",
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_archive_prints_a_redacted_widget_signing_failure_summary(chain):
+    root, run, _, _, config = chain
+
+    result = run(
+        "archive.sh",
+        "--version",
+        "1.2.3",
+        "--build",
+        "42",
+        "--output",
+        root / "output",
+        "--signing-config",
+        config,
+        ARCHIVE_SIGNING_ERROR="1",
+    )
+
+    assert result.returncode != 0
+    assert "archive failed; sanitized Xcode summary:" in result.stderr
+    assert "Drover Widget AppStore" in result.stderr
+    assert "DroverWidget" in result.stderr
+    assert "com.apple.security.application-groups" in result.stderr
+    assert WIDGET_ISSUER not in result.stderr
+    assert "Private Organization" not in result.stderr
 
 
 @pytest.mark.parametrize("count", ["0", "2"])

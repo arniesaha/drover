@@ -24,6 +24,53 @@ fail() {
   exit 1
 }
 
+summarize_archive_failure() {
+  local log_path="$1"
+  python3 - "$log_path" <<'PY' >&2
+import pathlib
+import re
+import sys
+
+try:
+    lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines()
+except OSError:
+    print("archive failed; sanitized Xcode summary is unavailable")
+    raise SystemExit(0)
+
+patterns = (
+    re.compile(r"error:", re.IGNORECASE),
+    re.compile(r"provisioning profile", re.IGNORECASE),
+    re.compile(r"(?:does not|doesn't) include.*entitlement", re.IGNORECASE),
+    re.compile(r"requires.*provisioning profile", re.IGNORECASE),
+    re.compile(r"in target ['\"]?[^'\"]+", re.IGNORECASE),
+)
+uuid = re.compile(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", re.IGNORECASE)
+certificate = re.compile(r"Apple (?:Distribution|Development): [^\"']+")
+path = re.compile(r"/(?:Users|private|var|tmp|Library)/[^\s:]+")
+ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+summary = []
+for line in lines:
+    line = ansi.sub("", line).strip()
+    if not line or not any(pattern.search(line) for pattern in patterns):
+        continue
+    line = uuid.sub("[profile UUID redacted]", line)
+    line = certificate.sub("Apple Distribution: [certificate redacted]", line)
+    line = path.sub("<path>", line)
+    if line not in summary:
+        summary.append(line[:600])
+    if len(summary) == 20:
+        break
+
+print("archive failed; sanitized Xcode summary:")
+if summary:
+    for line in summary:
+        print(f"  {line}")
+else:
+    print("  no safe signing or entitlement diagnostic matched")
+PY
+}
+
 version_at_least() {
   local actual="$1"
   local required="$2"
@@ -234,7 +281,8 @@ if ! xcodebuild \
   "CURRENT_PROJECT_VERSION=$BUILD" \
   ${CHANNEL_SETTINGS[@]+"${CHANNEL_SETTINGS[@]}"} \
   archive >"$LOG_DIRECTORY/archive.log" 2>&1; then
-  fail "archive failed; no signing details were printed"
+  summarize_archive_failure "$LOG_DIRECTORY/archive.log"
+  fail "archive failed; signed artifact was not created"
 fi
 
 if ! python3 "$VERIFY_SCRIPT" \
