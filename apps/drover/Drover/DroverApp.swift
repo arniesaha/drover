@@ -67,7 +67,10 @@ private final class ForegroundNotificationPresenter: NSObject, UNUserNotificatio
                 WorkAttentionNotifications.markSeen(attentionRef)
                 NotificationRoute.shared.open(attentionRef: attentionRef)
             } else if let sessionIDs { NotificationRoute.shared.open(sessionIDs: sessionIDs) }
-            else if let sessionID { NotificationRoute.shared.open(sessionID: sessionID) }
+            else if let sessionID {
+                NotificationRoute.shared.open(sessionID: sessionID)
+                Task { await SessionNotificationDelivery.clear(sessionID: sessionID) }
+            }
         }
         completionHandler()
     }
@@ -112,6 +115,7 @@ struct DroverApp: App {
         // documented requirement).
         BackgroundRefresh.register(notifier: notifier)
         UNUserNotificationCenter.current().delegate = notificationPresenter
+        SessionNotificationDelivery.registerCategories()
     }
 
     var body: some Scene {

@@ -205,7 +205,12 @@ def test_push_available_reports_registered_usable_sender(config, tmp_path):
 def test_alert_carries_time_sensitive_payload_and_collapse_id(tmp_path, config):
     store, credential = _paired_device(tmp_path)
     client = FakeClient()
-    sender = APNsSender(config, store, client=client)
+    sender = APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )
 
     sender._deliver(_transition())
 
@@ -217,7 +222,7 @@ def test_alert_carries_time_sensitive_payload_and_collapse_id(tmp_path, config):
     assert post["headers"]["apns-priority"] == "10"
     # Collapsing on the session means an offline phone wakes to one banner per
     # session, not one per transition it missed.
-    assert post["headers"]["apns-collapse-id"] == "sess-1"
+    assert post["headers"]["apns-collapse-id"] == "sess-1:input"
     assert post["headers"]["authorization"].startswith("bearer ")
 
     aps = json.loads(post["content"])["aps"]
@@ -240,7 +245,12 @@ def test_production_environment_uses_the_production_host(tmp_path, config):
 def test_input_and_approval_read_differently(tmp_path, config):
     store, _ = _paired_device(tmp_path)
     client = FakeClient()
-    sender = APNsSender(config, store, client=client)
+    sender = APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )
 
     sender._deliver(_transition(awaiting="input"))
 
@@ -583,14 +593,19 @@ def test_dispatch_survives_a_broken_sender():
 def test_body_quotes_the_agent_rather_than_a_generic_phrase(tmp_path, config):
     store, _ = _paired_device(tmp_path)
     client = FakeClient()
-    sender = APNsSender(config, store, client=client)
+    sender = APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )
 
     sender._deliver(
         _transition(awaiting="input", preview="Ready to deploy. Want me to push?")
     )
 
     alert = json.loads(client.posts[0]["content"])["aps"]["alert"]
-    assert alert["body"] == "Needs your input: Ready to deploy. Want me to push?"
+    assert alert["body"] == "Ready to deploy. Want me to push?"
     assert alert["title"] == "drover"
     assert "subtitle" not in alert
 
@@ -599,7 +614,12 @@ def test_without_a_preview_the_old_wording_survives(tmp_path, config):
     store, _ = _paired_device(tmp_path)
     client = FakeClient()
 
-    APNsSender(config, store, client=client)._deliver(_transition(preview=""))
+    APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )._deliver(_transition(preview=""))
 
     alert = json.loads(client.posts[0]["content"])["aps"]["alert"]
     assert alert["body"] == "Needs your input: approve a command"
@@ -658,7 +678,12 @@ def _batch_sender(config, store):
     now = [100.0]
     client = FakeClient()
     sender = APNsSender(
-        config, store, client=client, clock=lambda: now[0], timer_factory=ManualTimer
+        config,
+        store,
+        client=client,
+        clock=lambda: now[0],
+        timer_factory=ManualTimer,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
     )
     return sender, client, now
 
@@ -696,7 +721,7 @@ def test_terminal_payload_is_normal_and_threaded(tmp_path, config, status):
     )
     assert payload["aps"]["interruption-level"] == "active"
     assert payload["aps"]["thread-id"] == "sess-1"
-    assert payload["aps"]["alert"]["title"] == "OpenClaw capture"
+    assert payload["aps"]["alert"]["title"] == "drover · OpenClaw capture"
     assert "subtitle" not in payload["aps"]["alert"]
     sender.close()
 
@@ -712,8 +737,8 @@ def test_notification_text_strips_machine_details_and_limits_length(tmp_path, co
         + "word " * 100,
     )
     alert = json.loads(sender._payload(state, None))["aps"]["alert"]
-    assert alert["title"] == "Fix capture"
-    assert len(alert["body"]) <= 220
+    assert alert["title"] == "drover · Fix capture"
+    assert len(alert["body"]) <= 140
     assert all(
         word not in str(alert)
         for word in ("harness", "deadbeef", "run-", "codex", "12345678")
@@ -733,6 +758,189 @@ def test_private_content_never_appears_in_alert(tmp_path, config):
         )
     )["aps"]["alert"]
     assert alert == {"title": "drover", "body": "Needs your input: reply in the app"}
+    sender.close()
+
+
+def test_content_consent_off_uses_metadata_only(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender = APNsSender(config, store)
+    payload = json.loads(
+        sender._payload(
+            _transition(
+                title="**Secret migration**",
+                preview="Use production token 123",
+                approval_summary="Approve: run `npm test` in acme/web-app",
+                repo_name="acme/web-app",
+                host="studio",
+                content_allowed=False,
+            ),
+            2,
+        )
+    )
+    alert = payload["aps"]["alert"]
+    assert alert == {
+        "title": "Needs your input",
+        "body": "Needs your input · acme/web-app · studio",
+        "subtitle": "studio",
+    }
+    assert "Secret" not in json.dumps(payload)
+    assert "npm test" not in json.dumps(payload)
+    assert payload["aps"]["badge"] == 2
+    sender.close()
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        None,
+        lambda: {"enabled": False, "epoch": 2},
+        lambda: {"enabled": True, "epoch": 0},
+        lambda: {"enabled": True},
+        lambda: (_ for _ in ()).throw(RuntimeError("consent unavailable")),
+    ],
+    ids=["missing", "disabled", "unreconciled", "malformed", "unreadable"],
+)
+def test_consent_reader_fails_closed_for_notification_content(tmp_path, config, reader):
+    store, credential = _paired_device(tmp_path)
+    sender = APNsSender(config, store, content_consent_reader=reader)
+    payload = json.loads(
+        sender._device_payload(
+            credential,
+            _transition(
+                title="Secret session title",
+                preview="Secret question text",
+                approval_summary="Approve: run `npm test --token super-secret`",
+                repo_name="acme/web-app",
+                host="studio",
+            ),
+            None,
+        )
+    )
+    encoded = json.dumps(payload)
+    assert payload["aps"]["alert"]["title"] == "Needs your input"
+    assert payload["aps"]["alert"]["body"] == "Needs your input · acme/web-app · studio"
+    assert "Secret" not in encoded
+    assert "npm test" not in encoded
+    assert "super-secret" not in encoded
+    sender.close()
+
+
+def test_consent_reader_allows_notification_content_when_reconciled(tmp_path, config):
+    store, credential = _paired_device(tmp_path)
+    sender = APNsSender(
+        config,
+        store,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 2},
+    )
+    payload = json.loads(
+        sender._device_payload(
+            credential,
+            _transition(
+                title="Release candidate",
+                preview="May I deploy it?",
+                repo_name="acme/web-app",
+                host="studio",
+            ),
+            None,
+        )
+    )
+    assert payload["aps"]["alert"]["title"] == "acme/web-app · Release candidate"
+    assert payload["aps"]["alert"]["body"] == "Needs your input: approve a command"
+    sender.close()
+
+
+def test_configured_sender_uses_the_durable_consent_reader(tmp_path, config):
+    class Cfg:
+        apns_enabled = config.enabled
+        apns_key_path = str(config.key_path)
+        apns_key_id = config.key_id
+        apns_team_id = config.team_id
+        apns_bundle_id = config.bundle_id
+
+    store, credential = _paired_device(tmp_path)
+    sender = configure(Cfg(), store, lambda: {"enabled": False, "epoch": 1})
+    assert sender is not None
+    try:
+        payload = json.loads(sender._device_payload(credential, _transition(), None))
+        assert payload["aps"]["alert"]["title"] == "Needs your input"
+    finally:
+        sender.close()
+        set_sender(None)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "FOO_TOKEN=topsecret",
+        "API_KEY=topsecret",
+        "PASSWORD=topsecret",
+        "Authorization: Basic abcdef",
+        "Bearer topsecret",
+        "--token topsecret",
+        "--password topsecret",
+        "-p topsecret",
+        "https://alice:topsecret@example.test/repo",
+        "0123456789abcdef0123456789abcdef",
+    ],
+)
+def test_approval_command_redacts_lock_screen_secrets(tmp_path, config, secret):
+    store, _ = _paired_device(tmp_path)
+    sender = APNsSender(config, store)
+    body = json.loads(
+        sender._payload(
+            _transition(approval_summary=f"Approve: run `npm test {secret}`"), None
+        )
+    )["aps"]["alert"]["body"]
+    assert secret not in body
+    assert "…" in body
+    sender.close()
+
+
+def test_approval_payload_keeps_useful_command_and_session_grouping(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender = APNsSender(config, store)
+    payload = json.loads(
+        sender._payload(
+            _transition(
+                session_id="session-42",
+                title="**Ship** _the_ fix",
+                repo_name="acme/web-app",
+                host="studio",
+                approval_summary="Approve: run `npm test` in acme/web-app",
+            ),
+            3,
+        )
+    )
+    assert payload["aps"]["alert"] == {
+        "title": "acme/web-app · Ship the fix",
+        "body": "Approve: run `npm test` in acme/web-app",
+        "subtitle": "studio",
+    }
+    assert payload["aps"]["thread-id"] == "session-42"
+    assert payload["aps"]["summary-arg"] == "acme/web-app"
+    assert payload["aps"]["summary-arg-count"] == 1
+    sender.close()
+
+
+def test_urgent_burst_sends_first_now_then_one_replacement(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+    first = _transition(preview="What should I do?")
+    sender.notify(first)
+    assert len(client.posts) == 1
+    now[0] = 110
+    sender.notify(_transition(preview="Should I deploy after tests?"))
+    sender.notify(_transition(preview="Should I deploy after tests?"))
+    now[0] = 159
+    sender.flush_due()
+    assert len(client.posts) == 1
+    now[0] = 160
+    sender.flush_due()
+    assert len(client.posts) == 2
+    payload = json.loads(client.posts[-1]["content"])
+    assert payload["session_id"] == "sess-1"
+    assert payload["aps"]["alert"]["body"].startswith("2 updates · latest:")
+    assert payload["aps"]["summary-arg-count"] == 2
     sender.close()
 
 
@@ -756,16 +964,15 @@ def test_batch_has_fixed_window_and_latest_state_per_session(tmp_path, config):
     assert client.posts == []
     now[0] = 160
     sender.flush_due()
-    assert len(client.posts) == 1
-    payload = json.loads(client.posts[0]["content"])
-    assert payload["session_ids"] == ["sess-1", "sess-2"]
-    assert payload["aps"]["alert"]["body"] == "1 session finished, 1 session failed"
-    assert payload["aps"]["interruption-level"] == "active"
+    assert len(client.posts) == 2
+    payloads = [json.loads(post["content"]) for post in client.posts]
+    assert {payload["session_id"] for payload in payloads} == {"sess-1", "sess-2"}
+    assert all(payload["aps"]["interruption-level"] == "active" for payload in payloads)
     sender.notify(_transition(status="completed"))
     now[0] = 220
     sender.flush_due()
-    assert len(client.posts) == 2
-    assert json.loads(client.posts[1]["content"])["session_id"] == "sess-1"
+    assert len(client.posts) == 3
+    assert json.loads(client.posts[2]["content"])["session_id"] == "sess-1"
     sender.close()
 
 
@@ -776,7 +983,9 @@ def test_resolved_input_is_removed_before_batch_delivery(tmp_path, config):
     sender.notify(_transition(awaiting=None))
     now[0] = 160
     sender.flush_due()
-    assert client.posts == []
+    # The first actionable event already went out promptly; resolving it
+    # only prevents a later coalesced replacement.
+    assert len(client.posts) == 1
     sender.close()
 
 
@@ -796,7 +1005,7 @@ def test_each_device_has_its_own_mode_and_digest_deadline(tmp_path, config):
     assert len(client.posts) == 2
     assert client.posts[1]["url"].endswith("tablet")
     assert (
-        json.loads(client.posts[1]["content"])["aps"]["interruption-level"] == "active"
+        json.loads(client.posts[1]["content"])["aps"]["interruption-level"] == "passive"
     )
     sender.close()
 
@@ -820,7 +1029,7 @@ def test_daily_digest_batches_all_updates_into_one_summary_at_midnight(
         "title": "Session updates",
         "body": "1 session finished, 1 session updated",
     }
-    assert payload["aps"]["interruption-level"] == "active"
+    assert payload["aps"]["interruption-level"] == "passive"
     sender.close()
 
 
@@ -831,12 +1040,14 @@ def test_delivery_rechecks_revocation_and_preference(tmp_path, config):
     store.set_notification_mode(device.id, "digest")
     now[0] = 160
     sender.flush_due()
-    assert client.posts == []
+    # A time-sensitive first request cannot be recalled after a preference
+    # change; only queued follow-ups re-check the preference.
+    assert len(client.posts) == 1
     sender.notify(_transition())
     store.revoke(device.id)
     now[0] = 86400
     sender.flush_due()
-    assert client.posts == []
+    assert len(client.posts) == 1
     sender.close()
 
 
@@ -862,10 +1073,10 @@ def test_large_batches_keep_payloads_under_apns_limit(tmp_path, config):
         )
     now[0] = 160
     sender.flush_due()
-    assert len(client.posts) == 3
+    assert len(client.posts) == 45
     assert all(len(post["content"]) <= 4096 for post in client.posts)
     assert (
-        sum(len(json.loads(post["content"])["session_ids"]) for post in client.posts)
+        sum(1 for post in client.posts if "session_id" in json.loads(post["content"]))
         == 45
     )
     sender.close()
@@ -903,17 +1114,16 @@ def test_needs_input_shortens_existing_batch_and_includes_pending_sessions(
     now[0] = 114
     sender.notify(_transition(session_id="failed", status="failed"))
     sender.flush_due()
-    assert client.posts == []
-    now[0] = 115
+    assert len(client.posts) == 1  # prompt is immediate
+    now[0] = 160
     sender.flush_due()
-    assert len(client.posts) == 1
-    payload = json.loads(client.posts[0]["content"])
-    assert payload["session_ids"] == ["failed", "finished", "waiting"]
-    assert (
-        payload["aps"]["alert"]["body"]
-        == "1 session finished, 1 session needs input, 1 session failed"
-    )
-    assert payload["aps"]["interruption-level"] == "time-sensitive"
+    assert len(client.posts) == 3
+    payloads = [json.loads(post["content"]) for post in client.posts]
+    assert {payload["session_id"] for payload in payloads} == {
+        "waiting",
+        "finished",
+        "failed",
+    }
     sender.close()
 
 
@@ -941,10 +1151,10 @@ def test_repeated_urgent_states_do_not_extend_short_window(tmp_path, config):
     now[0] = 104
     sender.notify(_transition(awaiting="input"))
     sender.flush_due()
-    assert client.posts == []
-    now[0] = 105
-    sender.flush_due()
     assert len(client.posts) == 1
+    now[0] = 160
+    sender.flush_due()
+    assert len(client.posts) == 2
     sender.close()
 
 
@@ -1015,13 +1225,12 @@ def test_postgres_turn_completion_push_is_not_time_sensitive(
         assert payload["session_id"] == "fixture-session"
         assert payload["aps"]["category"] == expected_kind
         assert payload["aps"]["interruption-level"] == interruption
-        assert payload["aps"]["alert"]["body"].startswith(
-            {
-                "finished": "Finished:",
-                "failed": "Failed:",
-                "input": "Needs your input:",
-            }[expected_kind]
-        )
+        if expected_kind == "input":
+            assert payload["aps"]["alert"]["body"]
+        else:
+            assert payload["aps"]["alert"]["body"].startswith(
+                {"finished": "Finished:", "failed": "Failed:"}[expected_kind]
+            )
 
     try:
         ingest(1, "assistant_output", {"text": "Synthetic reply ready"})
