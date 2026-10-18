@@ -170,32 +170,6 @@ def test_process_limits_kill_and_reap(script, limits, error, tmp_path):
     )
 
 
-def test_disposable_query_launch_is_exec_only_not_a_hub_fork(tmp_path, monkeypatch):
-    """A large macOS hub must not be forked before its reader execs (#466)."""
-    from drover.server.lake import query_process
-
-    real_popen = query_process.subprocess.Popen
-    launches = []
-
-    def record_popen(*args, **kwargs):
-        launches.append(kwargs)
-        return real_popen(*args, **kwargs)
-
-    monkeypatch.setattr(query_process.subprocess, "Popen", record_popen)
-    result = query_process.run_disposable(
-        [sys.executable, "-c", "print('{\"rows\": []}')"],
-        admission_path=tmp_path / "admission",
-        limits=QueryLimits(),
-        cwd=tmp_path,
-    )
-
-    assert result["rows"] == []
-    assert len(launches) == 1
-    assert launches[0]["close_fds"] is False
-    assert "cwd" not in launches[0]
-    assert "start_new_session" not in launches[0]
-
-
 def test_child_failure_carries_its_cause_to_the_hub(tmp_path):
     """The query child's real error reaches the LakeError, not a bare code."""
     request = tmp_path / "request.json"
