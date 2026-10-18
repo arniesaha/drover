@@ -8,6 +8,7 @@ import urllib.request
 
 import duckdb
 import pytest
+from _timeouts import scale_timeout
 
 from drover.server import db
 from drover.server.cockpit.service import CockpitService
@@ -31,6 +32,16 @@ def request(port, path, method="GET"):
         )
     assert time.monotonic() - started < 1
     return result
+
+
+def _wait_for_log(caplog, message: str) -> bool:
+    """Wait for a handler thread's ``finally`` record while capture is active."""
+    deadline = time.monotonic() + scale_timeout(1.0)
+    while time.monotonic() < deadline:
+        if message in caplog.text:
+            return True
+        time.sleep(0.005)
+    return message in caplog.text
 
 
 def test_detection_health_and_fast_http_errors_until_recovered(tmp_path, monkeypatch):
@@ -164,12 +175,13 @@ def test_http_request_logs_activity_footprint_delta(tmp_path, caplog):
     try:
         with caplog.at_level("INFO", logger="drover.runtime_observability"):
             assert request(server.server_address[1], "/healthz")[0] == 200
+            assert "hub_activity start kind=request name=GET /healthz" in caplog.text
+            assert _wait_for_log(
+                caplog, "hub_activity end kind=request name=GET /healthz"
+            )
     finally:
         server.shutdown()
         server.server_close()
-
-    assert "hub_activity start kind=request name=GET /healthz" in caplog.text
-    assert "hub_activity end kind=request name=GET /healthz" in caplog.text
 
 
 @pytest.mark.parametrize("state", ["ok", "recovering", "failed-retrying"])
