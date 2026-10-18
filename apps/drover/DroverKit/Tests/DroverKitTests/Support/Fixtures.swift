@@ -231,6 +231,10 @@ func client(_ mock: MockNetwork? = nil) -> DroverClient {
                         retryGate: HubRetryGate())
 }
 
+func fixtureClient(_ mock: MockNetwork? = nil) -> DroverClient {
+    client(mock)
+}
+
 @MainActor
 func recoveryChatModel(
     client: DroverClient,
@@ -291,7 +295,7 @@ extension ChatModel {
     /// interactions are tested.
     /// Its host advertises every session control, so tests of approval and
     /// turn mechanics are not also tests of capability gating.
-    static func fixture(client: DroverClient = DroverKitTests.client(), messages: [HarnessMessage] = []) -> ChatModel {
+    static func fixture(client: DroverClient = fixtureClient(), messages: [HarnessMessage] = []) -> ChatModel {
         let model = recoveryChatModel(
             client: client,
             sessionID: "fixture-session",
