@@ -49,6 +49,8 @@ struct SessionsView: View {
     @State private var showInsights = false
     @State private var showHistory = false
     @State private var notificationSessionIDs: Set<String>?
+    @State private var filterState: FleetFilterState
+    @State private var isOverviewExpanded = false
 
     init(
         client: DroverClient,
@@ -68,6 +70,7 @@ struct SessionsView: View {
         self.chatModelFactory = chatModelFactory
         self.defaults = defaults
         self.onOpenSettings = onOpenSettings
+        _filterState = State(initialValue: FleetFilterState.load(from: defaults))
         _workStore = State(initialValue: WorkAttentionStore(service: client))
         _store = State(initialValue: SessionStore(client: client))
         _cockpitStore = State(initialValue: CockpitStore(client: client))
@@ -126,18 +129,30 @@ struct SessionsView: View {
                         // is allowed between them any more: the analytics that used
                         // to sit in the middle are below the list now (#80).
                         if inboxSessions.isEmpty, store.hasLoadedOnce {
-                            ContentUnavailableView("Nothing running",
-                                                   systemImage: "rectangle.stack.badge.plus",
-                                                   description: Text("Start a new session when you're ready."))
+                            if filterState.isFiltered {
+                                ContentUnavailableView(
+                                    "No matching sessions",
+                                    systemImage: "line.3.horizontal.decrease.circle",
+                                    description: Text("Try clearing the active filter to see all sessions.")
+                                )
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 40)
-                        } else {
-                            ForEach(inboxSessions) { session in
-                                row(for: session)
+                            } else {
+                                ContentUnavailableView("Nothing running",
+                                                       systemImage: "rectangle.stack.badge.plus",
+                                                       description: Text("Start a new session when you're ready."))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 40)
                             }
+                        } else {
+                            ForEach(inboxSessions, id: \.id) { session in
+                                row(for: session)
+                                    .id(session.id)
+                            }
+                            .animation(.easeInOut(duration: 0.2), value: inboxSessions.map(\.id))
                         }
 
-                        if notificationSessionIDs == nil, !store.finished.isEmpty {
+                        if notificationSessionIDs == nil, !finishedSessions.isEmpty {
                             finishedSection
                         }
 
@@ -374,12 +389,201 @@ struct SessionsView: View {
     @ViewBuilder
     private var statusHeader: some View {
         if store.hasLoadedOnce {
-            InboxStatusHeader(
-                summary: summary, hostGroups: store.hostGroups,
-                onRetry: { Task { await store.refresh() } }
-            ) { providerCapacity }
-            .accessibilityIdentifier("home-status-header")
+            VStack(alignment: .leading, spacing: 8) {
+                InboxStatusHeader(
+                    summary: summary,
+                    hostGroups: store.hostGroups,
+                    selectedHostID: filterState.hostID,
+                    onSelectHost: { hostID in
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            filterState.hostID = hostID
+                            filterState.save(to: defaults)
+                        }
+                    },
+                    isOverviewExpanded: isOverviewExpanded,
+                    onToggleOverview: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            isOverviewExpanded.toggle()
+                        }
+                    },
+                    onRetry: { Task { await store.refresh() } }
+                ) { providerCapacity }
+                .accessibilityIdentifier("home-status-header")
+
+                if isOverviewExpanded {
+                    FleetOverviewView(
+                        overview: store.overview,
+                        filterState: filterState,
+                        onSelectCell: { hostID, project in
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                if filterState.hostID == hostID && filterState.project == project {
+                                    filterState.clear()
+                                } else {
+                                    filterState.hostID = hostID
+                                    filterState.project = project
+                                }
+                                filterState.save(to: defaults)
+                            }
+                        },
+                        onSelectHost: { hostID in
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                if filterState.hostID == hostID {
+                                    filterState.hostID = nil
+                                } else {
+                                    filterState.hostID = hostID
+                                }
+                                filterState.save(to: defaults)
+                            }
+                        },
+                        onSelectProject: { project in
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                if filterState.project == project {
+                                    filterState.project = nil
+                                } else {
+                                    filterState.project = project
+                                }
+                                filterState.save(to: defaults)
+                            }
+                        }
+                    )
+                    .padding(.horizontal, 14)
+                }
+
+                if store.overview.projects.count > 1 {
+                    projectStrip
+                        .padding(.horizontal, 14)
+                }
+
+                if filterState.isFiltered {
+                    filterBanner
+                        .padding(.horizontal, 14)
+                }
+            }
         }
+    }
+
+    private var projectStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        filterState.project = nil
+                        filterState.save(to: defaults)
+                    }
+                } label: {
+                    Text("All Projects")
+                        .font(.system(.caption, design: .default, weight: filterState.project == nil ? .medium : .regular))
+                        .foregroundStyle(filterState.project == nil ? DroverColor.accentHi : DroverColor.muted)
+                        .padding(.horizontal, 9)
+                        .background {
+                            if filterState.project == nil {
+                                Capsule().fill(DroverColor.accentTint)
+                            }
+                        }
+                        .overlay {
+                            Capsule().strokeBorder(filterState.project == nil ? DroverColor.accent : DroverColor.line, lineWidth: filterState.project == nil ? 1.5 : 1)
+                        }
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("project-chip-all")
+
+                ForEach(store.overview.projects) { proj in
+                    let isSelected = filterState.project == proj.name
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            if filterState.project == proj.name {
+                                filterState.project = nil
+                            } else {
+                                filterState.project = proj.name
+                            }
+                            filterState.save(to: defaults)
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(proj.name)
+                                .font(.system(.caption, design: .default, weight: isSelected ? .medium : .regular))
+                                .foregroundStyle(isSelected ? DroverColor.accentHi : DroverColor.text)
+                                .lineLimit(1)
+                            Text("\(proj.activeCount)")
+                                .droverText(.marker)
+                                .foregroundStyle(isSelected ? AnyShapeStyle(DroverColor.accentHi) : AnyShapeStyle(DroverColor.faint))
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background {
+                            if isSelected {
+                                Capsule().fill(DroverColor.accentTint)
+                            }
+                        }
+                        .overlay {
+                            Capsule().strokeBorder(isSelected ? DroverColor.accent : DroverColor.line, lineWidth: isSelected ? 1.5 : 1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("project-chip-\(proj.name)")
+                    .accessibilityLabel("\(proj.name), \(proj.activeCount) active\(isSelected ? ", selected" : "")")
+                }
+            }
+        }
+        .scrollClipDisabled()
+    }
+
+    private var filterBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(DroverColor.accentHi)
+
+            Text(filterDescriptionText)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(DroverColor.text)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Text("(\(inboxSessions.count) active)")
+                .droverText(.marker)
+                .foregroundStyle(DroverColor.muted)
+
+            Spacer(minLength: 8)
+
+            Button("Clear") {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    filterState.clear()
+                    filterState.save(to: defaults)
+                }
+            }
+            .font(.system(.caption2, design: .default, weight: .semibold))
+            .foregroundStyle(DroverColor.accentHi)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(DroverColor.bg, in: Capsule())
+            .overlay {
+                Capsule().strokeBorder(DroverColor.accent, lineWidth: 1)
+            }
+            .accessibilityIdentifier("clear-filters-button")
+            .accessibilityLabel("Clear active filters")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(DroverColor.accentTint, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(DroverColor.accent.opacity(0.4), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("active-filters-banner")
+    }
+
+    private var filterDescriptionText: String {
+        var parts: [String] = []
+        if let hostID = filterState.hostID {
+            let title = store.snapshot?.hosts.first { $0.id == hostID }?.title ?? hostID
+            parts.append(title)
+        }
+        if let project = filterState.project {
+            parts.append(project)
+        }
+        return parts.joined(separator: " · ")
     }
 
     private var historyEntry: some View {
@@ -411,14 +615,17 @@ struct SessionsView: View {
         )
     }
 
-    /// The whole live list, in one piece: needs-you first, then working, each
-    /// newest-first. The store owns the order (`SessionStore.inboxSessions`) so
-    /// it can be tested without a view.
+    /// The filtered live list, in one piece: needs-you first, then working, each
+    /// stabilized by hysteresis.
     private var inboxSessions: [SessionSummary] {
         if let ids = notificationSessionIDs {
             return store.snapshot?.sessions.filter { ids.contains($0.id) } ?? []
         }
-        return store.inboxSessions
+        return filterState.filter(store.inboxSessions)
+    }
+
+    private var finishedSessions: [SessionSummary] {
+        filterState.filter(store.finished)
     }
 
     /// How far behind the snapshot every card below is drawn from.
@@ -510,14 +717,14 @@ struct SessionsView: View {
 
     private var finishedSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            FinishedRow(count: store.finished.count, isExpanded: showFinished) {
+            FinishedRow(count: finishedSessions.count, isExpanded: showFinished) {
                 withAnimation(.snappy(duration: 0.2)) { showFinished.toggle() }
             }
 
             if showFinished {
                 VStack(spacing: 10) {
-                    ForEach(store.finished) { session in
-                        row(for: session)
+                    ForEach(finishedSessions, id: \.id) { session in
+                        row(for: session).id(session.id)
                     }
                 }
             }

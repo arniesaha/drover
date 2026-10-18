@@ -101,19 +101,26 @@ public final class SessionStore {
         return sessions.sorted(by: Self.needsYouOrdering)
     }
 
+    private var cachedInboxSessions: [SessionSummary] = []
+
     public var activeSessions: [SessionSummary] {
-        Self.activeSessions(from: snapshot?.sessions ?? [])
+        let active = Self.activeSessions(from: snapshot?.sessions ?? [], existing: cachedInboxSessions)
+        cachedInboxSessions = active
+        return active
     }
 
-    public nonisolated static func activeSessions(from sessions: [SessionSummary]) -> [SessionSummary] {
-        sessions
-            .filter {
-                switch $0.attention {
-                case .needsApproval, .needsInput, .working: return true
-                case .done, .errored: return false
-                }
+    public nonisolated static func activeSessions(
+        from sessions: [SessionSummary],
+        existing: [SessionSummary] = [],
+        hysteresis: TimeInterval = SessionOrdering.defaultHysteresis
+    ) -> [SessionSummary] {
+        let active = sessions.filter {
+            switch $0.attention {
+            case .needsApproval, .needsInput, .working: return true
+            case .done, .errored: return false
             }
-            .sorted(by: Self.activeOrdering)
+        }
+        return SessionOrdering.sort(active, existing: existing, hysteresis: hysteresis)
     }
 
     public var working: [SessionSummary] {
@@ -122,26 +129,37 @@ public final class SessionStore {
             .sorted(by: Self.byActivityDescending)
     }
 
-    /// The inbox list, as one uninterrupted run ordered by recency: whatever
-    /// moved most recently is at the top, whether it is waiting on you or
-    /// still working. Attention only breaks ties between sessions with the
-    /// same (or no) activity date — see `activeOrdering`.
-    ///
-    /// The screen used to build this itself, as two `ForEach`es with four
-    /// analytics sections between them, needs-you above and working below.
-    /// That read as a sort bug: a session touched 27 minutes ago rendered
-    /// three sections below one last touched two days ago (#80).
-    ///
-    /// Pinning capacity fixed the split; ordering by recency was the second
-    /// half of the decision. Bucket-first was defensible while the analytics
-    /// sections separated the two groups — once the list is contiguous, a
-    /// two-day-old question sitting above live work is just stale-first.
+    /// The inbox list, ordered deterministically: needs-you first (approval then
+    /// input), followed by running sessions, with recency sort stabilized by
+    /// hysteresis so timestamp jitter does not cause rows to swap on refresh.
     public var inboxSessions: [SessionSummary] {
-        Self.inboxSessions(from: snapshot?.sessions ?? [])
+        activeSessions
     }
 
-    public nonisolated static func inboxSessions(from sessions: [SessionSummary]) -> [SessionSummary] {
-        activeSessions(from: sessions)
+    public nonisolated static func inboxSessions(
+        from sessions: [SessionSummary],
+        existing: [SessionSummary] = [],
+        hysteresis: TimeInterval = SessionOrdering.defaultHysteresis
+    ) -> [SessionSummary] {
+        activeSessions(from: sessions, existing: existing, hysteresis: hysteresis)
+    }
+
+    /// Filter state applied to inbox and finished lists.
+    public var filter = FleetFilterState()
+
+    /// Inbox sessions matching current filters.
+    public var filteredInboxSessions: [SessionSummary] {
+        filter.filter(inboxSessions)
+    }
+
+    /// Finished sessions matching current filters.
+    public var filteredFinished: [SessionSummary] {
+        filter.filter(finished)
+    }
+
+    /// Bird's-eye overview of active sessions across hosts and projects.
+    public var overview: FleetOverviewPresentation {
+        FleetOverviewPresentation(snapshot: snapshot)
     }
 
     public var finished: [SessionSummary] {
@@ -508,11 +526,12 @@ public final class SessionStore {
     }
 
     private nonisolated static func activeOrdering(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
+        let tierL = SessionOrdering.attentionTier(lhs)
+        let tierR = SessionOrdering.attentionTier(rhs)
+        if tierL != tierR { return tierL < tierR }
         if let ordered = activityDateOrdering(lhs, rhs) {
             return ordered
         }
-        let (ra, rb) = (attentionRank(lhs), attentionRank(rhs))
-        if ra != rb { return ra < rb }
         return lhs.id < rhs.id
     }
 

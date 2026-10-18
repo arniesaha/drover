@@ -6,12 +6,24 @@ import SwiftUI
 struct InboxStatusHeader<Capacity: View>: View {
     let summary: FleetSummaryPresentation
     let hostGroups: [HostGroup]
+    var selectedHostID: String? = nil
+    var onSelectHost: ((String?) -> Void)? = nil
+    var isOverviewExpanded: Bool = false
+    var onToggleOverview: (() -> Void)? = nil
     let onRetry: () -> Void
     @ViewBuilder let capacity: Capacity
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            FleetHeader(summary: summary, hostGroups: hostGroups, onRetry: onRetry)
+            FleetHeader(
+                summary: summary,
+                hostGroups: hostGroups,
+                selectedHostID: selectedHostID,
+                onSelectHost: onSelectHost,
+                isOverviewExpanded: isOverviewExpanded,
+                onToggleOverview: onToggleOverview,
+                onRetry: onRetry
+            )
             capacity
         }
         .padding(.horizontal, 14)

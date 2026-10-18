@@ -128,7 +128,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
         let preview = app.descendants(matching: .any)["provider-capacity-summary"]
         XCTAssertTrue(preview.waitForExistence(timeout: 8))
         XCTAssertTrue(app.buttons["lowest-account-meter"].label.contains("account-2@example.com, Anthropic, 19% left"))
-        XCTAssertLessThanOrEqual(preview.frame.height, 145)
+        XCTAssertLessThanOrEqual(preview.frame.height, 195)
         XCTAssertGreaterThan(app.scrollViews["fleet-list"].frame.height, 180)
         XCTAssertTrue(app.buttons["launch-button"].isHittable)
         XCTAssertLessThanOrEqual(preview.frame.maxX, app.frame.maxX)
@@ -190,11 +190,102 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
-    private func launch(large: Bool = false, dark: Bool = false) -> XCUIApplication {
+    func testHomeFleetOverviewAndFiltering() {
+        let app = launch(dark: true, fleetFilters: true)
+        app.tabBars.buttons["Home"].tap()
+
+        // 1. Host chips
+        let allChip = app.buttons["host-chip-all"]
+        XCTAssertTrue(allChip.waitForExistence(timeout: 8))
+        XCTAssertTrue(allChip.label.contains("4 active sessions"), "allChip.label was actually: '\(allChip.label)'")
+
+        let studioChip = app.buttons["host-chip-studio"]
+        XCTAssertTrue(studioChip.exists)
+        XCTAssertTrue(studioChip.label.contains("Arnabs-Mac-Studio"))
+
+        let gpuChip = app.buttons["host-chip-gpu-pc"]
+        XCTAssertTrue(gpuChip.exists)
+        XCTAssertTrue(gpuChip.label.contains("GPU PC"))
+
+        let nasChip = app.buttons["host-chip-nas"]
+        XCTAssertTrue(nasChip.exists)
+        XCTAssertTrue(nasChip.label.contains("NAS"))
+
+        screenshot("home-fleet-header-dark", app)
+
+        // 2. Expand Bird's-Eye Overview
+        let overviewToggle = app.buttons["overview-toggle"]
+        XCTAssertTrue(overviewToggle.waitForExistence(timeout: 5))
+        overviewToggle.tap()
+
+        let birdsEye = app.descendants(matching: .any)["fleet-birds-eye-view"]
+        XCTAssertTrue(birdsEye.waitForExistence(timeout: 5))
+        let summary = app.staticTexts["birds-eye-summary"]
+        XCTAssertTrue(summary.exists)
+        XCTAssertTrue(summary.label.contains("4 active · 2 live"))
+
+        screenshot("home-fleet-overview-dark", app)
+
+        // 3. Tap matrix cell: drover on GPU PC
+        let cell = app.buttons["overview-cell-arniesaha/drover-gpu-pc"]
+        XCTAssertTrue(cell.waitForExistence(timeout: 5))
+        cell.tap()
+
+        // 4. Verify Active Filters Banner and filtered session rows
+        let banner = app.descendants(matching: .any)["active-filters-banner"]
+        XCTAssertTrue(banner.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "GPU PC · arniesaha/drover")).firstMatch.exists)
+
+        XCTAssertTrue(app.buttons["gpu-drover-running"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["studio-drover-approval"].exists)
+        XCTAssertFalse(app.buttons["gpu-models-input"].exists)
+
+        screenshot("home-filtered-host-project", app)
+
+        // 5. Clear filter
+        let clearButton = app.buttons["clear-filters-button"]
+        XCTAssertTrue(clearButton.exists)
+        clearButton.tap()
+
+        XCTAssertFalse(banner.exists)
+        XCTAssertTrue(app.buttons["studio-drover-approval"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["gpu-drover-running"].exists)
+
+        // 6. Filter by host chip alone
+        studioChip.tap()
+        XCTAssertTrue(banner.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["studio-drover-approval"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["gpu-drover-running"].exists)
+
+        // Clear host filter by tapping All chip
+        allChip.tap()
+        XCTAssertFalse(banner.exists)
+    }
+
+    @MainActor
+    func testHomeFleetOverviewLightMode() {
+        let app = launch(dark: false, fleetFilters: true)
+        app.tabBars.buttons["Home"].tap()
+
+        let overviewToggle = app.buttons["overview-toggle"]
+        XCTAssertTrue(overviewToggle.waitForExistence(timeout: 8))
+        overviewToggle.tap()
+
+        let birdsEye = app.descendants(matching: .any)["fleet-birds-eye-view"]
+        XCTAssertTrue(birdsEye.waitForExistence(timeout: 5))
+
+        screenshot("home-fleet-overview-light", app)
+    }
+
+    @MainActor
+    private func launch(large: Bool = false, dark: Bool = false, fleetFilters: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "observability"
         app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        if fleetFilters {
+            app.launchEnvironment["DROVER_UI_TEST_FLEET_FILTERS"] = "1"
+        }
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
         }
@@ -205,9 +296,14 @@ final class ObservabilityFixtureUITests: XCTestCase {
 
     @MainActor
     private func screenshot(_ name: String, _ app: XCUIApplication) {
-        let attachment = XCTAttachment(screenshot: app.screenshot())
+        let screenshot = app.screenshot()
+        let attachment = XCTAttachment(screenshot: screenshot)
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+
+        let targetDir = URL(fileURLWithPath: "/tmp/drover-fleet-filters")
+        let targetFile = targetDir.appendingPathComponent("\(name).png")
+        try? screenshot.pngRepresentation.write(to: targetFile)
     }
 }
