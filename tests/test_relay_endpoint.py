@@ -445,6 +445,28 @@ def test_event_ingress_requires_host_credential_even_for_empty_batch(metrics_ser
     assert _post(metrics_server, "/harness/events", {"events": []}) == 200
 
 
+def test_event_ingress_rejects_oversized_body_before_reading(metrics_server):
+    """A replay cannot make the hub materialize an unbounded JSON request."""
+    sock = socket.create_connection(
+        (metrics_server.host, metrics_server.port), timeout=5
+    )
+    try:
+        limit = app_module.MAX_HARNESS_EVENT_REQUEST_BYTES
+        request = (
+            "POST /harness/events HTTP/1.1\r\n"
+            f"Host: {metrics_server.host}:{metrics_server.port}\r\n"
+            f"Authorization: Bearer {metrics_server.token}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {limit + 1}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
+        assert b" 413 " in sock.recv(1024)
+    finally:
+        sock.close()
+
+
 def test_unknown_session_is_skipped_only_after_observed_retry_window(
     metrics_server, monkeypatch
 ):

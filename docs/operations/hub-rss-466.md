@@ -31,6 +31,13 @@ footprint is the budgeted value there. With diagnostics enabled, connection clos
 still performs the complete ranking matrix, overview, and insights. Its
 `peak_hub_memory` must remain below the 1.5 GiB release budget.
 
+The same run also sends a header-only, oversized `/harness/events` replay.
+The hub must return 413 before reading the declared body; this protects the
+long-lived process from simultaneously materialising a replay's raw bytes,
+decoded text, and JSON graph. Normal event batches and their responses are
+unchanged. The ingress limit is 16 MiB, well above the pusher's normal
+100-event reconciliation page.
+
 ## Studio root-cause evidence and fix
 
 Read-only Studio logs from the 0.6.17 restart identify a startup peak rather

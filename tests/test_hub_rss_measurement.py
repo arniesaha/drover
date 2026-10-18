@@ -46,6 +46,10 @@ def test_harness_polls_cockpit_and_insights_routes_and_reports_growth(tmp_path):
     assert all(sample["hub_memory"] > 0 for sample in report["samples"])
     assert report["peak_hub_memory"] < report["hub_peak_budget_bytes"]
     assert report["lifetime_peak_hub_memory"] >= report["peak_hub_memory"]
+    assert report["harness_event_limit_probe"]["status"] == 413
+    assert report["harness_event_limit_probe"]["declared_bytes"] == (
+        report["harness_event_limit_probe"]["limit_bytes"] + 1
+    )
     assert [sample["path"] for sample in report["path_growth"]] == [
         path.split("?", 1)[0] for path in PRODUCTION_ENDPOINTS
     ]
