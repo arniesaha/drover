@@ -19,6 +19,7 @@ import logging
 import os
 import resource
 import runpy
+import socket
 import subprocess
 import sys
 import threading
@@ -42,7 +43,21 @@ from drover.server.process_memory import (
     hub_memory_bytes,
     process_footprint,
 )
-from drover.server.web.app import start_metrics_server
+from drover.server.web.app import MAX_HARNESS_EVENT_REQUEST_BYTES, start_metrics_server
+
+# The production app loads both rankings across its selectable windows, then
+# the overview and advisory lists. Keep this as data so the fixture cannot
+# silently stop covering the reported shape.
+PRODUCTION_ENDPOINTS = tuple(
+    f"/analytics?days={days}&metric={metric}"
+    for days in (7, 30, 90, 365)
+    for metric in ("tokens", "sessions")
+) + ("/cockpit/overview?days=365", "/insights")
+
+# macOS budgets physical footprint, Linux RSS. The fixture is intentionally
+# lower than the release gate: crossing this value means a hub-owned allocation
+# escaped the disposable reader and needs investigation before rollout.
+HUB_PEAK_BUDGET_BYTES = int(1.5 * 1024**3)
 
 
 def prepare(root, sessions, spans, files):
@@ -126,6 +141,30 @@ def _request(base: str, path: str) -> dict:
             if "activity" in payload
             else {}
         ),
+    }
+
+
+def _oversized_harness_event(server) -> dict:
+    """Prove event replay is rejected before its bytes enter the hub heap."""
+    host, port = server.server_address[:2]
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        request = (
+            "POST /harness/events HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {MAX_HARNESS_EVENT_REQUEST_BYTES + 1}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        sock.sendall(request)
+        sock.shutdown(socket.SHUT_WR)
+        status = int(sock.recv(1024).split(b" ", 2)[1])
+    finally:
+        sock.close()
+    return {
+        "status": status,
+        "declared_bytes": MAX_HARNESS_EVENT_REQUEST_BYTES + 1,
+        "limit_bytes": MAX_HARNESS_EVENT_REQUEST_BYTES,
     }
 
 
@@ -312,6 +351,7 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
     service = None
     requests = []
     path_growth = []
+    harness_event_limit_probe = None
     try:
         sample("imports")
         # Retain the live instance as the runtime pin/background workers do.
@@ -347,15 +387,12 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
             base = f"http://127.0.0.1:{server.server_address[1]}"
             deadline = time.monotonic() + minutes * 60
             index = 0
-            # Every cycle covers all app-facing cockpit polls. New day values
-            # avoid the activity response cache; /insights restores the
-            # advisory read exercised by the earlier service-only probe.
+            # Every cycle covers the same 7/30/90/365 ranking shape as the
+            # production app, followed by its overview and advisory reads.
+            # Every path has a distinct filter/cache key, so a warm result
+            # cannot hide one of the analytical requests.
             while index < 1 or time.monotonic() < deadline:
-                for path in (
-                    f"/cockpit/overview?days={7 + index}",
-                    f"/analytics?days={8 + index}",
-                    "/insights",
-                ):
+                for path in PRODUCTION_ENDPOINTS:
                     before_rss = process.memory_info().rss
                     before_hub = hub_memory_bytes(process.pid)
                     before_hub_lifetime = _hub_lifetime_peak(process.pid)
@@ -386,6 +423,11 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
                 if interval_seconds:
                     time.sleep(interval_seconds)
                 index += 1
+            before_hub = hub_memory_bytes(process.pid)
+            harness_event_limit_probe = _oversized_harness_event(server)
+            after_hub = hub_memory_bytes(process.pid)
+            harness_event_limit_probe["hub_growth_bytes"] = after_hub - before_hub
+            sample("harness_event_limit", live)
             sample("idle", live)
         sample("closed")
     finally:
@@ -405,11 +447,13 @@ def measure(root, *, live_reader=False, minutes=1.0, interval_seconds=1.0):
         endpoint_requests=requests,
         path_growth=path_growth,
         path_growth_summary=_growth_summary(path_growth),
+        harness_event_limit_probe=harness_event_limit_probe,
         # This is the budget metric: physical footprint on macOS and RSS on
         # Linux. The lifetime form preserves a short peak between requests.
         peak_hub_memory=max(
             [sample["hub_memory"] for sample in samples] + [peaks["parent_hub_memory"]]
         ),
+        hub_peak_budget_bytes=HUB_PEAK_BUDGET_BYTES,
         lifetime_peak_hub_memory=max(
             [
                 sample.get("lifetime_peak_footprint", sample["hub_memory"])

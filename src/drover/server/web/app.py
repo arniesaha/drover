@@ -91,6 +91,11 @@ log = logging.getLogger("drover.metrics")
 # elapsed hub-observed retries can establish a missing session as an orphan.
 _UNKNOWN_SESSION_RETRY_WINDOW_SECONDS = 24 * 60 * 60
 _MAX_UNKNOWN_SESSION_RETRIES = 4096
+# ``EventPusher`` retries ownership races, so one malformed or unusually large
+# replay can otherwise make the hub retain its raw bytes, decoded text, and
+# JSON object graph at once.  Keep enough room for a normal 100-event
+# reconciliation page while rejecting it before ``rfile.read()`` allocates.
+MAX_HARNESS_EVENT_REQUEST_BYTES = 16 * 1024 * 1024
 _ownership_retry_clock = time.time
 
 
@@ -2531,6 +2536,22 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         """
         from drover.server.metrics import _parse_event_timestamp
 
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = -1
+        if not 0 <= length <= MAX_HARNESS_EVENT_REQUEST_BYTES:
+            # Do not consume an oversized request: reading it first would
+            # materialize unbounded bytes in the long-lived hub.  Closing
+            # also prevents its remaining bytes from being parsed as a later
+            # keep-alive request.
+            self.close_connection = True
+            self._send(
+                413,
+                "application/json",
+                '{"error":"harness event request exceeds byte limit"}\n',
+            )
+            return
         body = self._read_json()
         if body is None:
             self._send(

@@ -31,6 +31,11 @@ _RETRY_BACKOFF_SECONDS = 5.0
 _AUTH_BACKOFF_SECONDS = 30.0
 _AUTH_MAX_BACKOFF_SECONDS = 300.0
 _POST_TIMEOUT_SECONDS = 10.0
+# Keep a full MiB below the hub's 16 MiB ingress limit.  This is deliberately
+# a client-side protocol limit rather than an import from web.app: harnessd
+# may be older than the hub during a rolling upgrade, and must protect the hub
+# without importing its server package.
+_MAX_EVENT_REQUEST_BYTES = 15 * 1024 * 1024
 # Live transcript deltas should not wait behind a multi-second bulk batch.
 # This remains a short batching window so a token burst is posted together.
 _LIVE_BATCH_INTERVAL_SECONDS = 0.25
@@ -40,6 +45,7 @@ _STOP_JOIN_SECONDS = 12.0
 # Final flush attempts. More than one because a worker that outlived the join
 # can hand a batch back after the first sweep has already read the queue.
 _SHUTDOWN_ATTEMPTS = 2
+_REQUEST_TOO_LARGE = object()
 
 
 def _record_undelivered(count: int) -> None:
@@ -92,6 +98,10 @@ class EventPusher:
         # Each entry holds (next attempt time, next exponential delay).
         self._pending_sessions: dict[str, tuple[float, float]] = {}
         self._orphan_logged_sessions: set[str] = set()
+        # The original body of a size-capped event is intentionally not
+        # delivered.  Count and warn once per identity, even if an outage
+        # makes us offer its compact replacement more than once.
+        self._size_capped_event_ids: set[str] = set()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -280,86 +290,184 @@ class EventPusher:
             offered = [e for e in batch if e.get("session_id") not in held_sessions]
             if not offered:
                 return list(batch)
-            request = Request(
-                f"{self._central_url}/harness/events",
-                data=json.dumps({"events": offered}).encode("utf-8"),
-                method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self._token}",
-                },
-            )
-            orphaned_sessions: set[str] = set()
-            try:
-                with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
-                    if not 200 <= response.status < 300:
-                        return None
-                    pending_sessions, orphaned_sessions = self._read_acknowledgement(
-                        response
-                    )
-                    self._authorization_retry_at = 0.0
-                    self._authorization_backoff = _AUTH_BACKOFF_SECONDS
-            except HTTPError as exc:
-                if exc.code != 403:
+            pending_sessions: set[str] = set()
+            pages = self._bounded_pages(offered)
+            while pages:
+                page = pages.pop(0)
+                # A previous page can discover that this session is not yet
+                # owned by the hub.  Do not offer a later fragment of it.
+                page = [
+                    event
+                    for event in page
+                    if event.get("session_id") not in pending_sessions
+                ]
+                if not page:
+                    continue
+                result = self._post_page(page)
+                if result is _REQUEST_TOO_LARGE:
+                    if len(page) > 1:
+                        midpoint = len(page) // 2
+                        pages[0:0] = [page[:midpoint], page[midpoint:]]
+                        continue
+                    event = page[0]
+                    event_id = str(event.get("event_id") or "")
+                    if event_id in self._size_capped_event_ids:
+                        # A hub with a smaller limit than even the compact
+                        # identity envelope cannot receive this record.  Its
+                        # body was already counted and warned about when it
+                        # was capped; make that loss terminal so it cannot
+                        # hold every following durable page hostage forever.
+                        log.warning("structured event rejected after size cap")
+                        continue
+                    pages.insert(0, [self._size_cap_event(event)])
+                    continue
+                if result is None:
                     return None
-                try:
-                    pending_sessions, _ = self._read_acknowledgement(exc)
-                except (OSError, ValueError):
-                    pending_sessions = set()
-                # Only the explicit all-pending ownership response is a
-                # partial acknowledgement on 403. Other failures retain all.
-                if pending_sessions != {e.get("session_id") for e in offered}:
-                    pending_sessions = set()
-                if not pending_sessions:
-                    delay = self._authorization_backoff
-                    self._authorization_retry_at = monotonic() + delay
-                    self._authorization_backoff = min(
-                        delay * 2, _AUTH_MAX_BACKOFF_SECONDS
+                page_pending, orphaned_sessions = result
+                offered_sessions = {event.get("session_id") for event in page}
+                if not page_pending <= offered_sessions:
+                    return None
+                if not orphaned_sessions <= offered_sessions - page_pending:
+                    return None
+                for session_id in orphaned_sessions:
+                    count = sum(event.get("session_id") == session_id for event in page)
+                    _record_orphaned(count)
+                    if session_id in self._orphan_logged_sessions:
+                        continue
+                    self._orphan_logged_sessions.add(session_id)
+                    log.info("structured event orphaned: events=%d", count)
+                for session_id in offered_sessions - page_pending:
+                    self._pending_sessions.pop(session_id, None)
+                for session_id in page_pending:
+                    _, delay = self._pending_sessions.get(
+                        session_id, (0.0, _AUTH_BACKOFF_SECONDS)
                     )
-                    _record_undelivered(len(offered))
+                    self._pending_sessions[session_id] = (
+                        monotonic() + delay,
+                        min(delay * 2, _AUTH_MAX_BACKOFF_SECONDS),
+                    )
+                    count = sum(event.get("session_id") == session_id for event in page)
+                    _record_undelivered(count)
                     log.warning(
-                        "structured event authorization backoff: "
-                        "events=%d retry_seconds=%.0f",
-                        len(offered),
+                        "structured event ownership backoff: events=%d retry_seconds=%.0f",
+                        count,
                         delay,
                     )
-                    return None
-            except (OSError, URLError, ValueError):
-                return None
-            offered_sessions = {e.get("session_id") for e in offered}
-            if not pending_sessions <= offered_sessions:
-                return None
-            if not orphaned_sessions <= offered_sessions - pending_sessions:
-                return None
-            for session_id in orphaned_sessions:
-                count = sum(e.get("session_id") == session_id for e in offered)
-                _record_orphaned(count)
-                if session_id in self._orphan_logged_sessions:
-                    continue
-                self._orphan_logged_sessions.add(session_id)
-                log.info("structured event orphaned: events=%d", count)
-            for session_id in offered_sessions - pending_sessions:
-                self._pending_sessions.pop(session_id, None)
-            for session_id in pending_sessions:
-                _, delay = self._pending_sessions.get(
-                    session_id, (0.0, _AUTH_BACKOFF_SECONDS)
-                )
-                self._pending_sessions[session_id] = (
-                    monotonic() + delay,
-                    min(delay * 2, _AUTH_MAX_BACKOFF_SECONDS),
-                )
-                count = sum(e.get("session_id") == session_id for e in offered)
-                _record_undelivered(count)
-                log.warning(
-                    "structured event ownership backoff: events=%d retry_seconds=%.0f",
-                    count,
-                    delay,
-                )
+                pending_sessions.update(page_pending)
             return [
                 e
                 for e in batch
                 if e.get("session_id") in held_sessions | pending_sessions
             ]
+
+    @staticmethod
+    def _request_body(events: list[dict[str, Any]]) -> bytes:
+        return json.dumps({"events": events}).encode("utf-8")
+
+    def _bounded_pages(
+        self, events: list[dict[str, Any]]
+    ) -> list[list[dict[str, Any]]]:
+        """Split outgoing records by their encoded JSON size as well as count."""
+        pages: list[list[dict[str, Any]]] = []
+        page: list[dict[str, Any]] = []
+        for event in events:
+            candidate = page + [event]
+            if len(self._request_body(candidate)) <= _MAX_EVENT_REQUEST_BYTES:
+                page = candidate
+                continue
+            if page:
+                pages.append(page)
+            page = [event]
+            if len(self._request_body(page)) > _MAX_EVENT_REQUEST_BYTES:
+                page = [self._size_cap_event(event)]
+            pages.append(page)
+            page = []
+        if page:
+            pages.append(page)
+        return pages
+
+    def _size_cap_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Keep an oversized record's identity while dropping its huge body.
+
+        The hub keys ingest idempotency on ``event_id`` and retains ``seq`` in
+        its ledger.  Sending this compact tombstone is therefore preferable to
+        letting one unrepresentable tool output permanently hold every later
+        durable replay page hostage.
+        """
+        original_bytes = len(self._request_body([event]))
+        event_id = str(event.get("event_id") or "")
+        if event_id not in self._size_capped_event_ids:
+            self._size_capped_event_ids.add(event_id)
+            _record_undelivered(1)
+            log.warning(
+                "structured event size capped: original_bytes=%d",
+                original_bytes,
+            )
+        capped: dict[str, Any] = {
+            "event_id": event_id,
+            "session_id": str(event.get("session_id") or ""),
+            "type": str(event.get("type") or "unknown"),
+            "seq": event.get("seq"),
+            "payload": {
+                "truncated": True,
+                "reason": "event exceeds harness request byte limit",
+                "original_bytes": original_bytes,
+            },
+        }
+        timestamp = event.get("ts")
+        if isinstance(timestamp, str) and len(timestamp) <= 256:
+            capped["ts"] = timestamp
+        return capped
+
+    def _post_page(
+        self, events: list[dict[str, Any]]
+    ) -> tuple[set[str], set[str]] | object | None:
+        request = Request(
+            f"{self._central_url}/harness/events",
+            data=self._request_body(events),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._token}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
+                if not 200 <= response.status < 300:
+                    return None
+                pending_sessions, orphaned_sessions = self._read_acknowledgement(
+                    response
+                )
+                self._authorization_retry_at = 0.0
+                self._authorization_backoff = _AUTH_BACKOFF_SECONDS
+                return pending_sessions, orphaned_sessions
+        except HTTPError as exc:
+            if exc.code == 413:
+                return _REQUEST_TOO_LARGE
+            if exc.code != 403:
+                return None
+            try:
+                pending_sessions, _ = self._read_acknowledgement(exc)
+            except (OSError, ValueError):
+                pending_sessions = set()
+            # Only the explicit all-pending ownership response is a partial
+            # acknowledgement on 403. Other failures retain every record.
+            if pending_sessions != {event.get("session_id") for event in events}:
+                pending_sessions = set()
+            if pending_sessions:
+                return pending_sessions, set()
+            delay = self._authorization_backoff
+            self._authorization_retry_at = monotonic() + delay
+            self._authorization_backoff = min(delay * 2, _AUTH_MAX_BACKOFF_SECONDS)
+            _record_undelivered(len(events))
+            log.warning(
+                "structured event authorization backoff: events=%d retry_seconds=%.0f",
+                len(events),
+                delay,
+            )
+            return None
+        except (OSError, URLError, ValueError):
+            return None
 
     @staticmethod
     def _read_acknowledgement(response: Any) -> tuple[set[str], set[str]]:
