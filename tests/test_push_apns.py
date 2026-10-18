@@ -668,14 +668,14 @@ def _batch_sender(config, store):
     [
         ("action", "input", "running", True),
         ("action", "approval", "running", True),
-        ("action", None, "completed", True),
-        ("action", None, "failed", True),
-        ("action", None, "errored", True),
+        ("action", None, "completed", False),
+        ("action", None, "failed", False),
+        ("action", None, "errored", False),
         ("action", None, "running", False),
         ("action", None, "terminated", False),
         ("all", None, "running", True),
         ("digest", "input", "running", True),
-        ("digest", None, "running", False),
+        ("digest", None, "running", True),
     ],
 )
 def test_delivery_mode_transition_filter(mode, awaiting, status, allowed):
@@ -745,7 +745,8 @@ def test_collapse_id_is_byte_bounded_and_collision_resistant():
 
 
 def test_batch_has_fixed_window_and_latest_state_per_session(tmp_path, config):
-    store, _ = _paired_device(tmp_path)
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, "all")
     sender, client, now = _batch_sender(config, store)
     sender.notify(_transition(status="completed"))
     now[0] = 159
@@ -800,6 +801,29 @@ def test_each_device_has_its_own_mode_and_digest_deadline(tmp_path, config):
     sender.close()
 
 
+def test_daily_digest_batches_all_updates_into_one_summary_at_midnight(
+    tmp_path, config
+):
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, "digest")
+    sender, client, now = _batch_sender(config, store)
+
+    sender.notify(_transition(session_id="finished", status="completed"))
+    sender.notify(_transition(session_id="working", awaiting=None, status="running"))
+    now[0] = 86400
+    sender.flush_due()
+
+    assert len(client.posts) == 1
+    payload = json.loads(client.posts[0]["content"])
+    assert payload["session_ids"] == ["finished", "working"]
+    assert payload["aps"]["alert"] == {
+        "title": "Session updates",
+        "body": "1 session finished, 1 session updated",
+    }
+    assert payload["aps"]["interruption-level"] == "active"
+    sender.close()
+
+
 def test_delivery_rechecks_revocation_and_preference(tmp_path, config):
     store, device = _paired_device(tmp_path)
     sender, client, now = _batch_sender(config, store)
@@ -826,7 +850,8 @@ def test_git_delivery_tail_stays_in_the_app():
 
 
 def test_large_batches_keep_payloads_under_apns_limit(tmp_path, config):
-    store, _ = _paired_device(tmp_path)
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, "all")
     sender, client, now = _batch_sender(config, store)
     for i in range(45):
         sender.notify(
@@ -865,13 +890,12 @@ def test_all_updates_device_receives_progress_while_default_device_does_not(
     sender.close()
 
 
-@pytest.mark.parametrize("mode", ["action", "all"])
 @pytest.mark.parametrize("awaiting", ["input", "approval"])
 def test_needs_input_shortens_existing_batch_and_includes_pending_sessions(
-    tmp_path, config, mode, awaiting
+    tmp_path, config, awaiting
 ):
     store, device = _paired_device(tmp_path)
-    store.set_notification_mode(device.id, mode)
+    store.set_notification_mode(device.id, "all")
     sender, client, now = _batch_sender(config, store)
     sender.notify(_transition(session_id="finished", status="completed"))
     now[0] = 110
@@ -890,6 +914,23 @@ def test_needs_input_shortens_existing_batch_and_includes_pending_sessions(
         == "1 session finished, 1 session needs input, 1 session failed"
     )
     assert payload["aps"]["interruption-level"] == "time-sensitive"
+    sender.close()
+
+
+def test_action_needed_excludes_completed_and_failed_sessions(tmp_path, config):
+    store, _ = _paired_device(tmp_path)
+    sender, client, now = _batch_sender(config, store)
+
+    sender.notify(_transition(session_id="finished", status="completed"))
+    sender.notify(_transition(session_id="failed", status="failed"))
+    sender.notify(_transition(session_id="waiting", awaiting="approval"))
+    now[0] = 105
+    sender.flush_due()
+
+    assert len(client.posts) == 1
+    payload = json.loads(client.posts[0]["content"])
+    assert payload["session_id"] == "waiting"
+    assert payload["aps"]["alert"]["body"] == "Needs your input: approve a command"
     sender.close()
 
 
@@ -949,7 +990,8 @@ def test_postgres_turn_completion_push_is_not_time_sensitive(
         status="running",
         mode="structured",
     )
-    store, _ = _paired_device(tmp_path)
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, "all")
     sender, client, now = _batch_sender(config, store)
     set_sender(sender)
 
