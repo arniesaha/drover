@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from test_harnessd_contract import request
+from .test_harnessd_contract import request
 
 
 def _shell(daemon, **extra):

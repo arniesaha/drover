@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 
 import pytest
-from conftest import wait_until
+from .conftest import wait_until
 
 
 def request(daemon, path, *, payload=None, token=True, method=None):
