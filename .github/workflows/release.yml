@@ -170,6 +170,19 @@ jobs:
           dist/requirements.lock.txt \
           dist/SHA256SUMS.txt
 
+  # Keep the platform-specific Rust build isolated from the Python release
+  # job. It runs after gh release create so the reusable workflow can attach
+  # its signed assets without racing release creation. A manual dispatch of
+  # that workflow is intentionally non-publishing for signing rehearsals.
+  harnessd-macos:
+    name: Sign and notarize macOS harnessd
+    needs: release
+    uses: ./.github/workflows/harnessd-macos-notarize.yml
+    with:
+      ref: ${{ github.event.inputs.ref || github.ref }}
+      release_tag: ${{ github.event.inputs.ref || github.ref_name }}
+    secrets: inherit
+
   # Install the release we just published, on a clean machine, the way a
   # stranger would. Unit tests cannot catch this class of bug: v0.1.1 passed
   # every suite, published three correct artifacts, and still could not
