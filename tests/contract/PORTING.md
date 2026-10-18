@@ -124,14 +124,14 @@ missing public seam rather than importing daemon internals.
 | `test_turn_with_unsupported_media_type_is_rejected` | `test_structured_launch_rejects_invalid_turn_input` |
 | `test_empty_turn_still_rejected` | `test_empty_turn_still_rejected` |
 | `test_structured_unknown_harness_rejected` | `test_structured_launch_validation_contract` |
-| `test_structured_launch_cannot_bypass_a_missing_adapter` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_structured_launch_cannot_bypass_a_missing_adapter` | `test_structured_launch_cannot_bypass_a_missing_adapter` |
 | `test_structured_launch_rejects_unknown_worktree_policy` | dropped: requires pre-seeding or faulting durable daemon state before startup |
 | `test_structured_permission_without_approval_channel_returns_400` | `test_public_query_error_contract` |
 | `test_structured_interrupt_unknown_session_is_404` | `test_public_query_error_contract` |
 | `test_structured_terminate_closes_driver_and_marks_terminated` | `test_public_session_mutation_contract` |
 | `test_structured_codex_session_runs_in_worktree` | dropped: requires pre-seeding or faulting durable daemon state before startup |
-| `test_structured_codex_session_non_git_cwd_runs_in_place` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
-| `test_structured_claude_session_stays_in_place` | dropped: checked HTTP, terminal WebSocket, relay WebSocket, and CLI launch seams; no request can establish this internal invariant |
+| `test_structured_codex_session_non_git_cwd_runs_in_place` | `test_structured_codex_session_non_git_cwd_runs_in_place` |
+| `test_structured_claude_session_stays_in_place` | `test_structured_claude_session_stays_in_place` |
 | `test_structured_session_rejects_ask_permission_mode` | `test_structured_launch_validation_contract` |
 | `test_structured_session_stores_default_permission_mode` | `test_public_session_mutation_contract` |
 | `test_structured_session_stores_explicit_auto_permission_mode` | `test_public_session_mutation_contract` |
