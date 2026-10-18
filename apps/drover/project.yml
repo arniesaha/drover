@@ -168,6 +168,14 @@ targets:
       configs:
         StoreRelease:
           CODE_SIGN_ENTITLEMENTS: DroverWidget/DroverWidget-AppStore.entitlements
+          CODE_SIGN_STYLE: "$(DROVER_CODE_SIGN_STYLE)"
+          DEVELOPMENT_TEAM: "$(DROVER_DEVELOPMENT_TEAM)"
+          CODE_SIGN_IDENTITY: "$(DROVER_CODE_SIGN_IDENTITY)"
+          # Store signing stays target-scoped: the app uses
+          # DROVER_PROVISIONING_PROFILE_SPECIFIER, while this extension uses
+          # the separately installed widget profile.
+          PROVISIONING_PROFILE_SPECIFIER: "$(DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER)"
+          OTHER_CODE_SIGN_FLAGS: "$(DROVER_OTHER_CODE_SIGN_FLAGS)"
     info:
       path: DroverWidget/Info.plist
       properties:

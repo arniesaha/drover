@@ -23,6 +23,7 @@ from test_ios_archive_verifier import (
 SCRIPTS = Path(__file__).parents[1] / "scripts" / "ios"
 HUB = "https://hub.example.test"
 ISSUER = "11111111-2222-3333-4444-555555555555"
+WIDGET_ISSUER = "66666666-7777-8888-9999-AAAAAAAAAAAA"
 KEY_ID = "EXAMPLE123"
 
 
@@ -41,6 +42,9 @@ def chain(tmp_path: Path):
     }
     app = write_bundle(tmp_path / "fixture", info=info)
     (app / "embedded.mobileprovision").write_bytes(b"synthetic profile fixture")
+    widget = app / "PlugIns" / "DroverWidget.appex"
+    widget.mkdir(parents=True)
+    (widget / "embedded.mobileprovision").write_bytes(b"synthetic widget profile fixture")
     archive = tmp_path / "Drover.xcarchive"
     archived = archive / "Products" / "Applications"
     archived.mkdir(parents=True)
@@ -56,7 +60,10 @@ def chain(tmp_path: Path):
                 "testFlightInternalTestingOnly": True,
                 "teamID": "TEAMID1234",
                 "signingCertificate": "Apple Distribution: Example (TEAMID1234)",
-                "provisioningProfiles": {"com.arnab.drover": ISSUER},
+                "provisioningProfiles": {
+                    "com.arnab.drover": ISSUER,
+                    "com.arnab.drover.widget": WIDGET_ISSUER,
+                },
             }
         )
     )
@@ -108,9 +115,17 @@ elif name == "codesign":
     elif "-dvv" in args:
         print("Authority=Apple Distribution: Example (TEAMID1234)", file=sys.stderr)
     else:
-        sys.stdout.buffer.write(plistlib.dumps({"application-identifier": "TEAMID1234.com.arnab.drover", "com.apple.developer.team-identifier": "TEAMID1234", "aps-environment": "production", "get-task-allow": False}))
+        if str(args[-1]).endswith("DroverWidget.appex"):
+            entitlements = {"application-identifier": "TEAMID1234.com.arnab.drover.widget", "com.apple.developer.team-identifier": "TEAMID1234", "com.apple.security.application-groups": ["group.com.arnab.drover"], "get-task-allow": False}
+        else:
+            entitlements = {"application-identifier": "TEAMID1234.com.arnab.drover", "com.apple.developer.team-identifier": "TEAMID1234", "aps-environment": "production", "get-task-allow": False}
+        sys.stdout.buffer.write(plistlib.dumps(entitlements))
 elif name == "security":
-    sys.stdout.buffer.write(plistlib.dumps({"UUID": "11111111-2222-3333-4444-555555555555", "TeamIdentifier": ["TEAMID1234"], "Entitlements": {"application-identifier": "TEAMID1234.com.arnab.drover"}}))
+    if str(args[-1]).endswith("DroverWidget.appex/embedded.mobileprovision"):
+        profile = {"UUID": "66666666-7777-8888-9999-AAAAAAAAAAAA", "TeamIdentifier": ["TEAMID1234"], "Entitlements": {"application-identifier": "TEAMID1234.com.arnab.drover.widget"}}
+    else:
+        profile = {"UUID": "11111111-2222-3333-4444-555555555555", "TeamIdentifier": ["TEAMID1234"], "Entitlements": {"application-identifier": "TEAMID1234.com.arnab.drover"}}
+    sys.stdout.buffer.write(plistlib.dumps(profile))
 elif name == "git":
     if "rev-parse" in args:
         print("a" * 40)
@@ -290,6 +305,7 @@ def test_export_emits_only_sanitized_ipa_evidence(chain, generate):
     assert settings["destination"] == "export"
     assert settings["testFlightInternalTestingOnly"] is True
     assert settings["manageAppVersionAndBuildNumber"] is False
+    assert settings["provisioningProfiles"]["com.arnab.drover.widget"] == WIDGET_ISSUER
     assert not (options.stat().st_mode & 0o077)
     assert list((root / "scratch").iterdir()) == []
     assert not list((root / "private").glob("drover-ipa-*"))

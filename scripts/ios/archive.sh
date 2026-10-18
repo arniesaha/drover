@@ -53,7 +53,7 @@ is_safe_xcconfig_path() {
 }
 
 validate_signing_config() {
-  local line code_sign_style="" team_id="" identity_name="" profile_uuid="" keychain_path="" raw_flags=""
+  local line code_sign_style="" team_id="" identity_name="" profile_uuid="" widget_profile_uuid="" keychain_path="" raw_flags=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     case "$line" in
       "DROVER_CODE_SIGN_STYLE = Manual")
@@ -77,6 +77,12 @@ validate_signing_config() {
         [[ "$profile_uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
           || fail "signing configuration is invalid"
         ;;
+      "DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER = "*)
+        [[ -z "$widget_profile_uuid" ]] || fail "signing configuration is invalid"
+        widget_profile_uuid="${line#DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER = }"
+        [[ "$widget_profile_uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+          || fail "signing configuration is invalid"
+        ;;
       "DROVER_OTHER_CODE_SIGN_FLAGS = --keychain "*)
         [[ -z "$keychain_path" ]] || fail "signing configuration is invalid"
         raw_flags="${line#DROVER_OTHER_CODE_SIGN_FLAGS = --keychain }"
@@ -90,7 +96,8 @@ validate_signing_config() {
     esac
   done < "$SIGNING_CONFIG"
   [[ "$code_sign_style" = Manual && -n "$team_id" && "$identity_name" == *"($team_id)" \
-    && -n "$profile_uuid" && -n "$keychain_path" ]] \
+    && -n "$profile_uuid" && -n "$widget_profile_uuid" \
+    && "$profile_uuid" != "$widget_profile_uuid" && -n "$keychain_path" ]] \
     || fail "signing configuration is incomplete"
 }
 

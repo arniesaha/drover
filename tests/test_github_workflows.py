@@ -20,11 +20,16 @@ def test_production_testflight_is_manual_local_networking_and_credential_isolate
         "version",
         "build",
         "internal_group",
+        "upload",
     }
     assert workflow["permissions"] == {"contents": "read"}
     assert set(workflow["jobs"]) == {"archive-upload"}
     upload = workflow["jobs"]["archive-upload"]
-    assert upload["if"] == "github.ref == 'refs/heads/main'"
+    assert upload["if"] == (
+        "github.ref == 'refs/heads/main' || "
+        "(github.ref == 'refs/heads/ci/testflight-widget-profile' && "
+        "inputs.upload == false)"
+    )
     assert upload["environment"] == "ios-testflight-upload"
     assert upload["runs-on"] == "macos-26"
     assert (
@@ -50,6 +55,12 @@ def test_production_testflight_is_manual_local_networking_and_credential_isolate
         s for s in upload["steps"] if s.get("name") == "Remove temporary credentials"
     )
     assert cleanup["if"] == "always()"
+    upload_step = next(
+        s
+        for s in upload["steps"]
+        if s.get("name") == "Upload, wait for Apple processing and assign internal group"
+    )
+    assert upload_step["if"] == "${{ inputs.upload }}"
 
 
 def test_production_testflight_repeats_the_required_ios_slices() -> None:
@@ -450,6 +461,7 @@ def test_distribution_workflow_is_manual_and_uses_the_documented_xcode() -> None
     assert "setup_distribution_signing.sh" in commands
     assert "cleanup_distribution_signing.sh" in commands
     assert "scripts/ios/archive.sh" in commands
+    assert "upload_testflight.sh" not in commands
     signing_step = next(step for step in steps if step.get("id") == "signing")
     assert (
         signing_step["env"]["DROVER_DISTRIBUTION_IDENTITY_NAME"]
@@ -458,8 +470,9 @@ def test_distribution_workflow_is_manual_and_uses_the_documented_xcode() -> None
     upload = next(
         step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
     )
-    assert upload["with"]["path"].endswith("/archive-record.json")
-    assert "xcarchive" not in upload["with"]["path"]
+    artifact_paths = upload["with"]["path"]
+    assert artifact_paths.endswith("/archive-record.json")
+    assert "xcarchive" not in artifact_paths
 
 
 def test_release_workflow_is_tag_triggered_and_publishes_three_artifacts() -> None:

@@ -75,6 +75,7 @@ def write_signing_config(directory: Path, *, keychain: Path) -> Path:
         "DROVER_DEVELOPMENT_TEAM = TEAMID1234\n"
         "DROVER_CODE_SIGN_IDENTITY = Apple Distribution: Example Organization (TEAMID1234)\n"
         "DROVER_PROVISIONING_PROFILE_SPECIFIER = 11111111-2222-3333-4444-555555555555\n"
+        "DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER = 66666666-7777-8888-9999-AAAAAAAAAAAA\n"
         f'DROVER_OTHER_CODE_SIGN_FLAGS = --keychain "{keychain}"\n',
         encoding="utf-8",
     )
