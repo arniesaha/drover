@@ -409,10 +409,15 @@ struct SettingsView: View {
         }
     }
 
+    @MainActor
     private func previewSampleNotification() async {
         let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        if settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional {
+        let status: UNAuthorizationStatus = await withCheckedContinuation { continuation in
+            center.getNotificationSettings { settings in
+                continuation.resume(returning: settings.authorizationStatus)
+            }
+        }
+        if status == .authorized || status == .provisional {
             let content = UNMutableNotificationContent()
             content.title = "Drover (Demo)"
             content.subtitle = "Needs Approval"
@@ -427,10 +432,8 @@ struct SettingsView: View {
             )
             try? await center.add(request)
         }
-        await MainActor.run {
-            withAnimation {
-                demoNotificationSent = true
-            }
+        withAnimation {
+            demoNotificationSent = true
         }
     }
 
