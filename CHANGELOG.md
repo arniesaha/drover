@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.24] - 2026-10-18
+
+### Fixed
+
+- Hub startup no longer spikes native memory on DuckLake hubs that haven't retired legacy writers (the Studio config). 0.6.23 still peaked at 4.18 GiB because #702's analytical pin only ran with `retire_legacy_writers`, so provider-refresh advisory enqueues closed the last handle to the legacy `drover.duckdb` and checkpointed it on every close. The bounded analytical pin now runs whenever DuckLake is selected, before bootstrap and workers. Off-production replay: first-120 s peak 3.42 GiB -> 0.56 GiB (#466, #708).
+- TestFlight bundle display names, and Apple validation errors are kept in the upload log (#707).
+
+### Changed
+
+- CI: iOS workflow provisions and verifies the widget TestFlight profile (#700); harnessd notarization uses an ephemeral signing keychain on the search list and assesses the bare notarized binary (#705, #709).
+
+### Upgrade notes
+
+- No control or lake migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`).
+
 ## [0.6.23] - 2026-10-18
 
 ### Fixed
