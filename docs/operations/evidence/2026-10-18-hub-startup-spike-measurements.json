@@ -1,0 +1,80 @@
+{
+  "measurement": "phys_footprint",
+  "runtime": "0.6.23 Python 3.14.7 DuckDB 1.5.5",
+  "startup_seconds": 120,
+  "limit_bytes": 1610612736,
+  "runs": {
+    "before": {
+      "startup_samples": 121,
+      "startup_sampled_peak_bytes": 3668299928,
+      "startup_lifetime_peak_bytes": 3670347928,
+      "after_requests_lifetime_peak_bytes": 3670347928,
+      "request_results": [
+        {
+          "phase": "/analytics?days=365&metric=tokens",
+          "status": 200,
+          "seconds": 3.9286757081281394,
+          "footprint": 249600000,
+          "lifetime_peak": 3670347928
+        },
+        {
+          "phase": "/analytics?days=365&metric=sessions",
+          "status": 200,
+          "seconds": 3.7905496249441057,
+          "footprint": 260134912,
+          "lifetime_peak": 3670347928
+        },
+        {
+          "phase": "/cockpit/overview?days=365",
+          "status": 200,
+          "seconds": 3.871995999943465,
+          "footprint": 249649152,
+          "lifetime_peak": 3670347928
+        },
+        {
+          "phase": "/insights",
+          "status": 200,
+          "seconds": 0.002181458054110408,
+          "footprint": 249649152,
+          "lifetime_peak": 3670347928
+        }
+      ]
+    },
+    "after": {
+      "startup_samples": 121,
+      "startup_sampled_peak_bytes": 511329744,
+      "startup_lifetime_peak_bytes": 599049680,
+      "after_requests_lifetime_peak_bytes": 720504392,
+      "request_results": [
+        {
+          "phase": "/analytics?days=365&metric=tokens",
+          "status": 200,
+          "seconds": 3.7915206670295447,
+          "footprint": 544441904,
+          "lifetime_peak": 718620232
+        },
+        {
+          "phase": "/analytics?days=365&metric=sessions",
+          "status": 200,
+          "seconds": 3.727091999957338,
+          "footprint": 554632752,
+          "lifetime_peak": 720422472
+        },
+        {
+          "phase": "/cockpit/overview?days=365",
+          "status": 200,
+          "seconds": 3.7254464998841286,
+          "footprint": 552617520,
+          "lifetime_peak": 720504392
+        },
+        {
+          "phase": "/insights",
+          "status": 200,
+          "seconds": 0.0025693329516798258,
+          "footprint": 552617520,
+          "lifetime_peak": 720504392
+        }
+      ]
+    }
+  }
+}
