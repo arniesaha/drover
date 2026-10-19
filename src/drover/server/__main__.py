@@ -6,6 +6,7 @@ import faulthandler
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
@@ -606,12 +607,48 @@ def _private_pairing_ip(cfg: DroverConfig) -> str | None:
         return None
 
 
+def _tailscale_serve_https_endpoint() -> str | None:
+    """Return the tailnet-only HTTPS authority published by Tailscale Serve.
+
+    ``tailscale serve status`` is local-only and safe to probe while printing a
+    pairing code. Its human-readable output has kept the public HTTPS URL
+    stable across versions, so extract only a ``*.ts.net`` URL and leave all
+    other output deliberately uninterpreted.
+    """
+    import subprocess
+
+    tailscale = shutil.which("tailscale")
+    if not tailscale:
+        return None
+    try:
+        result = subprocess.run(
+            [tailscale, "serve", "status"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    match = re.search(
+        r"https://([a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net)(?::(\d{1,5}))?",
+        result.stdout,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    host, port = match.groups()
+    return f"{host}:{port}" if port and port != "443" else host
+
+
 def _advertised_pairing_endpoint(cfg: DroverConfig) -> tuple[str, bool]:
     """Return the QR authority and whether it is HTTPS.
 
-    Preserve HTTPS MagicDNS names: they are the recommended remote setup.
-    For an HTTP FQDN, put an actually dialable Tailscale/LAN IP in the QR so
-    the iOS Store build remains inside `NSAllowsLocalNetworking`.
+    Preserve a configured HTTPS URL. Otherwise, prefer a tailnet-only URL
+    published by Tailscale Serve, because Store ATS rejects plain HTTP to
+    Tailscale CGNAT addresses. If Serve is not configured, retain the legacy
+    private-IP fallback for a plain HTTP FQDN.
     """
     configured = cfg.server_advertised_url.strip()
     tls = configured.lower().startswith("https://")
@@ -631,8 +668,15 @@ def _advertised_pairing_endpoint(cfg: DroverConfig) -> tuple[str, bool]:
     is_fqdn = bool(
         host and "." in host and not host.endswith(".local") and not is_ip_literal
     )
-    if tls or not is_fqdn:
+    if tls:
         return host_port, tls
+
+    served_https = _tailscale_serve_https_endpoint()
+    if served_https:
+        return served_https, True
+
+    if not is_fqdn:
+        return host_port, False
 
     replacement = _private_pairing_ip(cfg)
     if not replacement:
