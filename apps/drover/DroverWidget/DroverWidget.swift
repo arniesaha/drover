@@ -18,7 +18,7 @@ struct DroverWidget: Widget {
         }
         .configurationDisplayName("Drover Fleet")
         .description("At-a-glance quota across accounts and active fleet hosts.")
-        .supportedFamilies([.systemMedium, .systemSmall, .accessoryRectangular])
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge, .accessoryRectangular])
         .contentMarginsDisabled()
     }
 }
@@ -31,6 +31,12 @@ struct DroverWidget: Widget {
 }
 
 #Preview("Square Small", as: .systemSmall) {
+    DroverWidget()
+} timeline: {
+    DroverWidgetEntry(date: Date(), snapshot: .preview())
+}
+
+#Preview("Large", as: .systemLarge) {
     DroverWidget()
 } timeline: {
     DroverWidgetEntry(date: Date(), snapshot: .preview())
