@@ -271,12 +271,20 @@ symlinks. The receipt path must be absolute and absent. The wrapper sets
 same directory from a private temporary working directory. Key contents are
 never passed in command arguments. Raw JSON and stderr are captured in private
 temporary files and discarded on success or failure. Only a zero exit code and
-recognized positive upload confirmation without product errors produce a
-receipt. The receipt contains only `upload_confirmed` and `ipa_sha256`.
+recognized positive upload confirmation without product errors produce a success
+receipt containing `upload_confirmed` and `ipa_sha256`. Rejections also write a
+failure receipt with `stage`, `tool_exit_code`, `diagnostic_codes` and bounded
+`diagnostic_messages`. Apple message text (including ITMS codes, plist keys and
+bundle identifiers) is retained in the receipt and logs after credentials,
+tokens and paths under the home directory are redacted. Raw responses are never
+published.
 
 The upload wrapper uses `xcrun altool --upload-app -f` with JSON output and
 returns after upload confirmation when called with the upload-only arguments
-above. The production workflow also passes `--version`, `--build`, `--info-plist`
+above. The production workflow passes `--validate` to run `altool --validate-app`
+with the same credentials and sanitized diagnostics before any upload attempt.
+A validation rejection writes a failure receipt and prevents upload. It also
+passes `--version`, `--build`, `--info-plist`
 (the archived app plist) and `--internal-group` to wait up to 45 minutes for ASC
 processing, apply a declared non-exempt-encryption answer of NO, and confirm
 internal group assignment. This mode requires Python `cryptography>=42,<47`

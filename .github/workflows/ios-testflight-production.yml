@@ -154,7 +154,7 @@ jobs:
     - name: Install ASC signing dependency
       if: ${{ inputs.upload }}
       run: python3 -m pip install 'cryptography>=42,<47'
-    - name: Upload, wait for Apple processing and assign internal group
+    - name: Validate, upload, wait for Apple processing and assign internal group
       if: ${{ inputs.upload }}
       env:
         DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
@@ -179,7 +179,7 @@ jobs:
             environment = os.environ.copy()
             environment.pop("DROVER_APPSTORE_API_PRIVATE_KEY_BASE64", None)
             subprocess.run([
-                "scripts/ios/upload_testflight.sh", "--ipa", str(root / "drover-ios-export/Drover.ipa"),
+                "scripts/ios/upload_testflight.sh", "--validate", "--ipa", str(root / "drover-ios-export/Drover.ipa"),
                 "--api-key-id", key_id, "--api-issuer", os.environ["DROVER_APPSTORE_API_ISSUER_ID"],
                 "--private-keys-dir", str(directory), "--record", str(root / "upload-record.json"),
                 "--version", os.environ["CANDIDATE_VERSION"], "--build", os.environ["CANDIDATE_BUILD"],

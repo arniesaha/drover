@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Confirm upload and retain a fixed-schema receipt, never altool's raw response.
+# Validate/upload and retain a sanitized receipt, never altool's raw response.
 set +x
 set -euo pipefail
 umask 077
@@ -17,6 +17,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, sys.argv.pop(1))
+from apple_diagnostics import diagnostic_messages
 from testflight_api import Client, Rejected, distribute
 
 
@@ -88,6 +89,7 @@ def stderr_diagnostic_codes(value):
     """Extract only explicitly structured identifiers, never free-form text."""
     found = set()
     for pattern in (
+        r"\bITMS-\d{3,8}\b",
         r"\bCode=(-?\d{1,10})\b",
         r"\bstatusCode\s*=\s*(\d{3})\b",
         r'"code"\s*:\s*"([A-Z]{2,12}-\d{3,8})"',
@@ -110,6 +112,10 @@ def main():
     parser.add_argument("--api-issuer", required=True)
     parser.add_argument("--private-keys-dir", type=Path, required=True)
     parser.add_argument("--record", type=Path, required=True)
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="Validate with Apple before attempting upload",
+    )
     parser.add_argument("--version")
     parser.add_argument("--build")
     parser.add_argument("--info-plist", type=Path)
@@ -177,63 +183,74 @@ def main():
         # and removed on success, malformed output, or a nonzero tool exit.
         raw = Path(temporary) / "response.json"
         errors_path = Path(temporary) / "stderr.log"
-        with raw.open("wb") as output, errors_path.open("wb") as errors:
-            result = subprocess.run(
-                [
-                    "xcrun",
-                    "altool",
-                    "--upload-app",
-                    "-f",
-                    str(args.ipa),
-                    "--api-key",
-                    args.api_key_id,
-                    "--api-issuer",
-                    args.api_issuer,
-                    "--output-format",
-                    "json",
-                ],
-                stdout=output,
-                stderr=errors,
-                env=environment,
-                cwd=temporary,
-                check=False,
-            )
-        try:
-            response = json.loads(raw.read_text())
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            response = None
-        # altool has punctuated this line differently across Xcode releases --
-        # "archive", the full path, the basename, with and without a trailing
-        # period. An exact-match set fails the run *after* the bytes are at
-        # Apple: no receipt is written, and the operator's natural retry
-        # becomes a second build. Match the invariant part, and keep the
-        # product-errors check as the real gate.
-        message = (
-            response.get("success-message") if isinstance(response, dict) else None
-        )
-        confirmed = isinstance(message, str) and re.match(
-            r"^No errors uploading\b", message.strip()
-        )
-        product_errors = (
-            response.get("product-errors") if isinstance(response, dict) else None
-        )
-        if result.returncode != 0 or not confirmed or product_errors:
-            codes = set(diagnostic_codes(response))
-            codes.update(
-                stderr_diagnostic_codes(
-                    errors_path.read_text(errors="ignore")[: 1024 * 1024]
+        operations = [("upload", "--upload-app", "uploading")]
+        if args.validate:
+            operations.insert(0, ("validation", "--validate-app", "validating"))
+        for stage, operation, verb in operations:
+            with raw.open("wb") as output, errors_path.open("wb") as errors:
+                result = subprocess.run(
+                    [
+                        "xcrun",
+                        "altool",
+                        operation,
+                        "-f",
+                        str(args.ipa),
+                        "--api-key",
+                        args.api_key_id,
+                        "--api-issuer",
+                        args.api_issuer,
+                        "--output-format",
+                        "json",
+                    ],
+                    stdout=output,
+                    stderr=errors,
+                    env=environment,
+                    cwd=temporary,
+                    check=False,
                 )
+            raw_text = raw.read_text(errors="replace")[: 1024 * 1024]
+            try:
+                response = json.loads(raw_text)
+            except json.JSONDecodeError:
+                response = None
+            # altool has punctuated this line differently across Xcode releases --
+            # "archive", the full path, the basename, with and without a trailing
+            # period. An exact-match set fails the run *after* the bytes are at
+            # Apple: no receipt is written, and the operator's natural retry
+            # becomes a second build. Match the invariant part, and keep the
+            # product-errors check as the real gate.
+            message = (
+                response.get("success-message") if isinstance(response, dict) else None
             )
-            write_receipt(
-                args.record,
-                {
-                    "diagnostic_codes": sorted(codes)[:20],
-                    "ipa_sha256": digest,
-                    "tool_exit_code": result.returncode,
-                    "upload_confirmed": False,
-                },
+            confirmed = isinstance(message, str) and re.match(
+                rf"^No errors {verb}\b", message.strip()
             )
-            raise Rejected("upload rejected; sanitized failure receipt written")
+            product_errors = (
+                response.get("product-errors") if isinstance(response, dict) else None
+            )
+            if result.returncode != 0 or not confirmed or product_errors:
+                stderr = errors_path.read_text(errors="ignore")[: 1024 * 1024]
+                messages = diagnostic_messages(
+                    response,
+                    stderr + ("\n" + raw_text if response is None else ""),
+                    (args.api_key_id, args.api_issuer, key.read_text()),
+                )
+                codes = set(diagnostic_codes(response))
+                codes.update(stderr_diagnostic_codes(stderr))
+                write_receipt(
+                    args.record,
+                    {
+                        "diagnostic_codes": sorted(codes)[:20],
+                        "diagnostic_messages": messages,
+                        "stage": stage,
+                        "ipa_sha256": digest,
+                        "tool_exit_code": result.returncode,
+                        "upload_confirmed": False,
+                    },
+                )
+                for diagnostic in messages:
+                    print(f"Apple {stage}: {json.dumps(diagnostic)}", file=sys.stderr)
+                raise Rejected(f"{stage} rejected; sanitized failure receipt written")
     with args.ipa.open("rb") as artifact:
         require(
             hashlib.file_digest(artifact, "sha256").hexdigest() == digest,

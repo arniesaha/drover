@@ -59,7 +59,7 @@ def test_production_testflight_is_manual_local_networking_and_credential_isolate
         s
         for s in upload["steps"]
         if s.get("name")
-        == "Upload, wait for Apple processing and assign internal group"
+        == "Validate, upload, wait for Apple processing and assign internal group"
     )
     assert upload_step["if"] == "${{ inputs.upload }}"
 
@@ -216,6 +216,7 @@ def test_production_apple_key_is_private_and_cleanup_survives_tool_failure(
         assert command[command.index("--build") + 1] == "3"
         assert command[command.index("--internal-group") + 1] == "Drover Internal"
         assert "--info-plist" in command
+        assert "--validate" in command
         assert "DROVER_APPSTORE_API_PRIVATE_KEY_BASE64" not in kwargs["env"]
         raise subprocess.CalledProcessError(1, command, stderr="private diagnostic")
 
@@ -225,7 +226,7 @@ def test_production_apple_key_is_private_and_cleanup_survives_tool_failure(
         match="^upload or TestFlight distribution failed; see sanitized diagnostics and upload-record.json$",
     ):
         _run_production_python_step(
-            "Upload, wait for Apple processing and assign internal group",
+            "Validate, upload, wait for Apple processing and assign internal group",
             monkeypatch,
             tmp_path,
         )
