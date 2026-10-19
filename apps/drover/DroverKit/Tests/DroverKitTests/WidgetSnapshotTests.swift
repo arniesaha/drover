@@ -14,8 +14,10 @@ struct WidgetSnapshotTests {
                     id: "anthropic|work",
                     provider: "anthropic",
                     accountLabel: "Work",
+                    planLabel: "Pro",
                     remainingFraction: 0.15,
                     tightestWindowName: "5-hour",
+                    resetsAt: Date(timeIntervalSince1970: 1760003600),
                     isStale: false,
                     hasWarnings: false
                 ),
@@ -23,8 +25,10 @@ struct WidgetSnapshotTests {
                     id: "openai|team",
                     provider: "openai",
                     accountLabel: "Team",
+                    planLabel: "Plus",
                     remainingFraction: 0.60,
                     tightestWindowName: "Weekly",
+                    resetsAt: nil,
                     isStale: true,
                     hasWarnings: true
                 )
@@ -72,6 +76,8 @@ struct WidgetSnapshotTests {
         #expect(decoded.lowestQuotaAccount?.providerInitial == "A")
         #expect(decoded.accounts[1].providerInitial == "O")
         #expect(decoded.accounts[1].providerTitle == "OpenAI")
+        #expect(decoded.accounts[0].shortLabel == "Pro")
+        #expect(decoded.accounts[0].resetText(now: Date(timeIntervalSince1970: 1760000000)) == "resets 1h")
     }
 
     // MARK: - Truncation "+N"
@@ -176,6 +182,48 @@ struct WidgetSnapshotTests {
         #expect(snapshot.accounts[2].accountLabel == "Account B")
         #expect(snapshot.accounts[2].remainingPercent == 70)
         #expect(snapshot.lowestQuotaAccount?.accountLabel == "Account A")
+    }
+
+    @Test func buildCarriesPlanResetAndPrivacySafeEmailFallback() throws {
+        let now = Date(timeIntervalSince1970: 1760000000)
+        let json = """
+        {
+            "snapshot_id": "codex-plan-snapshot",
+            "dedup_key": "codex-plan-key",
+            "provider": "openai",
+            "account_label": "arnab.work@example.com",
+            "account_identity": "arnab.work@example.com",
+            "plan_label": "Plus",
+            "host_id": "studio",
+            "status": "ok",
+            "observed_at": "\(WireDate.withFractionalSeconds.string(from: now))",
+            "source": "codex_app_server",
+            "windows": [{
+                "kind": "five_hour",
+                "used_percent": 82,
+                "resets_at": "\(WireDate.withFractionalSeconds.string(from: now.addingTimeInterval(3 * 60 * 60)))"
+            }]
+        }
+        """
+        let account = try JSONDecoder().decode(ProviderAccount.self, from: Data(json.utf8))
+
+        let widget = WidgetFleetSnapshot.build(snapshot: nil, accounts: [account], now: now)
+        let quota = try #require(widget.accounts.first)
+        #expect(quota.providerDisplayName == "Codex")
+        #expect(quota.accountLabel == "arnab.work")
+        #expect(quota.shortLabel == "Plus")
+        #expect(quota.resetText(now: now) == "resets 3h")
+        #expect(quota.isLowQuota)
+    }
+
+    @Test func previewCoversFourAccountsIncludingLowAndStaleQuota() {
+        let preview = WidgetFleetSnapshot.preview()
+        let hasLowQuota = preview.accounts.contains { $0.isLowQuota }
+        let hasStaleQuota = preview.accounts.contains { $0.isStale }
+        #expect(preview.accounts.count == 4)
+        #expect(hasLowQuota)
+        #expect(hasStaleQuota)
+        #expect(preview.accounts.filter { $0.providerDisplayName == "Codex" }.map(\.shortLabel) == ["Plus", "Pro"])
     }
 
     // MARK: - Stale Detection
