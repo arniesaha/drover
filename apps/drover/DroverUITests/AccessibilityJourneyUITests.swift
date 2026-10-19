@@ -456,7 +456,7 @@ final class AccessibilityJourneyUITests: XCTestCase {
         for _ in 0..<12 {
             if session.exists {
                 let visible = session.frame.intersection(fleet.frame)
-                if !visible.isNull, visible.height >= min(160, session.frame.height), session.isHittable {
+                if !visible.isNull, visible.height >= min(160, session.frame.height) {
                     // Wrapped rows may be taller than the viewport. Tap their
                     // visible portion, without requiring the whole row to fit.
                     fleet.coordinate(withNormalizedOffset: .zero)
