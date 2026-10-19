@@ -2,9 +2,9 @@
 //! authority; SQLite is solely a durable, bounded local outbox/session tail.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path as FsPath, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command as TokioCommand,
-    sync::RwLock,
+    sync::{broadcast, mpsc, RwLock},
 };
 use tokio_tungstenite::{
     connect_async,
@@ -75,6 +75,9 @@ struct Args {
     /// Import drained Python JSONL records into the local SQLite tail, then exit.
     #[arg(long)]
     import_jsonl: Option<PathBuf>,
+    /// Validate a Python drain handoff without changing the Rust store.
+    #[arg(long, requires = "import_jsonl")]
+    import_dry_run: bool,
 }
 
 #[derive(Clone)]
@@ -82,7 +85,49 @@ struct App {
     cfg: Config,
     db: Arc<Mutex<Connection>>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
+    terminals: Arc<RwLock<HashMap<String, Arc<Terminal>>>>,
     client: Client,
+}
+
+const TERMINAL_SCROLLBACK_BYTES: usize = 256 * 1024;
+const TERMINAL_CHANNEL_CAPACITY: usize = 256;
+
+/// Owns the live half of a shell PTY. Broadcast receivers are bounded; a slow
+/// relay client loses repaint-only output rather than delaying the terminal
+/// reader or growing host memory without limit.
+struct Terminal {
+    writer: Mutex<Box<dyn Write + Send>>,
+    _master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    scrollback: Mutex<VecDeque<u8>>,
+    output: broadcast::Sender<Value>,
+}
+
+impl Terminal {
+    fn write(&self, data: &[u8]) -> Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        writer.write_all(data)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn replay(&self) -> Option<Value> {
+        let bytes: Vec<u8> = self
+            .scrollback
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (!text.is_empty()).then(|| json!({"type":"output","data":text}))
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<Value> {
+        self.output.subscribe()
+    }
 }
 
 #[derive(Clone)]
@@ -208,6 +253,40 @@ impl App {
         db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE pushed_at IS NOT NULL AND ts < datetime('now', ?1) AND id NOT IN (SELECT id FROM events e2 WHERE e2.session_id=events.session_id ORDER BY id DESC LIMIT ?2))",params![format!("-{} days",RETENTION_DAYS),RETENTION_PER_SESSION])?;
         db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY id DESC LIMIT -1 OFFSET ?1)", [OUTBOX_LIMIT])?;
         Ok(())
+    }
+    /// Preserve handoff identity exactly: Python's event ID and dedup key are
+    /// already the hub fence, so recomputing either would make replay unsafe.
+    fn import_event(&self, event: &Value) -> Result<bool> {
+        let event_id = event
+            .get("event_id")
+            .and_then(Value::as_str)
+            .context("import event_id missing")?;
+        let dedup_key = event
+            .get("dedup_key")
+            .and_then(Value::as_str)
+            .context("import dedup_key missing")?;
+        let session_id = event
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("import event session_id missing")?;
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .context("import event type missing")?;
+        let seq = event
+            .get("seq")
+            .and_then(Value::as_i64)
+            .context("import event seq missing")?;
+        let ts = event
+            .get("ts")
+            .or_else(|| event.get("created_at"))
+            .and_then(Value::as_str)
+            .context("import event timestamp missing")?;
+        let changed = self.db.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO events(event_id,session_id,seq,type,text,payload,turn_id,ts,dedup_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![event_id, session_id, seq, kind, event.get("text").and_then(Value::as_str), serde_json::to_string(event.get("payload").unwrap_or(&Value::Null))?, event.get("turn_id").and_then(Value::as_str), ts, dedup_key],
+        )?;
+        Ok(changed == 1)
     }
 }
 
@@ -577,7 +656,10 @@ async fn sessions_create(
             req.command.unwrap_or_else(|| vec!["/bin/sh".into()]),
             &s.cwd,
         ) {
-            Ok(pid) => s.pid = Some(pid),
+            Ok((pid, terminal)) => {
+                s.pid = Some(pid);
+                app.terminals.write().await.insert(sid.clone(), terminal);
+            }
             Err(e) => {
                 return err(
                     StatusCode::BAD_GATEWAY,
@@ -608,7 +690,7 @@ fn validate_images(images: &[Image]) -> std::result::Result<(), String> {
     }
     Ok(())
 }
-fn spawn_pty(command: Vec<String>, cwd: &str) -> Result<u32> {
+fn spawn_pty(command: Vec<String>, cwd: &str) -> Result<(u32, Arc<Terminal>)> {
     let exe = command.first().context("empty command")?;
     let pair = portable_pty::native_pty_system().openpty(portable_pty::PtySize {
         rows: 24,
@@ -623,9 +705,46 @@ fn spawn_pty(command: Vec<String>, cwd: &str) -> Result<u32> {
     cb.cwd(cwd);
     let child = pair.slave.spawn_command(cb)?;
     let pid = child.process_id().unwrap_or(0);
-    std::mem::forget(pair);
+    let mut reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
+    let (output, _) = broadcast::channel(TERMINAL_CHANNEL_CAPACITY);
+    let terminal = Arc::new(Terminal {
+        writer: Mutex::new(writer),
+        _master: Mutex::new(pair.master),
+        scrollback: Mutex::new(VecDeque::new()),
+        output: output.clone(),
+    });
+    let terminal_for_reader = terminal.clone();
+    std::thread::Builder::new()
+        .name(format!("pty-{pid}"))
+        .spawn(move || {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => {
+                        let _ = output.send(json!({"type":"exit"}));
+                        break;
+                    }
+                    Ok(count) => {
+                        let bytes = &buffer[..count];
+                        {
+                            let mut scrollback = terminal_for_reader
+                                .scrollback
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            scrollback.extend(bytes);
+                            while scrollback.len() > TERMINAL_SCROLLBACK_BYTES {
+                                scrollback.pop_front();
+                            }
+                        }
+                        let _ = output
+                            .send(json!({"type":"output","data":String::from_utf8_lossy(bytes)}));
+                    }
+                }
+            }
+        })?;
     std::mem::forget(child);
-    Ok(pid)
+    Ok((pid, terminal))
 }
 
 async fn session_get(
@@ -662,6 +781,9 @@ async fn terminate(State(app): State<App>, headers: HeaderMap, Path(id): Path<St
             .arg("-TERM")
             .arg(pid.to_string())
             .status();
+        if let Some(terminal) = app.terminals.write().await.remove(&id) {
+            let _ = terminal.output.send(json!({"type":"exit"}));
+        }
     }
     if let Some(w) = s.worktree.take() {
         let _ = cleanup_worktree(&w);
@@ -1209,7 +1331,18 @@ async fn relay_plain(url: &str, app: &App) -> Result<()> {
             .to_string(),
     )
     .await?;
-    while let Some(frame) = ws_recv(&mut socket).await? {
+    let (output_tx, mut output_rx) = mpsc::channel::<(String, Value)>(TERMINAL_CHANNEL_CAPACITY);
+    let mut channels: HashMap<String, (String, tokio::task::JoinHandle<()>)> = HashMap::new();
+    loop {
+        let frame = tokio::select! {
+            outbound = output_rx.recv() => {
+                let Some((chan, message)) = outbound else { continue };
+                ws_send(&mut socket, &json!({"kind":"data","chan":chan,"message":message}).to_string()).await?;
+                continue;
+            }
+            inbound = ws_recv(&mut socket) => inbound?,
+        };
+        let Some(frame) = frame else { break };
         let Ok(frame) = serde_json::from_str::<Value>(&frame) else {
             continue;
         };
@@ -1231,13 +1364,94 @@ async fn relay_plain(url: &str, app: &App) -> Result<()> {
                 .await?;
             }
             Some("open") => {
-                let chan = frame.get("chan").cloned().unwrap_or(Value::Null);
+                let chan = frame
+                    .get("chan")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let path = frame.get("path").and_then(Value::as_str).unwrap_or("");
+                let session_id = path
+                    .strip_prefix("/sessions/")
+                    .and_then(|v| v.strip_suffix("/terminal"));
+                let terminals = app.terminals.read().await;
+                let terminal = match session_id.and_then(|id| terminals.get(id).cloned()) {
+                    Some(terminal) => terminal,
+                    None => {
+                        ws_send(&mut socket, &json!({"kind":"open_error","chan":chan,"error":"unknown terminal session"}).to_string()).await?;
+                        continue;
+                    }
+                };
+                drop(terminals);
                 ws_send(
                     &mut socket,
-                    &json!({"kind":"open_error","chan":chan,"error":"terminal unavailable"})
-                        .to_string(),
+                    &json!({"kind":"opened","chan":chan}).to_string(),
                 )
                 .await?;
+                ws_send(&mut socket, &json!({"kind":"data","chan":chan,"message":{"type":"attached","session_id":session_id}}).to_string()).await?;
+                if let Some(message) = terminal.replay() {
+                    ws_send(
+                        &mut socket,
+                        &json!({"kind":"data","chan":chan,"message":message}).to_string(),
+                    )
+                    .await?;
+                }
+                let tx = output_tx.clone();
+                let relay_chan = chan.clone();
+                let mut subscription = terminal.subscribe();
+                let task = tokio::spawn(async move {
+                    loop {
+                        match subscription.recv().await {
+                            Ok(message) => {
+                                if tx.try_send((relay_chan.clone(), message)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                });
+                channels.insert(chan, (session_id.unwrap_or_default().to_string(), task));
+            }
+            Some("data") => {
+                let chan = frame.get("chan").and_then(Value::as_str).unwrap_or("");
+                let Some((session_id, _)) = channels.get(chan) else {
+                    continue;
+                };
+                let message = frame.get("message").unwrap_or(&Value::Null);
+                let terminal = app.terminals.read().await.get(session_id).cloned();
+                if let Some(terminal) = terminal {
+                    match message.get("type").and_then(Value::as_str) {
+                        Some("input") => {
+                            let _ = terminal.write(
+                                message
+                                    .get("data")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .as_bytes(),
+                            );
+                        }
+                        Some("interrupt") => {
+                            let _ = terminal.write(b"\x03");
+                        }
+                        Some("ping") => {
+                            ws_send(
+                                &mut socket,
+                                &json!({"kind":"data","chan":chan,"message":{"type":"pong"}})
+                                    .to_string(),
+                            )
+                            .await?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("close") => {
+                if let Some((_, task)) =
+                    channels.remove(frame.get("chan").and_then(Value::as_str).unwrap_or(""))
+                {
+                    task.abort();
+                }
             }
             _ => {}
         }
@@ -1395,10 +1609,15 @@ async fn main() -> Result<()> {
         cfg: cfg.clone(),
         db: Arc::new(Mutex::new(db)),
         sessions: Arc::new(RwLock::new(sessions)),
+        terminals: Arc::new(RwLock::new(HashMap::new())),
         client: Client::builder().timeout(Duration::from_secs(10)).build()?,
     };
     if let Some(path) = args.import_jsonl {
-        import_jsonl(&app, &path)?;
+        let counts = import_jsonl(&app, &path, args.import_dry_run)?;
+        println!(
+            "IMPORT sessions={} events={} skipped={} dry_run={}",
+            counts.0, counts.1, counts.2, args.import_dry_run
+        );
         return Ok(());
     }
     let router = Router::new()
@@ -1429,25 +1648,97 @@ async fn main() -> Result<()> {
     axum::serve(listener, router).await?;
     Ok(())
 }
-fn import_jsonl(app: &App, path: &FsPath) -> Result<()> {
+fn import_jsonl(app: &App, path: &FsPath, dry_run: bool) -> Result<(usize, usize, usize)> {
+    let mut sessions = 0;
+    let mut events = 0;
+    let mut skipped = 0;
     for line in fs::read_to_string(path)?.lines() {
         let v: Value = serde_json::from_str(line)?;
-        let sid = v
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("migrated");
-        let kind = v.get("type").and_then(Value::as_str).unwrap_or("raw");
-        app.emit(
-            sid,
-            kind,
-            v.get("text").and_then(Value::as_str),
-            v.get("payload")
-                .cloned()
-                .unwrap_or(Value::Object(Default::default())),
-            v.get("turn_id").and_then(Value::as_str),
-        )?;
+        let kind = v
+            .get("kind")
+            .or_else(|| v.get("record_type"))
+            .and_then(Value::as_str);
+        if kind == Some("session") {
+            let row = v.get("session").unwrap_or(&v);
+            let session_id = row.get("session_id").and_then(Value::as_str).unwrap_or("");
+            if session_id.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            let session = Session {
+                session_id: session_id.to_string(),
+                harness: row
+                    .get("harness")
+                    .and_then(Value::as_str)
+                    .unwrap_or("shell")
+                    .to_string(),
+                mode: row
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pty")
+                    .to_string(),
+                cwd: row
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                status: row
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("errored")
+                    .to_string(),
+                pid: None,
+                model: row.get("model").and_then(Value::as_str).map(str::to_string),
+                thinking_effort: row
+                    .get("thinking_effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                client_session_id: row
+                    .get("client_session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                parent_session_id: row
+                    .get("parent_session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                native_session_id: row
+                    .get("native_session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                worktree: row
+                    .get("worktree")
+                    .cloned()
+                    .and_then(|x| serde_json::from_value(x).ok()),
+                awaiting: row
+                    .get("awaiting")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                created_at: row
+                    .get("created_at")
+                    .or_else(|| row.get("started_at"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("1970-01-01T00:00:00+00:00")
+                    .to_string(),
+            };
+            sessions += 1;
+            if !dry_run {
+                app.save_session(&session)?;
+            }
+            continue;
+        }
+        if kind.is_some_and(|k| k != "event") {
+            skipped += 1;
+            continue;
+        }
+        if v.get("event_id").is_none() || v.get("dedup_key").is_none() {
+            skipped += 1;
+            continue;
+        }
+        if dry_run || app.import_event(&v)? {
+            events += 1;
+        }
     }
-    Ok(())
+    Ok((sessions, events, skipped))
 }
 
 #[cfg(test)]
