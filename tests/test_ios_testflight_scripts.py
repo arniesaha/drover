@@ -39,11 +39,22 @@ def chain(tmp_path: Path):
     logs.mkdir()
     info = valid_info() | {
         "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
+        "CFBundleDisplayName": "Drover",
+        "MinimumOSVersion": "18.0",
+        "CFBundleIcons": {
+            "CFBundlePrimaryIcon": {
+                "CFBundleIconName": "AppIcon",
+                "CFBundleIconFiles": ["AppIcon60x60"],
+            }
+        },
     }
     app = write_bundle(tmp_path / "fixture", info=info)
     (app / "embedded.mobileprovision").write_bytes(b"synthetic profile fixture")
     widget = app / "PlugIns" / "DroverWidget.appex"
     widget.mkdir(parents=True)
+    (widget / "Info.plist").write_bytes(
+        plistlib.dumps(info | {"CFBundleIdentifier": "com.arnab.drover.widget"})
+    )
     (widget / "embedded.mobileprovision").write_bytes(
         b"synthetic widget profile fixture"
     )
@@ -106,10 +117,15 @@ elif name == "xcrun":
         print("26.5")
     else:
         key = pathlib.Path(os.environ["API_PRIVATE_KEYS_DIR"]) / "AuthKey_EXAMPLE123.p8"
-        print(json.dumps({"tool-version": "8.003", "tool-path": "/synthetic/altool", "success-message": "No errors uploading archive.", "product-errors": []} | json.loads(os.getenv("UPLOAD_RESPONSE", "{}")) | {"private": key.read_text() + os.environ["LEAK_SENTINEL"]}))
+        if os.getenv("UPLOAD_RAW"):
+            print(os.environ["UPLOAD_RAW"])
+            print(os.getenv("UPLOAD_STDERR", ""), file=sys.stderr)
+            sys.exit(1)
+        validating = "--validate-app" in args
+        print(json.dumps({"tool-version": "8.003", "tool-path": "/synthetic/altool", "success-message": ("No errors validating archive." if validating else "No errors uploading archive."), "product-errors": []} | json.loads(os.getenv("VALIDATE_RESPONSE" if validating else "UPLOAD_RESPONSE", "{}")) | {"private": key.read_text() + os.environ["LEAK_SENTINEL"]}))
         if os.getenv("UPLOAD_STDERR"):
             print(os.environ["UPLOAD_STDERR"], file=sys.stderr)
-        sys.exit(int(os.getenv("UPLOAD_EXIT", "0")))
+        sys.exit(int(os.getenv("VALIDATE_EXIT" if validating else "UPLOAD_EXIT", "0")))
 elif name == "ditto":
     if "-x" in args:
         shutil.copytree(root / "fixture", pathlib.Path(args[-1]) / "Payload")
@@ -183,7 +199,7 @@ elif name != "xcodegen":
             **extra,
         )
 
-    def upload(**extra: str):
+    def upload(*args: str, **extra: str):
         return run(
             "upload_testflight.sh",
             "--ipa",
@@ -196,6 +212,7 @@ elif name != "xcodegen":
             private,
             "--record",
             tmp_path / "upload-record.json",
+            *args,
             **extra,
         )
 
@@ -468,6 +485,8 @@ def test_upload_requires_positive_confirmation_and_discards_raw_errors(chain, ex
     assert record["ipa_sha256"] == hashlib.sha256(b"synthetic IPA bytes").hexdigest()
     assert set(record) == {
         "diagnostic_codes",
+        "diagnostic_messages",
+        "stage",
         "ipa_sha256",
         "tool_exit_code",
         "upload_confirmed",
@@ -477,7 +496,7 @@ def test_upload_requires_positive_confirmation_and_discards_raw_errors(chain, ex
     assert list((root / "scratch").iterdir()) == []
 
 
-def test_upload_failure_receipt_keeps_only_bounded_apple_codes(chain):
+def test_upload_failure_receipt_preserves_nested_apple_messages(chain):
     root, _, _, upload, _ = chain
     result = upload(
         UPLOAD_EXIT="1",
@@ -486,12 +505,12 @@ def test_upload_failure_receipt_keeps_only_bounded_apple_codes(chain):
                 "product-errors": [
                     {
                         "code": -19237,
-                        "message": "private diagnostic RAW-UPLOAD-RESPONSE",
+                        "message": f"Apple rejected key {KEY_ID} issuer {ISSUER}",
                         "userInfo": {
                             "original_server_error": {
                                 "code": "STATE_ERROR.VALIDATION_ERROR.90161",
                                 "status": "409",
-                                "detail": "private diagnostic RAW-UPLOAD-RESPONSE",
+                                "detail": f"Apple rejected key {KEY_ID} issuer {ISSUER}",
                             }
                         },
                     }
@@ -507,11 +526,13 @@ def test_upload_failure_receipt_keeps_only_bounded_apple_codes(chain):
             "409",
             "STATE_ERROR.VALIDATION_ERROR.90161",
         ],
+        "diagnostic_messages": ["Apple rejected key [REDACTED] issuer [REDACTED]"],
+        "stage": "upload",
         "ipa_sha256": hashlib.sha256(b"synthetic IPA bytes").hexdigest(),
         "tool_exit_code": 1,
         "upload_confirmed": False,
     }
-    assert "private diagnostic" not in record_text + result.stdout + result.stderr
+    assert KEY_ID not in record_text + result.stdout + result.stderr
     assert "RAW-UPLOAD-RESPONSE" not in record_text + result.stdout + result.stderr
 
 
@@ -521,14 +542,14 @@ def test_upload_failure_receipt_extracts_only_structured_stderr_codes(chain):
         UPLOAD_EXIT="1",
         UPLOAD_STDERR=(
             "Error Domain=ITunesConnectionOperationErrorDomain Code=-19237 "
-            'private diagnostic RAW-UPLOAD-RESPONSE statusCode = 401 "code":"ITMS-90161"'
+            f'key {KEY_ID} issuer {ISSUER} statusCode = 401 "code":"ITMS-90161"'
         ),
     )
     assert result.returncode != 0
     record_text = (root / "upload-record.json").read_text()
     record = json.loads(record_text)
     assert record["diagnostic_codes"] == ["-19237", "401", "ITMS-90161"]
-    assert "private diagnostic" not in record_text + result.stdout + result.stderr
+    assert KEY_ID not in record_text + result.stdout + result.stderr
     assert "RAW-UPLOAD-RESPONSE" not in record_text + result.stdout + result.stderr
 
 
@@ -623,6 +644,182 @@ def test_upload_accepts_xcode_26_6_named_file_confirmation(chain):
     )
 
 
+@pytest.mark.parametrize("source", ["json", "stderr", "malformed-json"])
+def test_rejection_keeps_itms_message_key_and_bundle_without_secrets(chain, source):
+    root, _, _, upload, _ = chain
+    message = (
+        "ERROR ITMS-90360: Missing Info.plist value. CFBundleDisplayName is missing "
+        "in bundle com.arnab.drover.widget (Drover.app/PlugIns/DroverWidget.appex). "
+        f"key={KEY_ID} issuer={ISSUER} token=short-secret "
+        f"Bearer short-bearer {Path.home()}/private/AuthKey.p8 "
+        "/Users/runner/private/AuthKey.p8 "
+        "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJzZWNyZXQifQ.signature "
+        "-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----"
+    )
+    extra = {"UPLOAD_EXIT": "1"}
+    if source == "json":
+        extra["UPLOAD_RESPONSE"] = json.dumps(
+            {"product-errors": [{"code": 90360, "message": message}]}
+        )
+    else:
+        # Keep PEM on one line here: stderr is collected line by line.
+        extra["UPLOAD_STDERR"] = message.replace("\n", " ")
+        if source == "malformed-json":
+            # The fake tool echoes this as a value, so use its raw-output mode.
+            extra["UPLOAD_RAW"] = message
+            extra.pop("UPLOAD_STDERR")
+    result = upload(**extra)
+    assert result.returncode != 0
+    receipt = json.loads((root / "upload-record.json").read_text())
+    evidence = json.dumps(receipt) + result.stderr + result.stdout
+    for expected in (
+        "ITMS-90360",
+        "Missing Info.plist value",
+        "CFBundleDisplayName",
+        "com.arnab.drover.widget",
+    ):
+        assert expected in evidence
+    for secret in (
+        KEY_ID,
+        ISSUER,
+        "short-secret",
+        "short-bearer",
+        "private-material",
+        "AuthKey.p8",
+        str(Path.home()),
+        "/Users/runner",
+        "eyJhbG",
+    ):
+        assert secret not in evidence
+    assert list((root / "scratch").iterdir()) == []
+
+
+def test_validation_failure_prevents_upload_and_retains_diagnostics(chain):
+    root, _, _, upload, _ = chain
+    result = upload(
+        "--validate",
+        VALIDATE_EXIT="1",
+        VALIDATE_RESPONSE=json.dumps(
+            {
+                "product-errors": [
+                    {
+                        "code": 90360,
+                        "message": "ITMS-90360: Missing Info.plist value CFBundleDisplayName in com.arnab.drover.widget",
+                    }
+                ]
+            }
+        ),
+    )
+    assert result.returncode != 0
+    record = json.loads((root / "upload-record.json").read_text())
+    assert record["stage"] == "validation"
+    assert record["upload_confirmed"] is False
+    assert "CFBundleDisplayName" in record["diagnostic_messages"][0]
+    calls = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 1
+    assert "--validate-app" in calls[0]["args"]
+    assert "--upload-app" not in calls[0]["args"]
+
+
+def test_validation_runs_before_upload(chain):
+    root, _, _, upload, _ = chain
+    result = upload("--validate")
+    assert result.returncode == 0, result.stderr
+    calls = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 2
+    assert "--validate-app" in calls[0]["args"]
+    assert "--upload-app" in calls[1]["args"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "CFBundleDisplayName",
+        "CFBundleShortVersionString",
+        "CFBundleVersion",
+        "MinimumOSVersion",
+    ],
+)
+@pytest.mark.parametrize("value", [None, "", "$(UNRESOLVED)", "mismatch"])
+def test_widget_ipa_rejects_missing_or_mismatched_metadata(chain, key, value):
+    root, run, _, _, _ = chain
+    path = root / "fixture/Drover.app/PlugIns/DroverWidget.appex/Info.plist"
+    info = plistlib.loads(path.read_bytes())
+    if value is None:
+        info.pop(key)
+    else:
+        info[key] = value
+    path.write_bytes(plistlib.dumps(info))
+    result = run(
+        "verify_widget_ipa.sh",
+        "--ipa",
+        root / "fixture.ipa",
+        "--expected-profile-uuid",
+        WIDGET_ISSUER,
+    )
+    assert result.returncode != 0
+    assert key in result.stderr
+
+
+def test_widget_ipa_accepts_matching_metadata(chain):
+    root, run, _, _, _ = chain
+    result = run(
+        "verify_widget_ipa.sh",
+        "--ipa",
+        root / "fixture.ipa",
+        "--expected-profile-uuid",
+        WIDGET_ISSUER,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "metadata verified" in result.stdout
+
+
+def test_widget_ipa_rejects_missing_app_icon(chain):
+    root, run, _, _, _ = chain
+    path = root / "fixture/Drover.app/Info.plist"
+    info = plistlib.loads(path.read_bytes())
+    info.pop("CFBundleIcons")
+    path.write_bytes(plistlib.dumps(info))
+    result = run(
+        "verify_widget_ipa.sh",
+        "--ipa",
+        root / "fixture.ipa",
+        "--expected-profile-uuid",
+        WIDGET_ISSUER,
+    )
+    assert result.returncode != 0
+    assert "AppIcon" in result.stderr
+
+
+def test_apple_messages_are_bounded_and_redact_environment_credentials(monkeypatch):
+    from ios.apple_diagnostics import diagnostic_messages
+
+    monkeypatch.setenv("DROVER_TESTFLIGHT_HUB_TOKEN", "private-short-token")
+    messages = diagnostic_messages(
+        {
+            "product-errors": [
+                {"message": f"ITMS-90360: error {i} " + "x " * 3000} for i in range(30)
+            ]
+        },
+        "",
+    )
+    assert len(messages) == 20
+    assert all(len(message) <= 4096 for message in messages)
+    messages = diagnostic_messages(
+        {
+            "message": f'ITMS-90360: CFBundleDisplayName com.arnab.drover.widget private-short-token "{Path.home()}/Private Folder/key.p8"'
+        },
+        "",
+    )
+    assert messages == [
+        "ITMS-90360: CFBundleDisplayName com.arnab.drover.widget [REDACTED] [REDACTED_PATH]"
+    ]
+
+
 @pytest.mark.skipif(
     sys.platform != "darwin" or shutil.which("xcodegen") is None,
     reason="requires macOS Xcode and XcodeGen for real plist processing",
@@ -696,6 +893,7 @@ def test_generated_project_processes_typed_ats_metadata(
         / "Info.plist"
     )
     info = plistlib.loads(processed.read_bytes())
+    assert info["CFBundleDisplayName"] == "Drover"
     assert set(info["UISupportedInterfaceOrientations"]) == {
         "UIInterfaceOrientationPortrait",
         "UIInterfaceOrientationPortraitUpsideDown",

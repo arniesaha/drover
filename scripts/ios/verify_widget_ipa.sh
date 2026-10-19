@@ -46,7 +46,7 @@ codesign -d --entitlements :- "$WIDGET" > "$SCRATCH/codesign.out" 2>"$SCRATCH/co
   || fail "exported widget signature could not be read"
 security cms -D -i "$WIDGET/embedded.mobileprovision" > "$SCRATCH/widget-profile.plist" 2>"$SCRATCH/profile.log" \
   || fail "exported widget profile could not be read"
-python3 - "$SCRATCH/codesign.out" "$SCRATCH/codesign.err" "$SCRATCH/widget-profile.plist" "$EXPECTED_PROFILE_UUID" <<'PY'
+python3 - "$SCRATCH/codesign.out" "$SCRATCH/codesign.err" "$SCRATCH/widget-profile.plist" "$EXPECTED_PROFILE_UUID" "$APP/Info.plist" "$WIDGET/Info.plist" <<'PY'
 import plistlib
 import sys
 from pathlib import Path
@@ -55,6 +55,21 @@ stdout = Path(sys.argv[1])
 stderr = Path(sys.argv[2])
 profile_path = Path(sys.argv[3])
 expected = sys.argv[4]
+app_info = plistlib.loads(Path(sys.argv[5]).read_bytes())
+widget_info = plistlib.loads(Path(sys.argv[6]).read_bytes())
+for key in ("CFBundleDisplayName", "CFBundleShortVersionString", "CFBundleVersion", "MinimumOSVersion"):
+    app_value = app_info.get(key)
+    widget_value = widget_info.get(key)
+    if not isinstance(app_value, str) or not app_value.strip() or "$(" in app_value:
+        raise SystemExit(f"exported app {key} is missing or unresolved")
+    if not isinstance(widget_value, str) or not widget_value.strip() or "$(" in widget_value:
+        raise SystemExit(f"exported widget {key} is missing or unresolved")
+    if widget_value != app_value:
+        raise SystemExit(f"exported widget {key} does not match app")
+icons = app_info.get("CFBundleIcons", {}).get("CFBundlePrimaryIcon", {})
+if icons.get("CFBundleIconName") != "AppIcon" or not icons.get("CFBundleIconFiles"):
+    raise SystemExit("exported app primary AppIcon metadata is missing")
+print("widget IPA metadata verified: display name, version/build and MinimumOSVersion match app; AppIcon present")
 entitlements_data = stdout.read_bytes()
 if not entitlements_data.strip():
     diagnostic = stderr.read_text(encoding="utf-8", errors="replace")

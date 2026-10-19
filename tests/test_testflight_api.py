@@ -294,8 +294,18 @@ def test_production_workflow_passes_distribution_arguments():
         ).read_text()
     )
     job = workflow["jobs"]["archive-upload"]
-    step = next(s for s in job["steps"] if s.get("name", "").startswith("Upload, wait"))
-    for argument in ["--internal-group", "--version", "--build", "--info-plist"]:
+    step = next(
+        s
+        for s in job["steps"]
+        if s.get("name", "").startswith("Validate, upload, wait")
+    )
+    for argument in [
+        "--validate",
+        "--internal-group",
+        "--version",
+        "--build",
+        "--info-plist",
+    ]:
         assert argument in step["run"]
     assert (
         "vars.DROVER_TESTFLIGHT_INTERNAL_GROUP"
@@ -334,7 +344,7 @@ def test_upload_wrapper_preserves_acknowledgement_during_distribution(
         "argv",
         [
             "-",
-            str(tmp_path),
+            str(Path(__file__).parents[1] / "scripts/ios"),
             "--ipa",
             str(ipa),
             "--api-key-id",
