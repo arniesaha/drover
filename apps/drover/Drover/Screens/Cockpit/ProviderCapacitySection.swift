@@ -149,6 +149,11 @@ struct ProviderAccountCard: View {
                             Text([subscription.provider.capitalized, subscription.planLabel]
                                 .compactMap { $0 }.joined(separator: " · "))
                                 .droverText(.subtitle)
+                            if let attention = subscription.attention {
+                                Text("\(providerTitle) · \(attention.reason)")
+                                    .droverText(.subtitle, accented: true)
+                                    .accessibilityIdentifier("account-attention-\(subscription.id)")
+                            }
                         }
                         Spacer(minLength: 4)
                         if subscription.isDegraded || section.warningText != nil {
@@ -213,6 +218,10 @@ struct ProviderAccountCard: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("provider-account-\(subscription.id)")
+    }
+
+    private var providerTitle: String {
+        subscription.provider == "openai" ? "OpenAI" : subscription.provider.capitalized
     }
 
 }

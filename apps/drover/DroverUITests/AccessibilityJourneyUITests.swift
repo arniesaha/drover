@@ -459,9 +459,7 @@ final class AccessibilityJourneyUITests: XCTestCase {
                 if !visible.isNull, visible.height >= min(160, session.frame.height), session.isHittable {
                     // Wrapped rows may be taller than the viewport. Tap their
                     // visible portion, without requiring the whole row to fit.
-                    fleet.coordinate(withNormalizedOffset: .zero)
-                        .withOffset(CGVector(dx: visible.midX - fleet.frame.minX,
-                                             dy: visible.midY - fleet.frame.minY)).tap()
+                    session.tap()
                     return
                 }
             }

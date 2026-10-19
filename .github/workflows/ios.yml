@@ -113,6 +113,7 @@ jobs:
           -destination "$SIMULATOR_DESTINATION" \
           -only-testing:DroverUITests/DeterministicJourneyUITests \
           -only-testing:DroverUITests/InsightDetailFixtureUITests \
+          -only-testing:DroverUITests/ObservabilityFixtureUITests \
           -only-testing:DroverUITests/AccessibilityJourneyUITests \
           -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
           test

@@ -12,6 +12,9 @@ public final class LaunchModel {
     /// True only while a `/harness` request this model owns is in flight.
     private(set) public var isFetchingSnapshot: Bool = false
     private(set) public var snapshot: HarnessSnapshot?
+    /// Provider usage captured by the same cockpit snapshot as Accounts.
+    /// It is injected because the launch flow owns no provider request.
+    public let providerAccounts: [ProviderAccount]
     /// Why the last snapshot fetch failed, if it did. The sheet renders this —
     /// a failed fetch otherwise leaves it with no hosts and no explanation.
     public private(set) var snapshotError: String?
@@ -95,11 +98,13 @@ public final class LaunchModel {
     public init(
         client: DroverClient,
         snapshot: HarnessSnapshot?,
+        providerAccounts: [ProviderAccount] = [],
         store: HarnessModelCatalogStore = HarnessModelCatalogStore(),
         completionDebounce: Duration = .milliseconds(250)
     ) {
         self.client = client
         self.snapshot = snapshot
+        self.providerAccounts = providerAccounts
         self.completionDebounce = completionDebounce
         self.runPreferences = HarnessModelCatalogState(client: client, store: store)
         let hosts = (snapshot?.hosts ?? []).filter { $0.status == "online" || $0.status == "stale" }
@@ -162,6 +167,17 @@ public final class LaunchModel {
     /// ID when the host predates envelope display names.
     public func harnessLabel(_ name: String) -> String {
         selectedHost?.offer(named: name)?.label ?? name
+    }
+
+    /// Capacity text for a harness row, using the selected host's account.
+    /// The presentation helper deliberately supplies "quota unknown" only
+    /// when the Accounts snapshot has no usable matching percentage.
+    public func quotaText(forHarness name: String) -> String {
+        AccountQuotaPresentation.remainingText(
+            harness: name,
+            hostID: hostID,
+            accounts: providerAccounts
+        )
     }
 
     /// Harnesses the selected host lists but this app cannot launch, each

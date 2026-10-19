@@ -207,19 +207,7 @@ def test_additive_latest_control_migration_uses_point_release_path():
             "migration_id": migration_id,
             "statement_index": 1,
             "allowed": True,
-            "verdict": "alter_table_add_column_constant_default",
-        },
-        {
-            "migration_id": migration_id,
-            "statement_index": 2,
-            "allowed": True,
-            "verdict": "create_index",
-        },
-        {
-            "migration_id": migration_id,
-            "statement_index": 3,
-            "allowed": True,
-            "verdict": "create_index",
+            "verdict": "create_table",
         },
     ]
 

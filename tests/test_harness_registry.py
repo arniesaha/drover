@@ -52,6 +52,33 @@ def test_bootstrap_creates_harness_tables(tmp_path):
     }.issubset(tables)
 
 
+def test_quarantine_protects_previously_acknowledged_events_from_retention(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="s", host_id="h", harness="claude", command="test"
+    )
+    registry.append_event(
+        session_id="s",
+        event_id="e",
+        event_type="status",
+        seq=1,
+        payload={"type": "status"},
+        normalized_source="structured",
+    )
+    registry.mark_events_reconciled(["e"])
+    registry.quarantine_events(
+        [{"event_id": "e", "session_id": "s"}], "session_owned_by_another_host"
+    )
+    assert (
+        registry.prune_reconciled_events(
+            now=datetime.now(timezone.utc) + timedelta(days=30)
+        )
+        == 0
+    )
+    assert [e.event_id for e in registry.list_events_after("s", 0)] == ["e"]
+    assert registry.list_events_for_reconciliation() == []
+
+
 def test_control_registry_adds_event_sequence_and_pending_reconciliation_indexes(
     tmp_path,
 ):

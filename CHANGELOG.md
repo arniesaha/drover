@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.25] - 2026-10-19
+
+### Fixed
+
+- Structured event ownership rejections now quarantine retained host history with a reason and a hub insight. Missing-session registration grace is bounded to ten minutes, and reconciliation distinguishes ownership, delivery, and local ledger failures instead of reporting healthy hubs as awaiting recovery (#720, #721).
+- Make the ownership reconciliation regression independent of HTTP deadlines and background-worker timing on loaded CI runners; verify transport timeouts separately without retries or skipped coverage (#724).
+
+### Upgrade notes
+
+- Control migration 22 creates the additive `harness_event_quarantine` table. No lake migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`).
+
 ## [0.6.24] - 2026-10-18
 
 ### Fixed

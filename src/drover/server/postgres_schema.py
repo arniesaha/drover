@@ -707,6 +707,19 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS harness_events_reconciliation_pending ON harness_events (reconcile_pending, created_at, event_id)",
         ),
     ),
+    (
+        22,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS harness_event_quarantine (
+              event_id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              quarantined_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

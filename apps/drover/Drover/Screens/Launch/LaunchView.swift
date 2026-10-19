@@ -23,9 +23,15 @@ struct LaunchView: View {
     let onLaunched: (String, Bool, String) -> Void
 
     init(client: DroverClient, snapshot: HarnessSnapshot?,
+         providerAccounts: [ProviderAccount] = [],
          catalogStore: HarnessModelCatalogStore = HarnessModelCatalogStore(),
          onLaunched: @escaping (String, Bool, String) -> Void) {
-        _model = State(initialValue: LaunchModel(client: client, snapshot: snapshot, store: catalogStore))
+        _model = State(initialValue: LaunchModel(
+            client: client,
+            snapshot: snapshot,
+            providerAccounts: providerAccounts,
+            store: catalogStore
+        ))
         self.client = client
         self.onLaunched = onLaunched
     }
@@ -65,7 +71,7 @@ struct LaunchView: View {
                 } else {
                     Picker("Harness", selection: $model.harness) {
                         ForEach(model.availableHarnesses, id: \.self) { name in
-                            Text(model.harnessLabel(name)).tag(name)
+                            Text("\(model.harnessLabel(name)) · \(model.quotaText(forHarness: name))").tag(name)
                         }
                     }
                     .accessibilityIdentifier("launch-harness-picker")

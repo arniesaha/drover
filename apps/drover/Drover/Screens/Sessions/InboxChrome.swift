@@ -80,10 +80,7 @@ private struct ChromeButton: View {
     }
 }
 
-/// The footer: one full-width primary action rather than a floating pill,
-/// pinned below the list so it never scrolls away. Outlined on the ground
-/// tone, never a filled bar — the system guide reserves fills for nothing at
-/// this scale.
+/// A floating primary action that stays above the dock without covering rows.
 struct NewSessionBar: View {
     let action: () -> Void
 
@@ -92,19 +89,53 @@ struct NewSessionBar: View {
             Label("New Session", systemImage: "plus")
                 .font(.system(.subheadline, design: .default, weight: .medium))
                 .foregroundStyle(DroverColor.accentHi)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 13)
-                .background(DroverColor.bg, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(DroverColor.accent, lineWidth: 1)
-                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 44)
+                .floatingDockSurface(in: Capsule())
+                .overlay { Capsule().strokeBorder(DroverColor.accent, lineWidth: 1) }
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("launch-button")
-        .padding(.horizontal, 18)
-        .padding(.top, 10)
-        .padding(.bottom, 8)
+        .accessibilityLabel("New Session")
+    }
+}
+
+/// Material is deliberately limited to floating controls. Reduce Transparency
+/// uses the same opaque surface token as cards so both contrast and hit targets
+/// remain stable.
+struct FloatingDockSurface<S: InsettableShape>: ViewModifier {
+    let shape: S
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.forcesOpaqueDockChrome) private var forcesOpaqueChrome
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                if reduceTransparency || forcesOpaqueChrome {
+                    shape.fill(DroverColor.sheet)
+                } else {
+                    shape.fill(.ultraThinMaterial)
+                }
+            }
+            .overlay(shape.strokeBorder(.secondary.opacity(0.22), lineWidth: 1))
+            .shadow(color: .black.opacity(0.12), radius: 5, y: 2)
+    }
+}
+
+extension View {
+    func floatingDockSurface<S: InsettableShape>(in shape: S) -> some View {
+        modifier(FloatingDockSurface(shape: shape))
+    }
+}
+
+private struct ForcesOpaqueDockChromeKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var forcesOpaqueDockChrome: Bool {
+        get { self[ForcesOpaqueDockChromeKey.self] }
+        set { self[ForcesOpaqueDockChromeKey.self] = newValue }
     }
 }
 

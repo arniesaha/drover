@@ -56,6 +56,7 @@ class HostBusyError(ValueError):
 _SESSION_PREVIEW_CANDIDATE_LIMIT = 5
 _MODEL_CATALOG_CACHE_MAX_BYTES = 512 * 1024
 _MODEL_CATALOG_SCOPES_PER_HARNESS = 2
+UNKNOWN_SESSION_RETRY_WINDOW_SECONDS = 10 * 60
 
 #: Statuses that mean a session is finished and may therefore be capped out of
 #: a listing. Deliberately an allowlist rather than "not running": statuses are
@@ -2670,6 +2671,9 @@ class HarnessRegistry:
                   )
                   AND e.reconcile_pending
                   AND e.reconciled_at IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM harness_event_quarantine q WHERE q.event_id = e.event_id
+                  )
                   AND (CAST(? AS TEXT) IS NULL OR s.host_id IS NULL OR s.host_id = ?)
                   AND (
                     CAST(? AS TIMESTAMPTZ) IS NULL
@@ -2711,17 +2715,51 @@ class HarnessRegistry:
     def mark_events_reconciled(self, event_ids: list[str]) -> None:
         """Record the hub acknowledgement so durable replay does not re-offer it."""
         unique_ids = list(dict.fromkeys(event_id for event_id in event_ids if event_id))
+        quarantined = self.quarantined_event_ids(unique_ids)
+        unique_ids = [
+            event_id for event_id in unique_ids if event_id not in quarantined
+        ]
         if not unique_ids:
             return
         placeholders = ", ".join("?" for _ in unique_ids)
         with self._connect() as con:
             con.execute(
                 "UPDATE harness_events SET reconciled_at = now(), reconcile_pending = FALSE "
-                "WHERE event_id IN (" + placeholders + ")",
+                "WHERE event_id IN (" + placeholders + ") AND NOT EXISTS ("
+                "SELECT 1 FROM harness_event_quarantine q "
+                "WHERE q.event_id = harness_events.event_id)",
                 unique_ids,
             )
         if not self.write_outbox:
             self.prune_reconciled_events()
+
+    def quarantine_events(self, events: list[dict[str, Any]], reason: str) -> None:
+        """Preserve rejected history separately from hub acknowledgements.
+
+        The original event and payload remain durable and are never candidates
+        for acknowledged-event pruning. Repeated replies are idempotent.
+        """
+        with self._connect() as con:
+            con.executemany(
+                "INSERT INTO harness_event_quarantine (event_id, session_id, reason) "
+                "VALUES (?, ?, ?) ON CONFLICT (event_id) DO NOTHING",
+                [[e["event_id"], e["session_id"], reason] for e in events],
+            )
+
+    def quarantined_event_ids(self, event_ids: list[str]) -> set[str]:
+        if not event_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in event_ids)
+        with self._connect() as con:
+            return {
+                str(row[0])
+                for row in con.execute(
+                    "SELECT event_id FROM harness_event_quarantine WHERE event_id IN ("
+                    + placeholders
+                    + ")",
+                    event_ids,
+                ).fetchall()
+            }
 
     def prune_reconciled_events(self, *, now: datetime | None = None) -> int:
         """Bound acknowledged host-ledger history to D3's retention policy.
@@ -2743,6 +2781,10 @@ class HarnessRegistry:
                            ) AS retained_rank
                       FROM harness_events
                      WHERE reconcile_pending = FALSE AND reconciled_at IS NOT NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM harness_event_quarantine q
+                          WHERE q.event_id = harness_events.event_id
+                       )
                 ), evicted AS MATERIALIZED (
                     SELECT event_id FROM ranked
                      WHERE reconciled_at < ? OR retained_rank > 500
@@ -2828,7 +2870,7 @@ class HarnessRegistry:
                 ).fetchone()
         if row is None:
             return False
-        return now - float(row[0]) >= 24 * 60 * 60
+        return now - float(row[0]) >= UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
 
     def forget_unknown_session_retry(self, host_id: str, session_id: str) -> None:
         with self._connect() as con:

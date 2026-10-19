@@ -155,19 +155,14 @@ final class DemoModeUITests: XCTestCase {
         }
 
         // 6. View Analytics
-        let analyticsButton = app.buttons["analytics-summary"]
-        if !analyticsButton.isHittable {
-            app.scrollViews["fleet-list"].swipeUp()
-        }
-        XCTAssertTrue(analyticsButton.waitForExistence(timeout: 5))
-        analyticsButton.tap()
+        app.buttons["dock-analytics"].tap()
 
         let analyticsFilters = app.descendants(matching: .any)["analytics-filters"]
         XCTAssertTrue(analyticsFilters.waitForExistence(timeout: 5))
         captureScreenshot(named: "07_Analytics_Overview", in: app)
 
         // Back to fleet
-        app.navigationBars.firstMatch.buttons.firstMatch.tap()
+        app.buttons["dock-home"].tap()
         XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
 
         // 7. Settings & Exit Demo
