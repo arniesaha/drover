@@ -26,6 +26,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    22: "59435a76787934e90c01fe728e69ba26690410f3f8faa685e951578e657e1a5c",
     21: "ef468d3f44709b4f120177ead79dcf501eae9a1437cb5f7894d69df4b9f90088",
     20: "c95db9e518f8e9ea47ee4dc79dfbea63b48993a027b61613f0a6f88845920d13",
     EXPORTER_RESTART_GUARD_MIGRATION: "095352196aeecf2c6f86e819465f33f993e54b4bcfceda46dc65f9bb245d31b8",
@@ -162,6 +163,39 @@ def test_lake_export_batches_migration_11_forward(pg_control_path):
         if vector_extension_schema(con) is not None:
             expected.add(VECTOR_MIGRATION)
         assert versions == sorted(expected)
+
+
+def test_event_quarantine_migration_22_forward_and_terminal_receipt(pg_control_path):
+    from drover.server.control_store import postgres_control_store
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute("DROP TABLE harness_event_quarantine")
+        con.execute("DELETE FROM control_schema_migrations WHERE version = 22")
+    bootstrap_postgres_control_store(store)
+    registry = HarnessRegistry(pg_control_path)
+    with store.connection() as con:
+        con.execute(
+            "INSERT INTO harness_events (event_id, session_id, event_type, payload_json, "
+            "normalized_source, seq) VALUES ('rejected', 'missing', 'status', '{}', 'structured', 1)"
+        )
+    assert len(registry.list_events_for_reconciliation()) == 1
+    registry.quarantine_events(
+        [{"event_id": "rejected", "session_id": "missing"}],
+        "session_missing_after_registration_window",
+    )
+    registry.mark_events_reconciled(["rejected"])
+    assert registry.list_events_for_reconciliation() == []
+    assert registry.prune_reconciled_events() == 0
+    with store.connection() as con:
+        assert con.execute(
+            "SELECT reconciled_at FROM harness_events WHERE event_id = 'rejected'"
+        ).fetchone() == (None,)
+        assert con.execute(
+            "SELECT reason FROM harness_event_quarantine"
+        ).fetchone() == ("session_missing_after_registration_window",)
 
 
 def test_harness_events_reconciliation_migration_21_forward(pg_control_path):

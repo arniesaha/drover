@@ -71,10 +71,13 @@ class EventPusher:
         token: str,
         *,
         batch_interval: float = _LIVE_BATCH_INTERVAL_SECONDS,
+        registry: Any = None,
     ) -> None:
         self._central_url = central_url.rstrip("/")
         self._token = token
         self._batch_interval = batch_interval
+        self._registry = registry
+        self.reconciliation_deferred_reason: str | None = None
         self._queue: SimpleQueue[dict[str, Any]] = SimpleQueue()
         self._queue_len = 0
         self._queue_lock = threading.Lock()
@@ -282,6 +285,18 @@ class EventPusher:
         with self._post_lock:
             if self._authorization_retry_at > monotonic():
                 return None
+            try:
+                quarantined = (
+                    self._registry.quarantined_event_ids(
+                        [str(e.get("event_id") or "") for e in batch]
+                    )
+                    if self._registry is not None
+                    else set()
+                )
+            except Exception:
+                self.reconciliation_deferred_reason = "local quarantine unavailable"
+                return None
+            batch = [e for e in batch if e.get("event_id") not in quarantined]
             held_sessions = {
                 session_id
                 for session_id, (retry_at, _) in self._pending_sessions.items()
@@ -323,12 +338,41 @@ class EventPusher:
                     continue
                 if result is None:
                     return None
-                page_pending, orphaned_sessions = result
+                page_pending, orphaned_sessions, rejected = result
                 offered_sessions = {event.get("session_id") for event in page}
                 if not page_pending <= offered_sessions:
                     return None
                 if not orphaned_sessions <= offered_sessions - page_pending:
                     return None
+                if not set(rejected) <= offered_sessions - page_pending:
+                    return None
+                # Older hubs use only `orphaned`; keep that terminal reply
+                # distinct from an acknowledgement as well.
+                for session_id in orphaned_sessions:
+                    rejected.setdefault(
+                        session_id, "session_missing_after_registration_window"
+                    )
+                for session_id, reason in rejected.items():
+                    rejected_events = [
+                        e for e in page if e.get("session_id") == session_id
+                    ]
+                    if self._registry is None:
+                        # Never acknowledge rejected durable history unless its
+                        # quarantine receipt was committed first.
+                        return None
+                    try:
+                        self._registry.quarantine_events(rejected_events, reason)
+                    except Exception:
+                        self.reconciliation_deferred_reason = (
+                            "local quarantine unavailable"
+                        )
+                        return None
+                    log.warning(
+                        "structured events quarantined: session_id=%s events=%d reason=%s",
+                        session_id,
+                        len(rejected_events),
+                        reason,
+                    )
                 for session_id in orphaned_sessions:
                     count = sum(event.get("session_id") == session_id for event in page)
                     _record_orphaned(count)
@@ -421,7 +465,7 @@ class EventPusher:
 
     def _post_page(
         self, events: list[dict[str, Any]]
-    ) -> tuple[set[str], set[str]] | object | None:
+    ) -> tuple[set[str], set[str], dict[str, str]] | object | None:
         request = Request(
             f"{self._central_url}/harness/events",
             data=self._request_body(events),
@@ -429,33 +473,43 @@ class EventPusher:
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self._token}",
+                "X-Drover-Event-Delivery": "quarantine-v1",
             },
         )
         try:
             with urlopen(request, timeout=_POST_TIMEOUT_SECONDS) as response:
                 if not 200 <= response.status < 300:
                     return None
-                pending_sessions, orphaned_sessions = self._read_acknowledgement(
-                    response
+                pending_sessions, orphaned_sessions, rejected = (
+                    self._read_acknowledgement(response)
                 )
                 self._authorization_retry_at = 0.0
                 self._authorization_backoff = _AUTH_BACKOFF_SECONDS
-                return pending_sessions, orphaned_sessions
+                return pending_sessions, orphaned_sessions, rejected
         except HTTPError as exc:
             if exc.code == 413:
                 return _REQUEST_TOO_LARGE
             if exc.code != 403:
                 return None
             try:
-                pending_sessions, _ = self._read_acknowledgement(exc)
+                pending_sessions, orphaned, rejected = self._read_acknowledgement(exc)
             except (OSError, ValueError):
                 pending_sessions = set()
+                orphaned, rejected = set(), {}
+            offered = {event.get("session_id") for event in events}
+            if (
+                rejected
+                and set(rejected) == offered
+                and not pending_sessions
+                and not orphaned
+            ):
+                return set(), set(), rejected
             # Only the explicit all-pending ownership response is a partial
             # acknowledgement on 403. Other failures retain every record.
             if pending_sessions != {event.get("session_id") for event in events}:
                 pending_sessions = set()
             if pending_sessions:
-                return pending_sessions, set()
+                return pending_sessions, set(), {}
             delay = self._authorization_backoff
             self._authorization_retry_at = monotonic() + delay
             self._authorization_backoff = min(delay * 2, _AUTH_MAX_BACKOFF_SECONDS)
@@ -470,10 +524,12 @@ class EventPusher:
             return None
 
     @staticmethod
-    def _read_acknowledgement(response: Any) -> tuple[set[str], set[str]]:
+    def _read_acknowledgement(
+        response: Any,
+    ) -> tuple[set[str], set[str], dict[str, str]]:
         raw = response.read()
         if not raw:
-            return set(), set()
+            return set(), set(), {}
         body = json.loads(raw)
         if not isinstance(body, dict):
             raise ValueError("invalid event acknowledgement")
@@ -487,7 +543,17 @@ class EventPusher:
             isinstance(session_id, str) for session_id in orphaned
         ):
             raise ValueError("invalid orphaned session acknowledgement")
-        return set(pending), set(orphaned)
+        rejected = body.get("rejected", {})
+        reasons = {
+            "session_missing_after_registration_window",
+            "session_owned_by_another_host",
+        }
+        if not isinstance(rejected, dict) or not all(
+            isinstance(s, str) and isinstance(reason, str) and reason in reasons
+            for s, reason in rejected.items()
+        ):
+            raise ValueError("invalid rejected session acknowledgement")
+        return set(pending), set(orphaned), rejected
 
     @staticmethod
     def _read_pending(response: Any) -> set[str]:
@@ -530,6 +596,8 @@ def reconcile_unsent_events(
 
     if pusher is None or not pusher.is_configured():
         return 0
+    pusher._registry = registry if hasattr(registry, "quarantine_events") else None
+    pusher.reconciliation_deferred_reason = None
     if not hasattr(registry, "list_events_for_reconciliation"):
         return 0
     page_size = max(1, int(batch_size))
@@ -548,8 +616,11 @@ def reconcile_unsent_events(
                 limit=page_size,
             )
         except Exception:
+            pusher.reconciliation_deferred_reason = "local ledger unavailable"
             return None
         if not events:
+            if ownership_pending:
+                pusher.reconciliation_deferred_reason = "session ownership pending"
             return None if ownership_pending else reconciled_count
 
         records: list[dict[str, Any]] = []
@@ -578,6 +649,9 @@ def reconcile_unsent_events(
         if partial_post is not None:
             pending = partial_post(records)
             if pending is None:
+                pusher.reconciliation_deferred_reason = (
+                    pusher.reconciliation_deferred_reason or "event delivery failed"
+                )
                 return None
             ownership_pending = ownership_pending or bool(pending)
             pending_ids = {str(event.get("event_id") or "") for event in pending}
@@ -586,11 +660,19 @@ def reconcile_unsent_events(
             ]
             marker = getattr(registry, "mark_events_reconciled", None)
             if marker is not None:
-                marker(acknowledged_ids)
+                try:
+                    marker(acknowledged_ids)
+                except Exception:
+                    pusher.reconciliation_deferred_reason = "local ledger update failed"
+                    return None
         elif not pusher.post_batch(records):
             return None
         elif hasattr(registry, "mark_events_reconciled"):
-            registry.mark_events_reconciled([event.event_id for event in events])
+            try:
+                registry.mark_events_reconciled([event.event_id for event in events])
+            except Exception:
+                pusher.reconciliation_deferred_reason = "local ledger update failed"
+                return None
         reconciled_count += len(records)
         final_event = events[-1]
         if final_event.created_at is None:
