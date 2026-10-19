@@ -673,9 +673,7 @@ def _harnesses_from_payload(value: Any) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(
-        harness for item in value
-        if isinstance(item, str)
-        if (harness := item.strip())
+        harness for item in value if isinstance(item, str) if (harness := item.strip())
     )
 
 

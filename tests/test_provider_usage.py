@@ -340,9 +340,7 @@ def test_provider_refresh_preserves_reported_account_harnesses(
 ):
     payload = {
         **GOOD_PAYLOAD,
-        "accounts": [
-            {**GOOD_PAYLOAD["accounts"][0], "harnesses": ["reviewer"]}
-        ],
+        "accounts": [{**GOOD_PAYLOAD["accounts"][0], "harnesses": ["reviewer"]}],
     }
 
     provider_service.refresh_host(provider_host, fetch=lambda _: payload)
