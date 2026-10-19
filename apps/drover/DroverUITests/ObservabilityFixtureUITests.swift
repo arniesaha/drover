@@ -4,7 +4,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testComparisonsFiltersAndAccountDetailsRemainReachable() {
         let app = launch()
-        app.tabBars.buttons["Analytics"].tap()
+        app.buttons["dock-analytics"].tap()
         let hosts = app.buttons["analytics-dimension-hosts"]
         XCTAssertTrue(hosts.waitForExistence(timeout: 5))
         hosts.tap()
@@ -18,14 +18,14 @@ final class ObservabilityFixtureUITests: XCTestCase {
         screenshot("analytics-host-comparison-by-tokens", app)
         rankToggle.buttons["Sessions"].tap()
 
-        app.tabBars.buttons["Inbox"].tap()
+        app.buttons["dock-inbox"].tap()
         app.segmentedControls["inbox-segments"].buttons["Insights"].tap()
         XCTAssertTrue(app.descendants(matching: .any)["insights-filters"].waitForExistence(timeout: 5))
         app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "More filters")).firstMatch.tap()
         XCTAssertTrue(app.textFields["Filter insights by host"].exists)
         screenshot("insights-overview", app)
 
-        app.tabBars.buttons["Accounts"].tap()
+        app.buttons["dock-accounts"].tap()
         let account = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "sample.user@example.com")).firstMatch
         XCTAssertTrue(account.waitForExistence(timeout: 5))
         screenshot("accounts-compact", app)
@@ -51,7 +51,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     private func checkAnalyticsLargestText(dark: Bool) {
         let app = launch(large: true, dark: dark)
-        app.tabBars.buttons["Analytics"].tap()
+        app.buttons["dock-analytics"].tap()
         let filters = app.descendants(matching: .any)["analytics-filters"].firstMatch
         XCTAssertTrue(filters.waitForExistence(timeout: 8))
         let days = app.buttons["7 days"].firstMatch
@@ -76,7 +76,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testLongHostNamesRemainOnScreenAtAccessibilitySize() {
         let app = launch(large: true)
-        app.tabBars.buttons["Accounts"].tap()
+        app.buttons["dock-accounts"].tap()
         let host = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Work laptop")).firstMatch
         XCTAssertTrue(host.waitForExistence(timeout: 5))
         XCTAssertLessThanOrEqual(host.frame.maxX, app.frame.maxX)
@@ -85,68 +85,64 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
-    func testHomePreviewOpensScrollingAccountsAndReturnsToSessions() {
-        let app = launch(dark: true)
-        app.tabBars.buttons["Home"].tap()
-        let preview = app.descendants(matching: .any)["provider-capacity-summary"]
-        XCTAssertTrue(preview.waitForExistence(timeout: 8))
-        XCTAssertLessThanOrEqual(preview.frame.height, 90)
-        XCTAssertTrue(app.buttons["provider-capacity-navigation"].label.contains("8 additional accounts"))
-        XCTAssertGreaterThanOrEqual(app.buttons["provider-capacity-navigation"].frame.height, 44)
+    func testRealAccountPayloadHasNoHomeCardOrBannerAndAccountsBadge() {
+        let app = launch(dark: true, declutter: true)
+        let home = app.buttons["dock-home"]
+        XCTAssertTrue(home.waitForExistence(timeout: 8))
+        home.tap()
         let fleet = app.scrollViews["fleet-list"]
-        XCTAssertTrue(fleet.exists)
+        XCTAssertTrue(fleet.waitForExistence(timeout: 8))
         XCTAssertGreaterThan(fleet.frame.height, app.frame.height * 0.45)
+        XCTAssertFalse(app.descendants(matching: .any)["provider-capacity-summary"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["account-health-warning"].exists)
         XCTAssertTrue(app.buttons["launch-button"].isHittable)
-        screenshot("home-compact-account-preview", app)
-        let strip = app.scrollViews["account-meter-strip"]
-        XCTAssertTrue(strip.exists)
-        let leadingAccount = strip.buttons.matching(NSPredicate(format: "label CONTAINS %@", "account-2@example.com")).firstMatch
-        XCTAssertTrue(leadingAccount.isHittable)
-        let initialX = leadingAccount.frame.minX
-        strip.swipeLeft()
-        XCTAssertLessThan(leadingAccount.frame.minX, initialX)
-        XCTAssertTrue(app.buttons["launch-button"].isHittable)
-        screenshot("home-account-preview-scrolled", app)
-        app.buttons["provider-capacity-navigation"].tap()
+
+        let accountsDock = app.buttons["dock-accounts"]
+        XCTAssertTrue(accountsDock.label.contains("1 account needs attention"))
+        screenshot("home-scrolled-behind-floating-dock-dark", app)
+
+        accountsDock.tap()
         let scroll = app.scrollViews["provider-accounts-scroll"]
         XCTAssertTrue(scroll.waitForExistence(timeout: 5))
-        let account = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "sample.user@example.com")).firstMatch
-        XCTAssertTrue(account.isHittable)
-        account.tap()
-        XCTAssertTrue(app.staticTexts["Five hour"].exists)
-        screenshot("accounts-dedicated-page", app)
-        let openAI = app.staticTexts["provider-heading-openai"]
-        for _ in 0..<6 where !openAI.isHittable { scroll.swipeUp() }
-        XCTAssertTrue(openAI.isHittable)
-        app.navigationBars.buttons.firstMatch.tap()
-        XCTAssertTrue(preview.waitForExistence(timeout: 5))
-        XCTAssertLessThanOrEqual(preview.frame.height, 90)
-        XCTAssertTrue(app.buttons["launch-button"].isHittable)
+        XCTAssertTrue(app.staticTexts["accounts-needs-attention"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "OpenAI · 12% left")).firstMatch.exists)
+        screenshot("accounts-attention-badge-dark", app)
     }
 
     @MainActor
-    func testHomePreviewKeepsSessionsReachableAtAccessibilitySize() {
-        let app = launch(large: true)
-        app.tabBars.buttons["Home"].tap()
-        let preview = app.descendants(matching: .any)["provider-capacity-summary"]
-        XCTAssertTrue(preview.waitForExistence(timeout: 8))
-        XCTAssertTrue(app.buttons["lowest-account-meter"].label.contains("account-2@example.com, Anthropic, 19% left"))
-        XCTAssertLessThanOrEqual(preview.frame.height, 195)
-        XCTAssertGreaterThan(app.scrollViews["fleet-list"].frame.height, 180)
+    func testDeclutterFixtureLightReduceTransparencyScreenshots() {
+        let app = launch(declutter: true, reduceTransparency: true)
+        let fleet = app.scrollViews["fleet-list"]
+        XCTAssertTrue(fleet.waitForExistence(timeout: 8))
+        for _ in 0..<3 { fleet.swipeUp() }
         XCTAssertTrue(app.buttons["launch-button"].isHittable)
-        XCTAssertLessThanOrEqual(preview.frame.maxX, app.frame.maxX)
-        screenshot("home-preview-accessibility", app)
+        screenshot("home-scrolled-floating-dock-light-reduce-transparency", app)
+
+        app.buttons["dock-accounts"].tap()
+        XCTAssertTrue(app.staticTexts["accounts-needs-attention"].waitForExistence(timeout: 5))
+        screenshot("accounts-attention-badge-light-reduce-transparency", app)
+    }
+
+    @MainActor
+    func testLastHomeRowReachesAboveFloatingDockAndNewSession() {
+        let app = launch(fleetFilters: true)
+        app.buttons["dock-home"].tap()
+        let fleet = app.scrollViews["fleet-list"]
+        XCTAssertTrue(fleet.waitForExistence(timeout: 8))
+        for _ in 0..<8 { fleet.swipeUp() }
+        let lastRow = app.buttons["gpu-models-input"]
+        XCTAssertTrue(lastRow.waitForExistence(timeout: 5))
+        XCTAssertTrue(lastRow.isHittable)
+        XCTAssertLessThan(lastRow.frame.maxY, app.buttons["launch-button"].frame.minY)
+        screenshot("home-last-row-above-floating-dock-light", app)
     }
 
     @MainActor
     func testStudioFallbackAndOfflineGoogleHostsProduceOneAccount() {
         let app = launch()
-        app.tabBars.buttons["Home"].tap()
-        let navigation = app.buttons["provider-capacity-navigation"]
-        XCTAssertTrue(navigation.waitForExistence(timeout: 8))
-        XCTAssertTrue(navigation.label.contains("11 accounts"))
-        navigation.tap()
+        app.buttons["dock-accounts"].tap()
         let scroll = app.scrollViews["provider-accounts-scroll"]
+        XCTAssertTrue(scroll.waitForExistence(timeout: 8))
         let googleAccounts = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Google · sample.google@example.com"))
         let google = googleAccounts.firstMatch
         for _ in 0..<6 where !google.isHittable { scroll.swipeUp() }
@@ -172,17 +168,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testLongDarkUnavailableHostStaysOffHome() {
         let app = launch()
-        app.tabBars.buttons["Home"].tap()
-        let navigation = app.buttons["provider-capacity-navigation"]
-        XCTAssertTrue(navigation.waitForExistence(timeout: 8))
-        XCTAssertTrue(navigation.label.contains("11 accounts"))
-        // The strip leads with the lowest remaining meter; 3% would lead it.
-        let strip = app.scrollViews["account-meter-strip"]
-        XCTAssertTrue(strip.exists)
-        XCTAssertTrue(strip.buttons.firstMatch.label.contains("account-2@example.com, Anthropic, 19% left"))
-        XCTAssertFalse(strip.buttons.matching(NSPredicate(format: "label CONTAINS %@", "work@example.com")).firstMatch.exists)
-        navigation.tap()
+        app.buttons["dock-accounts"].tap()
         let scroll = app.scrollViews["provider-accounts-scroll"]
+        XCTAssertTrue(scroll.waitForExistence(timeout: 8))
         let work = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Anthropic · work@example.com")).firstMatch
         for _ in 0..<8 where !work.isHittable { scroll.swipeUp() }
         XCTAssertTrue(work.isHittable)
@@ -195,7 +183,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testHomeFleetOverviewAndFiltering() {
         let app = launch(dark: true, fleetFilters: true)
-        app.tabBars.buttons["Home"].tap()
+        app.buttons["dock-home"].tap()
 
         // 1. Host chips
         let allChip = app.buttons["host-chip-all"]
@@ -269,7 +257,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testHomeFleetOverviewLightMode() {
         let app = launch(dark: false, fleetFilters: true)
-        app.tabBars.buttons["Home"].tap()
+        app.buttons["dock-home"].tap()
 
         let allChip = app.buttons["host-chip-all"]
         XCTAssertTrue(allChip.waitForExistence(timeout: 10))
@@ -285,7 +273,10 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
-    private func launch(large: Bool = false, dark: Bool = false, fleetFilters: Bool = false) -> XCUIApplication {
+    private func launch(
+        large: Bool = false, dark: Bool = false, fleetFilters: Bool = false,
+        declutter: Bool = false, reduceTransparency: Bool = false
+    ) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "observability"
@@ -293,6 +284,8 @@ final class ObservabilityFixtureUITests: XCTestCase {
         if fleetFilters {
             app.launchEnvironment["DROVER_UI_TEST_FLEET_FILTERS"] = "1"
         }
+        if declutter { app.launchEnvironment["DROVER_UI_TEST_HOME_DECLUTTER"] = "1" }
+        if reduceTransparency { app.launchEnvironment["DROVER_UI_TEST_REDUCE_TRANSPARENCY"] = "1" }
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
         }
@@ -322,14 +315,11 @@ final class ObservabilityFixtureUITests: XCTestCase {
     func testRealAppRootTabNavigationAndDeepLink() {
         // 1. Launch against real app root (core-journey scenario)
         let app = launchRealApp()
-        let tabBar = app.tabBars.element
-        XCTAssertTrue(tabBar.waitForExistence(timeout: 10))
-
-        // 2. Verify all four tabs exist
-        let homeTab = app.tabBars.buttons["Home"]
-        let analyticsTab = app.tabBars.buttons["Analytics"]
-        let inboxTab = app.tabBars.buttons["Inbox"]
-        let accountsTab = app.tabBars.buttons["Accounts"]
+        // 2. Verify all four dock destinations exist
+        let homeTab = app.buttons["dock-home"]
+        let analyticsTab = app.buttons["dock-analytics"]
+        let inboxTab = app.buttons["dock-inbox"]
+        let accountsTab = app.buttons["dock-accounts"]
 
         XCTAssertTrue(homeTab.exists)
         XCTAssertTrue(analyticsTab.exists)
@@ -367,11 +357,11 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testInboxSegmentsProduceReviewScreenshots() {
         let app = launch()
-        app.tabBars.buttons["Home"].tap()
+        app.buttons["dock-home"].tap()
         XCTAssertTrue(app.scrollViews["fleet-list"].waitForExistence(timeout: 8))
         screenshot("nav-home", app)
 
-        let inbox = app.tabBars.buttons["Inbox"]
+        let inbox = app.buttons["dock-inbox"]
         inbox.tap()
         let segments = app.segmentedControls["inbox-segments"]
         XCTAssertTrue(segments.waitForExistence(timeout: 5))
@@ -389,7 +379,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testRealAppHomeDockDarkMode() {
         let app = launchRealApp(dark: true)
-        let homeTab = app.tabBars.buttons["Home"]
+        let homeTab = app.buttons["dock-home"]
         XCTAssertTrue(homeTab.waitForExistence(timeout: 8))
         let newSessionButton = app.buttons["launch-button"]
         XCTAssertTrue(newSessionButton.waitForExistence(timeout: 5))
@@ -399,7 +389,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testRealAppHomeDockLargestText() {
         let app = launchRealApp(large: true, dark: true)
-        let homeTab = app.tabBars.buttons["Home"]
+        let homeTab = app.buttons["dock-home"]
         XCTAssertTrue(homeTab.waitForExistence(timeout: 8))
         let newSessionButton = app.buttons["launch-button"]
         XCTAssertTrue(newSessionButton.waitForExistence(timeout: 5))
@@ -409,7 +399,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testRealAppIPadDock() {
         let app = launchRealApp(dark: true)
-        let homeTab = app.descendants(matching: .any)["tab-home"].firstMatch
+        let homeTab = app.buttons["dock-home"]
         XCTAssertTrue(homeTab.waitForExistence(timeout: 10))
         screenshot("real-app-ipad-dock", app)
     }
@@ -423,9 +413,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
-    func testOverviewNoClippingOfAccountsCard() {
+    func testOverviewKeepsHostChipsClearOfFleetContent() {
         let app = launch(dark: true, fleetFilters: true)
-        let homeTab = app.tabBars.buttons["Home"]
+        let homeTab = app.buttons["dock-home"]
         XCTAssertTrue(homeTab.waitForExistence(timeout: 8))
         homeTab.tap()
 
@@ -436,14 +426,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(overviewToggle.waitForExistence(timeout: 8))
         overviewToggle.tap()
 
-        let accountsCard = app.descendants(matching: .any)["provider-capacity-summary"]
-        XCTAssertTrue(accountsCard.waitForExistence(timeout: 5))
-
         let hostChips = app.buttons["host-chip-all"]
         XCTAssertTrue(hostChips.waitForExistence(timeout: 5))
-
-        // Verify accounts card is not clipped under the host chips
-        XCTAssertGreaterThanOrEqual(accountsCard.frame.minY, hostChips.frame.maxY)
+        XCTAssertFalse(app.descendants(matching: .any)["provider-capacity-summary"].exists)
 
         screenshot("overview-no-clipping-dark", app)
     }

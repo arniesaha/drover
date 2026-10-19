@@ -125,6 +125,8 @@ struct DroverApp: App {
                 switch testScenario.kind {
                 case .coreJourney, .capabilityJourney, .longStreaming:
                     FixturePreparedRoot(scenario: testScenario, notifier: notifier)
+                        .environment(\.forcesOpaqueDockChrome,
+                                     ProcessInfo.processInfo.environment["DROVER_UI_TEST_REDUCE_TRANSPARENCY"] == "1")
                         .environment(\.forcesOpaqueChatChrome,
                                      ProcessInfo.processInfo.environment["DROVER_UI_TEST_REDUCE_TRANSPARENCY"] == "1")
                 case .insightDetail:

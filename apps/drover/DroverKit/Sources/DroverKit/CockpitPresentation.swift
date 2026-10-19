@@ -1028,6 +1028,8 @@ public struct ProviderSubscriptionPresentation: Sendable, Equatable, Identifiabl
     /// because a subscription with no windows must still say when it was read.
     public let freshnessText: String
     public let status: ProviderAccountStatus
+    /// Why this account belongs at the top of Accounts, if it needs action.
+    public let attention: AccountHealthPresentation.Attention?
 
     public var isDegraded: Bool { status != .ok }
 }
@@ -1123,7 +1125,8 @@ public enum ProviderSubscriptionGrouping {
                 freshnessText: ProviderCapacityPresentation.freshness(
                     observedAt: representative.observedAt, now: now
                 ),
-                status: representative.status
+                status: representative.status,
+                attention: AccountHealthPresentation.attention(for: members)
             )
         }
     }

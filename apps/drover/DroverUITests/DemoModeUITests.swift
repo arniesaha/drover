@@ -155,14 +155,14 @@ final class DemoModeUITests: XCTestCase {
         }
 
         // 6. View Analytics
-        app.tabBars.buttons["Analytics"].tap()
+        app.buttons["dock-analytics"].tap()
 
         let analyticsFilters = app.descendants(matching: .any)["analytics-filters"]
         XCTAssertTrue(analyticsFilters.waitForExistence(timeout: 5))
         captureScreenshot(named: "07_Analytics_Overview", in: app)
 
         // Back to fleet
-        app.tabBars.buttons["Home"].tap()
+        app.buttons["dock-home"].tap()
         XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
 
         // 7. Settings & Exit Demo

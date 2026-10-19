@@ -10,6 +10,7 @@ struct ObservabilityFixtureRoot: View {
     @State private var workStore: WorkAttentionStore
     @State private var attentionStore: InboxAttentionStore
     @State private var appearance = AppearanceStore()
+    @State private var selectedTab: AppTab = .home
 
     init(client: DroverClient) {
         self.client = client
@@ -23,7 +24,7 @@ struct ObservabilityFixtureRoot: View {
     }
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             NavigationStack {
                 SessionsView(client: client, notifier: FixtureNotifier(), recoveryStore: nil,
                     recoveryWriteGate: ChatRecoveryWriteGate(), recoveryGeneration: 0,
@@ -40,7 +41,6 @@ struct ObservabilityFixtureRoot: View {
                 )
             }
             .tabItem { Label(AppTab.inbox.title, systemImage: AppTab.inbox.systemImage) }
-            .badge(attentionStore.insights.isEmpty ? nil : String(attentionStore.insights.count))
             .tag(AppTab.inbox)
             .accessibilityIdentifier(AppTab.inbox.accessibilityIdentifier)
             NavigationStack { AnalyticsView(store: store) }
@@ -55,8 +55,25 @@ struct ObservabilityFixtureRoot: View {
             .tag(AppTab.accounts)
             .accessibilityIdentifier(AppTab.accounts.accessibilityIdentifier)
         }
-        .tabViewStyle(.sidebarAdaptable)
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Color.clear.frame(height: 76).allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottom) {
+            FloatingDock(
+                selectedTab: $selectedTab,
+                inboxBadge: attentionStore.insights.isEmpty ? nil : String(attentionStore.insights.count),
+                accountsBadge: AccountHealthPresentation.badgeValue(
+                    for: AccountHealthPresentation.count(accounts: ObservabilityFixtureData.accounts)
+                )
+            )
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
+        }
         .environment(appearance)
+        .environment(\.forcesOpaqueDockChrome,
+                     ProcessInfo.processInfo.environment["DROVER_UI_TEST_REDUCE_TRANSPARENCY"] == "1")
         .preferredColorScheme(appearance.appearance.colorScheme)
         .droverTint()
     }
@@ -67,12 +84,33 @@ enum ObservabilityFixtureData {
         "laptop": "Work laptop with a long descriptive host name", "nas": "NAS"]
 
     static var homeSnapshot: Data {
+        if isDeclutterFixture { return declutterSnapshot }
         if ProcessInfo.processInfo.environment["DROVER_UI_TEST_FLEET_FILTERS"] == "1" {
             return fleetSnapshot
         }
         var value = try! JSONSerialization.jsonObject(with: FixtureScenarioData.snapshotData()) as! [String: Any]
         value["cockpit_api_version"] = 1
         value["cockpit_sections"] = ["provider_capacity", "activity", "insights"]
+        return encode(value)
+    }
+
+    /// Four account records shaped exactly like the hub payload and a list
+    /// long enough to put real rows behind the floating controls.
+    static var declutterSnapshot: Data {
+        var value = try! JSONSerialization.jsonObject(with: fleetSnapshot) as! [String: Any]
+        value["cockpit_api_version"] = 1
+        value["cockpit_sections"] = ["provider_capacity", "activity", "insights"]
+        var sessions = value["sessions"] as! [[String: Any]]
+        sessions += (0..<8).map { index in
+            [
+                "session_id": "studio-declutter-\(index)", "host_id": "studio",
+                "harness": "codex", "mode": "structured", "status": "working",
+                "repo_name": "arniesaha/drover", "cwd": "/Users/arnab/code/drover",
+                "preview": "Realistic scrolling session \(index + 1)",
+                "last_activity": "2026-10-17T19:\(String(format: "%02d", index)):00Z",
+            ]
+        }
+        value["sessions"] = sessions
         return encode(value)
     }
 
@@ -195,8 +233,35 @@ enum ObservabilityFixtureData {
     private static let reported = "2026-09-30T18:00:00Z"
 
     static var accounts: [ProviderAccount] {
-        try! JSONDecoder().decode([ProviderAccount].self, from: encode(accountValues))
+        try! JSONDecoder().decode([ProviderAccount].self, from: encode(activeAccountValues))
     }
+
+    private static var isDeclutterFixture: Bool {
+        ProcessInfo.processInfo.environment["DROVER_UI_TEST_HOME_DECLUTTER"] == "1"
+    }
+
+    private static var activeAccountValues: [[String: Any]] {
+        isDeclutterFixture ? realisticAccountValues : accountValues
+    }
+
+    private static var realisticAccountValues: [[String: Any]] { [
+        ["snapshot_id": "openai-arnab", "dedup_key": "openai-arnab", "provider": "openai",
+         "account_label": "arnab@example.com", "plan_label": "Plus", "host_id": "studio",
+         "status": "ok", "observed_at": "2026-10-17T21:00:00Z", "source": "codex-app-server",
+         "windows": [["kind": "five_hour", "used_percent": 88]]],
+        ["snapshot_id": "anthropic-personal", "dedup_key": "anthropic-personal", "provider": "anthropic",
+         "account_label": "personal@example.com", "plan_label": "Max", "host_id": "studio",
+         "status": "ok", "observed_at": "2026-10-17T21:00:00Z", "source": "claude-usage",
+         "windows": [["kind": "five_hour", "used_percent": 42]]],
+        ["snapshot_id": "google-work", "dedup_key": "google-work", "provider": "google",
+         "account_label": "work@example.com", "host_id": "studio", "status": "ok",
+         "observed_at": "2026-10-17T21:00:00Z", "source": "gemini-usage",
+         "windows": [["kind": "five_hour", "used_percent": 10]]],
+        ["snapshot_id": "other-local", "dedup_key": "other-local", "provider": "other",
+         "account_label": "local@example.com", "host_id": "studio", "status": "ok",
+         "observed_at": "2026-10-17T21:00:00Z", "source": "local-usage",
+         "windows": [["kind": "five_hour", "used_percent": 1]]],
+    ] }
 
     private static var accountValues: [[String: Any]] {
         let shared: [[String: Any]] = [("studio", "ok", 32), ("mini", "stale", 32), ("laptop", "error", 32)].map { host, status, used in
@@ -265,7 +330,7 @@ enum ObservabilityFixtureData {
         let coverage = ["token_percent": 93, "cost_percent": 65]
         return encode([
             "cockpit_api_version": 1, "filters": ["days": 7, "metric": activeMetric],
-            "provider_capacity": ["status": "ok", "data": accountValues],
+            "provider_capacity": ["status": "ok", "data": activeAccountValues],
             "activity": ["status": "ok", "observed_at": reported, "coverage": coverage,
                 "data": ["totals": metrics(128, 4_100_000),
                     "projects": [breakdown("drover", 80, 2_400_000, project: true),

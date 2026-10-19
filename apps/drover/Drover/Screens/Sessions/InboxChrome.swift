@@ -91,15 +91,51 @@ struct NewSessionBar: View {
                 .foregroundStyle(DroverColor.accentHi)
                 .padding(.horizontal, 16)
                 .frame(minHeight: 44)
-                .background(DroverColor.bg, in: Capsule())
-                .overlay {
-                    Capsule()
-                        .strokeBorder(DroverColor.accent, lineWidth: 1)
-                }
+                .floatingDockSurface(in: Capsule())
+                .overlay { Capsule().strokeBorder(DroverColor.accent, lineWidth: 1) }
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("launch-button")
         .accessibilityLabel("New Session")
+    }
+}
+
+/// Material is deliberately limited to floating controls. Reduce Transparency
+/// uses the same opaque surface token as cards so both contrast and hit targets
+/// remain stable.
+struct FloatingDockSurface<S: InsettableShape>: ViewModifier {
+    let shape: S
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.forcesOpaqueDockChrome) private var forcesOpaqueChrome
+
+    func body(content: Content) -> some View {
+        content
+            .background {
+                if reduceTransparency || forcesOpaqueChrome {
+                    shape.fill(DroverColor.sheet)
+                } else {
+                    shape.fill(.ultraThinMaterial)
+                }
+            }
+            .overlay(shape.strokeBorder(.secondary.opacity(0.22), lineWidth: 1))
+            .shadow(color: .black.opacity(0.12), radius: 5, y: 2)
+    }
+}
+
+extension View {
+    func floatingDockSurface<S: InsettableShape>(in shape: S) -> some View {
+        modifier(FloatingDockSurface(shape: shape))
+    }
+}
+
+private struct ForcesOpaqueDockChromeKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var forcesOpaqueDockChrome: Bool {
+        get { self[ForcesOpaqueDockChromeKey.self] }
+        set { self[ForcesOpaqueDockChromeKey.self] = newValue }
     }
 }
 
