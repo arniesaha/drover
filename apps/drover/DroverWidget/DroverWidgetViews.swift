@@ -20,141 +20,59 @@ public struct MediumWidgetView: View {
     }
 
     public var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            // LEFT COLUMN: Accounts Quota
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 4) {
-                    Text("QUOTA")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundStyle(WidgetColor.faint)
-                    Spacer()
-                    if snapshot.accounts.isEmpty {
-                        Text("No data")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(WidgetColor.muted)
-                    }
-                }
-                .padding(.bottom, 1)
-
-                if quotaDisplay.visibleAccounts.isEmpty {
-                    Text("No accounts reported")
-                        .font(.system(size: 11))
-                        .foregroundStyle(WidgetColor.muted)
-                        .frame(maxHeight: .infinity, alignment: .center)
-                } else {
-                    VStack(alignment: .leading, spacing: 4.5) {
-                        ForEach(quotaDisplay.visibleAccounts) { account in
-                            accountQuotaRow(account)
-                        }
-                    }
-
-                    if quotaDisplay.hasTruncatedAccounts {
-                        Text("+\(quotaDisplay.truncatedCount) more")
-                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                            .foregroundStyle(WidgetColor.faint)
-                            .padding(.top, 1)
-                    }
-                }
-
-                Spacer(minLength: 0)
-
-                // Freshness footer
-                freshnessFooter
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("QUOTA")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(WidgetColor.faint)
+                Text("\(snapshot.accounts.count) accounts")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(WidgetColor.muted)
+                Spacer(minLength: 4)
+                needsYouHeadline
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
-            // VERTICAL DIVIDER
+            if quotaDisplay.visibleAccounts.isEmpty {
+                Text("No accounts reported")
+                    .font(.system(size: 11))
+                    .foregroundStyle(WidgetColor.muted)
+                    .frame(maxHeight: .infinity, alignment: .center)
+            } else {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(quotaDisplay.visibleAccounts) { account in
+                        WidgetQuotaRow(account: account, fallbackUpdatedText: timeAgoText(from: entry.date))
+                    }
+                }
+
+                if quotaDisplay.hasTruncatedAccounts {
+                    Text("+\(quotaDisplay.truncatedCount) more")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(WidgetColor.faint)
+                }
+            }
+
+            Spacer(minLength: 0)
+
             Rectangle()
                 .fill(WidgetColor.line)
-                .frame(width: 1)
-                .padding(.vertical, 2)
+                .frame(height: 1)
 
-            // RIGHT COLUMN: Hosts & Needs You
-            VStack(alignment: .leading, spacing: 5) {
-                // Headline: "N need you"
-                headlineSection
-
-                // Hosts List
-                if snapshot.hosts.isEmpty {
-                    Text("No hosts configured")
-                        .font(.system(size: 11))
-                        .foregroundStyle(WidgetColor.muted)
-                        .frame(maxHeight: .infinity, alignment: .center)
-                } else {
-                    VStack(alignment: .leading, spacing: 4.5) {
-                        ForEach(Array(snapshot.hosts.prefix(4))) { host in
-                            Link(destination: URL(string: "drover://host/\(host.id)")!) {
-                                hostRow(host)
-                            }
-                        }
-                    }
-                }
-
-                Spacer(minLength: 0)
-
-                // Stale indicator if applicable
-                staleFooter
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            hostFooter
         }
         .padding(13)
         .background(WidgetColor.bg)
         .widgetURL(URL(string: "drover://home"))
     }
 
-    // MARK: Account Row
-    private func accountQuotaRow(_ account: WidgetAccountQuota) -> some View {
-        HStack(spacing: 5) {
-            // Provider initial badge
-            Text(account.providerInitial)
-                .font(.system(size: 8, weight: .bold, design: .monospaced))
-                .foregroundStyle(WidgetColor.accentHi)
-                .frame(width: 13, height: 13)
-                .background(WidgetColor.card)
-                .clipShape(RoundedRectangle(cornerRadius: 3))
-
-            // Short account label
-            Text(account.accountLabel)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(WidgetColor.text)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: 55, alignment: .leading)
-
-            // Compact progress bar
-            WidgetCapacityBar(
-                fraction: account.remainingFraction,
-                isCritical: (account.remainingFraction ?? 1.0) <= 0.15,
-                isStale: account.isStale
-            )
-            .frame(maxWidth: .infinity)
-
-            // Percentage remaining
-            Text(account.remainingPercent.map { "\($0)%" } ?? "—")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .foregroundStyle(account.isStale ? AnyShapeStyle(WidgetColor.muted) : AnyShapeStyle(WidgetColor.accentHi))
-                .monospacedDigit()
-                .frame(width: 28, alignment: .trailing)
-
-            // Stale clock indicator
-            if account.isStale {
-                Image(systemName: "clock")
-                    .font(.system(size: 8.5))
-                    .foregroundStyle(WidgetColor.warn)
-            }
-        }
-    }
-
-    // MARK: Headline
     @ViewBuilder
-    private var headlineSection: some View {
+    private var needsYouHeadline: some View {
         if snapshot.needsYouCount > 0 {
             HStack(spacing: 5) {
                 Circle()
                     .fill(WidgetColor.accent)
                     .frame(width: 6, height: 6)
                 Text("\(snapshot.needsYouCount) need\(snapshot.needsYouCount == 1 ? "s" : "") you")
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(WidgetColor.accentHi)
                     .lineLimit(1)
             }
@@ -164,79 +82,35 @@ public struct MediumWidgetView: View {
                     .strokeBorder(WidgetColor.faint, lineWidth: 1)
                     .frame(width: 6, height: 6)
                 Text("All clear")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(WidgetColor.muted)
                     .lineLimit(1)
             }
         }
     }
 
-    // MARK: Host Row
-    private func hostRow(_ host: WidgetHostStatus) -> some View {
-        HStack(spacing: 6) {
-            // Status dot: active / idle / offline
-            switch host.status {
-            case .active:
-                if host.hasWaiting {
-                    Circle()
-                        .fill(WidgetColor.accent)
-                        .frame(width: 7, height: 7)
-                } else {
-                    Circle()
-                        .strokeBorder(WidgetColor.accentHi, lineWidth: 1.5)
-                        .frame(width: 7, height: 7)
-                }
-            case .idle:
-                Circle()
-                    .strokeBorder(WidgetColor.faint, lineWidth: 1.2)
-                    .frame(width: 7, height: 7)
-            case .offline:
-                Circle()
-                    .strokeBorder(WidgetColor.line, lineWidth: 1)
-                    .frame(width: 7, height: 7)
-            }
-
-            // Host short name
-            Text(host.name)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(host.status == .offline ? WidgetColor.faint : WidgetColor.text)
+    private var hostFooter: some View {
+        HStack(spacing: 7) {
+            Text("HOSTS")
+                .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                .foregroundStyle(WidgetColor.faint)
+            Text(hostSummary)
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(WidgetColor.muted)
                 .lineLimit(1)
-
-            Spacer(minLength: 4)
-
-            // Active session count
-            Text(host.status == .offline ? "·" : "\(host.activeSessionCount)")
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundStyle(host.activeSessionCount > 0 ? AnyShapeStyle(WidgetColor.accentHi) : AnyShapeStyle(WidgetColor.faint))
+            Spacer(minLength: 2)
+            Text("updated \(timeAgoText(from: entry.date))")
+                .font(.system(size: 8.5, design: .monospaced))
+                .foregroundStyle(entry.isStale ? WidgetColor.muted : WidgetColor.faint)
+                .lineLimit(1)
         }
-        .contentShape(Rectangle())
     }
 
-    // MARK: Footers
-    private var freshnessFooter: some View {
-        Text("Updated \(timeAgoText(from: entry.date))")
-            .font(.system(size: 8.5, design: .monospaced))
-            .foregroundStyle(WidgetColor.faint)
-            .lineLimit(1)
-    }
-
-    @ViewBuilder
-    private var staleFooter: some View {
-        if entry.isStale {
-            HStack(spacing: 3) {
-                Image(systemName: "clock.badge.exclamationmark")
-                    .font(.system(size: 8.5))
-                Text("Stale")
-                    .font(.system(size: 8.5, weight: .medium, design: .monospaced))
-            }
-            .foregroundStyle(WidgetColor.warn)
-        } else {
-            HStack(spacing: 4) {
-                Text("\(snapshot.liveHostsCount) live")
-                    .font(.system(size: 8.5, design: .monospaced))
-                    .foregroundStyle(WidgetColor.faint)
-            }
-        }
+    private var hostSummary: String {
+        guard !snapshot.hosts.isEmpty else { return "No hosts configured" }
+        return snapshot.hosts.prefix(3).map { host in
+            host.status == .offline ? "\(host.name) off" : "\(host.name) \(host.activeSessionCount)"
+        }.joined(separator: " · ")
     }
 
     private func timeAgoText(from date: Date) -> String {
@@ -248,6 +122,158 @@ public struct MediumWidgetView: View {
         } else {
             return "\(elapsed / 3600)h ago"
         }
+    }
+}
+
+private struct WidgetQuotaRow: View {
+    let account: WidgetAccountQuota
+    let fallbackUpdatedText: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("\(account.providerDisplayName) · \(account.shortLabel)")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(account.isStale ? WidgetColor.muted : WidgetColor.text)
+                .lineLimit(1)
+                .frame(width: 94, alignment: .leading)
+
+            WidgetCapacityBar(
+                fraction: account.remainingFraction,
+                isCritical: account.isLowQuota,
+                isStale: account.isStale,
+                height: 4
+            )
+            .frame(maxWidth: .infinity)
+            .layoutPriority(-1)
+
+            Text(account.remainingPercent.map { "\($0)%" } ?? "—")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(quotaForeground)
+                .monospacedDigit()
+                .frame(width: 28, alignment: .trailing)
+
+            Text(account.isStale ? "updated \(account.updatedText() ?? fallbackUpdatedText)" : (account.resetText() ?? ""))
+                .font(.system(size: 8.5, design: .monospaced))
+                .foregroundStyle(account.isStale ? WidgetColor.muted : WidgetColor.faint)
+                .lineLimit(1)
+                .frame(width: 82, alignment: .leading)
+                .layoutPriority(1)
+        }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
+        .background {
+            if account.isLowQuota {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(WidgetColor.lowQuotaTint)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+    }
+
+    private var quotaForeground: AnyShapeStyle {
+        if account.isStale { return AnyShapeStyle(WidgetColor.muted) }
+        if account.isLowQuota { return AnyShapeStyle(WidgetColor.warn) }
+        return AnyShapeStyle(WidgetColor.accentHi)
+    }
+}
+
+// MARK: - Large Widget
+
+public struct LargeWidgetView: View {
+    public let entry: DroverWidgetEntry
+
+    public init(entry: DroverWidgetEntry) {
+        self.entry = entry
+    }
+
+    private var snapshot: WidgetFleetSnapshot { entry.snapshot }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("QUOTA")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(WidgetColor.faint)
+                Text("lowest remaining first")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(WidgetColor.muted)
+                Spacer()
+                Text("updated \(timeAgoText(from: entry.date))")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(WidgetColor.faint)
+            }
+
+            if snapshot.accounts.isEmpty {
+                Text("No accounts reported")
+                    .font(.system(size: 12))
+                    .foregroundStyle(WidgetColor.muted)
+            } else {
+                VStack(spacing: 4) {
+                    // The large family deliberately receives the whole list;
+                    // medium uses four rows to reserve room for host context.
+                    ForEach(snapshot.accounts) { account in
+                        WidgetQuotaRow(account: account, fallbackUpdatedText: timeAgoText(from: entry.date))
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            Rectangle()
+                .fill(WidgetColor.line)
+                .frame(height: 1)
+
+            HStack {
+                if snapshot.needsYouCount > 0 {
+                    Text("\(snapshot.needsYouCount) need\(snapshot.needsYouCount == 1 ? "s" : "") you")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(WidgetColor.accentHi)
+                } else {
+                    Text("All clear")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(WidgetColor.muted)
+                }
+                Spacer()
+                Text("HOSTS")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(WidgetColor.faint)
+            }
+
+            if snapshot.hosts.isEmpty {
+                Text("No hosts configured")
+                    .font(.system(size: 11))
+                    .foregroundStyle(WidgetColor.muted)
+            } else {
+                VStack(spacing: 5) {
+                    ForEach(snapshot.hosts) { host in
+                        Link(destination: URL(string: "drover://host/\(host.id)")!) {
+                            HStack {
+                                Circle()
+                                    .fill(host.status == .offline ? WidgetColor.line : (host.hasWaiting ? WidgetColor.accent : WidgetColor.faint))
+                                    .frame(width: 7, height: 7)
+                                Text(host.name)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(host.status == .offline ? WidgetColor.faint : WidgetColor.text)
+                                Spacer()
+                                Text(host.status == .offline ? "off" : "\(host.activeSessionCount)")
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(host.status == .offline ? WidgetColor.faint : WidgetColor.accentHi)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background(WidgetColor.bg)
+        .widgetURL(URL(string: "drover://home"))
+    }
+
+    private func timeAgoText(from date: Date) -> String {
+        let elapsed = max(0, Int(Date().timeIntervalSince(date)))
+        if elapsed < 60 { return "just now" }
+        if elapsed < 3_600 { return "\(elapsed / 60)m ago" }
+        return "\(elapsed / 3_600)h ago"
     }
 }
 
@@ -291,10 +317,7 @@ public struct SmallWidgetView: View {
             if let lowest = snapshot.lowestQuotaAccount {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 4) {
-                        Text(lowest.providerInitial)
-                            .font(.system(size: 8, weight: .bold, design: .monospaced))
-                            .foregroundStyle(WidgetColor.accentHi)
-                        Text(lowest.accountLabel)
+                        Text("\(lowest.providerDisplayName) · \(lowest.shortLabel)")
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(WidgetColor.text)
                             .lineLimit(1)
@@ -306,7 +329,7 @@ public struct SmallWidgetView: View {
 
                     WidgetCapacityBar(
                         fraction: lowest.remainingFraction,
-                        isCritical: (lowest.remainingFraction ?? 1.0) <= 0.15,
+                        isCritical: lowest.isLowQuota,
                         isStale: lowest.isStale
                     )
                 }
@@ -361,7 +384,7 @@ public struct AccessoryRectangularWidgetView: View {
 
             if let lowest = snapshot.lowestQuotaAccount {
                 HStack(spacing: 4) {
-                    Text("\(lowest.accountLabel): \(lowest.remainingPercent.map { "\($0)%" } ?? "—") left")
+                    Text("\(lowest.providerDisplayName) · \(lowest.shortLabel): \(lowest.remainingPercent.map { "\($0)%" } ?? "—") left")
                         .font(.system(size: 9.5, weight: .medium))
                         .lineLimit(1)
                 }
@@ -390,6 +413,8 @@ public struct DroverWidgetEntryView: View {
         switch family {
         case .systemMedium:
             MediumWidgetView(entry: entry)
+        case .systemLarge:
+            LargeWidgetView(entry: entry)
         case .systemSmall:
             SmallWidgetView(entry: entry)
         case .accessoryRectangular:

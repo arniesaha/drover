@@ -65,4 +65,29 @@ struct WidgetSnapshotRenderTests {
             .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         try render(view: view, size: CGSize(width: 169, height: 169), fileName: "widget-small-light.png")
     }
+
+    @Test @MainActor func renderLargeDark() throws {
+        let entry = DroverWidgetEntry(date: Date(), snapshot: .preview())
+        let view = LargeWidgetView(entry: entry)
+            .environment(\.colorScheme, .dark)
+            .background(WidgetColor.bg.color(for: .dark))
+            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        try render(view: view, size: CGSize(width: 360, height: 379), fileName: "widget-large-dark.png")
+    }
+
+    @Test @MainActor func renderLargeLight() throws {
+        let entry = DroverWidgetEntry(date: Date(), snapshot: .preview())
+        let view = LargeWidgetView(entry: entry)
+            .environment(\.colorScheme, .light)
+            .background(WidgetColor.bg.color(for: .light))
+            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+        try render(view: view, size: CGSize(width: 360, height: 379), fileName: "widget-large-light.png")
+    }
+
+    @Test @MainActor func renderAccessoryRectangular() throws {
+        let entry = DroverWidgetEntry(date: Date(), snapshot: .preview())
+        let view = AccessoryRectangularWidgetView(entry: entry)
+            .environment(\.colorScheme, .dark)
+        try render(view: view, size: CGSize(width: 330, height: 75), fileName: "widget-accessory-dark.png")
+    }
 }
