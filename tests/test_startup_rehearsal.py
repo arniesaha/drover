@@ -88,6 +88,44 @@ def test_startup_phase_failure_does_not_log_exception_payload(caplog):
     assert "credential-and-query-payload" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "backend,retired,expected",
+    [("legacy", False, None), ("ducklake", False, True), ("ducklake", True, True)],
+)
+def test_ducklake_startup_pins_before_workers_without_requiring_retirement(
+    tmp_path, monkeypatch, backend, retired, expected
+):
+    """The Studio configuration omitted retirement and bypassed #702's pin."""
+    from types import SimpleNamespace
+
+    from drover.config import MemoryBudgetConfig
+    from drover.server.lake import writer_gate
+
+    path = tmp_path / "analytical.duckdb"
+    cfg = SimpleNamespace(
+        memory=MemoryBudgetConfig(),
+        runtime=SimpleNamespace(role="all"),
+        control_store=SimpleNamespace(backend="postgres"),
+        analytics=SimpleNamespace(backend=backend, retire_legacy_writers=retired),
+        duckdb_path=path,
+    )
+    monkeypatch.setattr(server_main, "_resolve_config", lambda _: cfg)
+    monkeypatch.setattr(server_main, "_register_stack_dump", lambda: None)
+    monkeypatch.setattr(threading.Thread, "start", Mock())
+    monkeypatch.setattr(server_main, "require_control_store_ready", Mock())
+    monkeypatch.setattr(writer_gate, "activate_retirement", Mock())
+    pin = Mock(side_effect=BeforeBind())
+    monkeypatch.setattr(server_main, "pin_analytical_connection", pin)
+    bootstrap = Mock(side_effect=AssertionError("bootstrap preceded pin"))
+    monkeypatch.setattr(server_main, "bootstrap", bootstrap)
+    with pytest.raises(BeforeBind):
+        CliRunner().invoke(
+            server_main.main, ["run", "--no-mcp"], catch_exceptions=False
+        )
+    pin.assert_called_once_with(path, enabled=expected)
+    bootstrap.assert_not_called()
+
+
 def test_backlog_prunes_archive_before_enumeration(tmp_path):
     incoming = tmp_path / "incoming"
     archive = incoming / "host" / ".processed" / "deep"
