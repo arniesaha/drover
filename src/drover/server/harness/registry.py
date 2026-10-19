@@ -208,6 +208,7 @@ def _dispatch_awaiting_push(
     approval_summary: str = "",
     content_allowed: bool = True,
     badge_count: int | None = None,
+    started_at: datetime | None = None,
 ) -> None:
     """Tell the push layer a session changed awaiting state.
 
@@ -233,6 +234,7 @@ def _dispatch_awaiting_push(
                 approval_summary=approval_summary,
                 content_allowed=content_allowed,
                 badge_count=badge_count,
+                started_at=started_at,
             )
         )
     except Exception:  # noqa: BLE001 - never break activity recording
@@ -1111,7 +1113,7 @@ class HarnessRegistry:
             with self._connect() as con:
                 row = con.execute(
                     """SELECT s.status, s.repo_name, s.cwd, h.display_name,
-                               h.capabilities_json
+                               h.capabilities_json, s.started_at
                          FROM harness_sessions s
                     LEFT JOIN harness_hosts h ON h.host_id = s.host_id
                         WHERE s.session_id = ?""",
@@ -1193,6 +1195,7 @@ class HarnessRegistry:
                     approval_summary=approval_summary,
                     content_allowed=content_allowed,
                     badge_count=int(badge_row[0] or 0),
+                    started_at=row[5],
                 )
         except Exception:  # Notification privacy checks fail closed.
             _dispatch_awaiting_push(

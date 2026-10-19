@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -221,8 +222,8 @@ def test_alert_carries_time_sensitive_payload_and_collapse_id(tmp_path, config):
     assert post["headers"]["apns-push-type"] == "alert"
     assert post["headers"]["apns-priority"] == "10"
     # Collapsing on the session means an offline phone wakes to one banner per
-    # session, not one per transition it missed.
-    assert post["headers"]["apns-collapse-id"] == "sess-1:input"
+    # session, not one per state transition it missed.
+    assert post["headers"]["apns-collapse-id"] == "sess-1"
     assert post["headers"]["authorization"].startswith("bearer ")
 
     aps = json.loads(post["content"])["aps"]
@@ -779,14 +780,42 @@ def test_content_consent_off_uses_metadata_only(tmp_path, config):
     )
     alert = payload["aps"]["alert"]
     assert alert == {
-        "title": "Needs your input",
-        "body": "Needs your input · acme/web-app · studio",
+        "title": "drover needs your input",
+        "body": "Claude Code session",
         "subtitle": "studio",
     }
     assert "Secret" not in json.dumps(payload)
     assert "npm test" not in json.dumps(payload)
     assert payload["aps"]["badge"] == 2
     sender.close()
+
+
+@pytest.mark.parametrize(
+    ("awaiting", "status", "title", "body"),
+    [
+        ("input", "running", "drover needs your input", "Codex session"),
+        (None, "completed", "drover finished a session", "Codex session finished"),
+        (None, "failed", "drover needs attention", "Codex session needs attention"),
+        (None, "running", "drover session update", "Codex session is still working"),
+    ],
+)
+def test_consent_off_metadata_alerts_distinguish_each_state(
+    awaiting, status, title, body
+):
+    state = _transition(
+        harness="codex",
+        awaiting=awaiting,
+        status=status,
+        host="Studio",
+        repo_name="secret-repo",
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=5, seconds=30),
+        content_allowed=False,
+    )
+
+    assert state.alert_title() == title
+    assert state.alert_subtitle() == "Studio"
+    assert state.alert_body().startswith(body + " · opened 5 min ago")
+    assert "secret-repo" not in state.alert_body()
 
 
 @pytest.mark.parametrize(
@@ -817,8 +846,8 @@ def test_consent_reader_fails_closed_for_notification_content(tmp_path, config, 
         )
     )
     encoded = json.dumps(payload)
-    assert payload["aps"]["alert"]["title"] == "Needs your input"
-    assert payload["aps"]["alert"]["body"] == "Needs your input · acme/web-app · studio"
+    assert payload["aps"]["alert"]["title"] == "drover needs your input"
+    assert payload["aps"]["alert"]["body"] == "Claude Code session"
     assert "Secret" not in encoded
     assert "npm test" not in encoded
     assert "super-secret" not in encoded
@@ -862,7 +891,7 @@ def test_configured_sender_uses_the_durable_consent_reader(tmp_path, config):
     assert sender is not None
     try:
         payload = json.loads(sender._device_payload(credential, _transition(), None))
-        assert payload["aps"]["alert"]["title"] == "Needs your input"
+        assert payload["aps"]["alert"]["title"] == "drover needs your input"
     finally:
         sender.close()
         set_sender(None)
@@ -950,6 +979,49 @@ def test_collapse_id_is_byte_bounded_and_collision_resistant():
     a = "é" * 100
     assert len(_collapse_id(a).encode()) == 64
     assert _collapse_id(a) != _collapse_id(a + "x")
+
+
+def test_all_state_kinds_share_one_session_collapse_id(tmp_path, config):
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, "all")
+    client = FakeClient()
+    sender = APNsSender(
+        config,
+        store,
+        client=client,
+        content_consent_reader=lambda: {"enabled": True, "epoch": 1},
+    )
+
+    for state in (
+        _transition(awaiting=None, status="running"),
+        _transition(awaiting="input", status="running"),
+        _transition(awaiting=None, status="completed"),
+    ):
+        sender._deliver(state)
+
+    assert len(client.posts) == 3
+    assert {post["headers"]["apns-collapse-id"] for post in client.posts} == {"sess-1"}
+    sender.close()
+
+
+def test_all_updates_debounce_replaces_progress_per_session(tmp_path, config):
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, "all")
+    sender, client, now = _batch_sender(config, store)
+
+    sender.notify(_transition(awaiting=None, status="running", preview="first"))
+    now[0] = 130
+    sender.notify(_transition(awaiting=None, status="running", preview="latest"))
+    sender.flush_due()
+    assert client.posts == []
+
+    now[0] = 160
+    sender.flush_due()
+    assert len(client.posts) == 1
+    payload = json.loads(client.posts[0]["content"])
+    assert payload["session_id"] == "sess-1"
+    assert payload["aps"]["summary-arg-count"] == 2
+    sender.close()
 
 
 def test_batch_has_fixed_window_and_latest_state_per_session(tmp_path, config):
