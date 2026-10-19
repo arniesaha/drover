@@ -1,0 +1,16 @@
+.account-list { display: grid; gap: 10px; margin-top: 34px; }
+.account-card { align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; display: flex; gap: 18px; justify-content: space-between; padding: 16px; }
+.account-card h2 { font-size: 16px; font-weight: 400; margin: 0 0 4px; }
+.account-card p { color: var(--muted); font-size: 12px; margin: 0; }
+.account-card p b { color: var(--faint); font-weight: 400; padding: 0 4px; }
+.quota-windows { display: flex; gap: 18px; }
+.quota-windows span { display: grid; gap: 1px; min-width: 72px; }
+.quota-windows small { color: var(--faint); font-size: 10px; text-transform: capitalize; }
+.quota-windows strong { color: var(--accent-hi); font-size: 13px; font-weight: 500; }
+.quota-windows em { color: var(--muted); font-size: 10px; font-style: normal; }
+@media (max-width: 720px) { .account-card { align-items: flex-start; flex-direction: column; } }
+@media (min-width: 721px) {
+  .app-shell { background: linear-gradient(to right, var(--surface) 0 231px, var(--line) 231px 232px, var(--bg) 232px); display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+  .rail { height: 100vh; inset: auto; min-height: 100vh; position: sticky; top: 0; width: auto; }
+  main { margin-left: 0; width: 100%; }
+}

@@ -1,74 +1,43 @@
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
+import { fixtureAccounts, fixtureConnectionToken, fixtureMessages, fixtureSnapshot, mapMessagePage, mapProviderAccounts, mapSnapshot, type Message, type ProviderAccount, type Session, type Snapshot } from "./models";
 import "./style.css";
+import "./accounts.css";
 
-const routes = ["home", "inbox", "sessions", "history", "analytics", "accounts"] as const;
-const allRoutes = [...routes, "connection"] as const;
-type Route = (typeof routes)[number];
-type AppRoute = (typeof allRoutes)[number];
-
-const labels: Record<Route, string> = {
-  home: "Home",
-  inbox: "Inbox",
-  sessions: "Sessions",
-  history: "History",
-  analytics: "Analytics",
-  accounts: "Accounts"
-};
-
-function routeFromHash(): AppRoute {
-  const route = window.location.hash.replace(/^#\/?/, "").split("/", 1)[0];
-  return (allRoutes as readonly string[]).includes(route)
-    ? (route as AppRoute)
-    : "home";
-}
+type Route = "home" | "inbox" | "analytics" | "accounts" | "connection" | "session";
+type Connection = { hub: string; token: string };
+const nav: Array<{ route: Exclude<Route, "connection" | "session">; icon: string; label: string }> = [{ route: "home", icon: "⌂", label: "Home" }, { route: "inbox", icon: "◉", label: "Inbox" }, { route: "analytics", icon: "◌", label: "Analytics" }, { route: "accounts", icon: "◒", label: "Accounts" }];
+const fixtureMode = () => new URLSearchParams(location.search).has("fixture");
+function routeFromHash(): { route: Route; sessionId?: string } { const parts = location.hash.replace(/^#\/?/, "").split("/"); if (parts[0] === "sessions" && parts[1]) return { route: "session", sessionId: decodeURIComponent(parts[1]) }; return (["home", "inbox", "analytics", "accounts", "connection"].includes(parts[0]) ? { route: parts[0] as Route } : { route: "home" }); }
+const initialHub = () => location.pathname.startsWith("/ui") ? location.origin : "";
+function loadConnection(): Connection | null { try { const raw = localStorage.getItem("drover.web.connection"); return raw ? JSON.parse(raw) : null; } catch { return null; } }
+function relative(value?: string) { const mins = value ? Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 60000)) : NaN; if (!Number.isFinite(mins)) return "Unknown"; if (mins < 1) return "now"; if (mins < 60) return `${mins}m ago`; if (mins < 1440) return `${Math.round(mins / 60)}h ago`; return `${Math.round(mins / 1440)}d ago`; }
+function state(session: Session) { if (session.awaiting === "input") return "Needs input"; if (session.awaiting === "approval") return "Needs approval"; if (session.status === "completed") return "Finished"; if (session.status === "terminated") return "Terminated"; if (session.status === "errored") return "Failed"; if (session.status === "working") return "Running"; return session.status || "Unknown"; }
+const isStructured = (session: Session) => session.mode === "structured" || (session.mode === undefined && session.harness !== "shell");
+const needsYou = (session: Session) => session.awaiting === "input" || session.awaiting === "approval";
+function canonicalHub(value: string) { const url = new URL(value.trim()); if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) throw new Error("Enter a hub origin, such as https://hub.example.com."); return url.origin; }
+async function api<T>(connection: Connection, path: string): Promise<T> { const response = await fetch(`${connection.hub}${path}`, { headers: { Authorization: `Bearer ${connection.token}` }, credentials: "omit" }); if (response.status === 401) throw new Error("This browser’s device credential is no longer valid. Pair again to continue."); if (!response.ok) throw new Error(`The hub could not load this view (${response.status}).`); return response.json() as Promise<T>; }
+const stateClass = (session: Session) => state(session).toLowerCase().replaceAll(" ", "-");
 
 function App() {
-  const [route, setRoute] = useState<AppRoute>(routeFromHash);
-
-  useEffect(() => {
-    const updateRoute = () => setRoute(routeFromHash());
-    window.addEventListener("hashchange", updateRoute);
-    return () => window.removeEventListener("hashchange", updateRoute);
-  }, []);
-
-  return (
-    <div class="app-shell">
-      <a class="skip-link" href="#content">Skip to content</a>
-      <header class="topbar">
-        <a class="wordmark" href="#/home" aria-label="Drover home">Drover</a>
-        <a class="connection" href="#/connection">Connect a hub</a>
-      </header>
-      <div class="layout">
-        <nav aria-label="Primary navigation">
-          <ul>
-            {routes.map((item) => (
-              <li>
-                <a
-                  aria-current={route === item ? "page" : undefined}
-                  href={`#/${item}`}
-                >
-                  {labels[item]}
-                </a>
-              </li>
-            ))}
-          </ul>
-        </nav>
-        <main id="content" tabIndex={-1}>
-          <p class="eyebrow">WEB CLIENT · P0</p>
-          <h1>{route === "connection" ? "Connect a hub" : labels[route]}</h1>
-          <section class="empty-state" aria-labelledby="coming-title">
-            <h2 id="coming-title">Coming in P0</h2>
-            <p>
-              {route === "connection"
-                ? "Pairing will arrive in the next P0 slice. This placeholder does not send a hub address or code."
-                : "This hub-served shell is ready for the fleet, inbox, session and analytics views that follow in this phase."}
-            </p>
-          </section>
-        </main>
-      </div>
-    </div>
-  );
+  const [current, setCurrent] = useState(routeFromHash); const [connection, setConnection] = useState<Connection | null>(fixtureMode() ? { hub: "fixture://fleet", token: fixtureConnectionToken } : loadConnection()); const [snapshot, setSnapshot] = useState<Snapshot | null>(fixtureMode() ? fixtureSnapshot : null); const [accounts, setAccounts] = useState<ProviderAccount[]>(fixtureMode() ? fixtureAccounts : []); const [error, setError] = useState(""); const [theme, setTheme] = useState<"system" | "light" | "dark">((localStorage.getItem("drover.web.theme") as "system" | "light" | "dark") || "system");
+  useEffect(() => { const listener = () => setCurrent(routeFromHash()); addEventListener("hashchange", listener); return () => removeEventListener("hashchange", listener); }, []);
+  useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem("drover.web.theme", theme); }, [theme]);
+  useEffect(() => { if (!connection || fixtureMode()) return; let alive = true; const refresh = async () => { try { const data = mapSnapshot(await api<unknown>(connection, "/harness")); if (alive) { setSnapshot(data); setError(""); } } catch (cause) { if (alive) setError(cause instanceof Error ? cause.message : "Unable to reach this hub."); } }; refresh(); const timer = setInterval(refresh, 5000); return () => { alive = false; clearInterval(timer); }; }, [connection]);
+  useEffect(() => { if (!connection || fixtureMode()) return; let alive = true; api<unknown>(connection, "/cockpit/overview?days=7").then((data) => alive && setAccounts(mapProviderAccounts(data))).catch(() => alive && setAccounts([])); return () => { alive = false; }; }, [connection]);
+  const inbox = snapshot?.sessions.filter(needsYou).length ?? 0; const go = (route: string) => { location.hash = `#/${route}`; };
+  return <div class="app-shell"><a class="skip-link" href="#content">Skip to content</a><aside class="rail" aria-label="Primary navigation"><a class="wordmark" href="#/home" aria-label="Drover home"><span>◆</span> Drover</a><Navigation current={current.route} inbox={inbox} /> <div class="rail-foot"><button class="quiet-button" onClick={() => go("connection")}>⌘ Connect hub</button><label class="theme-picker">Appearance<select value={theme} onChange={(event) => setTheme((event.currentTarget as HTMLSelectElement).value as typeof theme)}><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select></label></div></aside><main id="content" tabIndex={-1}>{error && <p class="notice" role="alert">{error} <a href="#/connection">Connection settings</a></p>}{!connection && current.route !== "connection" ? <Connect onConnected={(next) => { setConnection(next); go("home"); }} /> : current.route === "connection" ? <Connect onConnected={(next) => { setConnection(next); go("home"); }} /> : !snapshot ? <Loading /> : current.route === "home" ? <Home snapshot={snapshot} onOpen={(id) => go(`sessions/${encodeURIComponent(id)}`)} /> : current.route === "session" ? <SessionDetail session={snapshot.sessions.find((row) => row.id === current.sessionId)} connection={connection!} fixture={fixtureMode()} onBack={() => go("home")} /> : current.route === "accounts" ? <Accounts accounts={accounts} hosts={snapshot.hosts} /> : <Placeholder route={current.route} count={inbox} />}</main><div class="dock"><Navigation current={current.route} inbox={inbox} /></div></div>;
 }
-
+function Navigation({ current, inbox }: { current: Route; inbox: number }) { return <nav aria-label="Primary navigation"><ul>{nav.map((item) => <li><a href={`#/${item.route}`} aria-current={current === item.route ? "page" : undefined}><span aria-hidden="true">{item.icon}</span><small>{item.label}</small>{item.route === "inbox" && inbox > 0 && <b class="badge">{inbox}</b>}</a></li>)}</ul></nav>; }
+function Loading() { return <section class="loading"><p class="eyebrow">FLEET</p><h1>Connecting to your hub</h1><p>Loading its current fleet snapshot…</p></section>; }
+function Connect({ onConnected }: { onConnected: (connection: Connection) => void }) {
+  const [hub, setHub] = useState(initialHub()); const [code, setCode] = useState(""); const [remember, setRemember] = useState(true); const [message, setMessage] = useState(""); const [busy, setBusy] = useState(false);
+  const submit = async (event: Event) => { event.preventDefault(); setMessage(""); let origin: string; try { origin = canonicalHub(hub); } catch (cause) { setMessage(cause instanceof Error ? cause.message : "Check the hub address."); return; } if (location.protocol === "https:" && origin.startsWith("http:")) { setMessage("This HTTPS page cannot pair with an HTTP hub. Open that hub’s own /ui page, or use HTTPS through Tailscale Serve."); return; } if (!code.trim()) { setMessage("Enter the pairing code from your hub."); return; } setBusy(true); try { const response = await fetch(`${origin}/auth/pair`, { method: "POST", credentials: "omit", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: code.trim(), device_name: `Web – ${navigator.userAgent.includes("Firefox") ? "Firefox" : navigator.userAgent.includes("Safari") ? "Safari" : "Chrome"}` }) }); const body = await response.json() as { token?: string; scope?: string }; if (!response.ok) throw new Error(response.status === 410 ? "That pairing code has expired or was already used. Generate a new code." : "Pairing was not accepted. Check the code and try a new one."); if (body.scope !== "device" || !body.token) throw new Error("This code did not return a device credential. Use a device pairing code from the hub."); const next = { hub: origin, token: body.token }; if (remember) { localStorage.setItem(`drover.web.connection:${origin}`, JSON.stringify(next)); localStorage.setItem("drover.web.connection", JSON.stringify(next)); } onConnected(next); } catch (cause) { setMessage(cause instanceof Error ? cause.message : "Unable to pair with that hub."); } finally { setBusy(false); } };
+  return <section class="connect-page"><p class="eyebrow">DROVER WEB</p><h1>Connect your hub</h1><p class="lede">Pair this browser with a private Drover hub. Your hub address and device credential stay in this browser.</p><form class="connect-card" onSubmit={submit}><label>Hub URL<input type="url" value={hub} onInput={(event) => setHub((event.currentTarget as HTMLInputElement).value)} placeholder="https://hub.example.com" autoComplete="url" required /></label><label>Pairing code<input value={code} onInput={(event) => setCode((event.currentTarget as HTMLInputElement).value)} placeholder="XXXX-XXXX" autoComplete="one-time-code" required /></label><label class="checkbox"><input type="checkbox" checked={remember} onChange={(event) => setRemember((event.currentTarget as HTMLInputElement).checked)} /> Remember this hub on this browser</label>{message && <p class="form-error" role="alert">{message}</p>}<button class="primary" disabled={busy}>{busy ? "Pairing…" : "Pair hub"}</button></form><p class="connect-help">For a secure remote connection, use <strong>Tailscale Serve HTTPS</strong>. Device credentials are separate from the hub’s operator login.</p></section>;
+}
+function Home({ snapshot, onOpen }: { snapshot: Snapshot; onOpen: (id: string) => void }) { const [host, setHost] = useState("all"); const sessions = snapshot.sessions.filter((session) => host === "all" || session.hostId === host); const need = snapshot.sessions.filter(needsYou).length; const running = snapshot.sessions.filter((item) => item.status === "working" && !needsYou(item) && isStructured(item)).length; const attached = snapshot.sessions.filter((item) => item.status === "working" && !needsYou(item) && !isStructured(item)).length; const finished = snapshot.sessions.filter((item) => ["completed", "errored", "terminated"].includes(item.status)).length; const live = snapshot.hosts.filter((item) => item.status === "online").length; return <section class="home"><header class="page-header"><div><p class="eyebrow">FLEET OVERVIEW</p><h1>Home</h1></div><p class="refresh">Updated now <i /> Live</p></header><div class="counts"><span><strong>{need}</strong> need you</span><b>·</b><span><strong>{running}</strong> running</span>{attached > 0 && <><b>·</b><span><strong>{attached}</strong> shell attached</span></>}<b>·</b><span><strong>{finished}</strong> finished</span><b>·</b><span><strong>{live}</strong> hosts live</span></div><div class="filters" aria-label="Host filter"><button class={host === "all" ? "selected" : ""} onClick={() => setHost("all")}>All hosts <span>{snapshot.sessions.length}</span></button>{snapshot.hosts.map((item) => <button class={host === item.id ? "selected" : ""} onClick={() => setHost(item.id)}><i class={`host-dot ${item.status}`} />{item.name}<span>{snapshot.sessions.filter((session) => session.hostId === item.id).length}</span></button>)}</div><div class="section-heading"><p class="eyebrow">SESSIONS</p><span>{sessions.length} shown</span></div><div class="session-list">{sessions.map((session) => <SessionCard session={session} onOpen={onOpen} />)}</div></section>; }
+function SessionCard({ session, onOpen }: { session: Session; onOpen: (id: string) => void }) { return <article class="session-card"><button class="session-main" onClick={() => onOpen(session.id)} aria-label={`Open ${session.title}`}><div class="card-top"><code>{session.repo || "Unknown repository"}</code><span class={`state ${stateClass(session)}`}><i />{state(session)}</span></div><h2>{session.title}</h2><p class="session-meta"><span>{session.hostName}</span><b>·</b><span>{session.harness}</span><b>·</b><time dateTime={session.activityAt} title={session.activityAt}>{relative(session.activityAt)}</time></p></button><div class="card-actions">{needsYou(session) && <button disabled>Answer</button>}<button disabled>Watch</button></div></article>; }
+function SessionDetail({ session, connection, fixture, onBack }: { session?: Session; connection: Connection; fixture: boolean; onBack: () => void }) { const [messages, setMessages] = useState<Message[]>(fixture ? fixtureMessages : []); const [older, setOlder] = useState(fixture); const [loadingOlder, setLoadingOlder] = useState(false); const [error, setError] = useState(""); useEffect(() => { if (!session || fixture) return; let active = true; api<unknown>(connection, `/harness/sessions/${encodeURIComponent(session.id)}/messages?limit=50`).then((data) => { const page = mapMessagePage(data); if (active) { setMessages(page.messages); setOlder(page.hasOlder); } }).catch((cause) => active && setError(cause instanceof Error ? cause.message : "Transcript unavailable.")); return () => { active = false; }; }, [connection, fixture, session]); const loadOlder = async () => { if (!session || fixture) { setOlder(false); return; } const before = Math.min(...messages.map((message) => message.seq)); if (!Number.isFinite(before)) return; setLoadingOlder(true); try { const page = mapMessagePage(await api<unknown>(connection, `/harness/sessions/${encodeURIComponent(session.id)}/messages?before_seq=${before}&limit=50`)); setMessages((current) => [...current, ...page.messages].filter((message, index, all) => all.findIndex((candidate) => candidate.id === message.id) === index).sort((a, b) => a.seq - b.seq)); setOlder(page.hasOlder); } catch (cause) { setError(cause instanceof Error ? cause.message : "Older transcript messages are unavailable."); } finally { setLoadingOlder(false); } }; if (!session) return <section class="not-found"><h1>Session not found</h1><button class="text-button" onClick={onBack}>Back to Home</button></section>; return <section class="detail"><button class="back" onClick={onBack}>← Home</button><header class="detail-head"><div><code>{session.repo || "Unknown repository"}</code><h1>{session.title}</h1><p>{session.hostName} <b>·</b> {session.harness}{session.model && <> <b>·</b> {session.model}</>}</p></div><span class={`state ${stateClass(session)}`}><i />{state(session)}</span></header><section class="transcript" aria-label="Session transcript"><div class="transcript-head"><p class="eyebrow">TRANSCRIPT</p><span>Read-only · P0</span></div>{older && <button class="load-earlier" disabled={loadingOlder} onClick={loadOlder}>{loadingOlder ? "Loading…" : "Load earlier"}</button>}{error && <p class="form-error" role="alert">{error}</p>}{messages.length === 0 && !error ? <p class="empty-transcript">Loading the latest transcript…</p> : messages.map((message) => <article class={`message ${message.role}`}><header><span>{message.role === "user" ? "You" : message.role === "tool" ? "Tool" : message.type === "transcript.gap" ? "Transcript gap" : "Agent"}</span><time title={message.timestamp}>{message.timestamp ? relative(message.timestamp) : `#${message.seq}`}</time></header><pre>{message.text}</pre></article>)}</section></section>; }
+function Accounts({ accounts, hosts }: { accounts: ProviderAccount[]; hosts: Snapshot["hosts"] }) { const hostName = (id?: string) => hosts.find((host) => host.id === id)?.name || id || "Unknown host"; const remaining = (used?: number) => used === undefined ? "Unknown" : `${Math.max(0, 100 - used)}% left`; return <section class="accounts"><header class="page-header"><div><p class="eyebrow">PROVIDER CAPACITY</p><h1>Accounts</h1></div><p class="refresh">Read-only · P0</p></header>{accounts.length === 0 ? <p class="empty-transcript">This hub has not reported provider capacity.</p> : <div class="account-list">{accounts.map((account) => <article class="account-card"><div><h2>{account.provider}</h2><p>{account.account}{account.plan && <> <b>·</b> {account.plan}</>}<br />{hostName(account.hostId)} <b>·</b> {account.status}{account.observedAt && <> <b>·</b> <time title={account.observedAt}>{relative(account.observedAt)}</time></>}</p></div><div class="quota-windows">{account.windows.length ? account.windows.map((window) => <span><small>{window.kind.replaceAll("_", " ")}</small><strong>{remaining(window.usedPercent)}</strong>{window.resetsAt && <em>resets {relative(window.resetsAt)}</em>}</span>) : <span><small>quota</small><strong>Unknown</strong></span>}</div></article>)}</div>}</section>; }
+function Placeholder({ route, count }: { route: Route; count: number }) { const titles: Record<string, string> = { inbox: "Inbox", analytics: "Analytics", accounts: "Accounts" }; return <section class="placeholder"><p class="eyebrow">P0</p><h1>{titles[route] || "Drover"}</h1><p>{route === "inbox" && count ? `${count} sessions need attention. Inbox is next in the P0 sequence.` : "This read-only destination is being brought over from the iOS client."}</p></section>; }
 render(<App />, document.getElementById("app")!);
