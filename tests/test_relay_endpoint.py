@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 
 import pytest
+from _timeouts import scale_timeout
 
 from drover.schema import bootstrap
 from drover.server.harness.relay_protocol import hello_frame, req_frame, res_frame
@@ -585,7 +586,7 @@ def test_historical_ownership_batches_quarantine_and_finish_with_healthy_hub(
     # Successful registration drives replay; no health flag is held by pending
     # ownership, and no manual reset is needed to finish the durable pass.
     assert _heartbeat_once(state) is not None
-    state.event_reconciliation_thread.join(timeout=10)
+    state.event_reconciliation_thread.join(timeout=scale_timeout(10))
     assert not state.event_reconciliation_thread.is_alive()
     assert not state.event_reconciliation_pending
     assert local.list_events_for_reconciliation() == []
