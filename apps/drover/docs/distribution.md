@@ -307,8 +307,14 @@ when invoking commands with protected arguments.
 is dispatch-only from `main`, checks out the exact dispatch SHA, and uses the
 protected `ios-testflight-upload` environment with signing and ASC secrets.
 Required reviewers and main-only deployment branches must be configured before
-dispatch. It repeats the package, app and UI checks from `ios.yml`, then performs
-signing, archive, verified IPA export and upload.
+dispatch. Before tool setup or signing, it requires successful `ios.yml`
+main-push check runs on the exact dispatched commit SHA through a read-only
+GitHub API gate. PR results at a different SHA do not qualify, even when their
+Git trees match. The package, app and UI suites run in `ios.yml`; the TestFlight
+lane then performs signing, archive, verified IPA export, Apple validation and
+upload without repeating those suites. Missing, unfinished or unsuccessful
+checks fail immediately with their names. See the runbook for gate recovery and
+expected timings.
 
 Use the [TestFlight runbook](internal-testflight-runbook.md) for the required
 manual pre-upload smoke, exact secret names, Apple processing and physical
