@@ -18,6 +18,8 @@ removed in an `always()` cleanup step. The credentials are supplied by the
 protected `ios-testflight-upload` environment, matching the existing
 TestFlight API-key arrangement.
 
-Apple does not staple tickets to a bare Mach-O binary. Consequently the
-workflow verifies the notarised binary with `spctl --type execute`; Gatekeeper
-uses its normal online notarisation lookup when the downloaded command is run.
+Apple does not staple tickets to a bare Mach-O binary, and `spctl --type
+execute` assesses app bundles rather than standalone commands. Consequently the
+workflow verifies the notarised binary with `spctl -a -vv -t open --context
+context:primary-signature`; Gatekeeper uses its normal online notarisation
+lookup when the downloaded command is run.

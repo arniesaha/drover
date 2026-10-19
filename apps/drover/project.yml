@@ -70,6 +70,7 @@ targets:
     info:
       path: Drover/Info.plist
       properties:
+        CFBundleDisplayName: Drover
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         # Asked on every App Store Connect upload otherwise, which stalls a
         # TestFlight submission until someone answers it by hand. Drover uses
@@ -179,6 +180,7 @@ targets:
     info:
       path: DroverWidget/Info.plist
       properties:
+        CFBundleDisplayName: Drover
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:

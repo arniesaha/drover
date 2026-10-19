@@ -59,7 +59,7 @@ def test_production_testflight_is_manual_local_networking_and_credential_isolate
         s
         for s in upload["steps"]
         if s.get("name")
-        == "Upload, wait for Apple processing and assign internal group"
+        == "Validate, upload, wait for Apple processing and assign internal group"
     )
     assert upload_step["if"] == "${{ inputs.upload }}"
 
@@ -216,6 +216,7 @@ def test_production_apple_key_is_private_and_cleanup_survives_tool_failure(
         assert command[command.index("--build") + 1] == "3"
         assert command[command.index("--internal-group") + 1] == "Drover Internal"
         assert "--info-plist" in command
+        assert "--validate" in command
         assert "DROVER_APPSTORE_API_PRIVATE_KEY_BASE64" not in kwargs["env"]
         raise subprocess.CalledProcessError(1, command, stderr="private diagnostic")
 
@@ -225,7 +226,7 @@ def test_production_apple_key_is_private_and_cleanup_survives_tool_failure(
         match="^upload or TestFlight distribution failed; see sanitized diagnostics and upload-record.json$",
     ):
         _run_production_python_step(
-            "Upload, wait for Apple processing and assign internal group",
+            "Validate, upload, wait for Apple processing and assign internal group",
             monkeypatch,
             tmp_path,
         )
@@ -506,6 +507,27 @@ def test_release_workflow_never_runs_on_pull_requests() -> None:
     workflow = load_workflow("release.yml")
     assert "pull_request" not in workflow["on"]
     assert "pull_request_target" not in workflow["on"]
+
+
+def test_harnessd_macos_notarization_assesses_the_bare_binary() -> None:
+    """A standalone Mach-O needs an open assessment, not an app-bundle one."""
+    steps = load_workflow("harnessd-macos-notarize.yml")["jobs"]["sign-notarize"][
+        "steps"
+    ]
+    verify = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Verify signature and Gatekeeper assessment"
+    )
+
+    assert "codesign --verify --strict --verbose=2" in verify
+    assert "TeamIdentifier=$SIGNING_TEAM_ID" in verify
+    assert (
+        'spctl -a -vv -t open --context context:primary-signature "$binary"' in verify
+    )
+    assert "-t execute" not in verify
+    assert "grep -q 'accepted'" in verify
+    assert "grep -q 'source=Notarized Developer ID'" in verify
 
 
 def test_clean_install_uses_configured_address_and_keeps_pairing_private() -> None:
