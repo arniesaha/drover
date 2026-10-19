@@ -30,6 +30,10 @@ concurrency:
 
 jobs:
   archive-upload:
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     if: github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/ci/testflight-widget-profile' && inputs.upload == false)
     environment: ios-testflight-upload
     runs-on: macos-26
@@ -44,6 +48,11 @@ jobs:
       with:
         ref: ${{ github.sha }}
         persist-credentials: false
+    - name: Require successful iOS CI for dispatch SHA
+      timeout-minutes: 2
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: python3 scripts/ios/require_ios_ci.py
     - uses: actions/setup-python@v5
       with:
         python-version: '3.13'
@@ -58,47 +67,6 @@ jobs:
     - name: Generate Xcode project
       working-directory: apps/drover
       run: xcodegen generate
-    - name: Run DroverKit package tests
-      working-directory: apps/drover
-      run: swift test --package-path DroverKit --jobs 2
-    - name: Select iPhone simulator
-      working-directory: apps/drover
-      run: |
-        simulator_id="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
-        if [ -z "$simulator_id" ]; then
-          echo "No available iPhone simulator found." >&2
-          xcrun simctl list devices available >&2
-          exit 1
-        fi
-        echo "SIMULATOR_DESTINATION=id=$simulator_id" >> "$GITHUB_ENV"
-        echo "Selected simulator id=$simulator_id"
-    - name: Resolve Swift packages
-      working-directory: apps/drover
-      run: |
-        xcodebuild -project Drover.xcodeproj \
-          -scheme Drover \
-          -resolvePackageDependencies
-    - name: Run app unit tests
-      working-directory: apps/drover
-      run: |
-        set -o pipefail
-        xcodebuild -project Drover.xcodeproj \
-          -scheme Drover \
-          -destination "$SIMULATOR_DESTINATION" \
-          -resultBundlePath "$RUNNER_TEMP/DroverTests.xcresult" \
-          test
-    - name: Run deterministic and accessibility UI journeys
-      working-directory: apps/drover
-      run: |
-        set -o pipefail
-        xcodebuild -project Drover.xcodeproj \
-          -scheme DroverUITests \
-          -destination "$SIMULATOR_DESTINATION" \
-          -only-testing:DroverUITests/DeterministicJourneyUITests \
-          -only-testing:DroverUITests/InsightDetailFixtureUITests \
-          -only-testing:DroverUITests/AccessibilityJourneyUITests \
-          -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
-          test
     - name: Snapshot runner keychain search list
       run: |
         python3 - <<'PY'
