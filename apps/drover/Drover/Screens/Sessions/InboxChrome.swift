@@ -80,10 +80,7 @@ private struct ChromeButton: View {
     }
 }
 
-/// The footer: one full-width primary action rather than a floating pill,
-/// pinned below the list so it never scrolls away. Outlined on the ground
-/// tone, never a filled bar — the system guide reserves fills for nothing at
-/// this scale.
+/// A floating primary action that stays above the dock without covering rows.
 struct NewSessionBar: View {
     let action: () -> Void
 
@@ -92,19 +89,17 @@ struct NewSessionBar: View {
             Label("New Session", systemImage: "plus")
                 .font(.system(.subheadline, design: .default, weight: .medium))
                 .foregroundStyle(DroverColor.accentHi)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 13)
-                .background(DroverColor.bg, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .padding(.horizontal, 16)
+                .frame(minHeight: 44)
+                .background(DroverColor.bg, in: Capsule())
                 .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    Capsule()
                         .strokeBorder(DroverColor.accent, lineWidth: 1)
                 }
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("launch-button")
-        .padding(.horizontal, 18)
-        .padding(.top, 10)
-        .padding(.bottom, 8)
+        .accessibilityLabel("New Session")
     }
 }
 

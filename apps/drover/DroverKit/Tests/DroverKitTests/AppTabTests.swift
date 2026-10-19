@@ -4,23 +4,24 @@ import Testing
 
 @Suite struct AppTabTests {
     @Test func allCasesHaveExpectedMetadata() {
-        #expect(AppTab.allCases == [.analytics, .insights, .accounts, .home])
+        #expect(AppTab.allCases == [.home, .inbox, .analytics, .accounts])
+
+        #expect(AppTab.home.title == "Home")
+        #expect(AppTab.home.systemImage == "rectangle.stack")
+        #expect(AppTab.home.accessibilityIdentifier == "tab-home")
+
+        #expect(AppTab.inbox.title == "Inbox")
+        #expect(AppTab.inbox.systemImage == "tray.full")
+        #expect(AppTab.inbox.accessibilityIdentifier == "tab-inbox")
 
         #expect(AppTab.analytics.title == "Analytics")
         #expect(AppTab.analytics.systemImage == "chart.bar")
         #expect(AppTab.analytics.accessibilityIdentifier == "tab-analytics")
 
-        #expect(AppTab.insights.title == "Insights")
-        #expect(AppTab.insights.systemImage == "lightbulb")
-        #expect(AppTab.insights.accessibilityIdentifier == "tab-insights")
-
         #expect(AppTab.accounts.title == "Accounts")
         #expect(AppTab.accounts.systemImage == "person.crop.circle")
         #expect(AppTab.accounts.accessibilityIdentifier == "tab-accounts")
 
-        #expect(AppTab.home.title == "Home")
-        #expect(AppTab.home.systemImage == "rectangle.stack")
-        #expect(AppTab.home.accessibilityIdentifier == "tab-home")
     }
 
     @Test func persistenceRoundTrip() {
@@ -43,6 +44,6 @@ import Testing
         // Corrupted value falls back
         defaults.set("invalid_tab_name", forKey: AppTab.defaultsKey)
         #expect(AppTab.load(from: defaults) == .home)
-        #expect(AppTab.load(from: defaults, default: .insights) == .insights)
+        #expect(AppTab.load(from: defaults, default: .inbox) == .inbox)
     }
 }

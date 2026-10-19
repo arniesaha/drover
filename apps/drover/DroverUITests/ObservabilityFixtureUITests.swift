@@ -4,6 +4,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     func testComparisonsFiltersAndAccountDetailsRemainReachable() {
         let app = launch()
+        app.tabBars.buttons["Analytics"].tap()
         let hosts = app.buttons["analytics-dimension-hosts"]
         XCTAssertTrue(hosts.waitForExistence(timeout: 5))
         hosts.tap()
@@ -17,8 +18,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
         screenshot("analytics-host-comparison-by-tokens", app)
         rankToggle.buttons["Sessions"].tap()
 
-        app.tabBars.buttons["Insights"].tap()
-        XCTAssertTrue(app.staticTexts["1 LOADED FINDING"].waitForExistence(timeout: 5))
+        app.tabBars.buttons["Inbox"].tap()
+        app.segmentedControls["inbox-segments"].buttons["Insights"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["insights-filters"].waitForExistence(timeout: 5))
         app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "More filters")).firstMatch.tap()
         XCTAssertTrue(app.textFields["Filter insights by host"].exists)
         screenshot("insights-overview", app)
@@ -49,6 +51,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     private func checkAnalyticsLargestText(dark: Bool) {
         let app = launch(large: true, dark: dark)
+        app.tabBars.buttons["Analytics"].tap()
         let filters = app.descendants(matching: .any)["analytics-filters"].firstMatch
         XCTAssertTrue(filters.waitForExistence(timeout: 8))
         let days = app.buttons["7 days"].firstMatch
@@ -325,20 +328,26 @@ final class ObservabilityFixtureUITests: XCTestCase {
         // 2. Verify all four tabs exist
         let homeTab = app.tabBars.buttons["Home"]
         let analyticsTab = app.tabBars.buttons["Analytics"]
-        let insightsTab = app.tabBars.buttons["Insights"]
+        let inboxTab = app.tabBars.buttons["Inbox"]
         let accountsTab = app.tabBars.buttons["Accounts"]
 
         XCTAssertTrue(homeTab.exists)
         XCTAssertTrue(analyticsTab.exists)
-        XCTAssertTrue(insightsTab.exists)
+        XCTAssertTrue(inboxTab.exists)
         XCTAssertTrue(accountsTab.exists)
 
         // 3. Switch through all four tabs
         analyticsTab.tap()
         XCTAssertTrue(app.navigationBars["Analytics"].waitForExistence(timeout: 5) || app.descendants(matching: .any)["analytics-filters"].waitForExistence(timeout: 5))
 
-        insightsTab.tap()
-        XCTAssertTrue(app.navigationBars["Insights"].waitForExistence(timeout: 5) || app.staticTexts["1 LOADED FINDING"].waitForExistence(timeout: 5))
+        inboxTab.tap()
+        XCTAssertTrue(app.navigationBars["Inbox"].waitForExistence(timeout: 5))
+        let segments = app.segmentedControls["inbox-segments"]
+        XCTAssertTrue(segments.buttons["Needs you · 0"].exists || segments.buttons["Needs you · 1"].exists)
+        segments.buttons["Insights"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["insights-filters"].waitForExistence(timeout: 5))
+        segments.buttons["History"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["history-list"].waitForExistence(timeout: 5))
 
         accountsTab.tap()
         XCTAssertTrue(app.navigationBars["Accounts"].waitForExistence(timeout: 5))
@@ -353,6 +362,28 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(newSessionButton.isHittable)
 
         screenshot("real-app-home-dock-light", app)
+    }
+
+    @MainActor
+    func testInboxSegmentsProduceReviewScreenshots() {
+        let app = launch()
+        app.tabBars.buttons["Home"].tap()
+        XCTAssertTrue(app.scrollViews["fleet-list"].waitForExistence(timeout: 8))
+        screenshot("nav-home", app)
+
+        let inbox = app.tabBars.buttons["Inbox"]
+        inbox.tap()
+        let segments = app.segmentedControls["inbox-segments"]
+        XCTAssertTrue(segments.waitForExistence(timeout: 5))
+        screenshot("nav-inbox-needs-you-badge", app)
+
+        segments.buttons["Insights"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["insights-filters"].waitForExistence(timeout: 5))
+        screenshot("nav-inbox-insights", app)
+
+        segments.buttons["History"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["history-list"].waitForExistence(timeout: 5))
+        screenshot("nav-inbox-history", app)
     }
 
     @MainActor
@@ -426,6 +457,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
         add(attachment)
 
         let targetDir = URL(fileURLWithPath: "/tmp/drover-fleet-filters")
+        try? FileManager.default.createDirectory(at: targetDir, withIntermediateDirectories: true)
         let targetFile = targetDir.appendingPathComponent("\(name).png")
         try? screenshot.pngRepresentation.write(to: targetFile)
     }

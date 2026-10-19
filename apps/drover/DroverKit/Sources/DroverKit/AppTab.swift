@@ -2,28 +2,28 @@ import Foundation
 
 /// Navigation destinations available in the primary bottom dock.
 public enum AppTab: String, CaseIterable, Identifiable, Sendable {
-    case analytics = "analytics"
-    case insights = "insights"
-    case accounts = "accounts"
     case home = "home"
+    case inbox = "inbox"
+    case analytics = "analytics"
+    case accounts = "accounts"
 
     public var id: String { rawValue }
 
     public var title: String {
         switch self {
-        case .analytics: "Analytics"
-        case .insights: "Insights"
-        case .accounts: "Accounts"
         case .home: "Home"
+        case .inbox: "Inbox"
+        case .analytics: "Analytics"
+        case .accounts: "Accounts"
         }
     }
 
     public var systemImage: String {
         switch self {
-        case .analytics: "chart.bar"
-        case .insights: "lightbulb"
-        case .accounts: "person.crop.circle"
         case .home: "rectangle.stack"
+        case .inbox: "tray.full"
+        case .analytics: "chart.bar"
+        case .accounts: "person.crop.circle"
         }
     }
 

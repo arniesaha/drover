@@ -26,9 +26,6 @@ import WidgetKit
 /// dot to its offline form, which is why there is no longer a banner inset or
 /// a whole-screen dim here.
 struct SessionsView: View {
-    @State private var workStore: WorkAttentionStore
-    @State private var focusedAttentionID: String?
-    @State private var attentionFocusRevision = 0
     @State private var store: SessionStore
     @State private var cockpitStore: CockpitStore
     private let client: DroverClient
@@ -46,11 +43,8 @@ struct SessionsView: View {
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
     @State private var showFinished = false
-    @State private var showAnalytics = false
     @State private var showAccounts = false
-    @State private var showInsights = false
     let isDemoMode: Bool
-    @State private var showHistory = false
     @State private var notificationSessionIDs: Set<String>?
     @State private var filterState: FleetFilterState
     @State private var isOverviewExpanded = false
@@ -80,7 +74,6 @@ struct SessionsView: View {
         self.onOpenSettings = onOpenSettings
         self.onOpenAccountsTab = onOpenAccountsTab
         _filterState = State(initialValue: FleetFilterState.load(from: defaults))
-        _workStore = State(initialValue: WorkAttentionStore(service: client))
         _store = State(initialValue: sessionStore ?? SessionStore(client: client))
         _cockpitStore = State(initialValue: cockpitStore ?? CockpitStore(client: client))
     }
@@ -113,17 +106,10 @@ struct SessionsView: View {
                     .accessibilityIdentifier("exporterFreshnessWarning")
             }
 
-            ScrollViewReader { proxy in
+            ScrollViewReader { _ in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         if dynamicTypeSize.isAccessibilitySize { statusHeader }
-                        if workStore.isVisible {
-                            WorkAttentionList(store: workStore, focusedID: focusedAttentionID) { sessionID in
-                                NotificationRoute.shared.open(sessionID: sessionID)
-                                openSessionFromNotification()
-                            }
-                            .id("work-attention")
-                        }
                         // Action errors (e.g. a failed continueSession) land here.
                         // They are distinct from an unreachable hub: connected, but
                         // the last thing you asked for didn't happen. Refresh
@@ -133,10 +119,8 @@ struct SessionsView: View {
                             actionFailedRow(lastError)
                         }
 
-                        // One list, in one run. Work that needs a human is still
-                        // first and running sessions still follow it, but nothing
-                        // is allowed between them any more: the analytics that used
-                        // to sit in the middle are below the list now (#80).
+                        // Home is the live fleet: needs-you and working sessions
+                        // stay together, while decisions and findings live in Inbox.
                         if inboxSessions.isEmpty, store.hasLoadedOnce {
                             if filterState.isFiltered {
                                 ContentUnavailableView(
@@ -165,18 +149,6 @@ struct SessionsView: View {
                             finishedSection
                         }
 
-                        // The live list holds only recent finished sessions per
-                        // host; everything older, across every host, is History.
-                        if store.hasLoadedOnce {
-                            historyEntry
-                        }
-
-                        if cockpitStore.isCockpitAvailable {
-                            VStack(alignment: .leading, spacing: 10) {
-                                analyticsSections
-                            }
-                            .padding(.top, 6)
-                        }
                     }
                     .padding(.horizontal, 14)
                     .padding(.top, 8)
@@ -184,7 +156,6 @@ struct SessionsView: View {
                 }
                 .accessibilityIdentifier("fleet-list")
                 .refreshable {
-                    await workStore.refresh()
                     await store.refresh()
                     if let snapshot = store.snapshot {
                         await cockpitStore.refresh(for: snapshot)
@@ -240,19 +211,17 @@ struct SessionsView: View {
                     }
                 }
 
-                .onChange(of: attentionFocusRevision) { _, _ in
-                    if let id = focusedAttentionID { proxy.scrollTo(id, anchor: .top) }
-                }
-                .onChange(of: workStore.items) { _, _ in
-                    if let id = focusedAttentionID { proxy.scrollTo(id, anchor: .top) }
-                }
             }
 
-            if store.hasLoadedOnce {
-                actionBar
-            }
         }
         .background(DroverColor.bg)
+        // A safe-area inset keeps the floating control visually pinned while
+        // reserving its hit region. An overlay left the final session row
+        // underneath the pill at accessibility sizes, so tapping the row
+        // opened New Session instead of the conversation.
+        .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
+            if store.hasLoadedOnce { actionBar.padding(.trailing, 18).padding(.vertical, 18) }
+        }
         // The design's chrome row *is* this screen's header, so the navigation
         // bar it would otherwise sit under has nothing left to carry. Pushed
         // screens (chat, terminal, the launch sheet) declare their own bars
@@ -265,22 +234,6 @@ struct SessionsView: View {
         // `startPolling()` now leaves a live loop alone, so the two calls can
         // stay independent and neither has to know about the other.
         .task { store.startPolling() }
-        .task(id: scenePhase) {
-            guard scenePhase == .active else { return }
-            while !Task.isCancelled {
-                await workStore.refresh()
-                if workStore.isReachable {
-                    await WorkAttentionNotifications.evaluate(workStore.items, notifier: notifier, defaults: defaults)
-                }
-                openAttentionFromNotification()
-                guard let interval = workStore.pollIntervalSeconds else { return }
-                do { try await Task.sleep(for: .seconds(interval)) }
-                catch { return }
-            }
-        }
-        .onChange(of: NotificationRoute.shared.pendingAttentionRef) { _, _ in
-            openAttentionFromNotification()
-        }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             while !Task.isCancelled {
@@ -346,11 +299,12 @@ struct SessionsView: View {
         .onChange(of: cockpitStore.providerAccounts) { _, _ in
             syncWidgetSnapshot()
         }
-        .onAppear { openSessionFromNotification(); openAttentionFromNotification() }
+        .onAppear { openSessionFromNotification() }
         .sheet(isPresented: $showLaunch) {
             NavigationStack {
                 LaunchView(
                     client: client, snapshot: store.snapshot,
+                    providerAccounts: cockpitStore.providerAccounts,
                     catalogStore: HarnessModelCatalogStore(defaults: defaults)
                 ) { sessionID, isStructured, harness in
                     launchedSession = LaunchedSession(
@@ -383,10 +337,6 @@ struct SessionsView: View {
             }
             .toolbar(.hidden, for: .tabBar)
         }
-        .navigationDestination(isPresented: $showAnalytics) {
-            AnalyticsView(store: cockpitStore)
-                .toolbar(.hidden, for: .tabBar)
-        }
         .navigationDestination(isPresented: $showAccounts) {
             ProviderAccountsView(
                 accounts: cockpitStore.providerAccounts,
@@ -399,14 +349,6 @@ struct SessionsView: View {
                 }
             )
             .toolbar(.hidden, for: .tabBar)
-        }
-        .navigationDestination(isPresented: $showInsights) {
-            InsightsView(client: client, store: cockpitStore)
-                .toolbar(.hidden, for: .tabBar)
-        }
-        .navigationDestination(isPresented: $showHistory) {
-            HistoryView(client: client)
-                .toolbar(.hidden, for: .tabBar)
         }
     }
 
@@ -610,26 +552,6 @@ struct SessionsView: View {
         return parts.joined(separator: " · ")
     }
 
-    private var historyEntry: some View {
-        Button { showHistory = true } label: {
-            CockpitCard {
-                HStack(spacing: 12) {
-                    Image(systemName: "clock.arrow.circlepath").foregroundStyle(DroverColor.accentHi)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("History").droverText(.h2)
-                        Text("Every session across your hosts").droverText(.subtitle)
-                    }
-                    Spacer(minLength: 8)
-                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(DroverColor.faint)
-                }
-                .frame(minHeight: 44, alignment: .leading)
-            }
-        }
-        .buttonStyle(.plain)
-        .padding(.top, 4)
-        .accessibilityIdentifier("history-entry")
-    }
-
     private var summary: FleetSummaryPresentation {
         FleetSummaryPresentation(
             snapshot: store.snapshot,
@@ -704,34 +626,32 @@ struct SessionsView: View {
                 }
             )
         }
+        if accountNeedsAttention {
+            Button {
+                if let onOpenAccountsTab {
+                    onOpenAccountsTab()
+                } else {
+                    showAccounts = true
+                }
+            } label: {
+                Label("Account needs attention", systemImage: "exclamationmark.triangle.fill")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .foregroundStyle(DroverColor.warn)
+                    .background(DroverColor.accentTint, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("account-health-warning")
+        }
     }
 
-    /// Everything that is *about* the fleet rather than *in* it. Below the
-    /// list, where it can no longer split it.
-    @ViewBuilder
-    private var analyticsSections: some View {
-        Button { showAnalytics = true } label: {
-            CockpitCard {
-                HStack(spacing: 12) {
-                    Image(systemName: "chart.bar").foregroundStyle(DroverColor.accentHi)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Analytics").droverText(.h2)
-                        Text("Projects, agents, hosts and models").droverText(.subtitle)
-                    }
-                    Spacer(minLength: 8)
-                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(DroverColor.faint)
-                }
-                .frame(minHeight: 44, alignment: .leading)
-            }
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("analytics-summary")
-
-        if cockpitStore.isInsightsAvailable {
-            InsightsSummaryRow(counts: cockpitStore.insightCounts) {
-                showInsights = true
-            }
-        }
+    private var accountNeedsAttention: Bool {
+        AccountHealthPresentation.needsAttention(
+            usedPercents: cockpitStore.providerAccounts.flatMap(\.windows).map(\.usedPercent),
+            hasAuthError: cockpitStore.providerAccounts.contains { $0.status != .ok },
+            hasProviderError: cockpitStore.providerError != nil,
+            isStale: providerSectionStatus == .stale || cockpitStore.providerAccounts.contains { $0.status == .stale }
+        )
     }
 
     private func actionFailedRow(_ message: String) -> some View {
@@ -829,18 +749,6 @@ struct SessionsView: View {
                 }
             }
         }
-    }
-
-    private func openAttentionFromNotification() {
-        guard let ref = NotificationRoute.shared.pendingAttentionRef else { return }
-        guard workStore.isReachable else { return }
-        notificationSessionIDs = nil
-        launchedSession = nil
-        focusedAttentionID = workStore.items.first {
-            $0.workspaceID == ref.workspaceID && $0.id == ref.id
-        }?.id ?? "work-attention"
-        attentionFocusRevision += 1
-        _ = NotificationRoute.shared.consumeAttention()
     }
 
     /// Marked on open and again on leaving: the session may only start asking

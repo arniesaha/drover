@@ -65,6 +65,10 @@ class ProviderAccountSnapshot:
     provider_observed_at: datetime | None = None
     freshness_age_seconds: float | None = None
     account_identity: str | None = None
+    # The host's capability inventory records which launchers use this
+    # account. Keep the wire relationship intact for clients; it is not
+    # inferred from a provider name on the client.
+    harnesses: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.status not in {
@@ -105,6 +109,7 @@ def provider_snapshot_schema() -> pa.Schema:
             ("observed_at", pa.timestamp("us", tz="UTC")),
             ("source", pa.string()),
             ("error_category", pa.string()),
+            ("harnesses", pa.list_(pa.string())),
             ("window_kind", pa.string()),
             ("used_percent", pa.float64()),
             ("limit_value", pa.float64()),
@@ -137,6 +142,7 @@ def provider_snapshot_table(snapshot: ProviderAccountSnapshot) -> pa.Table:
             "observed_at": snapshot.observed_at,
             "source": snapshot.source,
             "error_category": snapshot.error_category,
+            "harnesses": list(snapshot.harnesses),
             "window_kind": window.kind if window else None,
             "used_percent": window.used_percent if window else None,
             "limit_value": window.limit_value if window else None,
