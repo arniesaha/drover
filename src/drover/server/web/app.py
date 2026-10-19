@@ -44,7 +44,10 @@ from drover.server.db import (
 )
 from drover.server.harness.capabilities import unique_capability_keys
 from drover.server.harness.model_catalog.models import MAX_ID_LENGTH
-from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.registry import (
+    UNKNOWN_SESSION_RETRY_WINDOW_SECONDS,
+    HarnessRegistry,
+)
 from drover.server.harness.relay_protocol import (
     RELAY_CONTROL_FRAME_BYTES,
     RelayProtocolError,
@@ -90,7 +93,7 @@ log = logging.getLogger("drover.metrics")
 
 # Event timestamps can predate registration by years during replay. Only
 # elapsed hub-observed retries can establish a missing session as an orphan.
-_UNKNOWN_SESSION_RETRY_WINDOW_SECONDS = 24 * 60 * 60
+_UNKNOWN_SESSION_RETRY_WINDOW_SECONDS = UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
 _MAX_UNKNOWN_SESSION_RETRIES = 4096
 # ``EventPusher`` retries ownership races, so one malformed or unusually large
 # replay can otherwise make the hub retain its raw bytes, decoded text, and
@@ -2591,6 +2594,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         registry = self._harness_registry()
         skipped = 0
         pending_sessions: list[str] = []
+        rejected_sessions: dict[str, str] = {}
         if self.auth.enabled:
             credential = bearer_credential(self.auth, self.headers)
             if not self._authorize_host(credential.host_id if credential else ""):
@@ -2625,6 +2629,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                             pending_sessions.append(session_id)
                         continue
                     skipped += 1
+                    rejected_sessions[session_id] = (
+                        "session_missing_after_registration_window"
+                    )
                     if session_id not in orphaned_sessions:
                         orphaned_sessions.append(session_id)
                     log.debug(
@@ -2634,18 +2641,57 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         credential.host_id,
                     )
                     continue
-                if not self._authorize_host(session.host_id, session_id=session_id):
-                    return
+                if not credential_matches_host(credential, session.host_id):
+                    # Old clients treat every unlisted session in a 200 as
+                    # delivered. Preserve their atomic 403 contract during a
+                    # rolling upgrade rather than silently discarding history.
+                    if self.headers.get("X-Drover-Event-Delivery") != "quarantine-v1":
+                        self._authorize_host(session.host_id, session_id=session_id)
+                        return
+                    rejected_sessions[session_id] = "session_owned_by_another_host"
+                    skipped += 1
+                    log.warning(
+                        "host authorization rejected: route=/harness/events session_id=%s "
+                        "expected_host_id=%s credential_host_id=%s",
+                        session_id,
+                        session.host_id,
+                        credential.host_id,
+                    )
+                    continue
                 self.unknown_session_retries.forget(credential.host_id, session_id)
                 known_events.append(event)
+            if rejected_sessions:
+                from drover.server.harness.event_delivery import (
+                    record_ownership_rejection,
+                )
+
+                for session_id, reason in rejected_sessions.items():
+                    record_ownership_rejection(
+                        registry.duckdb_path, credential.host_id, session_id, reason
+                    )
+                if not known_events and not pending_sessions and not orphaned_sessions:
+                    response = {
+                        "error": "session ownership rejected",
+                        "rejected": rejected_sessions,
+                    }
+                    log.warning(
+                        "structured event ownership response: status=403 body=%s",
+                        json.dumps(response),
+                    )
+                    self._send(403, "application/json", json.dumps(response) + "\n")
+                    return
             # Preserve the single-session pre-registration error contract.
             # Mixed batches acknowledge writes/skips and list only held sessions.
             if pending_sessions and not known_events and not skipped:
+                response = {
+                    "error": "session ownership not registered",
+                    "pending": pending_sessions,
+                }
                 log.warning(
                     "structured event ownership pending: route=/harness/events "
-                    "session_id=%s credential_host_id=%s",
-                    pending_sessions[0],
+                    "credential_host_id=%s status=403 body=%s",
                     credential.host_id,
+                    json.dumps(response),
                 )
                 self._send(
                     403,
@@ -2697,12 +2743,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         result = {"ingested": ingested}
         if pending_sessions:
             result["pending"] = pending_sessions
+        if rejected_sessions:
+            result["rejected"] = rejected_sessions
         if skipped:
             result["skipped"] = skipped
         if self.auth.enabled and duplicates:
             result["duplicates"] = duplicates
         if self.auth.enabled and orphaned_sessions:
             result["orphaned"] = orphaned_sessions
+        if pending_sessions or rejected_sessions:
+            log.info(
+                "structured event ownership response: status=200 body=%s",
+                json.dumps(result),
+            )
         self._send(200, "application/json", json.dumps(result) + "\n")
 
     def _handle_login(self) -> None:

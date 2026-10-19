@@ -129,6 +129,12 @@ Host credentials are bound to the exact `--host-id` issued by the hub.
 Registration, heartbeats, relay attachment and event ingest require that binding.
 A different declared host receives 403 and a reason in the hub log. Event
 batches are checked against stored session ownership before any event is written.
+New harnessd clients quarantine terminal ownership rejections with a durable reason
+and retain the original event payloads. Missing-session registration races have a
+ten-minute, hub-observed grace period that survives hub restarts. The hub surfaces
+terminal rejections as an insight; unrelated owned sessions continue delivering.
+See [the #720 incident](incidents/720-ownership-reconciliation.md) for the protocol,
+retention behavior, and read-only diagnosis.
 Host credentials cannot issue pairing codes or change fleet credentials.
 Device credentials retain interactive fleet access, but cannot submit host ingress.
 

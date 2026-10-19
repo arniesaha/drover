@@ -722,9 +722,20 @@ def test_terminal_orphan_is_marked_once_without_warning_spam(
     caplog.set_level(logging.INFO, logger="drover.event_pusher")
     reset_orphaned_event_count()
     try:
+        quarantine = registry.quarantine_events
+
+        def fail_quarantine(*_args):
+            raise OSError("ledger temporarily unavailable")
+
+        monkeypatch.setattr(registry, "quarantine_events", fail_quarantine)
+        assert reconcile_unsent_events(registry, pusher, host_id="h1") is None
+        assert pusher.reconciliation_deferred_reason == "local quarantine unavailable"
+        assert len(registry.list_events_for_reconciliation(host_id="h1")) == 2
+        assert orphaned_event_count() == 0
+        monkeypatch.setattr(registry, "quarantine_events", quarantine)
         assert reconcile_unsent_events(registry, pusher, host_id="h1") == 2
         assert registry.list_events_for_reconciliation(host_id="h1") == []
-        assert len(calls) == 1
+        assert len(calls) == 2
         assert orphaned_event_count() == 2
         assert caplog.text.count("structured event orphaned") == 1
         assert "ownership backoff" not in caplog.text

@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 
 import pytest
+from _timeouts import scale_timeout
 
 from drover.schema import bootstrap
 from drover.server.harness.relay_protocol import hello_frame, req_frame, res_frame
@@ -489,7 +490,7 @@ def test_unknown_session_is_skipped_only_after_observed_retry_window(
     }
     # Event age cannot establish an orphan; the hub must observe failed retries.
     assert _post(metrics_server, "/harness/events", batch) == 403
-    now[0] += 24 * 60 * 60 - 1
+    now[0] += app_module._UNKNOWN_SESSION_RETRY_WINDOW_SECONDS - 1
     assert _post(metrics_server, "/harness/events", batch) == 403
     now[0] += 1
     # A fresh request-handler class simulates a hub process restart.  It must
@@ -511,9 +512,151 @@ def test_unknown_session_retry_window_survives_hub_restart(metrics_server, monke
     registry = HarnessRegistry(metrics_server.collector.duckdb_path)
     first_hub = app_module._UnknownSessionRetries(registry)
     assert not first_hub.expired("host-a", "missing")
-    now[0] += 24 * 60 * 60
+    now[0] += app_module._UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
     restarted_hub = app_module._UnknownSessionRetries(registry)
     assert restarted_hub.expired("host-a", "missing")
+
+
+def test_historical_ownership_batches_quarantine_and_finish_with_healthy_hub(
+    metrics_server, tmp_path, monkeypatch, caplog
+):
+    """#720: absent session rows plus mixed old/new event IDs held all replay."""
+    from datetime import datetime, timedelta, timezone
+
+    from drover.server.advisory.repository import AdvisoryRepository
+    from drover.server.harness.content_consent import DurableContentConsent
+    from drover.server.harness.daemon import (
+        DEFAULT_PRESETS,
+        HarnessDaemonState,
+        _heartbeat_once,
+        _reconcile_persisted_events,
+    )
+    from drover.server.harness.pty import PtySessionManager
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.structured import pusher as pusher_module
+    from drover.server.harness.structured.pusher import EventPusher
+
+    path = tmp_path / "host.duckdb"
+    bootstrap(parquet_dir=tmp_path / "host-parquet", duckdb_path=path)
+    local = HarnessRegistry(path, write_outbox=False)
+    central = HarnessRegistry(metrics_server.collector.duckdb_path)
+    now = [100.0]
+    monkeypatch.setattr(app_module, "_ownership_retry_clock", lambda: now[0])
+    monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0])
+    records = []
+    for number, count in enumerate((7, 8, 11, 12, 41)):
+        for seq in range(count):
+            records.append(
+                {
+                    "event_id": f"old-{number}-{seq}",
+                    "session_id": f"absent-{number}",
+                    "event_type": "status",
+                    "seq": seq,
+                    "payload": {"type": "status", "text": "private transcript"},
+                    "created_at": datetime.now(timezone.utc) - timedelta(days=60),
+                }
+            )
+    local.ingest_structured_events(records)
+    # Mirror/projection history already has some IDs, but its owner rows were
+    # pruned. One unrecognized ID makes the whole session pending in old hubs.
+    central.ingest_structured_events(records[::2])
+    url = f"http://{metrics_server.host}:{metrics_server.port}"
+    pusher = EventPusher(url, metrics_server.token, registry=local)
+    state = HarnessDaemonState(
+        host_id="host-a",
+        display_name="A",
+        kind="macos",
+        registry=local,
+        pty=PtySessionManager(),
+        presets=DEFAULT_PRESETS,
+        local_url="http://127.0.0.1:7081",
+        central_url=url,
+        api_token=metrics_server.token,
+        host_token=metrics_server.token,
+        content_consent=DurableContentConsent(tmp_path / "host-consent.json"),
+        pusher=pusher,
+    )
+    assert not _reconcile_persisted_events(state)
+    assert pusher.reconciliation_deferred_reason == "session ownership pending"
+    assert "hub recovery" not in caplog.text
+    assert "structured event reconciliation deferred" not in caplog.text
+    assert len(local.list_events_for_reconciliation()) == len(records)
+    assert _post(metrics_server, "/harness/hosts", {"host_id": "host-a"}) == 200
+    now[0] += app_module._UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
+    # Successful registration drives replay; no health flag is held by pending
+    # ownership, and no manual reset is needed to finish the durable pass.
+    assert _heartbeat_once(state) is not None
+    state.event_reconciliation_thread.join(timeout=scale_timeout(10))
+    assert not state.event_reconciliation_thread.is_alive()
+    assert not state.event_reconciliation_pending
+    assert local.list_events_for_reconciliation() == []
+    event_ids = [r["event_id"] for r in records]
+    assert local.quarantined_event_ids(event_ids) == set(event_ids)
+    with local._connect() as con:
+        assert con.execute(
+            "SELECT DISTINCT reason FROM harness_event_quarantine"
+        ).fetchall() == [("session_missing_after_registration_window",)]
+        assert (
+            con.execute(
+                "SELECT count(*) FROM harness_events WHERE reconciled_at IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+    assert (
+        local.prune_reconciled_events(
+            now=datetime.now(timezone.utc) + timedelta(days=30)
+        )
+        == 0
+    )
+    # Both daemon restart and a stale live queue respect the durable receipt.
+    restarted = HarnessRegistry(path, write_outbox=False)
+    assert pusher.reconcile(restarted) == 0
+    assert (
+        pusher.post_batch_pending(
+            [{"event_id": event_ids[0], "session_id": "absent-0"}]
+        )
+        == []
+    )
+    findings = AdvisoryRepository(metrics_server.collector.duckdb_path).list_findings()
+    assert any(
+        f.rule_id == "events.ownership_rejected" and f.target_id == "host-a"
+        for f in findings
+    )
+    assert "private transcript" not in caplog.text
+
+
+def test_wrong_owner_has_terminal_reply_without_blocking_current_owner(
+    metrics_server, tmp_path
+):
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.harness.structured.pusher import EventPusher
+
+    central = HarnessRegistry(metrics_server.collector.duckdb_path)
+    central.create_session(
+        session_id="moved", host_id="host-b", harness="claude", command="test"
+    )
+    central.create_session(
+        session_id="current", host_id="host-a", harness="claude", command="test"
+    )
+    path = tmp_path / "host.duckdb"
+    bootstrap(parquet_dir=tmp_path / "host-parquet", duckdb_path=path)
+    local = HarnessRegistry(path, write_outbox=False)
+    pusher = EventPusher(
+        f"http://{metrics_server.host}:{metrics_server.port}",
+        metrics_server.token,
+        registry=local,
+    )
+    moved = {"event_id": "moved-event", "session_id": "moved", "type": "status"}
+    current = {"event_id": "current-event", "session_id": "current", "type": "status"}
+    assert pusher.post_batch_pending([moved]) == []  # explicit 403 rejection
+    assert pusher._authorization_retry_at == 0
+    assert local.quarantined_event_ids(["moved-event"]) == {"moved-event"}
+    mixed = dict(moved, event_id="moved-event-2")
+    assert pusher.post_batch_pending([mixed, current]) == []
+    assert local.quarantined_event_ids(["moved-event-2"]) == {"moved-event-2"}
+    assert central.existing_structured_event_ids(["moved-event", "current-event"]) == {
+        "current-event"
+    }
 
 
 def test_reconciliation_acks_pruned_duplicates_and_marks_local_ledger(
@@ -634,7 +777,7 @@ def test_expired_orphan_does_not_block_known_owner_in_same_batch(
     )
     assert _post(metrics_server, "/harness/events", {"events": events}) == 200
     assert [e.event_id for e in registry.list_events_after("known", 0)] == ["new-event"]
-    now[0] += 24 * 60 * 60
+    now[0] += app_module._UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
     assert _post(metrics_server, "/harness/events", {"events": events}) == 200
     assert [e.event_id for e in registry.list_events_after("known", 0)] == ["new-event"]
     assert registry.list_events_after("absent", 0) == []
@@ -703,13 +846,13 @@ def test_orphan_window_is_host_scoped_and_eviction_extends_retries(monkeypatch):
     monkeypatch.setattr(app_module, "_MAX_UNKNOWN_SESSION_RETRIES", 2)
     retries = app_module._UnknownSessionRetries()
     assert not retries.expired("host-a", "s1")
-    now[0] += 24 * 60 * 60
+    now[0] += app_module._UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
     assert retries.expired("host-a", "s1")
     assert not retries.expired("host-b", "s1")
     assert not retries.expired("host-a", "s2")
     # Capacity eviction starts a fresh retry window, never an immediate skip.
     assert not retries.expired("host-a", "s1")
-    now[0] += 24 * 60 * 60
+    now[0] += app_module._UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
     assert retries.expired("host-a", "s1")
     retries.forget("host-a", "s1")
     assert not retries.expired("host-a", "s1")
