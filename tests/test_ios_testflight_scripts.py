@@ -818,6 +818,16 @@ def test_apple_messages_are_bounded_and_redact_environment_credentials(monkeypat
     assert messages == [
         "ITMS-90360: CFBundleDisplayName com.arnab.drover.widget [REDACTED] [REDACTED_PATH]"
     ]
+    messages = diagnostic_messages(
+        {
+            "message": "Missing NSBluetoothAlwaysUsageDescription in com.arnab.drover; token="
+            + "a" * 40
+        },
+        "",
+    )
+    assert messages == [
+        "Missing NSBluetoothAlwaysUsageDescription in com.arnab.drover; [REDACTED]"
+    ]
 
 
 @pytest.mark.skipif(

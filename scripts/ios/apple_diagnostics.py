@@ -55,7 +55,20 @@ def diagnostic_messages(response, stderr, secrets=()):
             "[REDACTED_PATH]",
             message,
         )
-        message = re.sub(r"\b[A-Za-z0-9_+/=-]{32,}\b", "[REDACTED]", message)
+        # Long CamelCase plist keys are diagnostic evidence, not opaque tokens.
+        # Known credential values were already removed above, even if they
+        # happen to resemble a plist key.
+        message = re.sub(
+            r"\b[A-Za-z0-9_+/=-]{32,}\b",
+            lambda match: (
+                match[0]
+                if re.fullmatch(
+                    r"(?:CF|NS|UI|LS|UT|WK|BG|ITS)(?:[A-Z][a-z0-9]+)+", match[0]
+                )
+                else "[REDACTED]"
+            ),
+            message,
+        )
         return " ".join(message.split())[:4096]
 
     messages = []
