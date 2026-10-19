@@ -509,6 +509,27 @@ def test_release_workflow_never_runs_on_pull_requests() -> None:
     assert "pull_request_target" not in workflow["on"]
 
 
+def test_harnessd_macos_notarization_assesses_the_bare_binary() -> None:
+    """A standalone Mach-O needs an open assessment, not an app-bundle one."""
+    steps = load_workflow("harnessd-macos-notarize.yml")["jobs"]["sign-notarize"][
+        "steps"
+    ]
+    verify = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Verify signature and Gatekeeper assessment"
+    )
+
+    assert "codesign --verify --strict --verbose=2" in verify
+    assert "TeamIdentifier=$SIGNING_TEAM_ID" in verify
+    assert (
+        'spctl -a -vv -t open --context context:primary-signature "$binary"' in verify
+    )
+    assert "-t execute" not in verify
+    assert "grep -q 'accepted'" in verify
+    assert "grep -q 'source=Notarized Developer ID'" in verify
+
+
 def test_clean_install_uses_configured_address_and_keeps_pairing_private() -> None:
     """The published-artifact smoke must not disturb another runner process.
 
