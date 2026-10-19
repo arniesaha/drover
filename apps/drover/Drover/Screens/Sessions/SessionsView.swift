@@ -213,9 +213,7 @@ struct SessionsView: View {
 
             }
 
-            if store.hasLoadedOnce {
-                actionBar
-            }
+            if store.hasLoadedOnce { actionBar }
         }
         .background(DroverColor.bg)
         // The design's chrome row *is* this screen's header, so the navigation
@@ -605,21 +603,28 @@ struct SessionsView: View {
     /// header) whenever the hub has no cockpit, or nothing to report about it.
     @ViewBuilder
     private var providerCapacity: some View {
-        if cockpitStore.isCockpitAvailable,
-           !cockpitStore.providerAccounts.isEmpty || cockpitStore.providerError != nil {
-            ProviderCapacitySection(
-                accounts: cockpitStore.providerAccounts,
-                status: providerSectionStatus,
-                statusMessage: cockpitStore.providerError,
-                hostTitles: hostTitles,
-                onOpenAccounts: {
+        if accountNeedsAttention {
+            Button {
                     if let onOpenAccountsTab {
                         onOpenAccountsTab()
                     } else {
                         showAccounts = true
                     }
-                }
-            )
+            } label: {
+                Label("Account needs attention", systemImage: "exclamationmark.triangle.fill")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .foregroundStyle(DroverColor.warn)
+                    .background(DroverColor.accentTint, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("account-health-warning")
+        }
+    }
+
+    private var accountNeedsAttention: Bool {
+        cockpitStore.providerError != nil || cockpitStore.providerAccounts.contains { account in
+            account.status != .ok || account.windows.contains { ($0.usedPercent ?? 0) > 80 }
         }
     }
 
