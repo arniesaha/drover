@@ -215,6 +215,9 @@ class AwaitingTransition:
     update_count: int = 1
     #: Count of sessions currently waiting for the person, not event count.
     badge_count: int | None = None
+    #: Session creation time is metadata, not transcript content.  It keeps a
+    #: consent-gated alert useful without naming the repository or prompt.
+    started_at: datetime | None = None
 
     @property
     def needs_user(self) -> bool:
@@ -248,7 +251,12 @@ class AwaitingTransition:
 
     def alert_title(self) -> str:
         if not self.allows_content:
-            return self._metadata_prefix()
+            return {
+                "input": "drover needs your input",
+                "finished": "drover finished a session",
+                "failed": "drover needs attention",
+                "progress": "drover session update",
+            }[self.kind]
         project = self.project_name()
         if self.private:
             return project or "Session"
@@ -278,10 +286,10 @@ class AwaitingTransition:
             "progress": "work is continuing",
         }[self.kind]
         if not self.allows_content:
-            metadata = [prefix, self.project_name(), self._safe_text(self.host)]
-            return _condense(
-                " · ".join(part for part in metadata if part), _BODY_MAX_CHARS
-            )
+            # ``_condense`` deliberately removes harness names from untrusted
+            # transcript text.  This path has already reduced the trusted
+            # metadata to a bounded label, so preserve it for usefulness.
+            return self._metadata_body()
         if self.private:
             return _condense(f"{prefix}: {fallback}", _BODY_MAX_CHARS)
         summary = (
@@ -314,6 +322,58 @@ class AwaitingTransition:
             "failed": "Failed",
             "progress": "Update",
         }[self.kind]
+
+    def _metadata_body(self) -> str:
+        """Describe a session state without leaking session-derived text.
+
+        The title already says what happened and the subtitle carries the
+        host.  Repeating either in the body wastes the one useful lock-screen
+        line we retain when content consent is off.  Harness and session age
+        are operational metadata, never transcript, repo, or prompt content.
+        """
+        session = f"{self._harness_label()} session"
+        opened = self._opened_age()
+        detail = {
+            "input": session,
+            "finished": f"{session} finished",
+            "failed": f"{session} needs attention",
+            "progress": f"{session} is still working",
+        }[self.kind]
+        return " · ".join(part for part in (detail, opened) if part)
+
+    def _harness_label(self) -> str:
+        """A bounded display label for the harness metadata field."""
+        raw = re.sub(r"[^A-Za-z0-9 ._+-]", "", str(self.harness or ""))
+        normalized = raw.strip().lower().replace("_", "-")
+        known = {
+            "codex": "Codex",
+            "claude": "Claude",
+            "claude-code": "Claude Code",
+            "gemini": "Gemini",
+            "opencode": "OpenCode",
+        }
+        if normalized in known:
+            return known[normalized]
+        return raw[:32] or "Agent"
+
+    def _opened_age(self, *, now: datetime | None = None) -> str:
+        started = self.started_at
+        if not isinstance(started, datetime):
+            return ""
+        if started.tzinfo is None:
+            # DuckDB returns its legacy TIMESTAMPTZ values as local naive
+            # datetimes; PostgreSQL returns an aware value.  Treat only the
+            # former as local so a generic age is not shifted by the host TZ.
+            started = started.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        moment = now or datetime.now(timezone.utc)
+        seconds = max(0, int((moment - started).total_seconds()))
+        if seconds < 90:
+            return "opened just now"
+        if seconds < 90 * 60:
+            return f"opened {seconds // 60} min ago"
+        if seconds < 36 * 60 * 60:
+            return f"opened {seconds // 3600}h ago"
+        return f"opened {seconds // 86400}d ago"
 
     def summary(self) -> str:
         # Git delivery details and command transcripts belong in the session.
@@ -890,14 +950,14 @@ class APNsSender:
             "apns-topic": self._config.bundle_id,
             "apns-push-type": "alert",
             "apns-priority": "10",
-            # One session collapses onto itself: a phone that was offline
-            # through three transitions wakes to the latest state, not three
-            # stacked banners for the same session.
+            # One session collapses onto itself across *all* state kinds: a
+            # phone that was offline through Update, Needs input, and Finished
+            # wakes to its latest state, not three stacked banners.
             "apns-collapse-id": (
-                _collapse_id(transition.session_id, transition.kind)
+                _collapse_id(transition.session_id)
                 if not isinstance(transition, list)
                 else (
-                    _collapse_id(transition[0].session_id, transition[0].kind)
+                    _collapse_id(transition[0].session_id)
                     if len(transition) == 1
                     else hashlib.sha256(
                         "\0".join(

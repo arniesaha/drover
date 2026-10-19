@@ -67,6 +67,7 @@ def test_entering_awaiting_notifies_once(registry, sender):
     assert transition.awaiting == "approval"
     assert transition.harness == "claude-code"
     assert transition.cwd == "/Users/x/work/drover"
+    assert isinstance(transition.started_at, datetime)
 
 
 def test_repeated_awaiting_does_not_re_notify(registry, sender):
@@ -167,8 +168,8 @@ def test_host_content_consent_off_never_exports_session_text(registry, sender):
 
     transition = sender.sent[0]
     assert not transition.content_allowed
-    assert transition.alert_title() == "Needs your input"
-    assert transition.alert_body() == "Needs your input · drover · Mac Mini"
+    assert transition.alert_title() == "drover needs your input"
+    assert transition.alert_body().startswith("Claude Code session · opened ")
     assert "Secret" not in transition.alert_body()
     assert "token" not in transition.alert_body()
 
@@ -416,8 +417,8 @@ def test_notification_privacy_exception_fails_closed(registry, sender, monkeypat
         preview="Synthetic private text",
     )
     assert sender.sent[0].private
-    assert sender.sent[0].alert_title() == "Finished"
-    assert sender.sent[0].alert_body() == "Finished"
+    assert sender.sent[0].alert_title() == "drover finished a session"
+    assert sender.sent[0].alert_body() == "Agent session finished"
 
 
 @pytest.mark.parametrize("exit_code,kind", [(0, "finished"), (1, "failed")])
