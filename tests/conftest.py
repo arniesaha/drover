@@ -68,6 +68,7 @@ _RUST_PHASE2 = (
     "test_native_history_contract.py::test_discovers_codex_",
     "test_native_history_contract.py::test_native_sessions_query_",
     "test_relay_spoke_contract.py::test_relay_",
+    "test_rust_migration_contract.py::test_rust_",
 )
 
 
