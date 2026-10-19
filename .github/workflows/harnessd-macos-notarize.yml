@@ -174,11 +174,12 @@ jobs:
         printf '%s\n' "$details"
         printf '%s\n' "$details" | grep -qx "TeamIdentifier=$SIGNING_TEAM_ID"
         printf '%s\n' "$details" | grep -Eq 'flags=.*runtime'
-        # A bare Mach-O cannot carry a stapled ticket. Gatekeeper therefore
-        # performs its normal online notarization check here and at install time.
-        spctl -a -t execute -vv "$binary" 2>&1 | tee "$RUNNER_TEMP/harnessd-release/spctl.txt"
+        # A bare Mach-O cannot carry a stapled ticket and is not an app bundle.
+        # Assess its primary signature, which performs Gatekeeper's normal
+        # online notarization check here and when the command is run.
+        spctl -a -vv -t open --context context:primary-signature "$binary" 2>&1 | tee "$RUNNER_TEMP/harnessd-release/spctl.txt"
         grep -q 'accepted' "$RUNNER_TEMP/harnessd-release/spctl.txt"
-        grep -q 'Notarized Developer ID' "$RUNNER_TEMP/harnessd-release/spctl.txt"
+        grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/harnessd-release/spctl.txt"
 
     - name: Generate release checksum
       run: |
