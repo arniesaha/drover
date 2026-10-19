@@ -3698,7 +3698,7 @@ def test_auth_accepts_session_cookie(tmp_path):
     assert status == 200
 
 
-def test_auth_ui_redirects_to_login(tmp_path):
+def test_auth_observatory_redirects_to_login(tmp_path):
     collector = _make_collector(tmp_path)
     server = start_metrics_server(
         host="127.0.0.1", port=0, collector=collector, auth=_TEST_AUTH
@@ -3708,7 +3708,7 @@ def test_auth_ui_redirects_to_login(tmp_path):
 
         opener = urllib.request.build_opener(_NoRedirect)
         with pytest.raises(urllib.error.HTTPError) as exc:
-            opener.open(f"http://127.0.0.1:{port}/ui", timeout=5)
+            opener.open(f"http://127.0.0.1:{port}/ui/observatory", timeout=5)
         assert exc.value.code == 302
         assert exc.value.headers["Location"] == "/auth/login"
     finally:
@@ -3751,7 +3751,7 @@ def test_login_success_sets_cookie_and_cookie_works(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as exc:
             opener.open(request, timeout=5)
         assert exc.value.code == 302
-        assert exc.value.headers["Location"] == "/ui"
+        assert exc.value.headers["Location"] == "/ui/observatory"
         set_cookie = exc.value.headers["Set-Cookie"]
         assert set_cookie is not None
         cookie_value = set_cookie.split(";", 1)[0]

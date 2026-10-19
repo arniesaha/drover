@@ -69,5 +69,9 @@ docs/internal/
 *.tfvars.json
 .codex
 
+# The web shell commits its lockfile and source, never dependencies or bundles.
+apps/web/node_modules/
+src/drover/server/web/static/client/
+
 # Seeded acceptance-lake and pytest caches
 .pytest_cache/

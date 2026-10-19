@@ -41,6 +41,18 @@ jobs:
       with:
         ref: ${{ github.event.inputs.ref || github.ref }}
 
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+        cache: npm
+        cache-dependency-path: apps/web/package-lock.json
+
+    - name: Build the hub-served web client
+      run: |
+        npm ci --prefix apps/web --ignore-scripts
+        npm run build --prefix apps/web
+        test -f src/drover/server/web/static/client/client-manifest.json
+
     # uv is installed via pip rather than astral-sh/setup-uv, because this
     # repository restricts Actions to an allowlist of `actions/*` with
     # verified-creator actions disallowed. A third-party action there does not
@@ -107,6 +119,8 @@ jobs:
         python scripts/verify_release_candidate.py \
           --python "$CANDIDATE_ROOT/runtime/bin/python" \
           --server "$CANDIDATE_ROOT/runtime/bin/drover-server"
+        python scripts/check_web_client_wheel.py \
+          --python "$CANDIDATE_ROOT/runtime/bin/python"
 
     - name: Gate managed PostgreSQL provisioner before publication
       run: |

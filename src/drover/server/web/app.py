@@ -79,7 +79,7 @@ from drover.server.web.auth import (
 )
 from drover.server.web.listener import DroverHTTPServer, ResilientListener
 from drover.server.web.pairing import PairingCodes, ThrottledSource, UnknownCode
-from drover.server.web.ui import load_page
+from drover.server.web.ui import load_client_asset, load_page
 
 if TYPE_CHECKING:
     from drover.server.harness.models import HarnessHost
@@ -141,6 +141,14 @@ class _UnknownSessionRetries:
 # _redeem_pairing_code (single-use codes, TTL, per-source throttle) rather
 # than by this gate.
 _PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login", "/auth/pair", "/harness/probe"}
+
+# The initial shell has no inline code or remote resources. Keep the hub's
+# trust boundary explicit before P1 adds Markdown, attachments or terminals.
+_WEB_CLIENT_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; "
+    "img-src 'self' blob: data:; font-src 'self'; connect-src 'self'; "
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+)
 
 # Total budget for a spoke to send its hello after the 101, across every
 # frame it sends -- not per recv. See _accept_relay_websocket.
@@ -1079,6 +1087,16 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path.startswith("/_internal/analytics/"):
             self._handle_host_data_bridge(path, parsed.query)
             return
+        # The shell must be reachable before a browser has paired. This narrow
+        # route runs before the general auth gate; its asset loader admits only
+        # names emitted by the client build manifest, never arbitrary package
+        # files. Everything else under /ui keeps the existing auth boundary.
+        if path in {"/ui", "/ui/"}:
+            self._send_client_asset("index.html")
+            return
+        if path.startswith("/ui/assets/"):
+            self._send_client_asset(path.removeprefix("/ui/"))
+            return
         if not self._gate(path):
             return
         if self.analytics_boundary is None and self._is_analytics_public_path(path):
@@ -1227,7 +1245,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/auth/credentials":
             self._list_credentials()
             return
-        if path in {"/", "/ui"}:
+        if path in {"/", "/ui/observatory"}:
             self._send(200, "text/html; charset=utf-8", load_page("observatory.html"))
             return
         if path == "/ui/harness":
@@ -2734,7 +2752,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         self.send_response(302)
-        self.send_header("Location", "/ui")
+        self.send_header("Location", "/ui/observatory")
         if self.auth.enabled:
             self.send_header("Set-Cookie", session_cookie_value(self.auth))
         self.send_header("Content-Length", "0")
@@ -3440,6 +3458,29 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             '{"error":"analytical_store_unavailable"}\n',
             extra_headers={"Retry-After": "1"},
         )
+
+    def _send_client_asset(self, name: str) -> None:
+        """Serve a static web-client artifact with shell or hashed-asset cache rules."""
+
+        try:
+            asset, body = load_client_asset(name)
+        except FileNotFoundError:
+            self._send(404, "text/plain; charset=utf-8", "not found\n")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", asset.content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", asset.cache_control)
+        self.send_header("Content-Security-Policy", _WEB_CLIENT_CSP)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            log.info(
+                "client disconnected while sending web client asset %s", asset.name
+            )
 
     def _send_analytical_busy(self) -> None:
         """Make bounded analytical admission visible instead of dropping HTTP."""

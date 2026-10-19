@@ -18,6 +18,18 @@ jobs:
       with:
         fetch-depth: 0
 
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+        cache: npm
+        cache-dependency-path: apps/web/package-lock.json
+
+    - name: Build the hub-served web client
+      run: |
+        npm ci --prefix apps/web --ignore-scripts
+        npm run build --prefix apps/web
+        test -f src/drover/server/web/static/client/client-manifest.json
+
     # A self-hosted runner attached to a public repository is one
     # fork-triggerable workflow away from arbitrary code execution on the
     # runner host. This repository had exactly that: a non-ephemeral runner
@@ -75,6 +87,20 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -e ".[dev]"
+
+    # This creates an isolated runtime after the frontend build. The smoke
+    # imports from the installed wheel while its current directory contains no
+    # source checkout and invokes no Node tooling.
+    - name: Check the installed wheel contains the web client
+      if: steps.scope.outputs.python == 'true'
+      run: |
+        WHEEL_DIR="$(mktemp -d)"
+        RUNTIME_DIR="$(mktemp -d)"
+        trap 'rm -rf "$WHEEL_DIR" "$RUNTIME_DIR"' EXIT
+        python -m pip wheel --no-deps --wheel-dir "$WHEEL_DIR" .
+        python -m venv "$RUNTIME_DIR"
+        "$RUNTIME_DIR/bin/python" -m pip install --no-deps "$WHEEL_DIR"/drover-*.whl
+        python scripts/check_web_client_wheel.py --python "$RUNTIME_DIR/bin/python"
 
     # Shell fixtures import the real config and service-unit renderer even
     # when an iOS-only diff skips the Python suite. Keep their interpreter
