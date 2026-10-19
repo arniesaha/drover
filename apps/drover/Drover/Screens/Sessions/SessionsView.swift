@@ -300,6 +300,7 @@ struct SessionsView: View {
             NavigationStack {
                 LaunchView(
                     client: client, snapshot: store.snapshot,
+                    providerAccounts: cockpitStore.providerAccounts,
                     catalogStore: HarnessModelCatalogStore(defaults: defaults)
                 ) { sessionID, isStructured, harness in
                     launchedSession = LaunchedSession(
