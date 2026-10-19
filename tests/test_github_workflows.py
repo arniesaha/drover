@@ -521,10 +521,9 @@ def test_harnessd_macos_notarization_assesses_the_bare_binary() -> None:
     )
 
     assert "codesign --verify --strict --verbose=2" in verify
-    assert 'TeamIdentifier=$SIGNING_TEAM_ID' in verify
+    assert "TeamIdentifier=$SIGNING_TEAM_ID" in verify
     assert (
-        'spctl -a -vv -t open --context context:primary-signature "$binary"'
-        in verify
+        'spctl -a -vv -t open --context context:primary-signature "$binary"' in verify
     )
     assert "-t execute" not in verify
     assert "grep -q 'accepted'" in verify
