@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from drover.server import db
 from drover.server.runtime_observability import (
     FootprintWatchdog,
+    StartupFootprintSampler,
     active_activities,
     activity,
 )
@@ -52,6 +54,26 @@ def test_watchdog_dumps_work_and_stacks_once_per_threshold_crossing(caplog):
     assert dumped == ["thread-1\n  frame", "thread-1\n  frame"]
     assert caplog.text.count("hub_footprint_watchdog crossing") == 2
     assert caplog.text.count("GET /insights") == 2
+
+
+def test_startup_sampler_logs_native_hint_after_large_growth(caplog):
+    readings = [100, 100 + 80 * 1024**2]
+    sampler = StartupFootprintSampler(
+        duration_seconds=2,
+        interval_seconds=0.001,
+        footprint_reader=lambda: readings.pop(0) if len(readings) > 1 else readings[0],
+        activities=lambda: [],
+        native_hinter=lambda: "native_threads=28 native_frames=duckdb_checkpoint",
+    )
+    with caplog.at_level(logging.INFO, logger="drover.runtime_observability"):
+        sampler.start()
+        time.sleep(0.02)
+        sampler.stop()
+
+    assert "hub_startup_footprint footprint=" in caplog.text
+    assert "hub_startup_native_growth" in caplog.text
+    assert "outside_activities=True" in caplog.text
+    assert "native_frames=duckdb_checkpoint" in caplog.text
 
 
 def test_analytical_lock_logs_activity_holder_and_hold_time(tmp_path, caplog):
