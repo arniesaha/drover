@@ -1,15 +1,19 @@
 import Foundation
+import Network
 
 /// The host classes ATS permits for plain HTTP when
 /// `NSAllowsLocalNetworking` is enabled. Keep this separate from reachability:
 /// a Tailscale DNS name can be reachable, but a fully-qualified name still
 /// needs HTTPS under the Store build's ATS policy.
 public enum HTTPHostClassification: Sendable, Equatable {
-    case ipAddress
-    case tailscaleIP
+    case rfc1918IPv4
+    case uniqueLocalIPv6
+    case linkLocalIP
+    case loopbackIP
+    case carrierGradeNAT
+    case publicIP
     case localDomain
-    case singleLabel
-    case fullyQualifiedDomain
+    case hostname
 }
 
 /// The central server's base URL, persisted in `UserDefaults` (not sensitive —
@@ -51,34 +55,59 @@ public struct ServerConfig: Sendable, Equatable {
         return Self.classifyHTTPHost(host)
     }
 
-    /// Store builds intentionally permit HTTP only for IP literals,
-    /// unqualified names, and `.local` names. A named remote endpoint must use
-    /// HTTPS so ATS can validate its transport.
+    /// Store builds intentionally permit HTTP only for RFC1918 IPv4,
+    /// link-local and loopback addresses, plus `.local` names. Carrier-grade
+    /// NAT addresses (including Tailscale's 100.64.0.0/10 range), public IPs,
+    /// IPv6 ULAs, and ordinary hostnames need HTTPS.
     public var requiresHTTPSForAppTransportSecurity: Bool {
         baseURL.scheme?.lowercased() == "http"
-            && httpHostClassification == .fullyQualifiedDomain
+            && !(httpHostClassification?.allowsPlainHTTP ?? false)
     }
 
     /// User-facing copy shared by QR/manual pairing and saved-config recovery.
-    public static let httpsRePairMessage = "This hub uses plain HTTP on a named address. Re-pair with its Tailscale or LAN IP, or enable HTTPS with Tailscale Serve."
+    public static let httpsRePairMessage = "iOS blocked this plain-HTTP hub address for transport security. Use the hub’s HTTPS Tailscale (*.ts.net) URL (Tailscale Serve), or a local LAN/.local address."
 
     public static func classifyHTTPHost(_ host: String) -> HTTPHostClassification {
         let cleaned = host.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         let lower = cleaned.lowercased()
-        if isTailscaleIPv4(lower) {
-            return .tailscaleIP
+        if lower == "localhost" {
+            return .loopbackIP
         }
-        if isIPv4(lower) || lower.contains(":") {
-            return .ipAddress
+        if let octets = ipv4Octets(lower) {
+            if octets[0] == 10
+                || (octets[0] == 172 && (16...31).contains(octets[1]))
+                || (octets[0] == 192 && octets[1] == 168) {
+                return .rfc1918IPv4
+            }
+            if octets[0] == 169 && octets[1] == 254 {
+                return .linkLocalIP
+            }
+            if octets[0] == 127 {
+                return .loopbackIP
+            }
+            if octets[0] == 100 && (64...127).contains(octets[1]) {
+                return .carrierGradeNAT
+            }
+            return .publicIP
+        }
+        if let address = IPv6Address(lower) {
+            let bytes = Array(address.rawValue)
+            if bytes.dropLast().allSatisfy({ $0 == 0 }) && bytes.last == 1 {
+                return .loopbackIP
+            }
+            if (bytes[0] & 0xfe) == 0xfc {
+                return .uniqueLocalIPv6
+            }
+            if bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80 {
+                return .linkLocalIP
+            }
+            return .publicIP
         }
         if lower.hasSuffix(".local") {
             return .localDomain
         }
-        if !lower.contains(".") {
-            return .singleLabel
-        }
-        return .fullyQualifiedDomain
+        return .hostname
     }
 
     /// Detects if a host string is a Tailscale IPv4 address (CGNAT 100.64.0.0/10)
@@ -135,9 +164,11 @@ public struct ServerConfig: Sendable, Equatable {
         return octet0 == 100 && (64...127).contains(octet1)
     }
 
-    private static func isIPv4(_ host: String) -> Bool {
+    private static func ipv4Octets(_ host: String) -> [UInt8]? {
         let parts = host.split(separator: ".", omittingEmptySubsequences: false)
-        return parts.count == 4 && parts.allSatisfy { UInt8($0) != nil }
+        guard parts.count == 4 else { return nil }
+        let octets = parts.compactMap { UInt8($0) }
+        return octets.count == 4 ? octets : nil
     }
 
     public static let defaultsKey = "drover.server.url"
@@ -170,4 +201,15 @@ public struct ServerConfig: Sendable, Equatable {
         nil
     }
     #endif
+}
+
+private extension HTTPHostClassification {
+    var allowsPlainHTTP: Bool {
+        switch self {
+        case .rfc1918IPv4, .linkLocalIP, .loopbackIP, .localDomain:
+            return true
+        case .uniqueLocalIPv6, .carrierGradeNAT, .publicIP, .hostname:
+            return false
+        }
+    }
 }

@@ -173,15 +173,16 @@ Scan the QR code with the app. The app receives its own credential and stores
 it in the iOS Keychain. Nothing is typed by hand. The code is single use and
 expires after ten minutes.
 
-The QR points at `[server] advertised_url` from `~/.drover/config.toml`. Set
-that to a private LAN address or a private Tailscale address before pairing a
-physical iPhone. While it is unset, the command prints the loopback address and
-warns that only the simulator on this Mac can reach it. Do not use Tailscale
-Funnel.
+The QR points at `[server] advertised_url` from `~/.drover/config.toml`. For a
+physical iPhone, use a private LAN address only for plain HTTP; a Tailscale
+CGNAT address (`100.64.0.0/10`) needs the HTTPS Tailscale Serve URL below.
+While it is unset, the command prints the loopback address and warns that only
+the simulator on this Mac can reach it. Do not use Tailscale Funnel.
 
-For a plain-HTTP hub, `drover-server pair` prefers a detected Tailscale IP and
-then a LAN IP over a configured MagicDNS name. This keeps the QR compatible
-with the iOS Store build's local-network ATS policy. It does not change the
+`drover-server pair` prefers a configured or discovered Tailscale Serve HTTPS
+URL. If Serve is absent, it retains the previous private-IP fallback for a
+plain-HTTP configured name; Store builds can use plain HTTP only for LAN,
+link-local, loopback, or `.local` endpoints. This does not change the
 configured bind or advertise address.
 
 If the camera is unavailable, use **Or enter it by hand** in **Pair & Connect**
@@ -239,7 +240,7 @@ With the hub reachable on its Tailscale IP, publish its existing listener only
 inside the tailnet:
 
 ```bash
-tailscale serve --https=443 http://$(tailscale ip -4):7080
+tailscale serve --https=443 http://127.0.0.1:7080
 ```
 
 `tailscale serve status` prints the resulting `https://<machine>.<tailnet>.ts.net`

@@ -110,6 +110,7 @@ def test_pairing_prefers_tailscale_ip_over_plain_http_magicdns(monkeypatch):
         default_config(), server_advertised_url="http://studio.tailnet.ts.net:7080"
     )
     monkeypatch.setattr(server_main, "_private_pairing_ip", lambda _: "100.99.1.2")
+    monkeypatch.setattr(server_main, "_tailscale_serve_https_endpoint", lambda: None)
 
     assert _advertised_pairing_endpoint(cfg) == ("100.99.1.2:7080", False)
 
@@ -121,6 +122,7 @@ def test_pairing_falls_back_to_lan_ip_for_plain_http_fqdn(monkeypatch):
         default_config(), server_advertised_url="http://studio.example.test:7080"
     )
     monkeypatch.setattr(server_main, "_private_pairing_ip", lambda _: "192.168.1.12")
+    monkeypatch.setattr(server_main, "_tailscale_serve_https_endpoint", lambda: None)
 
     assert _advertised_pairing_endpoint(cfg) == ("192.168.1.12:7080", False)
 
@@ -134,6 +136,38 @@ def test_pairing_preserves_https_magicdns_name(monkeypatch):
     monkeypatch.setattr(server_main, "_private_pairing_ip", lambda _: "100.99.1.2")
 
     assert _advertised_pairing_endpoint(cfg) == ("studio.tailnet.ts.net", True)
+
+
+def test_tailscale_serve_status_discovers_https_authority(monkeypatch):
+    import drover.server.__main__ as server_main
+
+    class _Result:
+        stdout = "https://arnabs-mac-studio.tailb3dd58.ts.net (tailnet only)\n"
+
+    monkeypatch.setattr(server_main.shutil, "which", lambda name: "/usr/bin/tailscale")
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: _Result())
+
+    assert server_main._tailscale_serve_https_endpoint() == (
+        "arnabs-mac-studio.tailb3dd58.ts.net"
+    )
+
+
+def test_pairing_prefers_discovered_tailscale_serve_https_over_plain_cgnat(monkeypatch):
+    import drover.server.__main__ as server_main
+
+    cfg = dataclasses.replace(
+        default_config(), server_advertised_url="http://100.95.157.24:7080"
+    )
+    monkeypatch.setattr(
+        server_main,
+        "_tailscale_serve_https_endpoint",
+        lambda: "arnabs-mac-studio.tailb3dd58.ts.net",
+    )
+
+    assert _advertised_pairing_endpoint(cfg) == (
+        "arnabs-mac-studio.tailb3dd58.ts.net",
+        True,
+    )
 
 
 def _pair_cli(monkeypatch, cfg):
@@ -194,12 +228,34 @@ def test_pair_uses_a_private_ip_instead_of_plain_http_magicdns(monkeypatch):
         default_config(), server_advertised_url="http://studio.tailnet.ts.net:7080"
     )
     monkeypatch.setattr(server_main, "_private_pairing_ip", lambda _: "100.99.1.2")
+    monkeypatch.setattr(server_main, "_tailscale_serve_https_endpoint", lambda: None)
 
     result = _pair_cli(monkeypatch, cfg)
 
     assert result.exit_code == 0, result.output
     assert "drover://100.99.1.2:7080?v=1&code=K7QP-2M4X" in result.output
     assert "studio.tailnet.ts.net" not in result.output
+
+
+def test_pair_qr_uses_discovered_tailscale_serve_https(monkeypatch):
+    import drover.server.__main__ as server_main
+
+    cfg = dataclasses.replace(
+        default_config(), server_advertised_url="http://100.95.157.24:7080"
+    )
+    monkeypatch.setattr(
+        server_main,
+        "_tailscale_serve_https_endpoint",
+        lambda: "arnabs-mac-studio.tailb3dd58.ts.net",
+    )
+
+    result = _pair_cli(monkeypatch, cfg)
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "drover://arnabs-mac-studio.tailb3dd58.ts.net?v=1&code=K7QP-2M4X"
+        "&n=home-fleet&tls=1"
+    ) in result.output
 
 
 def test_pair_host_prints_a_pasteable_command(monkeypatch):
