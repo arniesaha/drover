@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.23] - 2026-10-18
+
+### Fixed
+
+- Hub startup no longer spikes native memory (0.6.22 peaked at 5.4 GiB on the Studio). Exclusive DuckLake hubs now pin the retired analytical DuckDB instance, so short advisory ledger opens no longer destroy and reload it (with a checkpoint and a fresh task scheduler each time). Instance settings (`memory_limit`, `threads`, `preserve_insertion_order`) are passed to `duckdb.connect(config=...)` instead of `SET` after connect. A lake-shaped cold/warm harness asserts startup peak under 1 GiB (#466, #702).
+
+### Added
+
+- Hub startup footprint sampler: one sample per second during startup, and a jump of 64 MiB or more captures a redacted macOS native sample signature (#702).
+- Rust harnessd (`harnessd-rs/`, binary `drover-harnessd`) phase 2 pilot slice: shell and Codex sessions, relay spoke client, and the tagged `rust_phase2` contract slice in CI on linux x86_64 (static) and aarch64-apple-darwin (#691, #701).
+- Rust harnessd relay shell terminal channels (open, attached output, input and interrupt forwarding, exit) with a bounded PTY output buffer, and `--import-jsonl` / `--import-dry-run` to import drain-handoff session and event JSONL with event IDs and dedup keys preserved (#691, #704).
+- `harnessd-macos-notarize.yml`: builds `drover-harnessd` for aarch64-apple-darwin, signs it with the Developer ID identity (hardened runtime) and notarizes it; `release.yml` calls it after the release is created to attach the signed asset. The job runs in an approval-gated environment (#691, #703).
+
+### Upgrade notes
+
+- No control or lake migration. Upgrade the hub and the Studio and NAS harnessd hosts (NAS keeps `--relay`). The Python harnessd remains the shipped implementation; the Rust binary is a pilot and is not installed by this rollout.
+
 ## [0.6.22] - 2026-10-18
 
 ### Fixed
