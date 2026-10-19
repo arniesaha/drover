@@ -93,9 +93,44 @@ is missing or ambiguous; it never creates groups or adds testers.
 
 Configure `ios-testflight-upload` with the signing and App Store Connect secrets
 above, required reviewers, and main-only deployment branches. The workflow
-checks out the dispatch SHA, uses `contents: read`, and serializes uploads with
+checks out the dispatch SHA, grants only `contents: read`, `actions: read` and
+`checks: read` to the archive job, and serializes uploads with
 `concurrency.group: ios-testflight-production`. The independent archive-only
 workflow uses `ios-distribution`; it does not upload to TestFlight.
+
+## Require iOS CI on the exact dispatch SHA
+
+Before dispatch, wait for [iOS CI](../../../.github/workflows/ios.yml) to pass on
+**main's push run for that exact commit SHA**. `ios.yml` runs on every push to
+main and owns the DroverKit package, app unit and deterministic/accessibility UI
+suites. The TestFlight lane does not repeat them.
+
+Immediately after checkout, `scripts/ios/require_ios_ci.py` queries GitHub's
+Actions API for `ios.yml` main-push runs at `GITHUB_SHA`, then reads every check
+in their check suites. Every matching run and its latest checks must be completed
+with conclusion `success`, including `Build and test iOS app`. A successful PR
+run, an equal Git tree at a different SHA, or a manually dispatched iOS run does
+not satisfy this gate. Missing, pending, skipped, cancelled and failed results
+stop the lane before Xcode setup or signing, with the missing/failed check names
+in the log. API errors and incomplete pagination also fail closed. The gate does
+not wait for CI: let the main-push run finish, or rerun its failed jobs, before
+retrying the authorized TestFlight dispatch. It uses only the job's read-only
+GitHub token; it never changes or starts another workflow run.
+
+After archive/export and widget verification, the existing upload wrapper runs
+`xcrun altool --validate-app` with the same ASC key before `--upload-app`.
+A validation rejection prevents upload and writes `stage: validation`, bounded
+Apple message text and codes to `upload-record.json` and sanitized logs. Secrets,
+key/issuer IDs, tokens and home-directory paths are redacted. Bundle metadata,
+version, icon and signing checks remain part of the artifact chain.
+
+Expected hosted-runner time after environment approval and with iOS CI already
+green: gate about 2–10 seconds, tool/signing setup about 0.5–1 minute,
+archive/export about 3–5 minutes, and Apple validation/upload about 1–3 minutes.
+These are estimates, roughly 5–9 minutes before Apple processing; runner queues,
+environment approval and Apple's processing/group assignment are additional.
+Processing can take up to the wrapper's 45-minute budget. The separate main-push
+iOS CI run still spends roughly 20–30 minutes on the test suites.
 
 ## Read-only live-hub smoke before every upload
 

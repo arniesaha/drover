@@ -64,24 +64,38 @@ def test_production_testflight_is_manual_local_networking_and_credential_isolate
     assert upload_step["if"] == "${{ inputs.upload }}"
 
 
-def test_production_testflight_repeats_the_required_ios_slices() -> None:
-    steps = load_workflow("ios-testflight-production.yml")["jobs"]["archive-upload"][
-        "steps"
-    ]
-    existing = load_workflow("ios.yml")["jobs"]["build-and-test"]["steps"]
+def test_production_testflight_requires_exact_sha_ci_instead_of_repeating_tests():
+    workflow = load_workflow("ios-testflight-production.yml")
+    job = workflow["jobs"]["archive-upload"]
+    assert job["permissions"] == {
+        "contents": "read",
+        "actions": "read",
+        "checks": "read",
+    }
+    steps = job["steps"]
+    assert steps[0]["with"]["ref"] == "${{ github.sha }}"
+    gate = steps[1]
+    assert gate["name"] == "Require successful iOS CI for dispatch SHA"
+    assert gate["run"] == "python3 scripts/ios/require_ios_ci.py"
+    assert gate["env"] == {"GITHUB_TOKEN": "${{ github.token }}"}
+    assert gate["timeout-minutes"] == "2"
+    assert "if" not in gate
+    commands = "\n".join(step.get("run", "") for step in steps)
+    assert "swift test" not in commands
+    assert "simctl" not in commands
+    assert "-only-testing:" not in commands
     for name in (
-        "Generate Xcode project",
         "Run DroverKit package tests",
-        "Select iPhone simulator",
-        "Resolve Swift packages",
         "Run app unit tests",
         "Run deterministic and accessibility UI journeys",
     ):
-        actual = next(s for s in steps if s.get("name") == name)
-        expected = next(s for s in existing if s.get("name") == name)
-        assert actual["run"] == expected["run"]
-        assert actual["working-directory"] == "apps/drover"
-        assert "if" not in actual
+        assert not any(step.get("name") == name for step in steps)
+    ios = load_workflow("ios.yml")
+    assert "main" in ios["on"]["push"]["branches"]
+    assert set(ios["jobs"]) == {"build-and-test"}
+    from ios.require_ios_ci import REQUIRED_CHECKS
+
+    assert REQUIRED_CHECKS == {ios["jobs"]["build-and-test"]["name"]}
 
 
 def _run_production_python_step(name, monkeypatch, tmp_path):
