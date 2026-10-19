@@ -100,6 +100,11 @@ jobs:
           -T /usr/bin/codesign
         security set-key-partition-list -S apple-tool:,apple: -s \
           -k "$keychain_password" "$keychain"
+        # codesign --keychain only resolves identities from keychains on the
+        # user search list, so prepend the ephemeral one to it.
+        existing="$(security list-keychains -d user | tr -d '"' | xargs)"
+        # shellcheck disable=SC2086
+        security list-keychains -d user -s "$keychain" $existing
         security find-identity -v -p codesigning "$keychain" | \
           grep -Fq "$SIGNING_IDENTITY"
         rm -f "$p12"
