@@ -8,9 +8,11 @@ struct HistoryView: View {
     @State private var model: HistoryModel
     @State private var showFilters = false
     private let client: DroverClient
+    var showsNavigationTitle = true
 
-    init(client: DroverClient) {
+    init(client: DroverClient, showsNavigationTitle: Bool = true) {
         self.client = client
+        self.showsNavigationTitle = showsNavigationTitle
         _model = State(initialValue: HistoryModel(loader: client))
     }
 
@@ -41,8 +43,7 @@ struct HistoryView: View {
         .overlay { emptyOrErrorState }
         .searchable(text: $model.searchText, prompt: "Titles, summaries, repos")
         .refreshable { await model.refresh() }
-        .navigationTitle("History")
-        .navigationBarTitleDisplayMode(.inline)
+        .modifier(HistoryNavigationTitle(isVisible: showsNavigationTitle))
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button { showFilters = true } label: {
@@ -140,6 +141,19 @@ struct HistoryView: View {
         return day.formatted(sameYear
             ? .dateTime.weekday(.abbreviated).month(.abbreviated).day()
             : .dateTime.month(.abbreviated).day().year())
+    }
+}
+
+private struct HistoryNavigationTitle: ViewModifier {
+    let isVisible: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isVisible {
+            content.navigationTitle("History").navigationBarTitleDisplayMode(.inline)
+        } else {
+            content
+        }
     }
 }
 

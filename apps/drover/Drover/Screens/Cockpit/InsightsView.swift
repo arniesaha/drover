@@ -4,8 +4,10 @@ import SwiftUI
 struct InsightsView: View {
     let client: DroverClient
     let store: CockpitStore
+    var showsConfigurationSummary = false
+    var showsNavigationTitle = true
     @State private var filtersExpanded = false
-    @State private var state: InsightState?
+    @State private var state: InsightState? = .open
     @State private var severity: InsightSeverity?
     @State private var confidence: InsightConfidence?
     @State private var analyzerClass: InsightAnalyzerClass?
@@ -16,6 +18,9 @@ struct InsightsView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 10) {
+                if showsConfigurationSummary {
+                    InsightsSummaryRow(counts: store.insightCounts, onOpenInsights: {})
+                }
                 filterStrip
                 if let error = store.insightsError {
                     Label(error, systemImage: error.hasPrefix("Hub busy,") ? "clock" : "exclamationmark.circle")
@@ -64,8 +69,7 @@ struct InsightsView: View {
             .padding(14)
         }
         .background(DroverColor.bg)
-        .navigationTitle("Insights")
-        .navigationBarTitleDisplayMode(.inline)
+        .modifier(InsightsNavigationTitle(isVisible: showsNavigationTitle))
         .task { await reload() }
         .refreshable { await reload() }
     }
@@ -191,7 +195,20 @@ struct InsightsView: View {
     }
 }
 
-private struct InsightFeedCard: View {
+private struct InsightsNavigationTitle: ViewModifier {
+    let isVisible: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isVisible {
+            content.navigationTitle("Insights").navigationBarTitleDisplayMode(.inline)
+        } else {
+            content
+        }
+    }
+}
+
+struct InsightFeedCard: View {
     let insight: InsightSummary
     let state: InsightState?
 

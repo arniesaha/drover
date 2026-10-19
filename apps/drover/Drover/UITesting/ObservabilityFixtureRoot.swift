@@ -6,6 +6,9 @@ import SwiftUI
 struct ObservabilityFixtureRoot: View {
     let client: DroverClient
     @State private var store: CockpitStore
+    @State private var sessionStore: SessionStore
+    @State private var workStore: WorkAttentionStore
+    @State private var attentionStore: InboxAttentionStore
     @State private var appearance = AppearanceStore()
 
     init(client: DroverClient) {
@@ -14,18 +17,36 @@ struct ObservabilityFixtureRoot: View {
         store.updateCapability(from: try! JSONDecoder().decode(HarnessSnapshot.self,
             from: FixtureScenarioData.insightCapabilitySnapshotData()))
         _store = State(initialValue: store)
+        _sessionStore = State(initialValue: SessionStore(client: client))
+        _workStore = State(initialValue: WorkAttentionStore(service: client))
+        _attentionStore = State(initialValue: InboxAttentionStore(client: client))
     }
 
     var body: some View {
         TabView {
+            NavigationStack {
+                SessionsView(client: client, notifier: FixtureNotifier(), recoveryStore: nil,
+                    recoveryWriteGate: ChatRecoveryWriteGate(), recoveryGeneration: 0,
+                    sessionStore: sessionStore, cockpitStore: store)
+            }
+            .tabItem { Label(AppTab.home.title, systemImage: AppTab.home.systemImage) }
+            .tag(AppTab.home)
+            .accessibilityIdentifier(AppTab.home.accessibilityIdentifier)
+            NavigationStack {
+                InboxView(
+                    client: client, sessionStore: sessionStore, cockpitStore: store,
+                    workStore: workStore, attentionStore: attentionStore,
+                    onOpenSession: { NotificationRoute.shared.open(sessionID: $0) }
+                )
+            }
+            .tabItem { Label(AppTab.inbox.title, systemImage: AppTab.inbox.systemImage) }
+            .badge(attentionStore.insights.isEmpty ? nil : String(attentionStore.insights.count))
+            .tag(AppTab.inbox)
+            .accessibilityIdentifier(AppTab.inbox.accessibilityIdentifier)
             NavigationStack { AnalyticsView(store: store) }
                 .tabItem { Label(AppTab.analytics.title, systemImage: AppTab.analytics.systemImage) }
                 .tag(AppTab.analytics)
                 .accessibilityIdentifier(AppTab.analytics.accessibilityIdentifier)
-            NavigationStack { InsightsView(client: client, store: store) }
-                .tabItem { Label(AppTab.insights.title, systemImage: AppTab.insights.systemImage) }
-                .tag(AppTab.insights)
-                .accessibilityIdentifier(AppTab.insights.accessibilityIdentifier)
             NavigationStack {
                 ProviderAccountsView(accounts: ObservabilityFixtureData.accounts, status: .ok,
                     statusMessage: nil, hostTitles: ObservabilityFixtureData.hostTitles)
@@ -33,14 +54,6 @@ struct ObservabilityFixtureRoot: View {
             .tabItem { Label(AppTab.accounts.title, systemImage: AppTab.accounts.systemImage) }
             .tag(AppTab.accounts)
             .accessibilityIdentifier(AppTab.accounts.accessibilityIdentifier)
-            NavigationStack {
-                SessionsView(client: client, notifier: FixtureNotifier(), recoveryStore: nil,
-                    recoveryWriteGate: ChatRecoveryWriteGate(), recoveryGeneration: 0)
-            }
-            .tabItem { Label(AppTab.home.title, systemImage: AppTab.home.systemImage) }
-            .tag(AppTab.home)
-            .accessibilityIdentifier(AppTab.home.accessibilityIdentifier)
-
         }
         .tabViewStyle(.sidebarAdaptable)
         .environment(appearance)
@@ -268,6 +281,33 @@ enum ObservabilityFixtureData {
     static var insights: Data {
         let finding = try! JSONSerialization.jsonObject(with: FixtureScenarioData.insightSummaryData())
         return encode(["findings": [finding], "next_cursor": NSNull()])
+    }
+
+    static var history: Data {
+        encode([
+            "items": [
+                [
+                    "id": "fixture-history-1", "title": "Review Inbox navigation",
+                    "harness": "codex", "model": "gpt-5", "state": "finished",
+                    "host": ["id": "studio", "name": "Mac Studio", "retired": false],
+                    "repo": "arniesaha/drover", "last_activity": "2026-10-18T20:35:00Z",
+                    "summary": "Moved decisions and findings into Inbox.", "has_transcript": true,
+                ],
+                [
+                    "id": "fixture-history-2", "title": "Earlier fleet check",
+                    "harness": "claude-code", "state": "finished",
+                    "host": ["id": "mini", "name": "Mac Mini", "retired": false],
+                    "repo": "arniesaha/drover", "last_activity": "2026-10-17T19:12:00Z",
+                    "summary": "Checked host capacity.", "has_transcript": false,
+                ],
+            ],
+            "next_cursor": NSNull(), "has_more": false, "page_size": 30, "truncated": false,
+        ])
+    }
+
+    static var historyFacets: Data {
+        encode(["hosts": [["id": "studio", "name": "Mac Studio", "retired": false]],
+                "harnesses": ["codex", "claude-code"], "repos": ["arniesaha/drover"]])
     }
 
     private static func encode(_ value: Any) -> Data {

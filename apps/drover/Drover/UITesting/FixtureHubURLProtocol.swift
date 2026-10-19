@@ -152,6 +152,10 @@ final class FixtureHubURLProtocol: URLProtocol {
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.analytics(metric: metric))
         case ("GET", "/insights"):
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.insights)
+        case ("GET", "/sessions/history"):
+            return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.history)
+        case ("GET", "/sessions/history/facets"):
+            return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.historyFacets)
         case ("GET", let path) where path == "/insights/\(FixtureScenarioData.insightFindingID)":
             return FixtureHubResponse(status: 200, body: FixtureScenarioData.insightDetailData())
         case ("GET", "/harness"):
