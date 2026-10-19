@@ -218,6 +218,38 @@ def test_reconcile_unsent_events_retries_from_durable_ledger_after_recovery(tmp_
         server.server_close()
 
 
+def test_transport_timeout_reports_delivery_failure_and_keeps_durable_history(
+    tmp_path, monkeypatch
+):
+    from drover.server.harness.structured import pusher as pusher_module
+
+    registry = _init_registry(tmp_path)
+    registry.ingest_structured_events(
+        [
+            {
+                "event_id": "timeout-event",
+                "session_id": "unregistered",
+                "event_type": "status",
+                "seq": 1,
+                "payload": {"type": "status"},
+                "created_at": datetime.now(timezone.utc),
+            }
+        ]
+    )
+
+    def timeout(*_args, **_kwargs):
+        raise TimeoutError("response has not arrived")
+
+    monkeypatch.setattr(pusher_module, "urlopen", timeout)
+    pusher = EventPusher("http://hub.invalid", "token", registry=registry)
+    assert reconcile_unsent_events(registry, pusher) is None
+    assert pusher.reconciliation_deferred_reason == "event delivery failed"
+    assert [e.event_id for e in registry.list_events_for_reconciliation()] == [
+        "timeout-event"
+    ]
+    assert registry.quarantined_event_ids(["timeout-event"]) == set()
+
+
 def test_failed_reconciliation_stays_in_duckdb_instead_of_the_bounded_retry_buffer(
     tmp_path,
 ):

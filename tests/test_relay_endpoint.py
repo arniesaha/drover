@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass
 
 import pytest
-from _timeouts import scale_timeout
 
 from drover.schema import bootstrap
 from drover.server.harness.relay_protocol import hello_frame, req_frame, res_frame
@@ -522,8 +521,14 @@ def test_historical_ownership_batches_quarantine_and_finish_with_healthy_hub(
 ):
     """#720: absent session rows plus mixed old/new event IDs held all replay."""
     from datetime import datetime, timedelta, timezone
+    from email.message import Message
+    from io import BytesIO
+    from urllib.error import HTTPError
+    from urllib.parse import urlsplit
+    from urllib.response import addinfourl
 
     from drover.server.advisory.repository import AdvisoryRepository
+    from drover.server.harness import daemon as daemon_module
     from drover.server.harness.content_consent import DurableContentConsent
     from drover.server.harness.daemon import (
         DEFAULT_PRESETS,
@@ -543,6 +548,42 @@ def test_historical_ownership_batches_quarantine_and_finish_with_healthy_hub(
     now = [100.0]
     monkeypatch.setattr(app_module, "_ownership_retry_clock", lambda: now[0])
     monkeypatch.setattr(pusher_module, "monotonic", lambda: now[0])
+    responses = []
+
+    def dispatch(request, **_kwargs):
+        # Exercise the real routing/auth/ownership/database code without a
+        # socket deadline racing its DuckDB work on loaded CI runners.
+        handler_class = metrics_server.server.RequestHandlerClass
+        handler = handler_class.__new__(handler_class)
+        handler.server = metrics_server.server
+        handler.command = request.get_method()
+        handler.path = urlsplit(request.full_url).path
+        handler.client_address = ("127.0.0.1", 0)
+        handler.headers = Message()
+        for key, value in request.header_items():
+            handler.headers[key] = value
+        handler.headers["Content-Length"] = str(len(request.data))
+        handler.rfile = BytesIO(request.data)
+        reply = []
+        handler._send = lambda status, _content_type, body, **_: reply.append(
+            (status, body)
+        )
+        handler.do_POST()
+        assert len(reply) == 1
+        status, body = reply[0]
+        responses.append((handler.path, status, json.loads(body)))
+        stream = BytesIO(body.encode())
+        if status >= 400:
+            raise HTTPError(request.full_url, status, "hub response", {}, stream)
+        return addinfourl(stream, {}, request.full_url, status)
+
+    monkeypatch.setattr(pusher_module, "urlopen", dispatch)
+    monkeypatch.setattr(daemon_module, "urlopen", dispatch)
+    # This test covers heartbeat-triggered ownership replay, not thread timing.
+    # The real background scheduler is exercised in test_event_reconciliation.
+    monkeypatch.setattr(
+        daemon_module, "_schedule_event_reconciliation", _reconcile_persisted_events
+    )
     records = []
     for number, count in enumerate((7, 8, 11, 12, 41)):
         for seq in range(count):
@@ -577,17 +618,17 @@ def test_historical_ownership_batches_quarantine_and_finish_with_healthy_hub(
         pusher=pusher,
     )
     assert not _reconcile_persisted_events(state)
+    assert responses[0][:2] == ("/harness/events", 403)
+    assert set(responses[0][2]["pending"]) == {f"absent-{i}" for i in range(5)}
     assert pusher.reconciliation_deferred_reason == "session ownership pending"
     assert "hub recovery" not in caplog.text
     assert "structured event reconciliation deferred" not in caplog.text
     assert len(local.list_events_for_reconciliation()) == len(records)
-    assert _post(metrics_server, "/harness/hosts", {"host_id": "host-a"}) == 200
     now[0] += app_module._UNKNOWN_SESSION_RETRY_WINDOW_SECONDS
     # Successful registration drives replay; no health flag is held by pending
     # ownership, and no manual reset is needed to finish the durable pass.
     assert _heartbeat_once(state) is not None
-    state.event_reconciliation_thread.join(timeout=scale_timeout(10))
-    assert not state.event_reconciliation_thread.is_alive()
+    assert (responses[1][0], responses[1][1]) == ("/harness/hosts", 200)
     assert not state.event_reconciliation_pending
     assert local.list_events_for_reconciliation() == []
     event_ids = [r["event_id"] for r in records]
