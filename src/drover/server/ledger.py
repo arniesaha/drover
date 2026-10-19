@@ -841,8 +841,7 @@ def ledger_stats(con) -> dict[str, dict[str, Any]]:
             oldest_lease_age_seconds=_seconds(row[5]),
             oldest_pending_age_seconds=_seconds(row[6]),
         )
-    for job_kind, dead_lettered, quarantined, skipped in con.execute(
-        """SELECT job_kind,
+    for job_kind, dead_lettered, quarantined, skipped in con.execute("""SELECT job_kind,
                   count(*) FILTER (WHERE status = 'dead_lettered'),
                   count(*) FILTER (WHERE status = 'quarantined'),
                   count(*) FILTER (
@@ -850,8 +849,7 @@ def ledger_stats(con) -> dict[str, dict[str, Any]]:
                   )
              FROM pipeline_jobs
             WHERE status IN ('dead_lettered', 'quarantined', 'superseded')
-            GROUP BY job_kind"""
-    ).fetchall():
+            GROUP BY job_kind""").fetchall():
         out[job_kind].update(
             dead_lettered=int(dead_lettered),
             quarantined=int(quarantined),

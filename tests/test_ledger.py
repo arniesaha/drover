@@ -137,7 +137,10 @@ def test_no_events_skip_is_non_error_without_a_schema_change(pg_control_path):
         "no_events",
         0,
     )
-    assert ledger.enqueue(SUMMARIZE_SESSION, "empty", source_version="v1") == "already_done"
+    assert (
+        ledger.enqueue(SUMMARIZE_SESSION, "empty", source_version="v1")
+        == "already_done"
+    )
     assert ledger.stats()[SUMMARIZE_SESSION]["skipped"] == 1
     assert ledger.stats()[SUMMARIZE_SESSION]["quarantined"] == 0
     with control_plane_connection(pg_control_path) as con:
