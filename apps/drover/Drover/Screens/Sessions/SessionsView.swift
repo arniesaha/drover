@@ -152,7 +152,7 @@ struct SessionsView: View {
                     }
                     .padding(.horizontal, 14)
                     .padding(.top, 8)
-                    .padding(.bottom, 16)
+                    .padding(.bottom, 92)
                 }
                 .accessibilityIdentifier("fleet-list")
                 .refreshable {
@@ -213,9 +213,11 @@ struct SessionsView: View {
 
             }
 
-            if store.hasLoadedOnce { actionBar }
         }
         .background(DroverColor.bg)
+        .overlay(alignment: .bottomTrailing) {
+            if store.hasLoadedOnce { actionBar.padding(.trailing, 18).padding(.bottom, 18) }
+        }
         // The design's chrome row *is* this screen's header, so the navigation
         // bar it would otherwise sit under has nothing left to carry. Pushed
         // screens (chat, terminal, the launch sheet) declare their own bars

@@ -65,7 +65,7 @@ struct LaunchView: View {
                 } else {
                     Picker("Harness", selection: $model.harness) {
                         ForEach(model.availableHarnesses, id: \.self) { name in
-                            Text(model.harnessLabel(name)).tag(name)
+                            Text("\(model.harnessLabel(name)) · quota unknown").tag(name)
                         }
                     }
                     .accessibilityIdentifier("launch-harness-picker")
