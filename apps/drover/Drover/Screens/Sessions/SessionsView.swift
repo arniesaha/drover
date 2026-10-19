@@ -623,9 +623,12 @@ struct SessionsView: View {
     }
 
     private var accountNeedsAttention: Bool {
-        cockpitStore.providerError != nil || cockpitStore.providerAccounts.contains { account in
-            account.status != .ok || account.windows.contains { ($0.usedPercent ?? 0) > 80 }
-        }
+        AccountHealthPresentation.needsAttention(
+            usedPercents: cockpitStore.providerAccounts.flatMap(\.windows).map(\.usedPercent),
+            hasAuthError: cockpitStore.providerAccounts.contains { $0.status != .ok },
+            hasProviderError: cockpitStore.providerError != nil,
+            isStale: providerSectionStatus == .stale || cockpitStore.providerAccounts.contains { $0.status == .stale }
+        )
     }
 
     private func actionFailedRow(_ message: String) -> some View {
