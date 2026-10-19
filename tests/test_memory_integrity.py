@@ -240,9 +240,16 @@ def test_metadata_only_session_is_insufficient(stores):
     SummarizerWorker(duckdb_path=path, _llm_call=llm, api_key="fixture").drain_once()
     llm.assert_not_called()
     job = JobLedger(path).latest(SUMMARIZE_SESSION, "harness-fixture")
-    assert job.status == "quarantined" and job.error_category == "no_events"
+    assert (job.status, job.error_category, job.failures) == (
+        "skipped",
+        "no_events",
+        0,
+    )
     assert MemoryRepository(path).summary("harness-fixture") is None
-    assert JobLedger(path).stats()["embed_session"]["pending"] == 0
+    stats = JobLedger(path).stats()
+    assert stats[SUMMARIZE_SESSION]["skipped"] == 1
+    assert stats[SUMMARIZE_SESSION]["quarantined"] == 0
+    assert stats["embed_session"]["pending"] == 0
     assert (
         tools.drover_session_summary(duckdb_path=path, session_id="harness-fixture")[
             "status"

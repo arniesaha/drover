@@ -621,7 +621,10 @@ class SummarizerWorker:
             )
             return "released"
         except Exception as exc:  # noqa: BLE001
-            log.exception("summarize %s failed: %s", session_id, _describe(exc))
+            if _classify_failure(exc)[1] == "no_events":
+                log.info("summarize %s skipped: %s", session_id, _describe(exc))
+            else:
+                log.exception("summarize %s failed: %s", session_id, _describe(exc))
             return self._finish_failure(ledger, job, exc)
 
         if not written:

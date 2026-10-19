@@ -8,6 +8,7 @@ the same registration path.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -340,7 +341,7 @@ def test_validation_failure_is_quarantined_with_reason(
 
 
 def test_session_without_events_is_skipped(
-    tmp_path: Path, pg_control_path: Path
+    tmp_path: Path, pg_control_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     _seed(tmp_path, pg_control_path)
     enqueue_summary_generation(pg_control_path, "sess-ghost", "v1")
@@ -353,6 +354,11 @@ def test_session_without_events_is_skipped(
     assert (job.status, job.error_category, job.failures) == ("skipped", "no_events", 0)
     assert "no events for session sess-ghost" in job.disposition_reason
     assert backend.calls == 0
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "drover.summarizer.worker" and record.levelno >= logging.ERROR
+    ]
 
 
 def test_missing_api_key_releases_without_spending_an_attempt(
