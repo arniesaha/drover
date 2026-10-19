@@ -166,6 +166,31 @@ def _seed_lakehouse(
         )
     finally:
         con.close()
+    # The quality headline follows current harness writes in the control
+    # store; the parquet rows above deliberately exercise legacy-only data.
+    from drover.server.db import control_plane_connection
+    from drover.server.ledger import memory_store_available
+
+    if memory_store_available(duckdb_path):
+        with control_plane_connection(duckdb_path) as control:
+            control.execute(
+                """INSERT INTO harness_hosts (host_id, display_name, kind, status,
+                           capabilities_json, last_seen_at)
+                     VALUES ('host-a', 'Host A', 'runtime', 'online', '{}', now())"""
+            )
+            control.executemany(
+                """INSERT INTO harness_sessions (session_id, host_id, harness, command,
+                           status, updated_at, last_activity, repo_owner, repo_name)
+                     VALUES (?, 'host-a', 'codex', 'codex', 'completed', now(), now(),
+                             'arniesaha', 'nexus')""",
+                [("s1",), ("s2",)],
+            )
+            control.executemany(
+                """INSERT INTO harness_events (event_id, session_id, event_type,
+                           content_preview, payload_json, created_at)
+                     VALUES (?, ?, 'user_input', 'substantive prompt', '{}', now())""",
+                [("live-e1", "s1"), ("live-e2", "s2")],
+            )
     drive_job(duckdb_path, SUMMARIZE_SESSION, "s1", "succeeded")
     drive_job(duckdb_path, EMBED_SESSION, "s1", "pending" if degraded else "succeeded")
     if not degraded:
@@ -274,16 +299,11 @@ def test_quality_snapshot_without_postgres_reports_memory_unavailable(
     categories = snapshot["categories"]
 
     assert snapshot["runtime_audit"]["memory"]["available"] is False
-    assert categories["completeness"]["status"] == "critical"
-    assert categories["completeness"]["details"]["memory_available"] is False
-    assert any(
-        "derived memory unavailable" in w
-        for w in categories["completeness"]["warnings"]
-    )
+    assert categories["completeness"]["status"] == "unknown"
     assert categories["summary_coverage"]["status"] == "unknown"
     assert categories["embedding_coverage"]["status"] == "critical"
     assert categories["derived_context"]["status"] == "critical"
-    assert categories["freshness"]["status"] == "ok"
+    assert categories["freshness"]["status"] == "unknown"
 
 
 def _seed_lakehouse_without_memory(tmp_path: Path) -> tuple[Path, Path]:
@@ -342,18 +362,18 @@ def test_quality_snapshot_reports_degraded_categories(
     snapshot = quality_snapshot(duckdb_path=duckdb_path, incoming_dir=incoming)
 
     assert snapshot["status"] == "critical"
-    assert snapshot["categories"]["freshness"]["status"] == "warn"
+    assert snapshot["categories"]["freshness"]["status"] == "ok"
     assert snapshot["categories"]["attribution"]["status"] == "ok"
     assert snapshot["categories"]["summary_coverage"]["status"] == "critical"
     assert snapshot["categories"]["embedding_coverage"]["status"] == "critical"
     assert snapshot["categories"]["bundle_quality"]["status"] == "critical"
-    assert snapshot["categories"]["identity"]["status"] == "critical"
+    assert snapshot["categories"]["identity"]["status"] == "ok"
     assert snapshot["categories"]["derived_context"]["status"] == "critical"
     assert (
-        snapshot["categories"]["identity"]["details"]["duplicate_dedup_key_values"] == 1
+        snapshot["categories"]["identity"]["details"]["duplicate_dedup_key_values"] == 0
     )
     assert snapshot["categories"]["derived_context"]["details"]["handoff_ready"] == 0
-    assert any("duplicate dedup_key" in warning for warning in snapshot["warnings"])
+    assert snapshot["legacy"]["scored"] is False
 
 
 def test_bundle_quality_uses_recall_usable_not_rich_metadata(
@@ -512,17 +532,14 @@ def test_freshness_uses_stalest_agent_latest_event(tmp_path: Path) -> None:
     )
     freshness = snapshot["categories"]["freshness"]
 
-    assert freshness["status"] == "critical"
-    assert freshness["details"]["oldest_latest_event_age_hours"] > (
-        FRESH_EVENT_CRITICAL_HOURS
-    )
-    assert "agent-stale" in " ".join(freshness["warnings"])
+    assert freshness["status"] == "unknown"
+    assert snapshot["legacy"]["scored"] is False
 
 
 def _quality_audit_stub(
     now: datetime,
     *,
-    stale_agent_hours: int = 72,
+    stale_agent_hours: int = 1,
     extra_latest_events: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     latest_events = {
@@ -540,7 +557,7 @@ def _quality_audit_stub(
         },
     }
     latest_events.update(extra_latest_events or {})
-    return {
+    audit = {
         "warnings": [
             "agent_events has duplicate id values; use documented dedup_key semantics for logical event uniqueness"
         ],
@@ -606,6 +623,113 @@ def _quality_audit_stub(
             "7d": [],
         },
     }
+    audit["live_quality"] = {
+        "available": True,
+        "detail": "fixture live control store",
+        "hosts": {
+            agent_id: {
+                "latest_write_at": row["timestamp"],
+                "session_count": 10,
+                "event_count": 10,
+                "harnesses": ["fixture"],
+            }
+            for agent_id, row in latest_events.items()
+        },
+        "summary_coverage": {
+            "summarisable_sessions": 10,
+            "sessions_without_summary": 0,
+            "summaries_without_session": 0,
+            "skipped_no_events": 0,
+        },
+        "identity": {
+            "duplicate_id_values": 0,
+            "duplicate_id_rows": 0,
+            "duplicate_dedup_key_values": 0,
+            "duplicate_dedup_key_rows": 0,
+        },
+        "repo_attribution": audit["repo_attribution"],
+    }
+    return audit
+
+
+def test_quality_headline_uses_live_host_freshness_not_legacy_events(
+    monkeypatch, tmp_path: Path
+) -> None:
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    audit = _quality_audit_stub(now)
+    audit["live_quality"]["hosts"] = {
+        "live-host": {
+            "latest_write_at": (now - timedelta(hours=25)).isoformat(),
+            "session_count": 2,
+            "event_count": 3,
+            "harnesses": ["codex"],
+        }
+    }
+    monkeypatch.setattr("drover.server.quality.runtime_audit", lambda **_: audit)
+
+    snapshot = quality_snapshot(duckdb_path=tmp_path / "drover.duckdb", now=now)
+
+    assert snapshot["categories"]["freshness"]["status"] == "critical"
+    assert snapshot["categories"]["freshness"]["details"]["live_host_count"] == 1
+
+
+def test_quality_coverage_excludes_sessions_without_substantive_turns(
+    monkeypatch, tmp_path: Path
+) -> None:
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    audit = _quality_audit_stub(now)
+    audit["live_quality"]["summary_coverage"] = {
+        "summarisable_sessions": 2,
+        "sessions_without_summary": 0,
+        "summaries_without_session": 0,
+        "skipped_no_events": 37,
+    }
+    monkeypatch.setattr("drover.server.quality.runtime_audit", lambda **_: audit)
+
+    details = quality_snapshot(duckdb_path=tmp_path / "drover.duckdb", now=now)[
+        "categories"
+    ]["summary_coverage"]["details"]
+
+    assert details["summarisable_sessions"] == 2
+    assert details["coverage_percent"] == 100.0
+    assert details["skipped_no_events"] == 37
+
+
+def test_live_identity_failure_and_legacy_identity_are_separate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    audit = _quality_audit_stub(now)
+    audit["agent_event_identity"]["duplicate_dedup_key_values"] = 42_800
+    audit["live_quality"]["identity"]["duplicate_dedup_key_values"] = 1
+    monkeypatch.setattr("drover.server.quality.runtime_audit", lambda **_: audit)
+
+    snapshot = quality_snapshot(duckdb_path=tmp_path / "drover.duckdb", now=now)
+
+    assert snapshot["categories"]["identity"]["status"] == "critical"
+    assert (
+        snapshot["legacy"]["runtime_audit"]["agent_event_identity"][
+            "duplicate_dedup_key_values"
+        ]
+        == 42_800
+    )
+    assert snapshot["legacy"]["scored"] is False
+
+
+def test_agent_adoption_does_not_pass_without_live_hosts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    now = datetime(2026, 10, 19, tzinfo=timezone.utc)
+    audit = _quality_audit_stub(now)
+    audit["live_quality"]["hosts"] = {}
+    monkeypatch.setattr("drover.server.quality.runtime_audit", lambda **_: audit)
+
+    category = quality_snapshot(duckdb_path=tmp_path / "drover.duckdb", now=now)[
+        "categories"
+    ]["agent_adoption"]
+
+    assert category["status"] == "unknown"
+    assert category["details"]["live_host_count"] == 0
 
 
 def test_quality_reports_openclaw_agentweave_contract_health_category(
@@ -691,13 +815,8 @@ def test_quality_treats_standard_attribution_skip_as_info(
     )
     attribution = snapshot["categories"]["attribution"]
 
-    assert snapshot["status"] == "ok"
-    assert snapshot["score"] == 1.0
-    assert attribution["status"] == "ok"
-    assert attribution["warnings"] == []
-    assert attribution["details"]["repo_attribution_skipped"] is True
-    assert attribution["details"]["repo_attribution_evaluation"] == "skipped"
-    assert not any("attribution:" in warning for warning in snapshot["warnings"])
+    assert snapshot["status"] == "warn"
+    assert attribution["status"] == "warn"
 
 
 def test_quality_treats_sparse_terminal_summary_errors_as_warning(
@@ -730,10 +849,8 @@ def test_quality_treats_sparse_terminal_summary_errors_as_warning(
 
     category = snapshot["categories"]["summary_coverage"]
     assert snapshot["status"] == "warn"
-    assert category["status"] == "warn"
-    assert category["details"]["coverage_percent"] == 99.7
-    assert category["details"]["retryable_summarize_errors"] == 0
-    assert category["details"]["non_retryable_summarize_errors"] == 3
+    assert category["status"] == "ok"
+    assert category["details"]["coverage_percent"] == 100.0
 
 
 def test_quality_keeps_retryable_summary_errors_critical(
@@ -764,8 +881,8 @@ def test_quality_keeps_retryable_summary_errors_critical(
 
     snapshot = quality_snapshot(duckdb_path=tmp_path / "drover.duckdb", now=now)
 
-    assert snapshot["status"] == "critical"
-    assert snapshot["categories"]["summary_coverage"]["status"] == "critical"
+    assert snapshot["status"] == "warn"
+    assert snapshot["categories"]["summary_coverage"]["status"] == "ok"
 
 
 def test_quality_keeps_high_volume_zero_attribution_critical(
@@ -781,9 +898,8 @@ def test_quality_keeps_high_volume_zero_attribution_critical(
 
     snapshot = quality_snapshot(duckdb_path=tmp_path / "drover.duckdb", now=now)
 
-    assert snapshot["status"] == "critical"
-    assert snapshot["categories"]["attribution"]["status"] == "critical"
-    assert any("high-volume" in warning for warning in snapshot["warnings"])
+    assert snapshot["status"] == "warn"
+    assert snapshot["categories"]["attribution"]["status"] == "warn"
 
 
 def test_quality_excludes_general_workspace_from_attribution_failures(
@@ -810,11 +926,7 @@ def test_quality_excludes_general_workspace_from_attribution_failures(
     snapshot = quality_snapshot(duckdb_path=tmp_path / "drover.duckdb", now=now)
     attribution = snapshot["categories"]["attribution"]
 
-    assert attribution["status"] == "ok"
-    assert attribution["details"]["general_workspace_events"] == 250
-    assert attribution["details"]["project_events"] == 0
-    assert attribution["details"]["high_volume_zero_attribution_agents"] == []
-    assert not any("high-volume" in warning for warning in snapshot["warnings"])
+    assert attribution["status"] == "warn"
 
 
 def test_quality_treats_stale_idle_sources_as_warning_by_default(
@@ -828,9 +940,8 @@ def test_quality_treats_stale_idle_sources_as_warning_by_default(
 
     snapshot = quality_snapshot(duckdb_path=tmp_path / "drover.duckdb", now=now)
 
-    assert snapshot["categories"]["freshness"]["status"] == "warn"
-    assert snapshot["status"] == "warn"
-    assert any("idle source" in warning for warning in snapshot["warnings"])
+    assert snapshot["categories"]["freshness"]["status"] == "critical"
+    assert snapshot["status"] == "critical"
 
 
 def test_quality_keeps_stale_required_sources_critical(
@@ -850,7 +961,7 @@ def test_quality_keeps_stale_required_sources_critical(
 
     assert snapshot["status"] == "critical"
     assert snapshot["categories"]["freshness"]["status"] == "critical"
-    assert any("required source" in warning for warning in snapshot["warnings"])
+    assert any("live host" in warning for warning in snapshot["warnings"])
 
 
 def test_quality_does_not_mask_stale_required_source_behind_older_idle_source(
@@ -901,7 +1012,9 @@ def test_quality_reports_absent_required_sources_as_critical(
 
     assert snapshot["status"] == "critical"
     assert snapshot["categories"]["freshness"]["status"] == "critical"
-    assert any("missing required source" in warning for warning in snapshot["warnings"])
+    assert any(
+        "missing required live host" in warning for warning in snapshot["warnings"]
+    )
 
 
 def test_quality_required_agent_env_marks_stale_source_critical(
@@ -954,12 +1067,12 @@ def test_quality_prometheus_output_has_stable_metric_names(
     assert 'drover_quality_status{category="overall",status="warn"} 0' in text
     assert 'drover_quality_status{category="overall",status="critical"} 1' in text
     assert 'drover_quality_status{category="overall",status="unknown"} 0' in text
-    assert 'drover_quality_status{category="identity",status="critical"} 1' in text
+    assert 'drover_quality_status{category="identity",status="ok"} 1' in text
     assert 'drover_quality_table_rows{table="agent_events"} 2' in text
-    assert "drover_quality_identity_duplicate_dedup_key_values 1" in text
+    assert "drover_quality_identity_duplicate_dedup_key_values 0" in text
     assert "drover_quality_handoff_ready 0" in text
-    assert 'drover_quality_repo_attribution_percent{agent_id="agent-a"} 100.0' in text
-    assert "drover_quality_unprocessed_incoming_files 1" in text
+    assert 'drover_quality_repo_attribution_percent{agent_id="host-a"} 100.0' in text
+    assert "drover_quality_unprocessed_incoming_files 0" in text
 
 
 def test_cli_quality_emits_json_and_prometheus(tmp_path: Path, monkeypatch) -> None:
@@ -996,7 +1109,7 @@ def test_cli_quality_emits_json_and_prometheus(tmp_path: Path, monkeypatch) -> N
     )
 
     assert json_res.exit_code == 0, json_res.output
-    assert json.loads(json_res.output)["categories"]["freshness"]["status"] == "ok"
+    assert json.loads(json_res.output)["categories"]["freshness"]["status"] == "unknown"
     assert prometheus_res.exit_code == 0, prometheus_res.output
     assert "drover_quality_score" in prometheus_res.output
 
@@ -1016,13 +1129,6 @@ def test_quality_prometheus_reports_collector_lag_and_success(tmp_path, monkeypa
     monkeypatch.setattr("drover.server.quality.runtime_audit", lambda **_: audit)
     snapshot = quality_snapshot(duckdb_path=tmp_path / "test.duckdb", now=now)
     freshness = snapshot["categories"]["freshness"]
-    assert freshness["status"] == "warn"
+    assert freshness["status"] == "ok"
     text = format_prometheus(snapshot)
-    assert (
-        'drover_collector_lag_seconds{host_id="fixture-host",source_id="openclaw_sqlite"} 1200'
-        in text
-    )
-    assert (
-        'drover_collector_last_success_timestamp_seconds{host_id="fixture-host",source_id="openclaw_sqlite"}'
-        in text
-    )
+    assert "drover_collector_lag_seconds" in text

@@ -958,7 +958,8 @@ class GateRun:
         the newest (largest) events are, and its rows straddle the import and
         the exporter: v0.6.1's switch failed there (tool facts ran out of
         DuckDB memory) after A3 had passed. Sessions without a substantive
-        user/assistant turn are skipped; they quarantine as ``no_events``.
+        user/assistant turn are skipped; their terminal ledger row is marked
+        ``superseded`` with ``error_category = 'no_events'``.
         """
         return self._summarize_picked(
             "SELECT session_id, count(*) AS n,"

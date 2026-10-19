@@ -853,7 +853,7 @@ def test_gate_a3_summarizes_the_largest_and_the_most_recent_session(
     rows += [
         ("live", "2026-10-06T18:47:47Z", "assistant", "done"),
         ("live", "2026-10-06T18:40:00Z", "user", "go"),
-        # Newer, but nothing to summarize: it would quarantine as no_events.
+        # Newer, but nothing to summarize: it is skipped as no_events.
         ("meta", "2026-10-06T19:00:00Z", None, None),
         ("drover-gate-x-a1", "2026-10-06T20:00:00Z", "user", "gate"),
     ]
