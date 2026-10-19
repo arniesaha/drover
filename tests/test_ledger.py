@@ -125,6 +125,32 @@ def test_claim_complete_and_already_done(pg_control_path):
     assert attempts == [(1, "succeeded")]
 
 
+def test_no_events_skip_is_non_error_without_a_schema_change(pg_control_path):
+    ledger = _ledger(pg_control_path)
+    ledger.enqueue(SUMMARIZE_SESSION, "empty", source_version="v1")
+    [job] = ledger.claim(SUMMARIZE_SESSION, worker_id="w")
+
+    assert ledger.skip(job, "no substantive turns")
+    row = _row(pg_control_path, job.job_id)
+    assert (row["status"], row["error_category"], row["failures"]) == (
+        "superseded",
+        "no_events",
+        0,
+    )
+    assert (
+        ledger.enqueue(SUMMARIZE_SESSION, "empty", source_version="v1")
+        == "already_done"
+    )
+    assert ledger.stats()[SUMMARIZE_SESSION]["skipped"] == 1
+    assert ledger.stats()[SUMMARIZE_SESSION]["quarantined"] == 0
+    with control_plane_connection(pg_control_path) as con:
+        attempts = con.execute(
+            "SELECT result, error_category FROM pipeline_job_attempts WHERE job_id = ?",
+            [job.job_id],
+        ).fetchall()
+    assert attempts == [("superseded", "no_events")]
+
+
 def test_retry_backoff_then_dead_letter_with_reason(pg_control_path):
     ledger = _ledger(pg_control_path)
     ledger.enqueue(BRIEF_PROJECT, "o/r")

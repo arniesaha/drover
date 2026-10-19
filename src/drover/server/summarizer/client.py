@@ -181,6 +181,11 @@ def _parse_json_response(raw: str, *, required_keys: tuple = _REQUIRED_KEYS) -> 
         try:
             return json.loads(s)
         except json.JSONDecodeError:
+            repaired_quotes = _try_repair_unescaped_quotes(s)
+            if repaired_quotes is not None and _is_acceptable_json_candidate(
+                repaired_quotes, required_keys
+            ):
+                return repaired_quotes
             repaired = _try_repair_truncated_json(s)
             if repaired is not None and _is_acceptable_json_candidate(
                 repaired, required_keys
@@ -216,7 +221,55 @@ def _parse_candidate(candidate: str) -> Any | None:
     try:
         return json.loads(s)
     except json.JSONDecodeError:
-        return _try_repair_truncated_json(s)
+        return _try_repair_unescaped_quotes(s) or _try_repair_truncated_json(s)
+
+
+def _try_repair_unescaped_quotes(s: str) -> Any | None:
+    """Repair quote characters a model placed verbatim inside JSON strings.
+
+    Models occasionally emit a JSON-shaped response such as ``"said "ship""``.
+    We only escape a quote while inside a string when the next non-whitespace
+    character cannot legally follow a closing JSON string. That keeps normal
+    JSON syntax authoritative and avoids guessing at arbitrary prose.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    changed = False
+    length = len(s)
+    for index, char in enumerate(s):
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            out.append(char)
+            escaped = True
+            continue
+        if char != '"':
+            out.append(char)
+            continue
+        if not in_string:
+            in_string = True
+            out.append(char)
+            continue
+        next_index = index + 1
+        while next_index < length and s[next_index].isspace():
+            next_index += 1
+        next_char = s[next_index] if next_index < length else ""
+        # A key closes before ':'; a value closes before a container delimiter.
+        if next_char in {":", ",", "}", "]", ""}:
+            in_string = False
+            out.append(char)
+        else:
+            out.append('\\"')
+            changed = True
+    if not changed:
+        return None
+    try:
+        return json.loads("".join(out))
+    except json.JSONDecodeError:
+        return None
 
 
 def _extract_json_object_candidates(raw: str) -> list[str]:
