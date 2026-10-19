@@ -601,6 +601,7 @@ def _snapshots_from_payload(
                 windows=windows,
                 source=_canonical_source(account.get("source")),
                 error_category=_optional_text(account.get("error_category")),
+                harnesses=_harnesses_from_payload(account.get("harnesses")),
             )
         )
     return tuple(snapshots)
@@ -662,9 +663,20 @@ def _snapshots_from_rows(rows: list[dict[str, Any]]) -> list[ProviderAccountSnap
                 windows=windows,
                 source=_canonical_source(first["source"]),
                 error_category=first["error_category"],
+                harnesses=_harnesses_from_payload(first.get("harnesses")),
             )
         )
     return snapshots
+
+
+def _harnesses_from_payload(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        harness for item in value
+        if isinstance(item, str)
+        if (harness := item.strip())
+    )
 
 
 def _connection_failed(connection: Mapping[str, Any]) -> bool:

@@ -8,14 +8,14 @@
 
 | State | Screenshot |
 | --- | --- |
-| Home — no account warning | [home-no-account-warning.png](home-no-account-warning.png) |
-| Home — account warning | [home-account-warning.png](home-account-warning.png) |
-| New Session — reported quota | [launch-picker-real-quota.png](launch-picker-real-quota.png) |
+| Home, no account warning | [home-no-account-warning.png](home-no-account-warning.png) |
+| Home, account warning | [home-account-warning.png](home-account-warning.png) |
+| New Session, reported quota | [launch-picker-real-quota.png](launch-picker-real-quota.png) |
 | Inbox | [inbox.png](inbox.png) |
 | Floating New Session control clear of the list | [home-floating-new-session-pill.png](home-floating-new-session-pill.png) |
 
 ## Validation
 
 - `swift test --package-path apps/drover/DroverKit --filter 'LaunchModelTests|AccountQuotaPresentationTests'`
-- `xcodebuild … -only-testing:DroverUITests/AccessibilityJourneyUITests test` — 15 tests passed.
-- `xcodebuild … -only-testing:DroverUITests/ObservabilityFixtureUITests test` — 17 tests passed.
+- `xcodebuild … -only-testing:DroverUITests/AccessibilityJourneyUITests test`: 15 tests passed.
+- `xcodebuild … -only-testing:DroverUITests/ObservabilityFixtureUITests test`: 17 tests passed.

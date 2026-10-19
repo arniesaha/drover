@@ -335,6 +335,22 @@ def test_provider_snapshot_table_preserves_each_usage_window():
     ]
 
 
+def test_provider_refresh_preserves_reported_account_harnesses(
+    provider_service, provider_host
+):
+    payload = {
+        **GOOD_PAYLOAD,
+        "accounts": [
+            {**GOOD_PAYLOAD["accounts"][0], "harnesses": ["reviewer"]}
+        ],
+    }
+
+    provider_service.refresh_host(provider_host, fetch=lambda _: payload)
+
+    account = provider_service.latest_accounts()[0]
+    assert account.harnesses == ("reviewer",)
+
+
 def test_codex_probe_reads_plan_and_multiple_windows(fake_codex_app_server):
     snapshot = CodexUsageProbe(command=fake_codex_app_server.command).read()
 

@@ -53,8 +53,8 @@ private func catalog(
     let snapshot = try HarnessSnapshot.decode(from: multiHostSnapshotJSON)
     let accounts = try JSONDecoder().decode([ProviderAccount].self, from: Data(#"""
     [
-      {"snapshot_id":"studio-openai","dedup_key":"studio-openai","provider":"openai","account_label":"Studio","host_id":"studio","status":"ok","observed_at":"2026-10-01T00:00:00Z","source":"fixture","windows":[{"kind":"primary","used_percent":38}]},
-      {"snapshot_id":"nas-openai","dedup_key":"nas-openai","provider":"openai","account_label":"NAS","host_id":"nas","status":"ok","observed_at":"2026-10-01T00:00:00Z","source":"fixture","windows":[{"kind":"primary","used_percent":79}]}
+      {"snapshot_id":"studio-openai","dedup_key":"studio-openai","provider":"openai","account_label":"Studio","host_id":"studio","harnesses":["codex"],"status":"ok","observed_at":"2026-10-01T00:00:00Z","source":"fixture","windows":[{"kind":"primary","used_percent":38}]},
+      {"snapshot_id":"nas-openai","dedup_key":"nas-openai","provider":"openai","account_label":"NAS","host_id":"nas","harnesses":["codex"],"status":"ok","observed_at":"2026-10-01T00:00:00Z","source":"fixture","windows":[{"kind":"primary","used_percent":79}]}
     ]
     """#.utf8))
     let model = LaunchModel(client: client(), snapshot: snapshot, providerAccounts: accounts, store: testStore())

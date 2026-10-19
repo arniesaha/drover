@@ -139,6 +139,9 @@ public struct ProviderAccount: Decodable, Sendable, Equatable {
     public let accountIdentity: String?
     public let planLabel: String?
     public let hostID: String
+    /// Harness identities reported with this account by the hub. This is the
+    /// account-to-launcher relationship; do not infer it from a launcher ID.
+    public let harnesses: [String]
     public let status: ProviderAccountStatus
     public let observedAt: Date
     public let windows: [ProviderWindow]
@@ -153,6 +156,7 @@ public struct ProviderAccount: Decodable, Sendable, Equatable {
         case accountIdentity = "account_identity"
         case planLabel = "plan_label"
         case hostID = "host_id"
+        case harnesses
         case status
         case observedAt = "observed_at"
         case windows
@@ -169,6 +173,7 @@ public struct ProviderAccount: Decodable, Sendable, Equatable {
         accountIdentity = try? container.decodeRequiredIdentity(forKey: .accountIdentity)
         planLabel = try? container.decode(String.self, forKey: .planLabel)
         hostID = try container.decodeRequiredIdentity(forKey: .hostID)
+        harnesses = (try? container.decode([String].self, forKey: .harnesses)) ?? []
         status = try container.decode(ProviderAccountStatus.self, forKey: .status)
         observedAt = try container.decodeRequiredWireDate(forKey: .observedAt)
         let reportedWindows = try container.decodeIfPresent([ProviderWindow].self, forKey: .windows) ?? []
