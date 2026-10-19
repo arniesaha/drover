@@ -19,6 +19,7 @@ public enum WidgetColor {
     public static let accentHi = PaletteToken(dark: 0x4F_C7_BB, light: 0x0E_54_50)
     public static let accentTint = PaletteToken(dark: 0x11_26_28, light: 0xD8_F0_EC)
     public static let warn = PaletteToken(dark: 0xED_B0_5A, light: 0x8A_4B_0A)
+    public static let lowQuotaTint = PaletteToken(dark: 0x31_25_17, light: 0xF8_E8_CC)
 
     public struct PaletteToken: ShapeStyle, Equatable, Sendable {
         public let dark: UInt32
@@ -74,7 +75,7 @@ public struct WidgetCapacityBar: View {
                 if let fraction, fraction > 0 {
                     GeometryReader { geo in
                         Capsule()
-                            .fill(isStale ? AnyShapeStyle(WidgetColor.muted) : AnyShapeStyle(WidgetColor.accent))
+                            .fill(isStale ? AnyShapeStyle(WidgetColor.muted) : AnyShapeStyle(isCritical ? WidgetColor.warn : WidgetColor.accent))
                             .frame(width: max(height, geo.size.width * min(1.0, fraction)))
                     }
                 }

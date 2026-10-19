@@ -13,9 +13,16 @@ public enum WidgetHostPresence: String, Codable, Sendable, Equatable {
 public struct WidgetAccountQuota: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let provider: String
+    /// A privacy-safe, compact account identity. Email labels are stored as
+    /// their local part only so widgets never render a truncated full address.
     public let accountLabel: String
+    /// Subscription tier reported by the accounts API, such as "Pro" or
+    /// "Plus". This makes same-provider accounts distinguishable at a glance.
+    public let planLabel: String?
     public let remainingFraction: Double?
     public let tightestWindowName: String?
+    public let resetsAt: Date?
+    public let observedAt: Date?
     public let isStale: Bool
     public let hasWarnings: Bool
 
@@ -23,16 +30,22 @@ public struct WidgetAccountQuota: Codable, Sendable, Equatable, Identifiable {
         id: String,
         provider: String,
         accountLabel: String,
+        planLabel: String? = nil,
         remainingFraction: Double?,
         tightestWindowName: String?,
+        resetsAt: Date? = nil,
+        observedAt: Date? = nil,
         isStale: Bool,
         hasWarnings: Bool
     ) {
         self.id = id
         self.provider = provider
         self.accountLabel = accountLabel
+        self.planLabel = planLabel
         self.remainingFraction = remainingFraction
         self.tightestWindowName = tightestWindowName
+        self.resetsAt = resetsAt
+        self.observedAt = observedAt
         self.isStale = isStale
         self.hasWarnings = hasWarnings
     }
@@ -56,12 +69,55 @@ public struct WidgetAccountQuota: Codable, Sendable, Equatable, Identifiable {
         }
     }
 
+    /// The harness names users recognize on the home screen, rather than an
+    /// initial badge that makes multiple accounts indistinguishable.
+    public var providerDisplayName: String {
+        switch provider.lowercased() {
+        case "anthropic", "claude": return "Claude"  // harness-name: display-only
+        case "openai", "codex": return "Codex"  // harness-name: display-only
+        case "google", "gemini", "antigravity": return "Gemini"  // harness-name: display-only
+        default: return provider.capitalized
+        }
+    }
+
+    /// Prefer the reported tier; otherwise use the short, privacy-safe label.
+    public var shortLabel: String {
+        let plan = planLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return plan.isEmpty ? accountLabel : plan
+    }
+
+    public func resetText(now: Date = Date()) -> String? {
+        guard let resetsAt else { return nil }
+        let seconds = resetsAt.timeIntervalSince(now)
+        guard seconds > 0 else { return nil }
+        let minutes = max(1, Int(seconds / 60))
+        if minutes < 60 { return "resets \(minutes)m" }
+        let hours = minutes / 60
+        if hours < 24 { return "resets \(hours)h" }
+        return "resets \(hours / 24)d"
+    }
+
+    public func updatedText(now: Date = Date()) -> String? {
+        guard let observedAt else { return nil }
+        let seconds = max(0, now.timeIntervalSince(observedAt))
+        if seconds < 60 { return "just now" }
+        if seconds < 3_600 { return "\(Int(seconds / 60))m ago" }
+        if seconds < 86_400 { return "\(Int(seconds / 3_600))h ago" }
+        return "\(Int(seconds / 86_400))d ago"
+    }
+
     public var remainingPercent: Int? {
         remainingFraction.map { max(0, min(100, Int(($0 * 100).rounded()))) }
     }
 
     public var remainingText: String {
         remainingPercent.map { "\($0)% left" } ?? "Unknown"
+    }
+
+    /// Widgets use an amber treatment below 20% remaining so urgency remains
+    /// readable even when color is not the only cue.
+    public var isLowQuota: Bool {
+        (remainingFraction ?? 1) < 0.20
     }
 }
 
@@ -184,9 +240,12 @@ public struct WidgetFleetSnapshot: Codable, Sendable, Equatable {
             return WidgetAccountQuota(
                 id: meter.id,
                 provider: meter.provider,
-                accountLabel: meter.accountLabel,
+                accountLabel: shortAccountLabel(meter.accountLabel),
+                planLabel: matchingSubscription?.planLabel,
                 remainingFraction: meter.remainingFraction,
                 tightestWindowName: windowTitle,
+                resetsAt: ProviderHeadline.leadingWindow(matchingSubscription?.windows ?? [])?.resetsAt,
+                observedAt: matchingSubscription?.representative.observedAt,
                 isStale: meter.isStale,
                 hasWarnings: meter.hasWarnings
             )
@@ -230,6 +289,13 @@ public struct WidgetFleetSnapshot: Codable, Sendable, Equatable {
         )
     }
 
+    private static func shortAccountLabel(_ label: String) -> String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let at = trimmed.firstIndex(of: "@") else { return trimmed }
+        let localPart = String(trimmed[..<at])
+        return localPart.isEmpty ? "Account" : localPart
+    }
+
     /// Fictional preview snapshot for WidgetKit gallery and Xcode previews.
     public static func preview() -> WidgetFleetSnapshot {
         WidgetFleetSnapshot(
@@ -237,20 +303,26 @@ public struct WidgetFleetSnapshot: Codable, Sendable, Equatable {
             needsYouCount: 2,
             accounts: [
                 WidgetAccountQuota(
-                    id: "anthropic|work",
+                    id: "anthropic|pro",
                     provider: "anthropic",
-                    accountLabel: "Work",
+                    accountLabel: "arnab",
+                    planLabel: "Pro",
                     remainingFraction: 0.18,
                     tightestWindowName: "5-hour",
+                    resetsAt: Date().addingTimeInterval(3 * 60 * 60),
+                    observedAt: Date().addingTimeInterval(-4 * 60),
                     isStale: false,
                     hasWarnings: false
                 ),
                 WidgetAccountQuota(
-                    id: "openai|personal",
+                    id: "openai|plus",
                     provider: "openai",
-                    accountLabel: "Personal",
+                    accountLabel: "arniesaha",
+                    planLabel: "Plus",
                     remainingFraction: 0.42,
                     tightestWindowName: "Weekly",
+                    resetsAt: Date().addingTimeInterval(16 * 60 * 60),
+                    observedAt: Date().addingTimeInterval(-4 * 60),
                     isStale: false,
                     hasWarnings: false
                 ),
@@ -258,28 +330,25 @@ public struct WidgetFleetSnapshot: Codable, Sendable, Equatable {
                     id: "google|lab",
                     provider: "google",
                     accountLabel: "Lab",
+                    planLabel: nil,
                     remainingFraction: 0.75,
                     tightestWindowName: "Daily",
+                    resetsAt: Date().addingTimeInterval(8 * 60 * 60),
+                    observedAt: Date().addingTimeInterval(-4 * 60),
                     isStale: false,
                     hasWarnings: false
                 ),
                 WidgetAccountQuota(
-                    id: "anthropic|backup",
-                    provider: "anthropic",
-                    accountLabel: "Backup",
+                    id: "openai|pro",
+                    provider: "openai",
+                    accountLabel: "work",
+                    planLabel: "Pro",
                     remainingFraction: 0.90,
-                    tightestWindowName: "5-hour",
+                    tightestWindowName: "Weekly",
+                    resetsAt: Date().addingTimeInterval(2 * 60 * 60),
+                    observedAt: Date().addingTimeInterval(-31 * 60),
                     isStale: true,
                     hasWarnings: true
-                ),
-                WidgetAccountQuota(
-                    id: "codex|eval",  // harness-name: display-only fixture ID
-                    provider: "codex",  // harness-name: display-only fixture provider
-                    accountLabel: "Eval",
-                    remainingFraction: 0.95,
-                    tightestWindowName: "Weekly",
-                    isStale: false,
-                    hasWarnings: false
                 )
             ],
             hosts: [
