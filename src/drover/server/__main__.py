@@ -2976,7 +2976,14 @@ def run(
             pin_analytical_connection(cfg.duckdb_path, enabled=True)
     else:
         with _startup_phase("pin_analytical_connection"):
-            pin_analytical_connection(cfg.duckdb_path)
+            # DuckLake serving and legacy-writer retirement are independent.
+            # Even before retirement, provider refresh enqueues advisory jobs
+            # in this file. Keep those short windows from repeatedly closing
+            # the last handle and checkpointing the whole legacy store (#702).
+            pin_analytical_connection(
+                cfg.duckdb_path,
+                enabled=True if cfg.analytics.backend == "ducklake" else None,
+            )
         with _startup_phase("bootstrap_catalog_and_control_store"):
             bootstrap(
                 parquet_dir=cfg.parquet_dir,
