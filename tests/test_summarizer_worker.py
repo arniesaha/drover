@@ -351,7 +351,11 @@ def test_session_without_events_is_skipped(
     assert worker.drain_once() == 1
 
     job = JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "sess-ghost")
-    assert (job.status, job.error_category, job.failures) == ("skipped", "no_events", 0)
+    assert (job.status, job.error_category, job.failures) == (
+        "superseded",
+        "no_events",
+        0,
+    )
     assert "no events for session sess-ghost" in job.disposition_reason
     assert backend.calls == 0
     assert not [

@@ -833,7 +833,7 @@ def _live_quality_audit(store_path: Path) -> dict:
                      (SELECT coalesce(sum(n - 1), 0) FROM (SELECT count(*) n FROM harness_events WHERE dedup_key IS NOT NULL GROUP BY dedup_key HAVING count(*) > 1) x)"""
             ).fetchone()
             skipped = con.execute("""SELECT count(*) FROM pipeline_jobs
-                    WHERE job_kind = 'summarize_session' AND status = 'skipped'
+                    WHERE job_kind = 'summarize_session' AND status = 'superseded'
                       AND error_category = 'no_events'""").fetchone()
             attribution_rows = con.execute("""SELECT s.host_id, count(*) AS total,
                           count(*) FILTER (WHERE s.repo_owner IS NOT NULL AND s.repo_name IS NOT NULL) AS attributed

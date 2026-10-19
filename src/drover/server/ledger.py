@@ -14,12 +14,15 @@ State machine::
        └──────────────────┼──────────────────────────────────────────────┘
                           ├──fail (budget spent / lease lost too often)──▶ dead_lettered
                           ├──fail (non-retryable input fault)───────────▶ quarantined
-                          ├──skip (nothing substantive to summarize)────▶ skipped
+                          ├──skip (nothing substantive to summarize)────▶ superseded
                           └──newer source generation / stale input──────▶ superseded
 
-``succeeded``, ``dead_lettered``, ``quarantined``, ``skipped`` and ``superseded`` are
-terminal. Every terminal failure carries a ``disposition_reason``; the schema
-refuses one without it.
+``succeeded``, ``dead_lettered``, ``quarantined`` and ``superseded`` are terminal.
+No-events skips use the existing ``superseded`` storage state with
+``error_category = 'no_events'``.  This keeps the no-events outcome non-error
+without widening the released status constraint in a point release. Every
+terminal failure carries a ``disposition_reason``; the schema refuses one
+without it.
 
 Claims take due rows with ``FOR UPDATE SKIP LOCKED``, so two workers never
 block on, or both take, one row, and one poisoned row cannot head the queue:
@@ -66,12 +69,11 @@ RETRY_WAIT = "retry_wait"
 SUCCEEDED = "succeeded"
 DEAD_LETTERED = "dead_lettered"
 QUARANTINED = "quarantined"
-SKIPPED = "skipped"
 SUPERSEDED = "superseded"
 
 LIVE_STATUSES = (PENDING, RUNNING, RETRY_WAIT)
 FAILED_STATUSES = (DEAD_LETTERED, QUARANTINED)
-TERMINAL_STATUSES = (SUCCEEDED, DEAD_LETTERED, QUARANTINED, SKIPPED, SUPERSEDED)
+TERMINAL_STATUSES = (SUCCEEDED, DEAD_LETTERED, QUARANTINED, SUPERSEDED)
 JOB_STATUSES = LIVE_STATUSES + TERMINAL_STATUSES
 
 EnqueueOutcome = Literal[
@@ -327,7 +329,8 @@ class JobLedger:
                 prior = con.execute(
                     f"""SELECT status FROM pipeline_jobs
                          WHERE job_kind = ? AND subject_key = ? AND source_version = ?
-                           AND status IN (?, ?, ?, ?)
+                           AND (status IN (?, ?, ?) OR
+                                (status = ? AND error_category = 'no_events'))
                          ORDER BY enqueued_at DESC LIMIT 1""",
                     [
                         job_kind,
@@ -335,11 +338,15 @@ class JobLedger:
                         source_version,
                         SUCCEEDED,
                         *FAILED_STATUSES,
-                        SKIPPED,
+                        SUPERSEDED,
                     ],
                 ).fetchone()
                 if prior is not None:
-                    return "already_done" if prior[0] == SUCCEEDED else "already_failed"
+                    return (
+                        "already_done"
+                        if prior[0] in {SUCCEEDED, SUPERSEDED}
+                        else "already_failed"
+                    )
                 if policy.max_failed_streak is not None:
                     streak = self._failed_streak(con, job_kind, subject_key)
                     if streak >= policy.max_failed_streak:
@@ -573,7 +580,7 @@ class JobLedger:
             with transaction(con):
                 row = con.execute(
                     """UPDATE pipeline_jobs
-                          SET status = 'skipped', error_category = ?,
+                          SET status = 'superseded', error_category = ?,
                               disposition_reason = ?, finished_at = now(),
                               lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
                               updated_at = now()
@@ -591,7 +598,7 @@ class JobLedger:
                     return False
                 con.execute(
                     """UPDATE pipeline_job_attempts
-                          SET finished_at = now(), result = 'skipped', error_category = ?,
+                          SET finished_at = now(), result = 'superseded', error_category = ?,
                               error_message = ?
                         WHERE job_id = ? AND lease_token = ? AND finished_at IS NULL""",
                     [category, _clip(reason), job.job_id, job.lease_token],
@@ -834,12 +841,22 @@ def ledger_stats(con) -> dict[str, dict[str, Any]]:
             oldest_lease_age_seconds=_seconds(row[5]),
             oldest_pending_age_seconds=_seconds(row[6]),
         )
-    for job_kind, status, count in con.execute(
-        """SELECT job_kind, status, count(*) FROM pipeline_jobs
-            WHERE status IN ('dead_lettered', 'quarantined', 'skipped')
-            GROUP BY job_kind, status"""
+    for job_kind, dead_lettered, quarantined, skipped in con.execute(
+        """SELECT job_kind,
+                  count(*) FILTER (WHERE status = 'dead_lettered'),
+                  count(*) FILTER (WHERE status = 'quarantined'),
+                  count(*) FILTER (
+                    WHERE status = 'superseded' AND error_category = 'no_events'
+                  )
+             FROM pipeline_jobs
+            WHERE status IN ('dead_lettered', 'quarantined', 'superseded')
+            GROUP BY job_kind"""
     ).fetchall():
-        out[job_kind][status] = int(count)
+        out[job_kind].update(
+            dead_lettered=int(dead_lettered),
+            quarantined=int(quarantined),
+            skipped=int(skipped),
+        )
     for job_kind in JOB_KINDS:
         success = con.execute(
             """SELECT finished_at FROM pipeline_jobs

@@ -241,7 +241,7 @@ def test_metadata_only_session_is_insufficient(stores):
     llm.assert_not_called()
     job = JobLedger(path).latest(SUMMARIZE_SESSION, "harness-fixture")
     assert (job.status, job.error_category, job.failures) == (
-        "skipped",
+        "superseded",
         "no_events",
         0,
     )

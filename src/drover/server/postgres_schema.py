@@ -707,15 +707,6 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS harness_events_reconciliation_pending ON harness_events (reconcile_pending, created_at, event_id)",
         ),
     ),
-    (
-        22,
-        (
-            "ALTER TABLE pipeline_jobs DROP CONSTRAINT IF EXISTS pipeline_jobs_status_check",
-            "ALTER TABLE pipeline_jobs ADD CONSTRAINT pipeline_jobs_status_check CHECK (status IN ('pending', 'running', 'retry_wait', 'succeeded', 'dead_lettered', 'quarantined', 'skipped', 'superseded'))",
-            "ALTER TABLE pipeline_job_attempts DROP CONSTRAINT IF EXISTS pipeline_job_attempts_result_check",
-            "ALTER TABLE pipeline_job_attempts ADD CONSTRAINT pipeline_job_attempts_result_check CHECK (result IN ('succeeded', 'retryable_failed', 'terminal_failed', 'lease_expired', 'released', 'skipped', 'superseded'))",
-        ),
-    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
