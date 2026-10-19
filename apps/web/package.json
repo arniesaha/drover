@@ -4,14 +4,19 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "build": "vite build && node scripts/write-server-manifest.mjs"
+    "dev": "vite",
+    "build": "vite build && node scripts/write-server-manifest.mjs",
+    "test": "vitest run",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "preact": "11.0.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.0",
     "@preact/preset-vite": "2.10.6",
     "typescript": "7.0.2",
-    "vite": "8.3.4"
+    "vite": "8.3.4",
+    "vitest": "^4.0.18"
   }
 }
