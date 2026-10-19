@@ -1,7 +1,7 @@
 export type Host = { id: string; name: string; status: string };
-export type Session = { id: string; hostId: string; hostName: string; harness: string; status: string; awaiting?: string; repo?: string; title: string; activityAt?: string };
+export type Session = { id: string; hostId: string; hostName: string; harness: string; mode?: string; status: string; awaiting?: string; repo?: string; cwd?: string; model?: string; title: string; activityAt?: string; startedAt?: string; updatedAt?: string; endedAt?: string };
 export type Snapshot = { hosts: Host[]; sessions: Session[] };
-export type Message = { id: string; seq: number; role: string; text: string };
+export type Message = { id: string; seq: number; type: string; role: string; text: string; timestamp?: string };
 export type ProviderAccount = { provider: string; account: string; remaining: number | null; status: "healthy" | "low" | "unknown" };
 const string = (value: unknown) => typeof value === "string" ? value : "";
 const array = (value: unknown) => Array.isArray(value) ? value : [];
@@ -12,10 +12,10 @@ export function mapSnapshot(payload: unknown): Snapshot {
   const source = record(payload);
   const hosts = array(source.hosts).map(record).filter((item) => string(item.host_id)).map((item) => ({ id: string(item.host_id), name: string(record(item.capabilities).display_name) || string(item.host_id), status: string(item.liveness) || string(item.status) || "offline" }));
   const hostNames = new Map(hosts.map((host) => [host.id, host.name]));
-  const sessions = array(source.sessions).map(record).filter((item) => string(item.session_id)).map((item) => ({ id: string(item.session_id), hostId: string(item.host_id), hostName: string(item.host_display_name) || hostNames.get(string(item.host_id)) || string(item.host_id) || "Unknown host", harness: string(item.harness) || "Unknown harness", status: string(item.status) || "unknown", awaiting: string(item.awaiting) || undefined, repo: string(item.repo_name) || undefined, title: string(item.preview) || string(item.recap) || "Untitled session", activityAt: string(item.last_activity) || string(item.updated_at) || string(item.started_at) || undefined }));
+  const sessions = array(source.sessions).map(record).filter((item) => string(item.session_id)).map((item) => ({ id: string(item.session_id), hostId: string(item.host_id), hostName: string(item.host_display_name) || hostNames.get(string(item.host_id)) || string(item.host_id) || "Unknown host", harness: string(item.harness) || "Unknown harness", mode: string(item.mode) || undefined, status: string(item.status) || "unknown", awaiting: string(item.awaiting) || undefined, repo: string(item.repo_name) || undefined, cwd: string(item.cwd) || undefined, model: string(item.model) || undefined, title: string(item.preview) || string(item.recap) || "Untitled session", activityAt: string(item.last_activity) || string(item.updated_at) || string(item.started_at) || undefined, startedAt: string(item.started_at) || undefined, updatedAt: string(item.updated_at) || undefined, endedAt: string(item.ended_at) || undefined }));
   return { hosts, sessions };
 }
-export function mapMessagePage(payload: unknown): { messages: Message[]; hasOlder: boolean } { const source = record(payload); return { messages: array(source.messages).map(record).filter((item) => string(item.event_id)).map((item) => ({ id: string(item.event_id), seq: Number(item.seq) || 0, role: string(item.role) || "assistant", text: string(item.text) })), hasOlder: source.has_older === true }; }
+export function mapMessagePage(payload: unknown): { messages: Message[]; hasOlder: boolean } { const source = record(payload); return { messages: array(source.messages).map(record).filter((item) => string(item.event_id)).map((item) => ({ id: string(item.event_id), seq: Number(item.seq) || 0, type: string(item.type) || "unknown", role: string(item.role) || "assistant", text: string(item.text), timestamp: string(item.ts) || undefined })), hasOlder: source.has_older === true }; }
 
 const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 export const fixtureSnapshot: Snapshot = mapSnapshot({ hosts: [{ host_id: "studio", liveness: "online", capabilities: { display_name: "Mac Studio" } }, { host_id: "forge", liveness: "online", capabilities: { display_name: "Forge Linux" } }], sessions: [
