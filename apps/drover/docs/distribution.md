@@ -60,13 +60,14 @@ simulator fixtures and local test servers. The supported Store matrix is:
 | Endpoint | Store configuration | Security consequence |
 | --- | --- | --- |
 | HTTPS server | ATS default trust evaluation; `wss` streams. | Preferred. Bearer traffic is encrypted in transit. |
-| HTTP IP address, including Tailscale `100.64.0.0/10` | Allowed by `NSAllowsLocalNetworking`; `ws` follows the same ATS boundary. | HTTP does not encrypt bearer traffic. |
-| HTTP unqualified name or `.local` name | Allowed by `NSAllowsLocalNetworking`. | HTTP does not encrypt bearer traffic. |
-| HTTP fully-qualified domain, including `*.ts.net` | Refused before pairing/configuration; the app asks the user to re-pair with an IP or configure HTTPS. | Use [Tailscale Serve HTTPS](../../../docs/getting-started.md#remote-tailscale-https) for remote access. |
+| HTTP RFC1918, link-local, or loopback IP | Allowed by the Store policy; `ws` follows the same ATS boundary. | HTTP does not encrypt bearer traffic. |
+| HTTP `.local` name | Allowed by the Store policy. | HTTP does not encrypt bearer traffic. |
+| HTTP CGNAT (`100.64.0.0/10`), IPv6 ULA, public IP, or hostname | Refused before pairing/configuration; the app explains that iOS transport security requires HTTPS. | Use the HTTPS Tailscale `*.ts.net` URL from [Tailscale Serve](../../../docs/getting-started.md#remote-tailscale-https). |
 
-The hub QR generator avoids plain-HTTP MagicDNS names where it can discover a
-Tailscale or LAN IP. Existing stored HTTP FQDN configurations intentionally
-enter a re-pair state rather than attempting a request that ATS will block.
+The hub QR generator prefers a configured or discovered Tailscale Serve HTTPS
+URL. Existing stored plain-HTTP configurations outside the Store policy
+intentionally enter a re-pair state rather than attempting a request that ATS
+will block.
 
 ### Device ATS probe
 

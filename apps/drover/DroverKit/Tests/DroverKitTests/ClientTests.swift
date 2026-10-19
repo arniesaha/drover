@@ -591,6 +591,19 @@ struct ClientTests {
     }
 }
 
+@Test func appTransportSecurityFailureExplainsHowToReachTheHub() async throws {
+    mock.transportError = URLError(URLError.Code(rawValue: -1022))
+    defer { mock.transportError = nil }
+
+    do {
+        _ = try await client().snapshot()
+        Issue.record("expected snapshot() to throw")
+    } catch let error as DroverError {
+        #expect(error.isTransportSecurityFailure)
+        #expect(error.localizedDescription == ServerConfig.httpsRePairMessage)
+    }
+}
+
 // Same gap, one layer up: proves the real DroverClient's `.timedOut` mapping
 // actually reaches CockpitStore.loadInsights and produces the cold-hub copy,
 // rather than only the CockpitClientStub-based tests in CockpitStoreTests.swift.
