@@ -339,7 +339,7 @@ def test_validation_failure_is_quarantined_with_reason(
     assert backend.calls == 1
 
 
-def test_session_without_events_is_quarantined(
+def test_session_without_events_is_skipped(
     tmp_path: Path, pg_control_path: Path
 ) -> None:
     _seed(tmp_path, pg_control_path)
@@ -350,7 +350,7 @@ def test_session_without_events_is_quarantined(
     assert worker.drain_once() == 1
 
     job = JobLedger(pg_control_path).latest(SUMMARIZE_SESSION, "sess-ghost")
-    assert (job.status, job.error_category) == ("quarantined", "no_events")
+    assert (job.status, job.error_category, job.failures) == ("skipped", "no_events", 0)
     assert "no events for session sess-ghost" in job.disposition_reason
     assert backend.calls == 0
 

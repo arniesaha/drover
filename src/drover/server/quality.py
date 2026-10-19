@@ -770,6 +770,304 @@ def _agent_adoption_category(audit: dict) -> dict:
     return _category(status, adoption, warnings)
 
 
+def _live_quality_audit(store_path: Path) -> dict:
+    """Read the current harness/control-store quality facts.
+
+    ``agent_events`` is an analytical, retired collector feed.  The harness
+    registry is authoritative for sessions and events that are live now, so
+    every headline category below is computed from this PostgreSQL store.
+    """
+    unavailable = {"available": False, "detail": "PostgreSQL control store unavailable"}
+    try:
+        from drover.server.db import control_plane_connection
+        from drover.server.ledger import memory_store_available
+
+        if not memory_store_available(store_path):
+            return unavailable
+        with control_plane_connection(store_path) as con:
+            host_rows = con.execute("""SELECT h.host_id, h.status, h.last_seen_at,
+                          max(e.created_at) AS last_event_at,
+                          max(greatest(s.updated_at, s.last_activity, s.started_at)) AS last_session_write_at,
+                          count(DISTINCT s.session_id) AS session_count,
+                          count(e.event_id) AS event_count,
+                          coalesce(string_agg(DISTINCT s.harness, ','), '') AS harnesses
+                     FROM harness_hosts h
+                LEFT JOIN harness_sessions s ON s.host_id = h.host_id
+                LEFT JOIN harness_events e ON e.session_id = s.session_id
+                    WHERE h.retired_at IS NULL
+                      AND h.kind IS DISTINCT FROM 'collector'
+                 GROUP BY h.host_id, h.status, h.last_seen_at
+                 ORDER BY h.host_id""").fetchall()
+            coverage = con.execute("""WITH summarisable AS (
+                       SELECT s.session_id
+                         FROM harness_sessions s
+                        WHERE EXISTS (
+                          SELECT 1 FROM harness_events e
+                           WHERE e.session_id = s.session_id
+                             AND e.event_type NOT IN ('status', 'system_event', 'metadata')
+                             AND coalesce(e.normalized_type, '') <> 'assistant_delta'
+                             AND nullif(btrim(e.content_preview), '') IS NOT NULL
+                        )
+                     ), covered AS (
+                       SELECT s.session_id FROM summarisable s
+                        WHERE EXISTS (
+                          SELECT 1 FROM harness_sessions h
+                          JOIN session_memory m ON m.session_id IN (
+                            h.session_id, h.summary_session_id, h.native_session_id
+                          )
+                           WHERE h.session_id = s.session_id AND m.phase = 'final'
+                        )
+                     )
+                     SELECT (SELECT count(*) FROM summarisable),
+                            (SELECT count(*) FROM summarisable) - (SELECT count(*) FROM covered),
+                            (SELECT count(*) FROM session_memory m WHERE m.phase = 'final'
+                              AND NOT EXISTS (
+                                SELECT 1 FROM harness_sessions h
+                                 WHERE m.session_id IN (h.session_id, h.summary_session_id, h.native_session_id)
+                              ))""").fetchone()
+            identity = con.execute(
+                """SELECT
+                     (SELECT count(*) FROM (SELECT event_id FROM harness_events GROUP BY event_id HAVING count(*) > 1) x),
+                     (SELECT coalesce(sum(n - 1), 0) FROM (SELECT count(*) n FROM harness_events GROUP BY event_id HAVING count(*) > 1) x),
+                     (SELECT count(*) FROM (SELECT dedup_key FROM harness_events WHERE dedup_key IS NOT NULL GROUP BY dedup_key HAVING count(*) > 1) x),
+                     (SELECT coalesce(sum(n - 1), 0) FROM (SELECT count(*) n FROM harness_events WHERE dedup_key IS NOT NULL GROUP BY dedup_key HAVING count(*) > 1) x)"""
+            ).fetchone()
+            skipped = con.execute("""SELECT count(*) FROM pipeline_jobs
+                    WHERE job_kind = 'summarize_session' AND status = 'skipped'
+                      AND error_category = 'no_events'""").fetchone()
+            attribution_rows = con.execute("""SELECT s.host_id, count(*) AS total,
+                          count(*) FILTER (WHERE s.repo_owner IS NOT NULL AND s.repo_name IS NOT NULL) AS attributed
+                     FROM harness_sessions s
+                    GROUP BY s.host_id""").fetchall()
+    except Exception as exc:  # quality is observational, never a control-plane failure
+        return {
+            **unavailable,
+            "detail": f"PostgreSQL control store unavailable: {type(exc).__name__}: {exc}",
+        }
+
+    hosts: dict[str, dict] = {}
+    for (
+        host_id,
+        status,
+        last_seen,
+        last_event,
+        last_session,
+        sessions,
+        events,
+        harnesses,
+    ) in host_rows:
+        writes = [
+            value
+            for value in (last_seen, last_event, last_session)
+            if value is not None
+        ]
+        hosts[str(host_id)] = {
+            "status": str(status),
+            "last_seen_at": last_seen.isoformat() if last_seen else None,
+            "last_event_at": last_event.isoformat() if last_event else None,
+            "last_session_write_at": last_session.isoformat() if last_session else None,
+            "latest_write_at": max(writes).isoformat() if writes else None,
+            "session_count": int(sessions or 0),
+            "event_count": int(events or 0),
+            "harnesses": [value for value in str(harnesses or "").split(",") if value],
+        }
+    attribution = {
+        str(host_id): {
+            "total": int(total or 0),
+            "attributed": int(attributed or 0),
+            "general_workspace": 0,
+            "project_total": int(total or 0),
+            "percent": (
+                round((int(attributed or 0) / int(total)) * 100, 1) if total else 100.0
+            ),
+        }
+        for host_id, total, attributed in attribution_rows
+    }
+    return {
+        "available": True,
+        "detail": "PostgreSQL harness control store",
+        "hosts": hosts,
+        "summary_coverage": {
+            "summarisable_sessions": int(coverage[0] or 0),
+            "sessions_without_summary": int(coverage[1] or 0),
+            "summaries_without_session": int(coverage[2] or 0),
+            "skipped_no_events": int(skipped[0] or 0),
+        },
+        "identity": {
+            "duplicate_id_values": int(identity[0] or 0),
+            "duplicate_id_rows": int(identity[1] or 0),
+            "duplicate_dedup_key_values": int(identity[2] or 0),
+            "duplicate_dedup_key_rows": int(identity[3] or 0),
+        },
+        "repo_attribution": attribution,
+    }
+
+
+def _live_freshness_category(
+    live: dict, *, now: datetime, required_host_ids: Iterable[str] | None
+) -> dict:
+    if not live.get("available"):
+        return _category(
+            "unknown", {"hosts": {}}, [live.get("detail", "live store unavailable")]
+        )
+    hosts = live["hosts"]
+    if not hosts:
+        return _category(
+            "unknown",
+            {"hosts": {}, "live_host_count": 0},
+            ["no live harness hosts found"],
+        )
+    ages = {
+        host_id: _age_hours(host["latest_write_at"], now=now)
+        for host_id, host in hosts.items()
+    }
+    required = _required_agent_ids(required_host_ids)
+    missing = sorted(required - set(hosts))
+    stale = sorted(
+        host_id
+        for host_id, age in ages.items()
+        if age is None or age > FRESH_EVENT_CRITICAL_HOURS
+    )
+    aging = sorted(
+        host_id
+        for host_id, age in ages.items()
+        if age is not None
+        and FRESH_EVENT_WARN_HOURS < age <= FRESH_EVENT_CRITICAL_HOURS
+    )
+    warnings: list[str] = []
+    status = "ok"
+    if missing:
+        status = "critical"
+        warnings.append("missing required live host: " + ", ".join(missing))
+    if stale:
+        status = "critical"
+        warnings.append("stale or unwritten live hosts: " + ", ".join(stale))
+    elif aging:
+        status = "warn"
+        warnings.append("aging live hosts: " + ", ".join(aging))
+    return _category(
+        status,
+        {
+            "hosts": hosts,
+            "live_host_count": len(hosts),
+            "required_host_ids": sorted(required),
+            "latest_event_age_hours_by_agent": ages,
+            "latest_write_age_hours_by_host": ages,
+            "latest_span_age_hours": None,
+            "collectors": [],
+            "unprocessed_incoming_files": 0,
+        },
+        warnings,
+    )
+
+
+def _live_summary_coverage_category(live: dict) -> dict:
+    if not live.get("available"):
+        return _category("unknown", {}, [live.get("detail", "live store unavailable")])
+    details = live["summary_coverage"]
+    total = details["summarisable_sessions"]
+    missing = details["sessions_without_summary"]
+    coverage = round(((total - missing) / total) * 100, 1) if total else 100.0
+    warnings: list[str] = []
+    status = "ok"
+    if missing:
+        status = "critical" if coverage < SUMMARY_COVERAGE_CRITICAL_PERCENT else "warn"
+        warnings.append(
+            f"{missing} summarisable sessions do not have a generated summary"
+        )
+    if details["summaries_without_session"]:
+        status = _worst_status(status, "warn")
+        warnings.append(
+            f"{details['summaries_without_session']} summaries do not map to a live session"
+        )
+    return _category(
+        status,
+        {
+            "event_sessions": total,
+            "event_sessions_without_summary": missing,
+            "summaries_without_events": details["summaries_without_session"],
+            "coverage_percent": coverage,
+            **details,
+        },
+        warnings,
+    )
+
+
+def _live_identity_category(live: dict) -> dict:
+    if not live.get("available"):
+        return _category("unknown", {}, [live.get("detail", "live store unavailable")])
+    identity = live["identity"]
+    status = "critical" if identity["duplicate_dedup_key_values"] else "ok"
+    warnings = (
+        ["duplicate live harness dedup_key values break event identity"]
+        if status == "critical"
+        else []
+    )
+    return _category(
+        status,
+        {"canonical_semantics": "harness_events.dedup_key", **identity},
+        warnings,
+    )
+
+
+def _live_completeness_category(live: dict, audit: dict) -> dict:
+    if not live.get("available"):
+        return _category("unknown", {}, [live.get("detail", "live store unavailable")])
+    memory = _memory(audit)
+    hosts = live["hosts"]
+    warnings: list[str] = []
+    status = "ok"
+    if not hosts:
+        status = "unknown"
+        warnings.append("no live harness hosts found")
+    if not memory.get("available"):
+        status = "critical"
+        warnings.append(f"derived memory unavailable: {memory.get('detail')}")
+    return _category(
+        status,
+        {
+            "live_hosts": len(hosts),
+            "live_sessions": sum(host["session_count"] for host in hosts.values()),
+            "live_events": sum(host["event_count"] for host in hosts.values()),
+            "memory_available": bool(memory.get("available")),
+        },
+        warnings,
+    )
+
+
+def _live_adoption_category(live: dict) -> dict:
+    if not live.get("available"):
+        return _category("unknown", {}, [live.get("detail", "live store unavailable")])
+    hosts = live["hosts"]
+    if not hosts:
+        return _category(
+            "unknown",
+            {"live_host_count": 0, "runtimes": []},
+            ["no live runtimes or hosts observed"],
+        )
+    observed = {
+        host_id: {"timestamp": host["latest_write_at"]}
+        for host_id, host in hosts.items()
+    }
+    adoption = adoption_snapshot(
+        {"latest_events": observed, "repo_attribution": live["repo_attribution"]}
+    )
+    runtimes = sorted(
+        {runtime for host in hosts.values() for runtime in host.get("harnesses", [])}
+    )
+    adoption.update(
+        {
+            "live_host_count": len(hosts),
+            "live_runtime_count": len(runtimes),
+            "observed_hosts": sorted(hosts),
+            "observed_runtime_names": runtimes,
+            "hosts": hosts,
+        }
+    )
+    warnings = list(adoption.get("warnings", []))
+    return _category("warn" if warnings else "ok", adoption, warnings)
+
+
 def quality_snapshot(
     *,
     duckdb_path: Path,
@@ -810,23 +1108,50 @@ def quality_snapshot(
         memory_store_path=memory_store_path,
         embedding_model=embedding_model,
     )
-    categories = {
-        "freshness": _freshness_category(
-            audit, now=now, required_agent_ids=required_agent_ids
-        ),
-        "completeness": _completeness_category(audit),
-        "summary_coverage": _summary_coverage_category(audit),
-        "embedding_coverage": _embedding_coverage_category(audit),
-        "attribution": _attribution_category(audit),
-        "bundle_quality": _bundle_quality_category(audit),
-        "identity": _identity_category(audit),
-        "derived_context": _derived_context_category(audit),
-        "agent_adoption": _agent_adoption_category(audit),
+    store_path = Path(memory_store_path) if memory_store_path else Path(duckdb_path)
+    # A caller that already performed the bounded control-store read can pass
+    # it through its audit payload; normal production callers use the direct
+    # read here. This keeps the snapshot composable for isolated diagnostics.
+    live = audit.get("live_quality") or _live_quality_audit(store_path)
+    live_coverage = live.get("summary_coverage", {})
+    headline_audit = {
+        **audit,
+        "latest_events": {
+            host_id: {"timestamp": host.get("latest_write_at")}
+            for host_id, host in live.get("hosts", {}).items()
+        },
+        "repo_attribution": live.get("repo_attribution", {}),
+        "session_consistency": {
+            "status": "ok" if live.get("available") else "missing",
+            "event_sessions": live_coverage.get("summarisable_sessions"),
+            "event_sessions_without_summary": live_coverage.get(
+                "sessions_without_summary"
+            ),
+            "summaries_without_events": live_coverage.get("summaries_without_session"),
+            "summaries_available": live.get("available", False),
+        },
+        "agent_event_identity": {
+            "status": "ok" if live.get("available") else "missing",
+            **live.get("identity", {}),
+        },
     }
-    span_linkability = _span_linkability_category(audit)
+    categories = {
+        "freshness": _live_freshness_category(
+            live, now=now, required_host_ids=required_agent_ids
+        ),
+        "completeness": _live_completeness_category(live, headline_audit),
+        "summary_coverage": _live_summary_coverage_category(live),
+        "embedding_coverage": _embedding_coverage_category(headline_audit),
+        "attribution": _attribution_category(headline_audit),
+        "bundle_quality": _bundle_quality_category(headline_audit),
+        "identity": _live_identity_category(live),
+        "derived_context": _derived_context_category(headline_audit),
+        "agent_adoption": _live_adoption_category(live),
+    }
+    span_linkability = _span_linkability_category(headline_audit)
     if span_linkability is not None:
         categories["span_linkability"] = span_linkability
-    openclaw_category = _openclaw_agentweave_category(audit)
+    openclaw_category = _openclaw_agentweave_category(headline_audit)
     if openclaw_category is not None:
         categories["openclaw_agentweave"] = openclaw_category
     status = _worst_status(*(category["status"] for category in categories.values()))
@@ -855,6 +1180,12 @@ def quality_snapshot(
         "categories": categories,
         "warnings": warnings,
         "runtime_audit": audit,
+        "legacy": {
+            "source": "retired agent_events collector pipeline",
+            "scored": False,
+            "runtime_audit": audit,
+        },
+        "live_store": live,
     }
 
 

@@ -14,9 +14,10 @@ State machine::
        └──────────────────┼──────────────────────────────────────────────┘
                           ├──fail (budget spent / lease lost too often)──▶ dead_lettered
                           ├──fail (non-retryable input fault)───────────▶ quarantined
+                          ├──skip (nothing substantive to summarize)────▶ skipped
                           └──newer source generation / stale input──────▶ superseded
 
-``succeeded``, ``dead_lettered``, ``quarantined`` and ``superseded`` are
+``succeeded``, ``dead_lettered``, ``quarantined``, ``skipped`` and ``superseded`` are
 terminal. Every terminal failure carries a ``disposition_reason``; the schema
 refuses one without it.
 
@@ -65,11 +66,12 @@ RETRY_WAIT = "retry_wait"
 SUCCEEDED = "succeeded"
 DEAD_LETTERED = "dead_lettered"
 QUARANTINED = "quarantined"
+SKIPPED = "skipped"
 SUPERSEDED = "superseded"
 
 LIVE_STATUSES = (PENDING, RUNNING, RETRY_WAIT)
 FAILED_STATUSES = (DEAD_LETTERED, QUARANTINED)
-TERMINAL_STATUSES = (SUCCEEDED, DEAD_LETTERED, QUARANTINED, SUPERSEDED)
+TERMINAL_STATUSES = (SUCCEEDED, DEAD_LETTERED, QUARANTINED, SKIPPED, SUPERSEDED)
 JOB_STATUSES = LIVE_STATUSES + TERMINAL_STATUSES
 
 EnqueueOutcome = Literal[
@@ -325,7 +327,7 @@ class JobLedger:
                 prior = con.execute(
                     f"""SELECT status FROM pipeline_jobs
                          WHERE job_kind = ? AND subject_key = ? AND source_version = ?
-                           AND status IN (?, ?, ?)
+                           AND status IN (?, ?, ?, ?)
                          ORDER BY enqueued_at DESC LIMIT 1""",
                     [
                         job_kind,
@@ -333,6 +335,7 @@ class JobLedger:
                         source_version,
                         SUCCEEDED,
                         *FAILED_STATUSES,
+                        SKIPPED,
                     ],
                 ).fetchone()
                 if prior is not None:
@@ -562,6 +565,39 @@ class JobLedger:
                     ),
                 )
 
+    def skip(
+        self, job: ClaimedJob, reason: str, *, category: str = "no_events"
+    ) -> bool:
+        """Finish a leased job without failure when its input is inapplicable."""
+        with self.connection() as con:
+            with transaction(con):
+                row = con.execute(
+                    """UPDATE pipeline_jobs
+                          SET status = 'skipped', error_category = ?,
+                              disposition_reason = ?, finished_at = now(),
+                              lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                              updated_at = now()
+                        WHERE job_id = ? AND lease_token = ? AND status = 'running'
+                          AND lease_expires_at > now()
+                    RETURNING job_id""",
+                    [
+                        category,
+                        _clip(f"skipped ({category}): {reason}"),
+                        job.job_id,
+                        job.lease_token,
+                    ],
+                ).fetchone()
+                if row is None:
+                    return False
+                con.execute(
+                    """UPDATE pipeline_job_attempts
+                          SET finished_at = now(), result = 'skipped', error_category = ?,
+                              error_message = ?
+                        WHERE job_id = ? AND lease_token = ? AND finished_at IS NULL""",
+                    [category, _clip(reason), job.job_id, job.lease_token],
+                )
+        return True
+
     def _spend_failure(
         self,
         con,
@@ -772,6 +808,7 @@ def ledger_stats(con) -> dict[str, dict[str, Any]]:
             "oldest_pending_age_seconds": None,
             "dead_lettered": 0,
             "quarantined": 0,
+            "skipped": 0,
             "last_success_at": None,
             "last_error": None,
         }
@@ -799,7 +836,7 @@ def ledger_stats(con) -> dict[str, dict[str, Any]]:
         )
     for job_kind, status, count in con.execute(
         """SELECT job_kind, status, count(*) FROM pipeline_jobs
-            WHERE status IN ('dead_lettered', 'quarantined')
+            WHERE status IN ('dead_lettered', 'quarantined', 'skipped')
             GROUP BY job_kind, status"""
     ).fetchall():
         out[job_kind][status] = int(count)

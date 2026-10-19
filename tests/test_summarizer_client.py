@@ -67,6 +67,16 @@ def test_strips_markdown_fence_around_json() -> None:
     assert out["summary_md"] == "x"
 
 
+def test_repairs_unescaped_quotes_inside_llm_json_strings() -> None:
+    fake = _FakeClient(
+        '{"summary_md":"The user said "ship it" before lunch.",'
+        '"next_steps_md":"Confirm the "release" window.","open_questions":[]}'
+    )
+    out = call_claude_summary("prompt", api_key="sk-test", _client=fake)
+    assert out["summary_md"] == 'The user said "ship it" before lunch.'
+    assert out["next_steps_md"] == 'Confirm the "release" window.'
+
+
 @pytest.mark.parametrize(
     ("response_text", "expected"),
     [

@@ -16,8 +16,9 @@ stay in the analytical DuckDB. Each claimed job:
      transaction rolls back and the result is discarded, so a stale generation
      can never overwrite a newer one or fan out downstream work.
 On failure the ledger spends one attempt: retry with backoff, dead-letter when
-the budget is spent, or quarantine a non-retryable input fault (validation
-failures, a session with no events). A missing API key is not the job's fault:
+the budget is spent, or quarantine a non-retryable input fault. A session with
+no substantive turns is instead skipped: it is a valid non-summarisable input,
+not an error. A missing API key is not the job's fault:
 the lease is released without spending an attempt.
 
 There is no startup recovery pass any more: a worker that dies mid-job leaves
@@ -639,6 +640,12 @@ class SummarizerWorker:
         """Spend one failure of the leased generation's budget."""
         self._before_failure_finish()
         retryable, category = _classify_failure(exc)
+        if category == "no_events":
+            skipped = ledger.skip(job, _describe(exc), category=category)
+            if skipped:
+                log.info("summarize %s skipped (%s)", job.subject_key, category)
+                return "skipped"
+            return "stale"
         outcome = ledger.fail(
             job, _describe(exc), retryable=retryable, category=category
         )
