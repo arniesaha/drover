@@ -29,6 +29,10 @@ public enum DroverError: Error, Equatable {
     /// enough across platforms to substring-match on downstream.
     public static let timeoutDetail = "timed out"
 
+    /// Stable marker for the URL loading system's ATS rejection. It is kept
+    /// separate from Foundation's localized copy, which varies by OS release.
+    public static let transportSecurityDetail = "transport security blocked"
+
     /// True for a request the app itself tore down — a superseded poll, a
     /// dismissed screen. Not a failure worth telling anyone about.
     public var isCancellation: Bool {
@@ -41,6 +45,11 @@ public enum DroverError: Error, Equatable {
     public var isTimeout: Bool {
         guard case .transport(let detail) = self else { return false }
         return detail == Self.timeoutDetail
+    }
+
+    public var isTransportSecurityFailure: Bool {
+        guard case .transport(let detail) = self else { return false }
+        return detail == Self.transportSecurityDetail
     }
 }
 
@@ -63,7 +72,9 @@ extension DroverError: LocalizedError {
         case .unavailable(let message):
             return message.isEmpty ? "That session is no longer available" : message
         case .transport:
-            return isCancellation ? "Request cancelled" : Self.unreachableDescription
+            if isCancellation { return "Request cancelled" }
+            if isTransportSecurityFailure { return ServerConfig.httpsRePairMessage }
+            return Self.unreachableDescription
         case .httpStatus(let code, let message):
             return message.isEmpty ? "Server error (\(code))" : message
         case .busy(let deadline):
@@ -75,6 +86,9 @@ extension DroverError: LocalizedError {
 
     /// Returns a contextual error description given whether the host is a Tailscale endpoint.
     public func localizedDescription(isTailscale: Bool) -> String {
+        if isTransportSecurityFailure {
+            return ServerConfig.httpsRePairMessage
+        }
         if case .transport = self, !isCancellation, isTailscale {
             return Self.unreachableTailscaleDescription
         }
@@ -179,12 +193,8 @@ public actor DroverClient {
         let response: URLResponse
         do {
             (data, response) = try await session.data(for: request)
-        } catch let error as URLError {
-            throw DroverError.transport(
-                error.code == .cancelled
-                    ? DroverError.cancellationDetail
-                    : error.localizedDescription
-            )
+        } catch {
+            throw transportError(from: error)
         }
         guard let http = response as? HTTPURLResponse else {
             throw DroverError.transport("non-HTTP response")
@@ -668,6 +678,9 @@ public actor DroverClient {
         } catch let error as DroverError {
             throw error
         } catch {
+            if Self.isAppTransportSecurityError(error) {
+                throw DroverError.transport(DroverError.transportSecurityDetail)
+            }
             return false
         }
     }
@@ -871,13 +884,7 @@ public actor DroverClient {
             // "The operation couldn't be completed. (NSURLErrorDomain error
             // -999.)" on some platforms and a bare "cancelled" on others, so
             // no substring test on it is reliable. The code always is.
-            if (error as? URLError)?.code == .cancelled {
-                throw DroverError.transport(DroverError.cancellationDetail)
-            }
-            if (error as? URLError)?.code == .timedOut {
-                throw DroverError.transport(DroverError.timeoutDetail)
-            }
-            throw DroverError.transport(error.localizedDescription)
+            throw Self.transportError(from: error)
         }
 
         guard let http = response as? HTTPURLResponse else {
@@ -889,6 +896,24 @@ public actor DroverClient {
 
     private func validatedData(_ data: Data, response http: HTTPURLResponse) throws -> Data {
         try Self.validate(data, response: http)
+    }
+
+    private static func transportError(from error: Error) -> DroverError {
+        if isAppTransportSecurityError(error) {
+            return .transport(DroverError.transportSecurityDetail)
+        }
+        if (error as? URLError)?.code == .cancelled {
+            return .transport(DroverError.cancellationDetail)
+        }
+        if (error as? URLError)?.code == .timedOut {
+            return .transport(DroverError.timeoutDetail)
+        }
+        return .transport(error.localizedDescription)
+    }
+
+    private static func isAppTransportSecurityError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == -1022
     }
 
     /// Static so the unauthenticated pairing call below can share exactly this

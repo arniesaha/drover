@@ -22,7 +22,7 @@ struct EnvironmentTests {
 @Test func factoryBuildsWhenConfigured() throws {
     let defaults = UserDefaults(suiteName: "drover-env-\(UUID().uuidString)")!
     let store = TokenStore(service: "drover-env-\(UUID().uuidString)")
-    ServerConfig(urlString: "http://h:7080")!.save(defaults: defaults)
+    ServerConfig(urlString: "http://127.0.0.1:7080")!.save(defaults: defaults)
     try store.save("tok")
     #expect(ClientFactory.make(defaults: defaults, tokenStore: store) != nil)
 }

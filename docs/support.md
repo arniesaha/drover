@@ -32,6 +32,19 @@ loopback works only for a simulator on the same computer. If the connection
 path is unclear, run the read-only check below after selecting the host,
 harness, and project:
 
+Store/TestFlight builds cannot use plain HTTP to a Tailscale CGNAT address
+(`100.64.0.0/10`). Publish the hub privately over HTTPS instead, then set the
+resulting `https://<machine>.<tailnet>.ts.net` URL as `[server] advertised_url`
+and generate a fresh QR code:
+
+```sh
+tailscale serve --https=443 http://127.0.0.1:7080
+drover-server pair
+```
+
+`tailscale serve status` shows the URL. This is tailnet-only; do not use
+Tailscale Funnel.
+
 ```sh
 drover-server setup-check --host HOST --harness HARNESS --project PROJECT
 ```
