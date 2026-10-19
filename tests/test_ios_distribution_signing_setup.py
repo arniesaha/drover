@@ -14,6 +14,13 @@ ROOT = Path(__file__).parents[1]
 SETUP_SCRIPT = ROOT / "scripts" / "ios" / "setup_distribution_signing.sh"
 CLEANUP_SCRIPT = ROOT / "scripts" / "ios" / "cleanup_distribution_signing.sh"
 PROJECT_SPEC = ROOT / "apps" / "drover" / "project.yml"
+WIDGET_PROFILE_UUID = "66666666-7777-8888-9999-AAAAAAAAAAAA"
+
+
+@pytest.fixture(autouse=True)
+def widget_profile_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DROVER_WIDGET_PROFILE_BASE64", "base64-widget-profile-material")
+    monkeypatch.setenv("DROVER_WIDGET_PROFILE_UUID", WIDGET_PROFILE_UUID)
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -59,7 +66,12 @@ def test_setup_creates_a_private_deterministic_signing_configuration(
     )
     write_executable(
         fake_bin / "plutil",
-        f"#!/usr/bin/env bash\nprintf '%s\\n' '{profile_uuid}'\n",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$*" == *widget-profile.plist ]]; then\n'
+        '  printf "%s\\n" "$DROVER_WIDGET_PROFILE_UUID"\n'
+        "else\n"
+        f"  printf '%s\\n' '{profile_uuid}'\n"
+        "fi\n",
     )
     write_executable(
         fake_bin / "security",
@@ -144,6 +156,7 @@ def test_setup_creates_a_private_deterministic_signing_configuration(
         "DROVER_DEVELOPMENT_TEAM = TEAMID1234\n"
         f"DROVER_CODE_SIGN_IDENTITY = {identity_name}\n"
         f"DROVER_PROVISIONING_PROFILE_SPECIFIER = {profile_uuid}\n"
+        f"DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER = {WIDGET_PROFILE_UUID}\n"
         f'DROVER_OTHER_CODE_SIGN_FLAGS = --keychain "{keychain}"\n'
     )
     flags = next(
@@ -153,6 +166,7 @@ def test_setup_creates_a_private_deterministic_signing_configuration(
     )
     assert shlex.split(flags) == ["--keychain", str(keychain)]
     assert Path(outputs["profile_path"]).name == f"{profile_uuid}.mobileprovision"
+    assert outputs["widget_profile_uuid"] == WIDGET_PROFILE_UUID
     assert Path(outputs["state_file"]).is_file()
     assert json.loads(
         (workspace / "keychain-state.json").read_text(encoding="utf-8")
@@ -170,14 +184,54 @@ def test_distribution_signing_values_are_mapped_only_by_the_app_target() -> None
         == "$(DROVER_PROVISIONING_PROFILE_SPECIFIER)"
     )
     assert store_release["OTHER_CODE_SIGN_FLAGS"] == "$(DROVER_OTHER_CODE_SIGN_FLAGS)"
+    widget_release = project["targets"]["DroverWidget"]["settings"]["configs"][
+        "StoreRelease"
+    ]
+    assert (
+        widget_release["PROVISIONING_PROFILE_SPECIFIER"]
+        == "$(DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER)"
+    )
     for name, target in project["targets"].items():
-        if name == "Drover":
+        if name in {"Drover", "DroverWidget"}:
             continue
         settings = target.get("settings", {})
         assert "PROVISIONING_PROFILE_SPECIFIER" not in settings.get("base", {})
         assert "PROVISIONING_PROFILE_SPECIFIER" not in settings.get("configs", {}).get(
             "StoreRelease", {}
         )
+
+
+def test_setup_fails_early_when_the_widget_profile_secrets_are_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DROVER_WIDGET_PROFILE_BASE64")
+    monkeypatch.delenv("DROVER_WIDGET_PROFILE_UUID")
+    environment = os.environ | {
+        "DROVER_DISTRIBUTION_P12_BASE64": "test-p12",
+        "DROVER_DISTRIBUTION_P12_PASSWORD": "test-password",
+        "DROVER_DISTRIBUTION_PROFILE_BASE64": "test-profile",
+        "DROVER_DISTRIBUTION_TEAM_ID": "TEAMID1234",
+        "DROVER_DISTRIBUTION_PROFILE_UUID": "11111111-2222-3333-4444-555555555555",
+        "DROVER_DISTRIBUTION_IDENTITY_SHA1": "A" * 40,
+        "DROVER_DISTRIBUTION_IDENTITY_NAME": "Apple Distribution: Example Organization (TEAMID1234)",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            str(SETUP_SCRIPT),
+            "--workspace",
+            str(tmp_path / "workspace"),
+            "--github-output",
+            str(tmp_path / "github-output"),
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr == "widget distribution profile input is unavailable\n"
 
 
 def test_setup_rejects_an_xcconfig_expansion_in_the_workspace_path(
@@ -228,7 +282,10 @@ def test_setup_refuses_to_replace_an_existing_provisioning_profile(
     )
     write_executable(fake_bin / "openssl", "#!/usr/bin/env bash\nexit 0\n")
     write_executable(
-        fake_bin / "plutil", f"#!/usr/bin/env bash\nprintf '%s\\n' '{profile_uuid}'\n"
+        fake_bin / "plutil",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$*" == *widget-profile.plist ]]; then printf "%s\\n" "$DROVER_WIDGET_PROFILE_UUID"; '
+        f"else printf '%s\\n' '{profile_uuid}'; fi\n",
     )
     write_executable(fake_bin / "swift", "#!/usr/bin/env bash\nexit 1\n")
     write_executable(
@@ -338,7 +395,10 @@ def test_setup_rejects_an_ambient_distribution_identity(tmp_path: Path) -> None:
         "#!/usr/bin/env bash\nprintf 'temporary-keychain-password'\n",
     )
     write_executable(
-        fake_bin / "plutil", f"#!/usr/bin/env bash\nprintf '%s\\n' '{profile_uuid}'\n"
+        fake_bin / "plutil",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$*" == *widget-profile.plist ]]; then printf "%s\\n" "$DROVER_WIDGET_PROFILE_UUID"; '
+        f"else printf '%s\\n' '{profile_uuid}'; fi\n",
     )
     write_executable(
         fake_bin / "swift",
@@ -420,7 +480,10 @@ def test_setup_failure_removes_keychain_file_when_security_delete_fails(
         "#!/usr/bin/env bash\nprintf 'temporary-keychain-password'\n",
     )
     write_executable(
-        fake_bin / "plutil", f"#!/usr/bin/env bash\nprintf '%s\\n' '{profile_uuid}'\n"
+        fake_bin / "plutil",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$*" == *widget-profile.plist ]]; then printf "%s\\n" "$DROVER_WIDGET_PROFILE_UUID"; '
+        f"else printf '%s\\n' '{profile_uuid}'; fi\n",
     )
     write_executable(
         fake_bin / "swift",
@@ -506,6 +569,8 @@ def test_cleanup_removes_only_the_recorded_temporary_signing_material(
     )
     profile.parent.mkdir(parents=True)
     profile.touch()
+    widget_profile = profile.with_name(f"{WIDGET_PROFILE_UUID}.mobileprovision")
+    widget_profile.touch()
     keychain_state.write_text(
         json.dumps(
             {"default": str(original_keychain), "search": [str(original_keychain)]}
@@ -518,6 +583,7 @@ def test_cleanup_removes_only_the_recorded_temporary_signing_material(
                 f"workspace={workspace}",
                 f"keychain={keychain}",
                 f"profile={profile}",
+                f"widget_profile={widget_profile}",
                 f"signing_config={signing_config}",
                 f"keychain_state={keychain_state}",
             ]
@@ -551,6 +617,7 @@ def test_cleanup_removes_only_the_recorded_temporary_signing_material(
     assert result.returncode == 0, result.stdout + result.stderr
     assert not workspace.exists()
     assert not profile.exists()
+    assert not widget_profile.exists()
     assert security_log.read_text(encoding="utf-8").splitlines() == [
         "delete-keychain",
         str(keychain),
@@ -589,6 +656,8 @@ def _write_cleanup_failure_fixture(tmp_path: Path) -> dict[str, Path]:
     )
     profile.parent.mkdir(parents=True)
     profile.touch()
+    widget_profile = profile.with_name(f"{WIDGET_PROFILE_UUID}.mobileprovision")
+    widget_profile.touch()
     signing_config = workspace / "signing.xcconfig"
     signing_config.touch()
     original_keychain = home / "Library" / "Keychains" / "login.keychain-db"
@@ -606,6 +675,7 @@ def _write_cleanup_failure_fixture(tmp_path: Path) -> dict[str, Path]:
                 f"workspace={workspace}",
                 f"keychain={keychain}",
                 f"profile={profile}",
+                f"widget_profile={widget_profile}",
                 f"signing_config={signing_config}",
                 f"keychain_state={keychain_state}",
             ]
@@ -618,6 +688,7 @@ def _write_cleanup_failure_fixture(tmp_path: Path) -> dict[str, Path]:
         "home": home,
         "keychain": keychain,
         "profile": profile,
+        "widget_profile": widget_profile,
         "state_file": state_file,
         "keychain_state": keychain_state,
     }
@@ -651,6 +722,7 @@ def test_cleanup_removes_keychain_file_when_security_delete_fails(
     assert result.returncode == 0, result.stdout + result.stderr
     assert not fixture["keychain"].exists()
     assert not fixture["profile"].exists()
+    assert not fixture["widget_profile"].exists()
     assert not fixture["workspace"].exists()
 
 
@@ -684,6 +756,7 @@ def test_cleanup_removes_credentials_but_retains_recovery_state_when_restore_fai
     assert "could not be restored" in result.stderr
     assert not fixture["keychain"].exists()
     assert not fixture["profile"].exists()
+    assert not fixture["widget_profile"].exists()
     assert fixture["workspace"].is_dir()
     assert fixture["state_file"].is_file()
     assert fixture["keychain_state"].is_file()

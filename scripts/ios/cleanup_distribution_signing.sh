@@ -25,6 +25,7 @@ done
 WORKSPACE=""
 KEYCHAIN_PATH=""
 PROFILE_PATH=""
+WIDGET_PROFILE_PATH=""
 SIGNING_CONFIG=""
 KEYCHAIN_STATE=""
 while IFS='=' read -r key value; do
@@ -32,6 +33,7 @@ while IFS='=' read -r key value; do
     workspace) WORKSPACE="$value" ;;
     keychain) KEYCHAIN_PATH="$value" ;;
     profile) PROFILE_PATH="$value" ;;
+    widget_profile) WIDGET_PROFILE_PATH="$value" ;;
     signing_config) SIGNING_CONFIG="$value" ;;
     keychain_state) KEYCHAIN_STATE="$value" ;;
     *) fail "state file is invalid" ;;
@@ -49,10 +51,17 @@ done < "$STATE_FILE"
   || fail "recorded keychain state is invalid"
 [[ "$PROFILE_PATH" == */Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision ]] \
   || fail "recorded provisioning profile path is invalid"
+[[ "$WIDGET_PROFILE_PATH" == */Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision ]] \
+  || fail "recorded widget provisioning profile path is invalid"
 PROFILE_UUID="${PROFILE_PATH##*/}"
 PROFILE_UUID="${PROFILE_UUID%.mobileprovision}"
 [[ "$PROFILE_UUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
   || fail "recorded provisioning profile path is invalid"
+WIDGET_PROFILE_UUID="${WIDGET_PROFILE_PATH##*/}"
+WIDGET_PROFILE_UUID="${WIDGET_PROFILE_UUID%.mobileprovision}"
+[[ "$WIDGET_PROFILE_UUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ \
+  && "$WIDGET_PROFILE_UUID" != "$PROFILE_UUID" ]] \
+  || fail "recorded widget provisioning profile path is invalid"
 [[ "$KEYCHAIN_PATH" = "$HOME/Library/Keychains/drover-distribution-$PROFILE_UUID.keychain-db" ]] \
   || fail "recorded keychain path is invalid"
 
@@ -93,6 +102,7 @@ subprocess.run(
 )
 PY
 rm -f "$PROFILE_PATH"
+rm -f "$WIDGET_PROFILE_PATH"
 if [[ "$KEYCHAIN_REMOVED" = true && "$KEYCHAIN_RESTORED" = true ]]; then
   rm -rf "$WORKSPACE"
   printf '%s\n' "temporary distribution signing material removed"

@@ -27,6 +27,10 @@ from verify_archive import (
 )
 
 
+WIDGET_BUNDLE_IDENTIFIER = "com.arnab.drover.widget"
+WIDGET_APP_GROUP = "group.com.arnab.drover"
+
+
 class Rejected(ValueError):
     pass
 
@@ -78,6 +82,48 @@ def verified(app, args):
         raise Rejected("signed artifact verification failed") from error
 
 
+def profile_reference(bundle, bundle_identifier, scratch, *, app_group=None):
+    require(
+        bundle.is_dir() and not bundle.is_symlink(),
+        "archive widget is unavailable",
+    )
+    profile_path = bundle / "embedded.mobileprovision"
+    profile_log = scratch / f"{bundle_identifier.rsplit('.', 1)[-1]}-profile.plist"
+    invoke(
+        ["security", "cms", "-D", "-i", str(profile_path)],
+        profile_log,
+        "archive provisioning metadata is unavailable",
+    )
+    profile = plistlib.loads(profile_log.read_bytes())
+    signing = inspect_signing(bundle)
+    team = signing.entitlements.get("com.apple.developer.team-identifier", "")
+    profile_id = profile.get("UUID", "")
+    require(
+        re.fullmatch(r"[A-Z0-9]{10}", team) is not None
+        and profile.get("TeamIdentifier") == [team]
+        and profile.get("Entitlements", {}).get("application-identifier")
+        == f"{team}.{bundle_identifier}"
+        and re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", profile_id
+        )
+        is not None,
+        "archive provisioning metadata does not match signed application",
+    )
+    if app_group is not None:
+        require(
+            app_group in signing.entitlements.get(
+                "com.apple.security.application-groups", []
+            ),
+            "signed widget is missing the required app group",
+        )
+    authority = next(
+        (a for a in signing.authorities if a.startswith("Apple Distribution:")),
+        None,
+    )
+    require(authority is not None, "archive signing authority is unavailable")
+    return team, profile_id, authority
+
+
 def export_options(path, archive, identity, scratch):
     private(path.parent, directory=True)
     if path.exists() or path.is_symlink():
@@ -85,30 +131,18 @@ def export_options(path, archive, identity, scratch):
         options = plistlib.loads(path.read_bytes())
     else:
         app = next((archive / "Products" / "Applications").glob("*.app"))
-        # Decode only the already-verified archive's public provisioning metadata.
-        profile_log = scratch / "profile.plist"
-        invoke(
-            ["security", "cms", "-D", "-i", str(app / "embedded.mobileprovision")],
-            profile_log,
-            "archive provisioning metadata is unavailable",
+        team, profile_id, authority = profile_reference(
+            app, identity.bundle_identifier, scratch
         )
-        profile = plistlib.loads(profile_log.read_bytes())
-        signing = inspect_signing(app)
-        team = signing.entitlements.get("com.apple.developer.team-identifier", "")
-        profile_id = profile.get("UUID", "")
+        widget_team, widget_profile_id, _ = profile_reference(
+            app / "PlugIns" / "DroverWidget.appex",
+            WIDGET_BUNDLE_IDENTIFIER,
+            scratch,
+            app_group=WIDGET_APP_GROUP,
+        )
         require(
-            re.fullmatch(r"[A-Z0-9]{10}", team) is not None
-            and profile.get("TeamIdentifier") == [team]
-            and profile.get("Entitlements", {}).get("application-identifier")
-            == f"{team}.{identity.bundle_identifier}"
-            and re.fullmatch(
-                r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", profile_id
-            )
-            is not None,
-            "archive provisioning metadata does not match signed application",
-        )
-        authority = next(
-            a for a in signing.authorities if a.startswith("Apple Distribution:")
+            widget_team == team,
+            "widget signing team does not match the application",
         )
         options = {
             "method": "app-store-connect",
@@ -116,7 +150,10 @@ def export_options(path, archive, identity, scratch):
             "signingStyle": "manual",
             "teamID": team,
             "signingCertificate": authority,
-            "provisioningProfiles": {identity.bundle_identifier: profile_id},
+            "provisioningProfiles": {
+                identity.bundle_identifier: profile_id,
+                WIDGET_BUNDLE_IDENTIFIER: widget_profile_id,
+            },
             "manageAppVersionAndBuildNumber": False,
             "testFlightInternalTestingOnly": True,
         }
@@ -147,9 +184,14 @@ def export_options(path, archive, identity, scratch):
         )
         and isinstance(profiles, dict)
         and isinstance(profiles.get(identity.bundle_identifier), str)
+        and isinstance(profiles.get(WIDGET_BUNDLE_IDENTIFIER), str)
         and re.fullmatch(
             r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
             profiles[identity.bundle_identifier],
+        )
+        and re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+            profiles[WIDGET_BUNDLE_IDENTIFIER],
         ),
         "export options require explicit team, certificate and provisioning profile references",
     )
@@ -227,6 +269,19 @@ def main():
             "IPA must contain exactly one application",
         )
         identity = verified(apps[0], args)
+        widget_team, _, _ = profile_reference(
+            apps[0] / "PlugIns" / "DroverWidget.appex",
+            WIDGET_BUNDLE_IDENTIFIER,
+            scratch,
+            app_group=WIDGET_APP_GROUP,
+        )
+        require(
+            widget_team
+            == inspect_signing(apps[0]).entitlements.get(
+                "com.apple.developer.team-identifier", ""
+            ),
+            "widget signing team does not match the application",
+        )
         with ipas[0].open("rb") as artifact:
             digest = hashlib.file_digest(artifact, "sha256").hexdigest()
         record = {

@@ -18,8 +18,9 @@ fail() {
 
 require_environment() {
   local name="$1"
+  local message="${2:-required protected signing input is unavailable}"
   local value="${!name:-}"
-  [[ -n "$value" ]] || fail "required protected signing input is unavailable"
+  [[ -n "$value" ]] || fail "$message"
   printf '%s' "$value"
 }
 
@@ -63,14 +64,20 @@ is_safe_xcconfig_path "$WORKSPACE" \
 P12_BASE64="$(require_environment DROVER_DISTRIBUTION_P12_BASE64)"
 P12_PASSWORD="$(require_environment DROVER_DISTRIBUTION_P12_PASSWORD)"
 PROFILE_BASE64="$(require_environment DROVER_DISTRIBUTION_PROFILE_BASE64)"
+WIDGET_PROFILE_BASE64="$(require_environment DROVER_WIDGET_PROFILE_BASE64 'widget distribution profile input is unavailable')"
 TEAM_ID="$(require_environment DROVER_DISTRIBUTION_TEAM_ID)"
 PROFILE_UUID="$(require_environment DROVER_DISTRIBUTION_PROFILE_UUID)"
+WIDGET_PROFILE_UUID="$(require_environment DROVER_WIDGET_PROFILE_UUID 'widget distribution profile reference is unavailable')"
 IDENTITY_SHA1="$(require_environment DROVER_DISTRIBUTION_IDENTITY_SHA1)"
 IDENTITY_NAME="$(require_environment DROVER_DISTRIBUTION_IDENTITY_NAME)"
 
 [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || fail "distribution team reference is invalid"
 [[ "$PROFILE_UUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
   || fail "distribution profile reference is invalid"
+[[ "$WIDGET_PROFILE_UUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+  || fail "widget distribution profile reference is invalid"
+[[ "$WIDGET_PROFILE_UUID" != "$PROFILE_UUID" ]] \
+  || fail "widget distribution profile must differ from the app profile"
 [[ "$IDENTITY_SHA1" =~ ^[[:xdigit:]]{40}$ ]] \
   || fail "distribution identity reference is invalid"
 [[ "$IDENTITY_NAME" == "Apple Distribution: "* && "$IDENTITY_NAME" == *"($TEAM_ID)" \
@@ -87,6 +94,8 @@ KEYCHAIN_PATH="$HOME/Library/Keychains/drover-distribution-$PROFILE_UUID.keychai
 P12_PATH="$WORKSPACE/distribution.p12"
 PROFILE_PATH="$WORKSPACE/distribution.mobileprovision"
 PROFILE_PLIST="$WORKSPACE/distribution-profile.plist"
+WIDGET_PROFILE_PATH="$WORKSPACE/widget.mobileprovision"
+WIDGET_PROFILE_PLIST="$WORKSPACE/widget-profile.plist"
 SIGNING_CONFIG="$WORKSPACE/signing.xcconfig"
 STATE_FILE="$WORKSPACE/signing-state"
 KEYCHAIN_STATE="$WORKSPACE/keychain-state.json"
@@ -94,7 +103,9 @@ IMPORT_LOG="$WORKSPACE/import.log"
 IDENTITY_CHECK_LOG="$WORKSPACE/identity-check.log"
 PARTITION_LIST_LOG="$WORKSPACE/partition-list.log"
 PROFILE_DESTINATION="$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+WIDGET_PROFILE_DESTINATION="$HOME/Library/MobileDevice/Provisioning Profiles/$WIDGET_PROFILE_UUID.mobileprovision"
 PROFILE_INSTALLED=false
+WIDGET_PROFILE_INSTALLED=false
 
 restore_keychain_state() {
   [[ -f "$KEYCHAIN_STATE" && ! -L "$KEYCHAIN_STATE" ]] || return 0
@@ -130,17 +141,23 @@ cleanup_failure() {
     if [[ "$PROFILE_INSTALLED" = true ]]; then
       rm -f "$PROFILE_DESTINATION"
     fi
+    if [[ "$WIDGET_PROFILE_INSTALLED" = true ]]; then
+      rm -f "$WIDGET_PROFILE_DESTINATION"
+    fi
     if [[ "$cleanup_incomplete" = true ]]; then
       printf '%s\n' \
         "keychain=$KEYCHAIN_PATH" \
         "keychain_state=$KEYCHAIN_STATE" \
         > "$WORKSPACE/cleanup-recovery"
-      rm -f "$P12_PATH" "$PROFILE_PATH" "$PROFILE_PLIST" "$SIGNING_CONFIG" \
+      rm -f "$P12_PATH" "$PROFILE_PATH" "$PROFILE_PLIST" "$WIDGET_PROFILE_PATH" \
+        "$WIDGET_PROFILE_PLIST" "$SIGNING_CONFIG" \
         "$STATE_FILE" "$IMPORT_LOG" "$IDENTITY_CHECK_LOG" \
         "$PARTITION_LIST_LOG" "$WORKSPACE/keychain-settings.log" \
         "$WORKSPACE/keychain-discovery.log" "$WORKSPACE/p12-decode.log" \
         "$WORKSPACE/profile-decode.log" "$WORKSPACE/profile-cms.log" \
-        "$WORKSPACE/profile-uuid.log" "$WORKSPACE/keychain-password.log"
+        "$WORKSPACE/profile-uuid.log" "$WORKSPACE/widget-profile-decode.log" \
+        "$WORKSPACE/widget-profile-cms.log" "$WORKSPACE/widget-profile-uuid.log" \
+        "$WORKSPACE/keychain-password.log"
       printf '%s\n' "distribution signing cleanup is incomplete; recovery state retained" >&2
     else
       rm -rf "$WORKSPACE"
@@ -154,18 +171,30 @@ printf '%s' "$P12_BASE64" | base64 -D > "$P12_PATH" 2>"$WORKSPACE/p12-decode.log
   || fail "distribution identity material could not be decoded"
 printf '%s' "$PROFILE_BASE64" | base64 -D > "$PROFILE_PATH" 2>"$WORKSPACE/profile-decode.log" \
   || fail "distribution profile could not be decoded"
+printf '%s' "$WIDGET_PROFILE_BASE64" | base64 -D > "$WIDGET_PROFILE_PATH" 2>"$WORKSPACE/widget-profile-decode.log" \
+  || fail "widget distribution profile could not be decoded"
 security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST" 2>"$WORKSPACE/profile-cms.log" \
   || fail "distribution profile could not be decoded"
+security cms -D -i "$WIDGET_PROFILE_PATH" > "$WIDGET_PROFILE_PLIST" 2>"$WORKSPACE/widget-profile-cms.log" \
+  || fail "widget distribution profile could not be decoded"
 ACTUAL_PROFILE_UUID="$(plutil -extract UUID raw "$PROFILE_PLIST" 2>"$WORKSPACE/profile-uuid.log")" \
   || fail "distribution profile could not be read"
+ACTUAL_WIDGET_PROFILE_UUID="$(plutil -extract UUID raw "$WIDGET_PROFILE_PLIST" 2>"$WORKSPACE/widget-profile-uuid.log")" \
+  || fail "widget distribution profile could not be read"
 [[ "$ACTUAL_PROFILE_UUID" = "$PROFILE_UUID" ]] \
   || fail "distribution profile does not match the approved reference"
+[[ "$ACTUAL_WIDGET_PROFILE_UUID" = "$WIDGET_PROFILE_UUID" ]] \
+  || fail "widget distribution profile does not match the approved reference"
 
 mkdir -p "$(dirname "$PROFILE_DESTINATION")"
 [[ ! -e "$PROFILE_DESTINATION" && ! -L "$PROFILE_DESTINATION" ]] \
   || fail "approved distribution profile already exists"
 cp "$PROFILE_PATH" "$PROFILE_DESTINATION"
 PROFILE_INSTALLED=true
+[[ ! -e "$WIDGET_PROFILE_DESTINATION" && ! -L "$WIDGET_PROFILE_DESTINATION" ]] \
+  || fail "approved widget distribution profile already exists"
+cp "$WIDGET_PROFILE_PATH" "$WIDGET_PROFILE_DESTINATION"
+WIDGET_PROFILE_INSTALLED=true
 
 KEYCHAIN_PASSWORD="$(openssl rand -base64 32 2>"$WORKSPACE/keychain-password.log")" \
   || fail "temporary signing keychain could not be created"
@@ -254,24 +283,29 @@ printf '%s\n' \
   "DROVER_DEVELOPMENT_TEAM = $TEAM_ID" \
   "DROVER_CODE_SIGN_IDENTITY = $IDENTITY_NAME" \
   "DROVER_PROVISIONING_PROFILE_SPECIFIER = $PROFILE_UUID" \
+  "DROVER_WIDGET_PROVISIONING_PROFILE_SPECIFIER = $WIDGET_PROFILE_UUID" \
   "DROVER_OTHER_CODE_SIGN_FLAGS = --keychain \"$KEYCHAIN_PATH\"" \
   > "$SIGNING_CONFIG"
 printf '%s\n' \
   "workspace=$WORKSPACE" \
   "keychain=$KEYCHAIN_PATH" \
   "profile=$PROFILE_DESTINATION" \
+  "widget_profile=$WIDGET_PROFILE_DESTINATION" \
   "signing_config=$SIGNING_CONFIG" \
   "keychain_state=$KEYCHAIN_STATE" \
   > "$STATE_FILE"
-rm -f "$P12_PATH" "$PROFILE_PATH" "$PROFILE_PLIST" "$IMPORT_LOG" \
+rm -f "$P12_PATH" "$PROFILE_PATH" "$PROFILE_PLIST" "$WIDGET_PROFILE_PATH" \
+  "$WIDGET_PROFILE_PLIST" "$IMPORT_LOG" \
   "$IDENTITY_CHECK_LOG" "$PARTITION_LIST_LOG" \
   "$WORKSPACE/keychain-settings.log" "$WORKSPACE/keychain-discovery.log" \
   "$WORKSPACE/p12-decode.log" "$WORKSPACE/profile-decode.log" \
   "$WORKSPACE/profile-cms.log" "$WORKSPACE/profile-uuid.log" \
+  "$WORKSPACE/widget-profile-decode.log" "$WORKSPACE/widget-profile-cms.log" \
+  "$WORKSPACE/widget-profile-uuid.log" \
   "$WORKSPACE/keychain-password.log"
 
-printf 'signing_config=%s\nkeychain_path=%s\nprofile_path=%s\nstate_file=%s\n' \
-  "$SIGNING_CONFIG" "$KEYCHAIN_PATH" "$PROFILE_DESTINATION" "$STATE_FILE" \
+printf 'signing_config=%s\nkeychain_path=%s\nprofile_path=%s\nwidget_profile_uuid=%s\nstate_file=%s\n' \
+  "$SIGNING_CONFIG" "$KEYCHAIN_PATH" "$PROFILE_DESTINATION" "$WIDGET_PROFILE_UUID" "$STATE_FILE" \
   >> "$GITHUB_OUTPUT_FILE"
 trap - EXIT
 printf '%s\n' "distribution signing setup complete"

@@ -23,6 +23,7 @@ from test_ios_archive_verifier import (
 SCRIPTS = Path(__file__).parents[1] / "scripts" / "ios"
 HUB = "https://hub.example.test"
 ISSUER = "11111111-2222-3333-4444-555555555555"
+WIDGET_ISSUER = "66666666-7777-8888-9999-AAAAAAAAAAAA"
 KEY_ID = "EXAMPLE123"
 
 
@@ -41,6 +42,11 @@ def chain(tmp_path: Path):
     }
     app = write_bundle(tmp_path / "fixture", info=info)
     (app / "embedded.mobileprovision").write_bytes(b"synthetic profile fixture")
+    widget = app / "PlugIns" / "DroverWidget.appex"
+    widget.mkdir(parents=True)
+    (widget / "embedded.mobileprovision").write_bytes(
+        b"synthetic widget profile fixture"
+    )
     archive = tmp_path / "Drover.xcarchive"
     archived = archive / "Products" / "Applications"
     archived.mkdir(parents=True)
@@ -56,7 +62,10 @@ def chain(tmp_path: Path):
                 "testFlightInternalTestingOnly": True,
                 "teamID": "TEAMID1234",
                 "signingCertificate": "Apple Distribution: Example (TEAMID1234)",
-                "provisioningProfiles": {"com.arnab.drover": ISSUER},
+                "provisioningProfiles": {
+                    "com.arnab.drover": ISSUER,
+                    "com.arnab.drover.widget": WIDGET_ISSUER,
+                },
             }
         )
     )
@@ -86,6 +95,10 @@ if name == "xcodebuild":
             (dest / f"Drover{i}.ipa").write_bytes(b"synthetic IPA bytes")
         print("private Xcode output " + os.environ["LEAK_SENTINEL"])
     else:
+        if os.getenv("ARCHIVE_SIGNING_ERROR") == "1":
+            print('error: Provisioning profile "Drover Widget AppStore" (66666666-7777-8888-9999-AAAAAAAAAAAA) does not include the com.apple.security.application-groups entitlement. (in target DroverWidget from project Drover)', file=sys.stderr)
+            print('Apple Distribution: Private Organization (TEAMID1234)', file=sys.stderr)
+            sys.exit(1)
         dest = pathlib.Path(args[args.index("-archivePath") + 1])
         shutil.copytree(root / "Drover.xcarchive", dest)
 elif name == "xcrun":
@@ -108,9 +121,17 @@ elif name == "codesign":
     elif "-dvv" in args:
         print("Authority=Apple Distribution: Example (TEAMID1234)", file=sys.stderr)
     else:
-        sys.stdout.buffer.write(plistlib.dumps({"application-identifier": "TEAMID1234.com.arnab.drover", "com.apple.developer.team-identifier": "TEAMID1234", "aps-environment": "production", "get-task-allow": False}))
+        if str(args[-1]).endswith("DroverWidget.appex"):
+            entitlements = {"application-identifier": "TEAMID1234.com.arnab.drover.widget", "com.apple.developer.team-identifier": "TEAMID1234", "com.apple.security.application-groups": ["group.com.arnab.drover"], "get-task-allow": False}
+        else:
+            entitlements = {"application-identifier": "TEAMID1234.com.arnab.drover", "com.apple.developer.team-identifier": "TEAMID1234", "aps-environment": "production", "get-task-allow": False}
+        sys.stdout.buffer.write(plistlib.dumps(entitlements))
 elif name == "security":
-    sys.stdout.buffer.write(plistlib.dumps({"UUID": "11111111-2222-3333-4444-555555555555", "TeamIdentifier": ["TEAMID1234"], "Entitlements": {"application-identifier": "TEAMID1234.com.arnab.drover"}}))
+    if str(args[-1]).endswith("DroverWidget.appex/embedded.mobileprovision"):
+        profile = {"UUID": "66666666-7777-8888-9999-AAAAAAAAAAAA", "TeamIdentifier": ["TEAMID1234"], "Entitlements": {"application-identifier": "TEAMID1234.com.arnab.drover.widget"}}
+    else:
+        profile = {"UUID": "11111111-2222-3333-4444-555555555555", "TeamIdentifier": ["TEAMID1234"], "Entitlements": {"application-identifier": "TEAMID1234.com.arnab.drover"}}
+    sys.stdout.buffer.write(plistlib.dumps(profile))
 elif name == "git":
     if "rev-parse" in args:
         print("a" * 40)
@@ -235,6 +256,31 @@ def test_archive_consumes_complete_xcode_version_output(chain):
     assert result.returncode == 0, result.stderr
 
 
+def test_archive_prints_a_redacted_widget_signing_failure_summary(chain):
+    root, run, _, _, config = chain
+
+    result = run(
+        "archive.sh",
+        "--version",
+        "1.2.3",
+        "--build",
+        "42",
+        "--output",
+        root / "output",
+        "--signing-config",
+        config,
+        ARCHIVE_SIGNING_ERROR="1",
+    )
+
+    assert result.returncode != 0
+    assert "archive failed; sanitized Xcode summary:" in result.stderr
+    assert "Drover Widget AppStore" in result.stderr
+    assert "DroverWidget" in result.stderr
+    assert "com.apple.security.application-groups" in result.stderr
+    assert WIDGET_ISSUER not in result.stderr
+    assert "Private Organization" not in result.stderr
+
+
 @pytest.mark.parametrize("count", ["0", "2"])
 def test_export_rejects_nonunique_ipa(chain, count):
     root, _, export, _, _ = chain
@@ -290,6 +336,7 @@ def test_export_emits_only_sanitized_ipa_evidence(chain, generate):
     assert settings["destination"] == "export"
     assert settings["testFlightInternalTestingOnly"] is True
     assert settings["manageAppVersionAndBuildNumber"] is False
+    assert settings["provisioningProfiles"]["com.arnab.drover.widget"] == WIDGET_ISSUER
     assert not (options.stat().st_mode & 0o077)
     assert list((root / "scratch").iterdir()) == []
     assert not list((root / "private").glob("drover-ipa-*"))
