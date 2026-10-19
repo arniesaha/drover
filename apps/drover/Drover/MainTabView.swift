@@ -89,6 +89,12 @@ struct MainTabView: View {
         InboxAttentionPresentation.badgeValue(for: inboxBadgeCount)
     }
 
+    private var accountsBadge: String? {
+        AccountHealthPresentation.badgeValue(
+            for: AccountHealthPresentation.count(accounts: cockpitStore.providerAccounts)
+        )
+    }
+
     var body: some View {
         TabView(selection: $selectedTab) {
             NavigationStack {
@@ -103,8 +109,7 @@ struct MainTabView: View {
                     defaults: defaults,
                     sessionStore: sessionStore,
                     cockpitStore: cockpitStore,
-                    onOpenSettings: onOpenSettings,
-                    onOpenAccountsTab: { selectedTab = .accounts }
+                    onOpenSettings: onOpenSettings
                 )
             }
             .tabItem { tabLabel(for: .home) }
@@ -128,7 +133,6 @@ struct MainTabView: View {
                 }
             }
             .tabItem { Label("Inbox", systemImage: "tray.full") }
-            .badge(inboxBadge)
             .tag(AppTab.inbox)
             .accessibilityLabel(AppTab.inbox.title)
             .accessibilityIdentifier(AppTab.inbox.accessibilityIdentifier)
@@ -165,7 +169,23 @@ struct MainTabView: View {
             .accessibilityIdentifier(AppTab.accounts.accessibilityIdentifier)
 
         }
-        .tabViewStyle(.sidebarAdaptable)
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        // Reserve the exact lane occupied by the floating dock. Descendants
+        // receive the adjusted safe area, so their own safe-area insets (such
+        // as Home's New Session button) keep the final row above both controls.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Color.clear.frame(height: 76).allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottom) {
+            FloatingDock(
+                selectedTab: $selectedTab,
+                inboxBadge: inboxBadge,
+                accountsBadge: accountsBadge
+            )
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
+        }
         .onChange(of: selectedTab) { _, newTab in
             newTab.save(to: defaults)
         }
@@ -234,5 +254,68 @@ private struct LazyTabRoot<Content: View>: View {
                 Color.clear
             }
         }
+    }
+}
+
+/// A compact app-owned dock avoids the system tab bar's opaque full-width
+/// background while retaining explicit labels, selected state, and badges.
+struct FloatingDock: View {
+    @Binding var selectedTab: AppTab
+    let inboxBadge: String?
+    let accountsBadge: String?
+
+    var body: some View {
+        HStack(spacing: 2) {
+            item(.home)
+            item(.inbox, badge: inboxBadge)
+            item(.analytics)
+            item(.accounts, badge: accountsBadge)
+        }
+        .padding(5)
+        .frame(maxWidth: .infinity)
+        .frame(maxWidth: 430)
+        .floatingDockSurface(in: Capsule())
+    }
+
+    @ViewBuilder
+    private func item(_ tab: AppTab, badge: String? = nil) -> some View {
+        Button {
+            selectedTab = tab
+        } label: {
+            VStack(spacing: 3) {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: tab.systemImage)
+                        .font(.system(size: 16, weight: .semibold))
+                    if let badge {
+                        Text(badge)
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, badge.count > 1 ? 4 : 0)
+                            .frame(minWidth: 16, minHeight: 16)
+                            .background(Circle().fill(DroverColor.warn))
+                            .offset(x: 8, y: -7)
+                            .accessibilityHidden(true)
+                    }
+                }
+                Text(tab.title)
+                    .font(.caption2.weight(tab == selectedTab ? .semibold : .regular))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(tab == selectedTab ? DroverColor.accentHi : DroverColor.muted)
+            .frame(maxWidth: .infinity, minHeight: 52)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("dock-\(tab.rawValue)")
+        .accessibilityLabel(accessibilityLabel(for: tab, badge: badge))
+        .accessibilityAddTraits(tab == selectedTab ? .isSelected : [])
+    }
+
+    private func accessibilityLabel(for tab: AppTab, badge: String?) -> String {
+        guard let badge else { return tab.title }
+        let noun = badge == "1" ? "account needs attention" : "accounts need attention"
+        if tab == .accounts { return "\(tab.title), \(badge) \(noun)" }
+        return "\(tab.title), \(badge) unread"
     }
 }

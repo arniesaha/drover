@@ -11,7 +11,8 @@ struct ProviderAccountsView: View {
 
     var body: some View {
         let subscriptions = ProviderSubscriptionGrouping.group(accounts, hostTitles: hostTitles)
-        let providers = Array(Set(subscriptions.map(\.provider))).sorted()
+        let affected = subscriptions.filter { $0.attention != nil }
+        let healthy = subscriptions.filter { $0.attention == nil }
         let section = ProviderSectionPresentation(status: status, message: statusMessage,
                                                    hasRetainedValues: !accounts.isEmpty)
         ScrollView {
@@ -28,11 +29,18 @@ struct ProviderAccountsView: View {
                     ContentUnavailableView("No reported accounts", systemImage: "person.crop.circle",
                         description: Text("Refresh to check for provider usage readings from your hosts."))
                 }
-                ForEach(providers, id: \.self) { provider in
-                    Text(provider == "openai" ? "OpenAI" : provider.capitalized).droverText(.h3)
+                if !affected.isEmpty {
+                    Text("Needs attention").droverText(.h3)
                         .padding(.top, 6)
-                        .accessibilityIdentifier("provider-heading-\(provider)")
-                    ForEach(subscriptions.filter { $0.provider == provider }) { subscription in
+                        .accessibilityIdentifier("accounts-needs-attention")
+                    ForEach(affected) { subscription in
+                        ProviderAccountCard(subscription: subscription, section: section)
+                    }
+                }
+                if !healthy.isEmpty {
+                    Text(affected.isEmpty ? "Accounts" : "All accounts").droverText(.h3)
+                        .padding(.top, 6)
+                    ForEach(healthy) { subscription in
                         ProviderAccountCard(subscription: subscription, section: section)
                     }
                 }

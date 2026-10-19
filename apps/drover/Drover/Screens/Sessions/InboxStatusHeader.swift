@@ -1,9 +1,9 @@
 import DroverKit
 import SwiftUI
 
-/// Pinned fleet status and a bounded Accounts preview. Provider details are
-/// pushed onto their own scrolling page so the inbox keeps room for sessions.
-struct InboxStatusHeader<Capacity: View>: View {
+/// Pinned fleet status. Account diagnostics live exclusively on Accounts so
+/// Home keeps its full vertical space for sessions.
+struct InboxStatusHeader: View {
     let summary: FleetSummaryPresentation
     let hostGroups: [HostGroup]
     var selectedHostID: String? = nil
@@ -11,7 +11,6 @@ struct InboxStatusHeader<Capacity: View>: View {
     var isOverviewExpanded: Bool = false
     var onToggleOverview: (() -> Void)? = nil
     let onRetry: () -> Void
-    @ViewBuilder let capacity: Capacity
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -24,7 +23,6 @@ struct InboxStatusHeader<Capacity: View>: View {
                 onToggleOverview: onToggleOverview,
                 onRetry: onRetry
             )
-            capacity
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)

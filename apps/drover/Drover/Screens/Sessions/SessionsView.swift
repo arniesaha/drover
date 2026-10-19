@@ -36,14 +36,12 @@ struct SessionsView: View {
     private let chatModelFactory: ChatModelFactory?
     private let defaults: UserDefaults
     private let onOpenSettings: () -> Void
-    private let onOpenAccountsTab: (() -> Void)?
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
     @State private var exporterFreshness = ExporterFreshnessGate()
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
     @State private var showFinished = false
-    @State private var showAccounts = false
     let isDemoMode: Bool
     @State private var notificationSessionIDs: Set<String>?
     @State private var filterState: FleetFilterState
@@ -60,8 +58,7 @@ struct SessionsView: View {
         defaults: UserDefaults = .standard,
         sessionStore: SessionStore? = nil,
         cockpitStore: CockpitStore? = nil,
-        onOpenSettings: @escaping () -> Void = {},
-        onOpenAccountsTab: (() -> Void)? = nil
+        onOpenSettings: @escaping () -> Void = {}
     ) {
         self.client = client
         self.isDemoMode = isDemoMode
@@ -72,7 +69,6 @@ struct SessionsView: View {
         self.chatModelFactory = chatModelFactory
         self.defaults = defaults
         self.onOpenSettings = onOpenSettings
-        self.onOpenAccountsTab = onOpenAccountsTab
         _filterState = State(initialValue: FleetFilterState.load(from: defaults))
         _store = State(initialValue: sessionStore ?? SessionStore(client: client))
         _cockpitStore = State(initialValue: cockpitStore ?? CockpitStore(client: client))
@@ -337,19 +333,6 @@ struct SessionsView: View {
             }
             .toolbar(.hidden, for: .tabBar)
         }
-        .navigationDestination(isPresented: $showAccounts) {
-            ProviderAccountsView(
-                accounts: cockpitStore.providerAccounts,
-                status: providerSectionStatus,
-                statusMessage: cockpitStore.providerError,
-                hostTitles: hostTitles,
-                onRefresh: {
-                    await store.refresh()
-                    if let snapshot = store.snapshot { await cockpitStore.refresh(for: snapshot) }
-                }
-            )
-            .toolbar(.hidden, for: .tabBar)
-        }
     }
 
     @ViewBuilder
@@ -373,7 +356,7 @@ struct SessionsView: View {
                         }
                     },
                     onRetry: { Task { await store.refresh() } }
-                ) { providerCapacity }
+                )
                 .accessibilityIdentifier("home-status-header")
 
                 if isOverviewExpanded {
@@ -584,14 +567,6 @@ struct SessionsView: View {
         store.freshness()
     }
 
-    private var providerSectionStatus: DataStatus {
-        let responseStatus = cockpitStore.overview?.providerCapacity.status ?? .ok
-        if cockpitStore.providerError != nil, responseStatus == .ok {
-            return .unknown
-        }
-        return responseStatus
-    }
-
     private var isEffectiveDemoMode: Bool {
         isDemoMode || client.config.baseURL.host == DemoHubData.syntheticHost
     }
@@ -603,54 +578,6 @@ struct SessionsView: View {
             isDemoMode: isEffectiveDemoMode,
             onToggleTheme: { appearance.toggle(displaying: colorScheme) },
             onOpenSettings: onOpenSettings
-        )
-    }
-
-    /// The pinned capacity strip. Empty (and so zero-height inside the pinned
-    /// header) whenever the hub has no cockpit, or nothing to report about it.
-    @ViewBuilder
-    private var providerCapacity: some View {
-        if cockpitStore.isCockpitAvailable,
-           !cockpitStore.providerAccounts.isEmpty || cockpitStore.providerError != nil {
-            ProviderCapacitySection(
-                accounts: cockpitStore.providerAccounts,
-                status: providerSectionStatus,
-                statusMessage: cockpitStore.providerError,
-                hostTitles: hostTitles,
-                onOpenAccounts: {
-                    if let onOpenAccountsTab {
-                        onOpenAccountsTab()
-                    } else {
-                        showAccounts = true
-                    }
-                }
-            )
-        }
-        if accountNeedsAttention {
-            Button {
-                if let onOpenAccountsTab {
-                    onOpenAccountsTab()
-                } else {
-                    showAccounts = true
-                }
-            } label: {
-                Label("Account needs attention", systemImage: "exclamationmark.triangle.fill")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .foregroundStyle(DroverColor.warn)
-                    .background(DroverColor.accentTint, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("account-health-warning")
-        }
-    }
-
-    private var accountNeedsAttention: Bool {
-        AccountHealthPresentation.needsAttention(
-            usedPercents: cockpitStore.providerAccounts.flatMap(\.windows).map(\.usedPercent),
-            hasAuthError: cockpitStore.providerAccounts.contains { $0.status != .ok },
-            hasProviderError: cockpitStore.providerError != nil,
-            isStale: providerSectionStatus == .stale || cockpitStore.providerAccounts.contains { $0.status == .stale }
         )
     }
 
@@ -783,16 +710,6 @@ struct SessionsView: View {
     private func markRead(_ session: SessionSummary) async {
         guard let snapshot = store.snapshot else { return }
         await AttentionWatcher(notifier: notifier, seenStore: defaults).markRead(session.id, in: snapshot)
-    }
-
-    /// Host id → display title from the fleet snapshot, so provider cards can
-    /// name the machines a subscription covers ("Mac Mini, NAS") rather than
-    /// showing raw ids.
-    private var hostTitles: [String: String] {
-        Dictionary(
-            (store.snapshot?.hosts ?? []).map { ($0.id, $0.title) },
-            uniquingKeysWith: { first, _ in first }
-        )
     }
 
     private func hostTitle(for session: SessionSummary) -> String {
