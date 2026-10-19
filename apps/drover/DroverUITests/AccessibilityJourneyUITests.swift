@@ -456,9 +456,10 @@ final class AccessibilityJourneyUITests: XCTestCase {
         for _ in 0..<12 {
             if session.exists {
                 let visible = session.frame.intersection(fleet.frame)
-                if !visible.isNull, visible.height >= min(160, session.frame.height) {
+                if !visible.isNull, visible.height >= 44 {
                     // Wrapped rows may be taller than the viewport. Tap their
-                    // visible portion, without requiring the whole row to fit.
+                    // visible portion once it reaches a tappable target size,
+                    // without requiring the whole row to fit.
                     fleet.coordinate(withNormalizedOffset: .zero)
                         .withOffset(CGVector(dx: visible.midX - fleet.frame.minX,
                                              dy: visible.midY - fleet.frame.minY)).tap()
