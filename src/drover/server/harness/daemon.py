@@ -4528,7 +4528,14 @@ def _reconcile_persisted_events(state: HarnessDaemonState) -> bool:
             host_id=state.host_id,
         )
         if result is None:
-            log.warning("structured event reconciliation deferred until hub recovery")
+            reason = (
+                getattr(pusher, "reconciliation_deferred_reason", None)
+                or "incomplete pass"
+            )
+            # A successful heartbeat already establishes hub reachability.
+            # Pending ownership is per-session work, not a hub-health failure.
+            logger = log.debug if reason == "session ownership pending" else log.warning
+            logger("structured event reconciliation deferred: %s", reason)
             return False
         state.event_reconciliation_pending = False
         log.info("structured event reconciliation completed: offered=%d", result)
@@ -4721,7 +4728,7 @@ def wire_event_pusher(state: HarnessDaemonState) -> EventPusher | None:
     """
     if not (state.central_url and state.api_token):
         return None
-    pusher = EventPusher(state.central_url, state.api_token)
+    pusher = EventPusher(state.central_url, state.api_token, registry=state.registry)
     pusher.start()
     state.push_event = pusher.push
     state.pusher = pusher

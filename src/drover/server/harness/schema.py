@@ -460,6 +460,14 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
         "ON harness_events (reconcile_pending, created_at, event_id)"
     )
     con.execute(_UNKNOWN_SESSION_RETRIES_DDL)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS harness_event_quarantine (
+          event_id VARCHAR PRIMARY KEY,
+          session_id VARCHAR NOT NULL,
+          reason VARCHAR NOT NULL,
+          quarantined_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
     migrate_legacy_harness_event_sequences(con)
     # Dropped, not migrated: every row duplicated a terminal.output event
     # byte-for-byte (verified 1:1 on live data), so there is nothing here

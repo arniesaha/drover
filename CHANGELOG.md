@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Structured event ownership rejections now quarantine retained host history with a reason and a hub insight. Missing-session registration grace is bounded to ten minutes, and reconciliation distinguishes ownership, delivery, and local ledger failures instead of reporting healthy hubs as awaiting recovery (#720). Adds control migration 22.
+
 ## [0.6.24] - 2026-10-18
 
 ### Fixed
