@@ -9,3 +9,8 @@
 .quota-windows strong { color: var(--accent-hi); font-size: 13px; font-weight: 500; }
 .quota-windows em { color: var(--muted); font-size: 10px; font-style: normal; }
 @media (max-width: 720px) { .account-card { align-items: flex-start; flex-direction: column; } }
+@media (min-width: 721px) {
+  .app-shell { background: linear-gradient(to right, var(--surface) 0 231px, var(--line) 231px 232px, var(--bg) 232px); display: grid; grid-template-columns: 232px minmax(0, 1fr); }
+  .rail { height: 100vh; inset: auto; min-height: 100vh; position: sticky; top: 0; width: auto; }
+  main { margin-left: 0; width: 100%; }
+}
