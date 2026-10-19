@@ -17,4 +17,5 @@
 ## Validation
 
 - `swift test --package-path apps/drover/DroverKit --filter 'LaunchModelTests|AccountQuotaPresentationTests'`
-- Scoped `CapabilityJourneyUITests` and `ObservabilityFixtureUITests` simulator run (the five capacity-summary fixture failures are recorded separately in the review handoff).
+- `xcodebuild … -only-testing:DroverUITests/AccessibilityJourneyUITests test` — 15 tests passed.
+- `xcodebuild … -only-testing:DroverUITests/ObservabilityFixtureUITests test` — 17 tests passed.

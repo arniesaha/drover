@@ -152,7 +152,7 @@ struct SessionsView: View {
                     }
                     .padding(.horizontal, 14)
                     .padding(.top, 8)
-                    .padding(.bottom, 92)
+                    .padding(.bottom, 16)
                 }
                 .accessibilityIdentifier("fleet-list")
                 .refreshable {
@@ -215,8 +215,12 @@ struct SessionsView: View {
 
         }
         .background(DroverColor.bg)
-        .overlay(alignment: .bottomTrailing) {
-            if store.hasLoadedOnce { actionBar.padding(.trailing, 18).padding(.bottom, 18) }
+        // A safe-area inset keeps the floating control visually pinned while
+        // reserving its hit region. An overlay left the final session row
+        // underneath the pill at accessibility sizes, so tapping the row
+        // opened New Session instead of the conversation.
+        .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
+            if store.hasLoadedOnce { actionBar.padding(.trailing, 18).padding(.vertical, 18) }
         }
         // The design's chrome row *is* this screen's header, so the navigation
         // bar it would otherwise sit under has nothing left to carry. Pushed
@@ -606,13 +610,29 @@ struct SessionsView: View {
     /// header) whenever the hub has no cockpit, or nothing to report about it.
     @ViewBuilder
     private var providerCapacity: some View {
-        if accountNeedsAttention {
-            Button {
+        if cockpitStore.isCockpitAvailable,
+           !cockpitStore.providerAccounts.isEmpty || cockpitStore.providerError != nil {
+            ProviderCapacitySection(
+                accounts: cockpitStore.providerAccounts,
+                status: providerSectionStatus,
+                statusMessage: cockpitStore.providerError,
+                hostTitles: hostTitles,
+                onOpenAccounts: {
                     if let onOpenAccountsTab {
                         onOpenAccountsTab()
                     } else {
                         showAccounts = true
                     }
+                }
+            )
+        }
+        if accountNeedsAttention {
+            Button {
+                if let onOpenAccountsTab {
+                    onOpenAccountsTab()
+                } else {
+                    showAccounts = true
+                }
             } label: {
                 Label("Account needs attention", systemImage: "exclamationmark.triangle.fill")
                     .frame(maxWidth: .infinity, alignment: .leading)
