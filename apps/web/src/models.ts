@@ -2,7 +2,7 @@ export type Host = { id: string; name: string; status: string };
 export type Session = { id: string; hostId: string; hostName: string; harness: string; mode?: string; status: string; awaiting?: string; repo?: string; cwd?: string; model?: string; title: string; activityAt?: string; startedAt?: string; updatedAt?: string; endedAt?: string };
 export type Snapshot = { hosts: Host[]; sessions: Session[] };
 export type Message = { id: string; seq: number; type: string; role: string; text: string; timestamp?: string };
-export type ProviderAccount = { provider: string; account: string; remaining: number | null; status: "healthy" | "low" | "unknown" };
+export type ProviderAccount = { id: string; provider: string; account: string; plan?: string; hostId?: string; status: string; observedAt?: string; source?: string; errorCategory?: string; windows: Array<{ kind: string; usedPercent?: number; resetsAt?: string }> };
 const string = (value: unknown) => typeof value === "string" ? value : "";
 const array = (value: unknown) => Array.isArray(value) ? value : [];
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -16,6 +16,8 @@ export function mapSnapshot(payload: unknown): Snapshot {
   return { hosts, sessions };
 }
 export function mapMessagePage(payload: unknown): { messages: Message[]; hasOlder: boolean } { const source = record(payload); return { messages: array(source.messages).map(record).filter((item) => string(item.event_id)).map((item) => ({ id: string(item.event_id), seq: Number(item.seq) || 0, type: string(item.type) || "unknown", role: string(item.role) || "assistant", text: string(item.text), timestamp: string(item.ts) || undefined })), hasOlder: source.has_older === true }; }
+/** Maps cockpit provider_capacity while preserving unknown/stale/error states. */
+export function mapProviderAccounts(payload: unknown): ProviderAccount[] { const capacity = record(record(payload).provider_capacity); return array(capacity.data).map(record).filter((item) => string(item.snapshot_id) || string(item.dedup_key)).map((item) => ({ id: string(item.snapshot_id) || string(item.dedup_key), provider: string(item.provider) || "Unknown provider", account: string(item.account_label) || "Unknown account", plan: string(item.plan_label) || undefined, hostId: string(item.host_id) || undefined, status: string(item.status) || "unknown", observedAt: string(item.observed_at) || undefined, source: string(item.source) || undefined, errorCategory: string(item.error_category) || undefined, windows: array(item.windows).map(record).map((window) => ({ kind: string(window.kind) || "quota", usedPercent: typeof window.used_percent === "number" ? window.used_percent : undefined, resetsAt: string(window.resets_at) || undefined })) })); }
 
 const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 export const fixtureSnapshot: Snapshot = mapSnapshot({ hosts: [{ host_id: "studio", liveness: "online", capabilities: { display_name: "Mac Studio" } }, { host_id: "forge", liveness: "online", capabilities: { display_name: "Forge Linux" } }], sessions: [
@@ -23,8 +25,8 @@ export const fixtureSnapshot: Snapshot = mapSnapshot({ hosts: [{ host_id: "studi
 ].map(([session_id,host_id,harness,status,awaiting,repo_name,preview,minutes]) => ({ session_id, host_id, harness, status, awaiting: awaiting || null, repo_name, preview, last_activity: ago(minutes as number) })) });
 export const fixtureMessages: Message[] = mapMessagePage({ has_older: true, messages: [{ event_id: "m1", seq: 18, role: "user", text: "Please review the home cards against the iOS fleet view." }, { event_id: "m2", seq: 19, role: "assistant", text: "I’m comparing the card hierarchy, state labels, and host metadata now." }, { event_id: "m3", seq: 20, role: "tool", text: "rg --files apps/web apps/drover" }, { event_id: "m4", seq: 21, role: "assistant", text: "The fleet view now uses the same Tide palette and monospace repository labels." }] }).messages;
 export const fixtureAccounts: ProviderAccount[] = [
-  { provider: "Claude", account: "studio@acme.test", remaining: 74, status: "healthy" },
-  { provider: "OpenAI", account: "forge@acme.test", remaining: 18, status: "low" },
-  { provider: "Claude", account: "forge@acme.test", remaining: 61, status: "healthy" },
-  { provider: "OpenAI", account: "studio@acme.test", remaining: null, status: "unknown" }
+  { id: "fixture-claude-studio", provider: "Claude", account: "studio@acme.test", plan: "Team", hostId: "studio", status: "ok", observedAt: ago(1), source: "fixture", windows: [{ kind: "seven day", usedPercent: 26 }, { kind: "five hour", usedPercent: 11 }] },
+  { id: "fixture-openai-forge", provider: "OpenAI", account: "forge@acme.test", plan: "Enterprise", hostId: "forge", status: "low", observedAt: ago(2), source: "fixture", windows: [{ kind: "seven day", usedPercent: 82 }] },
+  { id: "fixture-claude-forge", provider: "Claude", account: "forge@acme.test", plan: "Team", hostId: "forge", status: "ok", observedAt: ago(4), source: "fixture", windows: [{ kind: "seven day", usedPercent: 39 }] },
+  { id: "fixture-openai-studio", provider: "OpenAI", account: "studio@acme.test", hostId: "studio", status: "unknown", observedAt: ago(6), source: "fixture", windows: [{ kind: "seven day" }] }
 ];
