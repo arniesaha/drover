@@ -1,8 +1,8 @@
 """Bounded Apple error messages with upload credentials and local paths removed."""
 
 import os
-from pathlib import Path
 import re
+from pathlib import Path
 
 
 def diagnostic_messages(response, stderr, secrets=()):
