@@ -60,7 +60,7 @@ gh run view "$PILOT_RUN_ID" --repo arniesaha/drover \
 # Require exactly PILOT_SOURCE_SHA and success before continuing.
 gh run download "$PILOT_RUN_ID" --repo arniesaha/drover \
   --name harnessd-pilot-x86_64-unknown-linux-musl --dir "$PILOT_ROOT/download"
-cd "$PILOT_ROOT/download"
+cd "$PILOT_ROOT/download/pilot-artifacts"
 sha256sum --check SHA256SUMS
 gh attestation verify drover-harnessd-x86_64-unknown-linux-musl \
   --repo arniesaha/drover --signer-workflow arniesaha/drover/.github/workflows/ci.yml \
