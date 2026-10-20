@@ -1,4 +1,7 @@
 mod delivery;
+mod event_bus;
+mod folders;
+mod transport;
 
 // Linux-first, deliberately small harness daemon.  The hub remains the
 // authority; SQLite is solely a durable, bounded local outbox/session tail.
@@ -6,6 +9,7 @@ mod delivery;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs,
+    future::IntoFuture,
     io::{Read, Write},
     path::{Path as FsPath, PathBuf},
     process::Command,
@@ -15,7 +19,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -33,8 +40,10 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use subtle::ConstantTimeEq;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Command as TokioCommand,
     sync::{broadcast, mpsc, RwLock},
 };
@@ -50,7 +59,11 @@ const RETENTION_DAYS: i64 = 7;
 const RETENTION_PER_SESSION: i64 = 500;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "drover-harnessd", about = "Drover Rust harness daemon")]
+#[command(
+    name = "drover-harnessd",
+    version,
+    about = "Drover Rust harness daemon"
+)]
 struct Args {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -58,7 +71,7 @@ struct Args {
     host_id: String,
     #[arg(long)]
     display_name: Option<String>,
-    #[arg(long, default_value = "gpu-pc")]
+    #[arg(long, default_value = "linux")]
     kind: String,
     #[arg(long, default_value = "127.0.0.1:7081")]
     listen: String,
@@ -89,6 +102,10 @@ struct App {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     terminals: Arc<RwLock<HashMap<String, Arc<Terminal>>>>,
     client: Client,
+    events: broadcast::Sender<Value>,
+    writer: event_bus::StoreWriter,
+    operations: Arc<tokio::sync::Mutex<()>>,
+    stop: Arc<tokio::sync::Notify>,
 }
 
 const TERMINAL_SCROLLBACK_BYTES: usize = 256 * 1024;
@@ -100,6 +117,8 @@ const TERMINAL_CHANNEL_CAPACITY: usize = 256;
 struct Terminal {
     writer: Mutex<Box<dyn Write + Send>>,
     _master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    finished: tokio::sync::watch::Sender<bool>,
     scrollback: Mutex<VecDeque<u8>>,
     output: broadcast::Sender<Value>,
 }
@@ -139,6 +158,9 @@ struct Config {
     kind: String,
     token: String,
     central_url: Option<String>,
+    local_url: Option<String>,
+    tailscale_url: Option<String>,
+    consent_path: PathBuf,
     relay: bool,
     worktrees: PathBuf,
     home: PathBuf,
@@ -168,6 +190,10 @@ struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     awaiting: Option<String>,
     created_at: String,
+    #[serde(default)]
+    restart_lost: bool,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,27 +238,46 @@ impl App {
         headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == format!("Bearer {}", self.cfg.token))
+            .map(|v| {
+                bool::from(
+                    v.as_bytes()
+                        .ct_eq(format!("Bearer {}", self.cfg.token).as_bytes()),
+                )
+            })
             .unwrap_or(false)
     }
     fn save_session(&self, s: &Session) -> Result<()> {
-        self.db.lock().unwrap().execute(
-            "INSERT INTO sessions(session_id, data, status, created_at) VALUES(?1,?2,?3,?4)
+        let db = self.db.lock().unwrap();
+        db.execute_batch("SAVEPOINT session_write")?;
+        let result = (|| -> Result<()> {
+            db.execute(
+                "INSERT INTO sessions(session_id, data, status, created_at) VALUES(?1,?2,?3,?4)
              ON CONFLICT(session_id) DO UPDATE SET data=excluded.data,status=excluded.status",
-            params![
-                s.session_id,
-                serde_json::to_string(s)?,
-                s.status,
-                s.created_at
-            ],
-        )?;
-        Ok(())
+                params![
+                    s.session_id,
+                    serde_json::to_string(s)?,
+                    s.status,
+                    s.created_at
+                ],
+            )?;
+            if let Some(worktree) = &s.worktree {
+                db.execute("INSERT INTO worktrees(session_id,data) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET data=excluded.data",params![s.session_id,serde_json::to_string(worktree)?])?;
+            } else {
+                db.execute("DELETE FROM worktrees WHERE session_id=?1", [&s.session_id])?;
+            }
+            Ok(())
+        })();
+        db.execute_batch(if result.is_ok() {
+            "RELEASE session_write"
+        } else {
+            "ROLLBACK TO session_write; RELEASE session_write"
+        })?;
+        result
     }
-    async fn set_session(&self, s: Session) {
-        if let Err(e) = self.save_session(&s) {
-            error!("save: {e:#}");
-        }
+    async fn set_session(&self, s: Session) -> Result<()> {
+        self.save_session(&s)?;
         self.sessions.write().await.insert(s.session_id.clone(), s);
+        Ok(())
     }
     fn emit(
         &self,
@@ -242,18 +287,7 @@ impl App {
         payload: Value,
         turn_id: Option<&str>,
     ) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        let seq: i64 = db.query_row(
-            "SELECT COALESCE(MAX(seq),-1)+1 FROM events WHERE session_id=?1",
-            [session_id],
-            |r| r.get(0),
-        )?;
-        let ts = now();
-        let event_id = format!("harness-event-{}", Uuid::new_v4());
-        let dedup = event_identity(session_id, seq, kind, &ts, &payload);
-        db.execute("INSERT OR IGNORE INTO events(event_id,session_id,seq,type,text,payload,turn_id,ts,dedup_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![event_id,session_id,seq,kind,text,serde_json::to_string(&payload)?,turn_id,ts,dedup])?;
-        prune_events(&db)?;
-        Ok(())
+        self.writer.append(session_id, kind, text, payload, turn_id)
     }
     /// Preserve handoff identity exactly: Python's event ID and dedup key are
     /// already the hub fence, so recomputing either would make replay unsafe.
@@ -287,6 +321,15 @@ impl App {
             "INSERT OR IGNORE INTO events(event_id,session_id,seq,type,text,payload,turn_id,ts,dedup_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![event_id, session_id, seq, kind, event.get("text").and_then(Value::as_str), serde_json::to_string(event.get("payload").unwrap_or(&Value::Null))?, event.get("turn_id").and_then(Value::as_str), ts, dedup_key],
         )?;
+        self.db.lock().unwrap().execute("INSERT INTO session_sequences(session_id,next_seq) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET next_seq=MAX(next_seq,excluded.next_seq)",params![session_id,seq+1])?;
+        if let Some(turn_id) = event["turn_id"]
+            .as_str()
+            .filter(|v| Uuid::parse_str(v).is_ok())
+        {
+            if kind == "user_input" {
+                self.db.lock().unwrap().execute("INSERT OR IGNORE INTO turns(session_id,client_turn_id,turn_id) VALUES(?1,?2,?2)",params![session_id,turn_id])?;
+            }
+        }
         Ok(changed == 1)
     }
 }
@@ -354,20 +397,35 @@ fn canonical(v: &Value) -> Value {
 
 fn init_db(path: &FsPath) -> Result<Connection> {
     if let Some(p) = path.parent() {
-        fs::create_dir_all(p)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(p)?;
     }
     let db = Connection::open(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     db.pragma_update(None, "journal_mode", "WAL")?;
     db.busy_timeout(Duration::from_secs(5))?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS sessions(session_id TEXT PRIMARY KEY,data TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,event_id TEXT UNIQUE NOT NULL,session_id TEXT NOT NULL,seq INTEGER NOT NULL,type TEXT NOT NULL,text TEXT,payload TEXT NOT NULL,turn_id TEXT,ts TEXT NOT NULL,dedup_key TEXT UNIQUE NOT NULL,pushed_at TEXT);
     CREATE INDEX IF NOT EXISTS events_outbox ON events(pushed_at,id); CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id,seq);")?;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    anyhow::ensure!(version <= 1, "SQLite schema is newer than this binary");
+    anyhow::ensure!(version <= 4, "SQLite schema is newer than this binary");
     if version < 1 {
         db.execute_batch("BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS event_quarantine(event_id TEXT PRIMARY KEY REFERENCES events(event_id),session_id TEXT NOT NULL,reason TEXT NOT NULL,quarantined_at TEXT NOT NULL);
         PRAGMA user_version=1; COMMIT;")?;
+    }
+    if version < 2 {
+        db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS turns(session_id TEXT NOT NULL,client_turn_id TEXT NOT NULL,turn_id TEXT NOT NULL,PRIMARY KEY(session_id,client_turn_id));
+        CREATE TABLE IF NOT EXISTS worktrees(session_id TEXT PRIMARY KEY,data TEXT NOT NULL);
+        PRAGMA user_version=2; COMMIT;")?;
+    }
+    if version < 3 {
+        db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS handoff_records(kind TEXT NOT NULL,record_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(kind,record_id)); PRAGMA user_version=3; COMMIT;")?;
+    }
+    if version < 4 {
+        db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE session_sequences(session_id TEXT PRIMARY KEY,next_seq INTEGER NOT NULL); INSERT INTO session_sequences SELECT session_id,MAX(seq)+1 FROM events GROUP BY session_id; PRAGMA user_version=4; COMMIT;")?;
     }
     Ok(db)
 }
@@ -398,17 +456,20 @@ fn config(args: &Args) -> Result<Config> {
         "a non-empty host token is required"
     );
     let mut worktrees = home.join(".drover/worktrees");
-    if let Some(path) = &args.config {
-        if let Ok(v) = fs::read_to_string(path) {
-            if let Ok(t) = v.parse::<toml::Value>() {
-                if let Some(s) = t
-                    .get("paths")
-                    .and_then(|x| x.get("worktrees_dir"))
-                    .and_then(|x| x.as_str())
-                {
-                    worktrees = PathBuf::from(s);
-                }
-            }
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| home.join(".drover/config.toml"));
+    if config_path.exists() {
+        let t: toml::Value = fs::read_to_string(&config_path)?
+            .parse()
+            .context("invalid config TOML")?;
+        if let Some(path) = t
+            .get("paths")
+            .and_then(|x| x.get("worktrees_dir"))
+            .and_then(|x| x.as_str())
+        {
+            worktrees = PathBuf::from(path.replace("~", &home.to_string_lossy()));
         }
     }
     Ok(Config {
@@ -419,7 +480,16 @@ fn config(args: &Args) -> Result<Config> {
             .unwrap_or_else(|| args.host_id.clone()),
         kind: args.kind.clone(),
         token,
-        central_url: args.central_url.clone(),
+        central_url: args
+            .central_url
+            .as_ref()
+            .map(|url| url.trim_end_matches('/').to_string()),
+        local_url: args.local_url.clone(),
+        tailscale_url: args.tailscale_url.clone(),
+        consent_path: config_path.with_file_name(format!(
+            ".{}.harness-content-consent.json",
+            config_path.file_name().unwrap().to_string_lossy()
+        )),
         relay: args.relay,
         worktrees,
         home,
@@ -434,7 +504,9 @@ fn load_sessions(db: &Connection) -> Result<HashMap<String, Session>> {
         let mut s: Session = serde_json::from_str(&row?)?;
         if s.status == "running" {
             s.status = "errored".into();
+            s.restart_lost = true;
             s.awaiting = None;
+            s.pid = None;
         }
         out.insert(s.session_id.clone(), s);
     }
@@ -449,13 +521,19 @@ async fn health(State(app): State<App>) -> Response {
 async fn options() -> Response {
     response(StatusCode::NO_CONTENT, Value::Null)
 }
+fn capability_envelope() -> Value {
+    json!({"schema_version":1,"lifecycle":{"worktree_inventory":1},"harnesses":[
+        {"name":"shell","display_name":"Shell","enabled":true,"capabilities":{"schema_version":1,"harness_id":"shell","launch_modes":["pty"],"interrupt":true,"worktree":false,"interactive_auth":false}},
+        {"name":"codex","display_name":"Codex","enabled":true,"capabilities":{"schema_version":1,"harness_id":"codex","launch_modes":["structured"],"interrupt":true,"native_resume":true,"worktree":true,"attachments":["image/png","image/jpeg","image/webp","image/gif"],"interactive_auth":false}}
+    ]})
+}
 async fn capabilities(State(app): State<App>, headers: HeaderMap) -> Response {
     if !app.authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required");
-    };
-    ok(
-        json!({"schema_version":1,"host_id":app.cfg.host_id,"harnesses":[{"name":"shell","display_name":"Shell","enabled":true,"capabilities":{"launch_modes":["pty"],"interrupt":true,"worktree":false}},{"name":"codex","display_name":"Codex","enabled":true,"capabilities":{"launch_modes":["structured"],"interrupt":true,"native_resume":true,"worktree":true,"attachments":true}}]}),
-    )
+    }
+    let mut value = capability_envelope();
+    value["host_id"] = json!(app.cfg.host_id);
+    ok(value)
 }
 
 #[derive(Deserialize)]
@@ -465,6 +543,9 @@ struct Create {
     cwd: Option<String>,
     command: Option<Vec<String>>,
     prompt: Option<String>,
+    initial_input: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
     images: Option<Vec<Image>>,
     model: Option<String>,
     #[serde(rename = "thinking_effort")]
@@ -555,6 +636,7 @@ async fn sessions_create(
     if !app.authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required");
     };
+    let _operation = app.operations.lock().await;
     let mode = req.mode.clone().unwrap_or_else(|| {
         if req.harness == "shell" {
             "pty".into()
@@ -591,13 +673,15 @@ async fn sessions_create(
             return err(StatusCode::BAD_REQUEST, "unknown permission_mode");
         }
     }
-    if let Some(model) = &req.model {
-        if model != "contract-model" {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "This model is no longer available; refresh model choices and try again.",
-            );
-        }
+    if req
+        .model
+        .as_ref()
+        .is_some_and(|m| m.trim().is_empty() || m.len() > 256)
+    {
+        return err(StatusCode::BAD_REQUEST, "invalid model");
+    }
+    if !matches!(mode.as_str(), "pty" | "structured") {
+        return err(StatusCode::BAD_REQUEST, "unknown session mode");
     }
     if let Some(images) = &req.images {
         if let Err(e) = validate_images(images) {
@@ -664,29 +748,83 @@ async fn sessions_create(
         } else {
             None
         },
+        extra: BTreeMap::new(),
+        restart_lost: false,
         created_at: now(),
     };
+    if let Err(error) = app.set_session(s.clone()).await {
+        return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+    }
+    if let Err(error) = app.emit(&sid, "status", None, json!({"status":"started"}), None) {
+        return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+    }
     if mode == "pty" {
         match spawn_pty(
             req.command.unwrap_or_else(|| vec!["/bin/sh".into()]),
             &s.cwd,
+            app.clone(),
+            sid.clone(),
         ) {
             Ok((pid, terminal)) => {
                 s.pid = Some(pid);
+                let _ = terminal
+                    ._master
+                    .lock()
+                    .unwrap()
+                    .resize(portable_pty::PtySize {
+                        rows: req.rows.unwrap_or(24).clamp(1, 1000),
+                        cols: req.cols.unwrap_or(80).clamp(1, 1000),
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                if let Some(input) = req.initial_input {
+                    let _ = terminal.write(input.as_bytes());
+                }
+                let mut finished = terminal.finished.subscribe();
+                let app2 = app.clone();
+                let sid2 = sid.clone();
+                tokio::spawn(async move {
+                    if !*finished.borrow_and_update() {
+                        let _ = finished.changed().await;
+                    }
+                    let _operation = app2.operations.lock().await;
+                    let session = { app2.sessions.read().await.get(&sid2).cloned() };
+                    if let Some(mut session) = session {
+                        if session.status == "running" {
+                            session.status = "completed".into();
+                            session.pid = None;
+                            if let Err(error) = app2.set_session(session).await {
+                                error!("session store unavailable: {error}");
+                            }
+                        }
+                    }
+                    app2.terminals.write().await.remove(&sid2);
+                });
                 app.terminals.write().await.insert(sid.clone(), terminal);
             }
             Err(e) => {
+                s.status = "errored".into();
+                let _ = app.set_session(s).await;
                 return err(
                     StatusCode::BAD_GATEWAY,
                     format!("terminal launch failed: {e}"),
-                )
+                );
             }
         }
     }
-    app.set_session(s.clone()).await;
-    let _ = app.emit(&sid, "status", None, json!({"status":"started"}), None);
-    if let Some(prompt) = req.prompt {
-        run_codex_turn(app.clone(), sid.clone(), prompt, None, None).await;
+    if let Err(error) = app.set_session(s.clone()).await {
+        return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+    }
+    let images = req.images.unwrap_or_default();
+    if let Some(prompt) = req
+        .prompt
+        .or_else(|| (!images.is_empty()).then(String::new))
+    {
+        if let Err(error) =
+            run_codex_turn(app.clone(), sid.clone(), prompt, None, None, &images).await
+        {
+            return err(StatusCode::BAD_GATEWAY, error.to_string());
+        }
     }
     response(StatusCode::CREATED, session_wire(s))
 }
@@ -705,7 +843,12 @@ fn validate_images(images: &[Image]) -> std::result::Result<(), String> {
     }
     Ok(())
 }
-fn spawn_pty(command: Vec<String>, cwd: &str) -> Result<(u32, Arc<Terminal>)> {
+fn spawn_pty(
+    command: Vec<String>,
+    cwd: &str,
+    app: App,
+    sid: String,
+) -> Result<(u32, Arc<Terminal>)> {
     let exe = command.first().context("empty command")?;
     let pair = portable_pty::native_pty_system().openpty(portable_pty::PtySize {
         rows: 24,
@@ -718,12 +861,15 @@ fn spawn_pty(command: Vec<String>, cwd: &str) -> Result<(u32, Arc<Terminal>)> {
         cb.arg(a);
     }
     cb.cwd(cwd);
-    let child = pair.slave.spawn_command(cb)?;
+    let mut child = pair.slave.spawn_command(cb)?;
+    drop(pair.slave);
     let pid = child.process_id().unwrap_or(0);
     let mut reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
     let (output, _) = broadcast::channel(TERMINAL_CHANNEL_CAPACITY);
     let terminal = Arc::new(Terminal {
+        killer: Mutex::new(child.clone_killer()),
+        finished: tokio::sync::watch::channel(false).0,
         writer: Mutex::new(writer),
         _master: Mutex::new(pair.master),
         scrollback: Mutex::new(VecDeque::new()),
@@ -737,7 +883,16 @@ fn spawn_pty(command: Vec<String>, cwd: &str) -> Result<(u32, Arc<Terminal>)> {
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => {
-                        let _ = output.send(json!({"type":"exit"}));
+                        let status = child.wait().ok().map(|s| s.exit_code());
+                        let _ = app.emit(
+                            &sid,
+                            "status",
+                            Some("exited"),
+                            json!({"exited":status}),
+                            None,
+                        );
+                        terminal_for_reader.finished.send_replace(true);
+                        let _ = output.send(json!({"type":"exit","exit_code":status}));
                         break;
                     }
                     Ok(count) => {
@@ -752,13 +907,28 @@ fn spawn_pty(command: Vec<String>, cwd: &str) -> Result<(u32, Arc<Terminal>)> {
                                 scrollback.pop_front();
                             }
                         }
-                        let _ = output
-                            .send(json!({"type":"output","data":String::from_utf8_lossy(bytes)}));
+                        let text = String::from_utf8_lossy(bytes);
+                        if app
+                            .emit(
+                                &sid,
+                                "assistant_output",
+                                Some(&text),
+                                json!({"source":"terminal"}),
+                                None,
+                            )
+                            .is_err()
+                        {
+                            let _ = terminal_for_reader.killer.lock().unwrap().kill();
+                            let _ = child.wait();
+                            terminal_for_reader.finished.send_replace(true);
+                            let _ = output.send(json!({"type":"exit"}));
+                            break;
+                        }
+                        let _ = output.send(json!({"type":"output","data":text}));
                     }
                 }
             }
         })?;
-    std::mem::forget(child);
     Ok((pid, terminal))
 }
 
@@ -782,6 +952,7 @@ async fn terminate(State(app): State<App>, headers: HeaderMap, Path(id): Path<St
     if !app.authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required");
     };
+    let _operation = app.operations.lock().await;
     let mut s = match app.sessions.read().await.get(&id).cloned() {
         Some(s) => s,
         None => {
@@ -792,20 +963,34 @@ async fn terminate(State(app): State<App>, headers: HeaderMap, Path(id): Path<St
         }
     };
     if let Some(pid) = s.pid {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
+        signal_group(pid, libc::SIGTERM);
+        for _ in 0..20 {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        signal_group(pid, libc::SIGKILL);
         if let Some(terminal) = app.terminals.write().await.remove(&id) {
+            let _ = terminal.killer.lock().unwrap().kill();
             let _ = terminal.output.send(json!({"type":"exit"}));
         }
     }
-    if let Some(w) = s.worktree.take() {
-        let _ = cleanup_worktree(&w);
+    if let Some(w) = &s.worktree {
+        if owns_worktree(&app, &id, w) {
+            match cleanup_worktree(w) {
+                Ok(true) => s.worktree = None,
+                Ok(false) => {}
+                Err(error) => warn!("worktree cleanup retained: {error}"),
+            }
+        }
     }
+    s.pid = None;
     s.status = "terminated".into();
     s.awaiting = None;
-    app.set_session(s).await;
+    if let Err(error) = app.set_session(s).await {
+        return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+    }
     let _ = app.emit(
         &id,
         "status",
@@ -833,229 +1018,414 @@ async fn turn(
 ) -> Response {
     if !app.authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required");
-    };
-    let s = match app.sessions.read().await.get(&id).cloned() {
-        Some(s) => s,
-        None => {
-            return err(
-                StatusCode::NOT_FOUND,
-                format!("unknown structured session: {id}"),
-            )
-        }
-    };
-    if s.mode != "structured" {
+    }
+    let _operation = app.operations.lock().await;
+    let Some(mut session) = ({ app.sessions.read().await.get(&id).cloned() }) else {
         return err(
             StatusCode::NOT_FOUND,
             format!("unknown structured session: {id}"),
         );
     };
-    if t.text.as_deref().unwrap_or("").is_empty() && t.images.as_ref().is_none_or(Vec::is_empty) {
-        return err(StatusCode::BAD_REQUEST, "text or images required");
-    };
-    if let Some(m) = &t.model {
-        if m != "contract-model" {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "This model is no longer available; refresh model choices and try again.",
-            );
-        }
+    if session.mode != "structured" || session.status != "running" {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("unknown structured session: {id}"),
+        );
     }
-    if let Some(k) = &t.client_turn_id {
-        if Uuid::parse_str(k).is_err() {
+    if let Some(key) = &t.client_turn_id {
+        if Uuid::parse_str(key).is_err() {
             return err(StatusCode::BAD_REQUEST, "client_turn_id must be a UUID");
         }
-    }
-    if let Some(im) = &t.images {
-        if let Err(e) = validate_images(im) {
-            return err(StatusCode::BAD_REQUEST, e);
-        };
-        if let Err(e) = save_images(&app, &id, im) {
-            return err(StatusCode::BAD_REQUEST, e.to_string());
+        let existing = app
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT turn_id FROM turns WHERE session_id=?1 AND client_turn_id=?2",
+                params![id, key],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        if let Some(turn_id) = existing {
+            return response(StatusCode::ACCEPTED, json!({"turn_id":turn_id}));
         }
     }
-    let turn_id = Uuid::new_v4().to_string();
-    run_codex_turn(
-        app,
+    if session.pid.is_some() {
+        return err(StatusCode::CONFLICT, "turn already in flight");
+    }
+    let images = t.images.unwrap_or_default();
+    let text = t.text.unwrap_or_default();
+    if text.trim().is_empty() && images.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "text or images required");
+    }
+    if let Err(error) = validate_images(&images) {
+        return err(StatusCode::BAD_REQUEST, error);
+    }
+    if let Some(model) = t.model {
+        if model.trim().is_empty() || model.len() > 256 {
+            return err(StatusCode::BAD_REQUEST, "invalid model");
+        }
+        session.model = Some(model);
+    }
+    if let Some(effort) = t._thinking_effort {
+        session.thinking_effort = Some(effort);
+    }
+    if let Err(error) = app.set_session(session).await {
+        return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+    }
+    let turn_id = t
+        .client_turn_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Err(error) = run_codex_turn(
+        app.clone(),
         id,
-        t.text.unwrap_or_default(),
+        text,
         Some(turn_id.clone()),
         t.client_turn_id,
+        &images,
     )
-    .await;
+    .await
+    {
+        return err(StatusCode::BAD_GATEWAY, error.to_string());
+    }
     response(StatusCode::ACCEPTED, json!({"turn_id":turn_id}))
 }
 
-fn save_images(app: &App, sid: &str, images: &[Image]) -> Result<()> {
-    let d = app.cfg.home.join(".drover/attachments").join(sid);
-    fs::create_dir_all(&d)?;
-    for i in images {
-        let bytes = base64::engine::general_purpose::STANDARD.decode(&i.data_base64)?;
-        let path = d.join(format!("{}.png", Uuid::new_v4()));
-        fs::write(path, bytes)?;
+fn save_images(app: &App, sid: &str, images: &[Image]) -> Result<Vec<PathBuf>> {
+    let dir = app.cfg.home.join(".drover/attachments").join(sid);
+    let mut paths = Vec::new();
+    for image in images {
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.png", Uuid::new_v4()));
+        fs::write(&path, STANDARD.decode(&image.data_base64)?)?;
+        paths.push(path);
     }
-    Ok(())
+    Ok(paths)
+}
+fn git(cwd: &str, args: &[&str]) -> Option<String> {
+    let result = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    result
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&result.stdout).into_owned())
+}
+fn git_evidence(cwd: &str, base: &str) -> Value {
+    let range = format!("{base}..HEAD");
+    let mut paths = std::collections::BTreeSet::new();
+    for args in [
+        vec![
+            "log",
+            "--first-parent",
+            "-m",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            "--no-relative",
+            "-z",
+            &range,
+            "--",
+        ],
+        vec![
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-relative",
+            "-z",
+            base,
+            "--",
+        ],
+        vec![
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "--no-relative",
+            "-z",
+            base,
+            "--",
+        ],
+        vec![
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "-z",
+            "--",
+            ":/",
+        ],
+    ] {
+        if let Some(output) = git(cwd, &args) {
+            paths.extend(
+                output
+                    .split('\0')
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    json!({"source":"git_diff","base_sha":base,"changes":paths.into_iter().map(|path|json!({"path":path})).collect::<Vec<_>>()})
 }
 async fn run_codex_turn(
     app: App,
     sid: String,
     text: String,
     turn_id: Option<String>,
-    _client: Option<String>,
-) {
-    let s = match app.sessions.read().await.get(&sid).cloned() {
-        Some(s) => s,
-        None => return,
+    client: Option<String>,
+    images: &[Image],
+) -> Result<()> {
+    let mut session = {
+        app.sessions
+            .read()
+            .await
+            .get(&sid)
+            .cloned()
+            .context("session missing")?
     };
-    let _ = app.emit(
-        &sid,
-        "user_input",
-        Some(&text),
-        json!({}),
-        turn_id.as_deref(),
-    );
+    let turn_id = turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let paths = save_images(&app, &sid, images)?;
+    let base = git(&session.cwd, &["rev-parse", "--verify", "HEAD"]).map(|v| v.trim().to_owned());
     let mut cmd = TokioCommand::new("codex");
-    if let Some(m) = &s.model {
-        cmd.arg("--model").arg(m);
+    if let Some(model) = &session.model {
+        cmd.args(["--model", model]);
     }
-    cmd.args([
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--sandbox",
-        "danger-full-access",
-        "--",
-    ])
-    .arg(&text)
-    .current_dir(&s.cwd)
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
-    match cmd.spawn() {
-        Ok(mut child) => {
-            if let Some(out) = child.stdout.take() {
-                let app2 = app.clone();
-                let sid2 = sid.clone();
-                let tid = turn_id.clone();
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(out).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                            let text = v
-                                .pointer("/item/text")
-                                .or_else(|| v.pointer("/item/content"))
-                                .and_then(Value::as_str)
-                                .map(str::to_owned);
-                            let _ = app2.emit(
-                                &sid2,
-                                "assistant_output",
-                                text.as_deref(),
-                                v,
-                                tid.as_deref(),
-                            );
+    if let Some(effort) = &session.thinking_effort {
+        cmd.args([
+            "-c",
+            &format!("model_reasoning_effort={}", serde_json::to_string(effort)?),
+        ]);
+    }
+    cmd.arg("exec");
+    if let Some(native) = &session.native_session_id {
+        cmd.args([
+            "resume",
+            native,
+            "--json",
+            "--skip-git-repo-check",
+            "-c",
+            "sandbox_mode=danger-full-access",
+        ]);
+    } else {
+        cmd.args([
+            "--json",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "danger-full-access",
+        ]);
+    }
+    for path in paths {
+        cmd.arg("--image").arg(path);
+    }
+    cmd.arg("--")
+        .arg(&text)
+        .current_dir(&session.cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let mut child = cmd.spawn()?;
+    session.pid = child.id();
+    session.awaiting = Some("assistant".into());
+    app.save_session(&session)?;
+    app.sessions
+        .write()
+        .await
+        .insert(sid.clone(), session.clone());
+    if let Some(key) = client {
+        app.db.lock().unwrap().execute(
+            "INSERT INTO turns(session_id,client_turn_id,turn_id) VALUES(?1,?2,?3)",
+            params![sid, key, turn_id],
+        )?;
+    }
+    app.emit(&sid, "user_input", Some(&text), json!({}), Some(&turn_id))?;
+    let out = child.stdout.take().context("stdout missing")?;
+    let stderr = child.stderr.take().context("stderr missing")?;
+    tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buffer = [0; 8192];
+            while let Ok(n) = reader.read(&mut buffer).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let mut lines = BufReader::new(out).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if value["type"] == "thread.started" {
+                    if let Some(native) = value["thread_id"].as_str() {
+                        let _operation = app.operations.lock().await;
+                        let current = { app.sessions.read().await.get(&sid).cloned() };
+                        if let Some(mut current) = current {
+                            if current.status == "running" {
+                                current.native_session_id = Some(native.into());
+                                if let Err(error) = app.set_session(current).await {
+                                    error!("session store unavailable: {error}");
+                                }
+                            }
                         }
                     }
-                });
-            }
-            let app2 = app.clone();
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-                if let Some(mut s) = app2.sessions.read().await.get(&sid).cloned() {
-                    s.awaiting = Some("input".into());
-                    app2.set_session(s).await;
                 }
-                let _ = app2.emit(
-                    &sid,
-                    "status",
-                    Some("turn complete"),
-                    json!({"turn_complete":true,"awaiting":"input"}),
-                    turn_id.as_deref(),
-                );
-            });
-        }
-        Err(e) => {
-            warn!("codex launch failed: {e}");
-            if let Some(mut s) = app.sessions.read().await.get(&sid).cloned() {
-                s.status = "errored".into();
-                app.set_session(s).await;
+                let kind = match value["item"]["type"].as_str() {
+                    Some("agent_message") => "assistant_output",
+                    Some("command_execution") => "tool_result",
+                    Some("reasoning") => "reasoning",
+                    _ => "status",
+                };
+                let text = value
+                    .pointer("/item/text")
+                    .or_else(|| value.pointer("/item/aggregated_output"))
+                    .and_then(Value::as_str);
+                if app
+                    .emit(&sid, kind, text, value.clone(), Some(&turn_id))
+                    .is_err()
+                {
+                    let _ = child.start_kill();
+                    break;
+                }
             }
+        }
+        let result = child.wait().await;
+        let _ = stderr_task.await;
+        if let Some(base) = base {
+            let payload = git_evidence(&session.cwd, &base);
+            if payload["changes"].as_array().is_some_and(|v| !v.is_empty()) {
+                let _ = app.emit(
+                    &sid,
+                    "tool_result",
+                    Some("Git file changes recorded at turn boundary"),
+                    payload,
+                    Some(&turn_id),
+                );
+            }
+        }
+        let _operation = app.operations.lock().await;
+        let current = { app.sessions.read().await.get(&sid).cloned() };
+        if let Some(mut current) = current {
+            if current.status == "running" {
+                current.pid = None;
+                current.awaiting = Some("input".into());
+                if let Err(error) = app.set_session(current).await {
+                    error!("session store unavailable: {error}");
+                }
+            }
+        }
+        let code = result.ok().and_then(|s| s.code()).unwrap_or(-1);
+        let _ = app.emit(
+            &sid,
+            "status",
+            Some("turn complete"),
+            json!({"turn_complete":true,"awaiting":"input","exited":code}),
+            Some(&turn_id),
+        );
+    });
+    Ok(())
+}
+
+fn signal_group(pid: u32, signal: i32) {
+    if pid > 1 {
+        unsafe {
+            libc::kill(-(pid as i32), signal);
         }
     }
 }
-
-async fn fs_list(
+async fn interrupt(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if !app.authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    let _operation = app.operations.lock().await;
+    let Some(session) = ({ app.sessions.read().await.get(&id).cloned() }) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("unknown structured session: {id}"),
+        );
+    };
+    if session.mode != "structured" || session.status != "running" {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("unknown structured session: {id}"),
+        );
+    }
+    if let Some(pid) = session.pid {
+        signal_group(pid, libc::SIGTERM);
+    }
+    ok(json!({"ok":true}))
+}
+const RECOVERY_UNAVAILABLE: &str =
+    "Session cannot be resumed after the harness restart. Continue it in a new session.";
+async fn recover(
     State(app): State<App>,
     headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
 ) -> Response {
     if !app.authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    let _operation = app.operations.lock().await;
+    let Some(mut session) = ({ app.sessions.read().await.get(&id).cloned() }) else {
+        return err(StatusCode::CONFLICT, RECOVERY_UNAVAILABLE);
     };
-    if q.get("host_id") != Some(&app.cfg.host_id) {
-        return err(StatusCode::FORBIDDEN, "host mismatch");
-    };
-    let limit = match q.get("limit").map(|s| s.parse::<usize>()) {
-        Some(Ok(n)) if (1..=100).contains(&n) => n,
-        Some(_) => return err(StatusCode::BAD_REQUEST, "invalid_limit"),
-        None => 100,
-    };
-    let path = q.get("path").cloned().unwrap_or_default();
-    if path.is_empty() {
+    if session.mode == "structured" && session.status == "running" {
         return ok(
-            json!({"roots":[{"name":"Home","path":app.cfg.home}],"path":null,"parent":null,"entries":[],"truncated":false,"next_cursor":null}),
+            json!({"session_id":id,"status":"running","recovered":false,"native_session_id":session.native_session_id}),
         );
     }
-    let p = PathBuf::from(&path);
-    let mut entries = match fs::read_dir(&p) {
-        Ok(x) => x
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-            .collect::<Vec<_>>(),
-        Err(_) => return err(StatusCode::BAD_REQUEST, "not_found"),
-    };
-    entries.sort_by_key(|e| e.file_name());
-    let truncated = entries.len() > limit;
-    let rows:Vec<Value>=entries.iter().take(limit).map(|e|json!({"name":e.file_name().to_string_lossy(),"path":e.path(),"is_dir":true,"is_git_repo":e.path().join(".git").exists(),"hidden":false})).collect();
-    ok(
-        json!({"roots":[{"name":"Home","path":app.cfg.home}],"path":path,"parent":p.parent().map(|x|x.to_string_lossy()),"entries":rows,"truncated":truncated,"next_cursor":if truncated{Some(URL_SAFE.encode(limit.to_string()))}else{None}}),
-    )
-}
-async fn fs_create(State(app): State<App>, headers: HeaderMap, Json(v): Json<Value>) -> Response {
-    if !app.authorized(&headers) {
-        return err(StatusCode::UNAUTHORIZED, "authentication required");
-    };
-    if v.get("host_id").and_then(Value::as_str) != Some(&app.cfg.host_id) {
-        return err(StatusCode::FORBIDDEN, "host mismatch");
-    };
-    let path = v.get("path").and_then(Value::as_str).unwrap_or("");
-    let name = v.get("name").and_then(Value::as_str).unwrap_or("");
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-        return err(StatusCode::BAD_REQUEST, "invalid_name");
-    };
-    let dest = PathBuf::from(path).join(name);
-    match fs::create_dir(&dest) {
-        Ok(_) => response(StatusCode::CREATED, json!({"name":name,"path":dest})),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            err(StatusCode::CONFLICT, "folder_exists")
-        }
-        Err(_) => err(StatusCode::BAD_REQUEST, "unavailable"),
-    }
-}
-async fn fs_exists(State(app): State<App>, headers: HeaderMap, Json(v): Json<Value>) -> Response {
-    if !app.authorized(&headers) {
-        return err(StatusCode::UNAUTHORIZED, "authentication required");
-    };
-    let mut x = serde_json::Map::new();
-    for p in v
-        .get("paths")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    let native = body["native_session_id"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty());
+    if session.mode != "structured"
+        || session.harness != "codex"
+        || session.status != "errored"
+        || !session.restart_lost
+        || native.is_none()
+        || session
+            .native_session_id
+            .as_deref()
+            .is_some_and(|s| Some(s) != native)
+        || !FsPath::new(&session.cwd).is_dir()
     {
-        if let Some(p) = p.as_str() {
-            x.insert(p.into(), Value::Bool(PathBuf::from(p).exists()));
-        }
+        return err(StatusCode::CONFLICT, RECOVERY_UNAVAILABLE);
     }
-    ok(json!({"exists":x}))
+    session.native_session_id = native.map(str::to_owned);
+    session.restart_lost = false;
+    session.status = "running".into();
+    session.awaiting = Some("input".into());
+    let reply = json!({"session_id":id,"status":"running","recovered":true,"native_session_id":session.native_session_id});
+    if let Err(error) = app.set_session(session).await {
+        return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+    }
+    ok(reply)
+}
+async fn permission(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !app.authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    let live = app
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .is_some_and(|s| s.mode == "structured" && s.status == "running");
+    if live {
+        err(StatusCode::CONFLICT, "approvals are not enabled")
+    } else {
+        err(
+            StatusCode::NOT_FOUND,
+            format!("unknown structured session: {id}"),
+        )
+    }
 }
 
 async fn catalog(
@@ -1066,18 +1436,12 @@ async fn catalog(
     if !app.authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required");
     };
-    let h = match q.get("harness") {
-        Some(x) if x == "codex" => x,
-        Some(x) => {
-            return err(
-                StatusCode::NOT_FOUND,
-                format!("unknown or disabled harness preset: {x}"),
-            )
-        }
-        None => return err(StatusCode::BAD_REQUEST, "invalid model catalog query"),
-    };
-    ok(
-        json!({"host_id":app.cfg.host_id,"harness":h,"models":[{"id":"contract-model","display_name":"Contract model","is_default":true,"reasoning":{"supported":["low","high"],"default":"low"}}],"stale":false,"stale_reason":null}),
+    err(
+        StatusCode::NOT_FOUND,
+        format!(
+            "unknown or disabled harness preset: {}",
+            q.get("harness").map(String::as_str).unwrap_or("")
+        ),
     )
 }
 async fn native_sessions(
@@ -1198,359 +1562,200 @@ fn create_worktree(cwd: &str, sid: &str, root: &FsPath) -> Result<Option<Worktre
         base,
     }))
 }
-fn cleanup_worktree(w: &Worktree) -> Result<()> {
-    let _ = Command::new("git")
-        .args(["-C", &w.repo, "worktree", "remove", "--force", &w.path])
-        .status();
-    let _ = Command::new("git")
-        .args(["-C", &w.repo, "branch", "-D", &w.branch])
-        .status();
-    Ok(())
+fn owns_worktree(app: &App, id: &str, w: &Worktree) -> bool {
+    let path = FsPath::new(&w.path);
+    path.file_name().is_some_and(|name| name == id)
+        && w.branch == format!("drover/{id}")
+        && path.parent().and_then(|p| p.canonicalize().ok())
+            == app.cfg.worktrees.canonicalize().ok()
 }
-
-async fn heartbeat(app: App) {
-    let Some(base) = app.cfg.central_url.clone() else {
-        return;
+fn cleanup_worktree(w: &Worktree) -> Result<bool> {
+    if !FsPath::new(&w.path).exists() {
+        return Ok(true);
+    }
+    let head = git(&w.path, &["rev-parse", "HEAD"]).context("inspect worktree HEAD")?;
+    let dirty = git(&w.path, &["status", "--porcelain", "--ignored"])
+        .context("inspect worktree changes")?;
+    if head.trim() != w.base || !dirty.is_empty() {
+        return Ok(false);
+    }
+    let removed = Command::new("git")
+        .args(["-C", &w.repo, "worktree", "remove", "--", &w.path])
+        .output()?;
+    anyhow::ensure!(removed.status.success(), "git worktree remove failed");
+    let deleted = Command::new("git")
+        .args(["-C", &w.repo, "branch", "-D", "--", &w.branch])
+        .output()?;
+    anyhow::ensure!(deleted.status.success(), "git branch cleanup failed");
+    Ok(true)
+}
+async fn usage(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !app.authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    ok(json!({"accounts":[],"observed_at":now()}))
+}
+async fn worktree_inventory(State(app): State<App>, headers: HeaderMap) -> Response {
+    if !app.authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    let trees: Result<Vec<(String, Worktree)>> = {
+        let db = app.db.lock().unwrap();
+        (|| {
+            let mut statement = db.prepare("SELECT session_id,data FROM worktrees")?;
+            let rows = statement
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.map(|r| {
+                let (sid, data) = r?;
+                Ok((sid, serde_json::from_str(&data)?))
+            })
+            .collect()
+        })()
     };
-    loop {
-        let body = json!({"host_id":app.cfg.host_id,"display_name":app.cfg.display_name,"kind":app.cfg.kind,"status":"online","connection_kind":if app.cfg.relay{"relay"}else{"direct"},"capabilities":{"schema_version":1,"harnesses":[{"name":"shell","enabled":true,"capabilities":{"launch_modes":["pty"]}},{"name":"codex","enabled":true,"capabilities":{"launch_modes":["structured"]}}]},"agent_version":env!("CARGO_PKG_VERSION"),"harnessd_impl":"rust"});
-        let _ = app
-            .client
-            .post(format!("{base}/harness/hosts"))
-            .bearer_auth(&app.cfg.token)
-            .json(&body)
-            .send()
-            .await;
-        tokio::time::sleep(Duration::from_secs(15)).await
+    match trees {
+        Ok(trees) => {
+            let rows=trees.into_iter().map(|(sid,w)|json!({"session_id":sid,"path":w.path,"repo":w.repo,"branch":w.branch,"base_sha":w.base,"ownership":if owns_worktree(&app,&sid,&w) {"owned"} else {"foreign"},"would_collect":false,"reasons":["retained_until_explicit_review"]})).collect::<Vec<_>>();
+            ok(json!({"worktrees":rows,"errors":[],"observed_at":now()}))
+        }
+        Err(error) => err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
     }
 }
-
-/// The relay deliberately dispatches to the same state/handler semantics as
-/// the loopback listener.  It has a small, bounded single-connection loop;
-/// every hub frame is handled before the next is read, which prevents an
-/// untrusted relay peer from accumulating unbounded work on the host.
-async fn relay(app: App) {
-    let Some(base) = app.cfg.central_url.clone() else {
-        return;
-    };
-    let url = format!("{}/harness/relay", base.trim_end_matches('/'))
-        .replacen("https://", "wss://", 1)
-        .replacen("http://", "ws://", 1);
-    loop {
-        // Tungstenite correctly enforces HTTP/1.1 for production WSS peers.
-        // The reference contract hub is deliberately a stdlib HTTP/1.0
-        // server, so use the protocol's tiny framed subset for plain WS.
-        if url.starts_with("ws://") {
-            if let Err(error) = relay_plain(&url, &app).await {
-                warn!("plain relay connection failed: {error}");
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-        let request = match url.clone().into_client_request().map(|mut request| {
-            request.headers_mut().insert(
-                header::AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", app.cfg.token))
-                    .unwrap_or(HeaderValue::from_static("")),
-            );
-            request.headers_mut().insert(
-                "X-Drover-Host-ID",
-                HeaderValue::from_str(&app.cfg.host_id).unwrap_or(HeaderValue::from_static("")),
-            );
-            request
-        }) {
-            Ok(request) => request,
-            Err(error) => {
-                warn!("invalid relay URL: {error}");
-                return;
-            }
-        };
-        match connect_async(request).await {
-            Ok((mut socket, _)) => {
-                let hello = json!({"kind":"hello","host_id":app.cfg.host_id,"capabilities":["framed_responses_v1"]});
-                if socket.send(Message::Text(hello.to_string())).await.is_err() {
-                    continue;
-                }
-                while let Some(Ok(Message::Text(frame))) = socket.next().await {
-                    let Ok(frame) = serde_json::from_str::<Value>(&frame) else {
-                        continue;
-                    };
-                    match frame.get("kind").and_then(Value::as_str) {
-                        Some("req") => {
-                            let id = frame.get("id").cloned().unwrap_or(Value::Null);
-                            let path = frame.get("path").and_then(Value::as_str).unwrap_or("");
-                            let method =
-                                frame.get("method").and_then(Value::as_str).unwrap_or("GET");
-                            let (status, body) = if method == "GET" && path == "/sessions" {
-                                (200, relay_inventory(&app).await)
-                            } else {
-                                (404, json!({"error":"not found"}))
-                            };
-                            let response = json!({"kind":"res","id":id,"status":status,"body":body.to_string()});
-                            if socket
-                                .send(Message::Text(response.to_string()))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Some("open") => {
-                            let chan = frame.get("chan").cloned().unwrap_or(Value::Null);
-                            let response = json!({"kind":"open_error","chan":chan,"error":"terminal unavailable"});
-                            if socket
-                                .send(Message::Text(response.to_string()))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(error) => warn!("relay connection failed: {error}"),
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+fn claim_store(root: &FsPath) -> Result<fs::File> {
+    use fs2::FileExt;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .truncate(false)
+        .open(root.join(".store-owner.lock"))?;
+    lock.try_lock_exclusive()
+        .context("Rust store is already in use; stop the daemon before import")?;
+    Ok(lock)
+}
+fn claim_worktrees(root: &FsPath) -> Result<fs::File> {
+    use fs2::FileExt;
+    fs::create_dir_all(root)?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .truncate(false)
+        .open(root.join(".drover-owner.lock"))?;
+    lock.try_lock_exclusive()
+        .context("worktrees directory is already in use")?;
+    Ok(lock)
 }
 
-async fn relay_plain(url: &str, app: &App) -> Result<()> {
-    let parsed = url::Url::parse(url)?;
-    let host = parsed.host_str().context("relay URL has no host")?;
-    let port = parsed
-        .port_or_known_default()
-        .context("relay URL has no port")?;
-    let mut socket = tokio::net::TcpStream::connect((host, port)).await?;
-    let key = STANDARD.encode(Uuid::new_v4().as_bytes());
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\nAuthorization: Bearer {}\r\nX-Drover-Host-ID: {}\r\n\r\n",
-        parsed.path(), host, port, key, app.cfg.token, app.cfg.host_id
-    );
-    socket.write_all(request.as_bytes()).await?;
-    let mut header = Vec::new();
-    while !header.ends_with(b"\r\n\r\n") {
-        anyhow::ensure!(header.len() < 65_536, "relay handshake too large");
-        let mut byte = [0_u8; 1];
-        socket.read_exact(&mut byte).await?;
-        header.push(byte[0]);
+async fn heartbeat_once(app: &App) -> Result<bool> {
+    let Some(base) = &app.cfg.central_url else {
+        return Ok(true);
+    };
+    let body = json!({"host_id":app.cfg.host_id,"display_name":app.cfg.display_name,"kind":app.cfg.kind,"local_url":app.cfg.local_url,"tailscale_url":app.cfg.tailscale_url,"status":"online","connection_kind":if app.cfg.relay{"relay"}else{"direct"},"capabilities":capability_envelope(),"agent_version":env!("CARGO_PKG_VERSION"),"harnessd_impl":"rust"});
+    let reply = app
+        .client
+        .post(format!("{base}/harness/hosts"))
+        .bearer_auth(&app.cfg.token)
+        .json(&body)
+        .send()
+        .await?;
+    if reply.status() == StatusCode::CONFLICT {
+        warn!("host retired; refusing registration and delivery");
+        return Ok(false);
     }
     anyhow::ensure!(
-        String::from_utf8_lossy(&header).contains(" 101 "),
-        "relay handshake refused"
+        reply.status().is_success(),
+        "heartbeat HTTP {}",
+        reply.status()
     );
-    ws_send(
-        &mut socket,
-        &json!({"kind":"hello","host_id":app.cfg.host_id,"capabilities":["framed_responses_v1"]})
-            .to_string(),
-    )
-    .await?;
-    let (output_tx, mut output_rx) = mpsc::channel::<(String, Value)>(TERMINAL_CHANNEL_CAPACITY);
-    let mut channels: HashMap<String, (String, tokio::task::JoinHandle<()>)> = HashMap::new();
+    let bytes = reply.bytes().await?;
+    anyhow::ensure!(bytes.len() <= 65536, "heartbeat response too large");
+    let reply: Value = serde_json::from_slice(&bytes)?;
+    if let Some(consent) = reply.get("content_consent") {
+        anyhow::ensure!(
+            consent.as_object().is_some_and(|v| v.len() == 2)
+                && consent["enabled"].is_boolean()
+                && consent["epoch"].as_u64().is_some(),
+            "invalid content consent"
+        );
+        let old = fs::read(&app.cfg.consent_path)
+            .ok()
+            .and_then(|v| serde_json::from_slice::<Value>(&v).ok())
+            .unwrap_or(json!({"enabled":false,"epoch":0}));
+        if consent["epoch"].as_u64() > old["epoch"].as_u64() {
+            if let Some(parent) = app.cfg.consent_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let temp = app.cfg.consent_path.with_extension("json.tmp");
+            fs::write(&temp, serde_json::to_vec(consent)?)?;
+            fs::rename(temp, &app.cfg.consent_path)?;
+        }
+    }
+    if reply["relay_required"] == true && !app.cfg.relay {
+        warn!("host requires --relay; refusing direct mode");
+        return Ok(false);
+    }
+    Ok(true)
+}
+async fn heartbeat(app: App) {
     loop {
-        let frame = tokio::select! {
-            outbound = output_rx.recv() => {
-                let Some((chan, message)) = outbound else { continue };
-                ws_send(&mut socket, &json!({"kind":"data","chan":chan,"message":message}).to_string()).await?;
-                continue;
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        match heartbeat_once(&app).await {
+            Ok(false) => {
+                app.stop.notify_one();
+                return;
             }
-            inbound = ws_recv(&mut socket) => inbound?,
-        };
-        let Some(frame) = frame else { break };
-        let Ok(frame) = serde_json::from_str::<Value>(&frame) else {
-            continue;
-        };
-        match frame.get("kind").and_then(Value::as_str) {
-            Some("req") => {
-                let id = frame.get("id").cloned().unwrap_or(Value::Null);
-                let path = frame.get("path").and_then(Value::as_str).unwrap_or("");
-                let method = frame.get("method").and_then(Value::as_str).unwrap_or("GET");
-                let (status, body) = if method == "GET" && path == "/sessions" {
-                    (200, relay_inventory(app).await)
-                } else {
-                    (404, json!({"error":"not found"}))
-                };
-                ws_send(
-                    &mut socket,
-                    &json!({"kind":"res","id":id,"status":status,"body":body.to_string()})
-                        .to_string(),
-                )
-                .await?;
-            }
-            Some("open") => {
-                let chan = frame
-                    .get("chan")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let path = frame.get("path").and_then(Value::as_str).unwrap_or("");
-                let session_id = path
-                    .strip_prefix("/sessions/")
-                    .and_then(|v| v.strip_suffix("/terminal"));
-                let terminals = app.terminals.read().await;
-                let terminal = match session_id.and_then(|id| terminals.get(id).cloned()) {
-                    Some(terminal) => terminal,
-                    None => {
-                        ws_send(&mut socket, &json!({"kind":"open_error","chan":chan,"error":"unknown terminal session"}).to_string()).await?;
-                        continue;
-                    }
-                };
-                drop(terminals);
-                ws_send(
-                    &mut socket,
-                    &json!({"kind":"opened","chan":chan}).to_string(),
-                )
-                .await?;
-                ws_send(&mut socket, &json!({"kind":"data","chan":chan,"message":{"type":"attached","session_id":session_id}}).to_string()).await?;
-                if let Some(message) = terminal.replay() {
-                    ws_send(
-                        &mut socket,
-                        &json!({"kind":"data","chan":chan,"message":message}).to_string(),
-                    )
-                    .await?;
-                }
-                let tx = output_tx.clone();
-                let relay_chan = chan.clone();
-                let mut subscription = terminal.subscribe();
-                let task = tokio::spawn(async move {
-                    loop {
-                        match subscription.recv().await {
-                            Ok(message) => {
-                                if tx.try_send((relay_chan.clone(), message)).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(_) => break,
-                        }
-                    }
-                });
-                channels.insert(chan, (session_id.unwrap_or_default().to_string(), task));
-            }
-            Some("data") => {
-                let chan = frame.get("chan").and_then(Value::as_str).unwrap_or("");
-                let Some((session_id, _)) = channels.get(chan) else {
-                    continue;
-                };
-                let message = frame.get("message").unwrap_or(&Value::Null);
-                let terminal = app.terminals.read().await.get(session_id).cloned();
-                if let Some(terminal) = terminal {
-                    match message.get("type").and_then(Value::as_str) {
-                        Some("input") => {
-                            let _ = terminal.write(
-                                message
-                                    .get("data")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .as_bytes(),
-                            );
-                        }
-                        Some("interrupt") => {
-                            let _ = terminal.write(b"\x03");
-                        }
-                        Some("ping") => {
-                            ws_send(
-                                &mut socket,
-                                &json!({"kind":"data","chan":chan,"message":{"type":"pong"}})
-                                    .to_string(),
-                            )
-                            .await?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Some("close") => {
-                if let Some((_, task)) =
-                    channels.remove(frame.get("chan").and_then(Value::as_str).unwrap_or(""))
-                {
-                    task.abort();
-                }
-            }
+            Err(error) => warn!("heartbeat unavailable: {error}"),
             _ => {}
         }
     }
-    Ok(())
 }
 
-async fn ws_send(socket: &mut tokio::net::TcpStream, text: &str) -> Result<()> {
-    let bytes = text.as_bytes();
-    anyhow::ensure!(bytes.len() <= 8 << 20, "relay frame too large");
-    let mut head = vec![0x81];
-    if bytes.len() < 126 {
-        head.push(0x80 | bytes.len() as u8);
-    } else if bytes.len() <= u16::MAX as usize {
-        head.push(0x80 | 126);
-        head.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    } else {
-        head.push(0x80 | 127);
-        head.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+async fn authenticate(
+    State(app): State<App>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request.uri().path() != "/healthz"
+        && request.method() != Method::OPTIONS
+        && !app.authorized(request.headers())
+    {
+        return err(StatusCode::UNAUTHORIZED, "authentication required");
     }
-    let mask = Uuid::new_v4();
-    let mask = &mask.as_bytes()[..4];
-    head.extend_from_slice(mask);
-    socket.write_all(&head).await?;
-    let masked: Vec<u8> = bytes
-        .iter()
-        .enumerate()
-        .map(|(index, byte)| byte ^ mask[index % 4])
-        .collect();
-    socket.write_all(&masked).await?;
-    Ok(())
+    next.run(request).await
+}
+fn router(app: App) -> Router {
+    Router::new()
+        .route("/healthz", get(health))
+        .route("/capabilities", get(capabilities))
+        .route(
+            "/sessions",
+            get(sessions_get).post(sessions_create).options(options),
+        )
+        .route("/sessions/:id", get(session_get).delete(terminate))
+        .route("/sessions/:id/terminate", post(terminate))
+        .route("/sessions/:id/turns", post(turn))
+        .route("/sessions/:id/interrupt", post(interrupt))
+        .route("/sessions/:id/recover", post(recover))
+        .route("/sessions/:id/permission", post(permission))
+        .route("/sessions/:id/terminal", get(transport::terminal_upgrade))
+        .route("/fs/list", get(folders::list))
+        .route("/fs/create", post(folders::create))
+        .route("/fs/exists", post(folders::exists))
+        .route("/fs/complete", get(folders::complete))
+        .route("/providers/usage", get(usage))
+        .route("/lifecycle/worktrees", get(worktree_inventory))
+        .route("/model-catalog", get(catalog))
+        .route("/native-sessions", get(native_sessions))
+        .fallback(any(fallback))
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            authenticate,
+        ))
+        .with_state(app)
 }
 
-async fn ws_recv(socket: &mut tokio::net::TcpStream) -> Result<Option<String>> {
-    let mut first = [0_u8; 2];
-    if socket.read_exact(&mut first).await.is_err() {
-        return Ok(None);
-    }
-    let opcode = first[0] & 0x0f;
-    let masked = first[1] & 0x80 != 0;
-    let mut length = (first[1] & 0x7f) as u64;
-    if length == 126 {
-        let mut value = [0; 2];
-        socket.read_exact(&mut value).await?;
-        length = u16::from_be_bytes(value) as u64;
-    } else if length == 127 {
-        let mut value = [0; 8];
-        socket.read_exact(&mut value).await?;
-        length = u64::from_be_bytes(value);
-    }
-    anyhow::ensure!(length <= 8 << 20, "relay frame too large");
-    let mut mask = [0; 4];
-    if masked {
-        socket.read_exact(&mut mask).await?;
-    };
-    let mut payload = vec![0; length as usize];
-    socket.read_exact(&mut payload).await?;
-    if masked {
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
-        }
-    }
-    if opcode == 8 {
-        return Ok(None);
-    };
-    if opcode != 1 {
-        return Ok(Some(String::new()));
-    };
-    Ok(Some(String::from_utf8(payload)?))
-}
-
-async fn relay_inventory(app: &App) -> Value {
-    let mut sessions: Vec<_> = app
-        .sessions
-        .read()
-        .await
-        .values()
-        .filter(|session| session.status == "running")
-        .cloned()
-        .map(session_wire)
-        .collect();
-    sessions.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
-    json!({"host_id":app.cfg.host_id,"sessions":sessions,"archived_limit":20,"next_archived_cursor":null})
-}
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1560,13 +1765,26 @@ async fn main() -> Result<()> {
         .init();
     let cfg = config(&args)?;
     let dbpath = cfg.home.join(".drover/harnessd/harnessd.sqlite");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dbpath.parent().unwrap())?;
+    fs::set_permissions(dbpath.parent().unwrap(), fs::Permissions::from_mode(0o700))?;
+    let _store_owner = claim_store(dbpath.parent().unwrap())?;
     let db = init_db(&dbpath)?;
     let sessions = load_sessions(&db)?;
+    let db = Arc::new(Mutex::new(db));
+    let events = broadcast::channel(256).0;
+    let writer = event_bus::StoreWriter::start(db.clone(), events.clone())?;
     let app = App {
         cfg: cfg.clone(),
-        db: Arc::new(Mutex::new(db)),
+        db,
         sessions: Arc::new(RwLock::new(sessions)),
         terminals: Arc::new(RwLock::new(HashMap::new())),
+        events,
+        writer,
+        operations: Arc::new(tokio::sync::Mutex::new(())),
+        stop: Arc::new(tokio::sync::Notify::new()),
         client: Client::builder().timeout(Duration::from_secs(10)).build()?,
     };
     if let Some(path) = args.import_jsonl {
@@ -1577,39 +1795,78 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    let router = Router::new()
-        .route("/healthz", get(health))
-        .route("/capabilities", get(capabilities))
-        .route(
-            "/sessions",
-            get(sessions_get).post(sessions_create).options(options),
-        )
-        .route("/sessions/:id", get(session_get).delete(terminate))
-        .route("/sessions/:id/terminate", post(terminate))
-        .route("/sessions/:id/turns", post(turn))
-        .route("/fs/list", get(fs_list))
-        .route("/fs/create", post(fs_create))
-        .route("/fs/exists", post(fs_exists))
-        .route("/model-catalog", get(catalog))
-        .route("/native-sessions", get(native_sessions))
-        .fallback(any(fallback))
-        .with_state(app.clone());
+    let _worktree_owner = claim_worktrees(&cfg.worktrees)?;
+    let previous: Vec<_> = app.sessions.read().await.values().cloned().collect();
+    for mut session in previous {
+        if let Some(worktree) = &session.worktree {
+            // Only reclaim records whose canonical path and branch prove this
+            // daemon owns them. Edited/committed trees remain recoverable.
+            if !session.restart_lost && owns_worktree(&app, &session.session_id, worktree) {
+                match cleanup_worktree(worktree) {
+                    Ok(true) => session.worktree = None,
+                    Ok(false) => {}
+                    Err(error) => warn!("startup worktree retained: {error}"),
+                }
+            }
+        }
+        app.set_session(session).await?;
+    }
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     println!("LISTENING {}", listener.local_addr()?);
     std::io::stdout().flush()?;
+    match heartbeat_once(&app).await {
+        Ok(false) => return Ok(()),
+        Err(error) => warn!("initial heartbeat unavailable: {error}"),
+        _ => {}
+    }
     tokio::spawn(heartbeat(app.clone()));
     if cfg.relay {
-        tokio::spawn(relay(app.clone()));
+        tokio::spawn(transport::relay(app.clone()));
     }
-    tokio::spawn(delivery::run(app));
-    axum::serve(listener, router).await?;
+    tokio::spawn(delivery::run(app.clone()));
+    tokio::select! {
+        result = axum::serve(listener, router(app.clone())).into_future() => result?,
+        _ = app.stop.notified() => {},
+        _ = tokio::signal::ctrl_c() => {},
+        _ = async { tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap().recv().await; } => {},
+    }
+    let ids: Vec<_> = app
+        .sessions
+        .read()
+        .await
+        .values()
+        .filter(|s| s.status == "running")
+        .map(|s| s.session_id.clone())
+        .collect();
+    for id in ids {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", app.cfg.token))?,
+        );
+        terminate(State(app.clone()), headers, Path(id)).await;
+    }
     Ok(())
 }
 fn import_jsonl(app: &App, path: &FsPath, dry_run: bool) -> Result<(usize, usize, usize)> {
+    app.db.lock().unwrap().execute_batch("SAVEPOINT handoff")?;
+    let result = import_records(app, path);
+    let finish = if result.is_err() || dry_run {
+        "ROLLBACK TO handoff; RELEASE handoff"
+    } else {
+        "RELEASE handoff"
+    };
+    app.db.lock().unwrap().execute_batch(finish)?;
+    result
+}
+fn import_records(app: &App, path: &FsPath) -> Result<(usize, usize, usize)> {
     let mut sessions = 0;
     let mut events = 0;
-    let mut skipped = 0;
-    for line in fs::read_to_string(path)?.lines() {
+    let skipped = 0;
+    for line in fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
         let v: Value = serde_json::from_str(line)?;
         let kind = v
             .get("kind")
@@ -1618,11 +1875,8 @@ fn import_jsonl(app: &App, path: &FsPath, dry_run: bool) -> Result<(usize, usize
         if kind == Some("session") {
             let row = v.get("session").unwrap_or(&v);
             let session_id = row.get("session_id").and_then(Value::as_str).unwrap_or("");
-            if session_id.is_empty() {
-                skipped += 1;
-                continue;
-            }
-            let session = Session {
+            anyhow::ensure!(!session_id.is_empty(), "import session_id missing");
+            let mut session = Session {
                 session_id: session_id.to_string(),
                 harness: row
                     .get("harness")
@@ -1670,6 +1924,8 @@ fn import_jsonl(app: &App, path: &FsPath, dry_run: bool) -> Result<(usize, usize
                     .get("awaiting")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                extra: BTreeMap::new(),
+                restart_lost: true,
                 created_at: row
                     .get("created_at")
                     .or_else(|| row.get("started_at"))
@@ -1677,21 +1933,111 @@ fn import_jsonl(app: &App, path: &FsPath, dry_run: bool) -> Result<(usize, usize
                     .unwrap_or("1970-01-01T00:00:00+00:00")
                     .to_string(),
             };
+            if session.status == "running" || session.status == "starting" {
+                session.status = "errored".into();
+                session.awaiting = None;
+            }
+            let known = serde_json::to_value(&session)?;
+            if let Some(fields) = row.as_object() {
+                session.extra = fields
+                    .iter()
+                    .filter(|(k, _)| {
+                        !known.as_object().unwrap().contains_key(*k)
+                            && ![
+                                "pid",
+                                "awaiting",
+                                "worktree",
+                                "model",
+                                "thinking_effort",
+                                "client_session_id",
+                                "parent_session_id",
+                                "native_session_id",
+                            ]
+                            .contains(&k.as_str())
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+            }
             sessions += 1;
-            if !dry_run {
+            // Re-imports never overwrite state produced after cutover.
+            let exists = app.db.lock().unwrap().query_row(
+                "SELECT count(*) FROM sessions WHERE session_id=?1",
+                [session_id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            if !exists {
                 app.save_session(&session)?;
             }
             continue;
         }
-        if kind.is_some_and(|k| k != "event") {
-            skipped += 1;
+        if matches!(kind, Some("worktree" | "lifecycle" | "quarantine")) {
+            let kind = kind.unwrap();
+            let record = v.get("record").unwrap_or(&v);
+            let id = record
+                .get("operation_id")
+                .or_else(|| record.get("event_id"))
+                .or_else(|| record.get("path"))
+                .and_then(Value::as_str)
+                .context("handoff record identity missing")?;
+            app.db.lock().unwrap().execute(
+                "INSERT OR IGNORE INTO handoff_records(kind,record_id,data) VALUES(?1,?2,?3)",
+                params![kind, id, serde_json::to_string(record)?],
+            )?;
+            if kind == "quarantine" {
+                app.db.lock().unwrap().execute("INSERT OR IGNORE INTO event_quarantine(event_id,session_id,reason,quarantined_at) VALUES(?1,?2,?3,?4)",params![id,record["session_id"].as_str().context("quarantine session missing")?,record["reason"].as_str().context("quarantine reason missing")?,record["quarantined_at"].as_str().unwrap_or(&now())])?;
+            }
+            if kind == "worktree"
+                && ["repo", "path", "branch", "base_sha"]
+                    .iter()
+                    .all(|k| record[k].is_string())
+            {
+                if let Some(sid) = record["session_id"].as_str() {
+                    let worktree = Worktree {
+                        repo: record["repo"]
+                            .as_str()
+                            .context("worktree repo missing")?
+                            .into(),
+                        path: record["path"]
+                            .as_str()
+                            .context("worktree path missing")?
+                            .into(),
+                        branch: record["branch"]
+                            .as_str()
+                            .context("worktree branch missing")?
+                            .into(),
+                        base: record["base_sha"]
+                            .as_str()
+                            .context("worktree base missing")?
+                            .into(),
+                    };
+                    app.db.lock().unwrap().execute(
+                        "INSERT OR IGNORE INTO worktrees(session_id,data) VALUES(?1,?2)",
+                        params![sid, serde_json::to_string(&worktree)?],
+                    )?;
+                    let raw = app
+                        .db
+                        .lock()
+                        .unwrap()
+                        .query_row(
+                            "SELECT data FROM sessions WHERE session_id=?1",
+                            [sid],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .ok();
+                    if let Some(raw) = raw {
+                        let mut session: Session = serde_json::from_str(&raw)?;
+                        session.worktree = Some(worktree);
+                        app.save_session(&session)?;
+                    }
+                }
+            }
             continue;
         }
-        if v.get("event_id").is_none() || v.get("dedup_key").is_none() {
-            skipped += 1;
-            continue;
-        }
-        if dry_run || app.import_event(&v)? {
+        anyhow::ensure!(
+            kind.is_none() || kind == Some("event"),
+            "unknown handoff record kind"
+        );
+        if app.import_event(&v)? {
             events += 1;
         }
     }

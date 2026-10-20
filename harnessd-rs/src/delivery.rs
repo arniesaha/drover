@@ -13,7 +13,7 @@ fn tombstone(event: &Value) -> Value {
     let mut capped = json!({
         "event_id":event["event_id"], "session_id":event["session_id"],
         "type":event["type"], "seq":event["seq"],
-        "payload":{"truncated":true,"reason":"event_size_cap","original_bytes":bytes}
+        "payload":{"truncated":true,"reason":"event exceeds harness request byte limit","original_bytes":bytes}
     });
     if event["ts"].is_string() {
         capped["ts"] = event["ts"].clone();
@@ -110,7 +110,7 @@ fn outbox(
     let rows = statement.query_map([], |row| {
         Ok((row.get(0)?, json!({
             "event_id": row.get::<_, String>(1)?, "session_id":row.get::<_, String>(2)?,
-            "type":row.get::<_, String>(3)?,"role":"assistant","text":row.get::<_, Option<String>>(4)?,
+            "type":row.get::<_, String>(3)?,"role":match row.get::<_,String>(3)?.as_str() {"user_input"=>"user","tool_result"=>"tool","status"=>"system",_=>"assistant"},"text":row.get::<_, Option<String>>(4)?,
             "payload":serde_json::from_str::<Value>(&row.get::<_, String>(5)?).unwrap_or(Value::Null),
             "turn_id":row.get::<_, Option<String>>(6)?,"seq":row.get::<_, i64>(7)?,"ts":row.get::<_, String>(8)?
         })))
@@ -154,7 +154,12 @@ pub(super) async fn run(app: App) {
             }
         };
         let mut pages = VecDeque::from([page]);
-        while let Some(page) = pages.pop_front() {
+        while let Some(mut page) = pages.pop_front() {
+            page.retain(|(_, e)| {
+                !held
+                    .get(e["session_id"].as_str().unwrap_or(""))
+                    .is_some_and(|(until, _)| *until > tokio::time::Instant::now())
+            });
             if page.is_empty() {
                 continue;
             }
@@ -181,7 +186,7 @@ pub(super) async fn run(app: App) {
                     pages.push_front(page[mid..].to_vec());
                     pages.push_front(page[..mid].to_vec());
                 } else if page[0].1.pointer("/payload/reason").and_then(Value::as_str)
-                    != Some("event_size_cap")
+                    != Some("event exceeds harness request byte limit")
                 {
                     pages.push_front(vec![(page[0].0, tombstone(&page[0].1))]);
                 } else {

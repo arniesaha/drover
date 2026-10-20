@@ -1919,6 +1919,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if auth_route and auth_route[2] == "input":
             self._auth_input(auth_route[0], auth_route[1] or "")
             return
+        if parsed.path == "/drain":
+            self._drain_for_handoff()
+            return
         if parsed.path == "/fs/create":
             self._fs_create()
             return
@@ -2455,7 +2458,48 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         return
 
+    def _drain_for_handoff(self) -> None:
+        """Fence launches/turns before the operator stops Python for export."""
+        if not self.server.state.host_token:
+            self._write_json({"error": "authentication required"}, status=401)
+            return
+        body = self._read_json() or {}
+        if body.get("cancel") is True:
+            self.server.state.structured.end_drain()
+            self._write_json({"draining": False})
+            return
+        timeout = body.get("timeout", 300)
+        if type(timeout) not in (int, float) or not 0 <= timeout <= 300:
+            self._write_json({"error": "invalid drain timeout"}, status=400)
+            return
+        self.server.state.structured.begin_drain(600)
+        # Closing terminals is explicit in the drain operation. Codex turns
+        # finish naturally, while the drain gate refuses new work.
+        self.server.state.pty.close_all()
+        deadline = time.monotonic() + timeout
+        while True:
+            busy = [
+                sid
+                for sid in self.server.state.structured.session_ids()
+                if self.server.state.structured.is_busy(sid)
+            ]
+            if not busy:
+                self._write_json({"draining": True, "quiescent": True})
+                return
+            if time.monotonic() >= deadline:
+                self._write_json(
+                    {"draining": True, "quiescent": False, "busy": busy}, status=409
+                )
+                return
+            time.sleep(0.1)
+
     def _create_session(self) -> None:
+        manager = getattr(
+            getattr(getattr(self, "server", None), "state", None), "structured", None
+        )
+        if callable(getattr(manager, "is_draining", None)) and manager.is_draining():
+            self._write_json({"error": "harness is draining"}, status=503)
+            return
         body = self._read_json()
         if body is None:
             self._write_json(
@@ -3209,6 +3253,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         self._write_json({"turn_id": turn_id}, status=HTTPStatus.ACCEPTED)
 
     def _recover_structured_session(self, session_id: str) -> None:
+        if self.server.state.structured.is_draining():
+            self._write_json({"error": "harness is draining"}, status=503)
+            return
         body = self._read_json()
         native_session_id = _optional_text(
             body.get("native_session_id") if body is not None else None
@@ -3339,7 +3386,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if (
             refusal := self._unsupported_operation(session_id, "approvals")
         ) is not None:
-            self._write_json({"error": refusal}, status=HTTPStatus.BAD_REQUEST)
+            self._write_json({"error": refusal}, status=HTTPStatus.CONFLICT)
             return
         try:
             self.server.state.structured.answer_permission(

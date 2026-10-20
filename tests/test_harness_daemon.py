@@ -4610,10 +4610,10 @@ def test_structured_launch_rejects_unknown_worktree_policy(monkeypatch, tmp_path
         server.server_close()
 
 
-def test_structured_permission_without_approval_channel_returns_400(tmp_path):
+def test_structured_permission_without_approval_channel_returns_409(tmp_path):
     # The adapter rejects approval when the driver has no wire channel. The
     # daemon must surface that as a
-    # 400, not a 500, and must not record a phantom approval_response event.
+    # 409, and must not record a phantom approval_response event.
     server, state, base_url = _start_test_server(tmp_path)
     try:
         codex_cli = [
@@ -4639,11 +4639,11 @@ def test_structured_permission_without_approval_channel_returns_400(tmp_path):
                 payload={"request_id": "req-1", "decision": "allow"},
             )
         except urllib.error.HTTPError as exc:
-            assert exc.code == 400
+            assert exc.code == 409
             payload = json.loads(exc.read().decode("utf-8"))
             assert "approval" in payload["error"]
         else:
-            raise AssertionError("codex has no approval channel; expected 400")
+            raise AssertionError("codex has no approval channel; expected 409")
 
         assert not any(
             event.event_type == "approval_response"
