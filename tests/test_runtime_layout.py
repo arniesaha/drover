@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -16,11 +17,13 @@ from drover.server.runtime import RuntimeLayout, compare_versions
 
 
 def _install(layout: RuntimeLayout, version: str, *, exit_code: int = 0) -> None:
-    """Fake an installed venv: a bin directory with a runnable drover-server."""
-    binary = layout.version_dir(version) / "bin" / "drover-server"
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    binary.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
-    binary.chmod(0o755)
+    """Fake an installed runtime with every service-facing entry point."""
+    bin_dir = layout.version_dir(version) / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("drover", "drover-server", "drover-harnessd"):
+        binary = bin_dir / name
+        binary.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
+        binary.chmod(0o755)
 
 
 @pytest.mark.parametrize(
@@ -150,6 +153,36 @@ def test_smoke_test_logs_output_before_timeout(tmp_path, monkeypatch, caplog):
 
 def test_smoke_test_fails_for_a_missing_version(tmp_path):
     assert RuntimeLayout(tmp_path).smoke_test("9.9.9") is False
+
+
+def test_runtime_verification_rejects_a_console_script_with_its_stage_path(tmp_path):
+    layout = RuntimeLayout(tmp_path)
+    _install(layout, "0.1.4")
+    stage = layout.root / ".0.1.4-stage"
+    (layout.version_dir("0.1.4") / "bin" / "drover-harnessd").write_text(
+        f"#!{stage}/bin/python\n", encoding="utf-8"
+    )
+
+    assert layout.verify_runtime("0.1.4", former_path=stage) is False
+
+
+def test_runtime_verification_exercises_every_service_entrypoint(tmp_path, monkeypatch):
+    layout = RuntimeLayout(tmp_path)
+    _install(layout, "0.1.4")
+    calls = []
+
+    def record(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", record)
+
+    assert layout.verify_runtime("0.1.4") is True
+    assert [Path(command[0]).name for command in calls] == [
+        "drover",
+        "drover-server",
+        "drover-harnessd",
+    ]
 
 
 def test_prune_keeps_the_newest_and_never_the_active_one(tmp_path):

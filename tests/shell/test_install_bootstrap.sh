@@ -120,6 +120,8 @@ printf '%s\n' \
   '    printf '\''#!/bin/bash\nexec "$FIXTURE_PYTHON" "$@"\n'\'' > "$target/bin/python"' \
   '    chmod +x "$target/bin/python"' \
   '    ln -s "$(dirname "$0")/drover-server" "$target/bin/drover-server"' \
+  '    ln -s "$(dirname "$0")/drover-server" "$target/bin/drover"' \
+  '    ln -s "$(dirname "$0")/drover-server" "$target/bin/drover-harnessd"' \
   '    ;;' \
   '  pip) printf "pip\\n" >> "$FIXTURE_UV_LOG" ;;' \
   '  *) exit 1 ;;' \

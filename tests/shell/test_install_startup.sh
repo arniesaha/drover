@@ -177,6 +177,8 @@ printf '%s\n' \
   '      ln -sf "$FIXTURE_RUNTIME_PYTHON" "$target/bin/python"' \
   '    fi' \
   '    ln -sf "$FIXTURE_SERVER" "$target/bin/drover-server"' \
+  '    ln -sf "$FIXTURE_SERVER" "$target/bin/drover"' \
+  '    ln -sf "$FIXTURE_SERVER" "$target/bin/drover-harnessd"' \
   '    ;;' \
   '  pip) ;;' \
   '  *) exit 1 ;;' \
@@ -186,6 +188,7 @@ chmod +x "$FAKE_BIN/uv"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -eu' \
+  'if [ "${FIXTURE_HARNESS_VERSION_UNSUPPORTED:-}" = 1 ] && [ "$(basename "$0")" = drover-harnessd ]; then case "${1:-}" in --help) exit 0 ;; *) exit 2 ;; esac; fi' \
   'case "${1:-}" in' \
   '  --version) printf "0.0.0\\n" ;;' \
   '  init)' \
@@ -386,6 +389,17 @@ unset FIXTURE_EXPECTED_DSN FIXTURE_INSTALL_DSN
 check_status "fresh install preserves an escaped PostgreSQL DSN" "$RESULT" "0"
 check_contains "escaped PostgreSQL DSN is stored in a private environment file" \
   "$HOME_DIR/.drover/server.env" 'DROVER_CONTROL_DSN='
+if /usr/bin/grep -r -F -q -- '/.0.0.0.install.' "$HOME_DIR/.drover/runtime/0.0.0/bin"; then
+  STAGED_PATH_REFERENCE=1
+else
+  STAGED_PATH_REFERENCE=0
+fi
+check_status "final runtime has no staged-path console scripts" \
+  "$STAGED_PATH_REFERENCE" "0"
+for entry in drover drover-server drover-harnessd; do
+  "$HOME_DIR/.drover/runtime/0.0.0/bin/$entry" --version >/dev/null 2>&1
+  check_status "final runtime runs $entry" "$?" "0"
+done
 
 new_case missing-dsn
 export FIXTURE_INSTALL_DSN=""
@@ -442,6 +456,17 @@ check_status "compatible release verification leaves Drover state absent" \
   "$([ -e "$HOME_DIR/.drover" ] && echo present || echo absent)" "absent"
 check_status "compatible release verification cleans its disposable runtime" \
   "$(find "$CASE_DIR/verify-tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0"
+
+# Older releases predate drover-harnessd --version. Candidate verification
+# must still approve one when every executable behavior it can exercise works.
+new_case compatible-release-legacy-harness-version
+export FIXTURE_HARNESS_VERSION_UNSUPPORTED=1
+OUT="$(run_release_verification)"
+RESULT=$?
+unset FIXTURE_HARNESS_VERSION_UNSUPPORTED
+check_status "candidate verification accepts an older harnessd without --version" "$RESULT" "0"
+check_contains "older candidate verification reports the contract" <(printf '%s' "$OUT") \
+  'satisfies the PostgreSQL-default installer contract'
 
 new_case release-verification-without-uv
 mkdir -p "$CASE_DIR/no-uv"
