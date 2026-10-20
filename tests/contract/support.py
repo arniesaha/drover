@@ -52,6 +52,8 @@ def fake_hub():
     hub: FakeHub
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def do_GET(self):  # noqa: N802
             if self.path != "/harness/relay":
                 self.send_error(404)
@@ -137,6 +139,11 @@ def _fake_cli(path: Path, fixture: Path, log: Path) -> None:
         " Path(os.environ['HARNESSD_FAKE_AUTH_STATE']).write_text('authenticated')\n"
         " print('Signed in', flush=True)\n"
         " raise SystemExit(0)\n"
+        "if 'exec' in sys.argv:\n"
+        " for event in open("
+        + repr(str(fixture))
+        + "): print(event.rstrip(), flush=True)\n"
+        " raise SystemExit(0)\n"
         "for line in sys.stdin:\n"
         " with open(log, 'a') as out: out.write(json.dumps({'stdin': line.rstrip()}) + '\\n')\n"
         " request = json.loads(line)\n"
@@ -208,7 +215,9 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
     if impl == "rs":
         binary = Path("target/release/drover-harnessd")
         if not binary.exists():
-            pytest.skip("Rust harnessd binary has not been built")
+            pytest.fail(
+                "Rust contract gate requires a built target/release/drover-harnessd"
+            )
         command = [str(binary)]
     elif impl == "py":
         command = [sys.executable, "-m", "drover.server.harness.cli"]

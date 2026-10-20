@@ -17,7 +17,7 @@ def test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance(
     daemon, fake_hub
 ):
     daemon.process.wait(timeout=5)
-    assert daemon.process.returncode == 0
+    assert daemon.process.returncode == 0, daemon.process.stderr.read()
     wait_until(
         lambda: any(item["path"] == "/harness/hosts" for item in fake_hub.requests)
     )

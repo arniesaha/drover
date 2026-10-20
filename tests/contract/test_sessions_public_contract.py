@@ -16,6 +16,8 @@ def _shell(daemon, **extra):
 def test_shell_create_get_list_and_terminate(daemon):
     status, created = _shell(daemon)
     assert status == 201
+    assert created["host_id"] == "contract-host"
+    assert created["registry_synced"] is True
     assert created["status"] == "running"
     assert isinstance(created["pid"], int) and created["pid"] > 0
     sid = created["session_id"]

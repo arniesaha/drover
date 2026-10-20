@@ -55,7 +55,11 @@ def pytest_addoption(parser):
 # advisory cases remain outside its capability envelope until later slices.
 _RUST_PHASE2 = (
     "test_fs_contract.py::test_fs_",
-    "test_model_selection_contract.py::test_",
+    "test_model_selection_contract.py::test_model_preference_",
+    "test_phase2_contract.py::test_",
+    "test_harnessd_contract.py::test_unknown_session_",
+    "test_startup_registration_contract.py::test_bound_host_",
+    "test_recovery_contract.py::test_orphaned_pty_",
     "test_sessions_public_contract.py::test_shell_",
     "test_sessions_public_contract.py::test_client_session_key_",
     "test_sessions_public_contract.py::test_unkeyed_",
@@ -68,7 +72,6 @@ _RUST_PHASE2 = (
     "test_native_history_contract.py::test_discovers_codex_",
     "test_native_history_contract.py::test_native_sessions_query_",
     "test_relay_spoke_contract.py::test_relay_",
-    "test_rust_migration_contract.py::test_rust_",
 )
 
 
