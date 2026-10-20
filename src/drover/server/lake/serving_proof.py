@@ -372,8 +372,10 @@ def validate_export_receipts(con):
                 raise ValueError()
 
 
-def _check_referenced_files(spec, con):
-    """Bounded metadata-only coverage, including current delete files; no globs."""
+def check_referenced_files(spec, con, *, limit=REFERENCED_FILE_LIMIT):
+    """Return checked current file count, rejecting unsafe catalog references."""
+    if type(limit) is not int or limit < 1:
+        raise ValueError("referenced file limit must be a positive integer")
     required = {
         "agent_events",
         "agent_events_legacy_metadata",
@@ -402,7 +404,7 @@ def _check_referenced_files(spec, con):
                 if name is None:
                     continue
                 files += 1
-                if files > REFERENCED_FILE_LIMIT:
+                if files > limit:
                     raise LakeError("lake_verification_file_limit")
                 path = Path(name)
                 if not path.resolve().is_relative_to(root):
@@ -414,3 +416,9 @@ def _check_referenced_files(spec, con):
                     raise LakeError(
                         "lake_verification_file_missing_or_changed"
                     ) from None
+    return files
+
+
+def _check_referenced_files(spec, con):
+    """Bounded metadata-only coverage, including current delete files; no globs."""
+    return check_referenced_files(spec, con)

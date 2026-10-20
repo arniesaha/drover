@@ -156,7 +156,12 @@ from drover.server.metrics import (
 from drover.server.native_usage_rollup import NativeUsageRollupWorker
 from drover.server.observatory import pipeline_observatory_snapshot
 from drover.server.otlp.receiver import OTLPReceiver
-from drover.server.planned_stop import PlannedStopStore, readyz, recover_planned_stop
+from drover.server.planned_stop import (
+    PlannedStopStore,
+    readyz,
+    recover_planned_stop,
+    valid_marker,
+)
 from drover.server.profile_cli import profile as profile_commands
 from drover.server.providers.service import ProviderUsageService
 from drover.server.quality import format_prometheus, quality_snapshot
@@ -3104,9 +3109,25 @@ def run(
         # can start. A bad cutover config is a startup failure, never a read
         # fallback to the legacy analytical store.
         with _startup_phase("validate_ducklake_serving"):
+            from drover.server.lake.runtime import LakeError
             from drover.server.lake.serving import check_selected
 
-            check_selected(cfg.duckdb_path)
+            try:
+                check_selected(cfg.duckdb_path)
+            except LakeError as exc:
+                if exc.code == "lake_verification_file_limit":
+                    env_name = (
+                        cfg.analytics.maintenance_dsn_env
+                        or "<catalog-admin-dsn-environment-variable>"
+                    )
+                    log.error(
+                        "DuckLake referenced-file limit exceeded; compact before restart: "
+                        "drover-server lake compact --data-root %s --catalog-dsn-env %s "
+                        "--i-have-a-backup",
+                        cfg.analytics.data_root,
+                        env_name,
+                    )
+                raise
     host_bridge = (
         HostDataBridgeClient(
             cfg.analytics_boundary,
@@ -3188,6 +3209,51 @@ def run(
     # One gate per process, shared by the foreground cockpit build and every
     # background analytical pass (#331).
     analytics_gate = AnalyticalMaintenanceGate()
+    lake_compactor = None
+    if cfg.analytics.backend == "ducklake":
+        from drover.server.lake.maintenance import (
+            CompactionPolicy,
+            LakeCompactionScheduler,
+        )
+        from drover.server.lake.serving import lake_spec
+
+        planned_stop_store = PlannedStopStore(runtime_config_path.parent)
+
+        def _exporter_backlog_high() -> bool:
+            if outbox_exporter is None:
+                return True
+            try:
+                return outbox_exporter.health().get("state") != "ok"
+            except Exception:  # noqa: BLE001 - maintenance must stand aside
+                return True
+
+        lake_compactor = LakeCompactionScheduler(
+            reader_spec=lake_spec(cfg.analytics),
+            maintenance_dsn_env=cfg.analytics.maintenance_dsn_env,
+            policy=CompactionPolicy(
+                soft_file_limit=cfg.analytics.auto_compaction_soft_file_limit,
+                daily_window_hour=cfg.analytics.auto_compaction_daily_window_hour,
+            ),
+            max_runtime_seconds=cfg.analytics.auto_compaction_max_runtime_seconds,
+            maintenance_admission=MaintenanceAdmission(analytics_gate),
+            planned_stop_active=lambda: valid_marker(planned_stop_store.read()),
+            exporter_backlog_high=_exporter_backlog_high,
+        )
+        lake_compactor.refresh_health()
+
+        def _run_lake_compaction() -> None:
+            while not stop.is_set():
+                try:
+                    lake_compactor.tick()
+                except Exception:  # noqa: BLE001 - next quiet tick may recover
+                    log.exception("scheduled DuckLake compaction failed")
+                stop.wait(60)
+
+        threading.Thread(
+            target=_run_lake_compaction,
+            name="ducklake-compaction",
+            daemon=True,
+        ).start()
     advisory_worker: AdvisoryWorker | None = None
     # Before any analyzer is built or fact read: decides whether advisory
     # loaders may touch span Parquet at all (#473).
@@ -3407,6 +3473,7 @@ def run(
                         if cfg.analytics.backend == "ducklake" and outbox_exporter
                         else None
                     ),
+                    lake_health=lake_compactor.health if lake_compactor else None,
                     embeddings_state=embeddings_state,
                     api_token=auth.api_token if auth.enabled else "",
                     lifecycle_config=cfg.lifecycle,
@@ -3552,6 +3619,7 @@ def run(
                     if cfg.analytics.backend == "ducklake" and outbox_exporter
                     else None
                 ),
+                lake_health=lake_compactor.health if lake_compactor else None,
                 embeddings_state=embeddings_state,
                 api_token=auth.api_token if auth.enabled else "",
                 lifecycle_config=cfg.lifecycle,
@@ -4590,6 +4658,11 @@ def quality_cmd(
     cfg = _resolve_config(
         ctx.obj["config_path"], allow_missing_default=duckdb_path is not None
     )
+    lake_health = None
+    if cfg.analytics.backend == "ducklake":
+        from drover.server.lake.maintenance import lake_health_for_config
+
+        lake_health = lake_health_for_config(cfg.analytics)
     with _diagnostic_db_path(duckdb_path or cfg.duckdb_path) as db_path:
         snapshot = quality_snapshot(
             duckdb_path=db_path,
@@ -4600,6 +4673,7 @@ def quality_cmd(
             spans_enabled=cfg.spans_enabled,
             memory_store_path=cfg.duckdb_path,
             embedding_model=_configured_embedding_model(cfg),
+            lake_health=lake_health,
         )
     if as_prometheus:
         click.echo(format_prometheus(snapshot), nl=False)

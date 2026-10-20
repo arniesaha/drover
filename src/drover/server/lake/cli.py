@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import click
@@ -14,6 +15,7 @@ from .runtime import LakeError, LakeSpec, sanitize_detail
 REBUILD_RSS_CEILING_ENV = "DROVER_LAKE_REBUILD_RSS_CEILING_BYTES"
 REBUILD_RSS_CEILING_MIN = 512 * 1024**2
 REBUILD_RSS_CEILING_MAX = 12 * 1024**3
+BACKUP_RECEIPT_MAX_AGE = timedelta(hours=36)
 
 
 def rebuild_rss_ceiling_from_env() -> int:
@@ -77,6 +79,20 @@ def _echo_report_with_proof_pin(report, spec):
     receipt = _with_proof_pin(report, spec)
     click.echo(json.dumps(receipt, indent=2))
     click.echo(receipt["verification_sha256_hint"])
+
+
+def _recent_verified_backup(path: Path, *, now: datetime | None = None) -> bool:
+    """Accept the Studio's latest successful, verification-backed NAS receipt."""
+    try:
+        receipt = json.loads(path.read_text())
+        completed = datetime.fromisoformat(receipt["completed_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if completed.tzinfo is None or receipt.get("verification_ok") is not True:
+        return False
+    return (now or datetime.now(timezone.utc)) - completed.astimezone(timezone.utc) <= (
+        BACKUP_RECEIPT_MAX_AGE
+    )
 
 
 @click.group("lake")
@@ -328,6 +344,70 @@ def maintain_cmd(data_root, catalog_dsn_env, dry_run):
         return
     try:
         report = maintain_lake(spec_from_options(data_root, catalog_dsn_env))
+    except LakeError as exc:
+        raise _lake_failure(exc, data_root) from None
+    click.echo(json.dumps(report, indent=2))
+
+
+@lake_cmd.command("compact")
+@click.option(
+    "--data-root", type=click.Path(exists=True, path_type=Path), required=True
+)
+@click.option(
+    "--catalog-dsn-env",
+    required=True,
+    help="Environment variable holding the catalog ADMIN DSN.",
+)
+@click.option("--dry-run", is_flag=True, help="Show the non-mutating compaction plan.")
+@click.option(
+    "--backup-receipt",
+    type=click.Path(path_type=Path),
+    default=lambda: Path.home() / ".drover/backup-state/last-success.json",
+    show_default="~/.drover/backup-state/last-success.json",
+)
+@click.option(
+    "--i-have-a-backup",
+    is_flag=True,
+    help="Acknowledge a recent verified backup not represented by the local receipt.",
+)
+def compact_cmd(
+    data_root: Path,
+    catalog_dsn_env: str,
+    dry_run: bool,
+    backup_receipt: Path,
+    i_have_a_backup: bool,
+) -> None:
+    """Merge tiny files under the mutation fence and verify every row count."""
+    from .maintenance import CLEANUP_RETENTION, EXPORT_MAINTENANCE_TABLES, compact_lake
+
+    if dry_run:
+        click.echo(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "tables": EXPORT_MAINTENANCE_TABLES,
+                    "referenced_files_before": None,
+                    "referenced_files_after": None,
+                    "after_is_projected": False,
+                    "row_counts": "would verify equal before and after each table",
+                    "operations": [
+                        "drained_mutation fence",
+                        "merge adjacent files per table",
+                        "verify row counts per table",
+                        "expire snapshots and clean files older than "
+                        + CLEANUP_RETENTION,
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+    if not i_have_a_backup and not _recent_verified_backup(backup_receipt):
+        raise click.ClickException(
+            "recent verified backup required; provide --backup-receipt or --i-have-a-backup"
+        )
+    try:
+        report = compact_lake(spec_from_options(data_root, catalog_dsn_env))
     except LakeError as exc:
         raise _lake_failure(exc, data_root) from None
     click.echo(json.dumps(report, indent=2))
