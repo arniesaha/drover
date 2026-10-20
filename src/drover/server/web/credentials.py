@@ -543,15 +543,13 @@ class PostgresCredentialStore:
         with self._connection() as con:
             con.execute("BEGIN")
             try:
-                # Serialise registrations for this endpoint: otherwise two
-                # concurrent re-pairs can each clear the other, leaving both
-                # credentials subscribed when their transactions interleave.
+                # Registrations are rare, so serialize them all. Locking just
+                # the destination endpoint deadlocks when two paired devices
+                # concurrently swap endpoints: each owns one device row and
+                # then needs the other's row while clearing duplicates.
                 con.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
-                    [
-                        "apns-registration:"
-                        + apns_registration_fingerprint(token, environment)
-                    ],
+                    ["apns-registration"],
                 )
                 target = con.execute(
                     """SELECT credential_id FROM control_credentials
