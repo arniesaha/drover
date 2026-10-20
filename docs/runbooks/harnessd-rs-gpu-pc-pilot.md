@@ -88,23 +88,23 @@ Use an authenticated temporary token; the HOME is private and disposable.
 
 ```bash
 export REHEARSAL="$PILOT_ROOT/rehearsal"
-mkdir -p "$REHEARSAL/home/.drover"
-chmod 700 "$REHEARSAL" "$REHEARSAL/home"
-openssl rand -hex 32 > "$REHEARSAL/home/.drover/api_token"
-chmod 600 "$REHEARSAL/home/.drover/api_token"
+mkdir -p "$REHEARSAL/isolated-home/.drover"
+chmod 700 "$REHEARSAL" "$REHEARSAL/isolated-home"
+openssl rand -hex 32 > "$REHEARSAL/isolated-home/.drover/api_token"
+chmod 600 "$REHEARSAL/isolated-home/.drover/api_token"
 printf '[paths]\nworktrees_dir = "%s/worktrees"\n' "$REHEARSAL" > "$REHEARSAL/config.toml"
 # Unset inherited production tokens so the rehearsal uses its own token file.
-env -u DROVER_API_TOKEN HOME="$REHEARSAL/home" "$RS_BIN" \
+env -u DROVER_API_TOKEN HOME="$REHEARSAL/isolated-home" "$RS_BIN" \
   --config "$REHEARSAL/config.toml" --host-id gpu-pc-rs-rehearsal \
   --listen 127.0.0.1:17081 > "$REHEARSAL/stdout.log" 2> "$REHEARSAL/stderr.log" &
 REHEARSAL_PID=$!
 curl --fail --silent http://127.0.0.1:17081/healthz
-curl --fail --silent -H "Authorization: Bearer $(cat "$REHEARSAL/home/.drover/api_token")" \
+curl --fail --silent -H "Authorization: Bearer $(cat "$REHEARSAL/isolated-home/.drover/api_token")" \
   http://127.0.0.1:17081/capabilities
 ```
 
 Authenticate the rehearsal Codex CLI in the isolated HOME first (for example,
-`env HOME="$REHEARSAL/home" codex login` in an operator terminal). Keep its
+`env HOME="$REHEARSAL/isolated-home" codex login` in an operator terminal). Keep its
 credentials separate from the production HOME.
 
 Create a shell session in a disposable directory and exercise terminal attach,

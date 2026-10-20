@@ -3253,7 +3253,8 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         self._write_json({"turn_id": turn_id}, status=HTTPStatus.ACCEPTED)
 
     def _recover_structured_session(self, session_id: str) -> None:
-        if self.server.state.structured.is_draining():
+        is_draining = getattr(self.server.state.structured, "is_draining", None)
+        if callable(is_draining) and is_draining():
             self._write_json({"error": "harness is draining"}, status=503)
             return
         body = self._read_json()
