@@ -1,6 +1,6 @@
 # ADR 0002: Hub session lifecycle, first iteration observes and records only
 
-- **Status:** Accepted
+- **Status:** Accepted; implemented in v0.6.10 (#552) as report-only lifecycle observation.
 - **Date:** 2026-10-06
 - **Decision owners:** Drover maintainers
 - **Issue:** [#547](https://github.com/arniesaha/drover/issues/547)

@@ -129,7 +129,7 @@ By default, the hub asks GitHub for a newer release every six hours.
 
 - To stay on one release, set `pinned_version`.
 - To stop the check, set `enabled = false`.
-- To update manually, run `drover-server update`. To go back, run `drover-server rollback`.
+- `drover-server update` refreshes and reports the convergence target; installer-managed host convergence installs and activates it. To activate a previously installed release, run `drover-server rollback`.
 
 ## Favorite directories
 

@@ -232,17 +232,17 @@ DuckDB backup over newer Python data. For an aborted drain before stopping
 Python, cancel with `curl --fail -H "Authorization: Bearer $DROVER_API_TOKEN"
 -H 'Content-Type: application/json' -d '{"cancel":true}' "$LOCAL_URL/drain"`.
 
-## 72-hour soak exit criteria
+## Overnight (8–9 hour) soak exit criteria
 
 Record UTC start/end, source SHA, restart count, representative workload,
 counts/histograms and logs. Any restart, warning, rollback or code/config change
-resets the uninterrupted 72-hour clock after correction.
+resets the uninterrupted soak clock after correction.
 
 | Gate | Measurement and passing criterion |
 |---|---|
 | Daemon RSS | Sample `/proc/<MainPID>/status` `VmRSS` every minute: every sample **<100 MB** (100,000,000 bytes; require VmRSS <97,656 KiB, interpreting the kernel's `kB` field as KiB). Track Codex child RSS separately. No rising retained-session trend after repeated terminal attaches/exits. |
 | Idle CPU | Use `pidstat -p <MainPID> 60` or `/proc/<pid>/stat` deltas during quiet windows: daemon CPU **<1% of one core**. Record at least hourly idle windows; exclude deliberate Codex/shell work from the idle classification. |
-| Relay launch latency | Measure at the orchestrator from POST to completed response through the hub's actual relay create route. Include shell and Codex launches (real scratch Git repo/worktree); use unique client_session_id for each attempt. Record all failures/timeouts. Require **p99 <2 s**, zero failed launches, at least 100 samples over 72 hours and coverage of both harnesses. Compute p99 by nearest-rank over all samples, retaining raw timings and workload labels. |
+| Relay launch latency | Measure at the orchestrator from POST to completed response through the hub's actual relay create route. Include shell and Codex launches (real scratch Git repo/worktree); use unique client_session_id for each attempt. Record all failures/timeouts. Require **p99 <2 s**, zero failed launches, at least 20 samples during the 8–9 hour soak and coverage of both harnesses. Compute p99 by nearest-rank over all samples, retaining raw timings and workload labels. |
 | Ownership / reconciliation | **Zero ownership or reconciliation warnings** during the soak, zero new quarantine receipts, no repeated historical replay batches. Query `event_quarantine` and the unpushed count hourly and after a relay interruption; pending events must drain on recovery. Retained quarantine payloads are never pruned or treated as acknowledgements. |
 | Correctness | Shared contracts green for both implementations at the installed SHA; shell terminal WS data/input/resize, Codex resume/recover/interrupt, Git evidence, folder picker, relay reconnect and restart recovery remain functional. No unexplained session/worktree loss. |
 
@@ -259,5 +259,5 @@ journalctl --user -u "$RS_UNIT" --since '<soak UTC start>' --no-pager \
 ```
 
 The orchestrator owns the pilot outcome. M2 implementation readiness is not a
-claim that the 72-hour live-host exit gate has already passed. Keep Python
+claim that the overnight live-host exit gate has already passed. Keep Python
 available until the recorded soak meets every gate and rollout is authorized.

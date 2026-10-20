@@ -96,9 +96,9 @@ store to PostgreSQL; that remains an explicit operator step described in
   routes except `/healthz`, `/readyz`, `/auth/login`, `/auth/pair`, and
   `/harness/probe`
 - Per-device and per-host credentials, individually revocable
-- Host credentials are not yet bound to a host identity: any host credential
-  can act as any registered host
-  ([#13](https://github.com/arniesaha/drover/issues/13))
+- Host credentials are bound to their issued host ID. Registration,
+  heartbeats, relay attachment, and event ingest reject a mismatched host ID.
+  This is not cryptographic machine identity.
 - The legacy shared token is accepted by default for upgrade compatibility
   until `[auth] legacy_token_enabled = false`
 - Credential hashing: `sha256("drover-cred-v1\0" + token)`
