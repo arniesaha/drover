@@ -101,6 +101,10 @@ struct App {
     db: Arc<Mutex<Connection>>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     terminals: Arc<RwLock<HashMap<String, Arc<Terminal>>>>,
+    // Claude's stream-json protocol is a persistent, bidirectional process.
+    // Keep only its stdin sender here; process ownership remains with the
+    // pump task, while POSIX process-group signalling handles interruption.
+    claude_inputs: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<String>>>>,
     client: Client,
     events: broadcast::Sender<Value>,
     writer: event_bus::StoreWriter,
@@ -524,7 +528,9 @@ async fn options() -> Response {
 fn capability_envelope() -> Value {
     json!({"schema_version":1,"lifecycle":{"worktree_inventory":1},"harnesses":[
         {"name":"shell","display_name":"Shell","enabled":true,"capabilities":{"schema_version":1,"harness_id":"shell","launch_modes":["pty"],"interrupt":true,"worktree":false,"interactive_auth":false}},
-        {"name":"codex","display_name":"Codex","enabled":true,"capabilities":{"schema_version":1,"harness_id":"codex","launch_modes":["structured"],"interrupt":true,"native_resume":true,"worktree":true,"attachments":["image/png","image/jpeg","image/webp","image/gif"],"interactive_auth":false}}
+        {"name":"claude-code","display_name":"Claude Code CLI","enabled":true,"capabilities":{"schema_version":1,"harness_id":"claude-code","launch_modes":["structured"],"approvals":true,"interrupt":true,"native_resume":true,"attachments":["image/png","image/jpeg","image/webp","image/gif"],"interactive_auth":false}},
+        {"name":"codex","display_name":"Codex","enabled":true,"capabilities":{"schema_version":1,"harness_id":"codex","launch_modes":["structured"],"interrupt":true,"native_resume":true,"worktree":true,"attachments":["image/png","image/jpeg","image/webp","image/gif"],"interactive_auth":false}},
+        {"name":"deepseek-harness","display_name":"DeepSeek Harness","enabled":true,"capabilities":{"schema_version":1,"harness_id":"deepseek-harness","launch_modes":["structured"],"interrupt":true,"native_resume":false,"worktree":true,"interactive_auth":false}}
     ]})
 }
 async fn capabilities(State(app): State<App>, headers: HeaderMap) -> Response {
@@ -648,7 +654,10 @@ async fn sessions_create(
             "structured".into()
         }
     });
-    if req.harness != "shell" && req.harness != "codex" {
+    if !matches!(
+        req.harness.as_str(),
+        "shell" | "codex" | "claude-code" | "deepseek-harness"
+    ) {
         return err(
             StatusCode::BAD_REQUEST,
             format!("unknown or disabled harness preset: {}", req.harness),
@@ -660,7 +669,11 @@ async fn sessions_create(
             "harness has no structured driver: shell",
         );
     };
-    if req.harness == "codex" && mode != "structured" {
+    if matches!(
+        req.harness.as_str(),
+        "codex" | "claude-code" | "deepseek-harness"
+    ) && mode != "structured"
+    {
         return err(
             StatusCode::BAD_REQUEST,
             "harness codex has no pty launch mode",
@@ -715,7 +728,7 @@ async fn sessions_create(
     let original = req.cwd.unwrap_or_else(|| ".".into());
     let mut cwd = original.clone();
     let mut wt = None;
-    if req.harness == "codex" {
+    if matches!(req.harness.as_str(), "codex" | "deepseek-harness") {
         match create_worktree(&original, &sid, &app.cfg.worktrees) {
             Ok(Some(w)) => {
                 cwd = w.path.clone();
@@ -816,6 +829,27 @@ async fn sessions_create(
             }
         }
     }
+    // Claude must be spawned before accepting an initial prompt: unlike
+    // Codex it keeps one stream-json child alive for the session lifetime.
+    if s.harness == "claude-code" {
+        match start_claude(app.clone(), sid.clone(), &mut s).await {
+            Ok(()) => {}
+            Err(error) => {
+                s.status = "errored".into();
+                let _ = app.set_session(s).await;
+                return err(StatusCode::BAD_GATEWAY, error.to_string());
+            }
+        }
+    } else if s.harness == "deepseek-harness" {
+        match start_deepseek(&app, &mut s).await {
+            Ok(()) => {}
+            Err(error) => {
+                s.status = "errored".into();
+                let _ = app.set_session(s).await;
+                return err(StatusCode::BAD_GATEWAY, error.to_string());
+            }
+        }
+    }
     if let Err(error) = app.set_session(s.clone()).await {
         return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
     }
@@ -824,9 +858,14 @@ async fn sessions_create(
         .prompt
         .or_else(|| (!images.is_empty()).then(String::new))
     {
-        if let Err(error) =
-            run_codex_turn(app.clone(), sid.clone(), prompt, None, None, &images).await
-        {
+        let result = match s.harness.as_str() {
+            "claude-code" => send_claude_turn(&app, &sid, &prompt, None, &images).await,
+            "deepseek-harness" => {
+                run_deepseek_turn(app.clone(), sid.clone(), prompt, None, None, &images).await
+            }
+            _ => run_codex_turn(app.clone(), sid.clone(), prompt, None, None, &images).await,
+        };
+        if let Err(error) = result {
             return err(StatusCode::BAD_GATEWAY, error.to_string());
         }
     }
@@ -1054,7 +1093,9 @@ async fn turn(
             return response(StatusCode::ACCEPTED, json!({"turn_id":turn_id}));
         }
     }
-    if session.pid.is_some() {
+    if (session.harness != "claude-code" && session.pid.is_some())
+        || (session.harness == "claude-code" && session.awaiting.as_deref() != Some("input"))
+    {
         return err(StatusCode::CONFLICT, "turn already in flight");
     }
     let images = t.images.unwrap_or_default();
@@ -1074,6 +1115,7 @@ async fn turn(
     if let Some(effort) = t._thinking_effort {
         session.thinking_effort = Some(effort);
     }
+    let harness = session.harness.clone();
     if let Err(error) = app.set_session(session).await {
         return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
     }
@@ -1081,16 +1123,32 @@ async fn turn(
         .client_turn_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    if let Err(error) = run_codex_turn(
-        app.clone(),
-        id,
-        text,
-        Some(turn_id.clone()),
-        t.client_turn_id,
-        &images,
-    )
-    .await
-    {
+    let result = match harness.as_str() {
+        "claude-code" => send_claude_turn(&app, &id, &text, Some(&turn_id), &images).await,
+        "deepseek-harness" => {
+            run_deepseek_turn(
+                app.clone(),
+                id,
+                text,
+                Some(turn_id.clone()),
+                t.client_turn_id,
+                &images,
+            )
+            .await
+        }
+        _ => {
+            run_codex_turn(
+                app.clone(),
+                id,
+                text,
+                Some(turn_id.clone()),
+                t.client_turn_id,
+                &images,
+            )
+            .await
+        }
+    };
+    if let Err(error) = result {
         return err(StatusCode::BAD_GATEWAY, error.to_string());
     }
     response(StatusCode::ACCEPTED, json!({"turn_id":turn_id}))
@@ -1106,6 +1164,582 @@ fn save_images(app: &App, sid: &str, images: &[Image]) -> Result<Vec<PathBuf>> {
         paths.push(path);
     }
     Ok(paths)
+}
+
+/// Start the persistent Claude stream-json transport.  This deliberately
+/// mirrors the Python driver's CLI flags and sanitised environment so a
+/// nested Claude invocation cannot inherit the parent's CLAUDE* session.
+async fn start_claude(app: App, sid: String, session: &mut Session) -> Result<()> {
+    let mut cmd = TokioCommand::new("claude");
+    cmd.args([
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+    ]);
+    // Keep the normal unattended policy from the established Python adapter.
+    cmd.args(["--permission-mode", "bypassPermissions"]);
+    if let Some(native) = &session.native_session_id {
+        cmd.args(["--resume", native]);
+    }
+    if let Some(model) = &session.model {
+        cmd.args(["--model", model]);
+    }
+    if let Some(effort) = &session.thinking_effort {
+        cmd.args(["--effort", effort]);
+    }
+    cmd.current_dir(&session.cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("CLAUDE")) {
+        cmd.env_remove(key);
+    }
+    let mut child = cmd.spawn()?;
+    session.pid = child.id();
+    session.awaiting = Some("input".into());
+    let mut stdin = child.stdin.take().context("claude stdin missing")?;
+    let stdout = child.stdout.take().context("claude stdout missing")?;
+    let stderr = child.stderr.take().context("claude stderr missing")?;
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
+    app.claude_inputs
+        .write()
+        .await
+        .insert(sid.clone(), input_tx);
+    let app_for_task = app.clone();
+    tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
+            while let Some(line) = input_rx.recv().await {
+                if tokio::io::AsyncWriteExt::write_all(&mut stdin, line.as_bytes())
+                    .await
+                    .is_err()
+                    || tokio::io::AsyncWriteExt::write_all(&mut stdin, b"\n")
+                        .await
+                        .is_err()
+                    || tokio::io::AsyncWriteExt::flush(&mut stdin).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = [0; 8192];
+            while let Ok(n) = reader.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            match serde_json::from_str::<Value>(&line) {
+                Ok(value) => {
+                    let _ = emit_claude_event(&app_for_task, &sid, value);
+                }
+                Err(_) => {
+                    let _ = app_for_task.emit(
+                        &sid,
+                        "raw",
+                        Some(&line),
+                        json!({"source":"claude"}),
+                        None,
+                    );
+                }
+            }
+        }
+        let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+        writer.abort();
+        let _ = stderr_task.await;
+        app_for_task.claude_inputs.write().await.remove(&sid);
+        let _operation = app_for_task.operations.lock().await;
+        let current = { app_for_task.sessions.read().await.get(&sid).cloned() };
+        if let Some(mut current) = current {
+            if current.status == "running" {
+                current.pid = None;
+                current.status = if code == 0 {
+                    "completed".into()
+                } else {
+                    "errored".into()
+                };
+                current.awaiting = None;
+                let _ = app_for_task.set_session(current).await;
+            }
+        }
+        let _ = app_for_task.emit(
+            &sid,
+            "status",
+            Some("process exited"),
+            json!({"exited":code}),
+            None,
+        );
+    });
+    Ok(())
+}
+
+async fn send_claude_turn(
+    app: &App,
+    sid: &str,
+    text: &str,
+    turn_id: Option<&str>,
+    images: &[Image],
+) -> Result<()> {
+    let tx = app
+        .claude_inputs
+        .read()
+        .await
+        .get(sid)
+        .cloned()
+        .context("Claude process is not running")?;
+    let mut content = vec![json!({"type":"text","text":text})];
+    for image in images {
+        content.push(json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data_base64}}));
+    }
+    tx.send(json!({"type":"user","message":{"role":"user","content":content}}).to_string())
+        .map_err(|_| anyhow::anyhow!("Claude process is not running"))?;
+    let mut current = app
+        .sessions
+        .read()
+        .await
+        .get(sid)
+        .cloned()
+        .context("session missing")?;
+    current.awaiting = Some("assistant".into());
+    app.set_session(current).await?;
+    app.emit(sid, "user_input", Some(text), json!({}), turn_id)?;
+    Ok(())
+}
+
+fn claude_metadata(value: &Value, message: &Value) -> Value {
+    let mut payload = serde_json::Map::new();
+    if let Some(usage) = message.get("usage") {
+        payload.insert("usage".into(), usage.clone());
+        if let Some(id) = message.get("id") {
+            payload.insert("usage_message_id".into(), id.clone());
+        }
+    }
+    if let Some(model) = message.get("model") {
+        payload.insert("model".into(), model.clone());
+    }
+    if let Some(native) = value.get("session_id") {
+        payload.insert("native_session_id".into(), native.clone());
+    }
+    if let Some(event) = value.get("uuid") {
+        payload.insert("native_event_id".into(), event.clone());
+    }
+    Value::Object(payload)
+}
+fn emit_claude_event(app: &App, sid: &str, value: Value) -> Result<()> {
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    if let Some(native) = value.get("session_id").and_then(Value::as_str) {
+        // This parser runs inside a Tokio task. Use a non-blocking write so a
+        // concurrent HTTP mutation can never stall the stdout pump (and avoid
+        // calling blocking_* locks from the runtime worker).
+        if let Ok(mut sessions) = app.sessions.try_write() {
+            if let Some(s) = sessions.get_mut(sid) {
+                if s.native_session_id.as_deref() != Some(native) {
+                    s.native_session_id = Some(native.into());
+                    app.save_session(s)?;
+                }
+            }
+        }
+    }
+    match kind.as_str() {
+        "system" => {
+            let mut payload = value.as_object().cloned().unwrap_or_default();
+            if let Some(native) = value.get("session_id") {
+                payload.insert("native_session_id".into(), native.clone());
+            }
+            app.emit(
+                sid,
+                "status",
+                Some(
+                    value
+                        .get("subtype")
+                        .and_then(Value::as_str)
+                        .unwrap_or("system"),
+                ),
+                Value::Object(payload),
+                None,
+            )
+        }
+        "assistant" | "user" => {
+            let message = value.get("message").cloned().unwrap_or(Value::Null);
+            let base = claude_metadata(&value, &message);
+            let blocks = message
+                .get("content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if blocks.is_empty() {
+                return app.emit(
+                    sid,
+                    "status",
+                    Some("empty content"),
+                    json!({"empty_content":true,"event":value}),
+                    None,
+                );
+            }
+            for (index, block) in blocks.into_iter().enumerate() {
+                let typ = block.get("type").and_then(Value::as_str).unwrap_or("");
+                let mut payload = base.as_object().cloned().unwrap_or_default();
+                match typ {
+                    "text" | "thinking" => {
+                        if kind == "assistant" {
+                            if let Some(id) = message.get("id").and_then(Value::as_str) {
+                                payload.insert(
+                                    "text_stream_id".into(),
+                                    json!(format!("{id}:{index}")),
+                                );
+                                payload.insert("text_stream_final".into(), json!(true));
+                            }
+                            if typ == "thinking" {
+                                payload.insert("thinking".into(), json!(true));
+                            }
+                            app.emit(
+                                sid,
+                                "assistant_output",
+                                block
+                                    .get(if typ == "thinking" {
+                                        "thinking"
+                                    } else {
+                                        "text"
+                                    })
+                                    .and_then(Value::as_str),
+                                Value::Object(payload),
+                                None,
+                            )?;
+                        }
+                    }
+                    "tool_use" => {
+                        payload.insert(
+                            "tool".into(),
+                            block.get("name").cloned().unwrap_or(Value::Null),
+                        );
+                        payload.insert(
+                            "tool_use_id".into(),
+                            block.get("id").cloned().unwrap_or(Value::Null),
+                        );
+                        payload.insert(
+                            "input".into(),
+                            block.get("input").cloned().unwrap_or(Value::Null),
+                        );
+                        app.emit(
+                            sid,
+                            "tool_action",
+                            block.get("name").and_then(Value::as_str),
+                            Value::Object(payload),
+                            None,
+                        )?;
+                    }
+                    "tool_result" => {
+                        payload.insert(
+                            "tool_use_id".into(),
+                            block.get("tool_use_id").cloned().unwrap_or(Value::Null),
+                        );
+                        payload.insert(
+                            "is_error".into(),
+                            block.get("is_error").cloned().unwrap_or(Value::Null),
+                        );
+                        let text = block.get("content").and_then(Value::as_str).unwrap_or("");
+                        app.emit(sid, "tool_result", Some(text), Value::Object(payload), None)?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        "result" => {
+            if let Ok(mut sessions) = app.sessions.try_write() {
+                if let Some(s) = sessions.get_mut(sid) {
+                    s.awaiting = Some("input".into());
+                    app.save_session(s)?;
+                }
+            }
+            app.emit(
+                sid,
+                "status",
+                Some("turn complete"),
+                json!({"turn_complete":true,"awaiting":"input","result":value}),
+                None,
+            )
+        }
+        "control_request" => {
+            let request = value.get("request").cloned().unwrap_or(Value::Null);
+            app.emit(sid,"approval_prompt",Some(&format!("approval needed: {}",request.get("tool_name").and_then(Value::as_str).unwrap_or(""))),json!({"request_id":value.get("request_id"),"tool":request.get("tool_name"),"input":request.get("input")}),None)
+        }
+        _ => app.emit(sid, "status", Some(&kind), value, None),
+    }
+}
+
+fn deepseek_url() -> String {
+    std::env::var("DROVER_DEEPSEEK_HARNESS_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3080".into())
+        .trim_end_matches('/')
+        .to_string()
+}
+async fn deepseek_call(app: &App, method: &str, payload: Value) -> Result<Value> {
+    let rpc_id = format!("drover-{}", Uuid::new_v4());
+    let response: Value = app
+        .client
+        .post(format!("{}/api/{method}", deepseek_url()))
+        .json(&json!({"type":"client-request","rpcId":rpc_id,"method":method,"payload":payload}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    anyhow::ensure!(
+        response.get("rpcId").and_then(Value::as_str) == Some(&rpc_id),
+        "DeepSeek Harness returned an invalid RPC response"
+    );
+    let result = response
+        .get("result")
+        .context("DeepSeek Harness returned no RPC result")?;
+    anyhow::ensure!(
+        result.get("ok") == Some(&Value::Bool(true)),
+        "{}",
+        result
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("error").and_then(Value::as_str))
+            .unwrap_or("DeepSeek Harness request failed")
+    );
+    result
+        .get("value")
+        .cloned()
+        .context("DeepSeek Harness returned an invalid RPC value")
+}
+async fn start_deepseek(app: &App, session: &mut Session) -> Result<()> {
+    if session.native_session_id.is_none() {
+        let created = deepseek_call(app, "session.create", json!({"cwd":session.cwd})).await?;
+        session.native_session_id = Some(
+            created
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .context("DeepSeek Harness did not return a session ID")?
+                .into(),
+        );
+    }
+    session.awaiting = Some("input".into());
+    app.emit(
+        &session.session_id,
+        "status",
+        Some("ready"),
+        json!({"awaiting":"input","native_session_id":session.native_session_id}),
+        None,
+    )
+}
+async fn run_deepseek_turn(
+    app: App,
+    sid: String,
+    text: String,
+    turn_id: Option<String>,
+    client: Option<String>,
+    images: &[Image],
+) -> Result<()> {
+    let mut session = app
+        .sessions
+        .read()
+        .await
+        .get(&sid)
+        .cloned()
+        .context("session missing")?;
+    let native = session
+        .native_session_id
+        .clone()
+        .context("DeepSeek session has not started")?;
+    let turn_id = turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Fence before submission: DSH history has no turn identity, so only
+    // events beyond this sequence belong to the just-submitted prompt.
+    let history = deepseek_call(
+        &app,
+        "session.history",
+        json!({"sessionId":native,"maxMessages":1}),
+    )
+    .await?;
+    let seq = history
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.pointer("/event/seq").and_then(Value::as_i64))
+        .max()
+        .unwrap_or(-1);
+    session.extra.insert("deepseek_seq".into(), json!(seq));
+    session.pid = Some(1);
+    session.awaiting = Some("assistant".into());
+    app.set_session(session.clone()).await?;
+    if let Some(key) = client {
+        app.db.lock().unwrap().execute(
+            "INSERT INTO turns(session_id,client_turn_id,turn_id) VALUES(?1,?2,?3)",
+            params![sid, key, turn_id],
+        )?;
+    }
+    app.emit(&sid, "user_input", Some(&text), json!({}), Some(&turn_id))?;
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(json!({"type":"text","text":text}));
+    }
+    for image in images {
+        content.push(json!({"type":"image","mediaType":image.media_type,"data":image.data_base64,"name":"image"}));
+    }
+    deepseek_call(
+        &app,
+        "session.prompt",
+        json!({"sessionId":native,"mode":"queue","content":content}),
+    )
+    .await?;
+    tokio::spawn(async move {
+        let mut failures = 0;
+        loop {
+            let Some(current) = app.sessions.read().await.get(&sid).cloned() else {
+                return;
+            };
+            if current.status != "running" {
+                return;
+            }
+            match deepseek_call(
+                &app,
+                "session.history",
+                json!({"sessionId":native,"maxMessages":512}),
+            )
+            .await
+            {
+                Ok(history) => {
+                    failures = 0;
+                    let mut last = current
+                        .extra
+                        .get("deepseek_seq")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(-1);
+                    let mut complete = false;
+                    for item in history
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let seq = item
+                            .pointer("/event/seq")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(-1);
+                        if seq <= last {
+                            continue;
+                        }
+                        last = seq;
+                        if let Ok(done) = emit_deepseek_event(&app, &sid, item, &turn_id, &native) {
+                            complete |= done;
+                        }
+                    }
+                    let changed = { app.sessions.read().await.get(&sid).cloned() };
+                    if let Some(mut changed) = changed {
+                        changed.extra.insert("deepseek_seq".into(), json!(last));
+                        if complete {
+                            changed.pid = None;
+                            changed.awaiting = Some("input".into());
+                        }
+                        let _ = app.set_session(changed).await;
+                    }
+                    if complete {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    if failures >= 5 {
+                        let _=app.emit(&sid,"status",Some(&error.to_string()),json!({"turn_complete":true,"awaiting":"input","error":true,"native_session_id":native}),Some(&turn_id));
+                        let changed = { app.sessions.read().await.get(&sid).cloned() };
+                        if let Some(mut changed) = changed {
+                            changed.pid = None;
+                            changed.awaiting = Some("input".into());
+                            let _ = app.set_session(changed).await;
+                        }
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+    Ok(())
+}
+fn emit_deepseek_event(
+    app: &App,
+    sid: &str,
+    item: &Value,
+    turn_id: &str,
+    native: &str,
+) -> Result<bool> {
+    let event = item.get("event").unwrap_or(&Value::Null);
+    let data = event.get("data").unwrap_or(&Value::Null);
+    let typ = event.get("type").and_then(Value::as_str).unwrap_or("");
+    match typ {
+        "assistant/message" if event.get("surfaceOp").and_then(Value::as_str) == Some("append") => {
+            for block in data
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let typ = block.get("type").and_then(Value::as_str);
+                if matches!(typ, Some("text") | Some("reasoning")) {
+                    app.emit(sid,"assistant_output",block.get("text").and_then(Value::as_str),json!({"thinking":typ==Some("reasoning"),"usage":data.get("usage"),"native_session_id":native}),Some(turn_id))?;
+                }
+            }
+            Ok(false)
+        }
+        "tool/call" => {
+            let name = data.get("name").and_then(Value::as_str).unwrap_or("tool");
+            app.emit(sid,"tool_action",Some(name),json!({"tool":name,"tool_use_id":data.get("callId"),"input":data.get("arguments"),"view":item.get("view"),"native_session_id":native}),Some(turn_id))?;
+            Ok(false)
+        }
+        "tool/result" => {
+            for block in data
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if block.get("type").and_then(Value::as_str) == Some("tool-result")
+                    || block.get("toolCallId").is_some()
+                {
+                    let text = block
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_else(|| {
+                            block
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .into()
+                        });
+                    app.emit(sid,"tool_result",Some(&text),json!({"tool_use_id":block.get("toolCallId"),"is_error":block.get("isError").and_then(Value::as_bool).unwrap_or(false),"view":item.get("view"),"native_session_id":native}),Some(turn_id))?;
+                }
+            }
+            Ok(false)
+        }
+        "turn/end" => {
+            app.emit(sid,"status",Some(&format!("turn {}",data.pointer("/reason/kind").and_then(Value::as_str).unwrap_or("completed"))),json!({"turn_complete":true,"awaiting":"input","reason":data.get("reason"),"native_session_id":native}),Some(turn_id))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 fn git(cwd: &str, args: &[&str]) -> Option<String> {
     let result = Command::new("git")
@@ -1360,6 +1994,11 @@ async fn interrupt(State(app): State<App>, headers: HeaderMap, Path(id): Path<St
     if let Some(pid) = session.pid {
         signal_group(pid, libc::SIGTERM);
     }
+    if session.harness == "deepseek-harness" {
+        if let Some(native) = session.native_session_id {
+            let _ = deepseek_call(&app, "session.cancel", json!({"sessionId":native})).await;
+        }
+    }
     ok(json!({"ok":true}))
 }
 const RECOVERY_UNAVAILABLE: &str =
@@ -1386,7 +2025,10 @@ async fn recover(
         .as_str()
         .filter(|s| !s.trim().is_empty());
     if session.mode != "structured"
-        || session.harness != "codex"
+        || !matches!(
+            session.harness.as_str(),
+            "codex" | "claude-code" | "deepseek-harness"
+        )
         || session.status != "errored"
         || !session.restart_lost
         || native.is_none()
@@ -1403,6 +2045,15 @@ async fn recover(
     session.status = "running".into();
     session.awaiting = Some("input".into());
     let reply = json!({"session_id":id,"status":"running","recovered":true,"native_session_id":session.native_session_id});
+    if session.harness == "claude-code" {
+        if let Err(error) = start_claude(app.clone(), id.clone(), &mut session).await {
+            return err(StatusCode::BAD_GATEWAY, error.to_string());
+        }
+    } else if session.harness == "deepseek-harness" {
+        if let Err(error) = start_deepseek(&app, &mut session).await {
+            return err(StatusCode::BAD_GATEWAY, error.to_string());
+        }
+    }
     if let Err(error) = app.set_session(session).await {
         return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
     }
@@ -1412,23 +2063,54 @@ async fn permission(
     State(app): State<App>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Json(body): Json<Value>,
 ) -> Response {
     if !app.authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required");
     }
-    let live = app
-        .sessions
-        .read()
-        .await
-        .get(&id)
+    let session = app.sessions.read().await.get(&id).cloned();
+    let live = session
+        .as_ref()
         .is_some_and(|s| s.mode == "structured" && s.status == "running");
-    if live {
-        err(StatusCode::CONFLICT, "approvals are not enabled")
-    } else {
-        err(
+    if !live {
+        return err(
             StatusCode::NOT_FOUND,
             format!("unknown structured session: {id}"),
-        )
+        );
+    }
+    if session.as_ref().is_some_and(|s| s.harness == "claude-code") {
+        let request_id = body
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty());
+        let decision = body
+            .get("decision")
+            .and_then(Value::as_str)
+            .filter(|v| matches!(*v, "allow" | "deny"));
+        let (Some(request_id), Some(decision)) = (request_id, decision) else {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "request_id and decision (allow or deny) are required",
+            );
+        };
+        let tx = match app.claude_inputs.read().await.get(&id).cloned() {
+            Some(tx) => tx,
+            None => return err(StatusCode::CONFLICT, "approvals are not enabled"),
+        };
+        let note = body.get("note").and_then(Value::as_str).unwrap_or("");
+        if tx.send(json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":{"behavior":if decision=="allow"{"allow"}else{"deny"},"message":note}}}).to_string()).is_err(){return err(StatusCode::CONFLICT,"approvals are not enabled");}
+        if let Err(error) = app.emit(
+            &id,
+            "approval_response",
+            Some(decision),
+            json!({"request_id":request_id,"decision":decision,"note":note}),
+            None,
+        ) {
+            return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+        }
+        ok(json!({"ok":true}))
+    } else {
+        err(StatusCode::CONFLICT, "approvals are not enabled")
     }
 }
 
@@ -1458,6 +2140,11 @@ async fn native_sessions(
     };
     let h = q.get("harness").map(String::as_str).unwrap_or("");
     let cwd = q.get("cwd").map(String::as_str);
+    let limit = q
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(20)
+        .min(100);
     let mut rows = Vec::new();
     if h == "codex" {
         let root = app.cfg.home.join(".codex/sessions");
@@ -1481,6 +2168,30 @@ async fn native_sessions(
             }
         }
     }
+    if h == "claude-code" {
+        let root = app.cfg.home.join(".claude/projects");
+        for f in walk_jsonl(&root, 100) {
+            if let Ok(t) = fs::read_to_string(&f) {
+                let parsed: Vec<Value> = t
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect();
+                let id = parsed
+                    .iter()
+                    .find_map(|entry| entry.get("sessionId").and_then(Value::as_str))
+                    .or_else(|| f.file_stem().and_then(|name| name.to_str()));
+                let session_cwd = parsed
+                    .iter()
+                    .find_map(|entry| entry.get("cwd").and_then(Value::as_str));
+                if let (Some(id), Some(session_cwd)) = (id, session_cwd) {
+                    if cwd.is_none_or(|wanted| wanted == session_cwd) {
+                        rows.push(json!({"harness":"claude-code","session_id":id,"cwd":session_cwd,"native_resume":{"session_id":id}}));
+                    }
+                }
+            }
+        }
+    }
+    rows.truncate(limit);
     ok(json!({"host_id":app.cfg.host_id,"sessions":rows}))
 }
 fn walk_jsonl(root: &FsPath, limit: usize) -> Vec<PathBuf> {
@@ -1785,6 +2496,7 @@ async fn main() -> Result<()> {
         db,
         sessions: Arc::new(RwLock::new(sessions)),
         terminals: Arc::new(RwLock::new(HashMap::new())),
+        claude_inputs: Arc::new(RwLock::new(HashMap::new())),
         events,
         writer,
         operations: Arc::new(tokio::sync::Mutex::new(())),
