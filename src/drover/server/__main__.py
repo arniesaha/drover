@@ -1341,6 +1341,29 @@ def session_cmd() -> None:
     """Inspect recorded session data."""
 
 
+@main.group(name="work-items")
+def work_items_cmd() -> None:
+    """Read hub-owned continuity work items."""
+
+
+@work_items_cmd.command(name="export")
+@click.pass_context
+def work_items_export_cmd(ctx: click.Context) -> None:
+    """Emit the reconciler-compatible hub work-item projection as JSON."""
+    from drover.server.work_queue.store import WorkStore
+
+    cfg = _resolve_config(ctx.obj["config_path"])
+    if not cfg.work_queue.workspace_id:
+        raise click.ClickException("work queue workspace_id is required")
+    bootstrap_control_plane_store(cfg.duckdb_path)
+    click.echo(
+        json.dumps(
+            WorkStore(cfg.duckdb_path, cfg.work_queue.workspace_id).hub_export(),
+            default=str,
+        )
+    )
+
+
 @main.group(name="harness")
 def harness_cmd() -> None:
     """Audit and migrate Drover harness data."""

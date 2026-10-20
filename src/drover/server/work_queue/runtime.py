@@ -177,3 +177,47 @@ def dispatch(service, auth, headers, operation, args):
         return 409, {
             "error": "work operation paused; inspect provider or execution intent"
         }
+
+
+def dispatch_hub_items(service, auth, headers, operation, args):
+    """Credential boundary for the hub-owned continuity projection."""
+    if service is None:
+        return 503, {"error": "work control unavailable"}
+    try:
+        actor = authenticated_actor(auth, headers, service.config)
+        if not actor.human:
+            raise PermissionError("device credential required")
+        if operation == "list":
+            if set(args) - {"state"}:
+                raise ValueError("invalid work item query")
+            result = {"items": service.store.hub_items(state=args.get("state"))}
+        elif operation == "get":
+            if set(args) != {"id"}:
+                raise ValueError("invalid work item query")
+            result = service.store.hub_item(args["id"])
+            if result is None:
+                return 404, {"error": "work item not found"}
+        elif operation == "patch":
+            allowed = {"id", "stage", "next", "pr", "acceptance"}
+            if set(args) - allowed:
+                raise ValueError("invalid work item fields")
+            result = service.store.patch_hub_item(
+                args.pop("id"),
+                stage=args.get("stage"),
+                next_action=args.get("next"),
+                pr=args.get("pr"),
+                acceptance=args.get("acceptance"),
+            )
+        elif operation == "export":
+            if args:
+                raise ValueError("invalid work item query")
+            result = service.store.hub_export()
+        else:
+            raise ValueError("unknown work item operation")
+        return 200, json.loads(json.dumps(result, default=str))
+    except PermissionError:
+        return 403, {"error": "work item operation forbidden"}
+    except KeyError:
+        return 404, {"error": "work item not found"}
+    except (ValueError, TypeError):
+        return 400, {"error": "invalid work item request"}
