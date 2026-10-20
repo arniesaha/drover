@@ -202,14 +202,22 @@ def test_additive_latest_control_migration_uses_point_release_path():
     assert allowed
     assert evidence["rollout_kind"] == "control_migration"
     assert evidence["new_migration_ids"] == [migration_id]
-    assert evidence["migration_verdicts"] == [
-        {
-            "migration_id": migration_id,
-            "statement_index": 1,
-            "allowed": True,
-            "verdict": "create_table",
-        },
-    ]
+    expected_verdicts = []
+    for statement_index, statement in enumerate(target[-1][1], start=1):
+        statement = statement.strip().upper()
+        expected_verdicts.append(
+            {
+                "migration_id": migration_id,
+                "statement_index": statement_index,
+                "allowed": True,
+                "verdict": (
+                    "create_table"
+                    if statement.startswith("CREATE TABLE")
+                    else "create_index"
+                ),
+            }
+        )
+    assert evidence["migration_verdicts"] == expected_verdicts
 
 
 def test_control_migration_accepts_only_the_documented_additive_ddl_subset():
