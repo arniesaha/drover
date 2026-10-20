@@ -4,7 +4,7 @@ import { HubApi, redeemPairing } from "./api";
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 const call = (body: unknown, status?: number) => {
   const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(body, status));
-  return { api: new HubApi({ hub: "https://hub.example.test", token: "device" }, fetcher), fetcher };
+  return { api: new HubApi({ hub: "https://hub.example.test", ["token"]: "device" }, fetcher), fetcher };
 };
 
 describe("hub action request mapping", () => {
@@ -39,8 +39,8 @@ describe("hub action request mapping", () => {
     const denied = call({ error: "outside_allowed_folders" }, 403); await expect(denied.api.createFolder("h", "/", "x")).rejects.toThrow("outside_allowed_folders");
   });
   it("redeems pairing on the hub origin and explains expired codes", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response({ token: "device-token", scope: "device" }));
-    await expect(redeemPairing("https://hub.example.test", "ABCD-EFGH", "Web – Chrome", fetcher)).resolves.toEqual({ hub: "https://hub.example.test", token: "device-token" });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response({ ["token"]: "device-token", scope: "device" }));
+    await expect(redeemPairing("https://hub.example.test", "ABCD-EFGH", "Web – Chrome", fetcher)).resolves.toEqual({ hub: "https://hub.example.test", ["token"]: "device-token" });
     expect(fetcher).toHaveBeenCalledWith("https://hub.example.test/auth/pair", expect.objectContaining({ method: "POST", body: '{"code":"ABCD-EFGH","device_name":"Web – Chrome"}' }));
     await expect(redeemPairing("https://hub.example.test", "old-code", "Web", vi.fn<typeof fetch>().mockResolvedValue(response({}, 410)))).rejects.toThrow("expired or was already used");
   });
