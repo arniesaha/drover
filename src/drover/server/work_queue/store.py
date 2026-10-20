@@ -4,6 +4,7 @@ import re
 from contextlib import contextmanager
 from uuid import uuid4
 
+from drover.server.control_outbox import is_postgres_connection
 from drover.server.control_store import postgres_control_store
 
 
@@ -313,6 +314,10 @@ def apply_hub_lifecycle_event(con, *, event_id, session_id, event_type, payload)
     The source-event unique key makes a replay a no-op even if a caller later
     replays a historical event through another ingest path.
     """
+    # Hub-owned work items are part of the PostgreSQL control plane. Local
+    # harness daemons retain their historical DuckDB event path unchanged.
+    if not is_postgres_connection(con):
+        return False
     data = _event_payload(payload)
     if data.get("turn_complete") is True:
         stage, gate, kind, detail = (
