@@ -242,15 +242,41 @@ least-privilege exporter. Provisioning therefore keeps its two delete targets
 at a zero inlining limit and only inlines append-only tables. Do not broaden the
 exporter role as a workaround.
 
-For a catalog that already accumulated tiny files, schedule bounded
-`ducklake_merge_adjacent_files` maintenance for the five export tables. After
-the configured 30-day retention window and a verified backup, expire old
-snapshots and clean their unreferenced files with DuckLake's maintenance
-procedures. Do not perform these operations as part of normal server restart.
+For a catalog that already accumulated tiny files, the hub can schedule bounded
+`ducklake_merge_adjacent_files` maintenance for the five export tables. It runs
+only in its low-priority UTC hour, takes the same drained mutation fence as the
+exporter, and stands aside for a planned stop, foreground analytical work, or
+an exporter that is not healthy. It uses a killable child with a bounded
+runtime. After the configured 30-day retention window it expires snapshots and
+cleans unreferenced files only after seven days. This is never part of normal
+server restart.
+
+### Auto-compaction configuration
+
+Auto-compaction is deliberately opt-in because it needs a catalog-admin role;
+the normal exporter role must not acquire those permissions. Add only the name
+of the environment variable to the hub configuration, and supply its value in
+the service environment (never in `config.toml`):
+
+```toml
+[analytics]
+maintenance_dsn_env = "DROVER_LAKE_STUDIO_MAINTENANCE_DSN"
+auto_compaction_soft_file_limit = 5000
+auto_compaction_daily_window_hour = 3
+auto_compaction_max_runtime_seconds = 300
+```
+
+`maintenance_dsn_env` unset means auto-compaction is disabled. `/readyz` and
+the data-quality snapshot still expose referenced-file count and ratio, and say
+`auto-compaction disabled (maintenance DSN not configured)`. They warn at 50%
+of the 50,000-file serving limit and degrade at 80%, so a disabled scheduler
+cannot hide an approaching restart failure. The listed environment variable
+must hold an administrator DSN for the same catalog as the configured reader;
+Drover never logs or returns its value.
 
 ### First compaction and schedule
 
-`lake maintain` is an administrator-only, fenced operation. It acquires the
+`lake compact` is an administrator-only, fenced operation. It acquires the
 same mutation fence as the exporter and drains readers; it therefore fails
 safely if the hub is still exporting. It fingerprints each compacted table
 before and after merging and writes a fenced `drover-maintenance` receipt in
@@ -262,7 +288,9 @@ baseline, then seven-day old unreferenced files are cleaned. Maintenance checks
 that chain and advances its checkpoint; it never changes exporter privileges or
 inlining options.
 
-1. Verify a current, restorable backup generation. Do not shorten either
+1. Verify a current, restorable backup generation. `lake compact` accepts the
+   Studio's successful backup receipt no older than 36 hours, or requires the
+   explicit `--i-have-a-backup` acknowledgement. Do not shorten either
    retention window for the first run.
 2. Before stopping the hub for this maintenance window, record the bounded
    planned stop. It authorizes one check-in recovery attempt only:
@@ -277,22 +305,22 @@ inlining options.
    variables and catalog admin DSN, inspect the plan:
 
    ```sh
-   drover-server lake maintain --data-root "$DROVER_LAKE_ROOT/$LAKE" \
+   drover-server lake compact --data-root "$DROVER_LAKE_ROOT/$LAKE" \
      --catalog-dsn-env DROVER_LAKE_V2_ADMIN_DSN --dry-run
    ```
 
-5. Run the same command without `--dry-run`. Save its JSON report, including
-   per-table file counts and snapshot counts, with the maintenance record.
+5. Run the same command without `--dry-run`. It reports before/after referenced
+   files and verifies per-table row counts are unchanged. Save its JSON report,
+   including file counts and snapshot counts, with the maintenance record.
 6. Save the report and confirm it names a checkpoint snapshot. Start the hub,
    then confirm `/readyz` reports a running exporter and a later successful
    export. Do not edit a proof or checkpoint to recover a failed maintenance
    run; investigate it and perform offline verification if needed.
 7. Once the restarted hub's `/readyz` is 200, run
-   `drover-server planned-stop complete`. Add an operator-owned weekly launchd
-   timer invoking the maintenance command while
-   the hub is stopped for its maintenance window. Keep the seven-day cleanup
-   safety window and the 30-day snapshot retention unless a separately
-   verified backup/restore policy authorizes a change.
+   `drover-server planned-stop complete`. With the opt-in configuration above,
+   the hub handles subsequent daily/pressure-triggered compaction itself. Keep
+   the seven-day cleanup safety window and the 30-day snapshot retention unless
+   a separately verified backup/restore policy authorizes a change.
 
 ### Restoring a lake without restoring control
 

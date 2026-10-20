@@ -80,9 +80,9 @@ live-session count; the returned list can be smaller with `truncated: true`.
 Each MCP read has a 5-second caller deadline and returns `status: timeout` if
 exceeded. Four read calls can execute at once per server; further calls return
 `status: busy`. Timed-out execution retains its admission slot until it finishes.
-These are response-level deadlines, not cancellation of SQL or LLM work. Phase 4
-(#481) owns disposable query processes and hard execution cancellation. This
-contract does not introduce analytical storage or query process changes.
+These are response-level deadlines, not cancellation of SQL or LLM work.
+Analytical reads run through bounded disposable query children and fail closed
+when their serving verification fails.
 
 `drover_active_sessions` and `drover_fleet_status` use the authoritative harness
 registry, including live/awaiting sessions regardless of analytical ingestion or
@@ -130,8 +130,8 @@ The tool masks email account labels. For example, `alice@example.com` becomes
 Agy Claude/GPT ("3p") buckets with a sliding reset are omitted (#527). When agy
 returns a 429 error, Drover records the window as `observed_exhausted`.
 
-> **Known limitation:** If the hub has authentication on, `fresh=true` returns
-> 401 host errors. The MCP server has no hub token. Use `fresh=false` on these hubs.
+`fresh=true` uses the hub's configured direct or relay transport. Failures are
+reported in `refresh_errors`, while saved quota data remains available.
 
 ## Single hub recall endpoint and freshness
 

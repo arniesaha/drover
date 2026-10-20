@@ -102,12 +102,15 @@ Encrypt your backups. Store them away from the hub.
 Read the [changelog](https://github.com/arniesaha/drover/blob/main/CHANGELOG.md) before you upgrade.
 
 ```bash
-drover-server update --check     # is a newer release available?
-drover-server update             # install it
-drover-server rollback           # go back to the previous release
+drover-server update --check     # report installed, active, and target release
+drover-server update             # refresh and report the convergence target
+drover-server rollback           # activate a previously installed release
 ```
 
-Releases install side by side in `~/.drover/runtime/`. To stay on one release, set [`pinned_version`](/docs/configuration/#updates). An upgrade does not migrate a DuckDB control store to PostgreSQL.
+Installer-managed host convergence installs and activates releases. Releases
+install side by side in `~/.drover/runtime/`. To stay on one release, set
+[`pinned_version`](/docs/configuration/#updates). An upgrade does not migrate a
+DuckDB control store to PostgreSQL.
 
 ## The analytics lake
 

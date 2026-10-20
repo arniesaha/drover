@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"claude-fixture-native","uuid":"fixture-system"}
+{"type":"control_request","request_id":"permit-1","request":{"tool_name":"Bash","input":{"command":"echo permitted"}}}
+{"type":"assistant","session_id":"claude-fixture-native","uuid":"fixture-assistant","message":{"id":"msg-fixture-1","model":"fixture-model","usage":{"input_tokens":5,"output_tokens":2},"content":[{"type":"text","text":"permission accepted"}]}}
+{"type":"result","session_id":"claude-fixture-native","subtype":"success","is_error":false,"result":"permission accepted","usage":{"input_tokens":5,"output_tokens":2}}

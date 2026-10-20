@@ -1,6 +1,6 @@
 # ADR 0003: Portable profile iteration 1
 
-Status: accepted. Date: 2026-10-07. Authority: issue #545 decisions comment.
+Status: accepted; implemented in v0.6.4 (#555). Date: 2026-10-07. Authority: issue #545 decisions comment.
 
 Agent proposal policy in item 5 is updated for iteration 2; see the current
 [profile contract](../portable-profile.md#proposals-review-and-reversal).

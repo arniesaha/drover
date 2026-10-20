@@ -22,4 +22,6 @@ explicitly false. `--help` documents the CLI/config subset and offline importer.
 
 See [the Phase 2 audit](../docs/runbooks/harnessd-rs-phase2-audit.md) and
 [the operator pilot runbook](../docs/runbooks/harnessd-rs-gpu-pc-pilot.md).
-The GPU PC 72-hour soak is an operator gate, not a completed implementation test.
+The GPU PC pilot is an operator gate, not a completed implementation test. The
+current pilot is an overnight 8–9 hour soak; do not treat it as a completed
+rollout or a 72-hour qualification.

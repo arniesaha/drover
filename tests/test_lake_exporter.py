@@ -145,6 +145,31 @@ def test_maintenance_compacts_export_files_under_the_drained_fence(export_lake):
     assert report["baseline_snapshot"] == snapshot
 
 
+def test_compact_lake_preserves_rows_and_reduces_referenced_files_under_limit(
+    export_lake,
+):
+    """A high-tiny-file lake becomes serveable again without losing rows."""
+    from drover.server.lake.maintenance import compact_lake
+    from drover.server.lake.serving_proof import check_referenced_files
+
+    with lake_connection(export_lake, read_only=False) as con:
+        for i in range(300):
+            con.execute(
+                "INSERT INTO lake.agent_events (id, date) VALUES (?, '2026-10-15')",
+                [f"compact-{i}"],
+            )
+    write_serving_proof(export_lake)
+
+    report = compact_lake(export_lake, tables=("agent_events",))
+
+    assert report["referenced_files_before"] >= 300
+    assert report["referenced_files_after"] < report["referenced_files_before"]
+    assert report["tables"]["agent_events"]["rows_before"] == 300
+    assert report["tables"]["agent_events"]["rows_after"] == 300
+    with lake_connection(export_lake) as con:
+        assert check_referenced_files(export_lake, con, limit=10) <= 10
+
+
 def test_reconcile_repairs_acknowledged_batch_missing_from_restored_lake(
     export_lake, postgres_control_store
 ):
