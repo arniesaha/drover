@@ -142,9 +142,12 @@ def test_native_inventory_fingerprint_invalidates_same_size_rewrite_with_restore
     assert first_record.updated_at == second_record.updated_at
     assert len(first_record.source_fingerprint) == 64
     assert first_record.source_fingerprint != second_record.source_fingerprint
-    serialized = json.dumps(first.to_wire(), sort_keys=True)
-    assert str(session) not in serialized
-    assert "aaaa" not in serialized
+    first_wire = first.to_wire()
+    assert str(session) not in json.dumps(first_wire, sort_keys=True)
+    # The transcript's title must not escape into inventory metadata. Do not
+    # search the whole JSON string: a SHA-256 source fingerprint can contain
+    # any four-character hexadecimal sequence, including "aaaa".
+    assert "aaaa" not in first_wire["records"][0].values()
 
 
 def test_native_inventory_groups_duplicate_source_sessions_and_uses_latest_mtime(
