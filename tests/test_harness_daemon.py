@@ -136,7 +136,13 @@ def test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance(
         def close_all(self):
             calls.append("closed")
 
+    class _Cache:
+        def start(self):
+            pytest.fail("background cache started for a refused host")
+
     class _State:
+        provider_usage_cache = _Cache()
+        lifecycle_worktree_inventory_cache = _Cache()
         api_token = ""
         host_token = None
         pty = _Closer()
@@ -152,7 +158,11 @@ def test_bound_host_in_direct_mode_refuses_startup_with_relay_guidance(
 
     monkeypatch.setattr(harness_daemon, "HarnessDaemonState", lambda **kwargs: _State())
     monkeypatch.setattr(harness_daemon, "resolve_daemon_token", lambda token: "token")
-    monkeypatch.setattr(harness_daemon, "wire_event_pusher", lambda state: None)
+    monkeypatch.setattr(
+        harness_daemon,
+        "wire_event_pusher",
+        lambda state: pytest.fail("pusher started for a refused host"),
+    )
     monkeypatch.setattr(harness_daemon, "register_daemon_host", lambda state: None)
     monkeypatch.setattr(
         harness_daemon,

@@ -4871,16 +4871,6 @@ def run_harnessd(
         # ordering, not socket binding.
         bound_port = getattr(server, "server_port", listen_port)
         print(f"LISTENING {listen_host}:{bound_port}", flush=True)
-        # The first pass is asynchronous: a slow Codex app-server startup
-        # must not hold either daemon startup or a future relay request open.
-        provider_usage_cache = getattr(state, "provider_usage_cache", None)
-        if provider_usage_cache is not None:
-            provider_usage_cache.start()
-        lifecycle_worktree_inventory_cache = getattr(
-            state, "lifecycle_worktree_inventory_cache", None
-        )
-        if lifecycle_worktree_inventory_cache is not None:
-            lifecycle_worktree_inventory_cache.start()
         # Capture only paths from the previous daemon run. The sweep itself runs
         # concurrently with serving, so scanning the directory later could pick
         # up and remove a new session's still-clean worktree.
@@ -4896,7 +4886,8 @@ def run_harnessd(
         # Bind before any historical replay starts. A large durable ledger must
         # never hold the daemon socket closed or trip the updater's liveness
         # watchdog during an otherwise healthy restart.
-        pusher = wire_event_pusher(state)
+        # Reject direct-mode registration before any background producer can
+        # race DuckDB teardown while this short-lived process exits.
         register_daemon_host(state)
         initial_heartbeat = _heartbeat_once(state)
         if (
@@ -4910,10 +4901,19 @@ def run_harnessd(
             )
             state.pty.close_all()
             state.auth.close_all()
-            if pusher is not None:
-                pusher.stop()
             server.server_close()
             return
+        pusher = wire_event_pusher(state)
+        # The first pass is asynchronous: a slow Codex app-server startup
+        # must not hold either daemon startup or a future relay request open.
+        provider_usage_cache = getattr(state, "provider_usage_cache", None)
+        if provider_usage_cache is not None:
+            provider_usage_cache.start()
+        lifecycle_worktree_inventory_cache = getattr(
+            state, "lifecycle_worktree_inventory_cache", None
+        )
+        if lifecycle_worktree_inventory_cache is not None:
+            lifecycle_worktree_inventory_cache.start()
         start_remote_heartbeat(state)
         # After create_harness_server, and on its *bound* port: announcing a live
         # relay before the socket is bound gives the hub a window in which every
