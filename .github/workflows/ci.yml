@@ -186,8 +186,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Keep the Rust lane visible now: its launcher skips until the Phase 2
-        # binary exists, then starts exercising exactly the same black-box API.
+        # Both implementations must pass the identical Phase 2 envelope.
         impl: [py, rs]
     steps:
     - uses: actions/checkout@v4
@@ -199,13 +198,25 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -e ".[dev]"
-    - name: Run harnessd black-box contract suite
+    - name: Build required Rust contract binary
+      if: matrix.impl == 'rs'
+      run: cargo build --locked --release -p drover-harnessd
+    - name: Run shared Phase 2 black-box contract subset
       env:
         HARNESSD_IMPL: ${{ matrix.impl }}
-      run: pytest tests/contract -q
+      run: pytest tests/contract -m rust_phase2 -q --junitxml=contract-${{ matrix.impl }}.xml
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: harnessd-contract-${{ matrix.impl }}
+        path: contract-${{ matrix.impl }}.xml
 
   harnessd-rust-phase2:
     name: harnessd Rust phase 2 (${{ matrix.target }})
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -240,7 +251,43 @@ jobs:
         cargo build --release -p drover-harnessd --target ${{ matrix.target }}
         mkdir -p target/release
         cp target/${{ matrix.target }}/release/drover-harnessd target/release/drover-harnessd
-        pytest tests/contract --daemon=rust -m rust_phase2 -q
+        if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
+          file target/release/drover-harnessd | tee /tmp/harnessd-file.txt
+          grep -E 'static(ally linked|[- ]pie linked)' /tmp/harnessd-file.txt
+        fi
+        pytest tests/contract --daemon=rust -m rust_phase2 -q --junitxml=contract-${{ matrix.target }}.xml
+        pytest tests/contract/test_rust_migration_contract.py --daemon=rust -q
+    - name: Package pilot binary and checksums
+      shell: bash
+      run: |
+        mkdir -p pilot-artifacts
+        asset="drover-harnessd-${{ matrix.target }}"
+        cp target/${{ matrix.target }}/release/drover-harnessd "pilot-artifacts/$asset"
+        if [ "${{ runner.os }}" = Darwin ] || [ "${{ runner.os }}" = macOS ]; then
+          codesign --force --sign - "pilot-artifacts/$asset"
+          codesign --verify --strict "pilot-artifacts/$asset"
+        fi
+        python - "$asset" <<'PY'
+        import hashlib, pathlib, sys
+        path = pathlib.Path("pilot-artifacts") / sys.argv[1]
+        size = path.stat().st_size
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        (path.parent / "SHA256SUMS").write_text(f"{digest}  {path.name}\n")
+        with open(__import__("os").environ["GITHUB_STEP_SUMMARY"], "a") as out:
+            out.write(f"{path.name}: {size:,} bytes; sha256 `{digest}`\n")
+        PY
+    # GitHub's OIDC identity signs provenance for the exact binary digest.
+    # Release macOS assets additionally use Developer ID + notarization.
+    - uses: actions/attest-build-provenance@v3
+      if: github.event.pull_request.head.repo.fork != true
+      with:
+        subject-path: pilot-artifacts/drover-harnessd-${{ matrix.target }}
+    - uses: actions/upload-artifact@v4
+      with:
+        name: harnessd-pilot-${{ matrix.target }}
+        path: |
+          pilot-artifacts/*
+          contract-${{ matrix.target }}.xml
 
   postgres-integration:
     # This job is intentionally unconditional. A documentation-only change may
