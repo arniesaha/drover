@@ -1183,6 +1183,7 @@ class MetricsCollector:
     include_analytical_readiness: bool = True
     analytics_worker_state: str | Callable[[], str] | None = None
     exporter_health: Callable[[], dict] | None = None
+    lake_health: Callable[[], dict] | None = None
     # The API role injects the bounded worker RPC resolver.  It is intentionally
     # absent in legacy/all mode until retained history is configured there.
     archive_resolver: Any | None = None
@@ -1270,6 +1271,16 @@ class MetricsCollector:
                 payload["exporter"] = freshness_status(
                     {}, running=False, last_error="lake_export_unavailable"
                 )
+            body = json.dumps(payload, sort_keys=True) + "\n"
+        if self.lake_health is not None:
+            payload = json.loads(body)
+            try:
+                payload["lake"] = self.lake_health()
+            except Exception:  # noqa: BLE001 - readiness must stay bounded
+                payload["lake"] = {
+                    "state": "unavailable",
+                    "detail": "lake_health_unavailable",
+                }
             body = json.dumps(payload, sort_keys=True) + "\n"
         if self.analytics_worker_state is None:
             return status, body
@@ -3303,6 +3314,19 @@ class MetricsCollector:
             "embedding_model": (self.embeddings_state or {}).get("model"),
         }
 
+    def _lake_health_kwargs(self) -> dict[str, Any]:
+        if self.lake_health is None:
+            return {}
+        try:
+            return {"lake_health": self.lake_health()}
+        except Exception:  # noqa: BLE001 - audits remain observational
+            return {
+                "lake_health": {
+                    "state": "unavailable",
+                    "detail": "lake_health_unavailable",
+                }
+            }
+
     def _build_audit_payload(self) -> tuple[dict, dict]:
         """Build quality + observatory from one private store snapshot."""
         source = Path(self.duckdb_path)
@@ -3313,6 +3337,7 @@ class MetricsCollector:
                 deep=False,
                 spans_enabled=self.spans_enabled,
                 **self._memory_kwargs(),
+                **self._lake_health_kwargs(),
             )
             return quality, {}
 
@@ -3326,6 +3351,7 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
                 **self._memory_kwargs(),
+                **self._lake_health_kwargs(),
                 role="snapshot",
                 spans_enabled=self.spans_enabled,
             )
@@ -3419,6 +3445,7 @@ class MetricsCollector:
                 deep=False,
                 spans_enabled=self.spans_enabled,
                 **self._memory_kwargs(),
+                **self._lake_health_kwargs(),
             )
         # Deliberately a COPY, unlike harness_snapshot's live read.
         #
@@ -3448,6 +3475,7 @@ class MetricsCollector:
                 incoming_dir=self.incoming_dir,
                 deep=False,
                 **self._memory_kwargs(),
+                **self._lake_health_kwargs(),
                 role="snapshot",
                 spans_enabled=self.spans_enabled,
             )

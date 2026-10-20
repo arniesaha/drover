@@ -1080,6 +1080,7 @@ def quality_snapshot(
     spans_enabled: bool = False,
     memory_store_path: Optional[Path] = None,
     embedding_model: Optional[str] = None,
+    lake_health: dict | None = None,
 ) -> dict:
     """Return a structured Drover data-quality snapshot.
 
@@ -1164,6 +1165,10 @@ def quality_snapshot(
     for name, category in categories.items():
         for warning in category.get("warnings", []):
             warnings.append(f"{name}: {warning}")
+    if lake_health and lake_health.get("state") in {"warn", "degraded", "unavailable"}:
+        warnings.append(
+            "lake: referenced file pressure " + str(lake_health.get("state"))
+        )
     from drover.server.process_memory import memory_guard
 
     return {
@@ -1179,6 +1184,7 @@ def quality_snapshot(
         "score": score,
         "categories": categories,
         "warnings": warnings,
+        "lake": lake_health,
         "runtime_audit": audit,
         "legacy": {
             "source": "retired agent_events collector pipeline",
