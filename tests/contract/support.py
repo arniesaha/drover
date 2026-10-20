@@ -47,6 +47,16 @@ class FakeHub:
         raise AssertionError("daemon did not send relay hello")
 
 
+@dataclass
+class FakeDeepSeek:
+    server: ThreadingHTTPServer
+    requests: list[dict] = field(default_factory=list)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+
 @pytest.fixture
 def fake_deepseek():
     """Small DSH Web-RPC double shared by Python and Rust contract lanes."""
@@ -61,47 +71,82 @@ def fake_deepseek():
             request = json.loads(raw or b"{}")
             method = request.get("method")
             payload = request.get("payload") or {}
+            service.requests.append({"method": method, "payload": payload})
             session_id = payload.get("sessionId") or "dsh-fixture-1"
             if method == "session.create":
                 sessions.setdefault("dsh-fixture-1", [])
                 value = {"sessionId": "dsh-fixture-1"}
             elif method == "session.prompt":
-                sessions[session_id] = [
-                    {
-                        "event": {
-                            "type": "assistant/message",
-                            "seq": 1,
-                            "surfaceOp": "append",
-                            "data": {
-                                "message": {
-                                    "content": [
-                                        {"type": "text", "text": "deepseek fixture"}
-                                    ]
+                content = payload.get("content") or []
+                if any(
+                    item.get("text") == "wait"
+                    for item in content
+                    if isinstance(item, dict)
+                ):
+                    sessions[session_id] = []
+                    value = {}
+                else:
+                    sessions[session_id] = [
+                        {
+                            "event": {
+                                "type": "assistant/message",
+                                "seq": 1,
+                                "surfaceOp": "append",
+                                "data": {
+                                    "message": {
+                                        "content": [
+                                            {"type": "text", "text": "deepseek fixture"}
+                                        ]
+                                    },
+                                    "usage": {"input_tokens": 3, "output_tokens": 2},
                                 },
-                                "usage": {"input_tokens": 3, "output_tokens": 2},
                             },
+                            "view": {"fixture": True},
                         },
-                        "view": {"fixture": True},
-                    },
-                    {
-                        "event": {
-                            "type": "tool/call",
-                            "seq": 2,
-                            "data": {"callId": "call-1", "name": "Read", "arguments": {"path": "README.md"}},
+                        {
+                            "event": {
+                                "type": "tool/call",
+                                "seq": 2,
+                                "data": {
+                                    "callId": "call-1",
+                                    "name": "Read",
+                                    "arguments": {"path": "README.md"},
+                                },
+                            },
+                            "view": {"fixture": True},
                         },
-                        "view": {"fixture": True},
-                    },
-                    {
-                        "event": {
-                            "type": "tool/result",
-                            "seq": 3,
-                            "data": {"message": {"content": [{"type": "tool-result", "toolCallId": "call-1", "content": [{"type": "text", "text": "fixture read"}]}]}},
+                        {
+                            "event": {
+                                "type": "tool/result",
+                                "seq": 3,
+                                "data": {
+                                    "message": {
+                                        "content": [
+                                            {
+                                                "type": "tool-result",
+                                                "toolCallId": "call-1",
+                                                "content": [
+                                                    {
+                                                        "type": "text",
+                                                        "text": "fixture read",
+                                                    }
+                                                ],
+                                            }
+                                        ]
+                                    }
+                                },
+                            },
+                            "view": {"fixture": True},
                         },
-                        "view": {"fixture": True},
-                    },
-                    {"event": {"type": "turn/end", "seq": 4, "data": {"reason": {"kind": "completed"}}}},
-                ]
-                value = {}
+                        {
+                            "event": {
+                                "type": "turn/end",
+                                "seq": 4,
+                                "data": {"reason": {"kind": "completed"}},
+                            }
+                        },
+                    ]
+                    value = {}
             elif method == "session.history":
                 value = {"events": sessions.get(session_id, []), "hasMore": False}
             elif method in {"session.cancel", "session.selectModel"}:
@@ -123,10 +168,11 @@ def fake_deepseek():
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    service = FakeDeepSeek(server)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}"
+        yield service
     finally:
         server.shutdown()
         server.server_close()
@@ -229,6 +275,9 @@ def _fake_cli(path: Path, fixture: Path, log: Path) -> None:
         + repr(str(fixture))
         + "): print(event.rstrip(), flush=True)\n"
         " raise SystemExit(0)\n"
+        f"events = [line.rstrip() for line in open({str(fixture)!r}) if line.strip()]\n"
+        f"permission_fixture = {fixture.name!r} == 'claude_permission.ndjson'\n"
+        "permission_index = next((i for i, event in enumerate(events) if json.loads(event).get('type') == 'control_request'), -1)\n"
         "for line in sys.stdin:\n"
         " with open(log, 'a') as out: out.write(json.dumps({'stdin': line.rstrip()}) + '\\n')\n"
         " request = json.loads(line)\n"
@@ -240,7 +289,13 @@ def _fake_cli(path: Path, fixture: Path, log: Path) -> None:
         "  if method == 'model/list': result = {'data': [{'id': 'contract-model', 'displayName': 'Contract model', 'isDefault': True, 'supportedReasoningEfforts': [{'reasoningEffort': 'low'}, {'reasoningEffort': 'high'}], 'defaultReasoningEffort': 'low'}], 'nextCursor': None}\n"
         "  print(json.dumps({'id': request['id'], 'result': result}), flush=True)\n"
         "  continue\n"
-        f" for event in open({str(fixture)!r}): print(event.rstrip(), flush=True)\n"
+        " if permission_fixture:\n"
+        "  if request.get('type') == 'control_response':\n"
+        "   for event in events[permission_index + 1:]: print(event, flush=True)\n"
+        "  elif request.get('type') == 'user':\n"
+        "   for event in events[:permission_index + 1]: print(event, flush=True)\n"
+        "  continue\n"
+        " for event in events: print(event, flush=True)\n"
     )
     path.chmod(0o755)
 
@@ -362,7 +417,7 @@ def daemon(tmp_path, fake_hub, fake_clis, fake_deepseek, request):
             "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
             "HARNESSD_FAKE_CLI_LOG": str(log),
             "HARNESSD_FAKE_AUTH_STATE": str(tmp_path / "fake-auth-state"),
-            "DROVER_DEEPSEEK_HARNESS_URL": fake_deepseek,
+            "DROVER_DEEPSEEK_HARNESS_URL": fake_deepseek.url,
             "PYTHONPATH": str(Path.cwd() / "src")
             + os.pathsep
             + environment.get("PYTHONPATH", ""),
