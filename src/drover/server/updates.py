@@ -213,7 +213,9 @@ def _install_into(
 
     # uv succeeding is not the same as the result being runnable.
     if not layout.verify_runtime(artifact.version):
-        log.error("%s installed but failed its final-runtime verification", artifact.version)
+        log.error(
+            "%s installed but failed its final-runtime verification", artifact.version
+        )
         return False
     return True
 
