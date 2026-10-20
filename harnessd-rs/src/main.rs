@@ -1929,7 +1929,10 @@ fn import_records(app: &App, path: &FsPath) -> Result<(usize, usize, usize)> {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 extra: BTreeMap::new(),
-                restart_lost: true,
+                restart_lost: !matches!(
+                    row.get("status").and_then(Value::as_str),
+                    Some("completed" | "terminated" | "failed")
+                ),
                 created_at: row
                     .get("created_at")
                     .or_else(|| row.get("started_at"))

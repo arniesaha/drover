@@ -484,3 +484,77 @@ def test_rust_upgrades_phase2_v0_ledger_without_resetting_sequence(tmp_path):
         assert db.execute("SELECT event_id,dedup_key FROM events").fetchall() == [
             ("old", "old-key")
         ]
+
+
+def test_rust_startup_reclaims_imported_closed_untouched_worktree(tmp_path, fake_hub):
+    binary = _binary()
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in [
+        ["init"],
+        ["config", "user.email", "contract@example.test"],
+        ["config", "user.name", "Contract"],
+        ["commit", "--allow-empty", "-m", "initial"],
+    ]:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    base = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+    ).strip()
+    tree = home / ".drover/worktrees/closed-session"
+    tree.parent.mkdir(parents=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "drover/closed-session",
+            str(tree),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    handoff = tmp_path / "closed-tree.jsonl"
+    records = [
+        {
+            "kind": "session",
+            "session": {
+                "session_id": "closed-session",
+                "harness": "codex",
+                "mode": "structured",
+                "cwd": str(tree),
+                "status": "completed",
+            },
+        },
+        {
+            "kind": "worktree",
+            "record": {
+                "session_id": "closed-session",
+                "repo": str(repo),
+                "path": str(tree),
+                "branch": "drover/closed-session",
+                "base_sha": base,
+            },
+        },
+    ]
+    handoff.write_text("".join(json.dumps(row) + "\n" for row in records))
+    _run(binary, home, handoff)
+    process, _ = _start(binary, home, fake_hub)
+    try:
+        assert (
+            not tree.exists()
+        ), "closed, untouched owned worktree escaped startup reclaim"
+        with sqlite3.connect(home / ".drover/harnessd/harnessd.sqlite") as db:
+            assert db.execute("SELECT count(*) FROM worktrees").fetchone() == (0,)
+            assert (
+                json.loads(db.execute("SELECT data FROM sessions").fetchone()[0])[
+                    "status"
+                ]
+                == "completed"
+            )
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
