@@ -600,11 +600,11 @@ async fn sessions_get(
         .values()
         .filter(|s| s.status == "running")
         .cloned()
-        .map(session_wire)
+        .map(|s| session_wire(s, &app.cfg.host_id))
         .collect();
     result.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
     for s in archived.into_iter().skip(start).take(limit) {
-        result.push(session_wire(s));
+        result.push(session_wire(s, &app.cfg.host_id));
     }
     let next = if archived_len(&app).await > start + limit {
         Some(URL_SAFE.encode((start + limit).to_string()))
@@ -624,8 +624,12 @@ async fn archived_len(app: &App) -> usize {
         .filter(|s| s.status != "running")
         .count()
 }
-fn session_wire(s: Session) -> Value {
-    serde_json::to_value(s).unwrap_or_else(|_| json!({}))
+fn session_wire(s: Session, host_id: &str) -> Value {
+    let mut value = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
+    value.as_object_mut().unwrap().remove("restart_lost");
+    value["host_id"] = json!(host_id);
+    value["registry_synced"] = json!(true);
+    value
 }
 
 async fn sessions_create(
@@ -702,7 +706,7 @@ async fn sessions_create(
             .find(|s| s.client_session_id.as_ref() == Some(k))
             .cloned()
         {
-            let mut v = session_wire(s);
+            let mut v = session_wire(s, &app.cfg.host_id);
             v["deduplicated"] = Value::Bool(true);
             return response(StatusCode::OK, v);
         }
@@ -826,7 +830,7 @@ async fn sessions_create(
             return err(StatusCode::BAD_GATEWAY, error.to_string());
         }
     }
-    response(StatusCode::CREATED, session_wire(s))
+    response(StatusCode::CREATED, session_wire(s, &app.cfg.host_id))
 }
 
 fn validate_images(images: &[Image]) -> std::result::Result<(), String> {
@@ -941,7 +945,7 @@ async fn session_get(
         return err(StatusCode::UNAUTHORIZED, "authentication required");
     };
     match app.sessions.read().await.get(&id).cloned() {
-        Some(s) => ok(session_wire(s)),
+        Some(s) => ok(session_wire(s, &app.cfg.host_id)),
         None => err(
             StatusCode::NOT_FOUND,
             format!("unknown terminal session: {id}"),

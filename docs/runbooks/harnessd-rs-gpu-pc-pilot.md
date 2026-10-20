@@ -103,6 +103,10 @@ curl --fail --silent -H "Authorization: Bearer $(cat "$REHEARSAL/home/.drover/ap
   http://127.0.0.1:17081/capabilities
 ```
 
+Authenticate the rehearsal Codex CLI in the isolated HOME first (for example,
+`env HOME="$REHEARSAL/home" codex login` in an operator terminal). Keep its
+credentials separate from the production HOME.
+
 Create a shell session in a disposable directory and exercise terminal attach,
 input, resize, ping, interrupt and exit. Use a scratch Git repository for one
 Codex turn; verify its isolated worktree and the `git_diff` evidence event in
@@ -236,7 +240,7 @@ resets the uninterrupted 72-hour clock after correction.
 
 | Gate | Measurement and passing criterion |
 |---|---|
-| Daemon RSS | Sample `/proc/<MainPID>/status` `VmRSS` every minute: every sample **<100 MB** (100,000 kB). Track Codex child RSS separately. No rising retained-session trend after repeated terminal attaches/exits. |
+| Daemon RSS | Sample `/proc/<MainPID>/status` `VmRSS` every minute: every sample **<100 MB** (100,000,000 bytes; require VmRSS <97,656 KiB, interpreting the kernel's `kB` field as KiB). Track Codex child RSS separately. No rising retained-session trend after repeated terminal attaches/exits. |
 | Idle CPU | Use `pidstat -p <MainPID> 60` or `/proc/<pid>/stat` deltas during quiet windows: daemon CPU **<1% of one core**. Record at least hourly idle windows; exclude deliberate Codex/shell work from the idle classification. |
 | Relay launch latency | Measure at the orchestrator from POST to completed response through the hub's actual relay create route. Include shell and Codex launches (real scratch Git repo/worktree); use unique client_session_id for each attempt. Record all failures/timeouts. Require **p99 <2 s**, zero failed launches, at least 100 samples over 72 hours and coverage of both harnesses. Compute p99 by nearest-rank over all samples, retaining raw timings and workload labels. |
 | Ownership / reconciliation | **Zero ownership or reconciliation warnings** during the soak, zero new quarantine receipts, no repeated historical replay batches. Query `event_quarantine` and the unpushed count hourly and after a relay interruption; pending events must drain on recovery. Retained quarantine payloads are never pruned or treated as acknowledgements. |

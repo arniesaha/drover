@@ -30,6 +30,8 @@ def codex(daemon, **extra):
         },
     )
     assert status == 201, body
+    assert body["host_id"] == "contract-host"
+    assert body["registry_synced"] is True
     return body["session_id"]
 
 
