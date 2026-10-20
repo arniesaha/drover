@@ -36,6 +36,15 @@ class _Response(io.BytesIO):
 WHEEL = "drover-0.1.4-py3-none-any.whl"
 
 
+def _write_runnable_entrypoints(layout, version: str) -> None:
+    bin_dir = layout.version_dir(version) / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("drover", "drover-server", "drover-harnessd"):
+        binary = bin_dir / name
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o755)
+
+
 def _feed(tag="v0.1.4", names=(WHEEL, MANIFEST_NAME, LOCK_NAME)):
     return {
         "tag_name": tag,
@@ -203,10 +212,7 @@ def test_install_runs_uv_with_require_hashes(tmp_path):
         calls.append(cmd)
         # Fake what uv would leave behind so the smoke test can pass.
         if cmd[:2] == ["uv", "venv"]:
-            binary = RuntimeLayout(tmp_path).executable("drover-server", "0.1.4")
-            binary.parent.mkdir(parents=True, exist_ok=True)
-            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            binary.chmod(0o755)
+            _write_runnable_entrypoints(RuntimeLayout(tmp_path), "0.1.4")
         return _Ok()
 
     layout = RuntimeLayout(tmp_path)
@@ -214,7 +220,7 @@ def test_install_runs_uv_with_require_hashes(tmp_path):
         layout, artifact, runner=runner, opener=_download_opener(payload, lock)
     )
     flat = [" ".join(cmd) for cmd in calls]
-    assert any("uv venv" in line for line in flat)
+    assert any("uv venv --relocatable" in line for line in flat)
     assert any("--require-hashes" in line for line in flat)
     assert any("--no-deps" in line for line in flat)
 
@@ -229,10 +235,7 @@ def test_install_does_not_flip_the_symlink(tmp_path):
 
     def runner(cmd, **kwargs):
         if cmd[:2] == ["uv", "venv"]:
-            binary = RuntimeLayout(tmp_path).executable("drover-server", "0.1.4")
-            binary.parent.mkdir(parents=True, exist_ok=True)
-            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            binary.chmod(0o755)
+            _write_runnable_entrypoints(RuntimeLayout(tmp_path), "0.1.4")
         return _Ok()
 
     layout = RuntimeLayout(tmp_path)
@@ -308,7 +311,7 @@ def test_a_failed_install_does_not_poison_the_next_attempt(tmp_path):
     def runner(cmd, **kwargs):
         attempts.append(cmd)
         if cmd[:2] == ["uv", "venv"]:
-            target = Path(cmd[2])
+            target = Path(cmd[-1])
             if target.exists():
                 # What uv actually does: refuses rather than clobbering.
                 return _Result(1)
@@ -317,10 +320,7 @@ def test_a_failed_install_does_not_poison_the_next_attempt(tmp_path):
             # install killed partway through would.
             if len(attempts) <= 1:
                 return _Result(1)
-            binary = layout.executable("drover-server", artifact.version)
-            binary.parent.mkdir(parents=True, exist_ok=True)
-            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            binary.chmod(0o755)
+            _write_runnable_entrypoints(layout, artifact.version)
         return _Result(0)
 
     opener = _download_opener(payload, lock)
@@ -349,7 +349,7 @@ def test_a_failed_install_does_not_count_as_an_installed_version(tmp_path):
 
     def runner(cmd, **kwargs):
         if cmd[:2] == ["uv", "venv"]:
-            Path(cmd[2]).mkdir(parents=True, exist_ok=True)
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
             return _Result(1)
         return _Result(0)
 
@@ -373,10 +373,7 @@ def _installing_runner(tmp_path, version="0.1.4"):
 
     def runner(cmd, **kwargs):
         if cmd[:2] == ["uv", "venv"]:
-            binary = RuntimeLayout(tmp_path).executable("drover-server", version)
-            binary.parent.mkdir(parents=True, exist_ok=True)
-            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            binary.chmod(0o755)
+            _write_runnable_entrypoints(RuntimeLayout(tmp_path), version)
         return _Ok()
 
     return runner

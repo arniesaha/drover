@@ -340,12 +340,43 @@ verify_release_candidate() (
     || fail "candidate dependency install failed (hash mismatch?)"
   uv pip install --python "$runtime/bin/python" --no-deps "$temporary/$wheel" >/dev/null \
     || fail "installing candidate $wheel failed"
-  "$runtime/bin/drover-server" --version >/dev/null 2>&1 \
-    || fail "release v${version} failed its candidate smoke test"
+  # Older released harnessd entry points predate --version. Candidate
+  # verification must remain able to inspect those releases; activation of a
+  # newly installed runtime stays strict below.
+  verify_runtime_entrypoints "$runtime" "" allow_legacy_harness_version \
+    || fail "release v${version} failed its candidate runtime check"
   runtime_supports_postgres_default "$runtime/bin/python" "$runtime/bin/drover-server" \
     || fail "release v${version} predates PostgreSQL-default setup; choose a current release"
   success "release v${version} satisfies the PostgreSQL-default installer contract"
 )
+
+verify_runtime_entrypoints() {
+  # Console scripts may retain the absolute venv path they were generated in.
+  # The install path below stages then renames a runtime, so reject that stale
+  # reference before runtime/current can be flipped to an unexecutable tree.
+  local runtime="$1"
+  local staging="${2:-}"
+  local compatibility="${3:-}"
+  local entry
+  if [ -n "$staging" ] && /usr/bin/grep -r -F -q -- "$staging" "$runtime/bin"; then
+    return 1
+  fi
+  for entry in drover drover-server drover-harnessd; do
+    [ -x "$runtime/bin/$entry" ] || return 1
+    if "$runtime/bin/$entry" --version >/dev/null 2>&1; then
+      continue
+    fi
+    # Releases before #741's follow-up have no harnessd --version option.
+    # This is only accepted for disposable candidate verification; the final
+    # staged-to-final activation check requires --version for every entry.
+    if [ "$entry" = drover-harnessd ] \
+      && [ "$compatibility" = allow_legacy_harness_version ] \
+      && "$runtime/bin/$entry" --help >/dev/null 2>&1; then
+      continue
+    fi
+    return 1
+  done
+}
 
 install_runtime() {
   # Two statements, not one. Under `set -u`, bash declares every name in a
@@ -424,10 +455,10 @@ install_runtime() {
     [ -z "$backup" ] || mv "$backup" "$target" || true
     fail "could not activate the verified runtime"
   fi
-  if ! "$target/bin/drover-server" --version >/dev/null 2>&1; then
+  if ! verify_runtime_entrypoints "$target" "$staging"; then
     rm -rf "$target"
     [ -z "$backup" ] || mv "$backup" "$target" || true
-    fail "$version failed its final runtime smoke test; leaving the current install alone"
+    fail "$version failed final runtime verification; leaving the current install alone"
   fi
   [ -z "$backup" ] || rm -rf "$backup"
 
