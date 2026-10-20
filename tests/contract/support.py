@@ -261,6 +261,15 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
         consent_path = config.with_name(f".{config.name}.harness-content-consent.json")
         consent_path.write_text(json.dumps(options["preseed_consent"]) + "\n")
     bin_dir, log = fake_clis
+    fixtures = Path(__file__).parents[1] / "fixtures" / "structured"
+    claude_fixture_name = options.get("claude_fixture", "claude_basic.ndjson")
+    if (
+        not isinstance(claude_fixture_name, str)
+        or Path(claude_fixture_name).name != claude_fixture_name
+        or not (claude_fixture := fixtures / claude_fixture_name).is_file()
+    ):
+        raise pytest.UsageError("daemon claude_fixture must name a structured fixture")
+    _fake_cli(bin_dir / "claude", claude_fixture, log)
     environment = os.environ.copy()
     environment.update(
         {
