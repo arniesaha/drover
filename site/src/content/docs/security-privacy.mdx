@@ -37,7 +37,7 @@ drover-server credentials revoke <credential-id>
 
 ## Known limits
 
-- **A host credential is not bound to a host identity.** A host credential can act as any registered host. Enroll only machines that you control. See [issue 13](https://github.com/arniesaha/drover/issues/13).
+- **Host credentials are bound to the issued host ID.** Registration, heartbeats, relay attachment, and event ingest reject a mismatch. This is not cryptographic machine identity.
 - **The shared token is on by default.** Set `[auth] legacy_token_enabled = false` after each device and host has paired.
 - **No users or roles.** Each paired device and registered host is in one trust domain. Credential scopes are the only access control.
 - **No sandbox.** An agent runs with the account and file permissions of the host daemon.
