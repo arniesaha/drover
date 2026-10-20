@@ -142,7 +142,7 @@ def install_version(
     `prune` in place of a good one.
     """
     target = layout.version_dir(artifact.version)
-    if target.exists() and layout.smoke_test(artifact.version):
+    if target.exists() and layout.verify_runtime(artifact.version):
         return True
 
     _discard(target)
@@ -187,7 +187,7 @@ def _install_into(
 
         python = target / "bin" / "python"
         steps = [
-            ["uv", "venv", str(target)],
+            ["uv", "venv", "--relocatable", str(target)],
             # Dependencies are hash-pinned. The wheel goes in --no-deps
             # because it has already been verified against the manifest.
             [
@@ -212,8 +212,10 @@ def _install_into(
         layout.cache_artifact(artifact.version, wheel, lock)
 
     # uv succeeding is not the same as the result being runnable.
-    if not layout.smoke_test(artifact.version):
-        log.error("%s installed but failed its smoke test", artifact.version)
+    if not layout.verify_runtime(artifact.version):
+        log.error(
+            "%s installed but failed its final-runtime verification", artifact.version
+        )
         return False
     return True
 

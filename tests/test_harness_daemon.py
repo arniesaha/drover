@@ -1089,6 +1089,14 @@ def test_skinny_harnessd_entrypoint_documents_core_options():
     assert "--relay" in result.output
 
 
+def test_harnessd_cli_reports_the_packaged_version():
+    """Runtime activation invokes this exact entry point with --version."""
+    result = CliRunner().invoke(harnessd_cli, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert drover.__version__ in result.output
+
+
 def test_daemon_can_register_host_with_central_server(tmp_path):
     central = ThreadingHTTPServer(("127.0.0.1", 0), _CentralRegistrationHandler)
     _CentralRegistrationHandler.payloads = []

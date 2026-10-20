@@ -32,6 +32,7 @@ log = logging.getLogger("drover.runtime")
 
 MARKER_FILENAME = "pending_verification.json"
 SMOKE_TIMEOUT_SECONDS = 30
+RUNTIME_ENTRYPOINTS = ("drover", "drover-server", "drover-harnessd")
 
 
 def _smoke_excerpt(output: str | bytes | None) -> str:
@@ -177,17 +178,8 @@ class RuntimeLayout:
         staging.symlink_to(version)
         os.replace(staging, self.current)
 
-    def smoke_test(self, version: str) -> bool:
-        """A version that cannot state its own version never gets the symlink."""
-        binary = self.executable("drover-server", version)
-        try:
-            binary.stat()
-        except FileNotFoundError:
-            log.warning("smoke test executable is missing: %s", binary)
-            return False
-        except OSError as exc:
-            log.warning("smoke test cannot access %s: %s", binary, exc)
-            return False
+    def _run_entrypoint(self, binary: Path) -> bool:
+        """Run one installed console script without allowing a rollout to hang."""
         try:
             result = subprocess.run(
                 [str(binary), "--version"],
@@ -199,22 +191,75 @@ class RuntimeLayout:
             )
         except subprocess.TimeoutExpired as exc:
             log.warning(
-                "smoke test timed out for %s: %s",
+                "runtime check timed out for %s: %s",
                 binary,
                 _smoke_excerpt(exc.stderr or exc.stdout),
             )
             return False
         except OSError as exc:
-            log.warning("smoke test could not run %s: %s", binary, exc)
+            log.warning("runtime check could not run %s: %s", binary, exc)
             return False
         if result.returncode != 0:
             log.warning(
-                "smoke test failed for %s (exit %s): %s",
+                "runtime check failed for %s (exit %s): %s",
                 binary,
                 result.returncode,
                 _smoke_excerpt(result.stderr or result.stdout),
             )
             return False
+        return True
+
+    def smoke_test(self, version: str) -> bool:
+        """A version that cannot state its own version never gets the symlink."""
+        binary = self.executable("drover-server", version)
+        try:
+            binary.stat()
+        except FileNotFoundError:
+            log.warning("smoke test executable is missing: %s", binary)
+            return False
+        except OSError as exc:
+            log.warning("smoke test cannot access %s: %s", binary, exc)
+            return False
+        return self._run_entrypoint(binary)
+
+    def verify_runtime(self, version: str, *, former_path: Path | None = None) -> bool:
+        """Prove a staged runtime still executes at its final location.
+
+        Console scripts can retain the absolute venv path they were generated
+        in. Checking those references and every service-facing entry point
+        before activation turns a later systemd ``203/EXEC`` into a safe
+        failed update.
+        """
+        bin_dir = self.version_dir(version) / "bin"
+        if former_path is not None:
+            needle = str(former_path).encode()
+            try:
+                referenced = [
+                    entry
+                    for entry in bin_dir.iterdir()
+                    if entry.is_file() and needle in entry.read_bytes()
+                ]
+            except OSError as exc:
+                log.warning("could not inspect runtime scripts in %s: %s", bin_dir, exc)
+                return False
+            if referenced:
+                log.warning(
+                    "runtime %s still references staging path %s: %s",
+                    version,
+                    former_path,
+                    ", ".join(str(entry) for entry in referenced),
+                )
+                return False
+
+        for name in RUNTIME_ENTRYPOINTS:
+            binary = bin_dir / name
+            try:
+                binary.stat()
+            except OSError as exc:
+                log.warning("runtime entry point is missing: %s (%s)", binary, exc)
+                return False
+            if not self._run_entrypoint(binary):
+                return False
         return True
 
     def prune(self, keep: int) -> list[str]:
