@@ -31,7 +31,7 @@ from drover.server.push.apns import (
     push_status,
     set_sender,
 )
-from drover.server.web.credentials import CredentialStore
+from drover.server.web.credentials import Credential, CredentialStore
 
 cryptography = pytest.importorskip("cryptography")
 
@@ -112,6 +112,16 @@ def _transition(**overrides):
     }
     fields.update(overrides)
     return AwaitingTransition(**fields)
+
+
+class _DuplicateAPNsCredentialStore:
+    """A legacy store snapshot with two credentials for one APNs endpoint."""
+
+    def __init__(self, *credentials):
+        self._credentials = credentials
+
+    def list_all(self):
+        return list(self._credentials)
 
 
 # --- signing ---------------------------------------------------------------
@@ -540,6 +550,46 @@ def test_unregistered_and_revoked_devices_are_skipped(tmp_path, config):
     APNsSender(config, store, client=client)._deliver(_transition())
 
     assert client.posts == []
+
+
+def test_sender_uses_newest_credential_for_a_legacy_duplicate_apns_registration(config):
+    old = Credential(
+        id="old-pairing",
+        scope="device",
+        label="Old iPhone pairing",
+        verifier="old-verifier",
+        created_at="2026-09-30T22:03:07+00:00",
+        notification_mode="all",
+        apns_token="shared-device-token",
+        apns_environment="production",
+    )
+    current = Credential(
+        id="current-pairing",
+        scope="device",
+        label="Current iPhone pairing",
+        verifier="current-verifier",
+        created_at="2026-10-18T22:29:06+00:00",
+        notification_mode="action",
+        apns_token="shared-device-token",
+        apns_environment="production",
+    )
+    client = FakeClient()
+    sender = APNsSender(
+        config,
+        _DuplicateAPNsCredentialStore(old, current),
+        client=client,
+    )
+    try:
+        # The old All-updates pairing must not make a newer Action-only phone
+        # receive a non-actionable progress alert.
+        sender._deliver(_transition(awaiting=None, status="running"))
+        assert client.posts == []
+        # An actionable change still reaches the phone exactly once, through
+        # the newest credential rather than once per legacy pairing.
+        sender._deliver(_transition(awaiting="input", status="running"))
+        assert len(client.posts) == 1
+    finally:
+        sender.close()
 
 
 def test_notify_ignores_transitions_that_do_not_need_the_user(tmp_path, config):

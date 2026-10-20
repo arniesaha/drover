@@ -201,6 +201,23 @@ class CredentialStore:
                 or credential.scope != "device"
             ):
                 return False
+            # APNs assigns one token to one app installation. Re-pairing the
+            # same phone creates a fresh Drover credential, so transfer the
+            # endpoint instead of letting an old notification preference keep
+            # sending to that same installation.
+            for other_id, other in list(self._by_id.items()):
+                if (
+                    other_id != credential_id
+                    and other.scope == "device"
+                    and other.is_active
+                    and other.apns_token == token
+                    and other.apns_environment == environment
+                ):
+                    self._by_id[other_id] = replace(
+                        other,
+                        apns_token=None,
+                        apns_environment=None,
+                    )
             self._by_id[credential_id] = replace(
                 credential,
                 apns_token=token,
@@ -524,16 +541,45 @@ class PostgresCredentialStore:
         if environment not in APNS_ENVIRONMENTS:
             raise ValueError(f"unknown APNs environment: {environment}")
         with self._connection() as con:
-            row = con.execute(
-                """UPDATE control_credentials
-                   SET apns_token = ?, apns_environment = ?,
-                       apns_failure_reason = NULL, apns_failed_at = NULL,
-                       apns_failed_fingerprint = NULL
-                   WHERE credential_id = ? AND revoked_at IS NULL AND scope = 'device'
-                   RETURNING credential_id""",
-                [token, environment, credential_id],
-            ).fetchone()
-        return row is not None
+            con.execute("BEGIN")
+            try:
+                # Registrations are rare, so serialize them all. Locking just
+                # the destination endpoint deadlocks when two paired devices
+                # concurrently swap endpoints: each owns one device row and
+                # then needs the other's row while clearing duplicates.
+                con.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                    ["apns-registration"],
+                )
+                target = con.execute(
+                    """SELECT credential_id FROM control_credentials
+                       WHERE credential_id = ? AND revoked_at IS NULL AND scope = 'device'
+                       FOR UPDATE""",
+                    [credential_id],
+                ).fetchone()
+                if target is None:
+                    con.execute("ROLLBACK")
+                    return False
+                con.execute(
+                    """UPDATE control_credentials
+                       SET apns_token = NULL, apns_environment = NULL
+                       WHERE credential_id != ? AND revoked_at IS NULL AND scope = 'device'
+                         AND apns_token = ? AND apns_environment = ?""",
+                    [credential_id, token, environment],
+                )
+                con.execute(
+                    """UPDATE control_credentials
+                       SET apns_token = ?, apns_environment = ?,
+                           apns_failure_reason = NULL, apns_failed_at = NULL,
+                           apns_failed_fingerprint = NULL
+                       WHERE credential_id = ?""",
+                    [token, environment, credential_id],
+                )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+        return True
 
     def set_notification_mode(self, credential_id: str, mode: str) -> bool:
         if mode not in {"all", "action", "digest"}:

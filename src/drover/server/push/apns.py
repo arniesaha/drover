@@ -795,6 +795,7 @@ class APNsSender:
                         self._send_one(credential, state, self._needs_user_count(state))
 
     def _targets(self):
+        targets = {}
         for credential in self._credentials.list_all():
             if (
                 credential.scope == "device"
@@ -803,7 +804,20 @@ class APNsSender:
                 and credential.apns_environment in _HOSTS
                 and self.environment_available(credential.apns_environment)
             ):
-                yield credential
+                # Old hubs allowed a re-paired phone's APNs endpoint to remain
+                # on both credentials. Prefer the newest credential's current
+                # notification mode until the next registration repairs it.
+                key = (credential.apns_environment, credential.apns_token)
+                existing = targets.get(key)
+                if existing is None or (
+                    credential.created_at,
+                    credential.id,
+                ) > (
+                    existing.created_at,
+                    existing.id,
+                ):
+                    targets[key] = credential
+        yield from targets.values()
 
     def _deliver(self, transition: AwaitingTransition) -> None:
         try:

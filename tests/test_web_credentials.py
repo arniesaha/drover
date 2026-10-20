@@ -213,6 +213,44 @@ def test_apns_registration_writes_inside_touch_debounce(tmp_path):
     )
 
 
+def test_apns_registration_transfers_matching_environment_token_to_new_device(tmp_path):
+    """A re-paired phone must have exactly one active APNs recipient."""
+    store = _store(tmp_path)
+    old, _ = store.issue(scope="device", label="Old iPhone pairing")
+    sandbox, _ = store.issue(scope="device", label="Development iPhone pairing")
+    current, _ = store.issue(scope="device", label="Current iPhone pairing")
+
+    assert store.set_apns_registration(
+        old.id, token="shared-device-token", environment="production"
+    )
+    # The same APNs token in the other APNs environment is a distinct endpoint.
+    assert store.set_apns_registration(
+        sandbox.id, token="shared-device-token", environment="sandbox"
+    )
+    assert store.set_apns_registration(
+        current.id, token="shared-device-token", environment="production"
+    )
+
+    assert (store.get(old.id).apns_token, store.get(old.id).apns_environment) == (
+        None,
+        None,
+    )
+    assert (
+        store.get(current.id).apns_token,
+        store.get(current.id).apns_environment,
+    ) == (
+        "shared-device-token",
+        "production",
+    )
+    assert (
+        store.get(sandbox.id).apns_token,
+        store.get(sandbox.id).apns_environment,
+    ) == (
+        "shared-device-token",
+        "sandbox",
+    )
+
+
 def test_clear_apns_registration_compares_expected_token(tmp_path):
     store = _store(tmp_path)
     credential, _ = store.issue(scope="device", label="Phone")
