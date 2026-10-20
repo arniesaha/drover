@@ -48,6 +48,91 @@ class FakeHub:
 
 
 @pytest.fixture
+def fake_deepseek():
+    """Small DSH Web-RPC double shared by Python and Rust contract lanes."""
+
+    sessions: dict[str, list[dict]] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):  # noqa: N802
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            request = json.loads(raw or b"{}")
+            method = request.get("method")
+            payload = request.get("payload") or {}
+            session_id = payload.get("sessionId") or "dsh-fixture-1"
+            if method == "session.create":
+                sessions.setdefault("dsh-fixture-1", [])
+                value = {"sessionId": "dsh-fixture-1"}
+            elif method == "session.prompt":
+                sessions[session_id] = [
+                    {
+                        "event": {
+                            "type": "assistant/message",
+                            "seq": 1,
+                            "surfaceOp": "append",
+                            "data": {
+                                "message": {
+                                    "content": [
+                                        {"type": "text", "text": "deepseek fixture"}
+                                    ]
+                                },
+                                "usage": {"input_tokens": 3, "output_tokens": 2},
+                            },
+                        },
+                        "view": {"fixture": True},
+                    },
+                    {
+                        "event": {
+                            "type": "tool/call",
+                            "seq": 2,
+                            "data": {"callId": "call-1", "name": "Read", "arguments": {"path": "README.md"}},
+                        },
+                        "view": {"fixture": True},
+                    },
+                    {
+                        "event": {
+                            "type": "tool/result",
+                            "seq": 3,
+                            "data": {"message": {"content": [{"type": "tool-result", "toolCallId": "call-1", "content": [{"type": "text", "text": "fixture read"}]}]}},
+                        },
+                        "view": {"fixture": True},
+                    },
+                    {"event": {"type": "turn/end", "seq": 4, "data": {"reason": {"kind": "completed"}}}},
+                ]
+                value = {}
+            elif method == "session.history":
+                value = {"events": sessions.get(session_id, []), "hasMore": False}
+            elif method in {"session.cancel", "session.selectModel"}:
+                value = {}
+            elif method == "session.models":
+                value = {"current": {"provider": "deepseek", "model": "fixture"}}
+            else:
+                value = {}
+            body = json.dumps(
+                {"rpcId": request.get("rpcId"), "result": {"ok": True, "value": value}}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture
 def fake_hub():
     hub: FakeHub
 
@@ -204,7 +289,7 @@ class Daemon:
 
 
 @pytest.fixture
-def daemon(tmp_path, fake_hub, fake_clis, request):
+def daemon(tmp_path, fake_hub, fake_clis, fake_deepseek, request):
     """Launch the selected implementation with an isolated home and store."""
     options = getattr(request, "param", {})
     if options is True:
@@ -277,6 +362,7 @@ def daemon(tmp_path, fake_hub, fake_clis, request):
             "PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}",
             "HARNESSD_FAKE_CLI_LOG": str(log),
             "HARNESSD_FAKE_AUTH_STATE": str(tmp_path / "fake-auth-state"),
+            "DROVER_DEEPSEEK_HARNESS_URL": fake_deepseek,
             "PYTHONPATH": str(Path.cwd() / "src")
             + os.pathsep
             + environment.get("PYTHONPATH", ""),
