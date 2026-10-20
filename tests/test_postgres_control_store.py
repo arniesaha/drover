@@ -796,6 +796,36 @@ def test_postgres_credentials_record_apns_rejection(postgres_control_store):
     assert store.get(credential.id).apns_failed_fingerprint is None
 
 
+def test_postgres_apns_registration_transfers_matching_token_to_new_device(
+    postgres_control_store,
+):
+    control_path, _ = postgres_control_store
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    store = PostgresCredentialStore(control_path)
+    old, _ = store.issue(scope="device", label="Old iPhone pairing")
+    current, _ = store.issue(scope="device", label="Current iPhone pairing")
+
+    assert store.set_apns_registration(
+        old.id, token="shared-device-token", environment="production"
+    )
+    assert store.set_apns_registration(
+        current.id, token="shared-device-token", environment="production"
+    )
+
+    assert (store.get(old.id).apns_token, store.get(old.id).apns_environment) == (
+        None,
+        None,
+    )
+    assert (
+        store.get(current.id).apns_token,
+        store.get(current.id).apns_environment,
+    ) == (
+        "shared-device-token",
+        "production",
+    )
+
+
 def test_postgres_credentials_observe_cross_process_revocation(postgres_control_store):
     """A cached API process cannot continue honoring a revoked credential."""
     control_path, _ = postgres_control_store
