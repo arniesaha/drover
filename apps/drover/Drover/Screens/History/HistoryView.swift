@@ -198,20 +198,18 @@ struct HistoryRow: View {
     }
 
     private var stateBadge: some View {
-        Text(item.state.label)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(stateColor)
+        StatusChip(status: status)
     }
 
-    /// Red is reserved for terminate (see `DroverColor`); the label carries
-    /// the difference between waiting and failed.
-    private var stateColor: PaletteToken {
+    private var status: DroverStatus {
         switch item.state {
-        case .running: DroverColor.accentHi
-        case .awaiting, .failed: DroverColor.warn
-        case .finished: DroverColor.faint
+        case .running: .running
+        case .awaiting: .needsInput
+        case .finished: .finished
+        case .failed: .failed
         }
     }
+
 }
 
 struct HistoryRowPlaceholder: View {

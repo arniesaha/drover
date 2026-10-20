@@ -31,6 +31,10 @@ struct InboxView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            ScreenHeader(
+                title: "Inbox",
+                subtitle: "Decisions, insights, and session history"
+            )
             Picker("Inbox section", selection: $segment) {
                 Text("Needs you · \(needsYouCount)").tag(Segment.needsYou)
                 Text(Segment.insights.rawValue).tag(Segment.insights)
@@ -50,8 +54,7 @@ struct InboxView: View {
             }
         }
         .background(DroverColor.bg)
-        .navigationTitle("Inbox")
-        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .navigationBar)
         .task { await refresh(); openAttentionFromNotification() }
         .onChange(of: workStore.items) { _, _ in openAttentionFromNotification() }
         .onChange(of: NotificationRoute.shared.pendingAttentionRef) { _, _ in openAttentionFromNotification() }
@@ -103,11 +106,12 @@ struct InboxView: View {
                 }
 
                 if !workStore.isVisible && waitingSessions.isEmpty && attentionStore.insights.isEmpty && !attentionStore.isLoading {
-                    ContentUnavailableView(
-                        "All caught up", systemImage: "checkmark.circle",
-                        description: Text("New decisions and priority findings will appear here."))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 60)
+                    StateView(
+                        kind: .empty,
+                        title: "All caught up",
+                        message: "New decisions and priority findings will appear here."
+                    )
+                    .padding(.vertical, 40)
                 }
             }
             .padding(14)

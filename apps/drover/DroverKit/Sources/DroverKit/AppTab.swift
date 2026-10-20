@@ -6,6 +6,7 @@ public enum AppTab: String, CaseIterable, Identifiable, Sendable {
     case inbox = "inbox"
     case analytics = "analytics"
     case accounts = "accounts"
+    case settings = "settings"
 
     public var id: String { rawValue }
 
@@ -15,6 +16,7 @@ public enum AppTab: String, CaseIterable, Identifiable, Sendable {
         case .inbox: "Inbox"
         case .analytics: "Analytics"
         case .accounts: "Accounts"
+        case .settings: "Settings"
         }
     }
 
@@ -24,6 +26,7 @@ public enum AppTab: String, CaseIterable, Identifiable, Sendable {
         case .inbox: "tray.full"
         case .analytics: "chart.bar"
         case .accounts: "person.crop.circle"
+        case .settings: "gearshape"
         }
     }
 
