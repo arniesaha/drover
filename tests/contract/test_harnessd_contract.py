@@ -81,6 +81,9 @@ def test_inventory_cursor_and_cors_contract(daemon):
     assert (status, body) == (400, {"error": "invalid archived_cursor"})
 
 
+@pytest.mark.parametrize(
+    "daemon", [{"claude_fixture": "claude_lifecycle.ndjson"}], indirect=True
+)
 def test_structured_lifecycle_and_event_push_contract(daemon, fake_hub):
     status, created = request(
         daemon,
