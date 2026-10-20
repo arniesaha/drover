@@ -1,8 +1,8 @@
 # Privacy
 
-Last reviewed: 2026-09-05
+Last reviewed: 2026-10-20
 
-A web version of this page is available at https://drover.fyi/privacy/.
+Public web documentation: [Security and privacy](https://drover.fyi/docs/security-privacy/).
 
 Drover is self-hosted software for a trusted personal fleet of coding agents.
 The iOS app connects to a Drover hub that you or another operator run; it does
@@ -61,10 +61,9 @@ on a lock screen or notification surface.
 
 Notifications are best effort. They are not a guarantee of timely delivery,
 and the app remains usable without them. Turn notifications off in iOS if you
-do not want alert content displayed. Signing out removes the phone's local
-connection but currently leaves its server credential and APNs registration in
-place. Revoke the device credential on the hub to clear its stored registration
-and stop hub-sent alerts for that credential.
+do not want alert content displayed. Signing Out asks the hub to revoke the
+device credential and clear its APNs registration; see [Retention and
+deletion](#retention-and-deletion) for the offline fallback.
 
 ## Optional integrations
 

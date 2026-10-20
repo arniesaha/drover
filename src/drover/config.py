@@ -343,6 +343,13 @@ class AnalyticsConfig:
     retire_legacy_writers: bool = False
     catalog_dsn_env: str = ""
     exporter_dsn_env: str = ""
+    # The catalog administrator credential is intentionally separate from the
+    # least-privilege exporter credential.  Leaving it unset disables the
+    # in-hub compactor while retaining file-pressure warnings.
+    maintenance_dsn_env: str = ""
+    auto_compaction_soft_file_limit: int = 5_000
+    auto_compaction_daily_window_hour: int = 3
+    auto_compaction_max_runtime_seconds: float = 300
     data_root: str = ""
     extension_dir: str = ""
     engine_sha256: str = ""
@@ -369,6 +376,33 @@ class AnalyticsConfig:
             raise ValueError("analytics.retire_legacy_writers must be boolean")
         if self.retire_legacy_writers and self.backend != "ducklake":
             raise ValueError("writer retirement requires analytics.backend=ducklake")
+        if (
+            type(self.auto_compaction_soft_file_limit) is not int
+            or self.auto_compaction_soft_file_limit < 1
+        ):
+            raise ValueError(
+                "analytics.auto_compaction_soft_file_limit must be a positive integer"
+            )
+        if (
+            type(self.auto_compaction_daily_window_hour) is not int
+            or not 0 <= self.auto_compaction_daily_window_hour < 24
+        ):
+            raise ValueError(
+                "analytics.auto_compaction_daily_window_hour must be from 0 through 23"
+            )
+        runtime = self.auto_compaction_max_runtime_seconds
+        if (
+            type(runtime) not in (int, float)
+            or not math.isfinite(runtime)
+            or runtime <= 0
+        ):
+            raise ValueError(
+                "analytics.auto_compaction_max_runtime_seconds must be a finite positive number"
+            )
+        for name in ("catalog_dsn_env", "exporter_dsn_env", "maintenance_dsn_env"):
+            value = getattr(self, name)
+            if value and not _ENV_NAME.fullmatch(value):
+                raise ValueError(f"analytics.{name} must name an environment variable")
         if self.backend == "ducklake":
             for name in (
                 "catalog_dsn_env",
@@ -385,12 +419,6 @@ class AnalyticsConfig:
             for name in ("engine_sha256", "verification_sha256"):
                 if not re.fullmatch(r"[0-9a-f]{64}", getattr(self, name)):
                     raise ValueError(f"analytics.{name} must be SHA-256")
-            for name in ("catalog_dsn_env", "exporter_dsn_env"):
-                value = getattr(self, name)
-                if value and not _ENV_NAME.fullmatch(value):
-                    raise ValueError(
-                        f"analytics.{name} must name an environment variable"
-                    )
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,8 @@
 # Web client
 
-Status: accepted direction, implementation proposed. Approved by Arnab on
-2026-10-18 at 23:32 PT. This document records the approved product decisions
-and proposes the implementation gates; it does not start P0.
+Status: P0 implemented in v0.6.26 (#718, #723); P1 and later remain proposed.
+Approved direction recorded 2026-10-18. This document preserves the product
+decisions and implementation gates; it is not a claim that every phase ships.
 
 ## Problem
 
@@ -17,11 +17,12 @@ screen map below comes from the Swift implementation, not a proposed new API.
 
 ## Decisions
 
-- **One static SPA, two entry points.** Serve it from the hub at `/ui` and
-  from `https://drover.fyi/web`. Both browsers call the user's hub directly.
-  There is no Drover-run backend, API proxy, relay, SSR server or user-data
-  service at drover.fyi. The hosted site delivers files and aggregate usage
-  counters only. Hub payloads and credentials never go there in normal operation.
+- **P0: one hub-served static SPA.** v0.6.26 serves the read-only Home and
+  session-detail client from the authenticated hub at `/ui`; its packaged wheel
+  includes hashed assets. A drover.fyi-hosted client is not shipped and remains
+  a later, separately gated option. There is no Drover-run backend, API proxy,
+  relay, SSR server, or user-data service. Hub payloads and credentials stay
+  between the browser and the user's hub.
 - **Replace the client console incrementally; retain the Observatory.** Move
   the current `/ui` Observatory to `/ui/observatory`, keeping its operator
   authentication. Existing harness/history/terminal pages remain during P0.

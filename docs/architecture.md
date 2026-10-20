@@ -174,5 +174,7 @@ may retain `nexus.*` identifiers, which readers accept as compatibility inputs.
 
 All components belong to one trusted operator. Device and host credentials
 protect the central API, while the legacy shared bearer token remains enabled
-by default for upgrades. Drover does not yet provide host-bound credential
-enforcement, RBAC, SSO, or multi-tenant isolation. See [Security](security.md).
+by default for upgrades. Drover enforces host-bound credentials for host
+registration, heartbeats, relay attachment, and event ingest; it does not
+provide RBAC, SSO, multi-tenant isolation, or cryptographic machine identity.
+See [Security](security.md).

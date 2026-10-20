@@ -104,8 +104,9 @@ commands remain available for private local audits.
 DuckLake replaced Pond in the production analytical path in v0.6.2. The planned
 R2 backup boundary is
 DuckLake catalog+files generations plus a Postgres dump, with receipts and
-verification. This backup implementation does not exist yet; see
-[Backup design](docs/backup.md).
+verification. Isolated backup and restore rehearsal tooling is available; the
+production off-site R2 workflow remains unimplemented. See [Backup
+design](docs/backup.md).
 
 Run the installer as `install.sh --dry-run` to preview its actions without
 changing anything.
@@ -133,9 +134,8 @@ The model and its compatibility boundary are documented in
 - Not supported: Tailscale Funnel or any public-internet exposure.
 - Authentication: individually issued device and host bearer credentials; the
   legacy shared token remains available for upgrades until explicitly disabled.
-- Host credentials are not yet bound to a host identity, so any host
-  credential can act as any host
-  ([#13](https://github.com/arniesaha/drover/issues/13)).
+- Host credentials are bound to their issued host ID; bound hosts use the
+  authenticated relay. This is not cryptographic machine identity.
 - Not provided: multi-user isolation, RBAC, SSO, or a hosted control plane.
 
 Read [Security](docs/security.md) before exposing a listener beyond localhost,
@@ -176,8 +176,9 @@ device signing, and server configuration.
 ## Status and limitations
 
 Drover is source-distributed software for technical users operating a trusted
-personal fleet; the current release line is listed in the
-[changelog](CHANGELOG.md). The Python server and native iOS client are
+personal fleet. The latest release is **v0.6.26**; see the
+[changelog](CHANGELOG.md) for upgrade notes and changes. The Python server and
+native iOS client are
 functional. The iOS app is built from source or distributed to testers through
 the TestFlight production lane; it is not on the public App Store. Push notifications work when the
 hub is configured with an APNs key (see the

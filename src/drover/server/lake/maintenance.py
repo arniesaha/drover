@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
+import tempfile
+import threading
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
@@ -22,6 +29,60 @@ MAINTENANCE_AUTHOR = "drover-maintenance"
 MAINTENANCE_RECEIPTS = "maintenance-receipts.json"
 
 
+@dataclass(frozen=True)
+class CompactionPolicy:
+    """When the hub may spend its idle maintenance budget compacting files."""
+
+    soft_file_limit: int = 5_000
+    daily_window_hour: int = 3
+
+    def __post_init__(self) -> None:
+        if type(self.soft_file_limit) is not int or self.soft_file_limit < 1:
+            raise ValueError("soft_file_limit must be a positive integer")
+        if (
+            type(self.daily_window_hour) is not int
+            or not 0 <= self.daily_window_hour < 24
+        ):
+            raise ValueError("daily_window_hour must be an hour from 0 through 23")
+
+
+def compaction_due(
+    policy: CompactionPolicy,
+    *,
+    referenced_files: int,
+    last_completed_at: datetime | None,
+    now: datetime | None = None,
+) -> bool:
+    """Run at most once daily, in one quiet UTC hour, or for file pressure."""
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    if referenced_files > policy.soft_file_limit:
+        return True
+    if current.hour != policy.daily_window_hour:
+        return False
+    if last_completed_at is None:
+        return True
+    return current - last_completed_at.astimezone(UTC) >= timedelta(days=1)
+
+
+def compaction_skip_reason(
+    *,
+    maintenance_dsn_env: str,
+    planned_stop_active: bool,
+    exporter_backlog_high: bool,
+    maintenance_admitted: bool,
+) -> str | None:
+    """Return the first safety gate refusing a background compaction tick."""
+    if not maintenance_dsn_env:
+        return "maintenance_dsn_not_configured"
+    if planned_stop_active:
+        return "planned_stop_active"
+    if exporter_backlog_high:
+        return "exporter_backlog_high"
+    if not maintenance_admitted:
+        return "foreground_or_maintenance_active"
+    return None
+
+
 def _file_count(con, table: str) -> int:
     row = con.execute(
         "SELECT coalesce(file_count, 0) FROM ducklake_table_info('lake') "
@@ -29,6 +90,10 @@ def _file_count(con, table: str) -> int:
         [table],
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+def _row_count(con, table: str) -> int:
+    return int(con.execute(f'SELECT count(*) FROM lake."{table}"').fetchone()[0])
 
 
 def _snapshot_count(con) -> int:
@@ -111,7 +176,11 @@ def maintain_lake(
         baseline, proof_digest, proof = _baseline_snapshot(spec)
         snapshots_before = _snapshot_count(con)
         before_snapshot = max(row[0] for row in _snapshot_rows(con))
+        from .serving_proof import check_referenced_files
+
+        referenced_files_before = check_referenced_files(spec, con, limit=2**31 - 1)
         before = {table: _fingerprint(con, table) for table in selected}
+        before_rows = {table: _row_count(con, table) for table in selected}
         run_id = uuid4().hex
         intent = {
             "version": 1,
@@ -149,6 +218,7 @@ def maintain_lake(
                 ).fetchall()
                 report["tables"][table] = {
                     "files_before": before,
+                    "rows_before": before_rows[table],
                     "merge_outputs": len(merged),
                     "files_after": _file_count(con, table),
                 }
@@ -156,6 +226,9 @@ def maintain_lake(
             after = {table: _fingerprint(con, table) for table in selected}
             if after != intent["tables"]:
                 raise ValueError("maintenance changed logical table content")
+            after_rows = {table: _row_count(con, table) for table in selected}
+            if after_rows != before_rows:
+                raise ValueError("maintenance changed logical table row counts")
             # Keep every catalog-changing maintenance procedure in this one
             # receipted transaction; a later anonymous expiry snapshot would
             # correctly fail the serving proof.
@@ -192,6 +265,7 @@ def maintain_lake(
             _append_receipt(spec, receipt, fence=fence)
         for table in selected:
             report["tables"][table]["files_after"] = _file_count(con, table)
+            report["tables"][table]["rows_after"] = after_rows[table]
         # The serving check validates this receipt before moving its trusted
         # start point. A crash before this step remains deliberately unservable.
         from .serving_proof import advance_checkpoint
@@ -201,10 +275,222 @@ def maintain_lake(
             {
                 "snapshots_before": snapshots_before,
                 "snapshots_after": _snapshot_count(con),
+                "referenced_files_before": referenced_files_before,
+                "referenced_files_after": check_referenced_files(
+                    spec, con, limit=2**31 - 1
+                ),
                 "cleanup_retention": CLEANUP_RETENTION,
                 "baseline_snapshot": baseline,
                 "checkpoint_snapshot": checkpoint["snapshot"] if checkpoint else None,
                 "elapsed_seconds": round(monotonic() - started, 3),
             }
         )
+        return report
+
+
+def compact_lake(
+    spec: LakeSpec, *, tables: tuple[str, ...] = EXPORT_MAINTENANCE_TABLES
+):
+    """Public name for the row-count-verified DuckLake compaction operation."""
+    return maintain_lake(spec, tables=tables)
+
+
+def referenced_file_health(spec: LakeSpec, *, hard_limit: int) -> dict:
+    """Read catalog metadata once for operator-facing file-pressure signals."""
+    from .serving_proof import check_referenced_files
+
+    try:
+        with lake_connection(spec) as con:
+            count = check_referenced_files(spec, con, limit=2**31 - 1)
+    except LakeError as exc:
+        return {
+            "state": "unavailable",
+            "detail": exc.code,
+            "referenced_files": None,
+            "referenced_file_limit": hard_limit,
+            "referenced_file_ratio": None,
+        }
+    except Exception:  # noqa: BLE001 - health must never leak catalog details
+        return {
+            "state": "unavailable",
+            "detail": "lake_health_unavailable",
+            "referenced_files": None,
+            "referenced_file_limit": hard_limit,
+            "referenced_file_ratio": None,
+        }
+    ratio = count / hard_limit
+    state = "degraded" if ratio >= 0.8 else "warn" if ratio >= 0.5 else "ok"
+    return {
+        "state": state,
+        "referenced_files": count,
+        "referenced_file_limit": hard_limit,
+        "referenced_file_ratio": round(ratio, 6),
+    }
+
+
+def lake_health_for_config(analytics) -> dict | None:
+    """One-shot lake health for CLI data-quality output outside the hub."""
+    if getattr(analytics, "backend", "legacy") != "ducklake":
+        return None
+    from .serving import lake_spec
+    from .serving_proof import REFERENCED_FILE_LIMIT
+
+    health = referenced_file_health(
+        lake_spec(analytics), hard_limit=REFERENCED_FILE_LIMIT
+    )
+    configured = bool(getattr(analytics, "maintenance_dsn_env", ""))
+    health["auto_compaction"] = "enabled" if configured else "disabled"
+    if not configured:
+        health["detail"] = "auto-compaction disabled (maintenance DSN not configured)"
+    return health
+
+
+def _run_compaction_process(spec: LakeSpec, *, timeout_seconds: float) -> dict:
+    """Execute destructive DuckLake maintenance in a killable child process."""
+    with tempfile.TemporaryDirectory(prefix="drover-lake-compact-") as directory:
+        root = Path(directory)
+        request_path = root / "request.json"
+        reply_path = root / "reply.json"
+        request_path.write_text(
+            json.dumps(
+                {
+                    "catalog_dsn_env": spec.catalog_dsn_env,
+                    "data_root": str(spec.data_root),
+                    "extension_dir": str(spec.extension_dir),
+                    "engine_sha256": spec.engine_sha256,
+                    "reply": str(reply_path),
+                }
+            )
+        )
+        request_path.chmod(0o600)
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "drover.server.lake.maintenance_worker",
+                str(request_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            child.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+            raise LakeError("lake_compaction_deadline_exceeded") from None
+        if child.returncode or not reply_path.is_file():
+            raise LakeError("lake_compaction_process_failed")
+        payload = json.loads(reply_path.read_text())
+        if payload.get("error"):
+            raise LakeError(str(payload["error"]), payload.get("detail"))
+        return payload["report"]
+
+
+class LakeCompactionScheduler:
+    """Low-priority scheduler around the fenced, row-checked compactor."""
+
+    def __init__(
+        self,
+        *,
+        reader_spec: LakeSpec,
+        maintenance_dsn_env: str,
+        policy: CompactionPolicy,
+        max_runtime_seconds: float,
+        maintenance_admission,
+        planned_stop_active,
+        exporter_backlog_high,
+        execute=_run_compaction_process,
+    ) -> None:
+        from .serving_proof import REFERENCED_FILE_LIMIT
+
+        self._reader_spec = reader_spec
+        self._maintenance_spec = LakeSpec(
+            maintenance_dsn_env,
+            reader_spec.data_root,
+            reader_spec.extension_dir,
+            reader_spec.engine_sha256,
+        )
+        self._maintenance_dsn_env = maintenance_dsn_env
+        self._policy = policy
+        self._max_runtime_seconds = max_runtime_seconds
+        self._admission = maintenance_admission
+        self._planned_stop_active = planned_stop_active
+        self._exporter_backlog_high = exporter_backlog_high
+        self._execute = execute
+        self._hard_limit = REFERENCED_FILE_LIMIT
+        self._lock = threading.Lock()
+        self._last_completed_at: datetime | None = None
+        self._last_report: dict | None = None
+        self._last_skip: str | None = None
+        self._file_health = {
+            "state": "unknown",
+            "referenced_files": None,
+            "referenced_file_limit": self._hard_limit,
+            "referenced_file_ratio": None,
+        }
+
+    def refresh_health(self) -> dict:
+        health = referenced_file_health(self._reader_spec, hard_limit=self._hard_limit)
+        with self._lock:
+            self._file_health = health
+        return health
+
+    def health(self) -> dict:
+        with self._lock:
+            last_completed = self._last_completed_at
+            report = self._last_report
+            skip = self._last_skip
+            health = dict(self._file_health)
+        health.update(
+            {
+                "auto_compaction": (
+                    "enabled" if self._maintenance_dsn_env else "disabled"
+                ),
+                "last_completed_at": (
+                    last_completed.isoformat() if last_completed else None
+                ),
+                "last_report": report,
+            }
+        )
+        if not self._maintenance_dsn_env:
+            health["detail"] = (
+                "auto-compaction disabled (maintenance DSN not configured)"
+            )
+        elif skip:
+            health["last_skip"] = skip
+        return health
+
+    def tick(self, *, now: datetime | None = None) -> dict | None:
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        health = self.refresh_health()
+        count = health.get("referenced_files")
+        if not isinstance(count, int) or not compaction_due(
+            self._policy,
+            referenced_files=count,
+            last_completed_at=self._last_completed_at,
+            now=current,
+        ):
+            return None
+        planned_stop = bool(self._planned_stop_active())
+        backlog = bool(self._exporter_backlog_high())
+        with self._admission.admit() as admitted:
+            skip = compaction_skip_reason(
+                maintenance_dsn_env=self._maintenance_dsn_env,
+                planned_stop_active=planned_stop,
+                exporter_backlog_high=backlog,
+                maintenance_admitted=admitted,
+            )
+            if skip:
+                with self._lock:
+                    self._last_skip = skip
+                return None
+            report = self._execute(
+                self._maintenance_spec, timeout_seconds=self._max_runtime_seconds
+            )
+        with self._lock:
+            self._last_completed_at = current
+            self._last_report = report
+            self._last_skip = None
         return report

@@ -1,10 +1,10 @@
 # Rust harnessd Phase 2 gap audit
 
-Baseline: `fc647b24` (origin/main, 2026-10-19). Scope follows the supplied
-§5 Phase 2 list and the local planning copy `/tmp/harnessd-rust-port-plan.md`.
-This table records the audit **before implementation**. All source paths below
-are relative to `harnessd-rs/src/main.rs` unless noted. Completion evidence will
-be added as milestones land. No live host is part of this work.
+Baseline: `fc647b24` (origin/main, 2026-10-19). Scope follows the Phase 2
+plan. The first table records the historical audit **before implementation**;
+the completion table below is the current implementation record. All source
+paths are relative to `harnessd-rs/src/main.rs` unless noted. No live host is
+part of this audit.
 
 | Scope item | Baseline | Evidence / gap |
 |---|---|---|
@@ -61,7 +61,7 @@ be added as milestones land. No live host is part of this work.
 | JSONL importer + drain session state | done | Authenticated Python drain gate and read-only stopped-registry exporter; atomic validated/dry-run import, idempotent events/sessions, preserved lifecycle/worktree/quarantine records and metadata, PID clearing/running→errored conversion. Real Python-export→Rust-import contract checks source DB unchanged. |
 | Signed Linux/macOS CI | done | Both platform jobs build/test the release binary; pilot artifacts include SHA256 and GitHub OIDC-signed provenance. macOS pilot CI adds ad-hoc signing; release Developer ID/notarization remains in the proven existing workflow. No signing secrets on PRs. |
 | Both implementations green | done, subject to exact-head CI | Identical `rust_phase2` selection for Python/Rust; missing Rust binary fails instead of skipping. Full Python contract coverage remains in the main test job. Rust-only migration/delivery checks run separately on both platform binaries. |
-| GPU PC pilot | operator gate pending | Runbook covers isolated spare-port rehearsal, install, drain/stop/import/same-port cutover, health, rollback and uninterrupted 72-hour quantitative gates. No live host was accessed. |
+| GPU PC pilot | operator gate pending | Runbook covers isolated spare-port rehearsal, install, drain/stop/import/same-port cutover, health, rollback and an overnight 8–9 hour quantitative soak gate. No live host was accessed. |
 
 ### Later phases
 
