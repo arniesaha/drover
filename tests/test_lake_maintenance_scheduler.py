@@ -35,6 +35,12 @@ def test_compaction_pressure_bypasses_low_priority_window():
         last_completed_at=now,
         now=now,
     )
+    assert not compaction_due(
+        policy,
+        referenced_files=5_000,
+        last_completed_at=None,
+        now=now.replace(hour=4),
+    )
 
 
 def test_scheduler_gates_before_attempting_compaction():
