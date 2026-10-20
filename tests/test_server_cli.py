@@ -82,6 +82,77 @@ def _make_config(tmp_path: Path, *, spans: bool = False) -> Path:
     return cfg
 
 
+def _ducklake_pairing_config(tmp_path: Path) -> Path:
+    cfg = _make_config(tmp_path)
+    cfg.write_text(
+        cfg.read_text(encoding="utf-8") + textwrap.dedent(f"""\
+
+            [control_store]
+            backend = "postgres"
+            dsn_env = "DROVER_PAIR_TEST_DSN"
+
+            [analytics]
+            backend = "ducklake"
+            catalog_dsn_env = "DROVER_LAKE_CATALOG_DSN"
+            data_root = "{tmp_path / 'lake'}"
+            extension_dir = "{tmp_path / 'extensions'}"
+            engine_sha256 = "{'0' * 64}"
+            verification_sha256 = "{'1' * 64}"
+            """),
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_pair_loads_the_private_control_dsn_without_validating_the_lake(
+    tmp_path, postgres_dsn, monkeypatch
+):
+    """SSH pairing needs the control store, not the hub's DuckLake secrets."""
+    cfg = _ducklake_pairing_config(tmp_path)
+    (tmp_path / "server.env").write_text(
+        f'DROVER_PAIR_TEST_DSN="{postgres_dsn}"\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("DROVER_PAIR_TEST_DSN", raising=False)
+    monkeypatch.delenv("DROVER_LAKE_CATALOG_DSN", raising=False)
+    monkeypatch.setenv("DROVER_API_TOKEN", "pair-test-token")
+    seen = []
+
+    def local_api(config, method, path, payload=None, **kwargs):
+        from drover.server.db import control_plane_connection
+
+        with control_plane_connection(config.duckdb_path) as con:
+            assert con.execute("SELECT 1").fetchone() == (1,)
+        seen.append((method, path, payload))
+        return {
+            "code": "PAIR-TEST",
+            "fleet_name": "Test fleet",
+            "expires_in_seconds": 900,
+        }
+
+    monkeypatch.setattr(server_main, "_local_api_request", local_api)
+
+    result = CliRunner().invoke(main, ["--config", str(cfg), "pair", "--label", "SSH"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == [("POST", "/auth/pair-codes", {"scope": "device", "label": "SSH"})]
+    assert "PAIR-TEST" in result.output
+
+
+def test_pair_explains_when_the_private_control_dsn_is_missing(tmp_path, monkeypatch):
+    cfg = _ducklake_pairing_config(tmp_path)
+    monkeypatch.delenv("DROVER_PAIR_TEST_DSN", raising=False)
+    monkeypatch.delenv("DROVER_LAKE_CATALOG_DSN", raising=False)
+
+    result = CliRunner().invoke(main, ["--config", str(cfg), "pair"])
+
+    assert result.exit_code != 0
+    assert (
+        "PostgreSQL control store DSN is missing from DROVER_PAIR_TEST_DSN"
+        in result.output
+    )
+    assert "lake_catalog_dsn_missing" not in result.output
+
+
 class _SetupCheckHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
