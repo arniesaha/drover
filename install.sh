@@ -340,7 +340,10 @@ verify_release_candidate() (
     || fail "candidate dependency install failed (hash mismatch?)"
   uv pip install --python "$runtime/bin/python" --no-deps "$temporary/$wheel" >/dev/null \
     || fail "installing candidate $wheel failed"
-  verify_runtime_entrypoints "$runtime" \
+  # Older released harnessd entry points predate --version. Candidate
+  # verification must remain able to inspect those releases; activation of a
+  # newly installed runtime stays strict below.
+  verify_runtime_entrypoints "$runtime" "" allow_legacy_harness_version \
     || fail "release v${version} failed its candidate runtime check"
   runtime_supports_postgres_default "$runtime/bin/python" "$runtime/bin/drover-server" \
     || fail "release v${version} predates PostgreSQL-default setup; choose a current release"
@@ -353,13 +356,25 @@ verify_runtime_entrypoints() {
   # reference before runtime/current can be flipped to an unexecutable tree.
   local runtime="$1"
   local staging="${2:-}"
+  local compatibility="${3:-}"
   local entry
   if [ -n "$staging" ] && /usr/bin/grep -r -F -q -- "$staging" "$runtime/bin"; then
     return 1
   fi
   for entry in drover drover-server drover-harnessd; do
     [ -x "$runtime/bin/$entry" ] || return 1
-    "$runtime/bin/$entry" --version >/dev/null 2>&1 || return 1
+    if "$runtime/bin/$entry" --version >/dev/null 2>&1; then
+      continue
+    fi
+    # Releases before #741's follow-up have no harnessd --version option.
+    # This is only accepted for disposable candidate verification; the final
+    # staged-to-final activation check requires --version for every entry.
+    if [ "$entry" = drover-harnessd ] \
+      && [ "$compatibility" = allow_legacy_harness_version ] \
+      && "$runtime/bin/$entry" --help >/dev/null 2>&1; then
+      continue
+    fi
+    return 1
   done
 }
 

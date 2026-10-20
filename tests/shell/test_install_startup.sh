@@ -188,6 +188,7 @@ chmod +x "$FAKE_BIN/uv"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -eu' \
+  'if [ "${FIXTURE_HARNESS_VERSION_UNSUPPORTED:-}" = 1 ] && [ "$(basename "$0")" = drover-harnessd ]; then case "${1:-}" in --help) exit 0 ;; *) exit 2 ;; esac; fi' \
   'case "${1:-}" in' \
   '  --version) printf "0.0.0\\n" ;;' \
   '  init)' \
@@ -455,6 +456,17 @@ check_status "compatible release verification leaves Drover state absent" \
   "$([ -e "$HOME_DIR/.drover" ] && echo present || echo absent)" "absent"
 check_status "compatible release verification cleans its disposable runtime" \
   "$(find "$CASE_DIR/verify-tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "0"
+
+# Older releases predate drover-harnessd --version. Candidate verification
+# must still approve one when every executable behavior it can exercise works.
+new_case compatible-release-legacy-harness-version
+export FIXTURE_HARNESS_VERSION_UNSUPPORTED=1
+OUT="$(run_release_verification)"
+RESULT=$?
+unset FIXTURE_HARNESS_VERSION_UNSUPPORTED
+check_status "candidate verification accepts an older harnessd without --version" "$RESULT" "0"
+check_contains "older candidate verification reports the contract" <(printf '%s' "$OUT") \
+  'satisfies the PostgreSQL-default installer contract'
 
 new_case release-verification-without-uv
 mkdir -p "$CASE_DIR/no-uv"
