@@ -1,5 +1,7 @@
-//! Linux-first, deliberately small harness daemon.  The hub remains the
-//! authority; SQLite is solely a durable, bounded local outbox/session tail.
+mod delivery;
+
+// Linux-first, deliberately small harness daemon.  The hub remains the
+// authority; SQLite is solely a durable, bounded local outbox/session tail.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -250,8 +252,7 @@ impl App {
         let event_id = format!("harness-event-{}", Uuid::new_v4());
         let dedup = event_identity(session_id, seq, kind, &ts, &payload);
         db.execute("INSERT OR IGNORE INTO events(event_id,session_id,seq,type,text,payload,turn_id,ts,dedup_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![event_id,session_id,seq,kind,text,serde_json::to_string(&payload)?,turn_id,ts,dedup])?;
-        db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE pushed_at IS NOT NULL AND ts < datetime('now', ?1) AND id NOT IN (SELECT id FROM events e2 WHERE e2.session_id=events.session_id ORDER BY id DESC LIMIT ?2))",params![format!("-{} days",RETENTION_DAYS),RETENTION_PER_SESSION])?;
-        db.execute("DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY id DESC LIMIT -1 OFFSET ?1)", [OUTBOX_LIMIT])?;
+        prune_events(&db)?;
         Ok(())
     }
     /// Preserve handoff identity exactly: Python's event ID and dedup key are
@@ -361,7 +362,21 @@ fn init_db(path: &FsPath) -> Result<Connection> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS sessions(session_id TEXT PRIMARY KEY,data TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,event_id TEXT UNIQUE NOT NULL,session_id TEXT NOT NULL,seq INTEGER NOT NULL,type TEXT NOT NULL,text TEXT,payload TEXT NOT NULL,turn_id TEXT,ts TEXT NOT NULL,dedup_key TEXT UNIQUE NOT NULL,pushed_at TEXT);
     CREATE INDEX IF NOT EXISTS events_outbox ON events(pushed_at,id); CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id,seq);")?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    anyhow::ensure!(version <= 1, "SQLite schema is newer than this binary");
+    if version < 1 {
+        db.execute_batch("BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS event_quarantine(event_id TEXT PRIMARY KEY REFERENCES events(event_id),session_id TEXT NOT NULL,reason TEXT NOT NULL,quarantined_at TEXT NOT NULL);
+        PRAGMA user_version=1; COMMIT;")?;
+    }
     Ok(db)
+}
+
+fn prune_events(db: &Connection) -> Result<()> {
+    // The row cap applies only to acknowledged tails. Pending and quarantined
+    // originals are durable until an operator resolves them.
+    db.execute("DELETE FROM events WHERE pushed_at IS NOT NULL AND event_id NOT IN (SELECT event_id FROM event_quarantine) AND (id IN (SELECT id FROM events WHERE pushed_at IS NOT NULL ORDER BY id DESC LIMIT -1 OFFSET ?1) OR (julianday(ts) < julianday('now', ?2) AND id NOT IN (SELECT id FROM events e2 WHERE e2.session_id=events.session_id ORDER BY id DESC LIMIT ?3)))",params![OUTBOX_LIMIT,format!("-{} days",RETENTION_DAYS),RETENTION_PER_SESSION])?;
+    Ok(())
 }
 
 fn config(args: &Args) -> Result<Config> {
@@ -1536,64 +1551,6 @@ async fn relay_inventory(app: &App) -> Value {
     sessions.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
     json!({"host_id":app.cfg.host_id,"sessions":sessions,"archived_limit":20,"next_archived_cursor":null})
 }
-async fn pusher(app: App) {
-    let Some(base) = app.cfg.central_url.clone() else {
-        return;
-    };
-    loop {
-        let events: Vec<(i64, Value)> = {
-            let db = app.db.lock().unwrap();
-            let mut statement = match db.prepare(
-                "SELECT id,event_id,session_id,type,text,payload,turn_id,seq,ts
-                 FROM events WHERE pushed_at IS NULL ORDER BY id LIMIT 100",
-            ) {
-                Ok(statement) => statement,
-                Err(error) => {
-                    warn!("outbox query failed: {error}");
-                    continue;
-                }
-            };
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        json!({
-                            "event_id": row.get::<_, String>(1)?, "session_id": row.get::<_, String>(2)?,
-                            "type": row.get::<_, String>(3)?, "role": "assistant", "text": row.get::<_, Option<String>>(4)?,
-                            "payload": serde_json::from_str::<Value>(&row.get::<_, String>(5)?).unwrap_or(Value::Null),
-                            "turn_id": row.get::<_, Option<String>>(6)?, "seq": row.get::<_, i64>(7)?, "ts": row.get::<_, String>(8)?,
-                        }),
-                    ))
-                })
-                .map(|rows| rows.flatten().collect())
-                .unwrap_or_default()
-        };
-        if !events.is_empty() {
-            let body =
-                json!({"events": events.iter().map(|row| row.1.clone()).collect::<Vec<_>>()});
-            if app
-                .client
-                .post(format!("{base}/harness/events"))
-                .bearer_auth(&app.cfg.token)
-                .json(&body)
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
-                let db = app.db.lock().unwrap();
-                for (id, _) in events {
-                    let _ = db.execute(
-                        "UPDATE events SET pushed_at=?1 WHERE id=?2",
-                        params![now(), id],
-                    );
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1644,7 +1601,7 @@ async fn main() -> Result<()> {
     if cfg.relay {
         tokio::spawn(relay(app.clone()));
     }
-    tokio::spawn(pusher(app));
+    tokio::spawn(delivery::run(app));
     axum::serve(listener, router).await?;
     Ok(())
 }
