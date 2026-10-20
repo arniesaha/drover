@@ -62,11 +62,13 @@ def _beat(version="0.1.4"):
 
 
 def _installed(layout: RuntimeLayout, version: str, *, exit_code: int = 0) -> None:
-    """A staged version tree: a runnable binary plus its cached artifacts."""
-    binary = layout.version_dir(version) / "bin" / "drover-server"
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    binary.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
-    binary.chmod(0o755)
+    """A staged version tree with its service-facing entry points."""
+    bin_dir = layout.version_dir(version) / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("drover", "drover-server", "drover-harnessd"):
+        binary = bin_dir / name
+        binary.write_text(f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8")
+        binary.chmod(0o755)
     _cached(layout, version)
 
 
@@ -359,10 +361,12 @@ def test_in_place_activation_without_a_cached_artifact_refuses(tmp_path):
     layout.flip("0.1.3")
 
     def install_without_cache(lay, artifact, **kwargs):
-        binary = lay.version_dir(artifact.version) / "bin" / "drover-server"
-        binary.parent.mkdir(parents=True, exist_ok=True)
-        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        binary.chmod(0o755)
+        bin_dir = lay.version_dir(artifact.version) / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("drover", "drover-server", "drover-harnessd"):
+            binary = bin_dir / name
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
         return True
 
     calls = []
