@@ -35,10 +35,12 @@ def _beat(version="0.1.4"):
 
 
 def _installed(layout, version):
-    binary = layout.version_dir(version) / "bin" / "drover-server"
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    binary.chmod(0o755)
+    bin_dir = layout.version_dir(version) / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("drover", "drover-server", "drover-harnessd"):
+        binary = bin_dir / name
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o755)
 
 
 def _updater(tmp_path, *, idle=True, installs=True, restarts=None, cfg=None):
@@ -247,13 +249,13 @@ def test_a_retracted_release_stops_the_smoke_test_subprocess(tmp_path):
     _installed(layout, "0.1.3")
     layout.flip("0.1.3")
     smoke_calls = []
-    real_smoke = layout.smoke_test
+    real_verify = layout.verify_runtime
 
-    def counting_smoke(version):
+    def counting_verify(version):
         smoke_calls.append(version)
-        return real_smoke(version)
+        return real_verify(version)
 
-    layout.smoke_test = counting_smoke
+    layout.verify_runtime = counting_verify
     updater = HostUpdater(
         _state(),
         layout,
@@ -443,7 +445,7 @@ def test_a_refusal_is_dropped_if_the_target_moved_while_we_checked(tmp_path):
         return False
 
     updater.observe(_beat("0.1.4"))
-    layout.smoke_test = retarget_then_fail
+    layout.verify_runtime = retarget_then_fail
 
     assert updater.maybe_activate() is False
     assert updater.status() == {

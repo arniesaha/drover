@@ -181,7 +181,9 @@ printf '%s\n' \
   '    mkdir -p "$target/bin"' \
   '    /bin/cp "$(dirname "$0")/python" "$target/bin/python"' \
   '    /bin/cp "$(dirname "$0")/drover-server" "$target/bin/drover-server"' \
-  '    chmod +x "$target/bin/python" "$target/bin/drover-server"' \
+  '    /bin/cp "$(dirname "$0")/drover-server" "$target/bin/drover"' \
+  '    /bin/cp "$(dirname "$0")/drover-server" "$target/bin/drover-harnessd"' \
+  '    chmod +x "$target/bin/python" "$target/bin/drover-server" "$target/bin/drover" "$target/bin/drover-harnessd"' \
   '    ;;' \
   '  pip) ;;' \
   '  *) exit 1 ;;' \

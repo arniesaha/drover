@@ -177,6 +177,8 @@ printf '%s\n' \
   '      ln -sf "$FIXTURE_RUNTIME_PYTHON" "$target/bin/python"' \
   '    fi' \
   '    ln -sf "$FIXTURE_SERVER" "$target/bin/drover-server"' \
+  '    ln -sf "$FIXTURE_SERVER" "$target/bin/drover"' \
+  '    ln -sf "$FIXTURE_SERVER" "$target/bin/drover-harnessd"' \
   '    ;;' \
   '  pip) ;;' \
   '  *) exit 1 ;;' \
@@ -386,6 +388,17 @@ unset FIXTURE_EXPECTED_DSN FIXTURE_INSTALL_DSN
 check_status "fresh install preserves an escaped PostgreSQL DSN" "$RESULT" "0"
 check_contains "escaped PostgreSQL DSN is stored in a private environment file" \
   "$HOME_DIR/.drover/server.env" 'DROVER_CONTROL_DSN='
+if /usr/bin/grep -r -F -q -- '/.0.0.0.install.' "$HOME_DIR/.drover/runtime/0.0.0/bin"; then
+  STAGED_PATH_REFERENCE=1
+else
+  STAGED_PATH_REFERENCE=0
+fi
+check_status "final runtime has no staged-path console scripts" \
+  "$STAGED_PATH_REFERENCE" "0"
+for entry in drover drover-server drover-harnessd; do
+  "$HOME_DIR/.drover/runtime/0.0.0/bin/$entry" --version >/dev/null 2>&1
+  check_status "final runtime runs $entry" "$?" "0"
+done
 
 new_case missing-dsn
 export FIXTURE_INSTALL_DSN=""
