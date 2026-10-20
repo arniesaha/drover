@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 
-def test_compaction_is_due_only_in_its_low_priority_window():
+def test_compaction_pressure_bypasses_low_priority_window():
     from drover.server.lake.maintenance import CompactionPolicy, compaction_due
 
     policy = CompactionPolicy(soft_file_limit=5_000, daily_window_hour=3)
@@ -23,7 +23,7 @@ def test_compaction_is_due_only_in_its_low_priority_window():
         last_completed_at=now - timedelta(days=1),
         now=now,
     )
-    assert not compaction_due(
+    assert compaction_due(
         policy,
         referenced_files=5_001,
         last_completed_at=now,
@@ -190,6 +190,6 @@ def test_scheduler_skips_planned_stop_before_starting_child(monkeypatch, tmp_pat
         execute=lambda *args, **kwargs: invoked.append((args, kwargs)),
     )
 
-    assert scheduler.tick(now=datetime(2026, 10, 20, 3, tzinfo=UTC)) is None
+    assert scheduler.tick(now=datetime(2026, 10, 20, 4, tzinfo=UTC)) is None
     assert invoked == []
     assert scheduler.health()["last_skip"] == "planned_stop_active"

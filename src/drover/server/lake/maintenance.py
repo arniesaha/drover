@@ -55,10 +55,10 @@ def compaction_due(
 ) -> bool:
     """Run at most once daily, in one quiet UTC hour, or for file pressure."""
     current = (now or datetime.now(UTC)).astimezone(UTC)
-    if current.hour != policy.daily_window_hour:
-        return False
     if referenced_files > policy.soft_file_limit:
         return True
+    if current.hour != policy.daily_window_hour:
+        return False
     if last_completed_at is None:
         return True
     return current - last_completed_at.astimezone(UTC) >= timedelta(days=1)
