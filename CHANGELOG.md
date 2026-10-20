@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.26] - 2026-10-19
+
+### Added
+
+- Hub-served web client at `/ui`, with iOS-style Home and session-detail screens; the packaged wheel includes its hashed web assets (#718, #723).
+- Rust harnessd Phase 2 protocol, delivery, transport, event-bus, and folder capabilities, plus the GPU-PC pilot runbook (#727).
+
+### Fixed
+
+- APNs device registrations now deduplicate by push token and mode so a phone has one active `action` registration (#726).
+
+### Changed
+
+- Added the BYO-cloud container-hub design note and refreshed operational documentation (#738).
+
+### Upgrade notes
+
+- No control or DuckLake migrations. Upgrade the hub and Studio/NAS harnessd hosts; NAS keeps `--relay`.
+
+
 ## [0.6.25] - 2026-10-19
 
 ### Fixed
