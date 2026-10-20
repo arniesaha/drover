@@ -95,6 +95,48 @@ class WorkService:
         )
         self.lock = threading.RLock()
 
+    def register_hub_launch(self, con, *, session_id, payload, owner):
+        """Register the hub's accepted session before its transaction commits.
+
+        This intentionally bypasses the old queue's shadow-mode mutation gate:
+        shadow mode controls automatic provider actions, never observation.
+        """
+        prompt = payload.get("prompt") if isinstance(payload.get("prompt"), str) else ""
+        intent = payload.get("intent") if isinstance(payload.get("intent"), str) else ""
+        branch = (
+            payload.get("branch") if isinstance(payload.get("branch"), str) else None
+        )
+        title = (
+            intent
+            or (prompt.splitlines()[0] if prompt else "")
+            or branch
+            or "Session work"
+        ).strip()
+        repo_owner = payload.get("repo_owner")
+        repo_name = payload.get("repo_name")
+        repo = (
+            f"{repo_owner}/{repo_name}"
+            if isinstance(repo_owner, str)
+            and isinstance(repo_name, str)
+            and repo_owner.strip()
+            and repo_name.strip()
+            else None
+        )
+        self.store.register_hub_launch(
+            con,
+            session_id=session_id,
+            title=title[:500] or "Session work",
+            repo=repo,
+            branch=branch,
+            owner=owner or "hub",
+            work_item_id=payload.get("work_item_id"),
+            acceptance=(
+                payload.get("acceptance")
+                if isinstance(payload.get("acceptance"), str)
+                else None
+            ),
+        )
+
     def scope(self, goal_id, number=None):
         scope = next((g for g in self.config.goals if g.goal_id == goal_id), None)
         if scope is None:
