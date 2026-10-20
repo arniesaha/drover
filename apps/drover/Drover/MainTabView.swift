@@ -26,6 +26,8 @@ struct MainTabView: View {
     @State private var inboxAttentionStore: InboxAttentionStore
     @State private var selectedTab: AppTab
     @State private var showGlobalLaunch = false
+    @State private var pendingGlobalLaunch: GlobalSessionRoute?
+    @State private var globalLaunchedSession: GlobalSessionRoute?
     @State private var inboxSession: InboxSessionRoute?
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
@@ -92,7 +94,9 @@ struct MainTabView: View {
                     sessionStore: sessionStore,
                     cockpitStore: cockpitStore,
                     onOpenInbox: { selectedTab = .inbox },
-                    showsNewSessionAction: false
+                    // Home owns the same action inside its navigation stack,
+                    // so it naturally leaves with a pushed session detail.
+                    showsNewSessionAction: true
                 )
             }
             .tabItem { tabLabel(for: .home) }
@@ -169,27 +173,68 @@ struct MainTabView: View {
         // This remains available from every destination on compact layouts,
         // rather than being embedded in (and duplicated by) the Home feed.
         .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
-            NewSessionBar { showGlobalLaunch = true }
-                .padding(.trailing, DroverSpace.x4)
-                .padding(.vertical, DroverSpace.x2)
+            if selectedTab != .home {
+                NewSessionBar { showGlobalLaunch = true }
+                    .padding(.trailing, DroverSpace.x4)
+                    // TabView's compact tab bar occupies the lower safe area.
+                    // Keep the global action above it so every destination stays
+                    // visually and physically reachable (including at large text).
+                    .padding(.bottom, DroverSpace.x12 + DroverSpace.x4)
+                    .padding(.vertical, DroverSpace.x2)
+            }
         }
-        .sheet(isPresented: $showGlobalLaunch) {
+        .sheet(isPresented: $showGlobalLaunch, onDismiss: {
+            // LaunchView dismisses its own sheet after invoking its callback.
+            // Wait for that dismissal before presenting the new session so a
+            // global launch follows the same launch -> session contract as Home.
+            globalLaunchedSession = pendingGlobalLaunch
+            pendingGlobalLaunch = nil
+        }) {
             NavigationStack {
                 LaunchView(
                     client: client,
                     snapshot: sessionStore.snapshot,
                     providerAccounts: cockpitStore.providerAccounts,
                     catalogStore: HarnessModelCatalogStore(defaults: defaults)
-                ) { _, _, _ in
-                    // The polling Home view receives the newly launched
-                    // session; returning there keeps launch a global action,
-                    // not an Inbox workflow.
+                ) { sessionID, isStructured, harness in
+                    pendingGlobalLaunch = GlobalSessionRoute(
+                        id: sessionID,
+                        isStructured: isStructured,
+                        harness: harness
+                    )
+                    // Return to Home once the session detail is dismissed;
+                    // launching remains global rather than an Inbox workflow.
                     selectedTab = .home
                 }
                 .navigationTitle("New Session")
             }
             .presentationDetents([.large])
             .presentationCornerRadius(DroverRadius.sheet)
+        }
+        .sheet(item: $globalLaunchedSession) { route in
+            NavigationStack {
+                Group {
+                    if route.isStructured {
+                        ChatView(
+                            client: environment.isDemoMode ? nil : client,
+                            sessionID: route.id,
+                            harness: route.harness,
+                            recoveryStore: environment.chatRecoveryStore,
+                            recoveryWriteGate: environment.chatRecoveryWriteGate,
+                            recoveryGeneration: environment.chatRecoveryGeneration,
+                            chatModelFactory: chatModelFactory,
+                            isDemoMode: environment.isDemoMode
+                        )
+                    } else {
+                        TerminalScreen(client: client, sessionID: route.id, harness: route.harness)
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Home") { globalLaunchedSession = nil }
+                    }
+                }
+            }
         }
         // A detail launched in Inbox is presented over that navigation stack.
         // Dismissing it therefore lands exactly back in Inbox, instead of
@@ -287,6 +332,12 @@ private struct InboxSessionRoute: Identifiable {
         recap = session.recap ?? session.preview
         recapSourceSeq = session.recapSourceSeq
     }
+}
+
+private struct GlobalSessionRoute: Identifiable {
+    let id: String
+    let isStructured: Bool
+    let harness: String
 }
 
 /// Defers constructing and loading a tab's view hierarchy until the tab is first visited,

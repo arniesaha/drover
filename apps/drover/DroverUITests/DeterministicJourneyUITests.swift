@@ -175,8 +175,10 @@ final class DeterministicJourneyUITests: XCTestCase {
         let app = makeCoreJourneyApp()
         app.launch()
         XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 5))
-        app.buttons["settings-button"].tap()
-        let guide = app.buttons["settings-server-setup-guide"]
+        let settings = app.tabBars.buttons["Settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        settings.tap()
+        let guide = app.buttons["Set Up Another Host"]
         XCTAssertTrue(guide.waitForExistence(timeout: 5))
         guide.tap()
         XCTAssertTrue(app.buttons["server-setup-mode-host"].waitForExistence(timeout: 5))
