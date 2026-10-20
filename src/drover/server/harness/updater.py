@@ -438,10 +438,13 @@ class HostUpdater:
             )
             self._record_refusal(target, "runtime_venv_mismatch")
             return False
-        if not self._layout.smoke_test(target):
+        if not self._layout.verify_runtime(target):
             # The installer may have reported success; this is the last gate
-            # before the symlink moves.
-            log.warning("%s failed its smoke test; refusing to activate", target)
+            # before the symlink moves. Check every service-facing console
+            # script so a stale staged-vm shebang cannot become 203/EXEC.
+            log.warning(
+                "%s failed final-runtime verification; refusing to activate", target
+            )
             self._record_refusal(target, "smoke_test")
             return False
         if not drain_for_restart(self._state):

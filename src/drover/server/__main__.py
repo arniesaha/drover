@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -495,8 +496,46 @@ high_water = 1000
 """
 
 
+def _load_private_control_dsn(config_path: Path, cfg: DroverConfig) -> None:
+    """Load only the configured control DSN from the service environment file.
+
+    The hub's service manager sources this private file. An SSH-launched CLI
+    does not inherit it, and pairing is a control-plane operation, so use the
+    same DSN without evaluating arbitrary shell from a user-owned file.
+    """
+    if cfg.control_store.backend != "postgres":
+        return
+    name = cfg.control_store.dsn_env
+    if os.environ.get(name):
+        return
+    environment_file = config_path.parent / "server.env"
+    try:
+        lines = environment_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator != "=" or key != name:
+            continue
+        try:
+            values = shlex.split(value, posix=True)
+        except ValueError:
+            break
+        if len(values) == 1 and values[0]:
+            os.environ[name] = values[0]
+            return
+        break
+    raise click.ClickException(
+        f"PostgreSQL control store DSN is missing from {name}; set {name} or "
+        f"restore {environment_file}"
+    )
+
+
 def _resolve_config(
-    path: Optional[str], *, allow_missing_default: bool = False
+    path: Optional[str],
+    *,
+    allow_missing_default: bool = False,
+    validate_analytics: bool = True,
 ) -> DroverConfig:
     p = Path(path) if path else _DEFAULT_CONFIG_PATH
     if not p.exists():
@@ -514,11 +553,16 @@ def _resolve_config(
     # The central API process explicitly registers its configured path. This
     # is deliberately absent from harnessd, which keeps its host-local DuckDB
     # store even when a hub has PostgreSQL credentials in its environment.
+    _load_private_control_dsn(p, cfg)
     configure_control_store(cfg.duckdb_path, cfg.control_store)
-    from drover.server.lake.serving import configure_analytics, validate_startup_config
+    if validate_analytics:
+        from drover.server.lake.serving import (
+            configure_analytics,
+            validate_startup_config,
+        )
 
-    validate_startup_config(cfg.analytics)
-    configure_analytics(cfg.duckdb_path, cfg.analytics)
+        validate_startup_config(cfg.analytics)
+        configure_analytics(cfg.duckdb_path, cfg.analytics)
     return cfg
 
 
@@ -1556,7 +1600,9 @@ def hosts_unretire_cmd(ctx: click.Context, host_id: str) -> None:
 @click.pass_context
 def pair_cmd(ctx: click.Context, label: str) -> None:
     """Print a QR code that pairs a phone with this fleet."""
-    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=True, validate_analytics=False
+    )
     minted = _local_api_request(
         cfg, "POST", "/auth/pair-codes", {"scope": "device", "label": label}
     )
@@ -1588,7 +1634,9 @@ def pair_cmd(ctx: click.Context, label: str) -> None:
 @click.pass_context
 def pair_host_cmd(ctx: click.Context, name: str) -> None:
     """Print the one-liner that joins another machine to this fleet."""
-    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=True, validate_analytics=False
+    )
     minted = _local_api_request(
         cfg,
         "POST",
@@ -1721,7 +1769,9 @@ def credentials_cmd() -> None:
 @credentials_cmd.command(name="list")
 @click.pass_context
 def credentials_list_cmd(ctx: click.Context) -> None:
-    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=True, validate_analytics=False
+    )
     listing = _local_api_request(cfg, "GET", "/auth/credentials")
     rows = listing.get("credentials") or []
     if not rows:
@@ -1749,7 +1799,9 @@ def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
     from here would never be honoured by the server the staging gate calls,
     and that server's next write would delete it again.
     """
-    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=True, validate_analytics=False
+    )
     minted = _local_api_request(
         cfg, "POST", "/auth/credentials", {"scope": "preflight", "label": label}
     )
@@ -1761,7 +1813,9 @@ def credentials_issue_preflight_cmd(ctx: click.Context, label: str) -> None:
 @click.pass_context
 def credentials_issue_host_cmd(ctx: click.Context, host_id: str) -> None:
     """Issue a bound host token, replacing any active token for this host."""
-    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=True, validate_analytics=False
+    )
     issued = _local_api_request(
         cfg,
         "POST",
@@ -1783,7 +1837,9 @@ def credentials_rotate_host_cmd(ctx: click.Context, host_id: str) -> None:
 @click.argument("credential_id")
 @click.pass_context
 def credentials_revoke_cmd(ctx: click.Context, credential_id: str) -> None:
-    cfg = _resolve_config(ctx.obj["config_path"], allow_missing_default=True)
+    cfg = _resolve_config(
+        ctx.obj["config_path"], allow_missing_default=True, validate_analytics=False
+    )
     _local_api_request(cfg, "DELETE", f"/auth/credentials/{credential_id}")
     click.echo(f"Revoked {credential_id}.")
 

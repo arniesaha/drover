@@ -9,6 +9,7 @@ from pathlib import Path
 import click
 import duckdb
 
+import drover
 from drover.config import DroverConfig, default_config, default_config_path, load_config
 from drover.schema import bootstrap_control_plane_store
 from drover.server.db import duckdb_connect_lock, pin_control_plane_connection
@@ -114,6 +115,7 @@ def run_harnessd_from_options(
 
 
 @click.command(name="drover-harnessd")
+@click.version_option(version=drover.__version__, prog_name="drover-harnessd")
 @click.option("--config", "config_path", default=None, help="Path to config TOML")
 @click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG logging")
 @click.option("--host-id", required=True, help="Stable host id, e.g. workstation")
