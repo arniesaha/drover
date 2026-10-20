@@ -1514,10 +1514,10 @@ async fn deepseek_call(app: &App, method: &str, payload: Value) -> Result<Value>
             .or_else(|| result.get("error").and_then(Value::as_str))
             .unwrap_or("DeepSeek Harness request failed")
     );
-    Ok(result
+    result
         .get("value")
         .cloned()
-        .context("DeepSeek Harness returned an invalid RPC value")?)
+        .context("DeepSeek Harness returned an invalid RPC value")
 }
 async fn start_deepseek(app: &App, session: &mut Session) -> Result<()> {
     if session.native_session_id.is_none() {
@@ -2108,7 +2108,7 @@ async fn permission(
         ) {
             return err(StatusCode::SERVICE_UNAVAILABLE, error.to_string());
         }
-        return ok(json!({"ok":true}));
+        ok(json!({"ok":true}))
     } else {
         err(StatusCode::CONFLICT, "approvals are not enabled")
     }
