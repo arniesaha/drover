@@ -32,7 +32,11 @@ struct UITestScenarioTransport {
         let runID = runUUID.uuidString
         self.kind = kind
         self.runID = runID
-        let receiptState = FixtureReceiptState(runID: runID, kind: kind)
+        let receiptState = FixtureReceiptState(
+            runID: runID,
+            kind: kind,
+            delaysAnalytics: environment["DROVER_UI_TEST_DELAYED_ANALYTICS"] == "1"
+        )
         FixtureHubURLProtocol.install(receiptState: receiptState)
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.protocolClasses = [FixtureHubURLProtocol.self]

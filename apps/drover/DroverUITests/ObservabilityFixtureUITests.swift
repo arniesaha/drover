@@ -302,7 +302,8 @@ final class ObservabilityFixtureUITests: XCTestCase {
         pendingSessionID: String? = nil,
         initialTab: String? = nil,
         awaitingSessionID: String? = nil,
-        liveUpdateSessionID: String? = nil
+        liveUpdateSessionID: String? = nil,
+        delayedAnalytics: Bool = false
     ) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -317,6 +318,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
         }
         if let liveUpdateSessionID {
             app.launchEnvironment["DROVER_UI_TEST_LIVE_UPDATE_SESSION_ID"] = liveUpdateSessionID
+        }
+        if delayedAnalytics {
+            app.launchEnvironment["DROVER_UI_TEST_DELAYED_ANALYTICS"] = "1"
         }
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
@@ -489,6 +493,82 @@ final class ObservabilityFixtureUITests: XCTestCase {
                                  handler: nil)
         wait(for: [update], timeout: 15)
         XCTAssertTrue(chatMenu.exists, "a live session update must not pop the pushed detail")
+    }
+
+    @MainActor
+    func testAnalyticsHorizontalSwipesDuringLoadingAndLiveUpdateStayInAnalytics() {
+        let app = launchRealApp(delayedAnalytics: true)
+        // The Home snapshot enables the Cockpit capability. Ensure it has
+        // arrived before entering Analytics, otherwise its task correctly
+        // declines to begin a request at all.
+        XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 8))
+        let analytics = tab(app, "analytics")
+        analytics.tap()
+
+        let loading = app.descendants(matching: .any)["analytics-loading"]
+        XCTAssertTrue(
+            loading.waitForExistence(timeout: 5),
+            "the fixture must hold the Analytics request while this gesture regression runs"
+        )
+        let analyticsHeader = app.descendants(matching: .any)["screen-header-analytics"]
+        let analyticsScroll = app.scrollViews.firstMatch
+        XCTAssertTrue(analyticsHeader.exists)
+        XCTAssertTrue(analyticsScroll.exists)
+
+        // Build 24 crashed during the page-container's interactive Analytics
+        // -> Accounts swipe. Exercise both physical directions because XCTest
+        // names the finger direction, while the observed report names the
+        // destination direction.
+        for _ in 0..<2 {
+            analyticsScroll.swipeLeft()
+            XCTAssertTrue(loading.exists)
+            XCTAssertTrue(analyticsHeader.exists)
+            XCTAssertFalse(tab(app, "accounts").isSelected)
+            analyticsScroll.swipeRight()
+            XCTAssertTrue(loading.exists)
+            XCTAssertTrue(analyticsHeader.exists)
+        }
+
+        let firstAnalyticsResponse = NSPredicate(format: "label == %@", "1")
+        let initialUpdate = expectation(
+            for: firstAnalyticsResponse,
+            evaluatedWith: app.staticTexts["fixture-analytics-response-count"],
+            handler: nil
+        )
+        wait(for: [initialUpdate], timeout: 10)
+
+        // Changing the reporting range issues AnalyticsView's real async
+        // reload. It is a deterministic live-data update, unlike trying to
+        // infer that a drag crossed SwiftUI's refresh-control threshold.
+        let range = app.buttons["7 days"].firstMatch
+        XCTAssertTrue(range.waitForExistence(timeout: 5))
+        range.tap()
+        let oneDay = app.buttons["1 day"].firstMatch
+        XCTAssertTrue(oneDay.waitForExistence(timeout: 5))
+        oneDay.tap()
+        for _ in 0..<2 {
+            analyticsScroll.swipeLeft()
+            XCTAssertTrue(analyticsHeader.exists)
+            XCTAssertFalse(tab(app, "accounts").isSelected)
+            analyticsScroll.swipeRight()
+            XCTAssertTrue(analyticsHeader.exists)
+        }
+
+        let secondAnalyticsResponse = NSPredicate(format: "label == %@", "2")
+        let liveUpdate = expectation(
+            for: secondAnalyticsResponse,
+            evaluatedWith: app.staticTexts["fixture-analytics-response-count"],
+            handler: nil
+        )
+        wait(for: [liveUpdate], timeout: 10)
+
+        for _ in 0..<2 {
+            analyticsScroll.swipeLeft()
+            XCTAssertTrue(analyticsHeader.exists)
+            XCTAssertFalse(tab(app, "accounts").isSelected)
+            analyticsScroll.swipeRight()
+            XCTAssertTrue(analyticsHeader.exists)
+        }
     }
 
     @MainActor

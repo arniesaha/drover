@@ -57,6 +57,7 @@ struct AnalyticsView: View {
                     ProgressView("Loading analytics…")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 50)
+                        .accessibilityIdentifier("analytics-loading")
                 }
             }
             .padding(14)

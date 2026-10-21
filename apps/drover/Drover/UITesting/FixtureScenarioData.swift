@@ -144,7 +144,7 @@ enum FixtureScenarioData {
         let awaitingSessionID = ProcessInfo.processInfo.environment[
             "DROVER_UI_TEST_AWAITING_SESSION_ID"
         ]
-        return jsonData([
+        var snapshot: [String: Any] = [
             "hosts": [[
                 "host_id": coreJourney.hostID,
                 "status": "online",
@@ -174,7 +174,14 @@ enum FixtureScenarioData {
                 "source": "fixture",
                 "host_id": coreJourney.hostID,
             ]],
-        ])
+        ]
+        // The real-root navigation regression needs Analytics to issue a
+        // request; the ordinary core journey intentionally has no Cockpit.
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_DELAYED_ANALYTICS"] == "1" {
+            snapshot["cockpit_api_version"] = 1
+            snapshot["cockpit_sections"] = ["activity"]
+        }
+        return jsonData(snapshot)
     }
 
     /// The capability journey's fleet: the fixture host advertises Codex and
