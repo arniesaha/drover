@@ -131,3 +131,26 @@ jobs:
 Migration 25 is additive: it adds `work_items.head_sha`, the additive event
 `detail`, and durable GitHub delivery/rollup tables. It does not backfill or
 alter existing values.
+
+## Step 4: hub rules and opt-in execution
+
+Migration 26 is additive. It adds `auto_merge`, `publish`, and
+`automation_gate` (`none`, `ui_review`, or `arnab`) to work items, plus rule
+action identities, dependency edges, and a durable rule cursor. The existing
+`gate` column remains the lifecycle projection. Existing items default to no
+automatic action.
+
+Workers publish branches themselves. With `publish`, the hub verifies the
+remote branch SHA before opening a draft PR; absence or mismatch emits
+`orchestrator_wake` (`branch_not_pushed` or `head_mismatch`). A behind PR is
+updated only through GitHub; exact-head green CI can ready and squash-merge
+only with `auto_merge` and `automation_gate=none`; merged PRs finish items and
+unblock dependencies. Failures, worker errors, review, and ambiguity wake the
+orchestrator. Actions are keyed by item/rule/head SHA and dry-run records only
+`would_act`. The rule worker is event driven and sweeps every 30-60 minutes.
+
+`shadow_mode` remains the default. A goal must opt into `execution_enabled`
+before reconciler candidates call the existing `WorkService.launch` path.
+Global/per-goal caps, estimated-cost budgets, and the kill switch deny before
+a launch intent exists. The external cron reduces to a safety sweep and
+responses to `orchestrator_wake`.

@@ -143,7 +143,13 @@ class GitHubCredential(Model):
     repository_id: int | None = Field(default=None, gt=0)
     capabilities: list[
         Literal[
-            "issues_read", "pulls_read", "checks_read", "actions_read", "issues_write"
+            "issues_read",
+            "pulls_read",
+            "checks_read",
+            "actions_read",
+            "issues_write",
+            "pulls_write",
+            "contents_read",
         ]
     ]
 
@@ -164,6 +170,10 @@ class GoalScope(Model):
     policy_path: str = ""
     execution_cwds: dict[str, str] = Field(default_factory=dict)
     brief_ref: str | None = None
+    execution_enabled: bool = False
+    execution_budget: float | None = Field(default=None, gt=0)
+    execution_estimated_cost: float = Field(default=5.0, gt=0)
+    execution_max_workers: int | None = Field(default=None, gt=0)
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -219,6 +229,18 @@ class GitHubWebhookConfig(Model):
         return self
 
 
+class WorkItemRulesConfig(Model):
+    enabled: bool = False
+    dry_run: bool = False
+    sweep_seconds: int = Field(default=1800, ge=1800, le=3600)
+    batch_size: int = Field(default=32, ge=1, le=100)
+
+
+class QueueExecutionConfig(Model):
+    global_max_workers: int = Field(default=1, ge=1)
+    kill_switch: bool = False
+
+
 class WorkQueueConfig(Model):
     enabled: bool = False
     shadow_mode: bool = True
@@ -227,6 +249,8 @@ class WorkQueueConfig(Model):
     principal_roles: dict[str, str] = Field(default_factory=dict)
     work_item_events: WorkItemEventsConfig = Field(default_factory=WorkItemEventsConfig)
     github_webhook: GitHubWebhookConfig = Field(default_factory=GitHubWebhookConfig)
+    rules: WorkItemRulesConfig = Field(default_factory=WorkItemRulesConfig)
+    execution: QueueExecutionConfig = Field(default_factory=QueueExecutionConfig)
 
     @model_validator(mode="after")
     def valid(self):

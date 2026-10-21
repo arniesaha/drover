@@ -342,6 +342,41 @@ def test_quota_reserve_unknown_and_exact_fraction(service):
         route(service.harness.quota(), load_policy(), 1, set())
 
 
+def test_opt_in_execution_uses_launch_and_respects_budget_caps_and_kill_switch(service):
+    from drover.server.work_queue.reconciler import QueueExecutionCoordinator
+
+    scope = service.config.goals[0].model_copy(
+        update={
+            "execution_enabled": True,
+            "execution_budget": 5.0,
+            "execution_estimated_cost": 5.0,
+            "execution_max_workers": 1,
+        }
+    )
+    service.config = service.config.model_copy(
+        update={
+            "goals": [scope],
+            "execution": service.config.execution.model_copy(
+                update={"global_max_workers": 1}
+            ),
+        }
+    )
+    coordinator = QueueExecutionCoordinator(service)
+    assert coordinator.launch_candidate("goal", 1).get("launched") is True
+    assert coordinator.launch_candidate("goal", 1)["denied"] == "global_cap"
+    service.config = service.config.model_copy(
+        update={
+            "execution": service.config.execution.model_copy(
+                update={"kill_switch": True}
+            )
+        }
+    )
+    assert (
+        QueueExecutionCoordinator(service).launch_candidate("goal", 1)["denied"]
+        == "kill_switch"
+    )
+
+
 def test_policy_capacity_and_retry_override(service, tmp_path):
     data = load_policy().model_dump()
     data["capacity"]["workspace_workers"] = 1

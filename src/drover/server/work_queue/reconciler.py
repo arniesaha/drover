@@ -11,6 +11,87 @@ from datetime import datetime, timezone
 
 from .config import WorkQueueConfig, load_policy
 from .github import GitHubProvider, ProviderUnavailable
+from .service import WorkActor, identity
+
+
+class QueueExecutionCoordinator:
+    """The sole automatic path delegates to the existing WorkService launcher."""
+
+    def __init__(self, service):
+        self.service = service
+        self.health = {"launches": 0, "cap_denials": 0, "budget_denials": 0}
+
+    def launch_candidate(self, goal_id, number):
+        with self.service.lock:
+            config = self.service.config
+            scope = next(
+                (item for item in config.goals if item.goal_id == goal_id), None
+            )
+            if scope is None or not scope.execution_enabled or config.shadow_mode:
+                return {"denied": "execution_disabled"}
+            if self.service.execution_kill_switch or config.execution.kill_switch:
+                return {"denied": "kill_switch"}
+            active = self.service.harness.active(self.service.store.links())
+            if len(active) >= config.execution.global_max_workers or (
+                sum(row["goal_id"] == goal_id for row in active)
+                >= (scope.execution_max_workers or config.execution.global_max_workers)
+            ):
+                self.health["cap_denials"] += 1
+                return {"denied": "global_cap"}
+            if (
+                scope.execution_budget is not None
+                and scope.execution_estimated_cost > scope.execution_budget
+            ):
+                self.health["budget_denials"] += 1
+                return {"denied": "budget"}
+            actor = WorkActor("control:queue-execution", "nix")
+            row = self.service.launch(
+                goal_id,
+                number,
+                identity("automatic-launch", goal_id, number),
+                scope.execution_estimated_cost,
+                actor=actor,
+            )
+        self.health["launches"] += 1
+        return {"launched": True, "link": row}
+
+
+class QueueExecutionWorker:
+    """Consumes the established candidate projection; it does not launch directly."""
+
+    def __init__(self, service):
+        self.service = service
+        self.coordinator = QueueExecutionCoordinator(service)
+        self.reconciler = ShadowReconciler(
+            service.config, service_principal="control:queue-execution"
+        )
+        self._stop = threading.Event()
+        self._thread = None
+
+    def process_once(self):
+        report = self.reconciler.poll()
+        for candidate in report["actions"]:
+            if candidate["kind"] == "launch_candidate":
+                self.coordinator.launch_candidate(
+                    candidate["goal_id"], candidate["number"]
+                )
+
+    def start(self, shutdown_event=None):
+        if self._thread is not None:
+            return
+
+        def run():
+            while not self._stop.is_set() and not (
+                shutdown_event and shutdown_event.is_set()
+            ):
+                self.process_once()
+                if self._stop.wait(5):
+                    return
+
+        self._thread = threading.Thread(
+            target=run, name="work-queue-execution", daemon=True
+        )
+        self._thread.start()
 
 
 def _identity(workspace, repo, source, action):

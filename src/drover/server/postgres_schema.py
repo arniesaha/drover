@@ -18,6 +18,7 @@ EXPORTER_RESTART_GUARD_MIGRATION = 19
 HUB_WORK_ITEMS_MIGRATION = 23
 WORK_ITEM_EVENTS_MIGRATION = 24
 GITHUB_WORK_ITEM_EVENTS_MIGRATION = 25
+CONTINUITY_RULES_MIGRATION = 26
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -847,6 +848,28 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
               PRIMARY KEY (work_item_id, head_sha, conclusion)
             )
             """,
+        ),
+    ),
+    (
+        CONTINUITY_RULES_MIGRATION,
+        (
+            "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS auto_merge BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS automation_gate TEXT NOT NULL DEFAULT 'none'",
+            "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS publish BOOLEAN NOT NULL DEFAULT FALSE",
+            """CREATE TABLE IF NOT EXISTS work_item_rule_actions (
+              work_item_id TEXT NOT NULL REFERENCES work_items(id), rule TEXT NOT NULL,
+              head_sha TEXT NOT NULL, state TEXT NOT NULL, dry_run BOOLEAN NOT NULL DEFAULT FALSE,
+              reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              PRIMARY KEY (work_item_id, rule, head_sha))""",
+            """CREATE TABLE IF NOT EXISTS work_item_dependencies (
+              blocker_id TEXT NOT NULL REFERENCES work_items(id), dependent_id TEXT NOT NULL REFERENCES work_items(id),
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (blocker_id, dependent_id),
+              CHECK (blocker_id <> dependent_id))""",
+            "CREATE INDEX IF NOT EXISTS work_item_dependencies_dependent ON work_item_dependencies (dependent_id)",
+            """CREATE TABLE IF NOT EXISTS work_item_rule_cursors (
+              workspace_id TEXT PRIMARY KEY, cursor BIGINT NOT NULL DEFAULT 0,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
         ),
     ),
 )
