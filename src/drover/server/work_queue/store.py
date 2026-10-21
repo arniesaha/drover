@@ -352,6 +352,22 @@ class WorkStore:
                     con.execute("UPDATE work_items SET stage='queued', updated_at=now() WHERE id=?", [row["dependent_id"]])
                     append_timeline_event(con, workspace_id=self.workspace_id, item_id=row["dependent_id"], kind="dependency_unblocked", stage="queued", gate=previous[1], detail=item_id, from_stage="blocked")
 
+    def append_rule_event(self, item_id, *, kind, detail):
+        with self.connection() as con:
+            row = con.execute("SELECT stage, gate FROM work_items WHERE workspace_id=? AND id=? FOR UPDATE", [self.workspace_id, item_id]).fetchone()
+            if row is not None:
+                append_timeline_event(con, workspace_id=self.workspace_id, item_id=item_id, kind=kind, stage=row[0], gate=row[1], detail=detail, from_stage=row[0])
+
+    def rule_cursor(self):
+        with self.connection() as con:
+            row = con.execute("SELECT cursor FROM work_item_rule_cursors WHERE workspace_id=?", [self.workspace_id]).fetchone()
+            return int(row[0]) if row else 0
+
+    def advance_rule_cursor(self, cursor):
+        with self.connection() as con:
+            con.execute("""INSERT INTO work_item_rule_cursors (workspace_id, cursor) VALUES (?, ?)
+                ON CONFLICT (workspace_id) DO UPDATE SET cursor=GREATEST(work_item_rule_cursors.cursor, EXCLUDED.cursor), updated_at=now()""", [self.workspace_id, cursor])
+
     def create_work_item_subscription(
         self, credential_id, *, url, event_kinds, repo=None
     ):
@@ -707,8 +723,8 @@ def apply_hub_lifecycle_event(con, *, event_id, session_id, event_type, payload)
     if inserted is None:
         return False
     con.execute(
-        "UPDATE work_items SET stage = ?, gate = ?, updated_at = now() WHERE id = ?",
-        [stage, gate, row[0]],
+        "UPDATE work_items SET stage = ?, gate = ?, head_sha = COALESCE(?, head_sha), updated_at = now() WHERE id = ?",
+        [stage, gate, detail if kind == "worker_done" else None, row[0]],
     )
     # The lifecycle timeline row has already been inserted so preserve its
     # stable id while creating the event/delivery facts.  The helper normally
@@ -730,8 +746,8 @@ def apply_hub_lifecycle_event(con, *, event_id, session_id, event_type, payload)
     con.execute(
         """INSERT INTO work_item_events
            (event_id, workspace_id, cursor, item_id, kind, from_stage, to_stage,
-            gate, next_action, session_id, pr, occurred_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           gate, next_action, session_id, pr, occurred_at, detail)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             timeline_id,
             item[0],
@@ -745,6 +761,7 @@ def apply_hub_lifecycle_event(con, *, event_id, session_id, event_type, payload)
             item[2],
             item[3],
             event_row[0],
+            detail,
         ],
     )
     subscriptions = con.execute(

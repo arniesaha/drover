@@ -239,6 +239,49 @@ class GitHubProvider:
         self.list_checks(sha)
         return self._pages(self.base + f"/commits/{sha}/statuses")
 
+    @staticmethod
+    def _pr_number(pr):
+        import re
+
+        match = re.search(r"/pull/(\d+)(?:$|[/?#])", pr or "")
+        if match is None:
+            raise ValueError("pull request URL required")
+        return int(match.group(1))
+
+    def branch_head(self, branch):
+        self._require("contents_read")
+        if not isinstance(branch, str) or not branch:
+            raise ValueError("branch required")
+        try:
+            row = self._request("GET", self.base + "/git/ref/heads/" + branch)
+        except ProviderUnavailable as exc:
+            if str(exc) == "github_http_404":
+                return None
+            raise
+        return ((row or {}).get("object") or {}).get("sha")
+
+    def open_draft_pr(self, branch, title):
+        self._require("pulls_write")
+        row = self._request("POST", self.base + "/pulls", body={"title": title, "head": branch, "base": "main", "draft": True})
+        return row["html_url"]
+
+    def pull_is_current(self, pr):
+        self._require("pulls_read")
+        row = self._request("GET", self.base + f"/pulls/{self._pr_number(pr)}")
+        return not bool(row.get("mergeable_state") in {"behind", "dirty"})
+
+    def mark_pr_ready(self, pr):
+        self._require("pulls_write")
+        self._request("PATCH", self.base + f"/pulls/{self._pr_number(pr)}", body={"draft": False})
+
+    def update_pr_branch(self, pr):
+        self._require("pulls_write")
+        self._request("PUT", self.base + f"/pulls/{self._pr_number(pr)}/update-branch")
+
+    def squash_merge(self, pr, head_sha):
+        self._require("pulls_write")
+        self._request("PUT", self.base + f"/pulls/{self._pr_number(pr)}/merge", body={"merge_method": "squash", "sha": head_sha})
+
     def list_attention(self):
         rows = []
         if "pulls_read" in self.capabilities:

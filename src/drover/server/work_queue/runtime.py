@@ -158,6 +158,22 @@ def start_github_webhook_worker(collector, config, shutdown_event):
     return worker
 
 
+def start_work_item_rule_worker(collector, config, shutdown_event):
+    service = getattr(collector, "work_control", None)
+    if service is None or not config.rules.enabled:
+        return None
+    from drover.server.work_queue.rules import WorkItemRuleWorker
+
+    worker = WorkItemRuleWorker(
+        service.store,
+        {scope.repo: service.providers[scope.goal_id] for scope in config.goals},
+        config.rules,
+    )
+    worker.start(shutdown_event)
+    collector.work_item_rule_worker = worker
+    return worker
+
+
 def authenticated_actor(auth, headers, config):
     if not auth.enabled:
         raise PermissionError("work tools require credentials")
