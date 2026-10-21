@@ -360,7 +360,7 @@ class WorkStore:
             rows = self.rows(
                 con.execute(
                     """SELECT event_id, cursor, item_id, kind, from_stage, to_stage, gate,
-                              next_action, session_id, pr, occurred_at
+                              next_action, session_id, pr, occurred_at, detail
                        FROM work_item_events WHERE workspace_id = ? AND cursor > ?
                        ORDER BY cursor LIMIT ?""",
                     [self.workspace_id, since, limit],
@@ -450,6 +450,113 @@ class WorkStore:
             "dead_lettered_total": int(row[1] or 0),
             "oldest_lag_seconds": float(row[2] or 0),
         }
+
+    def persist_github_webhook(self, *, delivery_id, event_type, payload):
+        """Durably accept a verified GitHub delivery without processing it."""
+        with self.connection() as con:
+            row = con.execute(
+                """INSERT INTO github_webhook_deliveries
+                   (delivery_id, workspace_id, event_type, payload)
+                   VALUES (?, ?, ?, ?) ON CONFLICT (delivery_id) DO NOTHING
+                   RETURNING delivery_id""",
+                [delivery_id, self.workspace_id, event_type, payload],
+            ).fetchone()
+        return row is not None
+
+    def claim_github_webhooks(self, limit):
+        with self.connection() as con:
+            rows = self.rows(
+                con.execute(
+                    """SELECT delivery_id, event_type, payload, attempts
+                   FROM github_webhook_deliveries WHERE workspace_id = ? AND
+                   (state = 'pending' OR (state = 'leased' AND lease_until <= now()))
+                   ORDER BY received_at LIMIT ? FOR UPDATE SKIP LOCKED""",
+                    [self.workspace_id, limit],
+                )
+            )
+            for row in rows:
+                row["attempts"] += 1
+                con.execute(
+                    """UPDATE github_webhook_deliveries SET state = 'leased', attempts = ?,
+                       lease_until = now() + interval '35 seconds' WHERE delivery_id = ?""",
+                    [row["attempts"], row["delivery_id"]],
+                )
+        return rows
+
+    def complete_github_webhook(self, row, *, error=None):
+        with self.connection() as con:
+            con.execute(
+                """UPDATE github_webhook_deliveries SET state = 'processed', processed_at = now(),
+                   lease_until = NULL, last_error = ? WHERE delivery_id = ? AND state = 'leased'
+                   AND attempts = ?""",
+                [error, row["delivery_id"], row["attempts"]],
+            )
+
+    def find_github_item(self, *, repo, pr_number=None, branch=None):
+        if not repo or (pr_number is None and not branch):
+            return None
+        clauses = []
+        if pr_number is not None:
+            clauses.append(("pr ~ ?", r"/pull/" + str(pr_number) + r"(?:$|[/?#])"))
+        if branch:
+            clauses.append(("branch = ?", branch))
+        with self.connection() as con:
+            for clause, value in clauses:
+                rows = self.rows(
+                    con.execute(
+                        "SELECT * FROM work_items WHERE workspace_id = ? AND repo = ? AND "
+                        + clause
+                        + " ORDER BY updated_at DESC, id LIMIT 2",
+                        [self.workspace_id, repo, value],
+                    )
+                )
+                if len(rows) == 1:
+                    return rows[0]
+        return None
+
+    def github_items_for_repo(self, repo):
+        with self.connection() as con:
+            return self.rows(
+                con.execute(
+                    """SELECT * FROM work_items WHERE workspace_id = ? AND repo = ?
+                   AND pr IS NOT NULL AND stage NOT IN ('done', 'closed')""",
+                    [self.workspace_id, repo],
+                )
+            )
+
+    def append_github_fact(self, item_id, *, kind, detail, head_sha=None):
+        """Append a provider fact through the same transactional event outbox."""
+        with self.connection() as con:
+            item = con.execute(
+                "SELECT stage, gate FROM work_items WHERE workspace_id = ? AND id = ? FOR UPDATE",
+                [self.workspace_id, item_id],
+            ).fetchone()
+            if item is None:
+                return None
+            if head_sha:
+                con.execute(
+                    "UPDATE work_items SET head_sha = ?, updated_at = now() WHERE id = ?",
+                    [head_sha, item_id],
+                )
+            return append_timeline_event(
+                con,
+                workspace_id=self.workspace_id,
+                item_id=item_id,
+                kind=kind,
+                stage=item[0],
+                gate=item[1],
+                detail=detail,
+                from_stage=item[0],
+            )
+
+    def record_github_ci_rollup(self, item_id, head_sha, conclusion):
+        with self.connection() as con:
+            row = con.execute(
+                """INSERT INTO github_ci_rollups (work_item_id, head_sha, conclusion)
+                   VALUES (?, ?, ?) ON CONFLICT DO NOTHING RETURNING work_item_id""",
+                [item_id, head_sha, conclusion],
+            ).fetchone()
+        return row is not None
 
     def hub_export(self):
         items = self.hub_items()

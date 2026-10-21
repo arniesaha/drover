@@ -94,6 +94,9 @@ class WorkService:
             harness,
         )
         self.lock = threading.RLock()
+        from .github_events import GitHubWebhookReceiver
+
+        self.github_webhooks = GitHubWebhookReceiver(store, config.github_webhook)
 
     def register_hub_launch(self, con, *, session_id, payload, owner):
         """Register the hub's accepted session before its transaction commits.

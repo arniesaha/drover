@@ -2842,12 +2842,14 @@ def _run_api_role(
 
     start_shadow_reconciler(collector, cfg.work_queue, stop, auth=auth)
     from drover.server.work_queue.runtime import (
+        start_github_webhook_worker,
         start_work_item_event_worker,
         start_work_service,
     )
 
     start_work_service(collector, cfg.work_queue)
     start_work_item_event_worker(collector, cfg.work_queue, stop)
+    start_github_webhook_worker(collector, cfg.work_queue, stop)
     if cfg.update_enabled:
         planner = UpdatePlanner(
             cfg, RuntimeLayout(config_home(), root=cfg.update_runtime_root)
@@ -3550,12 +3552,14 @@ def run(
                     metrics_collector, cfg.work_queue, stop, auth=auth
                 )
                 from drover.server.work_queue.runtime import (
+                    start_github_webhook_worker,
                     start_work_item_event_worker,
                     start_work_service,
                 )
 
                 start_work_service(metrics_collector, cfg.work_queue)
                 start_work_item_event_worker(metrics_collector, cfg.work_queue, stop)
+                start_github_webhook_worker(metrics_collector, cfg.work_queue, stop)
             # The hub decides what the fleet converges on and publishes it on
             # the heartbeat every harnessd already sends. Attached to the
             # collector rather than threaded through, because the only thing

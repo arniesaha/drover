@@ -143,7 +143,14 @@ class _UnknownSessionRetries:
 # credential yet is exactly the caller it exists for. It is hardened inside
 # _redeem_pairing_code (single-use codes, TTL, per-source throttle) rather
 # than by this gate.
-_PUBLIC_PATHS = {"/healthz", "/readyz", "/auth/login", "/auth/pair", "/harness/probe"}
+_PUBLIC_PATHS = {
+    "/healthz",
+    "/readyz",
+    "/auth/login",
+    "/auth/pair",
+    "/harness/probe",
+    "/integrations/github/webhook",
+}
 
 # The initial shell has no inline code or remote resources. Keep the hub's
 # trust boundary explicit before P1 adds Markdown, attachments or terminals.
@@ -1647,6 +1654,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path.startswith("/_internal/analytics/"):
             self._handle_host_data_bridge(path, parsed.query)
             return
+        if path == "/integrations/github/webhook":
+            self._github_webhook()
+            return
         if not self._gate(path):
             return
         if path == "/work-items/subscriptions":
@@ -2479,6 +2489,26 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             json.dumps(result, default=str),
             extra_headers={"Cache-Control": "no-store"},
         )
+
+    def _github_webhook(self):
+        service = getattr(self.collector, "work_control", None)
+        receiver = getattr(service, "github_webhooks", None)
+        if receiver is None:
+            self._send(
+                503, "application/json", '{"error":"github webhook unavailable"}'
+            )
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = -1
+        if length < 0 or length > receiver.config.max_body_bytes:
+            self.close_connection = True
+            self._send(413, "application/json", '{"error":"webhook body too large"}')
+            return
+        body = self.rfile.read(length)
+        status, result = receiver.accept(self.headers, body)
+        self._send(status, "application/json", json.dumps(result))
 
     def _harness_registry(self) -> HarnessRegistry:
         return HarnessRegistry(self.collector.duckdb_path)

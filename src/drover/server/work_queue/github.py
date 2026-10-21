@@ -166,6 +166,44 @@ class GitHubProvider:
             if "pull_request" not in r
         ]
 
+    def exact_head_check_state(self, sha, branch):
+        """Return green/failed/pending for this branch's required checks at SHA."""
+        self._require("checks_read")
+        required = self._request(
+            "GET", self.base + f"/branches/{branch}/protection/required_status_checks"
+        )
+        contexts = (
+            set(required.get("contexts", [])) if isinstance(required, dict) else set()
+        )
+        contexts.update(
+            check.get("context")
+            for check in (
+                required.get("checks", []) if isinstance(required, dict) else []
+            )
+            if isinstance(check, dict) and isinstance(check.get("context"), str)
+        )
+        if not contexts:
+            return "pending"
+        data = self._request(
+            "GET", self.base + f"/commits/{sha}/check-runs", params={"filter": "latest"}
+        )
+        runs = data.get("check_runs") if isinstance(data, dict) else None
+        if not isinstance(runs, list) or not runs:
+            return "pending"
+        by_name = {run.get("name"): run for run in runs if isinstance(run, dict)}
+        conclusions = []
+        for context in contexts:
+            run = by_name.get(context)
+            if not isinstance(run, dict) or run.get("status") != "completed":
+                return "pending"
+            conclusions.append(run.get("conclusion"))
+        # Be conservative if an incomplete non-required run is present: this
+        # avoids announcing green while the suite itself still runs.
+        for run in runs:
+            if not isinstance(run, dict) or run.get("status") != "completed":
+                return "pending"
+        return "green" if all(value == "success" for value in conclusions) else "failed"
+
     def get_item(self, ref):
         self._require("issues_read")
         return self._request("GET", self._ref(ref))

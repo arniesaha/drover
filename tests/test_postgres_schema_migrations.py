@@ -21,6 +21,7 @@ import hashlib
 from drover.server.postgres_schema import (
     EXPORTER_FRESHNESS_MIGRATION,
     EXPORTER_RESTART_GUARD_MIGRATION,
+    GITHUB_WORK_ITEM_EVENTS_MIGRATION,
     HUB_WORK_ITEMS_MIGRATION,
     PROFILE_MIGRATION,
     WORK_ITEM_EVENTS_MIGRATION,
@@ -28,6 +29,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    GITHUB_WORK_ITEM_EVENTS_MIGRATION: "e87f807d050efffa526c1878984b5e976cca5685732e6711b30b31e1ff7f1df0",
     WORK_ITEM_EVENTS_MIGRATION: "7323ab4d004d889ba2d7856f7c9e2af86796288d6ba566deb7a1cc9e0760624e",
     HUB_WORK_ITEMS_MIGRATION: "14a41ff01c0c4c10ba305572a415c35324f28af785fa90cb773e1d09d8565d4f",
     22: "59435a76787934e90c01fe728e69ba26690410f3f8faa685e951578e657e1a5c",
