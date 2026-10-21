@@ -16,6 +16,7 @@ EXPORTER_FRESHNESS_MIGRATION = 16
 WORK_QUEUE_MIGRATION = 18
 EXPORTER_RESTART_GUARD_MIGRATION = 19
 HUB_WORK_ITEMS_MIGRATION = 23
+WORK_ITEM_EVENTS_MIGRATION = 24
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -756,6 +757,64 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             "CREATE INDEX IF NOT EXISTS work_item_timeline_item_order ON work_item_timeline (work_item_id, created_at, id)",
+        ),
+    ),
+    (
+        WORK_ITEM_EVENTS_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS work_item_subscriptions (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              credential_id TEXT NOT NULL,
+              url TEXT NOT NULL,
+              event_kinds_json TEXT NOT NULL DEFAULT '[]',
+              repo TEXT,
+              hmac_secret TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS work_item_subscriptions_owner ON work_item_subscriptions (workspace_id, credential_id, created_at DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS work_item_event_cursors (
+              workspace_id TEXT PRIMARY KEY,
+              cursor BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS work_item_events (
+              event_id TEXT PRIMARY KEY REFERENCES work_item_timeline(id),
+              workspace_id TEXT NOT NULL,
+              cursor BIGINT NOT NULL,
+              item_id TEXT NOT NULL REFERENCES work_items(id),
+              kind TEXT NOT NULL,
+              from_stage TEXT,
+              to_stage TEXT,
+              gate TEXT,
+              next_action TEXT,
+              session_id TEXT,
+              pr TEXT,
+              occurred_at TIMESTAMPTZ NOT NULL,
+              UNIQUE (workspace_id, cursor)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS work_item_events_pull ON work_item_events (workspace_id, cursor)",
+            """
+            CREATE TABLE IF NOT EXISTS work_item_event_deliveries (
+              subscription_id TEXT NOT NULL REFERENCES work_item_subscriptions(id) ON DELETE CASCADE,
+              event_id TEXT NOT NULL REFERENCES work_item_events(event_id) ON DELETE CASCADE,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              last_status INTEGER,
+              state TEXT NOT NULL DEFAULT 'pending',
+              lease_until TIMESTAMPTZ,
+              delivered_at TIMESTAMPTZ,
+              dead_lettered_at TIMESTAMPTZ,
+              PRIMARY KEY (subscription_id, event_id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS work_item_event_deliveries_due ON work_item_event_deliveries (state, next_attempt_at)",
         ),
     ),
 )

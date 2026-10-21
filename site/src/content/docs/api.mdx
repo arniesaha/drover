@@ -118,6 +118,16 @@ tracking; it only suppresses automatic queue actions.
 | `GET` | `/work-items/{id}` | Get an item, including its append-only timeline. |
 | `PATCH` | `/work-items/{id}` | Set `stage`, `next`, `pr`, or `acceptance`. |
 | `GET` | `/work-items/export` | Reconciler projection: `{"items":[{"id","stage","pr","branch","sid","next","after"}]}`. |
+| `POST` | `/work-items/subscriptions` | Create a credential-scoped webhook subscription; returns its HMAC secret once. |
+| `GET` | `/work-items/subscriptions` | List the caller's subscriptions (never returns secrets). |
+| `DELETE` | `/work-items/subscriptions/{id}` | Delete one of the caller's subscriptions. |
+| `GET` | `/work-items/events?since=0` | Pull the ordered event stream; returns `next_cursor`. |
+
+Webhook URLs must be HTTPS, except loopback and explicitly allow-listed tailnet
+hosts. Deliveries are at least once and include `X-Drover-Event-Id` for
+deduplication plus `X-Drover-Signature: sha256=<hmac>` over the JSON body.
+The payload is versioned (`v: 1`) and includes the event id, item id, kind,
+stage transition, gate, next action, session, PR, and occurrence timestamp.
 
 ### Memory and analytics
 
