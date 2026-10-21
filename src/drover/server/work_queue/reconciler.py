@@ -24,7 +24,9 @@ class QueueExecutionCoordinator:
     def launch_candidate(self, goal_id, number):
         with self.service.lock:
             config = self.service.config
-            scope = next((item for item in config.goals if item.goal_id == goal_id), None)
+            scope = next(
+                (item for item in config.goals if item.goal_id == goal_id), None
+            )
             if scope is None or not scope.execution_enabled or config.shadow_mode:
                 return {"denied": "execution_disabled"}
             if self.service.execution_kill_switch or config.execution.kill_switch:
@@ -36,7 +38,10 @@ class QueueExecutionCoordinator:
             ):
                 self.health["cap_denials"] += 1
                 return {"denied": "global_cap"}
-            if scope.execution_budget is not None and scope.execution_estimated_cost > scope.execution_budget:
+            if (
+                scope.execution_budget is not None
+                and scope.execution_estimated_cost > scope.execution_budget
+            ):
                 self.health["budget_denials"] += 1
                 return {"denied": "budget"}
             actor = WorkActor("control:queue-execution", "nix")
@@ -67,17 +72,25 @@ class QueueExecutionWorker:
         report = self.reconciler.poll()
         for candidate in report["actions"]:
             if candidate["kind"] == "launch_candidate":
-                self.coordinator.launch_candidate(candidate["goal_id"], candidate["number"])
+                self.coordinator.launch_candidate(
+                    candidate["goal_id"], candidate["number"]
+                )
 
     def start(self, shutdown_event=None):
         if self._thread is not None:
             return
+
         def run():
-            while not self._stop.is_set() and not (shutdown_event and shutdown_event.is_set()):
+            while not self._stop.is_set() and not (
+                shutdown_event and shutdown_event.is_set()
+            ):
                 self.process_once()
                 if self._stop.wait(5):
                     return
-        self._thread = threading.Thread(target=run, name="work-queue-execution", daemon=True)
+
+        self._thread = threading.Thread(
+            target=run, name="work-queue-execution", daemon=True
+        )
         self._thread.start()
 
 

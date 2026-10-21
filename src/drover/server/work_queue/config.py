@@ -143,8 +143,13 @@ class GitHubCredential(Model):
     repository_id: int | None = Field(default=None, gt=0)
     capabilities: list[
         Literal[
-            "issues_read", "pulls_read", "checks_read", "actions_read", "issues_write",
-            "pulls_write", "contents_read"
+            "issues_read",
+            "pulls_read",
+            "checks_read",
+            "actions_read",
+            "issues_write",
+            "pulls_write",
+            "contents_read",
         ]
     ]
 

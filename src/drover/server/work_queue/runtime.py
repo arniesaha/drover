@@ -176,7 +176,11 @@ def start_work_item_rule_worker(collector, config, shutdown_event):
 
 def start_queue_execution_worker(collector, config, shutdown_event):
     service = getattr(collector, "work_control", None)
-    if service is None or config.shadow_mode or not any(g.execution_enabled for g in config.goals):
+    if (
+        service is None
+        or config.shadow_mode
+        or not any(g.execution_enabled for g in config.goals)
+    ):
         return None
     from drover.server.work_queue.reconciler import QueueExecutionWorker
 
@@ -257,7 +261,17 @@ def dispatch_hub_items(service, auth, headers, operation, args):
             if result is None:
                 return 404, {"error": "work item not found"}
         elif operation == "patch":
-            allowed = {"id", "stage", "next", "pr", "acceptance", "auto_merge", "automation_gate", "publish", "depends_on"}
+            allowed = {
+                "id",
+                "stage",
+                "next",
+                "pr",
+                "acceptance",
+                "auto_merge",
+                "automation_gate",
+                "publish",
+                "depends_on",
+            }
             if set(args) - allowed:
                 raise ValueError("invalid work item fields")
             result = service.store.patch_hub_item(

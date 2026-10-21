@@ -216,9 +216,11 @@ def test_additive_latest_control_migration_uses_point_release_path():
                     else (
                         "alter_table_add_column_constant_default"
                         if " DEFAULT " in statement
-                        else "alter_table_add_nullable_column"
-                        if statement.startswith("ALTER TABLE")
-                        else "create_index"
+                        else (
+                            "alter_table_add_nullable_column"
+                            if statement.startswith("ALTER TABLE")
+                            else "create_index"
+                        )
                     )
                 ),
             }

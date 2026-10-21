@@ -250,9 +250,19 @@ class WorkStore:
             )
             return rows[0]
 
-    def patch_hub_item(self, item_id, *, stage=None, next_action=None, pr=None,
-                       acceptance=None, auto_merge=None, automation_gate=None,
-                       publish=None, depends_on=None):
+    def patch_hub_item(
+        self,
+        item_id,
+        *,
+        stage=None,
+        next_action=None,
+        pr=None,
+        acceptance=None,
+        auto_merge=None,
+        automation_gate=None,
+        publish=None,
+        depends_on=None,
+    ):
         values = {
             "stage": stage,
             "next_action": next_action,
@@ -271,14 +281,23 @@ class WorkStore:
             if key in {"stage", "next_action", "pr", "acceptance", "automation_gate"}
         ):
             raise ValueError("non-empty work item fields required")
-        if automation_gate is not None and automation_gate not in {"none", "ui_review", "arnab"}:
+        if automation_gate is not None and automation_gate not in {
+            "none",
+            "ui_review",
+            "arnab",
+        }:
             raise ValueError("invalid automation gate")
-        if any(key in {"auto_merge", "publish"} and not isinstance(value, bool)
-               for key, value in supplied.items()):
+        if any(
+            key in {"auto_merge", "publish"} and not isinstance(value, bool)
+            for key, value in supplied.items()
+        ):
             raise ValueError("policy booleans required")
-        if depends_on is not None and (not isinstance(depends_on, list) or item_id in depends_on
-                                       or len(set(depends_on)) != len(depends_on)
-                                       or any(not isinstance(value, str) or not value for value in depends_on)):
+        if depends_on is not None and (
+            not isinstance(depends_on, list)
+            or item_id in depends_on
+            or len(set(depends_on)) != len(depends_on)
+            or any(not isinstance(value, str) or not value for value in depends_on)
+        ):
             raise ValueError("invalid work item dependencies")
         timeline_kind = (
             "pr_linked"
@@ -296,7 +315,9 @@ class WorkStore:
                 raise KeyError(item_id)
             row = (
                 con.execute(
-                    "UPDATE work_items SET " + ", ".join(columns) + ", updated_at = now() "
+                    "UPDATE work_items SET "
+                    + ", ".join(columns)
+                    + ", updated_at = now() "
                     "WHERE workspace_id = ? AND id = ? RETURNING id, stage, gate",
                     params,
                 ).fetchone()
@@ -319,65 +340,148 @@ class WorkStore:
                 from_stage=previous[0],
             )
             if depends_on is not None:
-                con.execute("DELETE FROM work_item_dependencies WHERE dependent_id = ?", [item_id])
+                con.execute(
+                    "DELETE FROM work_item_dependencies WHERE dependent_id = ?",
+                    [item_id],
+                )
                 for blocker_id in depends_on:
-                    if con.execute("SELECT 1 FROM work_items WHERE workspace_id = ? AND id = ?", [self.workspace_id, blocker_id]).fetchone() is None:
+                    if (
+                        con.execute(
+                            "SELECT 1 FROM work_items WHERE workspace_id = ? AND id = ?",
+                            [self.workspace_id, blocker_id],
+                        ).fetchone()
+                        is None
+                    ):
                         raise KeyError(blocker_id)
-                    con.execute("INSERT INTO work_item_dependencies (blocker_id, dependent_id) VALUES (?, ?)", [blocker_id, item_id])
+                    con.execute(
+                        "INSERT INTO work_item_dependencies (blocker_id, dependent_id) VALUES (?, ?)",
+                        [blocker_id, item_id],
+                    )
         return self.hub_item(item_id)
 
     def claim_rule_action(self, item_id, rule, head_sha, *, dry_run=False):
         with self.connection() as con:
-            row = con.execute("""INSERT INTO work_item_rule_actions
+            row = con.execute(
+                """INSERT INTO work_item_rule_actions
                 (work_item_id, rule, head_sha, state, dry_run) VALUES (?, ?, ?, 'claimed', ?)
-                ON CONFLICT DO NOTHING RETURNING work_item_id""", [item_id, rule, head_sha, dry_run]).fetchone()
+                ON CONFLICT DO NOTHING RETURNING work_item_id""",
+                [item_id, rule, head_sha, dry_run],
+            ).fetchone()
             if row is not None:
                 return True
             if not dry_run:
-                return con.execute("""UPDATE work_item_rule_actions SET state='claimed', dry_run=FALSE, updated_at=now()
-                    WHERE work_item_id=? AND rule=? AND head_sha=? AND state='would_act' RETURNING work_item_id""", [item_id, rule, head_sha]).fetchone() is not None
+                return (
+                    con.execute(
+                        """UPDATE work_item_rule_actions SET state='claimed', dry_run=FALSE, updated_at=now()
+                    WHERE work_item_id=? AND rule=? AND head_sha=? AND state='would_act' RETURNING work_item_id""",
+                        [item_id, rule, head_sha],
+                    ).fetchone()
+                    is not None
+                )
         return False
 
     def complete_rule_action(self, item_id, rule, head_sha, *, state, reason=None):
         with self.connection() as con:
-            con.execute("UPDATE work_item_rule_actions SET state=?, reason=?, updated_at=now() WHERE work_item_id=? AND rule=? AND head_sha=?", [state, reason, item_id, rule, head_sha])
+            con.execute(
+                "UPDATE work_item_rule_actions SET state=?, reason=?, updated_at=now() WHERE work_item_id=? AND rule=? AND head_sha=?",
+                [state, reason, item_id, rule, head_sha],
+            )
 
     def mark_done_and_unblock(self, item_id):
         with self.connection() as con:
-            item = con.execute("SELECT stage, gate FROM work_items WHERE workspace_id=? AND id=? FOR UPDATE", [self.workspace_id, item_id]).fetchone()
+            item = con.execute(
+                "SELECT stage, gate FROM work_items WHERE workspace_id=? AND id=? FOR UPDATE",
+                [self.workspace_id, item_id],
+            ).fetchone()
             if item is None:
                 raise KeyError(item_id)
             if item[0] != "done":
-                con.execute("UPDATE work_items SET stage='done', updated_at=now() WHERE id=?", [item_id])
-                append_timeline_event(con, workspace_id=self.workspace_id, item_id=item_id, kind="done", stage="done", gate=item[1], detail="pr_merged", from_stage=item[0])
-            rows = self.rows(con.execute("""SELECT d.dependent_id FROM work_item_dependencies d WHERE d.blocker_id=?
+                con.execute(
+                    "UPDATE work_items SET stage='done', updated_at=now() WHERE id=?",
+                    [item_id],
+                )
+                append_timeline_event(
+                    con,
+                    workspace_id=self.workspace_id,
+                    item_id=item_id,
+                    kind="done",
+                    stage="done",
+                    gate=item[1],
+                    detail="pr_merged",
+                    from_stage=item[0],
+                )
+            rows = self.rows(
+                con.execute(
+                    """SELECT d.dependent_id FROM work_item_dependencies d WHERE d.blocker_id=?
                 AND NOT EXISTS (SELECT 1 FROM work_item_dependencies a JOIN work_items b ON b.id=a.blocker_id
-                    WHERE a.dependent_id=d.dependent_id AND b.stage != 'done')""", [item_id]))
+                    WHERE a.dependent_id=d.dependent_id AND b.stage != 'done')""",
+                    [item_id],
+                )
+            )
             for row in rows:
-                previous = con.execute("SELECT stage, gate FROM work_items WHERE id=? FOR UPDATE", [row["dependent_id"]]).fetchone()
+                previous = con.execute(
+                    "SELECT stage, gate FROM work_items WHERE id=? FOR UPDATE",
+                    [row["dependent_id"]],
+                ).fetchone()
                 if previous and previous[0] == "blocked":
-                    con.execute("UPDATE work_items SET stage='queued', updated_at=now() WHERE id=?", [row["dependent_id"]])
-                    append_timeline_event(con, workspace_id=self.workspace_id, item_id=row["dependent_id"], kind="dependency_unblocked", stage="queued", gate=previous[1], detail=item_id, from_stage="blocked")
+                    con.execute(
+                        "UPDATE work_items SET stage='queued', updated_at=now() WHERE id=?",
+                        [row["dependent_id"]],
+                    )
+                    append_timeline_event(
+                        con,
+                        workspace_id=self.workspace_id,
+                        item_id=row["dependent_id"],
+                        kind="dependency_unblocked",
+                        stage="queued",
+                        gate=previous[1],
+                        detail=item_id,
+                        from_stage="blocked",
+                    )
 
     def append_rule_event(self, item_id, *, kind, detail):
         with self.connection() as con:
-            row = con.execute("SELECT stage, gate FROM work_items WHERE workspace_id=? AND id=? FOR UPDATE", [self.workspace_id, item_id]).fetchone()
+            row = con.execute(
+                "SELECT stage, gate FROM work_items WHERE workspace_id=? AND id=? FOR UPDATE",
+                [self.workspace_id, item_id],
+            ).fetchone()
             if row is not None:
-                append_timeline_event(con, workspace_id=self.workspace_id, item_id=item_id, kind=kind, stage=row[0], gate=row[1], detail=detail, from_stage=row[0])
+                append_timeline_event(
+                    con,
+                    workspace_id=self.workspace_id,
+                    item_id=item_id,
+                    kind=kind,
+                    stage=row[0],
+                    gate=row[1],
+                    detail=detail,
+                    from_stage=row[0],
+                )
 
     def has_timeline_kind(self, item_id, kind):
         with self.connection() as con:
-            return con.execute("SELECT 1 FROM work_item_timeline WHERE work_item_id=? AND kind=? LIMIT 1", [item_id, kind]).fetchone() is not None
+            return (
+                con.execute(
+                    "SELECT 1 FROM work_item_timeline WHERE work_item_id=? AND kind=? LIMIT 1",
+                    [item_id, kind],
+                ).fetchone()
+                is not None
+            )
 
     def rule_cursor(self):
         with self.connection() as con:
-            row = con.execute("SELECT cursor FROM work_item_rule_cursors WHERE workspace_id=?", [self.workspace_id]).fetchone()
+            row = con.execute(
+                "SELECT cursor FROM work_item_rule_cursors WHERE workspace_id=?",
+                [self.workspace_id],
+            ).fetchone()
             return int(row[0]) if row else 0
 
     def advance_rule_cursor(self, cursor):
         with self.connection() as con:
-            con.execute("""INSERT INTO work_item_rule_cursors (workspace_id, cursor) VALUES (?, ?)
-                ON CONFLICT (workspace_id) DO UPDATE SET cursor=GREATEST(work_item_rule_cursors.cursor, EXCLUDED.cursor), updated_at=now()""", [self.workspace_id, cursor])
+            con.execute(
+                """INSERT INTO work_item_rule_cursors (workspace_id, cursor) VALUES (?, ?)
+                ON CONFLICT (workspace_id) DO UPDATE SET cursor=GREATEST(work_item_rule_cursors.cursor, EXCLUDED.cursor), updated_at=now()""",
+                [self.workspace_id, cursor],
+            )
 
     def create_work_item_subscription(
         self, credential_id, *, url, event_kinds, repo=None

@@ -61,7 +61,9 @@ def test_process_once_consumes_event_cursor_and_wakes_blocked_worker(service):
     worker = _worker(service, GitHub())
     assert worker.process_once() >= 1
     assert worker.store.rule_cursor() > 0
-    assert "orchestrator_wake" in [row["kind"] for row in service.store.hub_item(item["id"])["timeline"]]
+    assert "orchestrator_wake" in [
+        row["kind"] for row in service.store.hub_item(item["id"])["timeline"]
+    ]
 
 
 def test_publish_missing_or_mismatched_branch_wakes_without_pr(service):
@@ -86,9 +88,13 @@ def test_stale_or_gated_green_never_merges_and_dry_run_records_only(service):
     worker.evaluate(item, "ci_green_exact_head", "a" * 40)
     assert not github.merged
     service.store.patch_hub_item(item["id"], automation_gate="none")
-    service.store.append_github_fact(item["id"], kind="pr_synchronized", detail="{}", head_sha="a" * 40)
+    service.store.append_github_fact(
+        item["id"], kind="pr_synchronized", detail="{}", head_sha="a" * 40
+    )
     item = service.store.hub_item(item["id"])
-    _worker(service, github, dry_run=True).evaluate(item, "ci_green_exact_head", "a" * 40)
+    _worker(service, github, dry_run=True).evaluate(
+        item, "ci_green_exact_head", "a" * 40
+    )
     assert not github.merged
 
 
@@ -96,7 +102,9 @@ def test_merged_marks_done_and_unblocks_dependents(service):
     blocker = _item(service)
     _register(service, session_id="dependent")
     dependent = service.store.hub_items()[0]
-    service.store.patch_hub_item(dependent["id"], stage="blocked", depends_on=[blocker["id"]])
+    service.store.patch_hub_item(
+        dependent["id"], stage="blocked", depends_on=[blocker["id"]]
+    )
     _worker(service, GitHub()).evaluate(blocker, "pr_merged", "a" * 40)
     assert service.store.hub_item(blocker["id"])["stage"] == "done"
     assert service.store.hub_item(dependent["id"])["stage"] == "queued"
@@ -104,7 +112,9 @@ def test_merged_marks_done_and_unblocks_dependents(service):
 
 def test_behind_pr_updates_once_only_when_ci_is_not_failed(service):
     item = _item(service, pr="https://github.com/example/project/pull/7", publish=True)
-    service.store.append_github_fact(item["id"], kind="pr_synchronized", detail="{}", head_sha="a" * 40)
+    service.store.append_github_fact(
+        item["id"], kind="pr_synchronized", detail="{}", head_sha="a" * 40
+    )
     item = service.store.hub_item(item["id"])
     github = GitHub()
     worker = _worker(service, github)

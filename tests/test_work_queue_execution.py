@@ -365,9 +365,16 @@ def test_opt_in_execution_uses_launch_and_respects_budget_caps_and_kill_switch(s
     assert coordinator.launch_candidate("goal", 1).get("launched") is True
     assert coordinator.launch_candidate("goal", 1)["denied"] == "global_cap"
     service.config = service.config.model_copy(
-        update={"execution": service.config.execution.model_copy(update={"kill_switch": True})}
+        update={
+            "execution": service.config.execution.model_copy(
+                update={"kill_switch": True}
+            )
+        }
     )
-    assert QueueExecutionCoordinator(service).launch_candidate("goal", 1)["denied"] == "kill_switch"
+    assert (
+        QueueExecutionCoordinator(service).launch_candidate("goal", 1)["denied"]
+        == "kill_switch"
+    )
 
 
 def test_policy_capacity_and_retry_override(service, tmp_path):

@@ -262,7 +262,11 @@ class GitHubProvider:
 
     def open_draft_pr(self, branch, title):
         self._require("pulls_write")
-        row = self._request("POST", self.base + "/pulls", body={"title": title, "head": branch, "base": "main", "draft": True})
+        row = self._request(
+            "POST",
+            self.base + "/pulls",
+            body={"title": title, "head": branch, "base": "main", "draft": True},
+        )
         return row["html_url"]
 
     def pull_is_current(self, pr):
@@ -272,15 +276,25 @@ class GitHubProvider:
 
     def mark_pr_ready(self, pr):
         self._require("pulls_write")
-        self._request("POST", self.base + f"/pulls/{self._pr_number(pr)}/ready-for-review")
+        self._request(
+            "POST", self.base + f"/pulls/{self._pr_number(pr)}/ready-for-review"
+        )
 
     def update_pr_branch(self, pr, head_sha):
         self._require("pulls_write")
-        self._request("PUT", self.base + f"/pulls/{self._pr_number(pr)}/update-branch", body={"expected_head_sha": head_sha})
+        self._request(
+            "PUT",
+            self.base + f"/pulls/{self._pr_number(pr)}/update-branch",
+            body={"expected_head_sha": head_sha},
+        )
 
     def squash_merge(self, pr, head_sha):
         self._require("pulls_write")
-        self._request("PUT", self.base + f"/pulls/{self._pr_number(pr)}/merge", body={"merge_method": "squash", "sha": head_sha})
+        self._request(
+            "PUT",
+            self.base + f"/pulls/{self._pr_number(pr)}/merge",
+            body={"merge_method": "squash", "sha": head_sha},
+        )
 
     def list_attention(self):
         rows = []
