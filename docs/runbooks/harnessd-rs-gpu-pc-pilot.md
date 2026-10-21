@@ -51,8 +51,10 @@ avoid tokens in process arguments. Clear the variable after the work.
 
 ## Install beside Python, without activation
 
-Run on the GPU PC as the existing service user, with `gh`, `curl`, `sqlite3`,
-`git`, Codex and the existing Python runtime available:
+Run on the GPU PC as the existing service user, with `gh`, `curl`, `git`,
+Codex and the existing Python runtime available. `sqlite3`, `pidstat`/`sysstat`
+and `rg` are not prerequisites: the harness binary reports its store state,
+and `ps`/`grep` cover the portable process/log checks below.
 
 ```bash
 gh run view "$PILOT_RUN_ID" --repo arniesaha/drover \
@@ -167,8 +169,7 @@ sha256sum --check "$PILOT_ROOT/evidence/python-registry.sha256"
 # The export is read-only, mode 0600, and refuses an existing output path.
 "$RS_BIN" --config "$CONFIG" --host-id "$HOST_ID" --import-jsonl "$HANDOFF" --import-dry-run
 "$RS_BIN" --config "$CONFIG" --host-id "$HOST_ID" --import-jsonl "$HANDOFF"
-sqlite3 "$HOME/.drover/harnessd/harnessd.sqlite" \
-  'PRAGMA integrity_check; SELECT status,count(*) FROM sessions GROUP BY status; SELECT count(*) FROM event_quarantine;'
+"$RS_BIN" store check
 ```
 
 Export includes session metadata, unreconciled events, original `event_id`,
@@ -241,7 +242,7 @@ resets the uninterrupted soak clock after correction.
 | Gate | Measurement and passing criterion |
 |---|---|
 | Daemon RSS | Sample `/proc/<MainPID>/status` `VmRSS` every minute: every sample **<100 MB** (100,000,000 bytes; require VmRSS <97,656 KiB, interpreting the kernel's `kB` field as KiB). Track Codex child RSS separately. No rising retained-session trend after repeated terminal attaches/exits. |
-| Idle CPU | Use `pidstat -p <MainPID> 60` or `/proc/<pid>/stat` deltas during quiet windows: daemon CPU **<1% of one core**. Record at least hourly idle windows; exclude deliberate Codex/shell work from the idle classification. |
+| Idle CPU | Sample `ps -o %cpu` (or `/proc/<pid>/stat` deltas) during quiet windows: daemon CPU **<1% of one core**. Record at least hourly idle windows; exclude deliberate Codex/shell work from the idle classification. |
 | Relay launch latency | Measure at the orchestrator from POST to completed response through the hub's actual relay create route. Include shell and Codex launches (real scratch Git repo/worktree); use unique client_session_id for each attempt. Record all failures/timeouts. Require **p99 <2 s**, zero failed launches, at least 20 samples during the 8–9 hour soak and coverage of both harnesses. Compute p99 by nearest-rank over all samples, retaining raw timings and workload labels. |
 | Ownership / reconciliation | **Zero ownership or reconciliation warnings** during the soak, zero new quarantine receipts, no repeated historical replay batches. Query `event_quarantine` and the unpushed count hourly and after a relay interruption; pending events must drain on recovery. Retained quarantine payloads are never pruned or treated as acknowledgements. |
 | Correctness | Shared contracts green for both implementations at the installed SHA; shell terminal WS data/input/resize, Codex resume/recover/interrupt, Git evidence, folder picker, relay reconnect and restart recovery remain functional. No unexplained session/worktree loss. |
@@ -251,11 +252,10 @@ Example read-only local measurements (operator runs these):
 ```bash
 PID="$(systemctl --user show "$RS_UNIT" --property=MainPID --value)"
 awk '/VmRSS/ {print strftime("%FT%TZ",systime(),1),$2,"kB"}' "/proc/$PID/status"
-pidstat -p "$PID" 60 1
-sqlite3 "$HOME/.drover/harnessd/harnessd.sqlite" \
-  'SELECT count(*) FROM event_quarantine; SELECT count(*) FROM events e WHERE pushed_at IS NULL AND NOT EXISTS(SELECT 1 FROM event_quarantine q WHERE q.event_id=e.event_id);'
+ps -o pid=,pcpu=,rss=,command= -p "$PID"
+"$RS_BIN" store check
 journalctl --user -u "$RS_UNIT" --since '<soak UTC start>' --no-pager \
-  | rg -i 'ownership|quarantin|reconcil|authorization backoff|unavailable|failed'
+  | grep -Ei 'ownership|quarantin|reconcil|authorization backoff|unavailable|failed'
 ```
 
 The orchestrator owns the pilot outcome. M2 implementation readiness is not a

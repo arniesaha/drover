@@ -1,0 +1,11 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+apps
+docs
+reports
+roadmap
+site
+tests
+target

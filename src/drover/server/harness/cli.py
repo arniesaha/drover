@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import click
 import duckdb
@@ -12,7 +13,11 @@ import duckdb
 import drover
 from drover.config import DroverConfig, default_config, default_config_path, load_config
 from drover.schema import bootstrap_control_plane_store
-from drover.server.db import duckdb_connect_lock, pin_control_plane_connection
+from drover.server.db import (
+    control_plane_path,
+    duckdb_connect_lock,
+    pin_control_plane_connection,
+)
 from drover.server.harness.daemon import run_harnessd
 
 log = logging.getLogger("drover.harnessd")
@@ -114,11 +119,88 @@ def run_harnessd_from_options(
     )
 
 
-@click.command(name="drover-harnessd")
+def store_check(cfg: DroverConfig) -> dict[str, Any]:
+    """Read the Python harness spool without a DuckDB command-line client.
+
+    DuckDB has no SQLite-style ``PRAGMA integrity_check``.  Opening the store
+    read-only and scanning each required relation is its useful equivalent for
+    this small control spool: it exercises catalog and data-block reads without
+    mutating or bootstrapping anything.
+    """
+
+    # The Python harness control spool is the sibling registry file, not the
+    # analytical DuckDB selector named in config.  This remains true when the
+    # hub itself uses PostgreSQL.
+    path = control_plane_path(cfg.duckdb_path)
+    if not path.is_file():
+        raise click.ClickException(f"DuckDB harness store does not exist: {path}")
+    try:
+        con = duckdb.connect(str(path), read_only=True)
+    except duckdb.Error as exc:
+        raise click.ClickException(
+            f"cannot open DuckDB harness store {path}: {exc}"
+        ) from exc
+    try:
+        tables = {
+            str(row[0])
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main'"
+            ).fetchall()
+        }
+        required = {"harness_sessions", "harness_events", "harness_event_quarantine"}
+        missing = sorted(required - tables)
+        if missing:
+            raise click.ClickException(
+                "DuckDB harness store is missing required relation(s): "
+                + ", ".join(missing)
+            )
+        # Do not use a metadata-only query here.  These small scans make a
+        # corrupt or unreadable block visible to the operator.
+        session_rows = con.execute(
+            "SELECT status, count(*) FROM harness_sessions "
+            "GROUP BY status ORDER BY status"
+        ).fetchall()
+        con.execute("SELECT count(*) FROM harness_events").fetchone()
+        quarantine_count = int(
+            con.execute("SELECT count(*) FROM harness_event_quarantine").fetchone()[0]
+        )
+        event_columns = {
+            str(row[1])
+            for row in con.execute("PRAGMA table_info('harness_events')").fetchall()
+        }
+        if "reconcile_pending" not in event_columns:
+            raise click.ClickException(
+                "DuckDB harness store predates the durable reconciliation queue; "
+                "upgrade harnessd before checking unpushed events"
+            )
+        unpushed_count = int(con.execute("""
+                SELECT count(*)
+                FROM harness_events AS event
+                WHERE event.reconcile_pending
+                  AND NOT EXISTS (
+                    SELECT 1 FROM harness_event_quarantine AS quarantine
+                    WHERE quarantine.event_id = event.event_id
+                  )
+                """).fetchone()[0])
+    except duckdb.Error as exc:
+        raise click.ClickException(f"DuckDB harness store check failed: {exc}") from exc
+    finally:
+        con.close()
+    return {
+        "store": str(path),
+        "integrity_check": "ok (DuckDB read-only relation scan)",
+        "session_counts": {str(status): int(count) for status, count in session_rows},
+        "quarantine_count": quarantine_count,
+        "unpushed_event_count": unpushed_count,
+    }
+
+
+@click.group(name="drover-harnessd", invoke_without_command=True)
 @click.version_option(version=drover.__version__, prog_name="drover-harnessd")
 @click.option("--config", "config_path", default=None, help="Path to config TOML")
 @click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG logging")
-@click.option("--host-id", required=True, help="Stable host id, e.g. workstation")
+@click.option("--host-id", required=False, help="Stable host id, e.g. workstation")
 @click.option("--display-name", default=None, help="Human-readable host label")
 @click.option("--kind", default="linux", show_default=True, help="Host kind")
 @click.option(
@@ -146,7 +228,9 @@ def run_harnessd_from_options(
     default=False,
     help="Dial out to --central-url instead of relying on inbound reachability",
 )
+@click.pass_context
 def main(
+    ctx: click.Context,
     config_path: str | None,
     verbose: bool,
     host_id: str,
@@ -165,6 +249,12 @@ def main(
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    ctx.ensure_object(dict)
+    ctx.obj["config_path"] = config_path
+    if ctx.invoked_subcommand is not None:
+        return
+    if not host_id:
+        raise click.UsageError("Missing option '--host-id'.")
     run_harnessd_from_options(
         config_path=config_path,
         host_id=host_id,
@@ -177,6 +267,30 @@ def main(
         host_token=host_token,
         relay=relay,
     )
+
+
+@main.group()
+def store() -> None:
+    """Inspect the local durable harness store."""
+
+
+@store.command(name="check")
+@click.option("--config", "config_path", default=None, help="Path to config TOML")
+def store_check_command(config_path: str | None) -> None:
+    """Print integrity, session, quarantine and unpushed-event counts."""
+
+    report = store_check(resolve_config(config_path))
+    click.echo(f"store: {report['store']}")
+    click.echo(f"integrity_check: {report['integrity_check']}")
+    click.echo("session_counts:")
+    counts = report["session_counts"]
+    if counts:
+        for status, count in counts.items():
+            click.echo(f"  {status}: {count}")
+    else:
+        click.echo("  (none)")
+    click.echo(f"quarantine_count: {report['quarantine_count']}")
+    click.echo(f"unpushed_event_count: {report['unpushed_event_count']}")
 
 
 if __name__ == "__main__":

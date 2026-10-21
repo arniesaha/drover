@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -38,6 +39,43 @@ REGISTRATION_DEADLINE_SECONDS = 90.0
 # restarting us; bounded so a restart that never comes does not leave every
 # session refusing turns until someone notices.
 RESTART_DRAIN_SECONDS = 300.0
+
+
+def runtime_dependency_preflight(state) -> list[str]:
+    """Return runtime commands that a host currently advertises but lacks.
+
+    Optional agent CLIs are not a global Drover requirement: a host without
+    one must simply not advertise that harness.  Once a resolved preset is
+    enabled, however, losing its executable between install and activation is
+    a real failed runtime dependency and must block the update visibly.
+    """
+
+    missing: list[str] = []
+    if shutil.which("git") is None:
+        missing.append("git")
+    for name, preset in getattr(state, "presets", {}).items():
+        if name == "shell" or not getattr(preset, "enabled", False):
+            continue
+        executable = getattr(preset, "executable", None)
+        if executable:
+            if not Path(executable).is_file() or not os.access(executable, os.X_OK):
+                missing.append(str(executable))
+            continue
+        command = tuple(getattr(preset, "command", ()) or ())
+        if command and shutil.which(command[0]) is None:
+            missing.append(str(command[0]))
+    return missing
+
+
+def runtime_dependency_install_hint() -> str:
+    """Keep update failures actionable without attempting package installs."""
+
+    return (
+        "Install missing system packages yourself, then retry: macOS: "
+        "brew install git; Debian/Ubuntu: sudo apt-get install -y git; "
+        "Fedora: sudo dnf install -y git; Alpine: sudo apk add git. "
+        "Install an advertised agent CLI using that provider's instructions."
+    )
 
 
 @dataclass(frozen=True)
@@ -421,6 +459,15 @@ class HostUpdater:
         with self._lock:
             target = self._pending
         if target is None:
+            return False
+        missing_dependencies = runtime_dependency_preflight(self._state)
+        if missing_dependencies:
+            log.error(
+                "runtime dependency preflight failed: missing %s. %s",
+                ", ".join(missing_dependencies),
+                runtime_dependency_install_hint(),
+            )
+            self._record_refusal(target, "runtime_dependencies")
             return False
         if (
             self._cfg.update_runtime_root is not None

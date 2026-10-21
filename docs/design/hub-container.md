@@ -19,8 +19,26 @@ The default network posture is private. The hub joins the operator's tailnet,
 either through a Tailscale sidecar or `tailscale serve`, and clients use the
 hub's HTTPS `ts.net` name. No hub port is published to the public internet.
 
-This is a deployment design, not a claim that a container image, Compose file,
-or chart exists today.
+`deploy/Dockerfile` is the reference hub image build. It runs only
+`drover-server` as an unprivileged user and deliberately does not include a
+harness CLI, Git, `sqlite3`, PostgreSQL client tools, Tailscale, a service
+manager, or troubleshooting utilities. Compose and Helm templates remain
+follow-up work; platform configuration must still meet the persistent-service
+contract below.
+
+For Railway or another generic container platform, provide (1) a private
+PostgreSQL service for the control store and DuckLake catalog, (2) one durable
+volume mounted at `/var/lib/drover` for the configured lake, incoming, DuckDB
+selector and scratch paths, and (3) a mounted `/etc/drover/config.toml` plus
+platform secrets. At minimum set `DROVER_CONTROL_DSN` to the control-store
+DSN named by `[control_store].dsn_env`; set the catalog DSN variables named by
+your `[analytics]` configuration when DuckLake is enabled, and set
+`DROVER_API_TOKEN` (or mount the token file). The container command is its
+default `drover-server --config /etc/drover/config.toml run`. Give it a
+restart policy and use `/healthz` for liveness and `/readyz` for readiness.
+Never use ephemeral filesystem storage for the lake. `systemd` and `launchd`
+do not apply in a container; Tailscale is optional and belongs in a sidecar or
+platform-supported private-network integration, never in the hub image.
 
 ## Goals and non-goals
 
