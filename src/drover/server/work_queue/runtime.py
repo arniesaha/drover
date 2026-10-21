@@ -158,6 +158,38 @@ def start_github_webhook_worker(collector, config, shutdown_event):
     return worker
 
 
+def start_work_item_rule_worker(collector, config, shutdown_event):
+    service = getattr(collector, "work_control", None)
+    if service is None or not config.rules.enabled:
+        return None
+    from drover.server.work_queue.rules import WorkItemRuleWorker
+
+    worker = WorkItemRuleWorker(
+        service.store,
+        {scope.repo: service.providers[scope.goal_id] for scope in config.goals},
+        config.rules,
+    )
+    worker.start(shutdown_event)
+    collector.work_item_rule_worker = worker
+    return worker
+
+
+def start_queue_execution_worker(collector, config, shutdown_event):
+    service = getattr(collector, "work_control", None)
+    if (
+        service is None
+        or config.shadow_mode
+        or not any(g.execution_enabled for g in config.goals)
+    ):
+        return None
+    from drover.server.work_queue.reconciler import QueueExecutionWorker
+
+    worker = QueueExecutionWorker(service)
+    worker.start(shutdown_event)
+    collector.work_queue_execution_worker = worker
+    return worker
+
+
 def authenticated_actor(auth, headers, config):
     if not auth.enabled:
         raise PermissionError("work tools require credentials")
@@ -229,7 +261,17 @@ def dispatch_hub_items(service, auth, headers, operation, args):
             if result is None:
                 return 404, {"error": "work item not found"}
         elif operation == "patch":
-            allowed = {"id", "stage", "next", "pr", "acceptance"}
+            allowed = {
+                "id",
+                "stage",
+                "next",
+                "pr",
+                "acceptance",
+                "auto_merge",
+                "automation_gate",
+                "publish",
+                "depends_on",
+            }
             if set(args) - allowed:
                 raise ValueError("invalid work item fields")
             result = service.store.patch_hub_item(
@@ -238,6 +280,10 @@ def dispatch_hub_items(service, auth, headers, operation, args):
                 next_action=args.get("next"),
                 pr=args.get("pr"),
                 acceptance=args.get("acceptance"),
+                auto_merge=args.get("auto_merge"),
+                automation_gate=args.get("automation_gate"),
+                publish=args.get("publish"),
+                depends_on=args.get("depends_on"),
             )
         elif operation == "export":
             if args:

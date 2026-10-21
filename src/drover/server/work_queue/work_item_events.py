@@ -153,6 +153,7 @@ def event_payload(row: dict) -> dict:
         "v": EVENT_VERSION,
         "type": EVENT_TYPE,
         "event_id": row["event_id"],
+        "cursor": row["cursor"],
         "item_id": row["item_id"],
         "kind": row["kind"],
         "from_stage": row["from_stage"],

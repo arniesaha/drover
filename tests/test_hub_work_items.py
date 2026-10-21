@@ -129,3 +129,27 @@ def test_work_item_http_read_patch_auth_and_export(transport):
             }
         ]
     }
+
+
+def test_item_policy_defaults_dependency_unblocks_and_rule_claim_is_idempotent(service):
+    _register(service, session_id="policy-blocker")
+    blocker = service.store.hub_items()[0]
+    _register(service, session_id="policy-dependent")
+    dependent = service.store.hub_items()[0]
+    assert blocker["auto_merge"] is False
+    assert blocker["publish"] is False
+    assert blocker["automation_gate"] == "none"
+
+    service.store.patch_hub_item(
+        dependent["id"],
+        stage="blocked",
+        auto_merge=True,
+        publish=True,
+        automation_gate="none",
+        depends_on=[blocker["id"]],
+    )
+    assert service.store.claim_rule_action(blocker["id"], "merge", "a" * 40)
+    assert not service.store.claim_rule_action(blocker["id"], "merge", "a" * 40)
+    service.store.mark_done_and_unblock(blocker["id"])
+    assert service.store.hub_item(blocker["id"])["stage"] == "done"
+    assert service.store.hub_item(dependent["id"])["stage"] == "queued"
