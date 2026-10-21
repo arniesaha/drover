@@ -301,7 +301,8 @@ final class ObservabilityFixtureUITests: XCTestCase {
         dark: Bool = false,
         pendingSessionID: String? = nil,
         initialTab: String? = nil,
-        awaitingSessionID: String? = nil
+        awaitingSessionID: String? = nil,
+        liveUpdateSessionID: String? = nil
     ) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -313,6 +314,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
         if let initialTab { app.launchEnvironment["DROVER_UI_TEST_INITIAL_TAB"] = initialTab }
         if let awaitingSessionID {
             app.launchEnvironment["DROVER_UI_TEST_AWAITING_SESSION_ID"] = awaitingSessionID
+        }
+        if let liveUpdateSessionID {
+            app.launchEnvironment["DROVER_UI_TEST_LIVE_UPDATE_SESSION_ID"] = liveUpdateSessionID
         }
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
@@ -443,6 +447,13 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(inboxDismiss.waitForExistence(timeout: 5))
         inboxDismiss.tap()
 
+        // Exercise rapid root-tab selections before the notification route
+        // begins.  Build 24's dock stayed interactive over transitions, so a
+        // human could produce this sequence much faster than a calm tab tour.
+        tab(app, "analytics").tap()
+        tab(app, "settings").tap()
+        tab(app, "inbox").tap()
+
         // A notification arriving while Inbox is selected must first select
         // Home, then push inside Home's sole NavigationStack.  This was the
         // crashing same-transaction sequence in build 24.
@@ -457,6 +468,27 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
         XCUIDevice.shared.orientation = .portrait
         XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
+    }
+
+    @MainActor
+    func testPushedSessionSurvivesPollingUpdateAndKeepsTabsUnavailable() {
+        let app = launchRealApp(liveUpdateSessionID: "fixture-session")
+        let session = app.buttons["fixture-session"]
+        XCTAssertTrue(session.waitForExistence(timeout: 8))
+        session.tap()
+
+        let chatMenu = app.buttons["chat-menu"]
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
+        // Main's system tab bar is deliberately hidden for a pushed session;
+        // unlike build 24's floating dock, it cannot change tabs mid-push.
+        XCTAssertFalse(tab(app, "inbox").isHittable)
+
+        let thirdSnapshot = NSPredicate(format: "label == %@", "3")
+        let update = expectation(for: thirdSnapshot,
+                                 evaluatedWith: app.staticTexts["fixture-harness-snapshot-count"],
+                                 handler: nil)
+        wait(for: [update], timeout: 15)
+        XCTAssertTrue(chatMenu.exists, "a live session update must not pop the pushed detail")
     }
 
     @MainActor

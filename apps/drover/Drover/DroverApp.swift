@@ -341,6 +341,8 @@ private struct FixturePreparedRoot: View {
                                 .accessibilityIdentifier("fixture-turn-receipt-count")
                             Text(String(scenario.transport.receiptState.submissionCount))
                                 .accessibilityIdentifier("fixture-turn-submission-count")
+                            Text(String(scenario.transport.receiptState.harnessSnapshotCount))
+                                .accessibilityIdentifier("fixture-harness-snapshot-count")
                         }
                         .font(.caption2)
                         .foregroundStyle(.clear)

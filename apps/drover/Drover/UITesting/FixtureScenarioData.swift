@@ -140,7 +140,7 @@ enum FixtureScenarioData {
         return jsonData(snapshot)
     }
 
-    static func snapshotData() -> Data {
+    static func snapshotData(liveUpdateSessionID: String? = nil) -> Data {
         let awaitingSessionID = ProcessInfo.processInfo.environment[
             "DROVER_UI_TEST_AWAITING_SESSION_ID"
         ]
@@ -166,6 +166,7 @@ enum FixtureScenarioData {
                     "last_activity": "2026-09-04T00:00:00Z",
                 ]
                 if session.id == awaitingSessionID { payload["awaiting"] = "input" }
+                if session.id == liveUpdateSessionID { payload["awaiting"] = "approval" }
                 return payload
             },
             "cwd_suggestions": [[

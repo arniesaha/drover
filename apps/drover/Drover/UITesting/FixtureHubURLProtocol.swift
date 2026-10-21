@@ -10,6 +10,7 @@ final class FixtureReceiptState: @unchecked Sendable {
         static let receiptCount = "fixture.receipt-count"
         static let submissionCount = "fixture.submission-count"
         static let historyLookupsAfterReceipt = "fixture.history-lookups-after-receipt"
+        static let harnessSnapshotCount = "fixture.harness-snapshot-count"
     }
 
     private let lock = NSLock()
@@ -31,6 +32,26 @@ final class FixtureReceiptState: @unchecked Sendable {
 
     var submissionCount: Int {
         lock.withLock { defaults.integer(forKey: Key.submissionCount) }
+    }
+
+    var harnessSnapshotCount: Int {
+        lock.withLock { defaults.integer(forKey: Key.harnessSnapshotCount) }
+    }
+
+    /// The live-update UI test needs a real polling transition, rather than a
+    /// timer that merely assumes a refresh happened.  On the third snapshot
+    /// the selected session moves to the needs-you bucket while its Chat view
+    /// remains pushed above the Home list.
+    func harnessSnapshotData() -> Data {
+        let liveUpdateSessionID = ProcessInfo.processInfo.environment[
+            "DROVER_UI_TEST_LIVE_UPDATE_SESSION_ID"
+        ]
+        let updatedSessionID = lock.withLock { () -> String? in
+            let next = defaults.integer(forKey: Key.harnessSnapshotCount) + 1
+            defaults.set(next, forKey: Key.harnessSnapshotCount)
+            return next >= 3 ? liveUpdateSessionID : nil
+        }
+        return FixtureScenarioData.snapshotData(liveUpdateSessionID: updatedSessionID)
     }
 
     func acceptTurn(from request: URLRequest) -> FixtureHubResponse {
@@ -167,7 +188,7 @@ final class FixtureHubURLProtocol: URLProtocol {
             case .capabilityJourney:
                 return FixtureHubResponse(status: 200, body: FixtureScenarioData.capabilitySnapshotData())
             case .coreJourney, .insightDetail:
-                return FixtureHubResponse(status: 200, body: FixtureScenarioData.snapshotData())
+                return FixtureHubResponse(status: 200, body: state.harnessSnapshotData())
             }
         case ("GET", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/fs/list":
             return FolderBrowserFixture.response(url: url)
