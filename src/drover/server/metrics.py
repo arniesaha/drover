@@ -1726,7 +1726,7 @@ class MetricsCollector:
         return _json_response(200, body)
 
     def proxy_create_harness_session(
-        self, host_id: str, payload: Mapping[str, Any]
+        self, host_id: str, payload: Mapping[str, Any], *, work_item_owner: str = "hub"
     ) -> tuple[int, str]:
         host = self._harness_host(host_id)
         if host is None:
@@ -1755,7 +1755,9 @@ class MetricsCollector:
             timeout_s=CREATE_SESSION_TIMEOUT_S,
         )
         if 200 <= status < 300:
-            self._sync_created_harness_session(host_id, payload, body)
+            self._sync_created_harness_session(
+                host_id, payload, body, work_item_owner=work_item_owner
+            )
         return status, body
 
     def fetch_harness_provider_usage(self, host: Any) -> Mapping[str, Any]:
@@ -2868,6 +2870,8 @@ class MetricsCollector:
         host_id: str,
         request_payload: Mapping[str, Any],
         response_body: str,
+        *,
+        work_item_owner: str = "hub",
     ) -> None:
         try:
             payload = json.loads(response_body)
@@ -2917,6 +2921,17 @@ class MetricsCollector:
         try:
             existing = registry.get_session(session_id)
             if existing is None:
+
+                def register_work_item(con, created_session_id):
+                    service = getattr(self, "work_control", None)
+                    if service is not None:
+                        service.register_hub_launch(
+                            con,
+                            session_id=created_session_id,
+                            payload=request_payload,
+                            owner=work_item_owner,
+                        )
+
                 registry.create_session(
                     session_id=session_id,
                     host_id=host_id,
@@ -2957,6 +2972,7 @@ class MetricsCollector:
                         payload.get("parent_session_id")
                         or request_payload.get("parent_session_id")
                     ),
+                    on_created=register_work_item,
                 )
             else:
                 registry.update_session_status(session_id, status)

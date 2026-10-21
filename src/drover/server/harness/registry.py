@@ -263,6 +263,28 @@ def _is_turn_completion_payload(payload: dict[str, Any]) -> bool:
     return isinstance(inner, dict) and inner.get("turn_complete") is True
 
 
+def _project_work_item_lifecycle(
+    con: Any,
+    *,
+    event_id: str,
+    session_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    """Keep the hub-owned work item in the same commit as its source event."""
+    # Imported lazily so the harness registry remains usable during work-queue
+    # bootstrap and on older databases before the additive table exists.
+    from drover.server.work_queue.store import apply_hub_lifecycle_event
+
+    apply_hub_lifecycle_event(
+        con,
+        event_id=event_id,
+        session_id=session_id,
+        event_type=event_type,
+        payload=payload,
+    )
+
+
 def _supports_live_recaps(mode: str | None, harness: str) -> bool:
     return mode == "structured" or (mode is None and harness != "shell")
 
@@ -650,6 +672,7 @@ class HarnessRegistry:
         thinking_effort: str | None = None,
         client_session_id: str | None = None,
         parent_session_id: str | None = None,
+        on_created: Any | None = None,
     ) -> HarnessSession:
         # Read before writing so the ordinary repeat is a cheap lookup, and
         # catch the constraint below so the concurrent one is still correct.
@@ -708,6 +731,8 @@ class HarnessRegistry:
                         parent_session_id,
                     ],
                 )
+                if on_created is not None:
+                    on_created(con, session_id)
                 con.execute("COMMIT")
             except Exception as exc:
                 # Another caller got there between the lookup above and this
@@ -1508,6 +1533,13 @@ class HarnessRegistry:
                         seq=seq,
                         store_path=self.control_plane_path,
                     )
+                    _project_work_item_lifecycle(
+                        con,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=payload or {},
+                    )
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
@@ -1675,6 +1707,17 @@ class HarnessRegistry:
                         seq=seq,
                         store_path=self.control_plane_path,
                     )
+                    _project_work_item_lifecycle(
+                        con,
+                        event_id=str(record["event_id"]),
+                        session_id=str(record["session_id"]),
+                        event_type=str(record["event_type"]),
+                        payload=(
+                            record.get("payload")
+                            if isinstance(record.get("payload"), dict)
+                            else {}
+                        ),
+                    )
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
@@ -1817,6 +1860,13 @@ class HarnessRegistry:
                         payload=payload,
                         seq=seq,
                         store_path=self.control_plane_path,
+                    )
+                    _project_work_item_lifecycle(
+                        con,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=payload,
                     )
                     inserted_count += 1
                     inserted_by_session.setdefault(session_id, []).append(

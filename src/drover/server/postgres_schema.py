@@ -15,6 +15,7 @@ PROFILE_MIGRATION = 15
 EXPORTER_FRESHNESS_MIGRATION = 16
 WORK_QUEUE_MIGRATION = 18
 EXPORTER_RESTART_GUARD_MIGRATION = 19
+HUB_WORK_ITEMS_MIGRATION = 23
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -718,6 +719,43 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
               quarantined_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """,
+        ),
+    ),
+    (
+        HUB_WORK_ITEMS_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS work_items (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              repo TEXT,
+              branch TEXT,
+              session_id TEXT UNIQUE,
+              owner TEXT NOT NULL,
+              stage TEXT NOT NULL,
+              gate TEXT,
+              acceptance TEXT,
+              next_action TEXT,
+              pr TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS work_items_workspace_state ON work_items (workspace_id, stage, updated_at DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS work_item_timeline (
+              id TEXT PRIMARY KEY,
+              work_item_id TEXT NOT NULL REFERENCES work_items(id),
+              source_event_id TEXT UNIQUE,
+              kind TEXT NOT NULL,
+              stage TEXT,
+              gate TEXT,
+              detail TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS work_item_timeline_item_order ON work_item_timeline (work_item_id, created_at, id)",
         ),
     ),
 )

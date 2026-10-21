@@ -104,6 +104,21 @@ A code is single use. A device code expires after ten minutes. A host code expir
 | WebSocket | `/harness/sessions/{id}/stream` | Live structured events. |
 | WebSocket | `/harness/sessions/{id}/terminal` | Live terminal. |
 
+### Work items
+
+Hub-owned work items are created for every accepted session launch. A launch may
+include `intent`, `acceptance`, and an existing `work_item_id`; `intent` falls
+back to the first prompt line, then the branch. Item reads and edits require a
+paired device credential. Shadow mode does not suppress registration or event
+tracking; it only suppresses automatic queue actions.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/work-items?state=open` | List open hub-owned work items. |
+| `GET` | `/work-items/{id}` | Get an item, including its append-only timeline. |
+| `PATCH` | `/work-items/{id}` | Set `stage`, `next`, `pr`, or `acceptance`. |
+| `GET` | `/work-items/export` | Reconciler projection: `{"items":[{"id","stage","pr","branch","sid","next","after"}]}`. |
+
 ### Memory and analytics
 
 | Method | Path | Purpose |

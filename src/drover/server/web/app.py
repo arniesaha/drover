@@ -1129,6 +1129,19 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         return
             self._work_tool(path.rsplit("/", 1)[1], args)
             return
+        if path in {"/work-items", "/work-items/export"} or path.startswith(
+            "/work-items/"
+        ):
+            if path == "/work-items":
+                args = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+                self._work_items("list", args)
+            elif path == "/work-items/export":
+                self._work_items("export", {})
+            else:
+                self._work_items(
+                    "get", {"id": unquote(path.removeprefix("/work-items/"))}
+                )
+            return
         if path == "/work-queue/report":
             credential = bearer_credential(self.auth, self.headers)
             if credential is None or credential.scope != "device":
@@ -1601,6 +1614,24 @@ class _MetricsHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib method name
         self._dispatch_request(self._do_POST)
 
+    def do_PATCH(self) -> None:  # noqa: N802 - stdlib method name
+        self._dispatch_request(self._do_PATCH)
+
+    def _do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if not self._gate(path):
+            return
+        if not path.startswith("/work-items/") or path == "/work-items/export":
+            self._send(404, "application/json", '{"error":"not found"}')
+            return
+        body = self._read_json()
+        if not isinstance(body, dict):
+            self._send(400, "application/json", '{"error":"JSON object required"}')
+            return
+        body["id"] = unquote(path.removeprefix("/work-items/"))
+        self._work_items("patch", body)
+
     def _do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -1869,7 +1900,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     '{"error": "request body must be valid JSON"}\n',
                 )
                 return
-            status, payload = self.collector.proxy_create_harness_session(host_id, body)
+            credential = bearer_credential(self.auth, self.headers)
+            owner = credential.label if credential is not None else "control"
+            status, payload = self.collector.proxy_create_harness_session(
+                host_id, body, work_item_owner=owner
+            )
             self._send(status, "application/json", payload)
             return
         if path.startswith("/harness/sessions/") and path.endswith("/publications"):
@@ -2382,6 +2417,23 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         from drover.server.work_queue.runtime import dispatch
 
         status, result = dispatch(
+            getattr(self.collector, "work_control", None),
+            self.auth,
+            self.headers,
+            operation,
+            args,
+        )
+        self._send(
+            status,
+            "application/json",
+            json.dumps(result, default=str),
+            extra_headers={"Cache-Control": "no-store"},
+        )
+
+    def _work_items(self, operation, args):
+        from drover.server.work_queue.runtime import dispatch_hub_items
+
+        status, result = dispatch_hub_items(
             getattr(self.collector, "work_control", None),
             self.auth,
             self.headers,
