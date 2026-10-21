@@ -248,6 +248,28 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+# --- host runtime preflight --------------------------------------------------
+# These are deliberately checked, not installed.  Installing a package manager
+# package changes the host's security/update policy and is outside the scope of
+# a Drover installer.  Agent CLIs remain opt-in: harnessd advertises only the
+# ones it finds when it starts, while Git is required for the advertised
+# worktree and repository-evidence capabilities.
+require_host_runtime_dependencies() {
+  if ! command -v git >/dev/null 2>&1; then
+    fail "missing runtime dependency: git. Install it before rerunning: macOS: brew install git (or install Xcode Command Line Tools); Debian/Ubuntu: sudo apt-get install -y git; Fedora: sudo dnf install -y git; Alpine: sudo apk add git"
+  fi
+  case "$OS" in
+    darwin)
+      command -v launchctl >/dev/null 2>&1 \
+        || fail "missing runtime dependency: launchctl. It is supplied by macOS; use a supported macOS host."
+      ;;
+    linux)
+      command -v systemctl >/dev/null 2>&1 \
+        || fail "missing runtime dependency: systemctl. Drover's native Linux installer requires a systemd user service; use a systemd host (Debian/Ubuntu: sudo apt-get install -y systemd)."
+      ;;
+  esac
+}
+
 # --- uv ----------------------------------------------------------------------
 ensure_uv() {
   command -v uv >/dev/null 2>&1 && return 0
@@ -894,6 +916,7 @@ EOF
 if [ "$VERIFY_RELEASE" -eq 1 ]; then
   require_uv_for_release_verification
 else
+  require_host_runtime_dependencies
   ensure_uv
 fi
 VERSION="$(resolve_version)"

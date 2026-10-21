@@ -11,6 +11,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from drover.config import default_config
+from drover.server.harness import updater as updater_module
 from drover.server.harness.updater import HostUpdater, verify_after_restart
 from drover.server.runtime import RuntimeLayout
 
@@ -90,6 +91,16 @@ def test_a_newer_version_installs_but_does_not_flip_yet(tmp_path):
     updater.observe(_beat("0.1.4"))
     assert "0.1.4" in layout.installed_versions()
     assert layout.active_version() == "0.1.3", "installed is not activated"
+
+
+def test_missing_runtime_dependency_blocks_activation(monkeypatch, tmp_path):
+    layout, updater = _updater(tmp_path)
+    updater.observe(_beat("0.1.4"))
+    monkeypatch.setattr(updater_module, "runtime_dependency_preflight", lambda _: ["git"])
+
+    assert updater.maybe_activate() is False
+    assert layout.active_version() == "0.1.3"
+    assert updater.status()["reason"] == "runtime_dependencies"
 
 
 def test_activation_happens_once_idle(tmp_path):
