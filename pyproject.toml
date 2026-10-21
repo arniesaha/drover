@@ -86,6 +86,7 @@ markers = [
     "pgvector: contracts requiring the actual PostgreSQL vector extension",
     "acceptance_scale: scale acceptance tests run manually on high-capacity hardware",
     "rust_phase2: shell + Codex Rust MVP contract",
+    "slow_integration: isolated integration coverage run on main and nightly, not PRs",
 ]
 # Passing tests stop leaving their tmp_path behind. The harness suites write a
 # DuckDB per test, so the default ("all", kept for the last 3 runs) reached

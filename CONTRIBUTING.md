@@ -238,6 +238,22 @@ tests/
 
 ### Writing Tests
 
+Every test must protect a user-visible capability, a public contract, or a
+documented regression. Prefer the smallest test that would fail if that
+promise breaks; do not add assertions for private helper shape, incidental
+copy, or implementation order. Put the originating issue or PR in a
+regression test's comment when it is not obvious from its name.
+
+Tests must be deterministic: use fixed clocks and fixtures, OS-assigned ports
+and `tmp_path`, bounded predicate waits instead of sleeps, and local doubles
+instead of real credentials, network services, or ambient user state. Do not
+fix a flake with retries or a `flaky` decorator.
+
+Most isolated contracts belong in the PR tier and must pass under xdist. Tests
+that need a real service, subprocess boundary, production-shaped data, or a
+performance-sized fixture belong in the `slow_integration` tier; it runs on
+main and nightly. Keep the reason for that tier next to the test or fixture.
+
 Use pytest fixtures for test data:
 
 ```python

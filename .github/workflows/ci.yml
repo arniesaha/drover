@@ -5,6 +5,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  schedule:
+    - cron: "23 5 * * *"
   workflow_dispatch:
 
 permissions:
@@ -159,7 +161,7 @@ jobs:
       # 4.0 minutes and raised the failure rate from 8% to 27%, with one run
       # stretching to 35 minutes. Two keeps most of the speedup and leaves the
       # runner room for the children. Revisit with numbers, not intuition.
-      run: pytest tests/ --ignore=tests/acceptance -n 2
+      run: pytest tests/ -n 2 -m 'not slow_integration'
 
     # The installer is shell, so pytest alone leaves it unguarded. Every
     # suite runs against stubs and temp directories and never touches the
@@ -179,6 +181,26 @@ jobs:
           echo "::endgroup::"
         done
         exit "$status"
+
+  slow-integration:
+    # Core service-boundary coverage stays required after merge and is also
+    # exercised nightly.  It is deliberately outside the PR feedback tier.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: "pip"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+    - name: Run slow integration tier
+      env:
+        DROVER_TEST_TIMEOUT_SCALE: "4"
+      run: pytest tests/ --ignore=tests/acceptance -n 2 -m slow_integration
 
   harnessd-contract:
     name: harnessd contract (${{ matrix.impl }})

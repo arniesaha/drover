@@ -302,7 +302,13 @@ def _fake_cli(path: Path, fixture: Path, log: Path) -> None:
 
 @pytest.fixture
 def fake_clis(tmp_path):
-    """CLI-shaped executables that retain argv/stdin and replay fixture NDJSON."""
+    """CLI-shaped executables that retain argv/stdin and replay fixture NDJSON.
+
+    The child daemon inherits this directory ahead of the host PATH.  Stub
+    ``security`` as well as the harness CLIs: setting HOME does not isolate
+    macOS Keychain, and an ambient Claude credential otherwise makes a
+    contract test perform a real provider probe.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "fake-cli.jsonl"
@@ -310,6 +316,9 @@ def fake_clis(tmp_path):
     _fake_cli(bin_dir / "claude", fixtures / "claude_basic.ndjson", log)
     _fake_cli(bin_dir / "codex", fixtures / "codex_basic.ndjson", log)
     _fake_cli(bin_dir / "agy", fixtures / "codex_basic.ndjson", log)
+    security = bin_dir / "security"
+    security.write_text("#!/bin/sh\nexit 1\n")
+    security.chmod(0o755)
     return bin_dir, log
 
 
