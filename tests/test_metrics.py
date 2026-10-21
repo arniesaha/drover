@@ -4208,6 +4208,7 @@ def test_messages_endpoint_orders_and_filters_by_seq(tmp_path):
         assert body["max_seq"] == 3
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_overlays_canonical_event_metadata(tmp_path):
@@ -4238,6 +4239,7 @@ def test_messages_endpoint_overlays_canonical_event_metadata(tmp_path):
         ]
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
@@ -4256,6 +4258,7 @@ def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
         assert body["max_seq"] == 2
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_legacy_after_seq_request_remains_unpaginated(tmp_path):
@@ -4278,6 +4281,7 @@ def test_messages_endpoint_legacy_after_seq_request_remains_unpaginated(tmp_path
         assert "has_newer" not in body
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_pages_newest_older_and_fixed_forward(tmp_path):
@@ -4329,6 +4333,7 @@ def test_messages_endpoint_pages_newest_older_and_fixed_forward(tmp_path):
         assert bounded["has_newer"] is False
     finally:
         server.shutdown()
+        server.server_close()
 
 
 @pytest.mark.parametrize(

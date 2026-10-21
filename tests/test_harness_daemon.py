@@ -20,8 +20,8 @@ from _timeouts import scale_timeout
 from click.testing import CliRunner
 
 import drover
-from drover.config import AdvisoryContentConfig
-from drover.schema import bootstrap
+from drover.config import AdvisoryContentConfig, default_config
+from drover.schema import bootstrap, bootstrap_control_plane_store
 from drover.server.__main__ import main
 from drover.server.harness import cli as harness_cli
 from drover.server.harness import daemon as harness_daemon
@@ -1095,6 +1095,20 @@ def test_harnessd_cli_reports_the_packaged_version():
 
     assert result.exit_code == 0, result.output
     assert drover.__version__ in result.output
+
+
+def test_skinny_harnessd_store_check_needs_no_database_cli(monkeypatch, tmp_path):
+    cfg = replace(default_config(), duckdb_path=tmp_path / "host-spool.duckdb")
+    bootstrap_control_plane_store(cfg.duckdb_path)
+    monkeypatch.setattr(harness_cli, "resolve_config", lambda _path: cfg)
+
+    result = CliRunner().invoke(harnessd_cli, ["store", "check"])
+
+    assert result.exit_code == 0, result.output
+    assert "integrity_check: ok (DuckDB read-only relation scan)" in result.output
+    assert "session_counts:\n  (none)" in result.output
+    assert "quarantine_count: 0" in result.output
+    assert "unpushed_event_count: 0" in result.output
 
 
 def test_daemon_can_register_host_with_central_server(tmp_path):
