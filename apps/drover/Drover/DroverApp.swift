@@ -212,7 +212,6 @@ private struct ChatHeaderFixtureRoot: View {
 private struct RootView: View {
     var environment: AppEnvironment
     let notifier: Notifying
-    @State private var showSettings = false
     @State private var pairingLink: PairingPayload?
     @State private var showPairingLink = false
     @State private var invalidPairingLink = false
@@ -241,16 +240,9 @@ private struct RootView: View {
                     environment: environment,
                     notifier: notifier,
                     defaults: defaults,
-                    chatModelFactory: chatModelFactory,
-                    onOpenSettings: { showSettings = true }
+                    chatModelFactory: chatModelFactory
                 )
                 .id(environment.generation)
-                .sheet(isPresented: $showSettings) {
-                    NavigationStack {
-                        SettingsView(environment: environment)
-                    }
-                    .presentationCornerRadius(24)
-                }
             } else {
                 NavigationStack {
                     OnboardingView(environment: environment)

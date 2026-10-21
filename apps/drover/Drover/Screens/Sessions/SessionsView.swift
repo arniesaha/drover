@@ -35,13 +35,13 @@ struct SessionsView: View {
     private let recoveryGeneration: Int
     private let chatModelFactory: ChatModelFactory?
     private let defaults: UserDefaults
-    private let onOpenSettings: () -> Void
+    private let onOpenInbox: () -> Void
+    private let showsNewSessionAction: Bool
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
     @State private var exporterFreshness = ExporterFreshnessGate()
     @State private var showLaunch = false
     @State private var launchedSession: LaunchedSession?
-    @State private var showFinished = false
     let isDemoMode: Bool
     @State private var notificationSessionIDs: Set<String>?
     @State private var filterState: FleetFilterState
@@ -58,7 +58,8 @@ struct SessionsView: View {
         defaults: UserDefaults = .standard,
         sessionStore: SessionStore? = nil,
         cockpitStore: CockpitStore? = nil,
-        onOpenSettings: @escaping () -> Void = {}
+        onOpenInbox: @escaping () -> Void = {},
+        showsNewSessionAction: Bool = true
     ) {
         self.client = client
         self.isDemoMode = isDemoMode
@@ -68,7 +69,8 @@ struct SessionsView: View {
         self.recoveryGeneration = recoveryGeneration
         self.chatModelFactory = chatModelFactory
         self.defaults = defaults
-        self.onOpenSettings = onOpenSettings
+        self.onOpenInbox = onOpenInbox
+        self.showsNewSessionAction = showsNewSessionAction
         _filterState = State(initialValue: FleetFilterState.load(from: defaults))
         _store = State(initialValue: sessionStore ?? SessionStore(client: client))
         _cockpitStore = State(initialValue: cockpitStore ?? CockpitStore(client: client))
@@ -117,32 +119,47 @@ struct SessionsView: View {
 
                         // Home is the live fleet: needs-you and working sessions
                         // stay together, while decisions and findings live in Inbox.
-                        if inboxSessions.isEmpty, store.hasLoadedOnce {
+                        if runningSessions.isEmpty, store.hasLoadedOnce {
                             if filterState.isFiltered {
-                                ContentUnavailableView(
-                                    "No matching sessions",
-                                    systemImage: "line.3.horizontal.decrease.circle",
-                                    description: Text("Try clearing the active filter to see all sessions.")
+                                StateView(
+                                    kind: .empty,
+                                    title: "No matching running sessions",
+                                    message: "Try clearing the active filter to see running work.",
+                                    actionTitle: "Clear filters",
+                                    action: { filterState.clear(); filterState.save(to: defaults) }
                                 )
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 40)
                             } else {
-                                ContentUnavailableView("Nothing running",
-                                                       systemImage: "rectangle.stack.badge.plus",
-                                                       description: Text("Start a new session when you're ready."))
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 40)
+                                StateView(
+                                    kind: .empty,
+                                    title: "Nothing running",
+                                    message: "Start a new session when you're ready."
+                                )
                             }
                         } else {
-                            ForEach(inboxSessions, id: \.id) { session in
+                            if !store.needsYou.isEmpty {
+                                Button {
+                                    onOpenInbox()
+                                } label: {
+                                    Label("\(store.needsYou.count) item\(store.needsYou.count == 1 ? "" : "s") need your attention", systemImage: "tray.full")
+                                        .font(DroverTypeScale.section)
+                                        .foregroundStyle(DroverTheme.accent)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(DroverSpace.x3)
+                                }
+                                .buttonStyle(.plain)
+                                .background(DroverTheme.accentSubtle,
+                                            in: RoundedRectangle(cornerRadius: DroverRadius.control, style: .continuous))
+                                .accessibilityIdentifier("home-open-inbox")
+                            }
+                            Text("Running now")
+                                .font(DroverTypeScale.section)
+                                .foregroundStyle(DroverTheme.textPrimary)
+                                .padding(.top, DroverSpace.x1)
+                            ForEach(runningSessions, id: \.id) { session in
                                 row(for: session)
                                     .id(session.id)
                             }
-                            .animation(.easeInOut(duration: 0.2), value: inboxSessions.map(\.id))
-                        }
-
-                        if notificationSessionIDs == nil, !finishedSessions.isEmpty {
-                            finishedSection
+                            .animation(.easeInOut(duration: 0.2), value: runningSessions.map(\.id))
                         }
 
                     }
@@ -216,7 +233,9 @@ struct SessionsView: View {
         // underneath the pill at accessibility sizes, so tapping the row
         // opened New Session instead of the conversation.
         .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
-            if store.hasLoadedOnce { actionBar.padding(.trailing, 18).padding(.vertical, 18) }
+            if showsNewSessionAction, store.hasLoadedOnce {
+                actionBar.padding(.trailing, 18).padding(.vertical, 18)
+            }
         }
         // The design's chrome row *is* this screen's header, so the navigation
         // bar it would otherwise sit under has nothing left to carry. Pushed
@@ -489,7 +508,7 @@ struct SessionsView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
 
-            Text("(\(inboxSessions.count) active)")
+            Text("(\(runningSessions.count) running)")
                 .droverText(.marker)
                 .foregroundStyle(DroverColor.muted)
 
@@ -546,15 +565,11 @@ struct SessionsView: View {
 
     /// The filtered live list, in one piece: needs-you first, then working, each
     /// stabilized by hysteresis.
-    private var inboxSessions: [SessionSummary] {
+    private var runningSessions: [SessionSummary] {
         if let ids = notificationSessionIDs {
             return store.snapshot?.sessions.filter { ids.contains($0.id) } ?? []
         }
-        return filterState.filter(store.inboxSessions)
-    }
-
-    private var finishedSessions: [SessionSummary] {
-        filterState.filter(store.finished)
+        return filterState.filter(store.working)
     }
 
     /// How far behind the snapshot every card below is drawn from.
@@ -574,11 +589,20 @@ struct SessionsView: View {
     // MARK: - Pieces
 
     private var chromeRow: some View {
-        InboxChromeRow(
-            isDemoMode: isEffectiveDemoMode,
-            onToggleTheme: { appearance.toggle(displaying: colorScheme) },
-            onOpenSettings: onOpenSettings
-        )
+        ScreenHeader(
+            title: "Home",
+            eyebrow: isEffectiveDemoMode ? "Demo" : nil,
+            subtitle: "Fleet health and running work"
+        ) {
+            Button {
+                appearance.toggle(displaying: colorScheme)
+            } label: {
+                Image(systemName: DroverAppearance.symbolName(displaying: colorScheme))
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel(DroverAppearance.accessibilityLabel(displaying: colorScheme))
+            .accessibilityIdentifier("theme-toggle")
+        }
     }
 
     private func actionFailedRow(_ message: String) -> some View {
@@ -595,23 +619,6 @@ struct SessionsView: View {
         .padding(.vertical, 9)
         .background(DroverColor.accentTint, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .accessibilityIdentifier("action-failed")
-    }
-
-    private var finishedSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            FinishedRow(count: finishedSessions.count, isExpanded: showFinished) {
-                withAnimation(.snappy(duration: 0.2)) { showFinished.toggle() }
-            }
-
-            if showFinished {
-                VStack(spacing: 10) {
-                    ForEach(finishedSessions, id: \.id) { session in
-                        row(for: session).id(session.id)
-                    }
-                }
-            }
-        }
-        .padding(.top, 4)
     }
 
     private var actionBar: some View {

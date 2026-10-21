@@ -20,6 +20,10 @@ struct AnalyticsView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 16) {
+                ScreenHeader(
+                    title: "Analytics",
+                    subtitle: "Observed activity over time"
+                )
                 filterStrip
 
                 if let notice = store.analyticsRefreshNotice {
@@ -58,10 +62,7 @@ struct AnalyticsView: View {
             .padding(14)
         }
         .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
-        .toolbarBackground(DroverColor.bg, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .navigationTitle("Analytics")
-        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .navigationBar)
         .task { await reload() }
         .refreshable { await reload() }
     }

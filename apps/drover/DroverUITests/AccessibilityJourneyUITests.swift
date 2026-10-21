@@ -45,6 +45,9 @@ final class AccessibilityJourneyUITests: XCTestCase {
         let effort = app.buttons["composer-effort"]
         XCTAssertTrue(model.exists)
         XCTAssertTrue(effort.exists)
+        // Preferences can wrap below the first visible row at XXXL. Scroll
+        // within the composer until the model choice is a real hit target.
+        for _ in 0..<3 where !model.isHittable { scroll.swipeUp() }
         XCTAssertTrue(model.isHittable)
         XCTAssertTrue(app.frame.contains(model.frame))
         // At XXXL the preferences wrap inside the scrollable input. Reach
@@ -387,9 +390,11 @@ final class AccessibilityJourneyUITests: XCTestCase {
         let app = coreJourneyApp()
         app.launchArguments = []
         app.launch()
-        XCTAssertTrue(app.buttons["settings-button"].waitForExistence(timeout: timeout))
-        app.buttons["settings-button"].tap()
-        let scan = app.buttons["settings-scan-pairing"]
+        let settings = app.tabBars.buttons["Settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: timeout))
+        XCTAssertTrue(settings.isHittable)
+        settings.tap()
+        let scan = app.buttons["Scan pairing code"]
         XCTAssertTrue(scan.waitForExistence(timeout: timeout))
         scan.tap()
         let code = app.textFields["K7QP-2M4X"]
