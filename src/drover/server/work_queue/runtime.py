@@ -143,6 +143,21 @@ def start_work_item_event_worker(collector, config, shutdown_event):
     return worker
 
 
+def start_github_webhook_worker(collector, config, shutdown_event):
+    """Start post-ack GitHub processing only after a work service is available."""
+    service = getattr(collector, "work_control", None)
+    if service is None or not config.github_webhook.secret_env:
+        return None
+    from drover.server.work_queue.github_events import GitHubWebhookWorker
+
+    worker = GitHubWebhookWorker(
+        service.store, config.github_webhook, service.github_webhooks, service.providers
+    )
+    worker.start(shutdown_event=shutdown_event)
+    collector.github_webhook_worker = worker
+    return worker
+
+
 def authenticated_actor(auth, headers, config):
     if not auth.enabled:
         raise PermissionError("work tools require credentials")

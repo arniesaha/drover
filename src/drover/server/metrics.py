@@ -1250,6 +1250,12 @@ class MetricsCollector:
                 payload["work_item_subscriptions"] = worker.health()
             except Exception:  # noqa: BLE001 - notification health is advisory
                 payload["work_item_subscriptions"] = {"state": "unavailable"}
+        github_worker = getattr(self, "github_webhook_worker", None)
+        if github_worker is not None and include_detail:
+            try:
+                payload["github_webhook"] = github_worker.health()
+            except Exception:  # noqa: BLE001 - receiver health is advisory
+                payload["github_webhook"] = {"state": "unavailable"}
         body = json.dumps(payload, sort_keys=True) + "\n"
         if self.exporter_health is not None:
             from drover.server.lake.freshness import freshness_status
@@ -3299,6 +3305,17 @@ class MetricsCollector:
                         f"drover_work_item_delivery_lag_seconds {health.get('oldest_lag_seconds', 0)}",
                     ]
                 )
+            except Exception:  # noqa: BLE001 - metrics must remain available
+                pass
+        github_worker = getattr(self, "github_webhook_worker", None)
+        if github_worker is not None:
+            try:
+                health = github_worker.health()
+                for key in ("received", "rejected_bad_signature", "deduped", "linked", "unlinked", "processing_errors"):
+                    lines.extend([
+                        f"# TYPE drover_github_webhook_{key} counter",
+                        f"drover_github_webhook_{key} {health.get(key, 0)}",
+                    ])
             except Exception:  # noqa: BLE001 - metrics must remain available
                 pass
         self._append_audit_cache_metrics(lines)

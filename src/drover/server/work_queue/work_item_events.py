@@ -110,8 +110,8 @@ def append_timeline_event(
     con.execute(
         """INSERT INTO work_item_events
            (event_id, workspace_id, cursor, item_id, kind, from_stage, to_stage,
-            gate, next_action, session_id, pr, occurred_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            gate, next_action, session_id, pr, occurred_at, detail)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [
             timeline_id,
             workspace_id,
@@ -125,6 +125,7 @@ def append_timeline_event(
             item[1],
             item[2],
             timeline[0],
+            detail,
         ],
     )
     subscriptions = con.execute(
@@ -161,6 +162,7 @@ def event_payload(row: dict) -> dict:
         "session_id": row["session_id"],
         "pr": row["pr"],
         "occurred_at": row["occurred_at"],
+        "detail": row.get("detail"),
     }
 
 

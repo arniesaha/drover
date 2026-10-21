@@ -201,6 +201,24 @@ class WorkItemEventsConfig(Model):
         return self
 
 
+class GitHubWebhookConfig(Model):
+    """Ingress limits and the secret reference for GitHub delivery facts."""
+
+    secret_env: str = ""
+    max_body_bytes: int = Field(default=128 * 1024, ge=1024, le=1024 * 1024)
+    batch_size: int = Field(default=16, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def valid(self):
+        import re
+
+        if self.secret_env and not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*", self.secret_env
+        ):
+            raise ValueError("github webhook secret_env must be an environment key")
+        return self
+
+
 class WorkQueueConfig(Model):
     enabled: bool = False
     shadow_mode: bool = True
@@ -208,6 +226,7 @@ class WorkQueueConfig(Model):
     goals: list[GoalScope] = Field(default_factory=list)
     principal_roles: dict[str, str] = Field(default_factory=dict)
     work_item_events: WorkItemEventsConfig = Field(default_factory=WorkItemEventsConfig)
+    github_webhook: GitHubWebhookConfig = Field(default_factory=GitHubWebhookConfig)
 
     @model_validator(mode="after")
     def valid(self):

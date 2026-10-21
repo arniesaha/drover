@@ -118,6 +118,19 @@ tracking; it only suppresses automatic queue actions.
 | `GET` | `/work-items/{id}` | Get an item, including its append-only timeline. |
 | `PATCH` | `/work-items/{id}` | Set `stage`, `next`, `pr`, or `acceptance`. |
 | `GET` | `/work-items/export` | Reconciler projection: `{"items":[{"id","stage","pr","branch","sid","next","after"}]}`. |
+| `POST` | `/integrations/github/webhook` | Public signed GitHub CI/PR ingress; validates `X-Hub-Signature-256`, accepts durable delivery with `202`. |
+
+### GitHub webhook ingress
+
+Configure `work_queue.github_webhook.secret_env` with the environment-variable
+name holding the webhook HMAC secret. Send `X-GitHub-Delivery`,
+`X-GitHub-Event`, and `X-Hub-Signature-256: sha256=<hex hmac>` over a private
+tailnet path (for example an Actions runner using Tailscale) or an
+Access-protected tunnel. The default body limit is 128 KiB. The hub returns
+`401` for a missing/bad signature, `413` for an oversized body, and `202` for
+both accepted and duplicate deliveries; it processes accepted deliveries after
+the response. The route is intentionally not bearer-authenticated because the
+signature is its credential.
 | `POST` | `/work-items/subscriptions` | Create a credential-scoped webhook subscription; returns its HMAC secret once. |
 | `GET` | `/work-items/subscriptions` | List the caller's subscriptions (never returns secrets). |
 | `DELETE` | `/work-items/subscriptions/{id}` | Delete one of the caller's subscriptions. |
