@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11, PostgreSQL control plane, Pydantic config, requests, pytest.
 
-**Spec:** `docs/superpowers/specs/2026-10-20-continuity-rules-engine-design.md`
+**Spec:** `docs/design/continuity-rules-engine-design.md`
 
 ## Global Constraints
 
