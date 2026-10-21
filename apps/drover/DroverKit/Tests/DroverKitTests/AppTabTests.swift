@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct AppTabTests {
     @Test func allCasesHaveExpectedMetadata() {
-        #expect(AppTab.allCases == [.home, .inbox, .analytics, .accounts])
+        #expect(AppTab.allCases == [.home, .inbox, .analytics, .accounts, .settings])
 
         #expect(AppTab.home.title == "Home")
         #expect(AppTab.home.systemImage == "rectangle.stack")
@@ -21,6 +21,10 @@ import Testing
         #expect(AppTab.accounts.title == "Accounts")
         #expect(AppTab.accounts.systemImage == "person.crop.circle")
         #expect(AppTab.accounts.accessibilityIdentifier == "tab-accounts")
+
+        #expect(AppTab.settings.title == "Settings")
+        #expect(AppTab.settings.systemImage == "gearshape")
+        #expect(AppTab.settings.accessibilityIdentifier == "tab-settings")
 
     }
 

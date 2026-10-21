@@ -3,28 +3,32 @@ import SwiftUI
 
 /// The root navigation dock of the application.
 ///
-/// Presents a floating translucent dock hosting:
+/// Presents the five first-class destinations.  The system tab bar becomes a
+/// sidebar automatically on iPad, preserving the same information
+/// architecture at every size class.
+///
+/// Hosts:
 /// - Home (`SessionsView`)
 /// - Inbox (`InboxView`)
 /// - Analytics (`AnalyticsView`)
 /// - Accounts (`ProviderAccountsView`)
-///
-/// Preserves per-tab navigation stacks and scroll position, handles deep linking
-/// (notification tap -> session), and ensures the floating dock does not obscure
-/// content or controls.
+/// - Settings (`SettingsView`)
 struct MainTabView: View {
     let client: DroverClient
     let environment: AppEnvironment
     let notifier: Notifying
     let defaults: UserDefaults
     let chatModelFactory: ChatModelFactory?
-    let onOpenSettings: () -> Void
 
     @State private var sessionStore: SessionStore
     @State private var cockpitStore: CockpitStore
     @State private var workStore: WorkAttentionStore
     @State private var inboxAttentionStore: InboxAttentionStore
     @State private var selectedTab: AppTab
+    @State private var showGlobalLaunch = false
+    @State private var pendingGlobalLaunch: GlobalSessionRoute?
+    @State private var globalLaunchedSession: GlobalSessionRoute?
+    @State private var inboxSession: InboxSessionRoute?
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
 
@@ -36,15 +40,13 @@ struct MainTabView: View {
         chatModelFactory: ChatModelFactory? = nil,
         initialTab: AppTab? = nil,
         sessionStore: SessionStore? = nil,
-        cockpitStore: CockpitStore? = nil,
-        onOpenSettings: @escaping () -> Void
+        cockpitStore: CockpitStore? = nil
     ) {
         self.client = client
         self.environment = environment
         self.notifier = notifier
         self.defaults = defaults
         self.chatModelFactory = chatModelFactory
-        self.onOpenSettings = onOpenSettings
         _sessionStore = State(initialValue: sessionStore ?? SessionStore(client: client))
         _cockpitStore = State(initialValue: cockpitStore ?? CockpitStore(client: client))
         _workStore = State(initialValue: WorkAttentionStore(service: client))
@@ -77,24 +79,6 @@ struct MainTabView: View {
         }
     }
 
-    private var inboxBadgeCount: Int {
-        InboxAttentionPresentation.count(
-            workItems: workStore.items,
-            sessions: sessionStore.snapshot?.sessions ?? [],
-            insights: inboxAttentionStore.insights
-        )
-    }
-
-    private var inboxBadge: String? {
-        InboxAttentionPresentation.badgeValue(for: inboxBadgeCount)
-    }
-
-    private var accountsBadge: String? {
-        AccountHealthPresentation.badgeValue(
-            for: AccountHealthPresentation.count(accounts: cockpitStore.providerAccounts)
-        )
-    }
-
     var body: some View {
         TabView(selection: $selectedTab) {
             NavigationStack {
@@ -109,7 +93,10 @@ struct MainTabView: View {
                     defaults: defaults,
                     sessionStore: sessionStore,
                     cockpitStore: cockpitStore,
-                    onOpenSettings: onOpenSettings
+                    onOpenInbox: { selectedTab = .inbox },
+                    // Home owns the same action inside its navigation stack,
+                    // so it naturally leaves with a pushed session detail.
+                    showsNewSessionAction: true
                 )
             }
             .tabItem { tabLabel(for: .home) }
@@ -126,8 +113,10 @@ struct MainTabView: View {
                         workStore: workStore,
                         attentionStore: inboxAttentionStore,
                         onOpenSession: { sessionID in
-                            NotificationRoute.shared.open(sessionID: sessionID)
-                            selectedTab = .home
+                            guard let session = sessionStore.snapshot?.sessions.first(where: { $0.id == sessionID }) else {
+                                return
+                            }
+                            inboxSession = InboxSessionRoute(session: session)
                         }
                     )
                 }
@@ -168,23 +157,114 @@ struct MainTabView: View {
             .accessibilityLabel(AppTab.accounts.title)
             .accessibilityIdentifier(AppTab.accounts.accessibilityIdentifier)
 
+            NavigationStack {
+                LazyTabRoot(isSelected: selectedTab == .settings) {
+                    SettingsView(environment: environment, showsDismissButton: false)
+                }
+            }
+            .tabItem { tabLabel(for: .settings) }
+            .tag(AppTab.settings)
+            .accessibilityLabel(AppTab.settings.title)
+            .accessibilityIdentifier(AppTab.settings.accessibilityIdentifier)
         }
-        .tabViewStyle(.page(indexDisplayMode: .never))
-        // Reserve the exact lane occupied by the floating dock. Descendants
-        // receive the adjusted safe area, so their own safe-area insets (such
-        // as Home's New Session button) keep the final row above both controls.
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            Color.clear.frame(height: 76).allowsHitTesting(false)
+        // iOS 18 renders this as the familiar tab bar on iPhone and promotes
+        // the same ordered destinations to a persistent sidebar on iPad.
+        .tabViewStyle(.sidebarAdaptable)
+        // This remains available from every destination on compact layouts,
+        // rather than being embedded in (and duplicated by) the Home feed.
+        .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
+            if selectedTab != .home {
+                NewSessionBar { showGlobalLaunch = true }
+                    .padding(.trailing, DroverSpace.x4)
+                    // TabView's compact tab bar occupies the lower safe area.
+                    // Keep the global action above it so every destination stays
+                    // visually and physically reachable (including at large text).
+                    .padding(.bottom, DroverSpace.x12 + DroverSpace.x4)
+                    .padding(.vertical, DroverSpace.x2)
+            }
         }
-        .overlay(alignment: .bottom) {
-            FloatingDock(
-                selectedTab: $selectedTab,
-                inboxBadge: inboxBadge,
-                accountsBadge: accountsBadge
-            )
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 14)
-            .padding(.bottom, 8)
+        .sheet(isPresented: $showGlobalLaunch, onDismiss: {
+            // LaunchView dismisses its own sheet after invoking its callback.
+            // Wait for that dismissal before presenting the new session so a
+            // global launch follows the same launch -> session contract as Home.
+            globalLaunchedSession = pendingGlobalLaunch
+            pendingGlobalLaunch = nil
+        }) {
+            NavigationStack {
+                LaunchView(
+                    client: client,
+                    snapshot: sessionStore.snapshot,
+                    providerAccounts: cockpitStore.providerAccounts,
+                    catalogStore: HarnessModelCatalogStore(defaults: defaults)
+                ) { sessionID, isStructured, harness in
+                    pendingGlobalLaunch = GlobalSessionRoute(
+                        id: sessionID,
+                        isStructured: isStructured,
+                        harness: harness
+                    )
+                    // Return to Home once the session detail is dismissed;
+                    // launching remains global rather than an Inbox workflow.
+                    selectedTab = .home
+                }
+                .navigationTitle("New Session")
+            }
+            .presentationDetents([.large])
+            .presentationCornerRadius(DroverRadius.sheet)
+        }
+        .sheet(item: $globalLaunchedSession) { route in
+            NavigationStack {
+                Group {
+                    if route.isStructured {
+                        ChatView(
+                            client: environment.isDemoMode ? nil : client,
+                            sessionID: route.id,
+                            harness: route.harness,
+                            recoveryStore: environment.chatRecoveryStore,
+                            recoveryWriteGate: environment.chatRecoveryWriteGate,
+                            recoveryGeneration: environment.chatRecoveryGeneration,
+                            chatModelFactory: chatModelFactory,
+                            isDemoMode: environment.isDemoMode
+                        )
+                    } else {
+                        TerminalScreen(client: client, sessionID: route.id, harness: route.harness)
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Home") { globalLaunchedSession = nil }
+                    }
+                }
+            }
+        }
+        // A detail launched in Inbox is presented over that navigation stack.
+        // Dismissing it therefore lands exactly back in Inbox, instead of
+        // silently switching the user to Home.
+        .sheet(item: $inboxSession) { route in
+            NavigationStack {
+                Group {
+                    if route.isStructured {
+                        ChatView(
+                            client: environment.isDemoMode ? nil : client,
+                            sessionID: route.id,
+                            harness: route.harness,
+                            recap: route.recap,
+                            recapSourceSeq: route.recapSourceSeq,
+                            recoveryStore: environment.chatRecoveryStore,
+                            recoveryWriteGate: environment.chatRecoveryWriteGate,
+                            recoveryGeneration: environment.chatRecoveryGeneration,
+                            chatModelFactory: chatModelFactory,
+                            isDemoMode: environment.isDemoMode
+                        )
+                    } else {
+                        TerminalScreen(client: client, sessionID: route.id, harness: route.harness)
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Inbox") { inboxSession = nil }
+                    }
+                }
+            }
         }
         .onChange(of: selectedTab) { _, newTab in
             newTab.save(to: defaults)
@@ -238,6 +318,28 @@ struct MainTabView: View {
     }
 }
 
+private struct InboxSessionRoute: Identifiable {
+    let id: String
+    let isStructured: Bool
+    let harness: String
+    let recap: String?
+    let recapSourceSeq: Int?
+
+    init(session: SessionSummary) {
+        id = session.id
+        isStructured = session.isStructured
+        harness = session.harness
+        recap = session.recap ?? session.preview
+        recapSourceSeq = session.recapSourceSeq
+    }
+}
+
+private struct GlobalSessionRoute: Identifiable {
+    let id: String
+    let isStructured: Bool
+    let harness: String
+}
+
 /// Defers constructing and loading a tab's view hierarchy until the tab is first visited,
 /// preventing unneeded network requests, tasks, and accessibility snapshot overhead on launch.
 private struct LazyTabRoot<Content: View>: View {
@@ -254,68 +356,5 @@ private struct LazyTabRoot<Content: View>: View {
                 Color.clear
             }
         }
-    }
-}
-
-/// A compact app-owned dock avoids the system tab bar's opaque full-width
-/// background while retaining explicit labels, selected state, and badges.
-struct FloatingDock: View {
-    @Binding var selectedTab: AppTab
-    let inboxBadge: String?
-    let accountsBadge: String?
-
-    var body: some View {
-        HStack(spacing: 2) {
-            item(.home)
-            item(.inbox, badge: inboxBadge)
-            item(.analytics)
-            item(.accounts, badge: accountsBadge)
-        }
-        .padding(5)
-        .frame(maxWidth: .infinity)
-        .frame(maxWidth: 430)
-        .floatingDockSurface(in: Capsule())
-    }
-
-    @ViewBuilder
-    private func item(_ tab: AppTab, badge: String? = nil) -> some View {
-        Button {
-            selectedTab = tab
-        } label: {
-            VStack(spacing: 3) {
-                ZStack(alignment: .topTrailing) {
-                    Image(systemName: tab.systemImage)
-                        .font(.system(size: 16, weight: .semibold))
-                    if let badge {
-                        Text(badge)
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, badge.count > 1 ? 4 : 0)
-                            .frame(minWidth: 16, minHeight: 16)
-                            .background(Circle().fill(DroverColor.warn))
-                            .offset(x: 8, y: -7)
-                            .accessibilityHidden(true)
-                    }
-                }
-                Text(tab.title)
-                    .font(.caption2.weight(tab == selectedTab ? .semibold : .regular))
-                    .lineLimit(1)
-            }
-            .foregroundStyle(tab == selectedTab ? DroverColor.accentHi : DroverColor.muted)
-            .frame(maxWidth: .infinity, minHeight: 52)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("dock-\(tab.rawValue)")
-        .accessibilityLabel(accessibilityLabel(for: tab, badge: badge))
-        .accessibilityAddTraits(tab == selectedTab ? .isSelected : [])
-    }
-
-    private func accessibilityLabel(for tab: AppTab, badge: String?) -> String {
-        guard let badge else { return tab.title }
-        let noun = badge == "1" ? "account needs attention" : "accounts need attention"
-        if tab == .accounts { return "\(tab.title), \(badge) \(noun)" }
-        return "\(tab.title), \(badge) unread"
     }
 }

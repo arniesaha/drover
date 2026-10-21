@@ -17,6 +17,10 @@ struct ProviderAccountsView: View {
                                                    hasRetainedValues: !accounts.isEmpty)
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 12) {
+                ScreenHeader(
+                    title: "Accounts",
+                    subtitle: "Current provider capacity"
+                )
                 Text("Provider-reported capacity. Host icons show usage reporting, not sign-in status.")
                     .droverText(.subtitle)
                     .fixedSize(horizontal: false, vertical: true)
@@ -45,13 +49,11 @@ struct ProviderAccountsView: View {
                     }
                 }
             }
-            .padding(14)
+            .padding(.vertical, 14)
         }
         .accessibilityIdentifier("provider-accounts-scroll")
         .background(DroverColor.bg)
-        .navigationTitle("Accounts")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(.visible, for: .navigationBar)
+        .toolbar(.hidden, for: .navigationBar)
         .refreshable { await onRefresh?() }
     }
 }

@@ -16,6 +16,9 @@ import UserNotifications
 /// everything else.
 struct SettingsView: View {
     var environment: AppEnvironment
+    /// Settings is normally a primary tab. Sheets used by legacy flows can
+    /// opt into their explicit close affordance.
+    var showsDismissButton = true
     @Environment(\.dismiss) private var dismiss
 
     @State private var urlString = ""
@@ -31,6 +34,10 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
+                ScreenHeader(
+                    title: "Settings",
+                    subtitle: "Appearance, connection, and preferences"
+                )
                 if environment.isDemoMode {
                     demoSection
                     supportLinks
@@ -134,15 +141,12 @@ struct SettingsView: View {
         }
         .background(DroverColor.bg)
         .scrollDismissesKeyboard(.interactively)
-        .navigationTitle("Settings")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(DroverColor.bg, for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbar(.hidden, for: .navigationBar)
         .toolbar {
             // Only when this is the sheet reached from the inbox. During
             // onboarding there is nothing behind it to go back to, and a Done
             // button that dismissed to an unconfigured app would be a trap.
-            if environment.client != nil {
+            if showsDismissButton, environment.client != nil {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                 }

@@ -10,7 +10,8 @@ struct ObservabilityFixtureRoot: View {
     @State private var workStore: WorkAttentionStore
     @State private var attentionStore: InboxAttentionStore
     @State private var appearance = AppearanceStore()
-    @State private var selectedTab: AppTab = .home
+    @State private var selectedTab: AppTab
+    private let settingsEnvironment: AppEnvironment
 
     init(client: DroverClient) {
         self.client = client
@@ -21,6 +22,12 @@ struct ObservabilityFixtureRoot: View {
         _sessionStore = State(initialValue: SessionStore(client: client))
         _workStore = State(initialValue: WorkAttentionStore(service: client))
         _attentionStore = State(initialValue: InboxAttentionStore(client: client))
+        _selectedTab = State(initialValue: AppTab(rawValue: ProcessInfo.processInfo.environment[
+            "DROVER_UI_TEST_SELECTED_TAB"
+        ] ?? "") ?? .home)
+        // Use the same fixture configuration as the app root, so the
+        // Settings capture exercises the real primary destination too.
+        settingsEnvironment = UITestScenario()!.environment
     }
 
     var body: some View {
@@ -54,23 +61,14 @@ struct ObservabilityFixtureRoot: View {
             .tabItem { Label(AppTab.accounts.title, systemImage: AppTab.accounts.systemImage) }
             .tag(AppTab.accounts)
             .accessibilityIdentifier(AppTab.accounts.accessibilityIdentifier)
+            NavigationStack {
+                SettingsView(environment: settingsEnvironment, showsDismissButton: false)
+            }
+            .tabItem { Label(AppTab.settings.title, systemImage: AppTab.settings.systemImage) }
+            .tag(AppTab.settings)
+            .accessibilityIdentifier(AppTab.settings.accessibilityIdentifier)
         }
-        .tabViewStyle(.page(indexDisplayMode: .never))
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            Color.clear.frame(height: 76).allowsHitTesting(false)
-        }
-        .overlay(alignment: .bottom) {
-            FloatingDock(
-                selectedTab: $selectedTab,
-                inboxBadge: attentionStore.insights.isEmpty ? nil : String(attentionStore.insights.count),
-                accountsBadge: AccountHealthPresentation.badgeValue(
-                    for: AccountHealthPresentation.count(accounts: ObservabilityFixtureData.accounts)
-                )
-            )
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 14)
-            .padding(.bottom, 8)
-        }
+        .tabViewStyle(.sidebarAdaptable)
         .environment(appearance)
         .environment(\.forcesOpaqueDockChrome,
                      ProcessInfo.processInfo.environment["DROVER_UI_TEST_REDUCE_TRANSPARENCY"] == "1")

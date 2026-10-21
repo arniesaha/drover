@@ -93,6 +93,7 @@ struct SessionRow: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     Spacer(minLength: 0)
+                    StatusChip(status: DroverStatus(session: session))
                 }
 
                 detailLayout {
