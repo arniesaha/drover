@@ -1256,6 +1256,9 @@ class MetricsCollector:
                 payload["github_webhook"] = github_worker.health()
             except Exception:  # noqa: BLE001 - receiver health is advisory
                 payload["github_webhook"] = {"state": "unavailable"}
+        rule_worker = getattr(self, "work_item_rule_worker", None)
+        if rule_worker is not None and include_detail:
+            payload["work_item_rules"] = dict(rule_worker.health)
         body = json.dumps(payload, sort_keys=True) + "\n"
         if self.exporter_health is not None:
             from drover.server.lake.freshness import freshness_status
@@ -3327,6 +3330,31 @@ class MetricsCollector:
                     )
             except Exception:  # noqa: BLE001 - metrics must remain available
                 pass
+        rule_worker = getattr(self, "work_item_rule_worker", None)
+        if rule_worker is not None:
+            for key in ("evaluations", "actions", "skips", "wakes"):
+                lines.extend(
+                    [
+                        f"# TYPE drover_work_item_rules_{key} counter",
+                        f"drover_work_item_rules_{key} {rule_worker.health.get(key, 0)}",
+                    ]
+                )
+        execution_worker = getattr(self, "work_queue_execution_worker", None)
+        if execution_worker is not None:
+            health = execution_worker.coordinator.health
+            for key in ("launches", "cap_denials", "budget_denials"):
+                lines.extend(
+                    [
+                        f"# TYPE drover_work_queue_{key} counter",
+                        f"drover_work_queue_{key} {health.get(key, 0)}",
+                    ]
+                )
+            lines.extend(
+                [
+                    "# TYPE drover_work_queue_kill_switch gauge",
+                    f"drover_work_queue_kill_switch {int(execution_worker.service.execution_kill_switch)}",
+                ]
+            )
         self._append_audit_cache_metrics(lines)
         redis_streams = _redis_stream_snapshots(self.job_streams)
         self._cached_text = "\n".join(lines) + "\n"

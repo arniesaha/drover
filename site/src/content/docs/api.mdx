@@ -116,7 +116,7 @@ tracking; it only suppresses automatic queue actions.
 | --- | --- | --- |
 | `GET` | `/work-items?state=open` | List open hub-owned work items. |
 | `GET` | `/work-items/{id}` | Get an item, including its append-only timeline. |
-| `PATCH` | `/work-items/{id}` | Set `stage`, `next`, `pr`, or `acceptance`. |
+| `PATCH` | `/work-items/{id}` | Set `stage`, `next`, `pr`, `acceptance`, `auto_merge`, `automation_gate`, `publish`, or `depends_on`. |
 | `GET` | `/work-items/export` | Reconciler projection: `{"items":[{"id","stage","pr","branch","sid","next","after"}]}`. |
 | `POST` | `/integrations/github/webhook` | Public signed GitHub CI/PR ingress; validates `X-Hub-Signature-256`, accepts durable delivery with `202`. |
 
@@ -141,6 +141,15 @@ hosts. Deliveries are at least once and include `X-Drover-Event-Id` for
 deduplication plus `X-Drover-Signature: sha256=<hmac>` over the JSON body.
 The payload is versioned (`v: 1`) and includes the event id, item id, kind,
 stage transition, gate, next action, session, PR, and occurrence timestamp.
+
+`automation_gate` is the auto-merge policy (`none`, `ui_review`, or `arnab`);
+it is distinct from the lifecycle `gate` returned by older item reads. Existing
+items have publication and auto-merge disabled. `work_queue.rules` configures
+event processing, dry-run, and the 30–60 minute sweep. Queue execution also
+requires non-shadow mode plus per-goal `execution_enabled`; worker caps,
+estimated-cost budgets, and the kill switch apply before the existing launcher
+is called. Missing GitHub write credentials emit `orchestrator_wake`, without
+making `/readyz` fail.
 
 ### Memory and analytics
 
