@@ -50,6 +50,8 @@ def receiver():
     yield f"http://127.0.0.1:{server.server_port}/events"
     server.shutdown()
     server.server_close()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
 
 
 def _item(service):

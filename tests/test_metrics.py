@@ -3640,6 +3640,7 @@ def test_auth_rejects_missing_token(tmp_path):
         assert "authentication required" in exc.value.read().decode()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_auth_healthz_open(tmp_path):
@@ -3656,6 +3657,7 @@ def test_auth_healthz_open(tmp_path):
             body = res.read().decode("utf-8")
     finally:
         server.shutdown()
+        server.server_close()
 
     assert status == 200
     assert body == "ok\nanalytical=ok\n"
@@ -3673,6 +3675,7 @@ def test_auth_accepts_bearer(tmp_path):
             body = res.read().decode("utf-8")
     finally:
         server.shutdown()
+        server.server_close()
 
     assert status == 200
     json.loads(body)  # valid JSON body
@@ -3694,6 +3697,7 @@ def test_auth_accepts_session_cookie(tmp_path):
             status = res.status
     finally:
         server.shutdown()
+        server.server_close()
 
     assert status == 200
 
@@ -3713,6 +3717,7 @@ def test_auth_observatory_redirects_to_login(tmp_path):
         assert exc.value.headers["Location"] == "/auth/login"
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_login_page_is_public(tmp_path):
@@ -3729,6 +3734,7 @@ def test_login_page_is_public(tmp_path):
             body = res.read().decode("utf-8")
     finally:
         server.shutdown()
+        server.server_close()
 
     assert status == 200
     assert "<form" in body
@@ -3764,6 +3770,7 @@ def test_login_success_sets_cookie_and_cookie_works(tmp_path):
             status = res.status
     finally:
         server.shutdown()
+        server.server_close()
 
     assert status == 200
 
@@ -3795,6 +3802,7 @@ def test_harness_events_ingest_idempotent(tmp_path):
             assert body["ingested"] == expected_new
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_harness_events_ingest_requires_auth(tmp_path):
@@ -3822,6 +3830,7 @@ def test_harness_events_ingest_requires_auth(tmp_path):
         assert exc.value.code == 401
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_harness_events_ingest_rejects_malformed_body(tmp_path):
@@ -3839,6 +3848,7 @@ def test_harness_events_ingest_rejects_malformed_body(tmp_path):
         assert exc.value.code == 400
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_ingest_harness_events_derives_session_awaiting_state(tmp_path):
@@ -3917,6 +3927,7 @@ def test_ingest_harness_events_derives_session_awaiting_state(tmp_path):
         assert session.awaiting == "input"
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_login_wrong_token_redirects_with_error(tmp_path):
@@ -3940,6 +3951,7 @@ def test_login_wrong_token_redirects_with_error(tmp_path):
         assert exc.value.headers.get("Set-Cookie") is None
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def _ingest_events(port: int, events: list[dict]) -> None:
@@ -3986,6 +3998,7 @@ def test_harness_events_wire_completion_enqueues_recap_at_host_sequence(
         assert body == {"ingested": 1}
     finally:
         server.shutdown()
+        server.server_close()
 
     assert _live_recap_jobs(pg_control_path, "harness-recap-wire") == [
         ("12", "pending")
@@ -4093,6 +4106,7 @@ def test_failed_split_db_sync_keeps_session_and_worker_retries_recap_once(
         assert LiveRecapWorker(duckdb_path=collector.duckdb_path).drain_once() == 1
     finally:
         server.shutdown()
+        server.server_close()
 
     with control_plane_connection(pg_control_path) as con:
         marker_after_recovery = con.execute(
@@ -4208,6 +4222,7 @@ def test_messages_endpoint_orders_and_filters_by_seq(tmp_path):
         assert body["max_seq"] == 3
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_overlays_canonical_event_metadata(tmp_path):
@@ -4238,6 +4253,7 @@ def test_messages_endpoint_overlays_canonical_event_metadata(tmp_path):
         ]
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
@@ -4256,6 +4272,7 @@ def test_messages_endpoint_defaults_after_seq_to_zero(tmp_path):
         assert body["max_seq"] == 2
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_legacy_after_seq_request_remains_unpaginated(tmp_path):
@@ -4278,6 +4295,7 @@ def test_messages_endpoint_legacy_after_seq_request_remains_unpaginated(tmp_path
         assert "has_newer" not in body
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_pages_newest_older_and_fixed_forward(tmp_path):
@@ -4329,6 +4347,7 @@ def test_messages_endpoint_pages_newest_older_and_fixed_forward(tmp_path):
         assert bounded["has_newer"] is False
     finally:
         server.shutdown()
+        server.server_close()
 
 
 @pytest.mark.parametrize(
@@ -4361,6 +4380,7 @@ def test_messages_endpoint_rejects_invalid_page_queries(tmp_path, query, detail)
         assert detail in exc.value.read().decode()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_selectively_gzips_large_pages(tmp_path):
@@ -4386,6 +4406,7 @@ def test_messages_endpoint_selectively_gzips_large_pages(tmp_path):
         assert len(compressed) < len(identity)
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_the_fleet_listing_is_compressed_when_the_client_offers_it(tmp_path):
@@ -4423,6 +4444,7 @@ def test_the_fleet_listing_is_compressed_when_the_client_offers_it(tmp_path):
         assert len(compressed) < len(identity)
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_a_client_that_cannot_decode_gzip_still_gets_plain_json(tmp_path):
@@ -4439,6 +4461,7 @@ def test_a_client_that_cannot_decode_gzip_still_gets_plain_json(tmp_path):
             json.loads(response.read())
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_keeps_small_page_uncompressed(tmp_path):
@@ -4459,6 +4482,7 @@ def test_messages_endpoint_keeps_small_page_uncompressed(tmp_path):
         assert body["messages"][0]["text"] == "small"
     finally:
         server.shutdown()
+        server.server_close()
 
 
 @pytest.mark.parametrize("raw_after_seq", ["nope", "--5"])
@@ -4478,6 +4502,7 @@ def test_messages_endpoint_rejects_non_integer_after_seq(tmp_path, raw_after_seq
         assert "after_seq must be an integer" in exc.value.read().decode()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_messages_endpoint_requires_auth(tmp_path):
@@ -4495,6 +4520,7 @@ def test_messages_endpoint_requires_auth(tmp_path):
         assert exc.value.code == 401
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_session_stream_ws_delivers_new_events(tmp_path):
@@ -4526,6 +4552,7 @@ def test_session_stream_ws_delivers_new_events(tmp_path):
             assert response.status == 200
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_session_stream_ws_initial_catch_up_overlays_canonical_event_metadata(
@@ -4564,6 +4591,7 @@ def test_session_stream_ws_initial_catch_up_overlays_canonical_event_metadata(
             sock.close()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_session_stream_ws_answers_ping_and_stays_live(tmp_path):
@@ -4594,6 +4622,7 @@ def test_session_stream_ws_answers_ping_and_stays_live(tmp_path):
             sock.close()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_session_stream_ws_respects_after_seq(tmp_path):
@@ -4623,6 +4652,7 @@ def test_session_stream_ws_respects_after_seq(tmp_path):
             sock.close()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_session_stream_ws_requires_auth(tmp_path):
@@ -4645,6 +4675,7 @@ def test_session_stream_ws_requires_auth(tmp_path):
             sock.close()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_session_stream_ws_rejects_missing_websocket_key(tmp_path):
@@ -4679,6 +4710,7 @@ def test_session_stream_ws_rejects_missing_websocket_key(tmp_path):
             sock.close()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_session_stream_ws_upgrade_is_http_1_1(tmp_path):
@@ -4712,6 +4744,7 @@ def test_session_stream_ws_upgrade_is_http_1_1(tmp_path):
             sock.close()
     finally:
         server.shutdown()
+        server.server_close()
 
 
 def test_sync_created_harness_session_preserves_mode(tmp_path):
