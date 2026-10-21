@@ -137,7 +137,9 @@ def store_check(cfg: DroverConfig) -> dict[str, Any]:
     try:
         con = duckdb.connect(str(path), read_only=True)
     except duckdb.Error as exc:
-        raise click.ClickException(f"cannot open DuckDB harness store {path}: {exc}") from exc
+        raise click.ClickException(
+            f"cannot open DuckDB harness store {path}: {exc}"
+        ) from exc
     try:
         tables = {
             str(row[0])
@@ -172,9 +174,7 @@ def store_check(cfg: DroverConfig) -> dict[str, Any]:
                 "DuckDB harness store predates the durable reconciliation queue; "
                 "upgrade harnessd before checking unpushed events"
             )
-        unpushed_count = int(
-            con.execute(
-                """
+        unpushed_count = int(con.execute("""
                 SELECT count(*)
                 FROM harness_events AS event
                 WHERE event.reconcile_pending
@@ -182,9 +182,7 @@ def store_check(cfg: DroverConfig) -> dict[str, Any]:
                     SELECT 1 FROM harness_event_quarantine AS quarantine
                     WHERE quarantine.event_id = event.event_id
                   )
-                """
-            ).fetchone()[0]
-        )
+                """).fetchone()[0])
     except duckdb.Error as exc:
         raise click.ClickException(f"DuckDB harness store check failed: {exc}") from exc
     finally:

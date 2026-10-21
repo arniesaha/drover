@@ -96,7 +96,9 @@ def test_a_newer_version_installs_but_does_not_flip_yet(tmp_path):
 def test_missing_runtime_dependency_blocks_activation(monkeypatch, tmp_path):
     layout, updater = _updater(tmp_path)
     updater.observe(_beat("0.1.4"))
-    monkeypatch.setattr(updater_module, "runtime_dependency_preflight", lambda _: ["git"])
+    monkeypatch.setattr(
+        updater_module, "runtime_dependency_preflight", lambda _: ["git"]
+    )
 
     assert updater.maybe_activate() is False
     assert layout.active_version() == "0.1.3"
