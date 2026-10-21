@@ -17,6 +17,7 @@ WORK_QUEUE_MIGRATION = 18
 EXPORTER_RESTART_GUARD_MIGRATION = 19
 HUB_WORK_ITEMS_MIGRATION = 23
 WORK_ITEM_EVENTS_MIGRATION = 24
+GITHUB_WORK_ITEM_EVENTS_MIGRATION = 25
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -815,6 +816,37 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             "CREATE INDEX IF NOT EXISTS work_item_event_deliveries_due ON work_item_event_deliveries (state, next_attempt_at)",
+        ),
+    ),
+    (
+        GITHUB_WORK_ITEM_EVENTS_MIGRATION,
+        (
+            "ALTER TABLE work_items ADD COLUMN IF NOT EXISTS head_sha TEXT",
+            "ALTER TABLE work_item_events ADD COLUMN IF NOT EXISTS detail TEXT",
+            """
+            CREATE TABLE IF NOT EXISTS github_webhook_deliveries (
+              delivery_id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'pending',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              lease_until TIMESTAMPTZ,
+              received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              processed_at TIMESTAMPTZ,
+              last_error TEXT
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS github_webhook_deliveries_due ON github_webhook_deliveries (workspace_id, state, received_at)",
+            """
+            CREATE TABLE IF NOT EXISTS github_ci_rollups (
+              work_item_id TEXT NOT NULL REFERENCES work_items(id),
+              head_sha TEXT NOT NULL,
+              conclusion TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              PRIMARY KEY (work_item_id, head_sha, conclusion)
+            )
+            """,
         ),
     ),
 )

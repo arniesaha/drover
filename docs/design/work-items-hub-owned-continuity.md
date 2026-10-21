@@ -64,3 +64,70 @@ exposes sent, failed, dead-lettered, pending, and lag measures.
 Step 3 can add a GitHub webhook receiver that appends CI/PR facts through this
 same timeline/event transaction. Step 4 can consume these event facts in an
 in-hub rules engine, using durable cursor delivery rather than a poll loop.
+
+## Step 3: GitHub CI and pull-request facts
+
+`POST /integrations/github/webhook` is a public, signed ingress route. Set
+`work_queue.github_webhook.secret_env` to the name of an environment variable
+containing the webhook secret. The receiver verifies
+`X-Hub-Signature-256: sha256=<hmac>` in constant time, caps the body (128 KiB
+by default), deduplicates `X-GitHub-Delivery`, and writes the delivery before
+returning `202`. It never logs the secret or body. A bounded local worker then
+handles the durable delivery; bad/missing signatures return `401` and an
+oversized body returns `413` before it is read.
+
+The worker links a delivery only to an existing item in the same workspace by
+repository plus PR URL/number, falling back to the recorded branch. It appends
+`ci_completed`, `ci_green_exact_head`, `ci_failed`, `pr_synchronized`,
+`pr_merged`, `pr_closed`, `pr_behind`, and `review_submitted` (plus small PR
+state facts) through the normal timeline/outbox transaction. `detail` is an
+additive, small JSON field on `work_item.event`; version remains `v: 1`.
+Unknown PRs never create items.
+
+For a completed suite or workflow, a green/failed rollup is emitted only when
+its `head_sha` equals the item head learned from a PR event. When the configured
+GitHub credential has `checks_read` and can read branch protection, the worker
+checks that branch's required check contexts at the immutable SHA; an
+in-progress check delays the fact. Without that read path it degrades cleanly
+to the conservative accumulated-webhook rollup. Individual `check_run` facts
+never turn an item green.
+
+The smallest secure tailnet deployment is an Actions `workflow_run` job that
+can reach the hub over Tailscale (or a Cloudflare Access-protected tunnel) and
+POSTs the signed JSON summary with a secret injected by that environment.
+Alternatively route GitHub's webhook through a Cloudflare tunnel to this
+receiver. Do not expose an unauthenticated route, and do not configure a live
+webhook or secret from Drover. Receiver health is advisory in `/readyz?detail=1`;
+Prometheus exports receive/reject/dedup/link/error counters.
+
+The supported default is the Actions route; add this to the repository that
+owns the work items, after supplying the three named Actions secrets. This is
+an example only. Drover never creates the workflow, secret, tunnel, or webhook.
+
+```yaml
+name: report completed CI to Drover
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tailscale/github-action@v2
+        with: {oauth-client-id: ${{ secrets.TS_CLIENT_ID }}, oauth-secret: ${{ secrets.TS_CLIENT_SECRET }}}
+      - env:
+          HUB_URL: ${{ secrets.DROVER_HUB_URL }} # https://<your-hub-host>
+          WEBHOOK_SECRET: ${{ secrets.DROVER_GITHUB_WEBHOOK_SECRET }}
+        run: |
+          body=$(cat "$GITHUB_EVENT_PATH")
+          sig=$(printf %s "$body" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | sed 's/^.* //')
+          curl --fail-with-body --max-time 5 -X POST "$HUB_URL/integrations/github/webhook" \
+            -H 'Content-Type: application/json' -H 'X-GitHub-Event: workflow_run' \
+            -H "X-GitHub-Delivery: actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -H "X-Hub-Signature-256: sha256=$sig" --data-binary @"$GITHUB_EVENT_PATH"
+```
+
+Migration 25 is additive: it adds `work_items.head_sha`, the additive event
+`detail`, and durable GitHub delivery/rollup tables. It does not backfill or
+alter existing values.

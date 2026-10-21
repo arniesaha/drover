@@ -213,7 +213,11 @@ def test_additive_latest_control_migration_uses_point_release_path():
                 "verdict": (
                     "create_table"
                     if statement.startswith("CREATE TABLE")
-                    else "create_index"
+                    else (
+                        "alter_table_add_nullable_column"
+                        if statement.startswith("ALTER TABLE")
+                        else "create_index"
+                    )
                 ),
             }
         )
