@@ -93,6 +93,7 @@ class WorkService:
             providers,
             harness,
         )
+        self.execution_kill_switch = config.execution.kill_switch
         self.lock = threading.RLock()
         from .github_events import GitHubWebhookReceiver
 

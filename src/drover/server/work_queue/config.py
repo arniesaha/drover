@@ -165,6 +165,10 @@ class GoalScope(Model):
     policy_path: str = ""
     execution_cwds: dict[str, str] = Field(default_factory=dict)
     brief_ref: str | None = None
+    execution_enabled: bool = False
+    execution_budget: float | None = Field(default=None, gt=0)
+    execution_estimated_cost: float = Field(default=5.0, gt=0)
+    execution_max_workers: int | None = Field(default=None, gt=0)
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -227,6 +231,11 @@ class WorkItemRulesConfig(Model):
     batch_size: int = Field(default=32, ge=1, le=100)
 
 
+class QueueExecutionConfig(Model):
+    global_max_workers: int = Field(default=1, ge=1)
+    kill_switch: bool = False
+
+
 class WorkQueueConfig(Model):
     enabled: bool = False
     shadow_mode: bool = True
@@ -236,6 +245,7 @@ class WorkQueueConfig(Model):
     work_item_events: WorkItemEventsConfig = Field(default_factory=WorkItemEventsConfig)
     github_webhook: GitHubWebhookConfig = Field(default_factory=GitHubWebhookConfig)
     rules: WorkItemRulesConfig = Field(default_factory=WorkItemRulesConfig)
+    execution: QueueExecutionConfig = Field(default_factory=QueueExecutionConfig)
 
     @model_validator(mode="after")
     def valid(self):

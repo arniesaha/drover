@@ -174,6 +174,18 @@ def start_work_item_rule_worker(collector, config, shutdown_event):
     return worker
 
 
+def start_queue_execution_worker(collector, config, shutdown_event):
+    service = getattr(collector, "work_control", None)
+    if service is None or config.shadow_mode or not any(g.execution_enabled for g in config.goals):
+        return None
+    from drover.server.work_queue.reconciler import QueueExecutionWorker
+
+    worker = QueueExecutionWorker(service)
+    worker.start(shutdown_event)
+    collector.work_queue_execution_worker = worker
+    return worker
+
+
 def authenticated_actor(auth, headers, config):
     if not auth.enabled:
         raise PermissionError("work tools require credentials")
