@@ -214,7 +214,9 @@ def test_additive_latest_control_migration_uses_point_release_path():
                     "create_table"
                     if statement.startswith("CREATE TABLE")
                     else (
-                        "alter_table_add_nullable_column"
+                        "alter_table_add_column_constant_default"
+                        if " DEFAULT " in statement
+                        else "alter_table_add_nullable_column"
                         if statement.startswith("ALTER TABLE")
                         else "create_index"
                     )

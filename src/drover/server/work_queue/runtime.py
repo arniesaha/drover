@@ -229,7 +229,7 @@ def dispatch_hub_items(service, auth, headers, operation, args):
             if result is None:
                 return 404, {"error": "work item not found"}
         elif operation == "patch":
-            allowed = {"id", "stage", "next", "pr", "acceptance"}
+            allowed = {"id", "stage", "next", "pr", "acceptance", "auto_merge", "automation_gate", "publish", "depends_on"}
             if set(args) - allowed:
                 raise ValueError("invalid work item fields")
             result = service.store.patch_hub_item(
@@ -238,6 +238,10 @@ def dispatch_hub_items(service, auth, headers, operation, args):
                 next_action=args.get("next"),
                 pr=args.get("pr"),
                 acceptance=args.get("acceptance"),
+                auto_merge=args.get("auto_merge"),
+                automation_gate=args.get("automation_gate"),
+                publish=args.get("publish"),
+                depends_on=args.get("depends_on"),
             )
         elif operation == "export":
             if args:

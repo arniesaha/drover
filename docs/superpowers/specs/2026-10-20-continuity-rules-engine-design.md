@@ -30,8 +30,9 @@ for an operator instead of being replayed blindly.
 
 Migration 26 only adds tables/columns:
 
-- `work_items.auto_merge BOOLEAN NOT NULL DEFAULT FALSE`, `gate TEXT NOT NULL
-  DEFAULT 'none'`, and `publish BOOLEAN NOT NULL DEFAULT FALSE`;
+- `work_items.auto_merge BOOLEAN NOT NULL DEFAULT FALSE`, `automation_gate TEXT
+  NOT NULL DEFAULT 'none'`, and `publish BOOLEAN NOT NULL DEFAULT FALSE`.
+  (`gate` already names the released lifecycle gate.)
 - `work_item_rule_actions` for rule idempotency, outcome, dry-run state, and
   short reason;
 - `work_item_dependencies` for directed `after` edges; and
