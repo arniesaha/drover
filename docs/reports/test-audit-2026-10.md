@@ -24,7 +24,7 @@ simulator availability.
 | `tests/contract/test_*.py` | PR / fast | core-capability contract: public Python/Rust harness envelope | #752 only in `test_auth_flow_contract.py`; fixed in `02d9c4f5` |
 | `tests/test_harness_*.py`, `tests/test_structured_*.py`, `tests/test_session_*.py`, `tests/test_relay_*.py`, `tests/test_tempo_relay.py` | PR / fast, except `test_relay_e2e.py`, `test_structured_e2e.py` merge/nightly | core-capability contract: lifecycle and relay | no repeat failure found |
 | `tests/test_pairing_cli.py`, `tests/test_profile_credential_scope.py`, `tests/test_web_auth.py`, `tests/test_web_credentials.py`, `tests/test_web_pairing*.py`, `tests/test_harness_auth*.py`, `tests/test_mcp_auth.py`, `tests/test_staging_credentials.py` | PR / fast | core-capability contract: pairing, auth, credentials and host binding | no repeat failure found |
-| `tests/test_control_*.py`, `tests/test_db.py`, `tests/test_schema.py`, `tests/test_lake_*.py`, `tests/test_ledger.py`, `tests/test_memory_*.py`, `tests/test_postgres_*.py`, `tests/test_factory_observer_continuity_postgres.py` | PR / fast where isolated; PostgreSQL and recovery/benchmark modules merge/nightly | core-capability contract: control DB, lake integrity and migrations | no repeat failure found |
+| `tests/test_control_*.py`, `tests/test_db.py`, `tests/test_schema.py`, `tests/test_lake_*.py`, `tests/test_ledger.py`, `tests/test_memory_*.py`, `tests/test_postgres_*.py`, `tests/test_factory_observer_continuity_postgres.py` | PR / fast where isolated; PostgreSQL serving and pgvector gates remain unconditional PR jobs; only the duplicate generic copies of `test_postgres_control_store.py` and `test_postgres_control_benchmark.py` are merge/nightly | core-capability contract: control DB, lake integrity and migrations | no repeat failure found |
 | `tests/test_exporter_freshness.py`, `tests/test_control_exporter.py`, `tests/test_control_outbox*.py`, `tests/test_incoming_export.py`, `tests/test_lake_exporter.py`, `tests/test_shipper.py` | PR / fast | core-capability contract: exporter/outbox | no repeat failure found |
 | `tests/test_work_queue_*.py`, `tests/test_hub_work_items.py`, `tests/test_job_streams.py`, `tests/test_redis_*.py`, `tests/test_decisions.py` | PR / fast | core-capability contract: work items and queue | no repeat failure found |
 | `tests/shell/test_*.sh`, `tests/test_in_place_activation.py`, `tests/test_update_*.py`, `tests/test_rollback_cli.py`, `tests/test_service_units.py`, `tests/test_setup_*.py` | PR / fast | core-capability contract: installer and host update | no repeat failure found |
@@ -39,6 +39,16 @@ The “remaining” row is intentionally retained, not silently removed.  These
 modules are proposed consolidation candidates; each needs a named capability
 owner before deletion.  That is safer than lowering coverage by treating
 source proximity as a reason to remove a test.
+
+The fast generic command excludes the two explicitly marked PostgreSQL
+modules, but this does not remove their PR coverage: `postgres-integration`
+still runs unconditionally on every PR and executes
+`test_postgres_control_store.py` and `test_postgres_control_benchmark.py`.
+`pgvector-memory-integration` also remains an unconditional PR release gate
+for `test_memory_store.py`, `test_embeddings.py`, and the production-schema
+drift check. `test_postgres_schema_migrations.py` and
+`test_factory_observer_continuity_postgres.py` are not marked slow, so they
+continue in the generic PR tier as before.
 
 ## Core capability map and gaps
 
@@ -85,8 +95,9 @@ suites.
 Before: CI run `39507045678` completed in 14m16s (2026-10-20).  The old PR
 lane included all non-acceptance Python modules plus unconditional PostgreSQL
 and pgvector jobs.  After: the PR Python command is xdist-enabled with two
-workers and excludes only `slow_integration`; service/data-bound coverage runs
-on main and the nightly schedule.  A real post-change CI run requires a push,
+workers and excludes only `slow_integration`; the PostgreSQL serving and
+pgvector release gates remain unconditional on PRs, while the remaining
+service/data-bound coverage runs on main and the nightly schedule.  A real post-change CI run requires a push,
 which this audit deliberately does not perform; local target timing is 13
 tests in 5.44s and 50 flake repetitions in about 74s.
 

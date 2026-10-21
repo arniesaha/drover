@@ -334,6 +334,10 @@ def test_public_workflows_select_expensive_suites_from_changed_paths() -> None:
     ):
         expensive_step = next(step for step in python_steps if step.get("name") == name)
         assert expensive_step["if"] == "steps.scope.outputs.python == 'true'"
+    # The generic PR tier may defer service-bound duplicates, but these are
+    # separate core-capability gates and must remain on every pull request.
+    for job_name in ("postgres-integration", "pgvector-memory-integration"):
+        assert "if" not in python_ci["jobs"][job_name]
     ios_xcode = next(
         step for step in ios_steps if step.get("name") == "Show Xcode version"
     )

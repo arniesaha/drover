@@ -315,7 +315,6 @@ jobs:
     # This job is intentionally unconditional. A documentation-only change may
     # skip the general Python suite, but the PostgreSQL serving contract must
     # keep running on every pull request and main push.
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -396,7 +395,6 @@ jobs:
 
   pgvector-memory-integration:
     # Unconditional release gate; keep the plain PostgreSQL job above as well.
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     services:
       postgres:
