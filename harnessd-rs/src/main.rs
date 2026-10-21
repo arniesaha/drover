@@ -33,7 +33,7 @@ use base64::{
     Engine,
 };
 use chrono::Utc;
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use rusqlite::{params, Connection};
@@ -65,10 +65,12 @@ const RETENTION_PER_SESSION: i64 = 500;
     about = "Drover Rust harness daemon"
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<HarnessCommand>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
-    host_id: String,
+    host_id: Option<String>,
     #[arg(long)]
     display_name: Option<String>,
     #[arg(long, default_value = "linux")]
@@ -93,6 +95,31 @@ struct Args {
     /// Validate a Python drain handoff without changing the Rust store.
     #[arg(long, requires = "import_jsonl")]
     import_dry_run: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum HarnessCommand {
+    /// Inspect the durable local SQLite store without requiring sqlite3(1).
+    Store(StoreArgs),
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct StoreArgs {
+    #[command(subcommand)]
+    command: StoreCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum StoreCommand {
+    /// Check SQLite integrity and print the local session/outbox summary.
+    Check(StoreCheckArgs),
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct StoreCheckArgs {
+    /// SQLite store path (defaults to ~/.drover/harnessd/harnessd.sqlite).
+    #[arg(long)]
+    store: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -434,6 +461,56 @@ fn init_db(path: &FsPath) -> Result<Connection> {
     Ok(db)
 }
 
+/// Read-only replacement for the ad-hoc sqlite3 commands in the cutover
+/// runbook.  Keeping this in the daemon means the diagnostic is present with
+/// the deployed harness binary, rather than depending on an operator package.
+fn check_store(path: &FsPath) -> Result<()> {
+    anyhow::ensure!(
+        path.is_file(),
+        "SQLite store does not exist: {}",
+        path.display()
+    );
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open SQLite store {}", path.display()))?;
+    db.busy_timeout(Duration::from_secs(5))?;
+
+    let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    let mut statuses =
+        db.prepare("SELECT status, count(*) FROM sessions GROUP BY status ORDER BY status")?;
+    let statuses = statuses
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let quarantined: i64 = db.query_row("SELECT count(*) FROM event_quarantine", [], |row| {
+        row.get(0)
+    })?;
+    let unpushed: i64 = db.query_row(
+        "SELECT count(*) FROM events e WHERE pushed_at IS NULL AND NOT EXISTS \
+         (SELECT 1 FROM event_quarantine q WHERE q.event_id = e.event_id)",
+        [],
+        |row| row.get(0),
+    )?;
+
+    println!("store: {}", path.display());
+    println!("integrity_check: {integrity}");
+    println!("session_counts:");
+    if statuses.is_empty() {
+        println!("  (none)");
+    } else {
+        for (status, count) in statuses {
+            println!("  {status}: {count}");
+        }
+    }
+    println!("quarantine_count: {quarantined}");
+    println!("unpushed_event_count: {unpushed}");
+    anyhow::ensure!(
+        integrity == "ok",
+        "SQLite integrity check failed: {integrity}"
+    );
+    Ok(())
+}
+
 fn prune_events(db: &Connection) -> Result<()> {
     // The row cap applies only to acknowledged tails. Pending and quarantined
     // originals are durable until an operator resolves them.
@@ -477,11 +554,14 @@ fn config(args: &Args) -> Result<Config> {
         }
     }
     Ok(Config {
-        host_id: args.host_id.clone(),
+        host_id: args
+            .host_id
+            .clone()
+            .context("--host-id is required when running the daemon")?,
         display_name: args
             .display_name
             .clone()
-            .unwrap_or_else(|| args.host_id.clone()),
+            .unwrap_or_else(|| args.host_id.clone().unwrap_or_default()),
         kind: args.kind.clone(),
         token,
         central_url: args
@@ -2478,6 +2558,19 @@ async fn main() -> Result<()> {
         .with_env_filter("warn")
         .with_writer(std::io::stderr)
         .init();
+    if let Some(HarnessCommand::Store(StoreArgs {
+        command: StoreCommand::Check(check),
+    })) = &args.command
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is required")?;
+        let path = check
+            .store
+            .clone()
+            .unwrap_or_else(|| home.join(".drover/harnessd/harnessd.sqlite"));
+        return check_store(&path);
+    }
     let cfg = config(&args)?;
     let dbpath = cfg.home.join(".drover/harnessd/harnessd.sqlite");
     fs::DirBuilder::new()
@@ -2766,6 +2859,7 @@ fn import_records(app: &App, path: &FsPath) -> Result<(usize, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn event_hash_matches_python_vector() {
         let v = json!({"event_id":"new","aggregated_output":"drop","nested":{"event_id":"nested","ok":true}});
@@ -2773,5 +2867,24 @@ mod tests {
             event_identity("s-1", 7, "tool_result", "2026-01-02T03:04:05+00:00", &v),
             "2b707256b02eac2ef61f23ffabb3c232899851bc38cd933ed163d79e4713cfad"
         );
+    }
+
+    #[test]
+    fn store_check_reads_the_bundled_sqlite_store() {
+        let path =
+            std::env::temp_dir().join(format!("drover-store-check-{}.sqlite", Uuid::new_v4()));
+        let db = init_db(&path).unwrap();
+        db.execute(
+            "INSERT INTO sessions(session_id,data,status,created_at) VALUES('s1','{}','running','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        check_store(&path).unwrap();
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
     }
 }

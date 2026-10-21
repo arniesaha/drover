@@ -48,11 +48,30 @@ hub prints its one pasted setup command with `drover-server pair-host`; see
 ## Prerequisites
 
 - macOS or Linux with Python 3.11+
+- Git (`brew install git` on macOS, `sudo apt-get install -y git` on
+  Debian/Ubuntu); the installer checks it and does not install OS packages
 - At least one supported agent CLI installed and signed in
 - Xcode 16+ and XcodeGen only if you are building the iOS app
 
 The installer brings its own [uv](https://docs.astral.sh/uv/) if you do not
 have it.
+
+## Railway / generic cloud hub
+
+Run the hub image built from [`deploy/Dockerfile`](../deploy/Dockerfile), not
+`drover-harnessd`. The cloud hub coordinates remote hosts over relay; agent
+CLIs, Git worktrees and host-local spools stay on those hosts.
+
+You need an operator-owned PostgreSQL service, a durable volume for the lake,
+and a mounted config file at `/etc/drover/config.toml`. Put secrets in the
+platform secret store: `DROVER_CONTROL_DSN`, any DuckLake catalog DSN variables
+named by your config, and `DROVER_API_TOKEN` (unless a token file is mounted).
+Mount the durable volume at `/var/lib/drover` and configure all lake/incoming/
+scratch paths beneath it. Set a restart policy and probe `/healthz` and
+`/readyz`. `systemd`/`launchd` do not apply; Tailscale is optional and runs as
+a sidecar or platform private-network integration. See the full
+[container design](design/hub-container.md) and the dependency matrix in
+[Dependencies](reference/dependencies.md).
 
 ## Build From Source
 
