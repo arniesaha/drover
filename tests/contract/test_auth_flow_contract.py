@@ -69,7 +69,18 @@ def test_provider_usage_keeps_plan_label_on_a_failing_anthropic_card(daemon):
         lambda: request(daemon, "/auth/claude-code/status")[1]["state"]
         == "authenticated"
     )
-    status, usage = request(daemon, "/providers/usage?refresh=1")
-    assert status == 200
-    claude = next(item for item in usage["accounts"] if item["provider"] == "anthropic")
+
+    def claude_usage():
+        status, usage = request(daemon, "/providers/usage")
+        assert status == 200
+        return next(
+            item for item in usage["accounts"] if item["provider"] == "anthropic"
+        )
+
+    # Provider usage refreshes asynchronously and the route deliberately
+    # returns a placeholder until its first observation is published.  The
+    # old one-shot request raced that boundary; wait for the no-credential
+    # observation that this contract is about.
+    wait_until(lambda: claude_usage()["status"] == "not_configured")
+    claude = claude_usage()
     assert (claude["status"], claude["plan_label"]) == ("not_configured", "max")
