@@ -74,6 +74,24 @@ _RUST_PHASE2 = (
     "test_relay_spoke_contract.py::test_relay_",
 )
 
+# These use real service/process/lake boundaries or performance-sized data.
+# They are not removed: CI runs them after a merge and nightly, while the PR
+# lane remains a fast, deterministic feedback loop.
+_SLOW_INTEGRATION_MODULES = frozenset(
+    {
+        "backup/test_studio_backup.py",
+        "operations/test_studio_pg_supervision.py",
+        "test_db_self_heal.py",
+        "test_postgres_control_benchmark.py",
+        "test_postgres_control_store.py",
+        "test_relay_e2e.py",
+        "test_server_e2e.py",
+        "test_session_history_perf.py",
+        "test_structured_e2e.py",
+        "test_testflight_smoke_live_hub.py",
+    }
+)
+
 
 def pytest_configure(config):
     selected = config.getoption("--daemon")
@@ -86,6 +104,9 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if any(fragment in item.nodeid for fragment in _RUST_PHASE2):
             item.add_marker(pytest.mark.rust_phase2)
+        path = Path(str(item.fspath)).relative_to(Path(__file__).parent).as_posix()
+        if path.startswith("acceptance/") or path in _SLOW_INTEGRATION_MODULES:
+            item.add_marker(pytest.mark.slow_integration)
 
 
 @pytest.hookimpl(hookwrapper=True)
