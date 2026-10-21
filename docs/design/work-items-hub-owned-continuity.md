@@ -147,7 +147,7 @@ updated only through GitHub; exact-head green CI can ready and squash-merge
 only with `auto_merge` and `automation_gate=none`; merged PRs finish items and
 unblock dependencies. Failures, worker errors, review, and ambiguity wake the
 orchestrator. Actions are keyed by item/rule/head SHA and dry-run records only
-`would_act`. The rule worker is event driven and sweeps every 30–60 minutes.
+`would_act`. The rule worker is event driven and sweeps every 30-60 minutes.
 
 `shadow_mode` remains the default. A goal must opt into `execution_enabled`
 before reconciler candidates call the existing `WorkService.launch` path.

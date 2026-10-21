@@ -78,7 +78,7 @@
 - Modify: focused tests touched above.
 
 **Interfaces:**
-- Consumes: final config/API names from Tasks 1–3.
+- Consumes: final config/API names from Tasks 1-3.
 
 - [ ] **Step 1: Document rule table, policy fields, config, kill switch, and reduced cron role.**
 - [ ] **Step 2: Run the exact focused test set**, including migration and rollout tests.

@@ -145,7 +145,7 @@ stage transition, gate, next action, session, PR, and occurrence timestamp.
 `automation_gate` is the auto-merge policy (`none`, `ui_review`, or `arnab`);
 it is distinct from the lifecycle `gate` returned by older item reads. Existing
 items have publication and auto-merge disabled. `work_queue.rules` configures
-event processing, dry-run, and the 30–60 minute sweep. Queue execution also
+event processing, dry-run, and the 30-60 minute sweep. Queue execution also
 requires non-shadow mode plus per-goal `execution_enabled`; worker caps,
 estimated-cost budgets, and the kill switch apply before the existing launcher
 is called. Missing GitHub write credentials emit `orchestrator_wake`, without

@@ -74,7 +74,7 @@ The existing manual launch authorization remains unchanged.
 ## Configuration and observability
 
 `work_queue.rules` supplies `enabled`, `dry_run`, and a sweep interval bounded
-to 30–60 minutes.  Goal scopes add `execution_enabled`,
+to 30-60 minutes.  Goal scopes add `execution_enabled`,
 `execution_budget`, and (where needed) an execution concurrency override;
 global execution settings provide a cap and initial kill-switch value.  Metrics
 cover rule evaluations, actions, skips by stable reason, wakes, launches,
