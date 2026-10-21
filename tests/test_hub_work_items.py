@@ -70,6 +70,11 @@ def test_lifecycle_event_is_applied_once_and_shadow_does_not_block_registration(
     assert lifecycle[0]["source_event_id"] == "work-turn-1"
     assert lifecycle[0]["kind"] == "worker_done"
     assert lifecycle[0]["detail"] == "a" * 40
+    events = service.store.work_item_events(since=0, limit=10)["events"]
+    worker_done = next(event for event in events if event["kind"] == "worker_done")
+    assert worker_done["event_id"] == lifecycle[0]["id"]
+    assert worker_done["from_stage"] == "launched"
+    assert worker_done["to_stage"] == "worker_done"
 
 
 def test_work_item_http_read_patch_auth_and_export(transport):
@@ -104,6 +109,10 @@ def test_work_item_http_read_patch_auth_and_export(transport):
     assert response.status_code == 200
     assert response.json()["stage"] == "review"
     assert response.json()["next_action"] == "wait for CI"
+    event = service.store.work_item_events(since=0, limit=10)["events"][-1]
+    assert event["kind"] == "pr_linked"
+    assert event["from_stage"] == "launched"
+    assert event["to_stage"] == "review"
 
     exported = requests.get(url + "/work-items/export", headers=headers, timeout=5)
     assert exported.status_code == 200

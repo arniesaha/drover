@@ -130,6 +130,19 @@ def start_work_service(collector, config):
     return service
 
 
+def start_work_item_event_worker(collector, config, shutdown_event):
+    """Start the notifier only after its Postgres-backed service exists."""
+    service = getattr(collector, "work_control", None)
+    if service is None:
+        return None
+    from drover.server.work_queue.work_item_events import WorkItemEventWorker
+
+    worker = WorkItemEventWorker(service.store, config.work_item_events)
+    worker.start(shutdown_event=shutdown_event)
+    collector.work_item_event_worker = worker
+    return worker
+
+
 def authenticated_actor(auth, headers, config):
     if not auth.enabled:
         raise PermissionError("work tools require credentials")
@@ -187,6 +200,9 @@ def dispatch_hub_items(service, auth, headers, operation, args):
         actor = authenticated_actor(auth, headers, service.config)
         if not actor.human:
             raise PermissionError("device credential required")
+        credential = bearer_credential(auth, headers)
+        if credential is None:
+            raise PermissionError("credential required")
         if operation == "list":
             if set(args) - {"state"}:
                 raise ValueError("invalid work item query")
@@ -212,6 +228,44 @@ def dispatch_hub_items(service, auth, headers, operation, args):
             if args:
                 raise ValueError("invalid work item query")
             result = service.store.hub_export()
+        elif operation == "subscriptions_list":
+            if args:
+                raise ValueError("invalid subscription query")
+            result = {
+                "subscriptions": service.store.work_item_subscriptions(credential.id)
+            }
+        elif operation == "subscriptions_create":
+            if set(args) - {"url", "event_kinds", "repo"} or "url" not in args:
+                raise ValueError("invalid subscription fields")
+            from drover.server.work_queue.work_item_events import (
+                validate_subscription_url,
+            )
+
+            url = validate_subscription_url(
+                args["url"], service.config.work_item_events.webhook_allow_hosts
+            )
+            result = service.store.create_work_item_subscription(
+                credential.id,
+                url=url,
+                event_kinds=args.get("event_kinds", []),
+                repo=args.get("repo"),
+            )
+        elif operation == "subscriptions_delete":
+            if set(args) != {"id"}:
+                raise ValueError("invalid subscription query")
+            if not service.store.delete_work_item_subscription(
+                credential.id, args["id"]
+            ):
+                return 404, {"error": "subscription not found"}
+            result = {"deleted": True}
+        elif operation == "events":
+            if set(args) - {"since", "limit"}:
+                raise ValueError("invalid event query")
+            since = int(args.get("since", 0))
+            limit = int(args.get("limit", 100))
+            if since < 0 or not 1 <= limit <= 100:
+                raise ValueError("invalid event cursor")
+            result = service.store.work_item_events(since=since, limit=limit)
         else:
             raise ValueError("unknown work item operation")
         return 200, json.loads(json.dumps(result, default=str))

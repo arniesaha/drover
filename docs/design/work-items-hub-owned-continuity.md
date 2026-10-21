@@ -36,6 +36,31 @@ if a rollback is required, is `DROP TABLE work_item_timeline; DROP TABLE
 work_items;` after taking an export backup; application rollback alone leaves
 the new tables inert and is the preferred safe path.
 
-Later continuity steps need the existing event emission hooks to continue
-including stable event ids and lifecycle payloads, a webhook receiver for CI
-and PR facts, and a rules engine to act on gates. None is introduced here.
+Later continuity steps need the event emission hooks below, a webhook receiver
+for CI and PR facts, and a rules engine to act on gates.
+
+## Step 2: subscriber events
+
+Every timeline append now atomically creates a versioned `work_item.event`.
+The timeline row id is its immutable `event_id`; the payload includes the item,
+kind, prior and resulting stage, gate, next action, session, PR, and timestamp.
+The hub allocates a workspace cursor while holding the transaction lock, so a
+pull consumer can advance `GET /work-items/events?since=<cursor>` without
+skipping a concurrent commit.
+
+Webhook subscriptions are owned by the creating credential. The server makes a
+per-subscription HMAC secret, returns it exactly once at creation, and stores
+the secret only to sign future delivery bodies. URLs require HTTPS except for
+loopback or an explicitly allow-listed tailnet host. Matching subscriptions are
+expanded into a durable delivery row in the same transaction as the event.
+
+The delivery worker leases a small database batch and uses a fixed in-flight
+cap. It signs `X-Drover-Signature: sha256=<hmac>` and includes
+`X-Drover-Event-Id`; success is any 2xx response. Failures retry with bounded
+exponential backoff (capped at one hour) and move to `dead_letter` after the
+configured attempt limit. Health is advisory in `/readyz`, while Prometheus
+exposes sent, failed, dead-lettered, pending, and lag measures.
+
+Step 3 can add a GitHub webhook receiver that appends CI/PR facts through this
+same timeline/event transaction. Step 4 can consume these event facts in an
+in-hub rules engine, using durable cursor delivery rather than a poll loop.

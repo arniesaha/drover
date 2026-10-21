@@ -1244,6 +1244,13 @@ class MetricsCollector:
         status, body = probe.check().as_response(include_detail=include_detail)
         body = _with_push_status(body, include_detail=include_detail)
         payload = json.loads(body)
+        worker = getattr(self, "work_item_event_worker", None)
+        if worker is not None and include_detail:
+            try:
+                payload["work_item_subscriptions"] = worker.health()
+            except Exception:  # noqa: BLE001 - notification health is advisory
+                payload["work_item_subscriptions"] = {"state": "unavailable"}
+        body = json.dumps(payload, sort_keys=True) + "\n"
         if self.exporter_health is not None:
             from drover.server.lake.freshness import freshness_status
 
@@ -3269,6 +3276,31 @@ class MetricsCollector:
         _append_advisory_metrics(lines)
         _append_usage_rollup_metrics(lines)
         _append_analytics_gate_metrics(lines)
+        worker = getattr(self, "work_item_event_worker", None)
+        if worker is not None:
+            try:
+                health = worker.health()
+                lines.extend(
+                    [
+                        "# HELP drover_work_item_delivery_pending Pending durable work-item event deliveries.",
+                        "# TYPE drover_work_item_delivery_pending gauge",
+                        f"drover_work_item_delivery_pending {health.get('pending', 0)}",
+                        "# HELP drover_work_item_delivery_dead_lettered Dead-lettered work-item event deliveries.",
+                        "# TYPE drover_work_item_delivery_dead_lettered gauge",
+                        f"drover_work_item_delivery_dead_lettered {health.get('dead_lettered_total', 0)}",
+                        "# HELP drover_work_item_delivery_sent Successful work-item event deliveries since process start.",
+                        "# TYPE drover_work_item_delivery_sent counter",
+                        f"drover_work_item_delivery_sent {health.get('sent', 0)}",
+                        "# HELP drover_work_item_delivery_failed Failed work-item event delivery attempts since process start.",
+                        "# TYPE drover_work_item_delivery_failed counter",
+                        f"drover_work_item_delivery_failed {health.get('failed', 0)}",
+                        "# HELP drover_work_item_delivery_lag_seconds Age of the oldest pending work-item event delivery.",
+                        "# TYPE drover_work_item_delivery_lag_seconds gauge",
+                        f"drover_work_item_delivery_lag_seconds {health.get('oldest_lag_seconds', 0)}",
+                    ]
+                )
+            except Exception:  # noqa: BLE001 - metrics must remain available
+                pass
         self._append_audit_cache_metrics(lines)
         redis_streams = _redis_stream_snapshots(self.job_streams)
         self._cached_text = "\n".join(lines) + "\n"
