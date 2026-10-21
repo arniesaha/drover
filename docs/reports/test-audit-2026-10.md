@@ -1,4 +1,4 @@
-# Test suite audit — 2026-10
+# Test suite audit: 2026-10
 
 Scope: every tracked test module at `HEAD` was inventoried with
 `find tests -type f \( -name 'test_*.py' -o -name 'test_*.sh' \)`, plus the
@@ -103,7 +103,7 @@ tests in 5.44s and 50 flake repetitions in about 74s.
 
 ## Commit sequence
 
-* `02d9c4f5` — flake root-cause fixes.
-* This report — classification snapshot.
-* Follow-on change — marker, CI tier split, contributing guidance, and the
+* `02d9c4f5`: flake root-cause fixes.
+* This report: classification snapshot.
+* Follow-on change: marker, CI tier split, contributing guidance, and the
   incidental-test deletion.
