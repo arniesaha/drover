@@ -76,24 +76,29 @@ class WorkItemRuleWorker:
                 return self._wake(item, "github_credential_unavailable", sha)
             return self._finish(item, "merge", sha, "acted")
         if kind == "pr_behind" and item.get("pr"):
+            action_sha = item.get("head_sha") or sha
+            if not (item.get("publish") or item.get("auto_merge")):
+                return self._record(item, "rule_skipped", "policy_disabled")
+            if self.store.has_timeline_kind(item["id"], "ci_failed"):
+                return self._wake(item, "ci_failed", action_sha)
             if provider is None:
-                return self._wake(item, "github_credential_unavailable", sha)
-            if not self.store.claim_rule_action(item["id"], "update_branch", sha, dry_run=self.config.dry_run):
+                return self._wake(item, "github_credential_unavailable", action_sha)
+            if not self.store.claim_rule_action(item["id"], "update_branch", action_sha, dry_run=self.config.dry_run):
                 return
             if self.config.dry_run:
-                return self._finish(item, "update_branch", sha, "would_act")
+                return self._finish(item, "update_branch", action_sha, "would_act")
             try:
-                provider.update_pr_branch(item["pr"])
+                provider.update_pr_branch(item["pr"], action_sha)
             except ProviderUnavailable:
-                return self._wake(item, "github_credential_unavailable", sha)
-            return self._finish(item, "update_branch", sha, "acted")
+                return self._wake(item, "github_credential_unavailable", action_sha)
+            return self._finish(item, "update_branch", action_sha, "acted")
         if kind == "pr_merged":
             if self.store.claim_rule_action(item["id"], "done", sha, dry_run=self.config.dry_run):
                 if self.config.dry_run:
                     return self._finish(item, "done", sha, "would_act")
                 self.store.mark_done_and_unblock(item["id"])
                 return self._finish(item, "done", sha, "acted")
-        if kind in {"ci_failed", "needs_input", "worker_error", "review_submitted"}:
+        if kind in {"ci_failed", "needs_input", "worker_error", "blocked", "review_submitted"}:
             self._wake(item, kind, sha)
 
     def process_once(self):
@@ -101,6 +106,7 @@ class WorkItemRuleWorker:
         page = self.store.work_item_events(since=cursor, limit=self.config.batch_size)
         for event in page["events"]:
             if event["kind"].startswith(("rule_", "orchestrator_wake")):
+                self.store.advance_rule_cursor(event["cursor"])
                 continue
             item = self.store.hub_item(event["item_id"])
             if item is not None:

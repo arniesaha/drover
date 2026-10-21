@@ -294,11 +294,18 @@ class WorkStore:
             ).fetchone()
             if previous is None:
                 raise KeyError(item_id)
-            row = con.execute(
-                "UPDATE work_items SET " + ", ".join(columns) + ", updated_at = now() "
-                "WHERE workspace_id = ? AND id = ? RETURNING id, stage, gate",
-                params,
-            ).fetchone()
+            row = (
+                con.execute(
+                    "UPDATE work_items SET " + ", ".join(columns) + ", updated_at = now() "
+                    "WHERE workspace_id = ? AND id = ? RETURNING id, stage, gate",
+                    params,
+                ).fetchone()
+                if columns
+                else con.execute(
+                    "SELECT id, stage, gate FROM work_items WHERE workspace_id = ? AND id = ?",
+                    [self.workspace_id, item_id],
+                ).fetchone()
+            )
             if row is None:
                 raise KeyError(item_id)
             append_timeline_event(
@@ -357,6 +364,10 @@ class WorkStore:
             row = con.execute("SELECT stage, gate FROM work_items WHERE workspace_id=? AND id=? FOR UPDATE", [self.workspace_id, item_id]).fetchone()
             if row is not None:
                 append_timeline_event(con, workspace_id=self.workspace_id, item_id=item_id, kind=kind, stage=row[0], gate=row[1], detail=detail, from_stage=row[0])
+
+    def has_timeline_kind(self, item_id, kind):
+        with self.connection() as con:
+            return con.execute("SELECT 1 FROM work_item_timeline WHERE work_item_id=? AND kind=? LIMIT 1", [item_id, kind]).fetchone() is not None
 
     def rule_cursor(self):
         with self.connection() as con:

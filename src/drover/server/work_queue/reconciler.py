@@ -22,30 +22,31 @@ class QueueExecutionCoordinator:
         self.health = {"launches": 0, "cap_denials": 0, "budget_denials": 0}
 
     def launch_candidate(self, goal_id, number):
-        config = self.service.config
-        scope = next((item for item in config.goals if item.goal_id == goal_id), None)
-        if scope is None or not scope.execution_enabled or config.shadow_mode:
-            return {"denied": "execution_disabled"}
-        if self.service.execution_kill_switch or config.execution.kill_switch:
-            return {"denied": "kill_switch"}
-        active = self.service.harness.active(self.service.store.links())
-        if len(active) >= config.execution.global_max_workers or (
-            sum(row["goal_id"] == goal_id for row in active)
-            >= (scope.execution_max_workers or config.execution.global_max_workers)
-        ):
-            self.health["cap_denials"] += 1
-            return {"denied": "global_cap"}
-        if scope.execution_budget is not None and scope.execution_estimated_cost > scope.execution_budget:
-            self.health["budget_denials"] += 1
-            return {"denied": "budget"}
-        actor = WorkActor("control:queue-execution", "nix")
-        row = self.service.launch(
-            goal_id,
-            number,
-            identity("automatic-launch", goal_id, number),
-            scope.execution_estimated_cost,
-            actor=actor,
-        )
+        with self.service.lock:
+            config = self.service.config
+            scope = next((item for item in config.goals if item.goal_id == goal_id), None)
+            if scope is None or not scope.execution_enabled or config.shadow_mode:
+                return {"denied": "execution_disabled"}
+            if self.service.execution_kill_switch or config.execution.kill_switch:
+                return {"denied": "kill_switch"}
+            active = self.service.harness.active(self.service.store.links())
+            if len(active) >= config.execution.global_max_workers or (
+                sum(row["goal_id"] == goal_id for row in active)
+                >= (scope.execution_max_workers or config.execution.global_max_workers)
+            ):
+                self.health["cap_denials"] += 1
+                return {"denied": "global_cap"}
+            if scope.execution_budget is not None and scope.execution_estimated_cost > scope.execution_budget:
+                self.health["budget_denials"] += 1
+                return {"denied": "budget"}
+            actor = WorkActor("control:queue-execution", "nix")
+            row = self.service.launch(
+                goal_id,
+                number,
+                identity("automatic-launch", goal_id, number),
+                scope.execution_estimated_cost,
+                actor=actor,
+            )
         self.health["launches"] += 1
         return {"launched": True, "link": row}
 

@@ -268,15 +268,15 @@ class GitHubProvider:
     def pull_is_current(self, pr):
         self._require("pulls_read")
         row = self._request("GET", self.base + f"/pulls/{self._pr_number(pr)}")
-        return not bool(row.get("mergeable_state") in {"behind", "dirty"})
+        return row.get("mergeable_state") == "clean"
 
     def mark_pr_ready(self, pr):
         self._require("pulls_write")
-        self._request("PATCH", self.base + f"/pulls/{self._pr_number(pr)}", body={"draft": False})
+        self._request("POST", self.base + f"/pulls/{self._pr_number(pr)}/ready-for-review")
 
-    def update_pr_branch(self, pr):
+    def update_pr_branch(self, pr, head_sha):
         self._require("pulls_write")
-        self._request("PUT", self.base + f"/pulls/{self._pr_number(pr)}/update-branch")
+        self._request("PUT", self.base + f"/pulls/{self._pr_number(pr)}/update-branch", body={"expected_head_sha": head_sha})
 
     def squash_merge(self, pr, head_sha):
         self._require("pulls_write")

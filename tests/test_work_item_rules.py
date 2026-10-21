@@ -26,8 +26,8 @@ class GitHub:
     def squash_merge(self, pr, head_sha):
         self.merged.append((pr, head_sha))
 
-    def update_pr_branch(self, pr):
-        self.updated.append(pr)
+    def update_pr_branch(self, pr, head_sha):
+        self.updated.append((pr, head_sha))
 
 
 def _worker(service, github, *, dry_run=False):
@@ -53,6 +53,15 @@ def test_publish_requires_remote_exact_head_and_duplicate_event_runs_once(servic
     worker.evaluate(item, "worker_done", "a" * 40)
     worker.evaluate(item, "worker_done", "a" * 40)
     assert len(github.opened) == 1
+
+
+def test_process_once_consumes_event_cursor_and_wakes_blocked_worker(service):
+    item = _item(service)
+    service.store.append_rule_event(item["id"], kind="blocked", detail="worker")
+    worker = _worker(service, GitHub())
+    assert worker.process_once() >= 1
+    assert worker.store.rule_cursor() > 0
+    assert "orchestrator_wake" in [row["kind"] for row in service.store.hub_item(item["id"])["timeline"]]
 
 
 def test_publish_missing_or_mismatched_branch_wakes_without_pr(service):
@@ -94,9 +103,11 @@ def test_merged_marks_done_and_unblocks_dependents(service):
 
 
 def test_behind_pr_updates_once_only_when_ci_is_not_failed(service):
-    item = _item(service, pr="https://github.com/example/project/pull/7")
+    item = _item(service, pr="https://github.com/example/project/pull/7", publish=True)
+    service.store.append_github_fact(item["id"], kind="pr_synchronized", detail="{}", head_sha="a" * 40)
+    item = service.store.hub_item(item["id"])
     github = GitHub()
     worker = _worker(service, github)
     worker.evaluate(item, "pr_behind", "a" * 40)
     worker.evaluate(item, "pr_behind", "a" * 40)
-    assert github.updated == [item["pr"]]
+    assert github.updated == [(item["pr"], "a" * 40)]
