@@ -5,7 +5,6 @@ import hmac
 import json
 
 import requests
-
 from test_hub_work_items import _register
 from test_work_queue_execution import service
 from test_work_queue_transport import transport

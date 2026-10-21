@@ -465,13 +465,15 @@ class WorkStore:
 
     def claim_github_webhooks(self, limit):
         with self.connection() as con:
-            rows = self.rows(con.execute(
-                """SELECT delivery_id, event_type, payload, attempts
+            rows = self.rows(
+                con.execute(
+                    """SELECT delivery_id, event_type, payload, attempts
                    FROM github_webhook_deliveries WHERE workspace_id = ? AND
                    (state = 'pending' OR (state = 'leased' AND lease_until <= now()))
                    ORDER BY received_at LIMIT ? FOR UPDATE SKIP LOCKED""",
-                [self.workspace_id, limit],
-            ))
+                    [self.workspace_id, limit],
+                )
+            )
             for row in rows:
                 row["attempts"] += 1
                 con.execute(
@@ -500,21 +502,27 @@ class WorkStore:
             clauses.append(("branch = ?", branch))
         with self.connection() as con:
             for clause, value in clauses:
-                rows = self.rows(con.execute(
-                    "SELECT * FROM work_items WHERE workspace_id = ? AND repo = ? AND " + clause +
-                    " ORDER BY updated_at DESC, id LIMIT 2", [self.workspace_id, repo, value]
-                ))
+                rows = self.rows(
+                    con.execute(
+                        "SELECT * FROM work_items WHERE workspace_id = ? AND repo = ? AND "
+                        + clause
+                        + " ORDER BY updated_at DESC, id LIMIT 2",
+                        [self.workspace_id, repo, value],
+                    )
+                )
                 if len(rows) == 1:
                     return rows[0]
         return None
 
     def github_items_for_repo(self, repo):
         with self.connection() as con:
-            return self.rows(con.execute(
-                """SELECT * FROM work_items WHERE workspace_id = ? AND repo = ?
+            return self.rows(
+                con.execute(
+                    """SELECT * FROM work_items WHERE workspace_id = ? AND repo = ?
                    AND pr IS NOT NULL AND stage NOT IN ('done', 'closed')""",
-                [self.workspace_id, repo],
-            ))
+                    [self.workspace_id, repo],
+                )
+            )
 
     def append_github_fact(self, item_id, *, kind, detail, head_sha=None):
         """Append a provider fact through the same transactional event outbox."""
@@ -526,10 +534,19 @@ class WorkStore:
             if item is None:
                 return None
             if head_sha:
-                con.execute("UPDATE work_items SET head_sha = ?, updated_at = now() WHERE id = ?", [head_sha, item_id])
+                con.execute(
+                    "UPDATE work_items SET head_sha = ?, updated_at = now() WHERE id = ?",
+                    [head_sha, item_id],
+                )
             return append_timeline_event(
-                con, workspace_id=self.workspace_id, item_id=item_id, kind=kind,
-                stage=item[0], gate=item[1], detail=detail, from_stage=item[0],
+                con,
+                workspace_id=self.workspace_id,
+                item_id=item_id,
+                kind=kind,
+                stage=item[0],
+                gate=item[1],
+                detail=detail,
+                from_stage=item[0],
             )
 
     def record_github_ci_rollup(self, item_id, head_sha, conclusion):

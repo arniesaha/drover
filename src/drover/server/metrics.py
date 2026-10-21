@@ -3311,11 +3311,20 @@ class MetricsCollector:
         if github_worker is not None:
             try:
                 health = github_worker.health()
-                for key in ("received", "rejected_bad_signature", "deduped", "linked", "unlinked", "processing_errors"):
-                    lines.extend([
-                        f"# TYPE drover_github_webhook_{key} counter",
-                        f"drover_github_webhook_{key} {health.get(key, 0)}",
-                    ])
+                for key in (
+                    "received",
+                    "rejected_bad_signature",
+                    "deduped",
+                    "linked",
+                    "unlinked",
+                    "processing_errors",
+                ):
+                    lines.extend(
+                        [
+                            f"# TYPE drover_github_webhook_{key} counter",
+                            f"drover_github_webhook_{key} {health.get(key, 0)}",
+                        ]
+                    )
             except Exception:  # noqa: BLE001 - metrics must remain available
                 pass
         self._append_audit_cache_metrics(lines)

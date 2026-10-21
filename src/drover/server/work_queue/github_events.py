@@ -9,7 +9,6 @@ import threading
 
 from .github import ProviderUnavailable
 
-
 _PR_ACTIONS = {
     "opened": "pr_opened",
     "synchronize": "pr_synchronized",
@@ -254,9 +253,9 @@ class GitHubWebhookWorker:
                     head_sha=sha,
                     conclusion=conclusion,
                     exact_head=True,
-                    source="github_api"
-                    if state is not None
-                    else "accumulated_webhooks",
+                    source=(
+                        "github_api" if state is not None else "accumulated_webhooks"
+                    ),
                 ),
             )
 

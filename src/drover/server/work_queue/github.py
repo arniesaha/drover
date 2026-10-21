@@ -172,10 +172,14 @@ class GitHubProvider:
         required = self._request(
             "GET", self.base + f"/branches/{branch}/protection/required_status_checks"
         )
-        contexts = set(required.get("contexts", [])) if isinstance(required, dict) else set()
+        contexts = (
+            set(required.get("contexts", [])) if isinstance(required, dict) else set()
+        )
         contexts.update(
             check.get("context")
-            for check in (required.get("checks", []) if isinstance(required, dict) else [])
+            for check in (
+                required.get("checks", []) if isinstance(required, dict) else []
+            )
             if isinstance(check, dict) and isinstance(check.get("context"), str)
         )
         if not contexts:

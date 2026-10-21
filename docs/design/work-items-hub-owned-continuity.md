@@ -102,7 +102,7 @@ Prometheus exports receive/reject/dedup/link/error counters.
 
 The supported default is the Actions route; add this to the repository that
 owns the work items, after supplying the three named Actions secrets. This is
-an example only—Drover never creates the workflow, secret, tunnel, or webhook.
+an example only. Drover never creates the workflow, secret, tunnel, or webhook.
 
 ```yaml
 name: report completed CI to Drover
@@ -117,7 +117,7 @@ jobs:
       - uses: tailscale/github-action@v2
         with: {oauth-client-id: ${{ secrets.TS_CLIENT_ID }}, oauth-secret: ${{ secrets.TS_CLIENT_SECRET }}}
       - env:
-          HUB_URL: ${{ secrets.DROVER_HUB_URL }} # https://hub.tailnet.ts.net
+          HUB_URL: ${{ secrets.DROVER_HUB_URL }} # https://<your-hub-host>
           WEBHOOK_SECRET: ${{ secrets.DROVER_GITHUB_WEBHOOK_SECRET }}
         run: |
           body=$(cat "$GITHUB_EVENT_PATH")
