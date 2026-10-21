@@ -1129,14 +1129,23 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         return
             self._work_tool(path.rsplit("/", 1)[1], args)
             return
-        if path in {"/work-items", "/work-items/export"} or path.startswith(
-            "/work-items/"
-        ):
+        if path in {
+            "/work-items",
+            "/work-items/export",
+            "/work-items/events",
+            "/work-items/subscriptions",
+        } or path.startswith("/work-items/"):
             if path == "/work-items":
                 args = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 self._work_items("list", args)
             elif path == "/work-items/export":
                 self._work_items("export", {})
+            elif path == "/work-items/events":
+                self._work_items(
+                    "events", {k: v[0] for k, v in parse_qs(parsed.query).items()}
+                )
+            elif path == "/work-items/subscriptions":
+                self._work_items("subscriptions_list", {})
             else:
                 self._work_items(
                     "get", {"id": unquote(path.removeprefix("/work-items/"))}
@@ -1640,6 +1649,23 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if not self._gate(path):
             return
+        if path == "/work-items/subscriptions":
+            try:
+                content_length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                content_length = -1
+            if not 0 <= content_length <= 16 * 1024:
+                self.close_connection = True
+                self._send(
+                    400, "application/json", '{"error":"invalid subscription body"}'
+                )
+                return
+            body = self._read_json()
+            if not isinstance(body, dict):
+                self._send(400, "application/json", '{"error":"JSON object required"}')
+                return
+            self._work_items("subscriptions_create", body)
+            return
         if self.analytics_boundary is None and self._is_analytics_public_path(path):
             require_analytical_store(self.collector.duckdb_path)
         if path.startswith("/profile/"):
@@ -2013,6 +2039,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if self.analytics_boundary is None and self._is_analytics_public_path(path):
             require_analytical_store(self.collector.duckdb_path)
+        if path.startswith("/work-items/subscriptions/"):
+            subscription_id = unquote(path.removeprefix("/work-items/subscriptions/"))
+            if not subscription_id or "/" in subscription_id:
+                self._send(404, "application/json", '{"error":"not found"}')
+                return
+            self._work_items("subscriptions_delete", {"id": subscription_id})
+            return
         if path.startswith("/auth/credentials/"):
             self._revoke_credential(unquote(path.removeprefix("/auth/credentials/")))
             return

@@ -1,11 +1,18 @@
 """Workspace-scoped execution links and append-only metadata events."""
 
+import json
 import re
+import secrets
 from contextlib import contextmanager
 from uuid import uuid4
 
 from drover.server.control_outbox import is_postgres_connection
 from drover.server.control_store import postgres_control_store
+from drover.server.work_queue.work_item_events import (
+    _filter_kinds,
+    append_timeline_event,
+    event_payload,
+)
 
 
 class WorkStore:
@@ -196,11 +203,15 @@ class WorkStore:
                     acceptance,
                 ],
             )
-        con.execute(
-            """INSERT INTO work_item_timeline
-               (id, work_item_id, kind, stage, gate, detail)
-               VALUES (?, ?, 'launched', 'launched', 'worker_done', ?)""",
-            [str(uuid4()), item_id, title],
+        append_timeline_event(
+            con,
+            workspace_id=self.workspace_id,
+            item_id=item_id,
+            kind="launched",
+            stage="launched",
+            gate="worker_done",
+            detail=title,
+            from_stage=None,
         )
         return item_id
 
@@ -254,9 +265,20 @@ class WorkStore:
             for value in supplied.values()
         ):
             raise ValueError("non-empty work item fields required")
+        timeline_kind = (
+            "pr_linked"
+            if "pr" in supplied
+            else ("stage_changed" if "stage" in supplied else "updated")
+        )
         columns = [f"{key} = ?" for key in supplied]
         params = [*supplied.values(), self.workspace_id, item_id]
         with self.connection() as con:
+            previous = con.execute(
+                "SELECT stage FROM work_items WHERE workspace_id = ? AND id = ?",
+                [self.workspace_id, item_id],
+            ).fetchone()
+            if previous is None:
+                raise KeyError(item_id)
             row = con.execute(
                 "UPDATE work_items SET " + ", ".join(columns) + ", updated_at = now() "
                 "WHERE workspace_id = ? AND id = ? RETURNING id, stage, gate",
@@ -264,12 +286,170 @@ class WorkStore:
             ).fetchone()
             if row is None:
                 raise KeyError(item_id)
-            con.execute(
-                """INSERT INTO work_item_timeline (id, work_item_id, kind, stage, gate, detail)
-                   VALUES (?, ?, 'patched', ?, ?, ?)""",
-                [str(uuid4()), item_id, row[1], row[2], ", ".join(supplied)],
+            append_timeline_event(
+                con,
+                workspace_id=self.workspace_id,
+                item_id=item_id,
+                kind=timeline_kind,
+                stage=row[1],
+                gate=row[2],
+                detail=", ".join(supplied),
+                from_stage=previous[0],
             )
         return self.hub_item(item_id)
+
+    def create_work_item_subscription(
+        self, credential_id, *, url, event_kinds, repo=None
+    ):
+        kinds = _filter_kinds(event_kinds)
+        if repo is not None and (
+            not isinstance(repo, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+        ):
+            raise ValueError("repo must be owner/name")
+        subscription_id = str(uuid4())
+        secret = secrets.token_urlsafe(32)
+        with self.connection() as con:
+            con.execute(
+                """INSERT INTO work_item_subscriptions
+                   (id, workspace_id, credential_id, url, event_kinds_json, repo, hmac_secret)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    subscription_id,
+                    self.workspace_id,
+                    credential_id,
+                    url,
+                    json.dumps(kinds),
+                    repo,
+                    secret,
+                ],
+            )
+        return {
+            "id": subscription_id,
+            "url": url,
+            "event_kinds": kinds,
+            "repo": repo,
+            "secret": secret,
+        }
+
+    def work_item_subscriptions(self, credential_id):
+        with self.connection() as con:
+            rows = self.rows(
+                con.execute(
+                    """SELECT id, url, event_kinds_json, repo, created_at, updated_at
+                       FROM work_item_subscriptions WHERE workspace_id = ? AND credential_id = ?
+                       ORDER BY created_at DESC, id""",
+                    [self.workspace_id, credential_id],
+                )
+            )
+        for row in rows:
+            row["event_kinds"] = json.loads(row.pop("event_kinds_json"))
+        return rows
+
+    def delete_work_item_subscription(self, credential_id, subscription_id):
+        with self.connection() as con:
+            row = con.execute(
+                """DELETE FROM work_item_subscriptions
+                   WHERE workspace_id = ? AND credential_id = ? AND id = ? RETURNING id""",
+                [self.workspace_id, credential_id, subscription_id],
+            ).fetchone()
+        return row is not None
+
+    def work_item_events(self, *, since, limit):
+        with self.connection() as con:
+            rows = self.rows(
+                con.execute(
+                    """SELECT event_id, cursor, item_id, kind, from_stage, to_stage, gate,
+                              next_action, session_id, pr, occurred_at
+                       FROM work_item_events WHERE workspace_id = ? AND cursor > ?
+                       ORDER BY cursor LIMIT ?""",
+                    [self.workspace_id, since, limit],
+                )
+            )
+        next_cursor = rows[-1]["cursor"] if rows else since
+        return {
+            "events": [event_payload(row) for row in rows],
+            "next_cursor": next_cursor,
+        }
+
+    def claim_work_item_deliveries(self, limit):
+        """Lease at most ``limit`` rows; expired leases make retries durable."""
+        with self.connection() as con:
+            rows = self.rows(
+                con.execute(
+                    """SELECT d.subscription_id, d.event_id, d.attempts, s.url, s.hmac_secret,
+                              e.item_id, e.kind, e.from_stage, e.to_stage, e.gate,
+                              e.next_action, e.session_id, e.pr, e.occurred_at
+                       FROM work_item_event_deliveries d
+                       JOIN work_item_subscriptions s ON s.id = d.subscription_id
+                       JOIN work_item_events e ON e.event_id = d.event_id
+                       WHERE (d.state = 'pending' AND d.next_attempt_at <= now())
+                          OR (d.state = 'leased' AND d.lease_until <= now())
+                       ORDER BY d.next_attempt_at, d.event_id LIMIT ? FOR UPDATE SKIP LOCKED""",
+                    [limit],
+                )
+            )
+            for row in rows:
+                row["attempts"] += 1
+                con.execute(
+                    """UPDATE work_item_event_deliveries SET attempts = ?, state = 'leased',
+                       lease_until = now() + interval '35 seconds' WHERE subscription_id = ? AND event_id = ?""",
+                    [row["attempts"], row["subscription_id"], row["event_id"]],
+                )
+        return rows
+
+    def complete_work_item_delivery(self, row, *, status, delivered, max_attempts):
+        with self.connection() as con:
+            if delivered:
+                con.execute(
+                    """UPDATE work_item_event_deliveries SET state = 'sent', last_status = ?,
+                       delivered_at = now(), lease_until = NULL WHERE subscription_id = ? AND event_id = ?
+                       AND state = 'leased' AND attempts = ?""",
+                    [status, row["subscription_id"], row["event_id"], row["attempts"]],
+                )
+                return "sent"
+            if row["attempts"] >= max_attempts:
+                con.execute(
+                    """UPDATE work_item_event_deliveries SET state = 'dead_letter', last_status = ?,
+                       dead_lettered_at = now(), lease_until = NULL WHERE subscription_id = ? AND event_id = ?
+                       AND state = 'leased' AND attempts = ?""",
+                    [
+                        status or None,
+                        row["subscription_id"],
+                        row["event_id"],
+                        row["attempts"],
+                    ],
+                )
+                return "dead_lettered"
+            delay = min(3600, 2 ** (row["attempts"] - 1))
+            con.execute(
+                """UPDATE work_item_event_deliveries SET state = 'pending', last_status = ?,
+                   next_attempt_at = now() + (? * interval '1 second'), lease_until = NULL
+                   WHERE subscription_id = ? AND event_id = ? AND state = 'leased' AND attempts = ?""",
+                [
+                    status or None,
+                    delay,
+                    row["subscription_id"],
+                    row["event_id"],
+                    row["attempts"],
+                ],
+            )
+            return "failed"
+
+    def work_item_delivery_health(self):
+        with self.connection() as con:
+            row = con.execute(
+                """SELECT count(*) FILTER (WHERE state = 'pending') AS pending,
+                          count(*) FILTER (WHERE state = 'dead_letter') AS dead_lettered,
+                          EXTRACT(EPOCH FROM (now() - min(next_attempt_at)
+                            FILTER (WHERE state = 'pending'))) AS oldest_lag_seconds
+                   FROM work_item_event_deliveries"""
+            ).fetchone()
+        return {
+            "pending": int(row[0] or 0),
+            "dead_lettered_total": int(row[1] or 0),
+            "oldest_lag_seconds": float(row[2] or 0),
+        }
 
     def hub_export(self):
         items = self.hub_items()
@@ -339,11 +519,11 @@ def apply_hub_lifecycle_event(con, *, event_id, session_id, event_type, payload)
         or data.get("session_status") == "errored"
         or (event_type == "session.exited" and data.get("exited") not in {None, 0})
     ):
-        stage, gate, kind, detail = "blocked", "worker_done", "errored", None
+        stage, gate, kind, detail = "blocked", "worker_done", "blocked", None
     elif (
         event_type == "session.terminated" or data.get("session_status") == "terminated"
     ):
-        stage, gate, kind, detail = "closed", None, "terminated", None
+        stage, gate, kind, detail = "closed", None, "closed", None
     else:
         return False
     row = con.execute(
@@ -353,14 +533,15 @@ def apply_hub_lifecycle_event(con, *, event_id, session_id, event_type, payload)
         return False
     # An explicit done state is a terminal success, and a later termination is
     # just cleanup rather than a closure of the item.
-    if kind == "terminated" and row[1] == "done":
+    if kind == "closed" and row[1] == "done":
         return False
+    timeline_id = str(uuid4())
     inserted = con.execute(
         """INSERT INTO work_item_timeline
            (id, work_item_id, source_event_id, kind, stage, gate, detail)
            VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (source_event_id) DO NOTHING
            RETURNING id""",
-        [str(uuid4()), row[0], event_id, kind, stage, gate, detail],
+        [timeline_id, row[0], event_id, kind, stage, gate, detail],
     ).fetchone()
     if inserted is None:
         return False
@@ -368,4 +549,57 @@ def apply_hub_lifecycle_event(con, *, event_id, session_id, event_type, payload)
         "UPDATE work_items SET stage = ?, gate = ?, updated_at = now() WHERE id = ?",
         [stage, gate, row[0]],
     )
+    # The lifecycle timeline row has already been inserted so preserve its
+    # stable id while creating the event/delivery facts.  The helper normally
+    # inserts its own timeline row; inline this one keeps source-event replay
+    # semantics intact.
+    event_row = con.execute(
+        "SELECT created_at FROM work_item_timeline WHERE id = ?", [timeline_id]
+    ).fetchone()
+    item = con.execute(
+        "SELECT workspace_id, repo, session_id, pr, next_action FROM work_items WHERE id = ?",
+        [row[0]],
+    ).fetchone()
+    cursor = con.execute(
+        """INSERT INTO work_item_event_cursors (workspace_id, cursor) VALUES (?, 1)
+           ON CONFLICT (workspace_id) DO UPDATE SET cursor = work_item_event_cursors.cursor + 1
+           RETURNING cursor""",
+        [item[0]],
+    ).fetchone()[0]
+    con.execute(
+        """INSERT INTO work_item_events
+           (event_id, workspace_id, cursor, item_id, kind, from_stage, to_stage,
+            gate, next_action, session_id, pr, occurred_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            timeline_id,
+            item[0],
+            cursor,
+            row[0],
+            kind,
+            row[1],
+            stage,
+            gate,
+            item[4],
+            item[2],
+            item[3],
+            event_row[0],
+        ],
+    )
+    subscriptions = con.execute(
+        "SELECT id, event_kinds_json, repo FROM work_item_subscriptions WHERE workspace_id = ?",
+        [item[0]],
+    ).fetchall()
+    for subscription_id, kinds_json, repo_filter in subscriptions:
+        try:
+            kinds = json.loads(kinds_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (kinds and kind not in kinds) or (repo_filter and repo_filter != item[1]):
+            continue
+        con.execute(
+            """INSERT INTO work_item_event_deliveries (subscription_id, event_id)
+               VALUES (?, ?) ON CONFLICT DO NOTHING""",
+            [subscription_id, timeline_id],
+        )
     return True

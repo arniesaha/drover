@@ -180,12 +180,34 @@ class GoalScope(Model):
         return self
 
 
+class WorkItemEventsConfig(Model):
+    """Bounded delivery policy for hub-owned work-item notifications."""
+
+    webhook_allow_hosts: list[str] = Field(default_factory=list)
+    max_in_flight: int = Field(default=4, ge=1, le=16)
+    batch_size: int = Field(default=16, ge=1, le=100)
+    max_attempts: int = Field(default=8, ge=1, le=20)
+    timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+
+    @model_validator(mode="after")
+    def valid(self):
+        normalized = [
+            host.strip().lower().rstrip(".") for host in self.webhook_allow_hosts
+        ]
+        if any(not host or "://" in host or "/" in host for host in normalized):
+            raise ValueError("webhook_allow_hosts must contain host names only")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("webhook_allow_hosts must not contain duplicates")
+        return self
+
+
 class WorkQueueConfig(Model):
     enabled: bool = False
     shadow_mode: bool = True
     workspace_id: str = ""
     goals: list[GoalScope] = Field(default_factory=list)
     principal_roles: dict[str, str] = Field(default_factory=dict)
+    work_item_events: WorkItemEventsConfig = Field(default_factory=WorkItemEventsConfig)
 
     @model_validator(mode="after")
     def valid(self):
