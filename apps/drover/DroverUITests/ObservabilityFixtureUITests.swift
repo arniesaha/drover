@@ -296,13 +296,23 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
-    private func launchRealApp(large: Bool = false, dark: Bool = false, pendingSessionID: String? = nil) -> XCUIApplication {
+    private func launchRealApp(
+        large: Bool = false,
+        dark: Bool = false,
+        pendingSessionID: String? = nil,
+        initialTab: String? = nil,
+        awaitingSessionID: String? = nil
+    ) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
         app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
         if let pendingSessionID {
             app.launchEnvironment["DROVER_UI_TEST_PENDING_SESSION_ID"] = pendingSessionID
+        }
+        if let initialTab { app.launchEnvironment["DROVER_UI_TEST_INITIAL_TAB"] = initialTab }
+        if let awaitingSessionID {
+            app.launchEnvironment["DROVER_UI_TEST_AWAITING_SESSION_ID"] = awaitingSessionID
         }
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
@@ -416,6 +426,37 @@ final class ObservabilityFixtureUITests: XCTestCase {
         let chatMenu = app.buttons["chat-menu"]
         let codexBar = app.navigationBars["Codex"]
         XCTAssertTrue(chatMenu.waitForExistence(timeout: 10) || codexBar.waitForExistence(timeout: 10))
+    }
+
+    @MainActor
+    func testNotificationRouteWaitsForHomeTabBeforePushingAndSurvivesRotation() {
+        // First prove that Inbox owns its own session presentation: this
+        // navigates neither Home's stack nor the tab selection at the same
+        // time.  The fixture marks one session as awaiting input solely for
+        // this UI-level routing coverage.
+        let app = launchRealApp(awaitingSessionID: "fixture-session")
+        tab(app, "inbox").tap()
+        let inboxSession = app.buttons["inbox-session-fixture-session"]
+        XCTAssertTrue(inboxSession.waitForExistence(timeout: 8))
+        inboxSession.tap()
+        let inboxDismiss = app.navigationBars["Codex"].buttons["Inbox"]
+        XCTAssertTrue(inboxDismiss.waitForExistence(timeout: 5))
+        inboxDismiss.tap()
+
+        // A notification arriving while Inbox is selected must first select
+        // Home, then push inside Home's sole NavigationStack.  This was the
+        // crashing same-transaction sequence in build 24.
+        app.terminate()
+        app.launchEnvironment["DROVER_UI_TEST_INITIAL_TAB"] = "inbox"
+        app.launchEnvironment["DROVER_UI_TEST_PENDING_SESSION_ID"] = "fixture-session"
+        app.launch()
+
+        let chatMenu = app.buttons["chat-menu"]
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 10))
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
     }
 
     @MainActor

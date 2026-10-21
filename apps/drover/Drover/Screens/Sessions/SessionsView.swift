@@ -37,6 +37,7 @@ struct SessionsView: View {
     private let defaults: UserDefaults
     private let onOpenInbox: () -> Void
     private let showsNewSessionAction: Bool
+    @Binding private var notificationRoute: HomeNotificationRoute?
     @Environment(\.scenePhase) private var scenePhase
     @Environment(AppearanceStore.self) private var appearance
     @State private var exporterFreshness = ExporterFreshnessGate()
@@ -59,6 +60,7 @@ struct SessionsView: View {
         sessionStore: SessionStore? = nil,
         cockpitStore: CockpitStore? = nil,
         onOpenInbox: @escaping () -> Void = {},
+        notificationRoute: Binding<HomeNotificationRoute?> = .constant(nil),
         showsNewSessionAction: Bool = true
     ) {
         self.client = client
@@ -71,6 +73,7 @@ struct SessionsView: View {
         self.defaults = defaults
         self.onOpenInbox = onOpenInbox
         self.showsNewSessionAction = showsNewSessionAction
+        _notificationRoute = notificationRoute
         _filterState = State(initialValue: FleetFilterState.load(from: defaults))
         _store = State(initialValue: sessionStore ?? SessionStore(client: client))
         _cockpitStore = State(initialValue: cockpitStore ?? CockpitStore(client: client))
@@ -295,18 +298,14 @@ struct SessionsView: View {
             let watcher = AttentionWatcher(notifier: notifier, seenStore: defaults)
             Task { await watcher.evaluate(snapshot) }
         }
-        // A tapped alert names one session; open that session rather than
-        // leaving the user on the list to find it again themselves.
-        .onChange(of: NotificationRoute.shared.pendingSessionIDs) { _, _ in
-            openSessionFromNotification()
+        // `MainTabView` delivers this only after Home has been selected and
+        // the tab transition has settled.  Retain an unresolved session route
+        // until the first snapshot arrives on a cold notification launch.
+        .onChange(of: notificationRoute) { _, _ in
+            openNotificationRoute()
         }
-        .onChange(of: NotificationRoute.shared.pendingSessionID) { _, _ in
-            openSessionFromNotification()
-        }
-        // A cold launch delivers the tap before the first poll returns, so the
-        // id cannot resolve to a session yet. Try again when the list arrives.
         .onChange(of: store.snapshot?.sessions.count) { _, _ in
-            openSessionFromNotification()
+            openNotificationRoute()
         }
         .onChange(of: store.lastSuccessfulRefresh) { _, _ in
             syncWidgetSnapshot()
@@ -314,7 +313,7 @@ struct SessionsView: View {
         .onChange(of: cockpitStore.providerAccounts) { _, _ in
             syncWidgetSnapshot()
         }
-        .onAppear { openSessionFromNotification() }
+        .onAppear { openNotificationRoute() }
         .sheet(isPresented: $showLaunch) {
             NavigationStack {
                 LaunchView(
@@ -688,30 +687,29 @@ struct SessionsView: View {
     /// Marked on open and again on leaving: the session may only start asking
     /// for something while the user is already reading it, and that should
     /// not leave a badge behind them.
-    /// Push straight into the session a tapped alert was about.
-    ///
-    /// Reuses the destination `LaunchView` already navigates through, so a
-    /// notification lands on exactly the screen launching that session would.
-    /// The id is only consumed once a matching session is actually in the
-    /// snapshot: a cold launch delivers the tap before the first poll returns,
-    /// and dropping it there would strand the user on the list.
-    private func openSessionFromNotification() {
-        if let ids = NotificationRoute.shared.consumeSummary() {
+    /// Push a route only after `MainTabView` has handed it to this Home stack.
+    /// A session route survives until a matching snapshot arrives, which keeps
+    /// cold-launch notification taps reliable without ever mutating navigation
+    /// during the tab-selection transaction.
+    private func openNotificationRoute() {
+        guard let route = notificationRoute else { return }
+        switch route {
+        case .summary(let ids):
             notificationSessionIDs = Set(ids)
             launchedSession = nil
-            return
+            notificationRoute = nil
+        case .session(let id):
+            guard let session = store.snapshot?.sessions.first(where: { $0.id == id }) else {
+                return
+            }
+            notificationSessionIDs = nil
+            notificationRoute = nil
+            launchedSession = LaunchedSession(
+                id: session.id,
+                isStructured: session.isStructured,
+                harness: session.harness
+            )
         }
-        guard let pending = NotificationRoute.shared.pendingSessionID else { return }
-        guard let session = store.snapshot?.sessions.first(where: { $0.id == pending }) else {
-            return
-        }
-        notificationSessionIDs = nil
-        _ = NotificationRoute.shared.consume()
-        launchedSession = LaunchedSession(
-            id: session.id,
-            isStructured: session.isStructured,
-            harness: session.harness
-        )
     }
 
     private func markRead(_ session: SessionSummary) async {

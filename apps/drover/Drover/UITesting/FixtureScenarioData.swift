@@ -141,7 +141,10 @@ enum FixtureScenarioData {
     }
 
     static func snapshotData() -> Data {
-        jsonData([
+        let awaitingSessionID = ProcessInfo.processInfo.environment[
+            "DROVER_UI_TEST_AWAITING_SESSION_ID"
+        ]
+        return jsonData([
             "hosts": [[
                 "host_id": coreJourney.hostID,
                 "status": "online",
@@ -152,7 +155,7 @@ enum FixtureScenarioData {
                 ],
             ]],
             "sessions": coreJourney.sessions.map { session in
-                [
+                var payload: [String: Any] = [
                     "session_id": session.id,
                     "host_id": coreJourney.hostID,
                     "harness": session.harness,
@@ -161,7 +164,9 @@ enum FixtureScenarioData {
                     "cwd": "/fixture/project",
                     "preview": session.title,
                     "last_activity": "2026-09-04T00:00:00Z",
-                ] as [String: Any]
+                ]
+                if session.id == awaitingSessionID { payload["awaiting"] = "input" }
+                return payload
             },
             "cwd_suggestions": [[
                 "path": "/fixture/project",

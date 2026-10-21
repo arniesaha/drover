@@ -80,6 +80,10 @@ struct UITestScenario {
             preconditionFailure("Could not create isolated synthetic stores")
         }
         self.defaults = defaults
+        if let rawInitialTab = launchEnvironment["DROVER_UI_TEST_INITIAL_TAB"],
+           let initialTab = AppTab(rawValue: rawInitialTab) {
+            initialTab.save(to: defaults)
+        }
         self.catalogStore = HarnessModelCatalogStore(defaults: defaults)
         self.recoveryStore = ChatRecoveryStore(root: root)
         self.environment = AppEnvironment(
