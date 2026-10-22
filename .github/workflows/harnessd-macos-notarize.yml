@@ -7,8 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref containing the Rust harnessd crate to sign (never publishes)"
+        description: "Git ref containing the Rust harnessd crate to sign"
         required: true
+        type: string
+      release_tag:
+        description: "Existing GitHub release to receive signed assets; empty never publishes"
+        required: false
+        default: ""
         type: string
   workflow_call:
     inputs:
@@ -197,7 +202,8 @@ jobs:
         set -euo pipefail
         cd "$RUNNER_TEMP/harnessd-release"
         gh release upload "$RELEASE_TAG" \
-          "$HARNESSD_ASSET" "$HARNESSD_ASSET.sha256" --clobber
+          "$HARNESSD_ASSET" "$HARNESSD_ASSET.sha256" --clobber \
+          --repo "$GITHUB_REPOSITORY"
 
     - name: Remove temporary signing credentials
       if: always()

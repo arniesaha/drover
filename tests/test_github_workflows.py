@@ -548,6 +548,32 @@ def test_harnessd_macos_notarization_assesses_the_bare_binary() -> None:
     assert "grep -q 'source=Notarized Developer ID'" in verify
 
 
+def test_harnessd_macos_notarization_dispatch_can_repair_an_existing_release() -> None:
+    """Dispatches may attach assets only when an explicit existing tag is given."""
+    workflow = load_workflow("harnessd-macos-notarize.yml")
+    dispatch_inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    callable_inputs = workflow["on"]["workflow_call"]["inputs"]
+
+    assert set(dispatch_inputs) == {"ref", "release_tag"}
+    assert dispatch_inputs["ref"]["required"] == "true"
+    assert dispatch_inputs["release_tag"] == {
+        "description": "Existing GitHub release to receive signed assets; empty never publishes",
+        "required": "false",
+        "default": "",
+        "type": "string",
+    }
+    # Keep the reusable release.yml caller contract unchanged.
+    assert callable_inputs["release_tag"]["default"] == ""
+    attach = next(
+        step
+        for step in workflow["jobs"]["sign-notarize"]["steps"]
+        if step.get("name") == "Attach signed binary to the existing release"
+    )
+    assert attach["if"] == "inputs.release_tag != ''"
+    assert 'gh release upload "$RELEASE_TAG"' in attach["run"]
+    assert '--repo "$GITHUB_REPOSITORY"' in attach["run"]
+
+
 def test_clean_install_uses_configured_address_and_keeps_pairing_private() -> None:
     """The published-artifact smoke must not disturb another runner process.
 
