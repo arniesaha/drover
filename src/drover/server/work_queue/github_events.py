@@ -298,8 +298,23 @@ class GitHubWebhookWorker:
             "inactive": "rejected",
         }.get(raw_state)
         environment = status.get("environment") or deployment.get("environment")
-        run_id = status.get("workflow_run_id") or deployment.get("workflow_run_id")
-        if not isinstance(run_id, int) or not state or not isinstance(environment, str):
+        # A deployment-status delivery is signed but GitHub's top-level
+        # payload varies by event producer.  Link it only when it carries the
+        # Actions run identity (including a deployment payload extension);
+        # never collapse unrelated deployments on branch alone.
+        deployment_payload = deployment.get("payload") or {}
+        run_id = (
+            status.get("workflow_run_id")
+            or deployment.get("workflow_run_id")
+            or deployment_payload.get("workflow_run_id")
+            or (payload.get("workflow_run") or {}).get("id")
+        )
+        if (
+            not isinstance(run_id, int)
+            or run_id <= 0
+            or not state
+            or not isinstance(environment, str)
+        ):
             return
         branch = deployment.get("ref") or (payload.get("workflow_run") or {}).get(
             "head_branch"

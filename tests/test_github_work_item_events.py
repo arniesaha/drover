@@ -322,3 +322,23 @@ def test_environment_approval_rejection_is_terminal_and_idempotent(
     assert [row["kind"] for row in result["timeline"]].count(
         "environment_approval_rejected"
     ) == 1
+
+    # A signed but delayed success delivery is still stale after a terminal
+    # rejection; it must not reopen the work item or emit another wake.
+    body = json.dumps(_deployment("success", run_id=92)).encode()
+    assert (
+        receiver.accept(
+            _headers(
+                body, delivery="reject-delayed-success", event="deployment_status"
+            ),
+            body,
+        )[0]
+        == 202
+    )
+    assert worker.process_once() == 1
+    result = service.store.hub_item(item["id"])
+    assert result["stage"] == "closed"
+    assert result["gate"] == "environment_rejected"
+    assert [row["kind"] for row in result["timeline"]].count(
+        "environment_approval_approved"
+    ) == 0

@@ -135,7 +135,9 @@ alter existing values.
 Protected-environment `deployment_status` facts are stored by item, workflow
 run, and environment. A pending gate records the environment, run URL, optional
 reviewer, and first-seen time and emits one `environment_approval_required`
-event; repeated webhooks and sweeps only refresh its observation time. Approval
+event; repeated webhooks and sweeps only refresh its observation time. A signed
+delivery is linked only when it carries an Actions workflow-run identity, and a
+terminal approval or rejection is not rewritten by a delayed delivery. Approval
 queues the item and emits `environment_approval_approved`, which wakes the
 owner; rejection closes it with `environment_rejected`. Migration 27 is
 additive and stores these facts. `github_approvals.reconciliation_seconds`
