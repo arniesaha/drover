@@ -4873,3 +4873,61 @@ def test_provider_reset_windows_ducklake_reader_errors_propagate(
             analytical_path=tmp_path / "drover.duckdb",
             connections=[("openai", "personal", "mac-mini")],
         )
+
+
+def test_provider_reset_windows_ducklake_groups_large_bounded_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The history gateway caps result rows at 1,000, not reset-window rows."""
+    from types import SimpleNamespace
+    from drover.server.advisory import worker as worker_module
+    import drover.server.lake.serving as serving
+
+    connections = [("openai", f"account-{index}", "mac-mini") for index in range(33)]
+    grouped = [
+        (
+            provider,
+            account_label,
+            host_id,
+            [
+                [f"window-{window}", NOW.isoformat(), NOW.isoformat(), "32"]
+                for window in range(32)
+            ],
+        )
+        for provider, account_label, host_id in connections
+    ]
+
+    class History:
+        executions = 0
+
+        def execute(self, sql, params):
+            self.executions += 1
+            assert "list([" in sql
+            assert params == [value for connection in connections for value in connection]
+            return self
+
+        def fetchall(self):
+            return grouped
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    history = History()
+    monkeypatch.setattr(
+        serving, "selected_config", lambda _path: SimpleNamespace(backend="ducklake")
+    )
+    monkeypatch.setattr(serving, "open_history", lambda _path: history)
+
+    rows = worker_module._provider_reset_windows(
+        object(),
+        "SELECT * FROM provider_usage_snapshots",
+        [],
+        analytical_path=tmp_path / "drover.duckdb",
+        connections=connections,
+    )
+
+    assert history.executions == 1
+    assert len(rows) == 33 * 32
