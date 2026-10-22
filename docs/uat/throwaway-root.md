@@ -45,7 +45,7 @@ all existing entries and using the service account's absolute home path:
 
 ```xml
 <key>DROVER_FOLDER_ROOTS</key>
-<string>/Users/NAME/drover-uat</string>
+<string>/Users/&lt;service-account&gt;/drover-uat</string>
 ```
 
 Before restarting that UAT service, create and inspect the directory as the
