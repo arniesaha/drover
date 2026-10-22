@@ -85,7 +85,9 @@ def test_first_advisory_review_reads_ducklake_provider_windows(
         )
         configure_analytics(prod_shaped, served.config)
         with duckdb.connect(str(prod_shaped)) as con:
-            with pytest.raises(duckdb.CatalogException, match="provider_usage_snapshots"):
+            with pytest.raises(
+                duckdb.CatalogException, match="provider_usage_snapshots"
+            ):
                 con.execute("SELECT count(*) FROM provider_usage_snapshots")
             for account in range(CONNECTIONS):
                 con.execute(

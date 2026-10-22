@@ -4832,7 +4832,9 @@ def test_provider_reset_windows_ducklake_empty_inventory_is_normal(
         serving, "selected_config", lambda _path: SimpleNamespace(backend="ducklake")
     )
     monkeypatch.setattr(
-        serving, "open_history", lambda _path: pytest.fail("empty inventory opened lake")
+        serving,
+        "open_history",
+        lambda _path: pytest.fail("empty inventory opened lake"),
     )
 
     class LegacyConnection:
@@ -4907,7 +4909,9 @@ def test_provider_reset_windows_ducklake_groups_large_bounded_inventory(
         def execute(self, sql, params):
             self.executions += 1
             assert "list([" in sql
-            assert params == [value for connection in connections for value in connection]
+            assert params == [
+                value for connection in connections for value in connection
+            ]
             return self
 
         def fetchall(self):
