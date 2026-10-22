@@ -256,23 +256,25 @@ For remote access, prefer Tailscale Serve HTTPS over plain HTTP to a MagicDNS
 name. Tailscale terminates the certificate and forwards privately to this hub;
 Drover itself still serves HTTP on port 7080 in this phase.
 
-With the hub reachable on its Tailscale IP, publish its existing listener only
-inside the tailnet:
+Publish the existing hub listener only inside the tailnet:
 
 ```bash
-tailscale serve --https=443 http://127.0.0.1:7080
+drover hub serve --tailscale
 ```
 
-`tailscale serve status` prints the resulting `https://<machine>.<tailnet>.ts.net`
-URL. Set `[server] advertised_url` to that HTTPS URL, then run
-`drover-server pair` again. The pairing QR carries `tls=1` and the iOS app uses
-HTTPS/WSS. Do not use `tailscale funnel`: it would make a private hub public.
+The helper verifies that the Tailscale CLI is available, configures
+`tailscale serve --bg --https=443` for the configured hub listener, and prints
+the resulting `https://<machine>.<tailnet>.ts.net` MagicDNS URL. It never
+invokes or enables Tailscale Funnel, and Drover itself continues serving plain
+HTTP on port 7080 behind Tailscale's HTTPS termination.
 
-If the hub is bound only to a LAN address, replace the command's upstream with
-that private address. A `drover hub serve --tailscale` helper is deliberately
-not part of phase 1; [#686](https://github.com/arniesaha/drover/issues/686)
-tracks that explicit helper while this command remains the documented,
-transparent setup.
+Set `[server] advertised_url` to the printed HTTPS URL, then run
+`drover-server pair` again. The pairing QR carries `tls=1` and the iOS app uses
+HTTPS/WSS. If the hub is bound to a single private address, the helper uses
+that address as the Serve upstream; loopback and wildcard listeners use
+`127.0.0.1`. To avoid replacing another route, it refuses to run if Tailscale
+Serve already has any configuration; inspect that configuration and add the
+listener manually instead.
 
 ### Hosts With More Than One Network (LAN + VPN)
 
