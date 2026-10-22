@@ -35,10 +35,19 @@ if [[ "$root" == *'/../'* || "$root" == */.. || "$root" == *'/./'* || "$root" ==
   echo "UAT root must not contain traversal components; refusing: $root" >&2
   exit 2
 fi
-if [[ -L "$root" ]]; then
-  echo "UAT root must not be a symlink; refusing: $root" >&2
-  exit 2
-fi
+# Reject every existing component below HOME, not just the final path.  Otherwise
+# `~/linked/drover-uat` could make mkdir traverse a symlink outside the private
+# UAT tree before the final-root check runs.
+relative_root="${root#"$HOME"/}"
+current="$HOME"
+IFS=/ read -r -a components <<< "$relative_root"
+for component in "${components[@]}"; do
+  current="$current/$component"
+  if [[ -L "$current" ]]; then
+    echo "UAT root must not contain symlink components; refusing: $root" >&2
+    exit 2
+  fi
+done
 
 umask 077
 if [[ ! -d "$root" ]]; then

@@ -49,6 +49,31 @@ def test_uat_runner_refuses_root_outside_home(tmp_path):
     assert not outside.exists()
 
 
+def test_uat_runner_refuses_symlink_component_before_creating_root(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = home / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    root = linked / "drover-uat"
+    environment = {
+        "HOME": str(home),
+        "PATH": os.environ["PATH"],
+        "DROVER_UAT_ROOT": str(root),
+    }
+    result = subprocess.run(
+        [str(SCRIPT), "--", "true"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "must not contain symlink components" in result.stderr
+    assert not (outside / "drover-uat").exists()
+
+
 def test_uat_runner_refuses_symlink_root(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
@@ -69,4 +94,4 @@ def test_uat_runner_refuses_symlink_root(tmp_path):
         text=True,
     )
     assert result.returncode == 2
-    assert "must not be a symlink" in result.stderr
+    assert "must not contain symlink components" in result.stderr
