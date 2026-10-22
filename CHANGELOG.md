@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The isolated UAT launcher uses a private, mode-0700 `~/drover-uat` root only for its child harness process. It rejects traversal, symlinked, outside-home, and `/tmp` roots without changing a running production daemon (#764).
 - Updated the web test toolchain to Vitest 4.1.12 and refreshed its lockfile, removing the reported development-only audit advisories; the shipped Preact bundle is unchanged (#766).
+- The web cockpit now renders active harness sessions with a normalized running state (#768).
+- Local embedding selection logs report the configured backend accurately (#769).
+- Advisory provider facts now read from DuckLake, preserving the production source of truth (#770).
 
 ### Upgrade notes
 
