@@ -132,6 +132,18 @@ Migration 25 is additive: it adds `work_items.head_sha`, the additive event
 `detail`, and durable GitHub delivery/rollup tables. It does not backfill or
 alter existing values.
 
+Protected-environment `deployment_status` facts are stored by item, workflow
+run, and environment. A pending gate records the environment, run URL, optional
+reviewer, and first-seen time and emits one `environment_approval_required`
+event; repeated webhooks and sweeps only refresh its observation time. Approval
+queues the item and emits `environment_approval_approved`, which wakes the
+owner; rejection closes it with `environment_rejected`. Migration 27 is
+additive and stores these facts. `github_approvals.reconciliation_seconds`
+(default 1800, bounded to 30–60 minutes) is the read-only fallback for missed
+webhooks; `stale_escalation_seconds` emits one escalation per still-pending
+gate. Tracking and notifications remain active in shadow mode; shadow mode
+still prevents automatic actions.
+
 ## Step 4: hub rules and opt-in execution
 
 Migration 26 is additive. It adds `auto_merge`, `publish`, and

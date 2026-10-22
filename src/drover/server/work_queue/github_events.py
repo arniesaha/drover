@@ -169,6 +169,8 @@ class GitHubWebhookWorker:
             self._ci(event_type, payload)
         elif event_type == "push":
             self._push(payload)
+        elif event_type == "deployment_status":
+            self._deployment_status(payload)
 
     def _pull_request(self, payload):
         pr = payload.get("pull_request") or {}
@@ -274,6 +276,50 @@ class GitHubWebhookWorker:
             except ProviderUnavailable:
                 return None
         return None
+
+    def _deployment_status(self, payload):
+        """Project protected-environment status changes into the owning item.
+
+        GitHub may deliver the same deployment state via webhook and the
+        bounded sweep.  The store's (item, run, environment) key makes both
+        paths idempotent and keeps the webhook free of provider writes.
+        """
+        deployment = payload.get("deployment") or {}
+        status = payload.get("deployment_status") or {}
+        raw_state = status.get("state")
+        state = {
+            "pending": "pending",
+            "queued": "pending",
+            "in_progress": "pending",
+            "success": "approved",
+            "approved": "approved",
+            "failure": "rejected",
+            "rejected": "rejected",
+            "inactive": "rejected",
+        }.get(raw_state)
+        environment = status.get("environment") or deployment.get("environment")
+        run_id = status.get("workflow_run_id") or deployment.get("workflow_run_id")
+        if not isinstance(run_id, int) or not state or not isinstance(environment, str):
+            return
+        branch = deployment.get("ref") or (payload.get("workflow_run") or {}).get(
+            "head_branch"
+        )
+        item = self._item(payload, branch=branch)
+        if item is None:
+            return
+        run_url = status.get("environment_url") or (
+            f"https://github.com/{item['repo']}/actions/runs/{run_id}"
+        )
+        sender = payload.get("sender") or {}
+        reviewer = sender.get("login") if state != "pending" else None
+        self.store.observe_environment_approval(
+            item["id"],
+            run_id=run_id,
+            environment=environment,
+            run_url=run_url,
+            state=state,
+            reviewer=reviewer,
+        )
 
     def _push(self, payload):
         repo = payload.get("repository") or {}

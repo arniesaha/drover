@@ -235,3 +235,90 @@ def test_old_head_cannot_make_current_head_green_and_unknown_pr_creates_nothing(
     assert [event["kind"] for event in events].count("ci_green_exact_head") == 1
     assert service.store.hub_items()[0]["id"] == item["id"]
     assert receiver.health()["unlinked"] >= 1
+
+
+def _deployment(state, *, run_id=91, environment="ios-testflight-upload"):
+    return {
+        "repository": {"full_name": "example/project"},
+        "deployment": {"ref": "feature/continuity", "workflow_run_id": run_id},
+        "deployment_status": {
+            "state": state,
+            "environment": environment,
+            "workflow_run_id": run_id,
+            "environment_url": f"https://github.com/example/project/actions/runs/{run_id}",
+        },
+        "sender": {"login": "release-reviewer"},
+    }
+
+
+def test_environment_approval_waiting_then_approved_resumes_once(service, monkeypatch):
+    _configure(service, monkeypatch)
+    item = _item(service)
+    receiver = service.github_webhooks
+    worker = GitHubWebhookWorker(service.store, service.config.github_webhook, receiver)
+    for delivery, state in (
+        ("approval-wait", "pending"),
+        ("approval-repeat", "pending"),
+        ("approval-ok", "success"),
+    ):
+        body = json.dumps(_deployment(state)).encode()
+        assert (
+            receiver.accept(
+                _headers(body, delivery=delivery, event="deployment_status"), body
+            )[0]
+            == 202
+        )
+    assert worker.process_once() == 3
+    result = service.store.hub_item(item["id"])
+    assert result["stage"] == "queued"
+    facts = [
+        row
+        for row in result["timeline"]
+        if row["kind"].startswith("environment_approval")
+    ]
+    assert [row["kind"] for row in facts] == [
+        "environment_approval_required",
+        "environment_approval_approved",
+    ]
+    with service.store.connection() as con:
+        row = con.execute(
+            "SELECT environment, run_url, reviewer, state FROM github_environment_approvals"
+        ).fetchone()
+    assert row == (
+        "ios-testflight-upload",
+        "https://github.com/example/project/actions/runs/91",
+        "release-reviewer",
+        "approved",
+    )
+
+    from drover.server.work_queue.rules import WorkItemRuleWorker
+
+    rule_worker = WorkItemRuleWorker(
+        service.store, {}, type("Config", (), {"batch_size": 50, "dry_run": False})()
+    )
+    rule_worker.process_once()
+    rule_worker.process_once()  # a replay cannot send another wake
+    kinds = [row["kind"] for row in service.store.hub_item(item["id"])["timeline"]]
+    assert kinds.count("orchestrator_wake") == 1
+
+
+def test_environment_approval_rejection_is_terminal_and_idempotent(
+    service, monkeypatch
+):
+    _configure(service, monkeypatch)
+    item = _item(service)
+    receiver = service.github_webhooks
+    worker = GitHubWebhookWorker(service.store, service.config.github_webhook, receiver)
+    for delivery in ("reject-wait", "reject", "reject-repeat"):
+        state = "pending" if delivery == "reject-wait" else "failure"
+        body = json.dumps(_deployment(state, run_id=92)).encode()
+        receiver.accept(
+            _headers(body, delivery=delivery, event="deployment_status"), body
+        )
+    worker.process_once()
+    result = service.store.hub_item(item["id"])
+    assert result["stage"] == "closed"
+    assert result["gate"] == "environment_rejected"
+    assert [row["kind"] for row in result["timeline"]].count(
+        "environment_approval_rejected"
+    ) == 1

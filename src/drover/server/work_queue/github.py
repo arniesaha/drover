@@ -296,6 +296,57 @@ class GitHubProvider:
             body={"merge_method": "squash", "sha": head_sha},
         )
 
+    def environment_approval_state(self, run_id):
+        """Translate a workflow's safe public state for reconciliation."""
+        self._require("actions_read")
+        if not isinstance(run_id, int) or run_id <= 0:
+            raise ValueError("invalid workflow run")
+        run = self._request("GET", self.base + f"/actions/runs/{run_id}")
+        status, conclusion = run.get("status"), run.get("conclusion")
+        if status == "waiting":
+            return "pending"
+        if status in {"queued", "in_progress", "requested", "pending"}:
+            return "approved"
+        if conclusion == "success":
+            return "approved"
+        if conclusion in {
+            "failure",
+            "cancelled",
+            "timed_out",
+            "action_required",
+            "startup_failure",
+        }:
+            return "rejected"
+        return "pending"
+
+    def list_environment_approvals(self):
+        """Read pending action gates only; this never approves or rejects."""
+        self._require("actions_read")
+        rows = []
+        runs = self._pages(
+            self.base + "/actions/runs", {"status": "waiting"}, "workflow_runs"
+        )
+        for run in runs:
+            pending = self._request(
+                "GET", self.base + f"/actions/runs/{run['id']}/pending_deployments"
+            )
+            for gate in pending:
+                environment = (gate.get("environment") or {}).get("name")
+                if not isinstance(environment, str) or not environment:
+                    continue
+                rows.append(
+                    {
+                        "run_id": run["id"],
+                        "environment": environment,
+                        "run_url": run.get("html_url")
+                        or f"https://github.com/{self.scope.repo}/actions/runs/{run['id']}",
+                        "branch": run.get("head_branch"),
+                        "reviewer": None,
+                        "state": "pending",
+                    }
+                )
+        return rows
+
     def list_attention(self):
         rows = []
         if "pulls_read" in self.capabilities:

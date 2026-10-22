@@ -19,6 +19,7 @@ HUB_WORK_ITEMS_MIGRATION = 23
 WORK_ITEM_EVENTS_MIGRATION = 24
 GITHUB_WORK_ITEM_EVENTS_MIGRATION = 25
 CONTINUITY_RULES_MIGRATION = 26
+GITHUB_ENVIRONMENT_APPROVALS_MIGRATION = 27
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -870,6 +871,20 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """CREATE TABLE IF NOT EXISTS work_item_rule_cursors (
               workspace_id TEXT PRIMARY KEY, cursor BIGINT NOT NULL DEFAULT 0,
               updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
+        ),
+    ),
+    (
+        GITHUB_ENVIRONMENT_APPROVALS_MIGRATION,
+        (
+            """CREATE TABLE IF NOT EXISTS github_environment_approvals (
+              work_item_id TEXT NOT NULL REFERENCES work_items(id), run_id BIGINT NOT NULL,
+              environment TEXT NOT NULL, run_url TEXT NOT NULL, reviewer TEXT,
+              state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'rejected')),
+              first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              notified_at TIMESTAMPTZ, escalated_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ,
+              PRIMARY KEY (work_item_id, run_id, environment))""",
+            "CREATE INDEX IF NOT EXISTS github_environment_approvals_pending ON github_environment_approvals (state, last_seen_at)",
         ),
     ),
 )
