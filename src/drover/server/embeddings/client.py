@@ -242,9 +242,7 @@ class EmbeddingBackendConfig:
                 model=self.api_model,
             )
         if self.mac_ollama_url:
-            log.warning(
-                "embedding backend selected by fallback: mac-local Ollama (API embedder unavailable)"
-            )
+            log.info("embedding backend selected: mac-local Ollama")
             return OllamaEmbedder(
                 ollama_url=self.mac_ollama_url,
                 model=self.local_model,
