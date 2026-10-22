@@ -248,6 +248,15 @@ class WorkStore:
                     [item_id],
                 )
             )
+            rows[0]["environment_approvals"] = self.rows(
+                con.execute(
+                    """SELECT run_id, environment, run_url, reviewer, state, first_seen_at,
+                       last_seen_at, notified_at, escalated_at, resolved_at
+                       FROM github_environment_approvals WHERE work_item_id=?
+                       ORDER BY first_seen_at, run_id, environment""",
+                    [item_id],
+                )
+            )
             return rows[0]
 
     def patch_hub_item(
@@ -733,6 +742,147 @@ class WorkStore:
                 detail=detail,
                 from_stage=item[0],
             )
+
+    def observe_environment_approval(
+        self, item_id, *, run_id, environment, run_url, state, reviewer=None
+    ):
+        """Durably project one protected-environment gate without secrets.
+
+        Repeated webhook and sweep observations only refresh ``last_seen_at``;
+        timeline notifications are emitted on state transitions exactly once.
+        """
+        if state not in {"pending", "approved", "rejected"}:
+            raise ValueError("invalid environment approval state")
+        if (
+            not isinstance(run_id, int)
+            or run_id <= 0
+            or not all(
+                isinstance(value, str) and value for value in (environment, run_url)
+            )
+        ):
+            raise ValueError("invalid environment approval")
+        reviewer = reviewer[:256] if isinstance(reviewer, str) and reviewer else None
+        detail = json.dumps(
+            {
+                "environment": environment[:256],
+                "run_url": run_url[:512],
+                "reviewer": reviewer,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.connection() as con:
+            item = con.execute(
+                "SELECT stage, gate FROM work_items WHERE workspace_id=? AND id=? FOR UPDATE",
+                [self.workspace_id, item_id],
+            ).fetchone()
+            if item is None:
+                return False
+            prior = con.execute(
+                "SELECT state FROM github_environment_approvals WHERE work_item_id=? AND run_id=? AND environment=? FOR UPDATE",
+                [item_id, run_id, environment],
+            ).fetchone()
+            # GitHub webhooks are at-least-once and may arrive out of order.
+            # Once an approval gate reaches either terminal decision, an older
+            # pending/success delivery must not resurrect or rewrite it.
+            if prior is not None and prior[0] in {"approved", "rejected"}:
+                con.execute(
+                    "UPDATE github_environment_approvals SET last_seen_at=now() WHERE work_item_id=? AND run_id=? AND environment=?",
+                    [item_id, run_id, environment],
+                )
+                return False
+            con.execute(
+                """INSERT INTO github_environment_approvals
+                   (work_item_id, run_id, environment, run_url, reviewer, state, notified_at, resolved_at)
+                   VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ?='pending' THEN now() END,
+                           CASE WHEN ?='pending' THEN NULL ELSE now() END)
+                   ON CONFLICT (work_item_id, run_id, environment) DO UPDATE SET
+                     run_url=EXCLUDED.run_url, reviewer=EXCLUDED.reviewer, state=EXCLUDED.state,
+                     last_seen_at=now(), resolved_at=CASE WHEN EXCLUDED.state='pending' THEN NULL ELSE now() END""",
+                [item_id, run_id, environment, run_url, reviewer, state, state, state],
+            )
+            old = prior[0] if prior else None
+            if old == state:
+                return False
+            if state == "pending":
+                stage, gate, kind = (
+                    "waiting_approval",
+                    "environment_approval",
+                    "environment_approval_required",
+                )
+            elif state == "approved":
+                stage, gate, kind = (
+                    "queued",
+                    "worker_done",
+                    "environment_approval_approved",
+                )
+            else:
+                stage, gate, kind = (
+                    "closed",
+                    "environment_rejected",
+                    "environment_approval_rejected",
+                )
+            con.execute(
+                "UPDATE work_items SET stage=?, gate=?, updated_at=now() WHERE id=?",
+                [stage, gate, item_id],
+            )
+            append_timeline_event(
+                con,
+                workspace_id=self.workspace_id,
+                item_id=item_id,
+                kind=kind,
+                stage=stage,
+                gate=gate,
+                detail=detail,
+                from_stage=item[0],
+            )
+            return True
+
+    def pending_environment_approvals(self, repo):
+        with self.connection() as con:
+            return self.rows(
+                con.execute(
+                    """SELECT a.*, w.branch FROM github_environment_approvals a
+                   JOIN work_items w ON w.id=a.work_item_id
+                   WHERE w.workspace_id=? AND w.repo=? AND a.state='pending'""",
+                    [self.workspace_id, repo],
+                )
+            )
+
+    def pending_environment_approval_escalations(self, threshold_seconds):
+        if not isinstance(threshold_seconds, int) or threshold_seconds <= 0:
+            raise ValueError("invalid approval escalation threshold")
+        with self.connection() as con:
+            rows = self.rows(
+                con.execute(
+                    """SELECT a.*, w.stage, w.gate FROM github_environment_approvals a
+                   JOIN work_items w ON w.id=a.work_item_id
+                   WHERE w.workspace_id=? AND a.state='pending' AND a.escalated_at IS NULL
+                     AND a.first_seen_at <= now() - (? * interval '1 second')
+                   FOR UPDATE OF a""",
+                    [self.workspace_id, threshold_seconds],
+                )
+            )
+            for row in rows:
+                con.execute(
+                    "UPDATE github_environment_approvals SET escalated_at=now() WHERE work_item_id=? AND run_id=? AND environment=?",
+                    [row["work_item_id"], row["run_id"], row["environment"]],
+                )
+                append_timeline_event(
+                    con,
+                    workspace_id=self.workspace_id,
+                    item_id=row["work_item_id"],
+                    kind="environment_approval_escalated",
+                    stage=row["stage"],
+                    gate=row["gate"],
+                    detail=json.dumps(
+                        {"environment": row["environment"], "run_url": row["run_url"]},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    from_stage=row["stage"],
+                )
+            return rows
 
     def record_github_ci_rollup(self, item_id, head_sha, conclusion):
         with self.connection() as con:

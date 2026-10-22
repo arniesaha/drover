@@ -236,6 +236,13 @@ class WorkItemRulesConfig(Model):
     batch_size: int = Field(default=32, ge=1, le=100)
 
 
+class GitHubApprovalConfig(Model):
+    """Bounded read-only reconciliation for protected environments."""
+
+    reconciliation_seconds: int = Field(default=1800, ge=1800, le=3600)
+    stale_escalation_seconds: int = Field(default=14_400, ge=1800)
+
+
 class QueueExecutionConfig(Model):
     global_max_workers: int = Field(default=1, ge=1)
     kill_switch: bool = False
@@ -250,6 +257,7 @@ class WorkQueueConfig(Model):
     work_item_events: WorkItemEventsConfig = Field(default_factory=WorkItemEventsConfig)
     github_webhook: GitHubWebhookConfig = Field(default_factory=GitHubWebhookConfig)
     rules: WorkItemRulesConfig = Field(default_factory=WorkItemRulesConfig)
+    github_approvals: GitHubApprovalConfig = Field(default_factory=GitHubApprovalConfig)
     execution: QueueExecutionConfig = Field(default_factory=QueueExecutionConfig)
 
     @model_validator(mode="after")
