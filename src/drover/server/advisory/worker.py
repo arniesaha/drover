@@ -1512,15 +1512,44 @@ def _provider_reset_windows(
           FROM lake.provider_usage_snapshots p
           JOIN chosen c USING (provider, account_label, host_id, snapshot_id)
         )
-        SELECT provider, account_label, host_id, window_kind, starts_at,
-               resets_at, window_count
+        SELECT provider, account_label, host_id,
+               list([
+                 window_kind,
+                 CAST(starts_at AS VARCHAR),
+                 CAST(resets_at AS VARCHAR),
+                 CAST(window_count AS VARCHAR)
+               ] ORDER BY window_no) AS windows
         FROM ranked
         WHERE window_no <= {MAX_RESET_WINDOWS_PER_CONNECTION}
-        ORDER BY host_id, provider, account_label, window_no
+        GROUP BY provider, account_label, host_id
+        ORDER BY host_id, provider, account_label
     """
     parameters = [value for connection in connections for value in connection]
     with open_history(analytical_path) as history:
-        return history.execute(query, parameters).fetchall()
+        grouped = history.execute(query, parameters).fetchall()
+    rows = []
+    for provider, account_label, host_id, windows in grouped:
+        for kind, starts_at, resets_at, count in windows:
+            rows.append(
+                (
+                    provider,
+                    account_label,
+                    host_id,
+                    kind,
+                    _lake_timestamp(starts_at),
+                    _lake_timestamp(resets_at),
+                    int(count),
+                )
+            )
+    return rows
+
+
+def _lake_timestamp(value: object) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise ValueError("DuckLake provider timestamp was not a timestamp")
 
 
 def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):

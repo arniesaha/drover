@@ -4781,7 +4781,14 @@ def test_provider_reset_windows_reads_ducklake_through_history_gateway(
             return self
 
         def fetchall(self):
-            return [("openai", "personal", "mac-mini", "five_hour", NOW, NOW, 1)]
+            return [
+                (
+                    "openai",
+                    "personal",
+                    "mac-mini",
+                    [["five_hour", NOW.isoformat(), NOW.isoformat(), "1"]],
+                )
+            ]
 
         def __enter__(self):
             return self
