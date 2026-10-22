@@ -455,3 +455,23 @@ def test_create_permission_denied(base_url, root):
         )
     finally:
         locked.chmod(0o700)
+
+
+def test_private_uat_root_is_allowed_without_widening_to_tmp(
+    base_url, root, monkeypatch
+):
+    """A dedicated root can be added without granting the shared temp tree."""
+    uat_root = root.parent / "home" / "drover-uat"
+    uat_root.mkdir(parents=True)
+    monkeypatch.setenv(
+        "DROVER_FOLDER_ROOTS", os.pathsep.join([str(root), str(uat_root)])
+    )
+
+    status, entry = listing(base_url)
+    assert status == 200
+    assert {location["path"] for location in entry["roots"]} == {
+        str(root),
+        str(uat_root),
+    }
+    assert listing(base_url, str(uat_root))[0] == 200
+    assert listing(base_url, "/tmp") == (403, {"error": "outside_allowed_folders"})

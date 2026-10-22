@@ -163,19 +163,20 @@ their authenticated outbound relay.
 The New Session folder picker can browse only directories explicitly allowed
 by the host daemon. With no `DROVER_FOLDER_ROOTS` value, its sole location is
 that daemon's Home directory; this is intentional and does not include `/tmp`
-or the filesystem root. To allow a temporary workspace without widening the
+or the filesystem root. To allow a dedicated UAT workspace without widening the
 default policy, set the daemon service environment before starting or
 restarting it:
 
 ```sh
-export DROVER_FOLDER_ROOTS="$HOME:/tmp"
+export DROVER_FOLDER_ROOTS="$HOME/drover-uat"
 uv run drover-harnessd ...
 ```
 
 Use the platform path separator (`:` on macOS/Linux, `;` on Windows) between
 absolute roots. An explicitly empty value disables picker locations entirely.
 Roots are host-operator configuration, never app input; symlinked roots and
-hidden/symlinked children are refused.
+hidden/symlinked children are refused. For an isolated UAT daemon, see
+[UAT throwaway folder root](uat/throwaway-root.md).
 
 Run the authenticated hosts request again and confirm the local host appears.
 
