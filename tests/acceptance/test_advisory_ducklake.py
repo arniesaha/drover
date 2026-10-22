@@ -19,7 +19,6 @@ from drover.server.db import control_plane_connection
 from drover.server.lake.runtime import LakeError
 from drover.server.lake.serving import configure_analytics
 
-
 NOW = datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc)
 WINDOWS_PER_CONNECTION = 32
 CONNECTIONS = 33
