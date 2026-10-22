@@ -3,7 +3,7 @@ import { mapAnalytics, mapHistory, mapInsights, mapMessagePage, mapProviderAccou
 
 describe("iOS wire payload mapping", () => {
   it("keeps host display names and maps useful fallback session fields", () => {
-    const fleet = mapSnapshot({ hosts: [{ host_id: "studio", liveness: "online", capabilities: { display_name: "Mac Studio" } }], sessions: [{ session_id: "run-1", host_id: "studio", harness: "codex", status: "working", awaiting: "input", repo_name: "acme/drover", recap: "Use recap when preview is absent", updated_at: "2026-10-19T10:00:00Z" }, { harness: "bad row" }] });
+    const fleet = mapSnapshot({ hosts: [{ host_id: "studio", liveness: "online", capabilities: { display_name: "Mac Studio" } }], sessions: [{ session_id: "run-1", host_id: "studio", harness: "codex", status: "running", awaiting: "input", repo_name: "acme/drover", recap: "Use recap when preview is absent", updated_at: "2026-10-19T10:00:00Z" }, { harness: "bad row" }] });
     expect(fleet.hosts).toEqual([{ id: "studio", name: "Mac Studio", status: "online", harnesses: [] }]);
     expect(fleet.sessions).toEqual([{ id: "run-1", hostId: "studio", hostName: "Mac Studio", harness: "codex", mode: undefined, status: "working", awaiting: "input", repo: "acme/drover", cwd: undefined, model: undefined, title: "Use recap when preview is absent", activityAt: "2026-10-19T10:00:00Z", startedAt: undefined, updatedAt: "2026-10-19T10:00:00Z", endedAt: undefined }]);
   });
