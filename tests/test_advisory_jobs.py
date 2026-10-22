@@ -4762,3 +4762,107 @@ def test_scope_cache_prunes_and_caps_distinct_targets(
 
     assert len(service._scope_cache) == 3
     assert stale_key not in service._scope_cache
+
+
+def test_provider_reset_windows_reads_ducklake_through_history_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DuckLake startup never needs the unbound legacy snapshot view."""
+    from types import SimpleNamespace
+    from drover.server.advisory import worker as worker_module
+    import drover.server.lake.serving as serving
+
+    calls: dict[str, object] = {}
+
+    class History:
+        def execute(self, sql, params):
+            calls["sql"] = sql
+            calls["params"] = params
+            return self
+
+        def fetchall(self):
+            return [("openai", "personal", "mac-mini", "five_hour", NOW, NOW, 1)]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        serving, "selected_config", lambda _path: SimpleNamespace(backend="ducklake")
+    )
+    monkeypatch.setattr(serving, "open_history", lambda _path: History())
+
+    class LegacyConnection:
+        def execute(self, *_args, **_kwargs):
+            pytest.fail("DuckLake advisory facts touched the legacy snapshot view")
+
+    rows = worker_module._provider_reset_windows(
+        LegacyConnection(),
+        "SELECT * FROM provider_usage_snapshots",
+        [],
+        analytical_path=tmp_path / "drover.duckdb",
+        connections=[("openai", "personal", "mac-mini")],
+    )
+
+    assert rows[0][:4] == ("openai", "personal", "mac-mini", "five_hour")
+    assert "lake.provider_usage_snapshots" in calls["sql"]
+    assert calls["params"] == ["openai", "personal", "mac-mini"]
+
+
+def test_provider_reset_windows_ducklake_empty_inventory_is_normal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No provider data is an empty fact set; it does not hide reader errors."""
+    from types import SimpleNamespace
+    from drover.server.advisory import worker as worker_module
+    import drover.server.lake.serving as serving
+
+    monkeypatch.setattr(
+        serving, "selected_config", lambda _path: SimpleNamespace(backend="ducklake")
+    )
+    monkeypatch.setattr(
+        serving, "open_history", lambda _path: pytest.fail("empty inventory opened lake")
+    )
+
+    class LegacyConnection:
+        def execute(self, *_args, **_kwargs):
+            pytest.fail("empty inventory queried legacy view")
+
+    assert (
+        worker_module._provider_reset_windows(
+            LegacyConnection(),
+            "SELECT * FROM provider_usage_snapshots",
+            [],
+            analytical_path=tmp_path / "drover.duckdb",
+            connections=[],
+        )
+        == []
+    )
+
+
+def test_provider_reset_windows_ducklake_reader_errors_propagate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    from drover.server.advisory import worker as worker_module
+    import drover.server.lake.serving as serving
+
+    monkeypatch.setattr(
+        serving, "selected_config", lambda _path: SimpleNamespace(backend="ducklake")
+    )
+
+    def broken_history(_path):
+        raise RuntimeError("verified lake unavailable")
+
+    monkeypatch.setattr(serving, "open_history", broken_history)
+
+    with pytest.raises(RuntimeError, match="verified lake unavailable"):
+        worker_module._provider_reset_windows(
+            object(),
+            "SELECT * FROM provider_usage_snapshots",
+            [],
+            analytical_path=tmp_path / "drover.duckdb",
+            connections=[("openai", "personal", "mac-mini")],
+        )
