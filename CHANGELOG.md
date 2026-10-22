@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.27] - 2026-10-21
+
+### Added
+
+- Web 1.0 foundation and live session controls: five-destination navigation, hub-backed cockpit views, New Session, session-detail composer, approvals, interruption, and watch controls gated by harness capabilities (#745, #749).
+- Hub-owned work-item continuity: lifecycle tracking, durable signed event subscriptions, GitHub PR/CI fact ingestion, and opt-in rules/queue execution (#748, #754, #757, #758).
+- Rust harnessd Phase 3 Claude Code and DeepSeek adapters, preserving Python-compatible projections and canonical D10 deduplication (#747).
+- Scheduled, safety-gated DuckLake compaction and referenced-file early warnings; it remains opt-in and requires a separate maintenance DSN (#743).
+
+### Fixed
+
+- Staged host runtimes are relocatable and verified before activation; pairing commands no longer require the lake service environment (#744).
+- iOS navigation guards and regression coverage protect the build-24 Analytics-loading horizontal-swipe crash path (#756).
+- Test-suite flake fixes and fast/slow CI tiers improve deterministic validation (#755).
+
+### Changed
+
+- Documented runtime dependencies, added Python and Rust `drover-harnessd store check`, and added a cloud hub Dockerfile (#751).
+- Refreshed public and operational documentation, including web client, Rust harnessd, and release guidance (#742).
+
+### Upgrade notes
+
+- Additive control migrations 23–26 create the work-item continuity, event delivery, GitHub webhook/fact, and rules-engine tables and columns. No DuckLake schema or engine/runtime pin migration is included; determine the final rollout path with installed-artifact `release-preflight` before activation.
+- Upgrade the hub and harnessd hosts. Rust harnessd now supports Claude Code and DeepSeek; existing Python harnessd hosts remain compatible. iOS changes ship in the next TestFlight build.
+
+
 ## [0.6.26] - 2026-10-19
 
 ### Added
