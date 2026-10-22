@@ -22,6 +22,7 @@ CONTINUITY_RULES_MIGRATION = 26
 GITHUB_ENVIRONMENT_APPROVALS_MIGRATION = 27
 CONTINUITY_OWNER_HANDOFF_MIGRATION = 28
 CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION = 29
+DAILY_DIGEST_MIGRATION = 30
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -914,6 +915,26 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_issued_by TEXT",
             "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_issued_at TIMESTAMPTZ",
             "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_redeemed_at TIMESTAMPTZ",
+        ),
+    ),
+    (
+        DAILY_DIGEST_MIGRATION,
+        (
+            "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS notification_timezone TEXT NOT NULL DEFAULT 'UTC'",
+            "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS notification_hour INTEGER CHECK (notification_hour BETWEEN 0 AND 23)",
+            """
+            CREATE TABLE IF NOT EXISTS notification_digest_items (
+              credential_id TEXT NOT NULL REFERENCES control_credentials(credential_id) ON DELETE CASCADE,
+              local_date DATE NOT NULL,
+              session_id TEXT NOT NULL,
+              kind TEXT NOT NULL CHECK (kind IN ('finished', 'input', 'failed', 'progress')),
+              awaiting TEXT, status TEXT, update_count INTEGER NOT NULL DEFAULT 1 CHECK (update_count > 0),
+              due_at TIMESTAMPTZ NOT NULL,
+              lease_until TIMESTAMPTZ, sent_at TIMESTAMPTZ,
+              PRIMARY KEY (credential_id, local_date, session_id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS notification_digest_due ON notification_digest_items (due_at) WHERE sent_at IS NULL",
         ),
     ),
 )

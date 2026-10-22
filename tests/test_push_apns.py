@@ -24,6 +24,7 @@ from drover.server.push.apns import (
     APNsSender,
     AwaitingTransition,
     _AuthToken,
+    _next_digest_deadline,
     classify_response,
     configure,
     dispatch_awaiting_transition,
@@ -1152,6 +1153,55 @@ def test_daily_digest_batches_all_updates_into_one_summary_at_midnight(
         "body": "1 session finished, 1 session updated",
     }
     assert payload["aps"]["interruption-level"] == "passive"
+    sender.close()
+
+
+def test_daily_digest_uses_iana_local_time_across_dst():
+    # 2026-03-08 09:59 UTC is 01:59 PST.  02:00 is skipped, so the first
+    # valid local delivery instant is 03:00 PDT (10:00 UTC).
+    now = datetime(2026, 3, 8, 9, 59, tzinfo=timezone.utc).timestamp()
+    deadline = _next_digest_deadline(now, "America/Los_Angeles", 2)
+    assert datetime.fromtimestamp(deadline, timezone.utc) == datetime(
+        2026, 3, 8, 10, 0, tzinfo=timezone.utc
+    )
+
+
+def test_daily_digest_restores_pending_items_after_restart(tmp_path, config):
+    store, device = _paired_device(tmp_path)
+    store.set_notification_preferences(
+        device.id, "digest", timezone="America/Los_Angeles", hour=8
+    )
+    sender, client, now = _batch_sender(config, store)
+    sender.notify(
+        _transition(session_id="restart-safe", awaiting=None, status="running")
+    )
+    due = store.pending_digests()[0]["due_at"]
+    sender.close()
+
+    restarted, restarted_client, restarted_now = _batch_sender(config, store)
+    restarted_now[0] = due
+    restarted.flush_due()
+    assert len(restarted_client.posts) == 1
+    assert store.pending_digests() == []
+    restarted.close()
+
+
+def test_daily_digest_retries_transient_failure_without_losing_pending_item(
+    tmp_path, config
+):
+    store, device = _paired_device(tmp_path)
+    store.set_notification_mode(device.id, "digest")
+    sender, client, now = _batch_sender(config, store)
+    client._responses = [FakeResponse(503), FakeResponse(200)]
+    sender.notify(_transition(session_id="retry-safe", awaiting=None, status="running"))
+    now[0] = store.pending_digests()[0]["due_at"]
+    sender.flush_due()
+    assert len(client.posts) == 1
+    assert [item["session_id"] for item in store.pending_digests()] == ["retry-safe"]
+    now[0] += 60
+    sender.flush_due()
+    assert len(client.posts) == 2
+    assert store.pending_digests() == []
     sender.close()
 
 

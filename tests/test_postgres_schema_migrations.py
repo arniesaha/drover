@@ -22,6 +22,7 @@ from drover.server.postgres_schema import (
     CONTINUITY_OWNER_HANDOFF_MIGRATION,
     CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION,
     CONTINUITY_RULES_MIGRATION,
+    DAILY_DIGEST_MIGRATION,
     EXPORTER_FRESHNESS_MIGRATION,
     EXPORTER_RESTART_GUARD_MIGRATION,
     GITHUB_ENVIRONMENT_APPROVALS_MIGRATION,
@@ -35,6 +36,7 @@ from drover.server.postgres_schema import (
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
     CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION: "30bf38eb05be55650ca75c256d7fd6f25e0c3712dc9084da22a4d2c485f8dea6",
     CONTINUITY_OWNER_HANDOFF_MIGRATION: "fbf01d89ff51d8b58df9d96833a729fa2d9c193f67eff3d896b3deea637289f4",
+    DAILY_DIGEST_MIGRATION: "11c61a9a70ead29656640c05c5750c4494f4788db787281b310afd570c0057b0",
     GITHUB_ENVIRONMENT_APPROVALS_MIGRATION: "c7807e38be214573f517f5b8818bad66e477f246ac3e3aecfec798e1d2479eea",
     CONTINUITY_RULES_MIGRATION: "c9f7d3fee1f230c5739a64bcc580ef4ca3ced6cd7075649714a381dcd327b3b9",
     GITHUB_WORK_ITEM_EVENTS_MIGRATION: "e87f807d050efffa526c1878984b5e976cca5685732e6711b30b31e1ff7f1df0",
@@ -73,6 +75,7 @@ def _statements_hash(statements) -> str:
 def _current_hashes() -> dict[int, str]:
     from drover.server.postgres_schema import (
         _MIGRATIONS,
+        DAILY_DIGEST_MIGRATION,
         VECTOR_MIGRATION,
         _vector_migration_statements,
     )
@@ -136,6 +139,7 @@ def test_lake_export_batches_migration_11_forward(pg_control_path):
     from drover.server.control_store import postgres_control_store
     from drover.server.postgres_schema import (
         _MIGRATIONS,
+        DAILY_DIGEST_MIGRATION,
         VECTOR_MIGRATION,
         bootstrap_postgres_control_store,
         vector_extension_schema,
