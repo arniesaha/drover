@@ -142,18 +142,24 @@ def test_embedding_backend_config_prefers_api_over_local_gpu() -> None:
     assert isinstance(embedder, ApiEmbedder)
 
 
-def test_embedding_backend_config_prefers_mac_local_ollama_before_gpu() -> None:
+def test_embedding_backend_config_selects_configured_mac_local_ollama(caplog) -> None:
     cfg = EmbeddingBackendConfig(
         api_base_url=None,
         api_key=None,
         mac_ollama_url="http://127.0.0.1:11435",
         gpu_rig=_rig(),
+        local_model="nomic-embed-text:768",
     )
-    embedder = cfg.select_embedder()
+    with caplog.at_level("INFO"):
+        embedder = cfg.select_embedder()
+
     assert isinstance(embedder, OllamaEmbedder)
     assert embedder.ollama_url == "http://127.0.0.1:11435"
+    assert embedder.model == "nomic-embed-text:768"
     assert embedder.wake_on_first_call is True
     assert embedder.launchd_label is None
+    assert "embedding backend selected: mac-local Ollama" in caplog.messages
+    assert not [record for record in caplog.records if record.levelname == "WARNING"]
 
 
 def test_mac_local_embedder_probes_before_launchd() -> None:
