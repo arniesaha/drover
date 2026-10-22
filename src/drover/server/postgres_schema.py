@@ -23,6 +23,7 @@ GITHUB_ENVIRONMENT_APPROVALS_MIGRATION = 27
 CONTINUITY_OWNER_HANDOFF_MIGRATION = 28
 CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION = 29
 DAILY_DIGEST_MIGRATION = 30
+DAILY_DIGEST_LEASE_MIGRATION = 31
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -935,6 +936,12 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             "CREATE INDEX IF NOT EXISTS notification_digest_due ON notification_digest_items (due_at) WHERE sent_at IS NULL",
+        ),
+    ),
+    (
+        DAILY_DIGEST_LEASE_MIGRATION,
+        (
+            "ALTER TABLE notification_digest_items ADD COLUMN IF NOT EXISTS lease_token TEXT",
         ),
     ),
 )

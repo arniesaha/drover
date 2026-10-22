@@ -23,6 +23,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -614,6 +615,8 @@ class APNsSender:
         )
         self._pending_lock = threading.Lock()
         self._pending = {}
+        # Used to fence PostgreSQL digest leases across hub workers/restarts.
+        self._digest_owner = uuid.uuid4().hex
         # Digest entries survive restarts in the control store. They contain
         # routing state only; previews and other transcript content are never
         # serialized into this queue.
@@ -843,7 +846,7 @@ class APNsSender:
             if credential.notification_mode != mode:
                 # A preference change must never send an alert under the old mode.
                 if mode == "digest":
-                    self._credentials.complete_digest(credential.id, list(states))
+                    self._credentials.cancel_digests(credential.id, list(states))
                 continue
             transitions = [
                 replace(state, update_count=count)
@@ -854,26 +857,71 @@ class APNsSender:
                 if mode == "digest":
                     for offset in range(0, len(transitions), 20):
                         batch = transitions[offset : offset + 20]
-                        ids = [state.session_id for state in batch]
-                        if self._send_one(
-                            credential, batch, self._needs_user_count(transitions[0])
-                        ):
-                            # Deletion is after the accepted APNs response.
-                            # If the process dies before this, the stable
-                            # collapse-id makes retry safe for an offline app.
-                            self._credentials.complete_digest(credential.id, ids)
-                        else:
-                            # Keep transient failures durable and retry with a
-                            # bounded delay; APNs collapse IDs make a reply-
-                            # lost retry idempotent for an offline device.
+                        claimed = self._credentials.claim_digests(
+                            credential.id,
+                            [state.session_id for state in batch],
+                            self._clock(),
+                            self._digest_owner,
+                        )
+                        if not claimed:
+                            # Another worker may hold the durable lease. Keep
+                            # our view armed so an expired lease is reclaimed
+                            # without requiring a process restart.
                             deadline = self._clock() + self._batch_seconds
-                            self._credentials.defer_digest(credential.id, ids, deadline)
                             with self._pending_lock:
                                 retry = self._pending.setdefault(
                                     credential.id, [deadline, "digest", {}]
                                 )
                                 retry[0] = min(retry[0], deadline)
                                 for state in batch:
+                                    retry[2][state.session_id] = [
+                                        state,
+                                        state.update_count,
+                                    ]
+                                self._schedule_locked()
+                            continue
+                        claimed_batch = [
+                            replace(state, update_count=claimed[state.session_id])
+                            for state in batch
+                            if state.session_id in claimed
+                        ]
+                        if self._send_one(
+                            credential,
+                            claimed_batch,
+                            self._needs_user_count(transitions[0]),
+                        ):
+                            # Deletion is fenced by the lease and version. If
+                            # the process dies before it, the stable collapse
+                            # ID makes the reclaimed retry safe for an offline app.
+                            self._credentials.complete_digest(
+                                credential.id, claimed, self._digest_owner
+                            )
+                        else:
+                            # Terminal token rejection clears the registration.
+                            # Do not retain an old-day digest that could be sent
+                            # if this credential later receives a new token.
+                            current = self._credentials.get(credential.id)
+                            if (
+                                current is None
+                                or current.apns_token != credential.apns_token
+                            ):
+                                self._credentials.complete_digest(
+                                    credential.id, claimed, self._digest_owner
+                                )
+                                continue
+                            # Keep transient failures durable and retry with a
+                            # bounded delay; APNs collapse IDs make a reply-
+                            # lost retry idempotent for an offline device.
+                            deadline = self._clock() + self._batch_seconds
+                            self._credentials.defer_digest(
+                                credential.id, claimed, deadline, self._digest_owner
+                            )
+                            with self._pending_lock:
+                                retry = self._pending.setdefault(
+                                    credential.id, [deadline, "digest", {}]
+                                )
+                                retry[0] = min(retry[0], deadline)
+                                for state in claimed_batch:
                                     retry[2][state.session_id] = [
                                         state,
                                         state.update_count,

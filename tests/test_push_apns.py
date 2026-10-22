@@ -1196,6 +1196,32 @@ def test_daily_digest_restores_pending_items_after_restart(tmp_path, config):
     restarted.close()
 
 
+def test_daily_digest_completion_preserves_update_queued_during_send(tmp_path):
+    store, device = _paired_device(tmp_path)
+    transition = _transition(
+        session_id="racing-update", awaiting=None, status="running"
+    )
+    store.queue_digest(device, transition, 1)
+    claimed = store.claim_digests(device.id, [transition.session_id], 1, "worker-a")
+    store.queue_digest(device, transition, 1)
+    store.complete_digest(device.id, claimed, "worker-a")
+    assert store.pending_digests()[0]["update_count"] == 2
+
+
+def test_postgres_digest_claim_is_fenced_between_workers(pg_control_path):
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    store = PostgresCredentialStore(pg_control_path)
+    device, _ = store.issue(scope="device", label="Phone")
+    transition = _transition(session_id="one-owner", awaiting=None, status="running")
+    store.queue_digest(device, transition, 1)
+    first = store.claim_digests(device.id, [transition.session_id], 1, "worker-a")
+    assert first == {transition.session_id: 1}
+    assert store.claim_digests(device.id, [transition.session_id], 1, "worker-b") == {}
+    store.complete_digest(device.id, first, "worker-a")
+    assert store.pending_digests() == []
+
+
 def test_daily_digest_retries_transient_failure_without_losing_pending_item(
     tmp_path, config
 ):

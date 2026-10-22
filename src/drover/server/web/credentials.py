@@ -289,19 +289,42 @@ class CredentialStore:
         with self._lock:
             return [dict(item) for item in self._digest_pending.values()]
 
-    def complete_digest(self, credential_id: str, session_ids: list[str]) -> None:
+    def claim_digests(
+        self, credential_id: str, session_ids: list[str], now: float, owner: str
+    ) -> dict[str, int]:
+        """Claim local-file items. The PostgreSQL implementation fences workers."""
+        with self._lock:
+            return {
+                session_id: int(item.get("update_count", 1))
+                for session_id in session_ids
+                if (item := self._digest_pending.get((credential_id, session_id)))
+                and float(item.get("due_at", 0)) <= now
+            }
+
+    def cancel_digests(self, credential_id: str, session_ids: list[str]) -> None:
         with self._lock:
             for session_id in session_ids:
                 self._digest_pending.pop((credential_id, session_id), None)
             self._write()
 
+    def complete_digest(
+        self, credential_id: str, claimed: dict[str, int], owner: str
+    ) -> None:
+        # Do not erase an update queued while the batch was in flight.
+        with self._lock:
+            for session_id, version in claimed.items():
+                item = self._digest_pending.get((credential_id, session_id))
+                if item is not None and int(item.get("update_count", 1)) == version:
+                    self._digest_pending.pop((credential_id, session_id), None)
+            self._write()
+
     def defer_digest(
-        self, credential_id: str, session_ids: list[str], due_at: float
+        self, credential_id: str, claimed: dict[str, int], due_at: float, owner: str
     ) -> None:
         with self._lock:
-            for session_id in session_ids:
+            for session_id, version in claimed.items():
                 item = self._digest_pending.get((credential_id, session_id))
-                if item is not None:
+                if item is not None and int(item.get("update_count", 1)) == version:
                     item["due_at"] = due_at
             self._write()
 
@@ -727,7 +750,25 @@ class PostgresCredentialStore:
             for r in rows
         ]
 
-    def complete_digest(self, credential_id: str, session_ids: list[str]) -> None:
+    def claim_digests(
+        self, credential_id: str, session_ids: list[str], now: float, owner: str
+    ) -> dict[str, int]:
+        """Atomically lease due items so hub workers never send the same batch."""
+        if not session_ids:
+            return {}
+        with self._connection() as con:
+            rows = con.execute(
+                """UPDATE notification_digest_items
+                   SET lease_until = to_timestamp(?) + interval '2 minutes', lease_token = ?
+                   WHERE credential_id = ? AND session_id = ANY(?) AND sent_at IS NULL
+                     AND due_at <= to_timestamp(?)
+                     AND (lease_until IS NULL OR lease_until < to_timestamp(?))
+                   RETURNING session_id, update_count""",
+                [now, owner, credential_id, session_ids, now, now],
+            ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def cancel_digests(self, credential_id: str, session_ids: list[str]) -> None:
         if not session_ids:
             return
         with self._connection() as con:
@@ -736,17 +777,36 @@ class PostgresCredentialStore:
                 [credential_id, session_ids],
             )
 
-    def defer_digest(
-        self, credential_id: str, session_ids: list[str], due_at: float
+    def complete_digest(
+        self, credential_id: str, claimed: dict[str, int], owner: str
     ) -> None:
-        if not session_ids:
+        # Match both the lease owner and version: a later notification must
+        # remain queued instead of being deleted by this earlier APNs response.
+        if not claimed:
             return
         with self._connection() as con:
-            con.execute(
-                "UPDATE notification_digest_items SET due_at = to_timestamp(?) "
-                "WHERE credential_id = ? AND session_id = ANY(?) AND sent_at IS NULL",
-                [due_at, credential_id, session_ids],
-            )
+            for session_id, version in claimed.items():
+                con.execute(
+                    """DELETE FROM notification_digest_items
+                       WHERE credential_id = ? AND session_id = ? AND update_count = ?
+                         AND lease_token = ? AND sent_at IS NULL""",
+                    [credential_id, session_id, version, owner],
+                )
+
+    def defer_digest(
+        self, credential_id: str, claimed: dict[str, int], due_at: float, owner: str
+    ) -> None:
+        if not claimed:
+            return
+        with self._connection() as con:
+            for session_id, version in claimed.items():
+                con.execute(
+                    """UPDATE notification_digest_items
+                       SET due_at = to_timestamp(?), lease_until = NULL, lease_token = NULL
+                       WHERE credential_id = ? AND session_id = ? AND update_count = ?
+                         AND lease_token = ? AND sent_at IS NULL""",
+                    [due_at, credential_id, session_id, version, owner],
+                )
 
     def clear_apns_registration(
         self, credential_id: str, *, expected_token: str | None = None
