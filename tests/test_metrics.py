@@ -576,9 +576,7 @@ def _wait_for_output(sock: socket.socket, needle: str) -> str:
     raise AssertionError(f"did not observe {needle!r}; collected={collected!r}")
 
 
-def _wait_for_terminal_input_and_output(
-    sock: socket.socket, needle: str
-) -> dict:
+def _wait_for_terminal_input_and_output(sock: socket.socket, needle: str) -> dict:
     """Receive both frames regardless of the PTY's output/event ordering."""
     deadline = monotonic() + 5
     input_event = None
