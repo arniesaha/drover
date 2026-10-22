@@ -1156,6 +1156,16 @@ def test_daily_digest_batches_all_updates_into_one_summary_at_midnight(
     sender.close()
 
 
+def test_daily_digest_uses_device_local_day_boundary():
+    # 06:59 UTC is 23:59 PDT on the preceding local day; midnight follows one
+    # minute later, not at the next UTC midnight.
+    now = datetime(2026, 6, 1, 6, 59, tzinfo=timezone.utc).timestamp()
+    deadline = _next_digest_deadline(now, "America/Los_Angeles", None)
+    assert datetime.fromtimestamp(deadline, timezone.utc) == datetime(
+        2026, 6, 1, 7, 0, tzinfo=timezone.utc
+    )
+
+
 def test_daily_digest_uses_iana_local_time_across_dst():
     # 2026-03-08 09:59 UTC is 01:59 PST.  02:00 is skipped, so the first
     # valid local delivery instant is 03:00 PDT (10:00 UTC).
@@ -1201,6 +1211,10 @@ def test_daily_digest_retries_transient_failure_without_losing_pending_item(
     now[0] += 60
     sender.flush_due()
     assert len(client.posts) == 2
+    assert (
+        client.posts[0]["headers"]["apns-collapse-id"]
+        == client.posts[1]["headers"]["apns-collapse-id"]
+    )
     assert store.pending_digests() == []
     sender.close()
 
