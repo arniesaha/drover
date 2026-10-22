@@ -64,6 +64,7 @@ from drover.server.web.app import _MetricsHandler
 from drover.server.web.auth import AuthSettings, mint_session
 from drover.server.web.credentials import CredentialStore
 from drover.server.web.ui import load_page
+from _timeouts import scale_timeout
 
 
 def _snapshot() -> dict:
@@ -555,7 +556,9 @@ def _json_request(url: str, *, payload: dict | None = None):
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = Request(url, data=data, headers=headers)
-    with urlopen(request, timeout=5) as response:
+    # Metrics HTTP tests share xdist workers with subprocess and server tests.
+    # Use the suite-wide CI ceiling rather than a second, unscaled 5s budget.
+    with urlopen(request, timeout=scale_timeout(5)) as response:
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
