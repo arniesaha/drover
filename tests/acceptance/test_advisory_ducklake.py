@@ -8,6 +8,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from served_lake import build_served_lake, drop_served_lake
 
 from drover.schema import bootstrap
 from drover.server.advisory.analyzers.connectors import ProviderResetWindowAnalyzer
@@ -17,8 +18,6 @@ from drover.server.advisory.worker import AdvisoryWorker, load_operational_snaps
 from drover.server.db import control_plane_connection
 from drover.server.lake.runtime import LakeError
 from drover.server.lake.serving import configure_analytics
-
-from served_lake import build_served_lake, drop_served_lake
 
 
 NOW = datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc)

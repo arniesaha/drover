@@ -4769,8 +4769,9 @@ def test_provider_reset_windows_reads_ducklake_through_history_gateway(
 ) -> None:
     """DuckLake startup never needs the unbound legacy snapshot view."""
     from types import SimpleNamespace
-    from drover.server.advisory import worker as worker_module
+
     import drover.server.lake.serving as serving
+    from drover.server.advisory import worker as worker_module
 
     calls: dict[str, object] = {}
 
@@ -4823,8 +4824,9 @@ def test_provider_reset_windows_ducklake_empty_inventory_is_normal(
 ) -> None:
     """No provider data is an empty fact set; it does not hide reader errors."""
     from types import SimpleNamespace
-    from drover.server.advisory import worker as worker_module
+
     import drover.server.lake.serving as serving
+    from drover.server.advisory import worker as worker_module
 
     monkeypatch.setattr(
         serving, "selected_config", lambda _path: SimpleNamespace(backend="ducklake")
@@ -4853,8 +4855,9 @@ def test_provider_reset_windows_ducklake_reader_errors_propagate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from types import SimpleNamespace
-    from drover.server.advisory import worker as worker_module
+
     import drover.server.lake.serving as serving
+    from drover.server.advisory import worker as worker_module
 
     monkeypatch.setattr(
         serving, "selected_config", lambda _path: SimpleNamespace(backend="ducklake")
@@ -4880,8 +4883,9 @@ def test_provider_reset_windows_ducklake_groups_large_bounded_inventory(
 ) -> None:
     """The history gateway caps result rows at 1,000, not reset-window rows."""
     from types import SimpleNamespace
-    from drover.server.advisory import worker as worker_module
+
     import drover.server.lake.serving as serving
+    from drover.server.advisory import worker as worker_module
 
     connections = [("openai", f"account-{index}", "mac-mini") for index in range(33)]
     grouped = [
