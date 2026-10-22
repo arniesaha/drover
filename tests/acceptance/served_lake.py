@@ -36,7 +36,9 @@ class ServedLake:
     rebuild_seconds: float
 
 
-def _write_companion_tables(root: Path) -> None:
+def _write_companion_tables(
+    root: Path, *, provider_rows: list[dict] | None = None
+) -> None:
     """``rebuild`` requires all three relations; the other two stay trivial."""
     for table, row in (
         ("provider_usage_snapshots", {"snapshot_id": "p"}),
@@ -44,7 +46,11 @@ def _write_companion_tables(root: Path) -> None:
     ):
         folder = root / table
         folder.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.Table.from_pylist([row]), folder / "part.parquet")
+        if table == "provider_usage_snapshots" and provider_rows is not None:
+            payload = pa.Table.from_pylist(provider_rows)
+        else:
+            payload = pa.Table.from_pylist([row])
+        pq.write_table(payload, folder / "part.parquet")
 
 
 def build_served_lake(
@@ -54,6 +60,7 @@ def build_served_lake(
     extension_dir: Path,
     workdir: Path,
     label: str,
+    provider_rows: list[dict] | None = None,
 ) -> ServedLake:
     """Rebuild ``parquet_root/agent_events`` into a verified lake under ``workdir``."""
     database = f"drover_acc_{label}_{uuid4().hex[:10]}"
@@ -70,7 +77,7 @@ def build_served_lake(
 
     try:
         companions = workdir / "companions"
-        _write_companion_tables(companions)
+        _write_companion_tables(companions, provider_rows=provider_rows)
         archive = workdir / f"{label}.tar"
         with tarfile.open(archive, "w") as tar:
             tar.add(parquet_root / "agent_events", arcname="parquet/agent_events")
