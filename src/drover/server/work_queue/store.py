@@ -782,6 +782,15 @@ class WorkStore:
                 "SELECT state FROM github_environment_approvals WHERE work_item_id=? AND run_id=? AND environment=? FOR UPDATE",
                 [item_id, run_id, environment],
             ).fetchone()
+            # GitHub webhooks are at-least-once and may arrive out of order.
+            # Once an approval gate reaches either terminal decision, an older
+            # pending/success delivery must not resurrect or rewrite it.
+            if prior is not None and prior[0] in {"approved", "rejected"}:
+                con.execute(
+                    "UPDATE github_environment_approvals SET last_seen_at=now() WHERE work_item_id=? AND run_id=? AND environment=?",
+                    [item_id, run_id, environment],
+                )
+                return False
             con.execute(
                 """INSERT INTO github_environment_approvals
                    (work_item_id, run_id, environment, run_url, reviewer, state, notified_at, resolved_at)
