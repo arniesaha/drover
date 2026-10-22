@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.28] - 2026-10-22
+
+### Added
+
+- `drover hub serve --tailscale` configures the existing hub listener behind private Tailscale Serve HTTPS and reports its MagicDNS URL without enabling Funnel or hub-native TLS (#765).
+
+### Fixed
+
+- The isolated UAT launcher uses a private, mode-0700 `~/drover-uat` root only for its child harness process. It rejects traversal, symlinked, outside-home, and `/tmp` roots without changing a running production daemon (#764).
+- Updated the web test toolchain to Vitest 4.1.12 and refreshed its lockfile, removing the reported development-only audit advisories; the shipped Preact bundle is unchanged (#766).
+
+### Upgrade notes
+
+- No control or DuckLake migrations. Existing hubs and harnessd hosts remain compatible. Tailscale Serve is opt-in and private-only.
+
 ## [0.6.27] - 2026-10-21
 
 ### Added
