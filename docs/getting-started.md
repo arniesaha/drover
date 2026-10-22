@@ -271,7 +271,9 @@ Set `[server] advertised_url` to the printed HTTPS URL, then run
 `drover-server pair` again. The pairing QR carries `tls=1` and the iOS app uses
 HTTPS/WSS. If the hub is bound to a single private address, the helper uses
 that address as the Serve upstream; loopback and wildcard listeners use
-`127.0.0.1`.
+`127.0.0.1`. To avoid replacing another route, it refuses to run if Tailscale
+Serve already has any configuration; inspect that configuration and add the
+listener manually instead.
 
 ### Hosts With More Than One Network (LAN + VPN)
 

@@ -691,6 +691,34 @@ def _tailscale_serve_https_endpoint(tailscale: str | None = None) -> str | None:
     return f"{host}:{port}" if port and port != "443" else host
 
 
+def _tailscale_serve_has_existing_config(tailscale: str) -> bool | None:
+    """Return whether Serve already has any routing configuration.
+
+    The helper owns no pre-existing Serve routes.  Refusing a non-empty
+    configuration is safer than replacing a user's unrelated routes (including
+    a route already bound to HTTPS 443).  ``None`` means the state could not be
+    inspected and must likewise block a mutation.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [tailscale, "serve", "status", "--json"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        status = json.loads(result.stdout)
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+        return None
+    if not isinstance(status, dict):
+        return None
+    return bool(status.get("Web") or status.get("TCP") or status.get("AllowFunnel"))
+
+
 def _hub_serve_upstream(cfg: DroverConfig) -> str:
     """Return the local HTTP listener that Tailscale Serve should proxy.
 
@@ -1170,6 +1198,19 @@ def hub_serve_cmd(ctx: click.Context, tailscale: bool) -> None:
 
     cfg = _resolve_config(ctx.obj["config_path"])
     upstream = _hub_serve_upstream(cfg)
+
+    existing_config = _tailscale_serve_has_existing_config(binary)
+    if existing_config is None:
+        raise click.ClickException(
+            "could not inspect existing Tailscale Serve configuration; refusing "
+            "to overwrite a possibly unrelated route"
+        )
+    if existing_config:
+        raise click.ClickException(
+            "Tailscale Serve already has configuration; refusing to overwrite "
+            "unrelated routes. Inspect it with `tailscale serve status` and "
+            "configure this listener manually."
+        )
 
     import subprocess
 
