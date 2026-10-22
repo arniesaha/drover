@@ -35,10 +35,76 @@ class WorkItemRuleWorker:
             self._record(item, "orchestrator_wake", reason)
             self.health["wakes"] += 1
 
+    def _reconcile_environment_approvals(self):
+        """Bounded provider-read fallback for missed GitHub deliveries."""
+        for repo, provider in self.providers.items():
+            fetch = getattr(provider, "list_environment_approvals", None)
+            if fetch is None:
+                continue
+            try:
+                approvals = fetch()
+            except ProviderUnavailable:
+                continue
+            for approval in approvals:
+                item = self.store.find_github_item(
+                    repo=repo, branch=approval.get("branch")
+                )
+                if item is None:
+                    continue
+                changed = self.store.observe_environment_approval(
+                    item["id"],
+                    run_id=approval["run_id"],
+                    environment=approval["environment"],
+                    run_url=approval["run_url"],
+                    state=approval.get("state", "pending"),
+                    reviewer=approval.get("reviewer"),
+                )
+                if changed and approval.get("state") == "approved":
+                    self._wake(
+                        item, "environment_approved", "run:" + str(approval["run_id"])
+                    )
+        # A delivery can be missed after GitHub accepts it. Re-read each local
+        # pending run on the 30--60 minute sweep and resolve only unambiguous
+        # workflow states; unknown stays pending and can escalate once.
+        for repo, provider in self.providers.items():
+            state_for = getattr(provider, "environment_approval_state", None)
+            if state_for is None:
+                continue
+            for approval in self.store.pending_environment_approvals(repo):
+                try:
+                    state = state_for(approval["run_id"])
+                except ProviderUnavailable:
+                    continue
+                if state == "pending":
+                    continue
+                changed = self.store.observe_environment_approval(
+                    approval["work_item_id"],
+                    run_id=approval["run_id"],
+                    environment=approval["environment"],
+                    run_url=approval["run_url"],
+                    state=state,
+                    reviewer=None,
+                )
+                if changed and state == "approved":
+                    item = self.store.hub_item(approval["work_item_id"])
+                    if item is not None:
+                        self._wake(
+                            item,
+                            "environment_approved",
+                            "run:" + str(approval["run_id"]),
+                        )
+        policy = getattr(self.config, "github_approvals", None)
+        threshold = getattr(policy, "stale_escalation_seconds", 14_400)
+        self.store.pending_environment_approval_escalations(threshold)
+
     def evaluate(self, item, kind, sha):
         self.health["evaluations"] += 1
         sha = sha or "event:" + kind
         provider = self.providers.get(item.get("repo"))
+        if kind == "environment_approval_approved":
+            return self._wake(item, "environment_approved", sha)
+        if kind == "environment_approval_rejected":
+            return None  # terminal: only a human may create a replacement work item
         if kind == "worker_done" and item.get("publish") and not item.get("pr"):
             if provider is None:
                 return self._wake(item, "github_credential_unavailable", sha)
@@ -150,6 +216,7 @@ class WorkItemRuleWorker:
 
         def run():
             last_sweep = 0.0
+            last_approval_sweep = 0.0
             while not stop.is_set() and not (
                 shutdown_event and shutdown_event.is_set()
             ):
@@ -164,6 +231,11 @@ class WorkItemRuleWorker:
                         ):
                             self.evaluate(item, "worker_done", item["head_sha"])
                     last_sweep = now
+                policy = getattr(self.config, "github_approvals", None)
+                approval_interval = getattr(policy, "reconciliation_seconds", 1800)
+                if now - last_approval_sweep >= approval_interval:
+                    self._reconcile_environment_approvals()
+                    last_approval_sweep = now
                 stop.wait(0.25)
 
         self._thread = threading.Thread(target=run, name="work-item-rules", daemon=True)
