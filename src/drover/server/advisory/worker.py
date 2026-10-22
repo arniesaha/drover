@@ -1250,7 +1250,9 @@ def load_operational_snapshot(
                 ConnectorFreshnessAnalyzer.analyzer_id,
                 ProviderResetWindowAnalyzer.analyzer_id,
             }:
-                providers = _load_provider_facts(con, target_id, analyzed_at)
+                providers = _load_provider_facts(
+                    con, target_id, analyzed_at, analytical_path=Path(duckdb_path)
+                )
             elif analyzer_id in {
                 TelemetryCoverageAnalyzer.analyzer_id,
                 CacheReadEfficiencyAnalyzer.analyzer_id,
@@ -1333,7 +1335,23 @@ def _optional_aware(value: datetime | None) -> datetime | None:
     return None if value is None else _aware(value, datetime.now(timezone.utc))
 
 
-def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
+def _load_provider_facts(
+    con,
+    target_id: str,
+    analyzed_at: datetime,
+    *,
+    analytical_path: Path | None = None,
+):
+    """Read connector state from control/legacy storage and windows from its owner.
+
+    ``provider_connections`` remains the local connector projection, while
+    usage snapshots are analytical facts. After a DuckLake cutover the old
+    ``provider_usage_snapshots`` view is intentionally not bound at startup,
+    so reading it through this connection would make the first advisory review
+    fail. Use the selected history gateway for those facts instead; it gives
+    DuckLake reads the same verified, bounded disposable-query contract as the
+    serving read models. Legacy installations retain the original query.
+    """
     where, params = _host_filter(target_id)
     provider_where, provider_params = _host_filter(target_id, alias="p")
     rows = con.execute(
@@ -1351,8 +1369,7 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
         """,
         provider_params,
     ).fetchall()
-    windows = con.execute(
-        f"""
+    legacy_windows_sql = f"""
         WITH bounded_connections AS (
           SELECT provider, account_label, host_id
           FROM provider_connections
@@ -1387,9 +1404,14 @@ def _load_provider_facts(con, target_id: str, analyzed_at: datetime):
         FROM ranked
         WHERE window_no <= {MAX_RESET_WINDOWS_PER_CONNECTION}
         ORDER BY host_id, provider, account_label, window_no
-        """,
+        """
+    windows = _provider_reset_windows(
+        con,
+        legacy_windows_sql,
         params,
-    ).fetchall()
+        analytical_path=analytical_path,
+        connections=[(str(row[0]), str(row[1]), str(row[2])) for row in rows],
+    )
     windows_by_account: dict[tuple[str, str, str], list[ProviderResetWindow]] = {}
     reset_completeness: dict[tuple[str, str, str], bool] = {}
     for provider, account_label, host_id, kind, starts_at, resets_at, count in windows:
@@ -1437,6 +1459,97 @@ _NO_SPANS_RELATION = """(
          NULL::BIGINT AS cache_read_tokens
   WHERE FALSE
 )"""
+
+
+def _provider_reset_windows(
+    con,
+    legacy_sql: str,
+    legacy_params: list[object],
+    *,
+    analytical_path: Path | None,
+    connections: list[tuple[str, str, str]],
+):
+    """Return bounded reset windows from the selected analytical backend.
+
+    An empty connector inventory is normal missing-provider data, not an error
+    or a reason to manufacture a table. Reader failures intentionally escape:
+    a broken verified lake must never be reported as an empty provider set.
+    """
+    if analytical_path is None:
+        return con.execute(legacy_sql, legacy_params).fetchall()
+
+    from drover.server.lake.serving import open_history, selected_config
+
+    if selected_config(analytical_path).backend != "ducklake":
+        return con.execute(legacy_sql, legacy_params).fetchall()
+    if not connections:
+        return []
+
+    requested = ", ".join("(?, ?, ?)" for _ in connections)
+    query = f"""
+        WITH requested(provider, account_label, host_id) AS (
+          VALUES {requested}
+        ),
+        chosen AS (
+          SELECT p.provider, p.account_label, p.host_id,
+                 arg_max(snapshot_id, observed_at) FILTER (
+                   WHERE status IN ('ok', 'usage_unavailable')
+                 ) AS snapshot_id
+          FROM lake.provider_usage_snapshots p
+          JOIN requested r USING (provider, account_label, host_id)
+          GROUP BY p.provider, p.account_label, p.host_id
+        ),
+        ranked AS (
+          SELECT p.provider, p.account_label, p.host_id, p.window_kind,
+                 p.starts_at, p.resets_at,
+                 count(p.window_kind) OVER (
+                   PARTITION BY p.provider, p.account_label, p.host_id
+                 ) AS window_count,
+                 row_number() OVER (
+                   PARTITION BY p.provider, p.account_label, p.host_id
+                   ORDER BY p.window_kind NULLS LAST, p.starts_at, p.resets_at
+                 ) AS window_no
+          FROM lake.provider_usage_snapshots p
+          JOIN chosen c USING (provider, account_label, host_id, snapshot_id)
+        )
+        SELECT provider, account_label, host_id,
+               list([
+                 window_kind,
+                 CAST(starts_at AS VARCHAR),
+                 CAST(resets_at AS VARCHAR),
+                 CAST(window_count AS VARCHAR)
+               ] ORDER BY window_no) AS windows
+        FROM ranked
+        WHERE window_no <= {MAX_RESET_WINDOWS_PER_CONNECTION}
+        GROUP BY provider, account_label, host_id
+        ORDER BY host_id, provider, account_label
+    """
+    parameters = [value for connection in connections for value in connection]
+    with open_history(analytical_path) as history:
+        grouped = history.execute(query, parameters).fetchall()
+    rows = []
+    for provider, account_label, host_id, windows in grouped:
+        for kind, starts_at, resets_at, count in windows:
+            rows.append(
+                (
+                    provider,
+                    account_label,
+                    host_id,
+                    kind,
+                    _lake_timestamp(starts_at),
+                    _lake_timestamp(resets_at),
+                    int(count),
+                )
+            )
+    return rows
+
+
+def _lake_timestamp(value: object) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise ValueError("DuckLake provider timestamp was not a timestamp")
 
 
 def _load_telemetry_facts(con, target_id: str, analyzed_at: datetime):
