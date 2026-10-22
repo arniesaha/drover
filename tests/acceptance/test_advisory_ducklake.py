@@ -103,8 +103,9 @@ def test_first_advisory_review_reads_ducklake_provider_windows(
             con.execute(
                 """
                 INSERT INTO harness_hosts (
-                  host_id, display_name, kind, status, last_seen_at, updated_at
-                ) VALUES ('studio-fixture', 'Studio fixture', 'local', 'online', ?, ?)
+                  host_id, display_name, kind, status, capabilities_json,
+                  last_seen_at, updated_at
+                ) VALUES ('studio-fixture', 'Studio fixture', 'local', 'online', '{}', ?, ?)
                 """,
                 [NOW, NOW],
             )
