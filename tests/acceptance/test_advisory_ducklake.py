@@ -14,7 +14,7 @@ from drover.server.advisory.analyzers.connectors import ProviderResetWindowAnaly
 from drover.server.advisory.jobs import enqueue_advisory_check
 from drover.server.advisory.repository import AdvisoryRepository
 from drover.server.advisory.worker import AdvisoryWorker, load_operational_snapshot
-from drover.server.control_store import control_plane_connection
+from drover.server.db import control_plane_connection
 from drover.server.lake.runtime import LakeError
 from drover.server.lake.serving import configure_analytics
 
