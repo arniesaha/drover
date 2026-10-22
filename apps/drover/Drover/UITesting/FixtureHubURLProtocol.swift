@@ -10,14 +10,22 @@ final class FixtureReceiptState: @unchecked Sendable {
         static let receiptCount = "fixture.receipt-count"
         static let submissionCount = "fixture.submission-count"
         static let historyLookupsAfterReceipt = "fixture.history-lookups-after-receipt"
+        static let harnessSnapshotCount = "fixture.harness-snapshot-count"
+        static let analyticsResponseCount = "fixture.analytics-response-count"
     }
 
     private let lock = NSLock()
     private let defaults: UserDefaults
     let kind: FixtureScenarioKind
+    let delaysAnalytics: Bool
 
-    init(runID: String, kind: FixtureScenarioKind = .coreJourney) {
+    init(
+        runID: String,
+        kind: FixtureScenarioKind = .coreJourney,
+        delaysAnalytics: Bool = false
+    ) {
         self.kind = kind
+        self.delaysAnalytics = delaysAnalytics
         let suiteName = "com.arnab.drover.ui-fixture.\(runID)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             preconditionFailure("Could not create isolated fixture defaults")
@@ -31,6 +39,37 @@ final class FixtureReceiptState: @unchecked Sendable {
 
     var submissionCount: Int {
         lock.withLock { defaults.integer(forKey: Key.submissionCount) }
+    }
+
+    var harnessSnapshotCount: Int {
+        lock.withLock { defaults.integer(forKey: Key.harnessSnapshotCount) }
+    }
+
+    var analyticsResponseCount: Int {
+        lock.withLock { defaults.integer(forKey: Key.analyticsResponseCount) }
+    }
+
+    func recordAnalyticsResponse() {
+        lock.withLock {
+            defaults.set(defaults.integer(forKey: Key.analyticsResponseCount) + 1,
+                         forKey: Key.analyticsResponseCount)
+        }
+    }
+
+    /// The live-update UI test needs a real polling transition, rather than a
+    /// timer that merely assumes a refresh happened.  On the third snapshot
+    /// the selected session moves to the needs-you bucket while its Chat view
+    /// remains pushed above the Home list.
+    func harnessSnapshotData() -> Data {
+        let liveUpdateSessionID = ProcessInfo.processInfo.environment[
+            "DROVER_UI_TEST_LIVE_UPDATE_SESSION_ID"
+        ]
+        let updatedSessionID = lock.withLock { () -> String? in
+            let next = defaults.integer(forKey: Key.harnessSnapshotCount) + 1
+            defaults.set(next, forKey: Key.harnessSnapshotCount)
+            return next >= 3 ? liveUpdateSessionID : nil
+        }
+        return FixtureScenarioData.snapshotData(liveUpdateSessionID: updatedSessionID)
     }
 
     func acceptTurn(from request: URLRequest) -> FixtureHubResponse {
@@ -119,6 +158,15 @@ final class FixtureHubURLProtocol: URLProtocol {
             return
         }
         let response = route(request, url: url, state: state)
+        // This only runs in the UI-test transport. It deliberately keeps the
+        // real Analytics view in its loading state long enough to exercise
+        // horizontal gestures, rather than changing app transition timing.
+        if url.path == "/analytics" {
+            if state.delaysAnalytics {
+                Thread.sleep(forTimeInterval: 6)
+            }
+            state.recordAnalyticsResponse()
+        }
         let http = HTTPURLResponse(
             url: url,
             statusCode: response.status,
@@ -167,7 +215,7 @@ final class FixtureHubURLProtocol: URLProtocol {
             case .capabilityJourney:
                 return FixtureHubResponse(status: 200, body: FixtureScenarioData.capabilitySnapshotData())
             case .coreJourney, .insightDetail:
-                return FixtureHubResponse(status: 200, body: FixtureScenarioData.snapshotData())
+                return FixtureHubResponse(status: 200, body: state.harnessSnapshotData())
             }
         case ("GET", let path) where path == "/harness/hosts/\(FixtureScenarioData.coreJourney.hostID)/fs/list":
             return FolderBrowserFixture.response(url: url)

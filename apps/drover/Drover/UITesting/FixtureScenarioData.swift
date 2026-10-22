@@ -140,8 +140,11 @@ enum FixtureScenarioData {
         return jsonData(snapshot)
     }
 
-    static func snapshotData() -> Data {
-        jsonData([
+    static func snapshotData(liveUpdateSessionID: String? = nil) -> Data {
+        let awaitingSessionID = ProcessInfo.processInfo.environment[
+            "DROVER_UI_TEST_AWAITING_SESSION_ID"
+        ]
+        var snapshot: [String: Any] = [
             "hosts": [[
                 "host_id": coreJourney.hostID,
                 "status": "online",
@@ -152,7 +155,7 @@ enum FixtureScenarioData {
                 ],
             ]],
             "sessions": coreJourney.sessions.map { session in
-                [
+                var payload: [String: Any] = [
                     "session_id": session.id,
                     "host_id": coreJourney.hostID,
                     "harness": session.harness,
@@ -161,14 +164,24 @@ enum FixtureScenarioData {
                     "cwd": "/fixture/project",
                     "preview": session.title,
                     "last_activity": "2026-09-04T00:00:00Z",
-                ] as [String: Any]
+                ]
+                if session.id == awaitingSessionID { payload["awaiting"] = "input" }
+                if session.id == liveUpdateSessionID { payload["awaiting"] = "approval" }
+                return payload
             },
             "cwd_suggestions": [[
                 "path": "/fixture/project",
                 "source": "fixture",
                 "host_id": coreJourney.hostID,
             ]],
-        ])
+        ]
+        // The real-root navigation regression needs Analytics to issue a
+        // request; the ordinary core journey intentionally has no Cockpit.
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_DELAYED_ANALYTICS"] == "1" {
+            snapshot["cockpit_api_version"] = 1
+            snapshot["cockpit_sections"] = ["activity"]
+        }
+        return jsonData(snapshot)
     }
 
     /// The capability journey's fleet: the fixture host advertises Codex and

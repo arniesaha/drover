@@ -29,6 +29,11 @@ struct MainTabView: View {
     @State private var pendingGlobalLaunch: GlobalSessionRoute?
     @State private var globalLaunchedSession: GlobalSessionRoute?
     @State private var inboxSession: InboxSessionRoute?
+    /// Notification taps must select Home before they can push a detail in
+    /// Home's stack.  Keeping that handoff here gives the tab root exclusive
+    /// ownership of the transition rather than asking two independently
+    /// updating views to change UIKit navigation state in one transaction.
+    @State private var homeNotificationRoute: HomeNotificationRoute?
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
 
@@ -94,6 +99,7 @@ struct MainTabView: View {
                     sessionStore: sessionStore,
                     cockpitStore: cockpitStore,
                     onOpenInbox: { selectedTab = .inbox },
+                    notificationRoute: $homeNotificationRoute,
                     // Home owns the same action inside its navigation stack,
                     // so it naturally leaves with a pushed session detail.
                     showsNewSessionAction: true
@@ -269,11 +275,8 @@ struct MainTabView: View {
         .onChange(of: selectedTab) { _, newTab in
             newTab.save(to: defaults)
         }
-        .onChange(of: NotificationRoute.shared.pendingSessionID) { _, pending in
-            if pending != nil {
-                selectedTab = .home
-                selectedTab.save(to: defaults)
-            }
+        .task(id: notificationSessionRouteKey) {
+            await deliverNotificationSessionRouteToHome()
         }
         .onChange(of: NotificationRoute.shared.pendingAttentionRef) { _, pending in
             if pending != nil {
@@ -281,18 +284,8 @@ struct MainTabView: View {
                 selectedTab.save(to: defaults)
             }
         }
-        .onChange(of: NotificationRoute.shared.pendingSessionIDs) { _, pending in
-            if pending != nil {
-                selectedTab = .home
-                selectedTab.save(to: defaults)
-            }
-        }
         .onAppear {
-            if NotificationRoute.shared.pendingSessionID != nil
-                || NotificationRoute.shared.pendingAttentionRef != nil
-                || NotificationRoute.shared.pendingSessionIDs != nil {
-                selectedTab = NotificationRoute.shared.pendingAttentionRef == nil ? .home : .inbox
-            }
+            if NotificationRoute.shared.pendingAttentionRef != nil { selectedTab = .inbox }
         }
         .task { sessionStore.startPolling() }
         .task(id: sessionStore.snapshot?.cockpitAPIVersion) {
@@ -316,6 +309,53 @@ struct MainTabView: View {
             }
         }
     }
+
+    /// A stable task identity lets a newer notification cancel an obsolete
+    /// delayed handoff.  `NotificationRoute` intentionally permits just one
+    /// of these values at a time.
+    private var notificationSessionRouteKey: String? {
+        if let id = NotificationRoute.shared.pendingSessionID { return "session:\(id)" }
+        if let ids = NotificationRoute.shared.pendingSessionIDs {
+            return "summary:\(ids.joined(separator: ","))"
+        }
+        return nil
+    }
+
+    /// UIKit is particularly sensitive to a navigation destination changing
+    /// in the same SwiftUI transaction as a tab selection.  Make the tab
+    /// selection first, then hand the destination to Home after the standard
+    /// compact-tab transition has completed.  If the user changes tabs during
+    /// that interval, select Home again and wait for that new transition too.
+    @MainActor
+    private func deliverNotificationSessionRouteToHome() async {
+        guard let key = notificationSessionRouteKey else { return }
+        selectedTab = .home
+
+        do { try await Task.sleep(for: .milliseconds(400)) }
+        catch { return }
+        guard !Task.isCancelled, notificationSessionRouteKey == key else { return }
+
+        if selectedTab != .home {
+            selectedTab = .home
+            do { try await Task.sleep(for: .milliseconds(400)) }
+            catch { return }
+            guard !Task.isCancelled, notificationSessionRouteKey == key else { return }
+        }
+
+        if let id = NotificationRoute.shared.consume() {
+            homeNotificationRoute = .session(id)
+        } else if let ids = NotificationRoute.shared.consumeSummary() {
+            homeNotificationRoute = .summary(ids)
+        }
+    }
+}
+
+/// A route becomes visible to `SessionsView` only after `MainTabView` has
+/// finished selecting Home.  It keeps detail pushes in the one Home-owned
+/// `NavigationStack` and out of tab-selection transactions.
+enum HomeNotificationRoute: Equatable {
+    case session(String)
+    case summary([String])
 }
 
 private struct InboxSessionRoute: Identifiable {

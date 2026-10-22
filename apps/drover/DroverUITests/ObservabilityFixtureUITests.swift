@@ -296,13 +296,31 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
-    private func launchRealApp(large: Bool = false, dark: Bool = false, pendingSessionID: String? = nil) -> XCUIApplication {
+    private func launchRealApp(
+        large: Bool = false,
+        dark: Bool = false,
+        pendingSessionID: String? = nil,
+        initialTab: String? = nil,
+        awaitingSessionID: String? = nil,
+        liveUpdateSessionID: String? = nil,
+        delayedAnalytics: Bool = false
+    ) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
         app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
         if let pendingSessionID {
             app.launchEnvironment["DROVER_UI_TEST_PENDING_SESSION_ID"] = pendingSessionID
+        }
+        if let initialTab { app.launchEnvironment["DROVER_UI_TEST_INITIAL_TAB"] = initialTab }
+        if let awaitingSessionID {
+            app.launchEnvironment["DROVER_UI_TEST_AWAITING_SESSION_ID"] = awaitingSessionID
+        }
+        if let liveUpdateSessionID {
+            app.launchEnvironment["DROVER_UI_TEST_LIVE_UPDATE_SESSION_ID"] = liveUpdateSessionID
+        }
+        if delayedAnalytics {
+            app.launchEnvironment["DROVER_UI_TEST_DELAYED_ANALYTICS"] = "1"
         }
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
@@ -416,6 +434,141 @@ final class ObservabilityFixtureUITests: XCTestCase {
         let chatMenu = app.buttons["chat-menu"]
         let codexBar = app.navigationBars["Codex"]
         XCTAssertTrue(chatMenu.waitForExistence(timeout: 10) || codexBar.waitForExistence(timeout: 10))
+    }
+
+    @MainActor
+    func testNotificationRouteWaitsForHomeTabBeforePushingAndSurvivesRotation() {
+        // First prove that Inbox owns its own session presentation: this
+        // navigates neither Home's stack nor the tab selection at the same
+        // time.  The fixture marks one session as awaiting input solely for
+        // this UI-level routing coverage.
+        let app = launchRealApp(awaitingSessionID: "fixture-session")
+        tab(app, "inbox").tap()
+        let inboxSession = app.buttons["inbox-session-fixture-session"]
+        XCTAssertTrue(inboxSession.waitForExistence(timeout: 8))
+        inboxSession.tap()
+        let inboxDismiss = app.navigationBars["Codex"].buttons["Inbox"]
+        XCTAssertTrue(inboxDismiss.waitForExistence(timeout: 5))
+        inboxDismiss.tap()
+
+        // Exercise rapid root-tab selections before the notification route
+        // begins.  Build 24's dock stayed interactive over transitions, so a
+        // human could produce this sequence much faster than a calm tab tour.
+        tab(app, "analytics").tap()
+        tab(app, "settings").tap()
+        tab(app, "inbox").tap()
+
+        // A notification arriving while Inbox is selected must first select
+        // Home, then push inside Home's sole NavigationStack.  This was the
+        // crashing same-transaction sequence in build 24.
+        app.terminate()
+        app.launchEnvironment["DROVER_UI_TEST_INITIAL_TAB"] = "inbox"
+        app.launchEnvironment["DROVER_UI_TEST_PENDING_SESSION_ID"] = "fixture-session"
+        app.launch()
+
+        let chatMenu = app.buttons["chat-menu"]
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 10))
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
+    }
+
+    @MainActor
+    func testPushedSessionSurvivesPollingUpdateAndKeepsTabsUnavailable() {
+        let app = launchRealApp(liveUpdateSessionID: "fixture-session")
+        let session = app.buttons["fixture-session"]
+        XCTAssertTrue(session.waitForExistence(timeout: 8))
+        session.tap()
+
+        let chatMenu = app.buttons["chat-menu"]
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
+        // Main's system tab bar is deliberately hidden for a pushed session;
+        // unlike build 24's floating dock, it cannot change tabs mid-push.
+        XCTAssertFalse(tab(app, "inbox").isHittable)
+
+        let thirdSnapshot = NSPredicate(format: "label == %@", "3")
+        let update = expectation(for: thirdSnapshot,
+                                 evaluatedWith: app.staticTexts["fixture-harness-snapshot-count"],
+                                 handler: nil)
+        wait(for: [update], timeout: 15)
+        XCTAssertTrue(chatMenu.exists, "a live session update must not pop the pushed detail")
+    }
+
+    @MainActor
+    func testAnalyticsHorizontalSwipesDuringLoadingAndLiveUpdateStayInAnalytics() {
+        let app = launchRealApp(delayedAnalytics: true)
+        // The Home snapshot enables the Cockpit capability. Ensure it has
+        // arrived before entering Analytics, otherwise its task correctly
+        // declines to begin a request at all.
+        XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 8))
+        let analytics = tab(app, "analytics")
+        analytics.tap()
+
+        let loading = app.descendants(matching: .any)["analytics-loading"]
+        XCTAssertTrue(
+            loading.waitForExistence(timeout: 5),
+            "the fixture must hold the Analytics request while this gesture regression runs"
+        )
+        let analyticsHeader = app.descendants(matching: .any)["screen-header-analytics"]
+        let analyticsScroll = app.scrollViews.firstMatch
+        XCTAssertTrue(analyticsHeader.exists)
+        XCTAssertTrue(analyticsScroll.exists)
+
+        // Build 24 crashed during the page-container's interactive Analytics
+        // -> Accounts swipe. Exercise both physical directions because XCTest
+        // names the finger direction, while the observed report names the
+        // destination direction.
+        for _ in 0..<2 {
+            analyticsScroll.swipeLeft()
+            XCTAssertTrue(loading.exists)
+            XCTAssertTrue(analyticsHeader.exists)
+            XCTAssertFalse(tab(app, "accounts").isSelected)
+            analyticsScroll.swipeRight()
+            XCTAssertTrue(loading.exists)
+            XCTAssertTrue(analyticsHeader.exists)
+        }
+
+        let firstAnalyticsResponse = NSPredicate(format: "label == %@", "1")
+        let initialUpdate = expectation(
+            for: firstAnalyticsResponse,
+            evaluatedWith: app.staticTexts["fixture-analytics-response-count"],
+            handler: nil
+        )
+        wait(for: [initialUpdate], timeout: 10)
+
+        // Changing the reporting range issues AnalyticsView's real async
+        // reload. It is a deterministic live-data update, unlike trying to
+        // infer that a drag crossed SwiftUI's refresh-control threshold.
+        let range = app.buttons["7 days"].firstMatch
+        XCTAssertTrue(range.waitForExistence(timeout: 5))
+        range.tap()
+        let oneDay = app.buttons["1 day"].firstMatch
+        XCTAssertTrue(oneDay.waitForExistence(timeout: 5))
+        oneDay.tap()
+        for _ in 0..<2 {
+            analyticsScroll.swipeLeft()
+            XCTAssertTrue(analyticsHeader.exists)
+            XCTAssertFalse(tab(app, "accounts").isSelected)
+            analyticsScroll.swipeRight()
+            XCTAssertTrue(analyticsHeader.exists)
+        }
+
+        let secondAnalyticsResponse = NSPredicate(format: "label == %@", "2")
+        let liveUpdate = expectation(
+            for: secondAnalyticsResponse,
+            evaluatedWith: app.staticTexts["fixture-analytics-response-count"],
+            handler: nil
+        )
+        wait(for: [liveUpdate], timeout: 10)
+
+        for _ in 0..<2 {
+            analyticsScroll.swipeLeft()
+            XCTAssertTrue(analyticsHeader.exists)
+            XCTAssertFalse(tab(app, "accounts").isSelected)
+            analyticsScroll.swipeRight()
+            XCTAssertTrue(analyticsHeader.exists)
+        }
     }
 
     @MainActor
