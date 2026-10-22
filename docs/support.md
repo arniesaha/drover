@@ -36,12 +36,13 @@ resulting `https://<machine>.<tailnet>.ts.net` URL as `[server] advertised_url`
 and generate a fresh QR code:
 
 ```sh
-tailscale serve --https=443 http://127.0.0.1:7080
+drover hub serve --tailscale
+# Set [server] advertised_url to the printed HTTPS MagicDNS URL.
 drover-server pair
 ```
 
-`tailscale serve status` shows the URL. This is tailnet-only; do not use
-Tailscale Funnel.
+The helper uses private Tailscale Serve only. It does not enable Tailscale
+Funnel or add TLS to the hub listener.
 
 ```sh
 drover-server setup-check --host HOST --harness HARNESS --project PROJECT

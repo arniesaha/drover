@@ -656,7 +656,7 @@ def _private_pairing_ip(cfg: DroverConfig) -> str | None:
         return None
 
 
-def _tailscale_serve_https_endpoint() -> str | None:
+def _tailscale_serve_https_endpoint(tailscale: str | None = None) -> str | None:
     """Return the tailnet-only HTTPS authority published by Tailscale Serve.
 
     ``tailscale serve status`` is local-only and safe to probe while printing a
@@ -666,7 +666,7 @@ def _tailscale_serve_https_endpoint() -> str | None:
     """
     import subprocess
 
-    tailscale = shutil.which("tailscale")
+    tailscale = tailscale or shutil.which("tailscale")
     if not tailscale:
         return None
     try:
@@ -689,6 +689,51 @@ def _tailscale_serve_https_endpoint() -> str | None:
         return None
     host, port = match.groups()
     return f"{host}:{port}" if port and port != "443" else host
+
+
+def _tailscale_serve_has_existing_config(tailscale: str) -> bool | None:
+    """Return whether Serve already has any routing configuration.
+
+    The helper owns no pre-existing Serve routes.  Refusing a non-empty
+    configuration is safer than replacing a user's unrelated routes (including
+    a route already bound to HTTPS 443).  ``None`` means the state could not be
+    inspected and must likewise block a mutation.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [tailscale, "serve", "status", "--json"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        status = json.loads(result.stdout)
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+        return None
+    if not isinstance(status, dict):
+        return None
+    return bool(status.get("Web") or status.get("TCP") or status.get("AllowFunnel"))
+
+
+def _hub_serve_upstream(cfg: DroverConfig) -> str:
+    """Return the local HTTP listener that Tailscale Serve should proxy.
+
+    The normal hub listener is loopback or wildcard-bound, for which loopback
+    is both the narrowest and most reliable upstream. A hub deliberately bound
+    to one private address remains supported without changing its listener.
+    ``tailscale serve`` itself provides the HTTPS termination; this helper
+    must never make the hub responsible for TLS.
+    """
+    host = (cfg.server_metrics_host or "").strip()
+    if host in {"", "0.0.0.0", "::", "127.0.0.1", "::1", "localhost"}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{cfg.metrics_http_port}"
 
 
 def _advertised_pairing_endpoint(cfg: DroverConfig) -> tuple[str, bool]:
@@ -1126,6 +1171,77 @@ def main(ctx: click.Context, config_path: Optional[str], verbose: bool) -> None:
 
 
 main.add_command(profile_commands)
+
+
+@main.group(name="hub")
+def hub_cmd() -> None:
+    """Operate the local hub's explicit network integrations."""
+
+
+@hub_cmd.command(name="serve")
+@click.option(
+    "--tailscale",
+    is_flag=True,
+    help="Publish the hub through private Tailscale Serve HTTPS.",
+)
+@click.pass_context
+def hub_serve_cmd(ctx: click.Context, tailscale: bool) -> None:
+    """Configure private Tailscale Serve HTTPS for the existing hub listener."""
+    if not tailscale:
+        raise click.UsageError("pass --tailscale to configure private Tailscale Serve")
+
+    binary = shutil.which("tailscale")
+    if not binary:
+        raise click.ClickException(
+            "Tailscale CLI is not available; install Tailscale, sign in, then retry"
+        )
+
+    cfg = _resolve_config(ctx.obj["config_path"])
+    upstream = _hub_serve_upstream(cfg)
+
+    existing_config = _tailscale_serve_has_existing_config(binary)
+    if existing_config is None:
+        raise click.ClickException(
+            "could not inspect existing Tailscale Serve configuration; refusing "
+            "to overwrite a possibly unrelated route"
+        )
+    if existing_config:
+        raise click.ClickException(
+            "Tailscale Serve already has configuration; refusing to overwrite "
+            "unrelated routes. Inspect it with `tailscale serve status` and "
+            "configure this listener manually."
+        )
+
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [binary, "serve", "--bg", "--https=443", upstream],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise click.ClickException(f"could not run Tailscale Serve: {exc}") from None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown Tailscale error").strip()
+        raise click.ClickException(f"Tailscale Serve failed: {detail}")
+
+    endpoint = _tailscale_serve_https_endpoint(binary)
+    if not endpoint:
+        raise click.ClickException(
+            "Tailscale Serve was configured, but its HTTPS MagicDNS URL could not "
+            "be read; run `tailscale serve status` locally to inspect it"
+        )
+
+    click.echo(f"Private Tailscale Serve URL: https://{endpoint}")
+    click.echo(f"Upstream: {upstream}")
+    click.echo("Tailnet-only: Tailscale Funnel was not enabled.")
+    click.echo(
+        "Set [server] advertised_url to this HTTPS URL, then run "
+        "`drover pair` (or `drover-server pair`) to make a fresh QR code."
+    )
 
 
 def _planned_stop_state_dir(ctx: click.Context, state_dir: Path | None) -> Path:
