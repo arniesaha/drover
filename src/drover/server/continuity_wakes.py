@@ -160,7 +160,7 @@ class ContinuityWakes:
                 """INSERT INTO continuity_wakes
                 (wake_id, issue_key, action, fingerprint, payload_json, next_delivery_at)
                 VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT (wake_id) DO NOTHING""",
+                ON CONFLICT DO NOTHING""",
                 [wake_id, issue_key, action, fingerprint, payload_json, self.clock()],
             )
             existing = _row(
