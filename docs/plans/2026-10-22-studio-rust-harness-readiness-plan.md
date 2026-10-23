@@ -71,10 +71,14 @@ redacted evidence bundle must bind a single canary/run ID to:
 2. successful authenticated request identity at the supported Drover boundary;
 3. a real parent-originated task and real parent-resume delivery observed in the
    OpenClaw runtime, including correlation ID and parent/session identity;
-4. durable exactly-once/duplicate-safe behavior through a deliberately repeated
-   delivery or replay, followed by an explicit authorized owner acknowledgment;
-   and
-5. Nix’s independent acceptance plus a second reviewer’s verification of the
+4. at-least-once delivery with stable identities and idempotent, duplicate-safe
+   consume/ack, including evidence of a lost consume reply and replay while the
+   action remains unacknowledged;
+5. a separately authorized OpenClaw parent/owner restart while a consumed action
+   remains outstanding and unacknowledged, then recovered parent resume with
+   stable run, event, and action IDs, duplicate-safe replay, explicit
+   `acknowledge`, and a post-ack poll proving no redelivery; and
+6. Nix’s independent acceptance plus a second reviewer’s verification of the
    raw, access-controlled records.
 
 The present mock adapter and synthetic authenticated HTTP/store tests prove only
@@ -149,14 +153,26 @@ SHA-256, source digest, CI provenance/attestation verification, architecture,
 and release record together. For a macOS artifact, require the actual
 Developer-ID signature details, hardened-runtime verification, notarization
 `Accepted` submission, and Gatekeeper assessment from the released asset, not
-merely the workflow YAML. The previous Python executable, unit/plist/service
-definition, configuration, credentials reference, registry backup location, and
-rollback artifact/digest must be identified privately and remain intact.
+merely the workflow YAML. Require an artifact-level provenance attestation whose
+subject digest equals the SHA-256 of the exact released signed binary. If the
+release workflow cannot produce that attestation, the enhancement is to be built
+and Gate 3 remains blocked. Retain and compare that same SHA-256 across the
+attestation subject, signing/notarization records, release asset, and Studio
+intake; any mismatch is a blocker. The previous Python executable,
+unit/plist/service definition, configuration, credentials reference, registry
+backup location, and rollback artifact/digest must be identified privately and
+remain intact. A future authorized rehearsal must first create a fresh,
+timestamped pre-cutover backup of the Python registry, configuration, and
+unit/plist/service definition, retain it as immutable with a SHA-256 digest, and
+validate restoration before cutover.
 
 Rollback acceptance is a rehearsed, time-bounded return to that verified Python
-artifact and prior state without data loss or concurrent dual-writer operation.
-This document neither changes nor names any Studio service/configuration/pin/
-plist and does not authorize a restart to obtain this evidence.
+artifact and prior state without concurrent dual-writer operation. Before Python
+is reopened, a tested reconciliation/export procedure must account for all
+Rust-era sessions and events, including state absent from the older Python
+ledger. No destructive restore is permitted over newer data. This document
+neither changes nor names any Studio service/configuration/pin/plist and does
+not authorize a restart to obtain this evidence.
 
 ## Acceptance matrix for a future authorized rehearsal
 
@@ -171,7 +187,7 @@ plugin mock.
 | JSONL replay | Same handoff can be replayed after restart without extra session/event rows. | Handoff digest, import reports, count/identity comparison, post-replay query/report. | Nix |
 | Duplicate delivery | Repeated delivery is collapsed by canonical dedup identity while legitimate distinct records remain. | Correlation IDs, dedup-key comparison, durable queue/store report. | Nix + independent reviewer |
 | Authorized-owner acknowledgment | A real authorized owner receives the canary/handoff outcome and explicitly acknowledges once; unauthorized access is refused. | Redacted authenticated trace, authorization decision, ack/correlation record, refusal evidence. | Nix + authorized owner |
-| Rollback | Previous verified Python path returns cleanly; no concurrent writers and no lost/replayed duplicate data. | Rollback timing, prior artifact digest, post-rollback health/inventory, reconciliation report. | Nix + Studio operator |
+| Rollback | Previous verified Python path returns cleanly after Rust-era state reconciliation/export; no concurrent writers or destructive restore over newer data. | Timestamped immutable Python registry/config/unit backup and digest, restore validation, rollback timing, prior artifact digest, Rust-era reconciliation/export manifest, post-rollback health/inventory. | Nix + Studio operator |
 
 Any missing result, mismatch, duplicate, unclear authority, or inability to
 reconcile is a blocker requiring investigation; it is never waived by a green
