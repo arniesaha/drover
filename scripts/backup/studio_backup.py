@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Private nightly Studio snapshots. No service restarts; fail on any failed step."""
 
+import argparse
 import ctypes
 import ctypes.util
 import datetime as dt
@@ -21,7 +22,8 @@ from pathlib import Path
 
 HOME = Path.home()
 STATE = HOME / ".drover/backup-state"
-LOG = HOME / "Library/Logs/drover/backup.log"
+LOG = Path("/Volumes/M2 1/drover-cutover-staging/logs/backup.log")
+BACKUP_CONFIG = Path("/Volumes/M2 1/drover-cutover-staging/config/backup-config.json")
 PG = Path("/opt/homebrew/opt/postgresql@17/bin")
 PG_ARGS = [
     "-h",
@@ -99,9 +101,9 @@ def sign_receipt(receipt, key):
     return signed
 
 
-def backup_manifest_identity(date, entries):
+def backup_manifest_identity(generation_id, entries):
     """Match the private NAS MANIFEST.json bytes before publishing a receipt."""
-    request = {"date": date, "files": entries}
+    request = {"generation_id": generation_id, "files": entries}
     return hashlib.sha256(json.dumps(request, indent=2).encode()).hexdigest()
 
 
@@ -250,6 +252,7 @@ def sync(source, destination, previous=None, excludes=(), *, second_pass=False):
         "-a",
         "--no-owner",
         "--no-group",
+        "--links",
         "--chmod=Du=rwx,Dgo=,Fu=rw,Fgo=",
         "-e",
         shlex.join(SSH),
@@ -268,7 +271,20 @@ def sync(source, destination, previous=None, excludes=(), *, second_pass=False):
 def file_entries(root, prefix):
     entries = []
     for path in sorted(root.rglob("*")):
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink():
+            target = os.readlink(path)
+            target_bytes = target.encode("utf-8", "surrogateescape")
+            entries.append(
+                {
+                    "path": prefix + "/" + path.relative_to(root).as_posix(),
+                    "kind": "symlink",
+                    "target": target,
+                    "size": len(target_bytes),
+                    "sha256": hashlib.sha256(target_bytes).hexdigest(),
+                }
+            )
+            continue
+        if not path.is_file():
             continue
         before = path.stat()
         h = hashlib.sha256()
@@ -364,17 +380,25 @@ def snapshot_databases(stage):
             snapshot_duckdb(source, stage / "duckdb" / name / relative)
 
 
-def backup():
+def backup(generation_id=None):
     global NAS
-    config = json.loads((HOME / ".drover/maintenance/backup-config.json").read_text())
+    config_path = BACKUP_CONFIG if BACKUP_CONFIG.exists() else HOME / ".drover/maintenance/backup-config.json"
+    config = json.loads(config_path.read_text())
     NAS = config["nas"]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", NAS):
         raise RuntimeError("invalid NAS SSH target")
+    # Staging state and configuration must not be copied as backup source data.
+    guard = Path("/Volumes/M2 1/drover-cutover-staging/config/backup-guard.sh")
+    if config_path == BACKUP_CONFIG:
+        for protected in [HOME / ".drover", *DATA.values()]:
+            for generated in (STATE, LOG, BACKUP_CONFIG):
+                run([str(guard), "require_disjoint", str(protected), str(generated)])
     started = time.monotonic()
     date = dt.date.today().isoformat()
+    generation_id = generation_id or date
     host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())
     # The storage home can differ from the SSH login account on UGOS.
-    target = config.get("target_root")
+    target = os.environ.get("DROVER_BACKUP_TARGET_ROOT", config.get("target_root"))
     if (
         not isinstance(target, str)
         or not target.startswith("/")
@@ -393,20 +417,20 @@ def backup():
         if not source.is_dir():
             raise RuntimeError("required M2 data root is missing")
     log("stage=NAS_preflight")
-    preparation = remote(helper, "prepare", root, {"date": date})
+    preparation = remote(helper, "prepare", root, {"generation_id": generation_id})
     try:
-        backup_generation(helper, root, date, preparation, started, host, receipt_key)
+        backup_generation(helper, root, generation_id, preparation, started, host, receipt_key)
     except Exception:
         try:
-            remote(helper, "fail", root, {"date": date})
+            remote(helper, "fail", root, {"generation_id": generation_id})
             log("stage=failed_generation_preserved")
         except Exception as error:
             log("stage=failed_generation_rename_failed" + failure_details(error))
         raise
 
 
-def verify_generation(helper, root, date, entries):
-    verification = remote(helper, "verify", root, {"date": date, "files": entries})
+def verify_generation(helper, root, generation_id, entries):
+    verification = remote(helper, "verify", root, {"generation_id": generation_id, "files": entries})
     if verification.get("verification_ok") is not True:
         for failure in verification["failures"]:
             # JSON escaping prevents filenames injecting additional log lines.
@@ -415,8 +439,8 @@ def verify_generation(helper, root, date, entries):
     return verification
 
 
-def backup_generation(helper, root, date, preparation, started, host, receipt_key):
-    pending = root + "/.pending-" + date
+def backup_generation(helper, root, generation_id, preparation, started, host, receipt_key):
+    pending = root + "/.pending-" + generation_id
     previous = root + "/" + preparation["previous"] if preparation["previous"] else None
     with tempfile.TemporaryDirectory(prefix="stage-", dir=STATE) as staging:
         stage = Path(staging)
@@ -504,13 +528,13 @@ def backup_generation(helper, root, date, preparation, started, host, receipt_ke
         # Sources may change immediately after rsync. Hash the now-frozen
         # destination, including files retained by the first pass, instead.
         entries.extend(
-            remote(helper, "inventory", root, {"date": date, "trees": list(DATA)})[
+            remote(helper, "inventory", root, {"generation_id": generation_id, "trees": list(DATA)})[
                 "files"
             ]
         )
         log("stage=NAS_checksum_verification")
-        verification = verify_generation(helper, root, date, entries)
-        local_backup_manifest_sha256 = backup_manifest_identity(date, entries)
+        verification = verify_generation(helper, root, generation_id, entries)
+        local_backup_manifest_sha256 = backup_manifest_identity(generation_id, entries)
         if not hmac.compare_digest(
             verification.get("artifact_manifest_sha256", ""),
             local_backup_manifest_sha256,
@@ -535,9 +559,10 @@ def backup_generation(helper, root, date, preparation, started, host, receipt_ke
             returned.unlink()
         receipt = sign_receipt(
             {
-                "date": date,
+                "date": generation_id[:10],
+                "generation_id": generation_id,
                 "host": host,
-                "nas_path": root + "/" + date,
+                "nas_path": root + "/" + generation_id,
                 "completed_at": dt.datetime.now().astimezone().isoformat(),
                 "completed_epoch": time.time(),
                 "duration_s": round(time.monotonic() - started, 2),
@@ -556,7 +581,13 @@ def backup_generation(helper, root, date, preparation, started, host, receipt_ke
         log("SUCCESS " + json.dumps({**receipt, "retention": retention}))
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--generation-id",
+        help="Unique cutover generation (YYYY-MM-DD-<safe-suffix>); daily runs omit it.",
+    )
+    args = parser.parse_args(argv or [])
     os.umask(0o077)
     # Keep the Mac awake for the run; the Studio sleeps after 1 min idle.
     subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())])
@@ -571,7 +602,7 @@ def main():
             log("FAILURE backup already running")
             return 1
         try:
-            backup()
+            backup(args.generation_id) if args.generation_id else backup()
         except Exception as error:
             # Arbitrary exceptions remain opaque; command failures carry only
             # bounded, redacted diagnostics with JSON escaping for single-line logs.
@@ -586,4 +617,4 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

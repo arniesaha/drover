@@ -94,6 +94,47 @@ class BackupTests(unittest.TestCase):
                 self.remote("prepare", root, {"date": "2026-10-12"}).returncode, 0
             )
 
+    def test_unique_cutover_generation_preserves_daily_and_rejects_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            daily = "2026-10-22"
+            cutover = daily + "-cutover-a1b2c3"
+            for generation in (daily, cutover):
+                self.assertEqual(
+                    self.remote("prepare", root, {"generation_id": generation}).returncode,
+                    0,
+                )
+                pending = root / (".pending-" + generation)
+                artifact = pending / "sample.dump"
+                artifact.write_bytes(generation.encode())
+                artifact.chmod(0o600)
+                payload = {
+                    "generation_id": generation,
+                    "files": [
+                        {
+                            "path": artifact.name,
+                            "size": artifact.stat().st_size,
+                            "sha256": nas.digest(artifact),
+                        }
+                    ],
+                    "nas_pg_restore_list": True,
+                }
+                self.assertTrue(
+                    json.loads(self.remote("verify", root, payload).stdout)[
+                        "verification_ok"
+                    ]
+                )
+                self.assertEqual(self.remote("publish", root, payload).returncode, 0)
+            self.assertTrue((root / daily / "SUCCESS.json").is_file())
+            self.assertTrue((root / cutover / "SUCCESS.json").is_file())
+            self.assertEqual(nas.retained_dates([daily, cutover]), {daily})
+            self.assertNotEqual(
+                self.remote(
+                    "prepare", root, {"generation_id": daily + "-../../escape"}
+                ).returncode,
+                0,
+            )
+
     def test_rsync_uses_hardlinks_private_modes_and_preserves_previous(self):
         backup_path = ROOT / "scripts/backup/studio_backup.py"
         spec = importlib.util.spec_from_file_location("studio_backup", backup_path)
