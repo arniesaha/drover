@@ -56,6 +56,7 @@ function reply(raw, config) {
   safeIntegers(result);
   const status = result.continuity;
   requireValue(status.run_id === config.runId && status.authority_scope === config.authorityScope, "Reply differs from trusted run/scope");
+  requireValue(status.owner_handoff.authorized_owner_id === config.ownerPrincipal, "Reply differs from trusted authorized owner");
   requireValue(status.scope_limit === scopes[config.authorityScope], "Reply scope limit is inconsistent");
   checkAction(status.next_action, config.authorityScope);
   checkAction(result.delivery, config.authorityScope);
@@ -125,7 +126,7 @@ async function invoke(config, readOnly, payload, signal, assertCurrent) {
     const body = { ...args, run_id: config.runId };
     if (body.owner_epoch === null) delete body.owner_epoch;
     if (args.operation === "report") body.source = "openclaw";
-    else body.owner_id = config.ownerSessionKey;
+    else body.owner_id = config.ownerPrincipal;
     raw = await request(config, "POST", body, signal, assertCurrent);
   }
   const result = reply(raw, config);
@@ -135,7 +136,7 @@ async function invoke(config, readOnly, payload, signal, assertCurrent) {
     requireValue(result.delivery === null || (status.next_action && actionFields.every((key) => result.delivery[key] === status.next_action[key])), "Delivery differs from the durable action");
   } else requireValue(!Object.hasOwn(raw, "delivery"), "Only consume may deliver an owner action");
   if (["lease", "consume", "acknowledge"].includes(args.operation)) {
-    requireValue(status.owner.id === config.ownerSessionKey && status.owner.live, "Reply no longer carries the trusted live owner");
+    requireValue(status.owner.id === config.ownerPrincipal && status.owner.live, "Reply no longer carries the trusted live owner");
     if (args.operation !== "lease") requireValue(status.owner.epoch === args.owner_epoch, "Reply no longer carries the requested owner epoch");
   }
   if (args.operation === "report") requireValue(result.event_id !== null, "Report must return its durable identity");

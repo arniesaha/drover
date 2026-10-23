@@ -252,6 +252,16 @@ def _record_completion_receipt(
     return state
 
 
+def _completion_payload(payload: dict | None) -> dict | None:
+    """Return the completion member from flat or EventPusher wire payloads."""
+    if not isinstance(payload, dict):
+        return None
+    inner = payload.get("payload")
+    if isinstance(inner, dict) and "turn_complete" in inner:
+        return inner
+    return payload if "turn_complete" in payload else None
+
+
 def record_observer_worker_completion(
     con,
     *,
@@ -270,7 +280,8 @@ def record_observer_worker_completion(
     in its existing event transaction, so an inserted event cannot lose a
     successful projection and a failed projection cannot disappear silently.
     """
-    if not isinstance(payload, dict) or payload.get("turn_complete") is not True:
+    completion = _completion_payload(payload)
+    if completion is None:
         return None
     session = _row(
         con,
@@ -293,6 +304,18 @@ def record_observer_worker_completion(
             sequence=sequence if type(sequence) is int else None,
             state="pending_authorization",
             reason="observer_run_not_initialized",
+            continuity_event_id=None,
+            recorded_at=received_at,
+        )
+    if completion.get("turn_complete") is not True:
+        return _record_completion_receipt(
+            con,
+            harness_event_id=event_id,
+            run_id=run["run_id"],
+            session_id=session_id,
+            sequence=sequence if type(sequence) is int else None,
+            state="rejected",
+            reason="completion_requires_true_turn_complete",
             continuity_event_id=None,
             recorded_at=received_at,
         )
@@ -582,7 +605,9 @@ class FactoryObserverContinuity:
     @staticmethod
     def _authorized_owner(run, owner_id):
         authorized = run.get("authorized_owner_id")
-        if authorized is not None and authorized != owner_id:
+        if not authorized:
+            raise ContinuityConflict("authorized owner handoff is required")
+        if authorized != owner_id:
             raise ContinuityConflict("owner is not authorized for this run")
 
     @staticmethod

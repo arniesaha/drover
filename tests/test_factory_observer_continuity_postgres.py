@@ -103,8 +103,18 @@ def report(store):
     )
 
 
+def handoff(store, owner_id):
+    store.initialize(
+        session_id="pg-observer",
+        objective="Prove #497 on PostgreSQL",
+        checkpoint="Pending",
+        authorized_owner_id=owner_id,
+    )
+
+
 def test_two_connections_and_two_owners_race_acquisition(pg_bridge):
     store, _ = pg_bridge
+    handoff(store, "owner-a")
     barrier = Barrier(2)
 
     def backend(_):
@@ -125,12 +135,13 @@ def test_two_connections_and_two_owners_race_acquisition(pg_bridge):
     assert len(winners) == 1
     assert sum(isinstance(result, ContinuityConflict) for result in outcomes) == 1
     status = store.status(RUN)
-    assert status["owner"]["id"] == winners[0]["owner_id"]
+    assert winners[0]["owner_id"] == status["owner"]["id"] == "owner-a"
     assert status["owner"]["epoch"] == winners[0]["owner_epoch"] == 1
 
 
 def test_owner_and_intruder_race_renewal_with_epoch_cas(pg_bridge):
     store, clock = pg_bridge
+    handoff(store, "owner-a")
     lease = store.lease(RUN, owner_id="owner-a", lease_seconds=10)
     epoch = lease["owner_epoch"]
     clock.advance(1)
@@ -157,6 +168,7 @@ def test_owner_and_intruder_race_renewal_with_epoch_cas(pg_bridge):
 
 def test_expired_readmission_race_and_stale_owner_ack(pg_bridge):
     store, clock = pg_bridge
+    handoff(store, "old-owner")
     old = store.lease(RUN, owner_id="old-owner", lease_seconds=5)
     event_id = report(store)
     action = store.consume(RUN, owner_id="old-owner", owner_epoch=old["owner_epoch"])
@@ -172,10 +184,16 @@ def test_expired_readmission_race_and_stale_owner_ack(pg_bridge):
     outcomes = race(
         [
             lambda: store.lease(
-                RUN, owner_id="new-a", owner_epoch=old["owner_epoch"], lease_seconds=5
+                RUN,
+                owner_id="old-owner",
+                owner_epoch=old["owner_epoch"],
+                lease_seconds=5,
             ),
             lambda: store.lease(
-                RUN, owner_id="new-b", owner_epoch=old["owner_epoch"], lease_seconds=5
+                RUN,
+                owner_id="new-owner",
+                owner_epoch=old["owner_epoch"],
+                lease_seconds=5,
             ),
         ]
     )
@@ -212,6 +230,7 @@ def test_expired_readmission_race_and_stale_owner_ack(pg_bridge):
 
 def test_duplicate_source_retries_race_before_and_after_ack(pg_bridge):
     store, _ = pg_bridge
+    handoff(store, "owner")
     ids = race([lambda: report(store), lambda: report(store)])
     assert ids[0] == ids[1] and isinstance(ids[0], str)
     assert store.status(RUN)["inbox_counts"] == {"pending": 1}
@@ -364,8 +383,37 @@ def test_pending_completion_recovers_after_authorized_handoff_on_postgres(pg_bri
     assert action["type"] == "review_worker_result"
 
 
+def test_unbound_run_denies_mutations_until_authorized_handoff_on_postgres(pg_bridge):
+    store, _ = pg_bridge
+    event_id = report(store)
+    for mutate in (
+        lambda: store.lease(RUN, owner_id="unrelated-owner"),
+        lambda: store.consume(RUN, owner_id="unrelated-owner", owner_epoch=0),
+        lambda: store.acknowledge(
+            RUN,
+            owner_id="unrelated-owner",
+            owner_epoch=0,
+            event_id=event_id,
+            checkpoint="Unauthorized acknowledgement",
+        ),
+    ):
+        with pytest.raises(ContinuityConflict, match="handoff"):
+            mutate()
+    handoff(store, "postgres-authorized-owner")
+    lease = store.lease(RUN, owner_id="postgres-authorized-owner")
+    assert (
+        store.consume(
+            RUN,
+            owner_id="postgres-authorized-owner",
+            owner_epoch=lease["owner_epoch"],
+        )["type"]
+        == "review_worker_result"
+    )
+
+
 def test_retry_pool_restart_persistence_and_bounded_exhaustion(pg_bridge):
     store, clock = pg_bridge
+    handoff(store, "owner")
     lease = store.lease(RUN, owner_id="owner", lease_seconds=5)
     fence = {"owner_id": "owner", "owner_epoch": lease["owner_epoch"]}
     event_id = report(store)
@@ -379,8 +427,8 @@ def test_retry_pool_restart_persistence_and_bounded_exhaustion(pg_bridge):
     assert restarted.consume(RUN, **fence) is None
     clock.advance(5)
     assert restarted.status(RUN)["recovery"] == "reclaim_expired_owner"
-    lease = restarted.lease(RUN, owner_id="recovered")
-    fence = {"owner_id": "recovered", "owner_epoch": lease["owner_epoch"]}
+    lease = restarted.lease(RUN, owner_id="owner")
+    fence = {"owner_id": "owner", "owner_epoch": lease["owner_epoch"]}
     assert restarted.consume(RUN, **fence) == action
     clock.advance(10)
     assert restarted.consume(RUN, **fence) == action

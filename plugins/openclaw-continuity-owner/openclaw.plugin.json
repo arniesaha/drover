@@ -39,6 +39,12 @@
         "maxLength": 191,
         "pattern": "^agent:[^\\s]+$"
       },
+      "ownerPrincipal": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 191,
+        "pattern": "^(?:credential:[^\\s]+|legacy:operator)$"
+      },
       "canarySessionKey": {
         "type": "string",
         "minLength": 1,
@@ -76,6 +82,7 @@
         "tokenEnvName",
         "runId",
         "ownerSessionKey",
+        "ownerPrincipal",
         "authorityScope"
       ]
     }

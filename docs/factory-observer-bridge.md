@@ -144,7 +144,9 @@ their bearer-derived principal, and that principal must match the stored handoff
 Mismatches return 403 before mutation; a different but authenticated owner is a
 409 authorization conflict. Credential bearers use `credential:<credential-id>`;
 the supported legacy bearer uses `legacy:operator`. Report remains a bounded
-fact-ingest operation, not an owner claim.
+fact-ingest operation, not an owner claim. A migrated/unbound run cannot be
+leased, consumed, or acknowledged by any principal: an explicit initialize
+handoff must bind its owner first.
 
 For example, after initialization and leasing, an OpenClaw adapter can report
 and consume CI results through the same boundary:
@@ -190,6 +192,12 @@ completion link. Replay of that harness event cannot create a second owner
 action. Both structured production ingestion and local batch append paths chunk
 new records into bounded groups of 100 while retaining each source event's
 transactional insert and projection outcome.
+
+The central `POST /harness/events` EventPusher wire envelope nests this as
+`event.payload.turn_complete`. The structured ingester preserves the outer
+event and the completion projector reads the nested member. A nested completion
+without its required status/sequence is retained as a rejected receipt instead
+of being silently deduplicated without an owner action.
 
 `factory_observer_completion_receipts` retains one durable outcome per relevant
 harness event: `projected`, `pending_authorization`, or `rejected`, including a

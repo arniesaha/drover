@@ -22,8 +22,10 @@ An integration must initialize the existing observer run through the existing
 continuity endpoint first. The server derives and records the immutable owner
 identity from that initialize caller's bearer: `credential:<credential-id>` for
 a credential or `legacy:operator` for the supported legacy bearer. It then binds
-the adapter's `run_id`, `owner_id` (that exact derived principal), and
-`authority_scope` outside model input.
+the adapter's `run_id`, `owner_principal` (that exact derived principal), and
+`authority_scope` outside model input. The inactive plugin separately binds its
+trusted OpenClaw `ownerSessionKey` for tool discovery; that session key is never
+sent as an HTTP owner identity.
 The tool request cannot choose another run, impersonate an owner, broaden scope,
 grant approval, or supply a URL, token, command, or arbitrary endpoint path.
 All transport calls use the fixed existing continuity endpoint. The injected

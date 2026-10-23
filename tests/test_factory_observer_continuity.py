@@ -16,9 +16,9 @@ import pytest
 from drover.schema import bootstrap_control_plane_store
 from drover.server.db import control_plane_connection
 from drover.server.harness.continuity import (
+    MAX_COMPLETION_PROJECTION_BATCH,
     ContinuityConflict,
     FactoryObserverContinuity,
-    MAX_COMPLETION_PROJECTION_BATCH,
     continuity_request,
 )
 from drover.server.harness.registry import HarnessRegistry
@@ -71,7 +71,17 @@ def report(store, kind="ci_green", *, sequence=1, source_event_id="ci-attempt-1"
     )
 
 
+def handoff(store, owner_id="openclaw-owner"):
+    return store.initialize(
+        session_id=SESSION,
+        objective="Fix #497",
+        checkpoint="Implementation pending",
+        authorized_owner_id=owner_id,
+    )
+
+
 def owner(store, owner_id="openclaw-owner", **kwargs):
+    handoff(store, owner_id)
     lease = store.lease(RUN, owner_id=owner_id, **kwargs)
     return {"owner_id": owner_id, "owner_epoch": lease["owner_epoch"]}
 
@@ -111,7 +121,10 @@ print(json.dumps(s.status(sys.argv[3])))
     assert restarted.status(RUN)["next_action"] is None
     # Initialization and a delayed ack retry cannot overwrite newer progress.
     restarted.initialize(
-        session_id=SESSION, objective="Fix #497", checkpoint="Old checkpoint"
+        session_id=SESSION,
+        objective="Fix #497",
+        checkpoint="Old checkpoint",
+        authorized_owner_id="openclaw-owner",
     )
     restarted.acknowledge(RUN, **fence, event_id=first, checkpoint="Old checkpoint")
     assert restarted.status(RUN)["checkpoint"] == "Corrective commit recorded"
@@ -210,8 +223,29 @@ def test_no_owner_keeps_event_pending_and_projects_recovery(bridge):
     assert projection["recovery"] == "claim_owner"
     assert not projection["owner_wake"]
     assert projection["inbox_counts"] == {"pending": 1}
-    with pytest.raises(ContinuityConflict):
+    with pytest.raises(ContinuityConflict, match="handoff"):
         store.consume(RUN, owner_id="absent", owner_epoch=0)
+
+
+def test_unbound_run_denies_owner_mutations_until_explicit_handoff(bridge):
+    store, _, _ = bridge
+    event_id = report(store, "worker_brief_completed")
+    for mutate in (
+        lambda: store.lease(RUN, owner_id="unrelated-owner"),
+        lambda: store.consume(RUN, owner_id="unrelated-owner", owner_epoch=0),
+        lambda: store.acknowledge(
+            RUN,
+            owner_id="unrelated-owner",
+            owner_epoch=0,
+            event_id=event_id,
+            checkpoint="Unauthorized acknowledgement",
+        ),
+    ):
+        with pytest.raises(ContinuityConflict, match="handoff"):
+            mutate()
+    handoff(store, "authorized-owner")
+    fence = owner(store, "authorized-owner")
+    assert store.consume(RUN, **fence)["type"] == "review_worker_result"
 
 
 def test_sequenced_drover_completion_is_durably_linked_to_observer_owner(bridge):
@@ -269,6 +303,97 @@ def test_sequenced_drover_completion_is_durably_linked_to_observer_owner(bridge)
     assert (
         store.status(RUN)["checkpoint"] == "Authorized owner reviewed Drover completion"
     )
+
+
+def test_harness_events_http_nested_completion_projects_and_rejects_malformed(
+    bridge, tmp_path
+):
+    """Exercise the actual EventPusher envelope, not a flattened registry call."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _, _ = bridge
+    handoff(store, "http-event-owner")
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, token = credentials.issue(
+        scope="host", label="HTTP event host", host_id="studio"
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=store.path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}/harness/events"
+
+    def post(events):
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps({"events": events}).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request) as response:
+            return response.status, json.loads(response.read())
+
+    try:
+        status, body = post(
+            [
+                {
+                    "event_id": "http-nested-completion",
+                    "session_id": SESSION,
+                    "seq": 8,
+                    "type": "status",
+                    "role": "system",
+                    "text": "turn complete",
+                    "payload": {"turn_complete": True},
+                    "turn_id": "turn-http-8",
+                    "ts": "2026-10-03T00:00:08+00:00",
+                },
+                {
+                    "event_id": "http-nested-malformed-completion",
+                    "session_id": SESSION,
+                    "type": "status",
+                    "role": "system",
+                    "text": "turn complete without a sequence",
+                    "payload": {"turn_complete": True},
+                    "turn_id": "turn-http-malformed",
+                    "ts": "2026-10-03T00:00:09+00:00",
+                },
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert status == 200 and body == {"ingested": 2}
+    projection = store.status(RUN)
+    assert [event["report"]["source_event_id"] for event in projection["events"]] == [
+        "http-nested-completion"
+    ]
+    assert projection["completion_receipts"] == {
+        "counts": {"projected": 1, "rejected": 1},
+        "errors": [
+            {
+                "harness_event_id": "http-nested-malformed-completion",
+                "state": "rejected",
+                "reason": "completion_requires_nonnegative_sequence",
+            }
+        ],
+    }
 
 
 def test_unsequenced_or_uninitialized_harness_completion_does_not_claim_owner(bridge):
@@ -552,6 +677,7 @@ def test_scope_is_immutable_and_deployment_approval_is_blocked(
         objective="Review release",
         checkpoint="Waiting",
         authority_scope=scope,
+        authorized_owner_id="owner",
     )
     with pytest.raises(ContinuityConflict, match="immutable"):
         store.initialize(
@@ -680,6 +806,14 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
             )[0]
             == 401
         )
+        status, body = request(
+            {
+                "operation": "lease",
+                "run_id": RUN,
+                "owner_id": "legacy:operator",
+            }
+        )
+        assert status == 409 and "handoff" in body["error"]
         status, payload = request(
             {
                 "operation": "initialize",
