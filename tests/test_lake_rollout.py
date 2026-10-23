@@ -676,25 +676,37 @@ def test_release_preflight_ledger_records_snapshot_and_never_claims_rollout(
     from click.testing import CliRunner
 
     from drover.server.lake import rollout
-    from drover.server.lake.release_workflow import read_release_workflow_ledger
+    from drover.server.lake.release_workflow import (
+        read_release_workflow_ledger,
+        sign_snapshot_receipt,
+    )
 
     values = _release_preflight_input_args(tmp_path)
     receipt = tmp_path / "last-success.json"
     receipt.write_text(
         json.dumps(
-            {
-                "date": "2026-10-22",
-                "host": "studio",
-                "nas_path": "/approved/snapshots/studio/2026-10-22",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "databases": 2,
-                "nas_pg_restore_list": True,
-                "verified_files": 3,
-                "verified_bytes": 100,
-            }
+            sign_snapshot_receipt(
+                {
+                    "date": "2026-10-22",
+                    "host": "studio",
+                    "nas_path": "/approved/snapshots/studio/2026-10-22",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "databases": 2,
+                    "verification_ok": True,
+                    "nas_pg_restore_list": True,
+                    "verified_files": 3,
+                    "verified_bytes": 100,
+                    "artifact_manifest_sha256": "a" * 64,
+                    "local_backup_manifest_sha256": "a" * 64,
+                    "producer": {"name": "studio_backup", "schema_version": 2},
+                },
+                "test-receipt-key",
+            )
         )
     )
-    ledger = tmp_path / "release-ledger.json"
+    ledger_root = tmp_path / "evidence"
+    ledger_root.mkdir(mode=0o700)
+    ledger = ledger_root / "release-ledger.json"
     monkeypatch.setattr(
         rollout,
         "run_release_preflight",
@@ -707,7 +719,12 @@ def test_release_preflight_ledger_records_snapshot_and_never_claims_rollout(
             str(receipt),
             "--ledger",
             str(ledger),
+            "--ledger-root",
+            str(ledger_root),
+            "--nas-snapshot-manifest-sha256",
+            "a" * 64,
         ],
+        env={"DROVER_NAS_SNAPSHOT_RECEIPT_KEY": "test-receipt-key"},
         **values,
     )
 

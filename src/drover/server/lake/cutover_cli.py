@@ -296,6 +296,21 @@ def backup_cmd(lake, lake_root, gate_root, backup_root, plist, pg_bin, dry_run):
     help="New private, immutable snapshot/preflight evidence ledger.",
 )
 @click.option(
+    "--ledger-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Owner-only evidence directory containing the new ledger; requires --ledger.",
+)
+@click.option(
+    "--nas-snapshot-manifest-sha256",
+    help="SHA-256 of the published NAS MANIFEST.json; requires --ledger.",
+)
+@click.option(
+    "--nas-snapshot-key-env",
+    default="DROVER_NAS_SNAPSHOT_RECEIPT_KEY",
+    show_default=True,
+    help="Environment variable holding the NAS snapshot receipt HMAC key.",
+)
+@click.option(
     "--max-nas-snapshot-age-hours",
     type=click.FloatRange(min=0, min_open=True),
     default=36,
@@ -330,6 +345,9 @@ def release_preflight_cmd(
     backup,
     nas_snapshot_receipt,
     ledger,
+    ledger_root,
+    nas_snapshot_manifest_sha256,
+    nas_snapshot_key_env,
     max_nas_snapshot_age_hours,
     device_token_env,
     min_free_gb,
@@ -345,9 +363,14 @@ def release_preflight_cmd(
     )
     from .rollout import run_release_preflight
 
-    if bool(nas_snapshot_receipt) != bool(ledger):
+    if not (
+        bool(nas_snapshot_receipt)
+        == bool(ledger)
+        == bool(ledger_root)
+        == bool(nas_snapshot_manifest_sha256)
+    ):
         raise click.UsageError(
-            "--nas-snapshot-receipt and --ledger must be used together"
+            "--nas-snapshot-receipt, --nas-snapshot-manifest-sha256, --ledger and --ledger-root must be used together"
         )
     plan = _plan(lake, lake_root, gate_root, backup_root)
     try:
@@ -364,6 +387,8 @@ def release_preflight_cmd(
         if nas_snapshot_receipt:
             snapshot = snapshot_receipt_check(
                 json.loads(nas_snapshot_receipt.read_text(encoding="utf-8")),
+                receipt_key=os.environ.get(nas_snapshot_key_env, ""),
+                expected_manifest_sha256=nas_snapshot_manifest_sha256,
                 max_age_hours=max_nas_snapshot_age_hours,
             )
         checks = (
@@ -397,7 +422,7 @@ def release_preflight_cmd(
             document = build_release_workflow_ledger(
                 plan, release=release, snapshot=snapshot, preflight=checks
             )
-            write_release_workflow_ledger(ledger, document)
+            write_release_workflow_ledger(ledger, document, evidence_root=ledger_root)
         except WorkflowError as exc:
             _emit(
                 verdict(

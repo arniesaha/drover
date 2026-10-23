@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -11,10 +13,13 @@ from drover.server.lake.release_workflow import (
     WorkflowError,
     build_release_workflow_ledger,
     read_release_workflow_ledger,
+    sign_snapshot_receipt,
     snapshot_receipt_check,
     validate_release_workflow_ledger,
     write_release_workflow_ledger,
 )
+
+RECEIPT_KEY = "test-receipt-key"
 
 
 def receipt(*, completed_at: datetime | None = None, **changes):
@@ -26,11 +31,24 @@ def receipt(*, completed_at: datetime | None = None, **changes):
         "completed_epoch": 1.0,
         "duration_s": 10.0,
         "databases": 2,
+        "verification_ok": True,
         "nas_pg_restore_list": True,
         "verified_files": 4,
         "verified_bytes": 1024,
+        "artifact_manifest_sha256": "a" * 64,
+        "local_backup_manifest_sha256": "a" * 64,
+        "producer": {"name": "studio_backup", "schema_version": 2},
     }
-    return value | changes
+    return sign_snapshot_receipt(value | changes, RECEIPT_KEY)
+
+
+def checked(value, **kwargs):
+    return snapshot_receipt_check(
+        value,
+        receipt_key=RECEIPT_KEY,
+        expected_manifest_sha256="a" * 64,
+        **kwargs,
+    )
 
 
 def preflight(*, passed: bool = True):
@@ -44,7 +62,7 @@ def test_successful_snapshot_and_preflight_stay_blocked_before_release_actions(
     tmp_path,
 ):
     plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
-    snapshot = snapshot_receipt_check(receipt())
+    snapshot = checked(receipt())
 
     document = build_release_workflow_ledger(
         plan, release="0.6.28", snapshot=snapshot, preflight=preflight()
@@ -54,6 +72,19 @@ def test_successful_snapshot_and_preflight_stay_blocked_before_release_actions(
     assert document["status"] == "blocked"
     assert document["phases"]["nas_snapshot_execution"]["state"] == "succeeded"
     assert document["phases"]["nas_snapshot_publication"]["state"] == "succeeded"
+    assert document["phases"]["nas_snapshot_publication"]["evidence"] == {
+        "attested_by": "studio_backup_success_receipt",
+        "verification_ok": True,
+        "nas_pg_restore_list": True,
+        "date": "2026-10-22",
+        "host": "studio",
+        "nas_path": "/approved/drover/studio/2026-10-22",
+        "artifact_manifest_sha256": "a" * 64,
+        "local_backup_manifest_sha256": "a" * 64,
+        "producer": document["phases"]["nas_snapshot_execution"]["evidence"][
+            "producer"
+        ],
+    }
     assert document["phases"]["release_preflight"]["state"] == "succeeded"
     assert document["phases"]["release_publication"]["state"] == "skipped"
     assert document["phases"]["rollout"]["state"] == "blocked"
@@ -65,7 +96,7 @@ def test_successful_snapshot_and_preflight_stay_blocked_before_release_actions(
 
 def test_invalid_snapshot_blocks_preflight_without_claiming_it_ran(tmp_path):
     plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
-    snapshot = snapshot_receipt_check(receipt(verification_ok=False))
+    snapshot = checked(receipt(verification_ok=False))
 
     document = build_release_workflow_ledger(
         plan, release="0.6.28", snapshot=snapshot, preflight=None
@@ -102,7 +133,7 @@ def test_preflight_failure_is_preserved_with_its_failed_check_ids(tmp_path):
     document = build_release_workflow_ledger(
         plan,
         release="0.6.28",
-        snapshot=snapshot_receipt_check(receipt()),
+        snapshot=checked(receipt()),
         preflight=preflight(passed=False),
     )
 
@@ -117,17 +148,49 @@ def test_preflight_failure_is_preserved_with_its_failed_check_ids(tmp_path):
 
 def test_snapshot_receipt_rejects_stale_or_incomplete_evidence():
     stale = datetime.now(timezone.utc) - timedelta(hours=37)
-    check = snapshot_receipt_check(receipt(completed_at=stale), max_age_hours=36)
+    check = checked(receipt(completed_at=stale), max_age_hours=36)
     assert not check.passed
     assert check.evidence["reason"] == "snapshot_receipt_stale"
 
-    check = snapshot_receipt_check(receipt(nas_pg_restore_list=False))
+    check = checked(receipt(nas_pg_restore_list=False))
     assert not check.passed
     assert check.evidence["reason"] == "snapshot_archive_readback_missing"
 
-    check = snapshot_receipt_check(receipt(verification_ok=False))
+    check = checked(receipt(verification_ok=False))
     assert not check.passed
     assert check.evidence["reason"] == "snapshot_verification_failed"
+
+    check = checked(receipt(verification_ok=0))
+    assert not check.passed
+    assert check.evidence["reason"] == "snapshot_verification_failed"
+
+    missing_success = receipt()
+    missing_success.pop("verification_ok")
+    check = checked(sign_snapshot_receipt(missing_success, RECEIPT_KEY))
+    assert not check.passed
+    assert check.evidence["reason"] == "snapshot_verification_failed"
+
+    unsigned = receipt()
+    unsigned.pop("producer")
+    check = checked(unsigned)
+    assert not check.passed
+    assert check.evidence["reason"] == "snapshot_provenance_missing"
+
+    forged = receipt()
+    forged["host"] = "other-studio"
+    check = checked(forged)
+    assert not check.passed
+    assert check.evidence["reason"] == "snapshot_provenance_invalid"
+
+    check = snapshot_receipt_check(
+        receipt(), receipt_key=RECEIPT_KEY, expected_manifest_sha256="b" * 64
+    )
+    assert not check.passed
+    assert check.evidence["reason"] == "snapshot_manifest_mismatch"
+
+    check = checked(receipt(local_backup_manifest_sha256="b" * 64))
+    assert not check.passed
+    assert check.evidence["reason"] == "snapshot_local_manifest_mismatch"
 
 
 def test_ledger_validator_rejects_a_false_success_shape(tmp_path):
@@ -135,7 +198,7 @@ def test_ledger_validator_rejects_a_false_success_shape(tmp_path):
     document = build_release_workflow_ledger(
         plan,
         release="0.6.28",
-        snapshot=snapshot_receipt_check(receipt()),
+        snapshot=checked(receipt()),
         preflight=preflight(),
     )
     document["phases"]["rollout"]["state"] = "succeeded"
@@ -149,7 +212,7 @@ def test_ledger_validator_requires_identity_and_evidence_for_success(tmp_path):
     document = build_release_workflow_ledger(
         plan,
         release="0.6.28",
-        snapshot=snapshot_receipt_check(receipt()),
+        snapshot=checked(receipt()),
         preflight=preflight(),
     )
 
@@ -168,22 +231,45 @@ def test_ledger_validator_requires_identity_and_evidence_for_success(tmp_path):
         validate_release_workflow_ledger(document)
 
 
+def test_ledger_validator_rejects_publication_with_mismatched_receipt_correlation(
+    tmp_path,
+):
+    plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
+    document = build_release_workflow_ledger(
+        plan,
+        release="0.6.28",
+        snapshot=checked(receipt()),
+        preflight=preflight(),
+    )
+    document["phases"]["nas_snapshot_publication"]["evidence"][
+        "nas_path"
+    ] = "/forged/generation"
+
+    with pytest.raises(
+        WorkflowError, match="workflow_ledger_snapshot_publication_invalid"
+    ):
+        validate_release_workflow_ledger(document)
+
+
 def test_ledger_write_is_private_atomic_and_never_rewrites_history(tmp_path):
     plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
     document = build_release_workflow_ledger(
         plan,
         release="0.6.28",
-        snapshot=snapshot_receipt_check(receipt()),
+        snapshot=checked(receipt()),
         preflight=preflight(),
     )
-    path = tmp_path / "evidence" / "release-ledger.json"
+    root = tmp_path / "evidence"
+    root.mkdir(mode=0o700)
+    path = root / "release-ledger.json"
 
-    write_release_workflow_ledger(path, document)
+    write_release_workflow_ledger(path, document, evidence_root=root)
 
     assert path.stat().st_mode & 0o777 == 0o600
+    assert not list(root.glob(".release-ledger.json.*.tmp"))
     assert read_release_workflow_ledger(path) == document
     with pytest.raises(WorkflowError, match="workflow_ledger_exists"):
-        write_release_workflow_ledger(path, document)
+        write_release_workflow_ledger(path, document, evidence_root=root)
 
 
 def test_ledger_write_sanitizes_filesystem_failures(tmp_path):
@@ -191,11 +277,77 @@ def test_ledger_write_sanitizes_filesystem_failures(tmp_path):
     document = build_release_workflow_ledger(
         plan,
         release="0.6.28",
-        snapshot=snapshot_receipt_check(receipt()),
+        snapshot=checked(receipt()),
         preflight=preflight(),
     )
     parent = tmp_path / "not-a-directory"
     parent.write_text("blocker")
 
-    with pytest.raises(WorkflowError, match="workflow_ledger_write_failed"):
-        write_release_workflow_ledger(parent / "release-ledger.json", document)
+    with pytest.raises(WorkflowError, match="workflow_ledger_path_unsafe"):
+        write_release_workflow_ledger(
+            parent / "release-ledger.json", document, evidence_root=parent
+        )
+
+
+def test_ledger_write_rejects_symlink_or_writable_evidence_root(tmp_path):
+    plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
+    document = build_release_workflow_ledger(
+        plan, release="0.6.28", snapshot=checked(receipt()), preflight=preflight()
+    )
+    safe = tmp_path / "safe"
+    safe.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(safe, target_is_directory=True)
+    with pytest.raises(WorkflowError, match="workflow_ledger_path_unsafe"):
+        write_release_workflow_ledger(
+            linked / "ledger.json", document, evidence_root=linked
+        )
+    safe.chmod(0o777)
+    with pytest.raises(WorkflowError, match="workflow_ledger_path_unsafe"):
+        write_release_workflow_ledger(
+            safe / "ledger.json", document, evidence_root=safe
+        )
+
+
+def test_ledger_write_rejects_symlinked_parent_traversal(tmp_path):
+    plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
+    document = build_release_workflow_ledger(
+        plan, release="0.6.28", snapshot=checked(receipt()), preflight=preflight()
+    )
+    backing = tmp_path / "backing"
+    backing.mkdir(mode=0o700)
+    root = backing / "evidence"
+    root.mkdir(mode=0o700)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(backing, target_is_directory=True)
+
+    with pytest.raises(WorkflowError, match="workflow_ledger_path_unsafe"):
+        write_release_workflow_ledger(
+            linked_parent / "evidence" / "ledger.json",
+            document,
+            evidence_root=linked_parent / "evidence",
+        )
+
+
+def test_ledger_write_fsyncs_the_file_and_evidence_directory(tmp_path, monkeypatch):
+    import drover.server.lake.release_workflow as workflow
+
+    plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
+    document = build_release_workflow_ledger(
+        plan, release="0.6.28", snapshot=checked(receipt()), preflight=preflight()
+    )
+    root = tmp_path / "evidence"
+    root.mkdir(mode=0o700)
+    modes = []
+    real_fsync = workflow.os.fsync
+
+    def record_fsync(descriptor):
+        modes.append(os.fstat(descriptor).st_mode)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(workflow.os, "fsync", record_fsync)
+    write_release_workflow_ledger(root / "ledger.json", document, evidence_root=root)
+
+    assert len(modes) == 2
+    assert stat.S_ISREG(modes[0])
+    assert stat.S_ISDIR(modes[1])

@@ -8,6 +8,8 @@ release, changes a runtime, or starts a rollout.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -31,6 +33,52 @@ _PHASES = (
     "acceptance",
 )
 _STATES = {"succeeded", "failed", "skipped", "blocked"}
+_RECEIPT_PRODUCER = {"name": "studio_backup", "schema_version": 2}
+
+
+def _sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value.lower())
+    )
+
+
+def _producer(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("name") == _RECEIPT_PRODUCER["name"]
+        and value.get("schema_version") == _RECEIPT_PRODUCER["schema_version"]
+        and _sha256(value.get("signature"))
+    )
+
+
+def _receipt_signature(receipt: dict[str, Any], receipt_key: str | bytes) -> str:
+    key = receipt_key.encode("utf-8") if isinstance(receipt_key, str) else receipt_key
+    if not isinstance(key, bytes) or not key:
+        raise WorkflowError("snapshot_receipt_key_missing")
+    payload = json.loads(json.dumps(receipt))
+    producer = payload.get("producer")
+    if isinstance(producer, dict):
+        producer.pop("signature", None)
+    return hmac.new(
+        key,
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def sign_snapshot_receipt(
+    receipt: dict[str, Any], receipt_key: str | bytes
+) -> dict[str, Any]:
+    """Add the versioned Studio producer HMAC to a receipt before persistence."""
+    signed = json.loads(json.dumps(receipt))
+    producer = signed.setdefault("producer", dict(_RECEIPT_PRODUCER))
+    if not isinstance(producer, dict):
+        raise WorkflowError("snapshot_provenance_invalid")
+    producer.pop("signature", None)
+    producer["signature"] = _receipt_signature(signed, receipt_key)
+    return signed
 
 
 def _action(owner: str, action: str) -> dict[str, str]:
@@ -62,6 +110,8 @@ def _timestamp(value: object) -> datetime:
 def snapshot_receipt_check(
     receipt: object,
     *,
+    receipt_key: str | bytes = b"",
+    expected_manifest_sha256: str = "",
     max_age_hours: float = 36,
     now: datetime | None = None,
 ) -> Check:
@@ -84,11 +134,15 @@ def snapshot_receipt_check(
     age_seconds = (clock - completed).total_seconds()
     evidence = {
         "date": receipt.get("date"),
+        "host": receipt.get("host"),
+        "nas_path": receipt.get("nas_path"),
         "completed_at": completed.isoformat(),
         "age_seconds": round(age_seconds),
         "verified_files": receipt.get("verified_files"),
         "verified_bytes": receipt.get("verified_bytes"),
         "databases": receipt.get("databases"),
+        "artifact_manifest_sha256": receipt.get("artifact_manifest_sha256"),
+        "local_backup_manifest_sha256": receipt.get("local_backup_manifest_sha256"),
     }
     if age_seconds < 0 or age_seconds > max_age_hours * 3600:
         return Check(
@@ -103,17 +157,60 @@ def snapshot_receipt_check(
         return Check(
             "nas_snapshot", False, evidence | {"reason": "snapshot_receipt_incomplete"}
         )
-    # ``verify_generation`` consumes this flag before writing
-    # ``last-success.json``. Its absence is therefore the current producer's
-    # successful-receipt shape, not missing verification evidence.
-    if receipt.get("verification_ok") is False:
+    if receipt.get("verification_ok") is not True:
         return Check(
             "nas_snapshot", False, evidence | {"reason": "snapshot_verification_failed"}
         )
-    if receipt.get("verification_ok") not in (None, True):
+    manifest = receipt.get("artifact_manifest_sha256")
+    if not _sha256(manifest):
         return Check(
-            "nas_snapshot", False, evidence | {"reason": "snapshot_receipt_invalid"}
+            "nas_snapshot", False, evidence | {"reason": "snapshot_manifest_invalid"}
         )
+    local_manifest = receipt.get("local_backup_manifest_sha256")
+    if not _sha256(local_manifest) or not hmac.compare_digest(
+        manifest.lower(), local_manifest.lower()
+    ):
+        return Check(
+            "nas_snapshot",
+            False,
+            evidence | {"reason": "snapshot_local_manifest_mismatch"},
+        )
+    if not isinstance(expected_manifest_sha256, str) or not hmac.compare_digest(
+        manifest.lower(), expected_manifest_sha256.lower()
+    ):
+        return Check(
+            "nas_snapshot", False, evidence | {"reason": "snapshot_manifest_mismatch"}
+        )
+    producer = receipt.get("producer")
+    if not isinstance(producer, dict):
+        return Check(
+            "nas_snapshot", False, evidence | {"reason": "snapshot_provenance_missing"}
+        )
+    signature = producer.get("signature")
+    if (
+        producer.get("name") != _RECEIPT_PRODUCER["name"]
+        or producer.get("schema_version") != _RECEIPT_PRODUCER["schema_version"]
+        or not isinstance(signature, str)
+        or len(signature) != 64
+    ):
+        return Check(
+            "nas_snapshot", False, evidence | {"reason": "snapshot_provenance_invalid"}
+        )
+    try:
+        signature_ok = hmac.compare_digest(
+            signature, _receipt_signature(receipt, receipt_key)
+        )
+    except WorkflowError as exc:
+        return Check("nas_snapshot", False, evidence | {"reason": str(exc)})
+    if not signature_ok:
+        return Check(
+            "nas_snapshot", False, evidence | {"reason": "snapshot_provenance_invalid"}
+        )
+    evidence["producer"] = {
+        "name": producer["name"],
+        "schema_version": producer["schema_version"],
+        "signature": signature,
+    }
     if receipt.get("nas_pg_restore_list") is not True:
         return Check(
             "nas_snapshot",
@@ -214,6 +311,16 @@ def build_release_workflow_ledger(
                 "attested_by": "studio_backup_success_receipt",
                 "verification_ok": True,
                 "nas_pg_restore_list": True,
+                "date": snapshot.evidence.get("date"),
+                "host": snapshot.evidence.get("host"),
+                "nas_path": snapshot.evidence.get("nas_path"),
+                "artifact_manifest_sha256": snapshot.evidence.get(
+                    "artifact_manifest_sha256"
+                ),
+                "local_backup_manifest_sha256": snapshot.evidence.get(
+                    "local_backup_manifest_sha256"
+                ),
+                "producer": snapshot.evidence.get("producer"),
             },
         )
         preflight_phase = _preflight_phase(preflight)
@@ -293,21 +400,42 @@ def validate_release_workflow_ledger(document: object) -> None:
         ):
             raise WorkflowError("workflow_ledger_failure_evidence_invalid")
     snapshot_evidence = phases["nas_snapshot_execution"]["evidence"]
-    if phases["nas_snapshot_execution"]["state"] == "succeeded" and not (
-        isinstance(snapshot_evidence.get("date"), str)
-        and isinstance(snapshot_evidence.get("completed_at"), str)
-        and all(
-            isinstance(snapshot_evidence.get(name), int)
-            and snapshot_evidence[name] >= 1
-            for name in ("verified_files", "verified_bytes", "databases")
-        )
-    ):
-        raise WorkflowError("workflow_ledger_snapshot_evidence_invalid")
+    if phases["nas_snapshot_execution"]["state"] == "succeeded":
+        producer = snapshot_evidence.get("producer")
+        manifest = snapshot_evidence.get("artifact_manifest_sha256")
+        local_manifest = snapshot_evidence.get("local_backup_manifest_sha256")
+        if not (
+            all(
+                isinstance(snapshot_evidence.get(name), str) and snapshot_evidence[name]
+                for name in ("date", "host", "nas_path", "completed_at")
+            )
+            and all(
+                isinstance(snapshot_evidence.get(name), int)
+                and snapshot_evidence[name] >= 1
+                for name in ("verified_files", "verified_bytes", "databases")
+            )
+            and _sha256(manifest)
+            and _sha256(local_manifest)
+            and hmac.compare_digest(manifest.lower(), local_manifest.lower())
+            and _producer(producer)
+        ):
+            raise WorkflowError("workflow_ledger_snapshot_evidence_invalid")
     publication_evidence = phases["nas_snapshot_publication"]["evidence"]
     if phases["nas_snapshot_publication"]["state"] == "succeeded" and (
         publication_evidence.get("attested_by") != "studio_backup_success_receipt"
         or publication_evidence.get("verification_ok") is not True
         or publication_evidence.get("nas_pg_restore_list") is not True
+        or any(
+            publication_evidence.get(name) != snapshot_evidence.get(name)
+            for name in (
+                "date",
+                "host",
+                "nas_path",
+                "artifact_manifest_sha256",
+                "local_backup_manifest_sha256",
+                "producer",
+            )
+        )
     ):
         raise WorkflowError("workflow_ledger_snapshot_publication_invalid")
     preflight_evidence = phases["release_preflight"]["evidence"]
@@ -358,16 +486,39 @@ def read_release_workflow_ledger(path: Path) -> dict[str, Any]:
     return document
 
 
-def write_release_workflow_ledger(path: Path, document: dict[str, Any]) -> None:
+def _symlinked_path(path: Path) -> bool:
+    """Reject any symlink component instead of resolving outside evidence root."""
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            return True
+    return False
+
+
+def write_release_workflow_ledger(
+    path: Path, document: dict[str, Any], *, evidence_root: Path
+) -> None:
     """Atomically create a private immutable ledger document.
 
     Rewriting history would let a later invocation turn a failed or skipped
     phase into a claimed success.  A new run must use a new evidence pathname.
     """
     validate_release_workflow_ledger(document)
-    path = Path(path)
+    path = Path(os.path.abspath(path))
+    evidence_root = Path(os.path.abspath(evidence_root))
     try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root_stat = evidence_root.lstat()
+        if (
+            _symlinked_path(evidence_root)
+            or not evidence_root.is_dir()
+            or root_stat.st_uid != os.getuid()
+            or root_stat.st_mode & 0o077
+            or path.parent != evidence_root
+            or path.name in {"", ".", ".."}
+            or path.is_symlink()
+        ):
+            raise WorkflowError("workflow_ledger_path_unsafe")
         if path.exists() or path.is_symlink():
             raise WorkflowError("workflow_ledger_exists")
         descriptor, temporary = tempfile.mkstemp(
@@ -383,6 +534,14 @@ def write_release_workflow_ledger(path: Path, document: dict[str, Any]) -> None:
             os.link(temporary, path)
         except FileExistsError as exc:
             raise WorkflowError("workflow_ledger_exists") from exc
+        directory = os.open(
+            evidence_root,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except OSError as exc:
         raise WorkflowError("workflow_ledger_write_failed") from exc
     finally:

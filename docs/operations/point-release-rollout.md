@@ -70,6 +70,8 @@ the same evidence trail, append these options to the command above:
 
 ```sh
   --nas-snapshot-receipt "$HOME/.drover/backup-state/last-success.json" \
+  --nas-snapshot-manifest-sha256 "$NAS_MANIFEST_SHA256" \
+  --ledger-root "$EVIDENCE_DIR" \
   --ledger "$EVIDENCE_DIR/release-preflight.json"
 ```
 
@@ -77,10 +79,22 @@ This is an evidence adapter around the existing snapshot receipt and the
 existing `release-preflight` checks. It does **not** start a NAS backup, write
 to the NAS, publish a release, select a runtime, restart a service, or execute
 a rollout. The ledger path is created once, mode 600, and cannot be rewritten;
-use a new path for a new attempt. It validates that the receipt attests to NAS
-verification and `pg_restore --list` readback, and by default rejects receipts
-older than 36 hours. `--max-nas-snapshot-age-hours` changes only that evidence
-bound.
+use a new path for a new attempt. The evidence root must already be
+owner-only (mode 700) and is the sole permitted parent for the ledger; symlinks,
+group/world-writable roots, and nested traversal are rejected. Creation fsyncs
+both the private ledger file and its evidence directory.
+
+The receipt must be produced by the current Studio job: it carries explicit
+`verification_ok: true`, the immutable NAS `MANIFEST.json` SHA-256, and a
+versioned `studio_backup` HMAC provenance record. Supply the manifest digest as
+`NAS_MANIFEST_SHA256` and make the matching key available only through
+`DROVER_NAS_SNAPSHOT_RECEIPT_KEY` (or `--nas-snapshot-key-env`). The Studio
+backup process uses that same private key when it writes its local receipt.
+Old receipts without this explicit correlation evidence are intentionally
+blocked; do not add fields by hand. A valid receipt has explicit
+`verification_ok: true`, a matching local/NAS manifest SHA-256 pair, and a
+versioned Studio producer HMAC. By default the check also rejects receipts
+older than 36 hours. `--max-nas-snapshot-age-hours` changes only that age bound.
 
 The JSON document has one explicit state for each phase:
 
