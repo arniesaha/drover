@@ -60,6 +60,7 @@ def test_owner_lease_acquire_renew_release_are_epoch_fenced():
     store = OwnerLeaseStore(con, clock=lambda: NOW)
     first = store.acquire("drover#785", owner_id="a", lease_seconds=30)
     assert first["owner_epoch"] == 1
+    assert "FOR UPDATE" not in con.calls[0][0]
     assert store.renew("drover#785", owner_id="a", owner_epoch=1)["owner_epoch"] == 1
     with pytest.raises(LeaseConflict):
         store.renew("drover#785", owner_id="a", owner_epoch=2)

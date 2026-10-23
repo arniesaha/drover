@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 from uuid import uuid4
 
+from drover.server.control_outbox import is_postgres_connection
+
 DEFAULT_DEADLINES_SECONDS = {
     "working": 45 * 60,
     "idle_undeclared": 10 * 60,
@@ -74,7 +76,7 @@ class OwnerLeaseStore:
         row = _one(
             self.con,
             "SELECT issue_key, owner_id, owner_epoch, lease_until "
-            "FROM continuity_owner_leases WHERE issue_key = ? FOR UPDATE",
+            "FROM continuity_owner_leases WHERE issue_key = ?" + _lock(self.con),
             [issue_key],
         )
         until = now + timedelta(seconds=lease_seconds)
@@ -150,7 +152,8 @@ class OwnerLeaseStore:
         now = _utc(self.clock())
         row = _one(
             self.con,
-            "SELECT issue_key, owner_id, owner_epoch, lease_until FROM continuity_owner_leases WHERE issue_key = ? FOR UPDATE",
+            "SELECT issue_key, owner_id, owner_epoch, lease_until FROM continuity_owner_leases WHERE issue_key = ?"
+            + _lock(self.con),
             [issue_key],
         )
         if (
@@ -253,6 +256,10 @@ def reap(
         )
         results.append(record)
     return results
+
+
+def _lock(con: Any) -> str:
+    return " FOR UPDATE" if is_postgres_connection(con) else ""
 
 
 def _one(con: Any, statement: str, params: list[Any]) -> dict | None:
