@@ -137,9 +137,17 @@ def _control_snapshot(con, request):
                 if table == "harness_hosts":
                     where = "WHERE kind IS DISTINCT FROM 'collector'"
                 names = ",".join('"' + name + '"' for name, _ in columns)
-                rows = pg.execute(
-                    f'SELECT {names} FROM "{table}" {where} LIMIT 10001', params
-                ).fetchall()
+                # Contexts come from their certified PG payload and never read
+                # these relations; copying every session row into the child
+                # was ~1 s of each open_loops call (drover#778). The tables
+                # stay, empty, so the shared freshness steps below still bind.
+                rows = (
+                    []
+                    if op == "contexts"
+                    else pg.execute(
+                        f'SELECT {names} FROM "{table}" {where} LIMIT 10001', params
+                    ).fetchall()
+                )
                 if len(rows) > 10000:
                     raise LakeError("analytics_control_row_limit_exceeded")
                 definitions = ",".join(f'"{name}" {kind}' for name, kind in columns)

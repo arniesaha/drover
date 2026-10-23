@@ -168,7 +168,7 @@ def _history_time_bound(path: Path, value: str) -> str:
     return value
 
 
-def _canonical_read(function):
+def _canonical_read(function, *, precheck=True):
     """A selected lake error is explicit unavailable, never a legacy retry."""
     from functools import wraps
 
@@ -182,7 +182,8 @@ def _canonical_read(function):
         if config.backend == "legacy":
             return function(*args, **kwargs)
         try:
-            check_selected(path)
+            if precheck:
+                check_selected(path)
             return function(*args, **kwargs)
         except (LakeError, duckdb.Error, OSError) as exc:
             return {
@@ -195,6 +196,15 @@ def _canonical_read(function):
             }
 
     return guarded
+
+
+def _lake_read(function):
+    """``_canonical_read`` for tools whose own body always reads the lake.
+
+    That read already fails closed, so the ``SELECT 1`` check child was a
+    second serialized lake child (~1.7 s on prod) on every call (drover#778).
+    """
+    return _canonical_read(function, precheck=False)
 
 
 def _row_to_dict(cursor: duckdb.DuckDBPyConnection) -> list[dict]:
@@ -336,15 +346,30 @@ def _repo_summaries(
     from drover.server.lake.serving import HistoryConnection
 
     if isinstance(con, HistoryConnection):
-        cursor = con.execute(
-            """SELECT session_id, task_id FROM agent_events
-            WHERE repo_owner=? AND repo_name=? AND (? IS NULL OR branch=?)
-            GROUP BY session_id,task_id ORDER BY max(timestamp) DESC LIMIT ?""",
-            [owner, name, branch, branch, _RECALL_SCOPE_LIMIT],
-        )
-        rows = cursor.fetchall()
-        found = repo.summaries(row[0] for row in rows if row[0])
-        for task in {row[1] for row in rows if row[1]}:
+        if branch is None:
+            # The per-day session rollup answers "which sessions touched this
+            # repo" from a few thousand rows. Grouping the identity-filtered
+            # agent_events view scanned every event: ~3 s a call on prod and
+            # sometimes over the 2 GiB child cap (drover#778). It has no task
+            # column, so tasks come from the summaries it finds.
+            rows = con.execute(
+                """SELECT session_id FROM lake.activity_daily
+                WHERE repo_owner=? AND repo_name=? AND session_id IS NOT NULL
+                GROUP BY session_id ORDER BY max(last_event_at) DESC LIMIT ?""",
+                [owner, name, _RECALL_SCOPE_LIMIT],
+            ).fetchall()
+            found = repo.summaries(row[0] for row in rows)
+            tasks = {s.task_id for s in found.values() if s.task_id}
+        else:
+            rows = con.execute(
+                """SELECT session_id, task_id FROM agent_events
+                WHERE repo_owner=? AND repo_name=? AND branch=?
+                GROUP BY session_id,task_id ORDER BY max(timestamp) DESC LIMIT ?""",
+                [owner, name, branch, _RECALL_SCOPE_LIMIT],
+            ).fetchall()
+            found = repo.summaries(row[0] for row in rows if row[0])
+            tasks = {row[1] for row in rows if row[1]}
+        for task in tasks:
             for summary in repo.recent_summaries(task_id=task, limit=limit):
                 found[summary.session_id] = summary
         if branch is None:
@@ -933,7 +958,7 @@ def drover_project_brief(
 # --- drover_recent_sessions ---------------------------------------------------
 
 
-@_canonical_read
+@_lake_read
 def drover_recent_sessions(
     *,
     duckdb_path: Path,
@@ -1008,7 +1033,7 @@ def _selected_context(path, *, limit, **options):
     return None
 
 
-@_canonical_read
+@_lake_read
 def drover_recent_contexts(
     *,
     duckdb_path: Path,
@@ -1055,7 +1080,7 @@ def drover_recent_contexts(
     return {"contexts": rows, "limit": int(limit)}
 
 
-@_canonical_read
+@_lake_read
 def drover_context_brief(
     *,
     duckdb_path: Path,
@@ -1090,7 +1115,7 @@ def drover_context_brief(
     return rows[0] if rows else None
 
 
-@_canonical_read
+@_lake_read
 def drover_open_loops(
     *,
     duckdb_path: Path,
