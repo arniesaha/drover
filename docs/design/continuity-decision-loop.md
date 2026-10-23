@@ -42,13 +42,22 @@ fall back to the inferred state.
 
 ## 2. Authority as data (gap 2)
 
-The issue's autonomy label and its `Hard stop:` lines are rendered into one
-`Authority` block. Launch (`WorkService.launch` and `drover.py launch`) and
-every nudge/turn sent by the decision loop prepend it, together with the
+The issue's operator-authored autonomy label and operator-authored `Hard stop:`
+lines are rendered into one `Authority` block. GitHub event provenance is part
+of the normalized facts: only allow-listed operator actors may grant or narrow
+authority. Agent-authored or provenance-unknown label/directive events are
+ignored and appended to the continuity audit as `untrusted_authority_event`.
+Until #786 provides separate identities, the existing operator-only actor
+filter in `drover.py` remains the authority boundary; the hub must not infer a
+grant from the current label set without its labeled-event actor.
+
+Launch (`WorkService.launch` and `drover.py launch`) and every nudge/turn sent
+by the decision loop prepend the verified block, together with the
 `Drover-State` contract above. A `needs_approval` state whose gate is at or
-below the approved stage, and not a hard stop or always-human gate, is answered
-automatically with one turn ("approved through `<stage>`, proceed"). Any other
-`needs_approval` becomes `blocked:human` on the issue with the worker's reason.
+below the verified approved stage, and not a hard stop or always-human gate,
+is answered automatically with one turn ("approved through `<stage>`,
+proceed"). Any other `needs_approval` becomes `blocked:human` on the issue with
+the worker's reason.
 
 ## 3. Deadlines and leases (gap 4)
 
@@ -65,8 +74,11 @@ no longer resets the clock.
 | `needs_approval` not covered by the label | 0 (escalate now) |
 
 Past deadline: first a nudge, then `stalled` plus one alert (the same two-step
-contract as today). Every action is recorded once per (issue, action,
-fingerprint) so a missed tick or a restart repeats nothing.
+contract as today). Every continuity action is recorded once per `(issue,
+action, fingerprint)` in the continuity wake/decision tables, so a missed tick
+or restart repeats nothing. `fingerprint` is derived from the relevant state
+transition (stage, worker state timestamp, PR head/check state, or release run),
+not from a possibly absent commit SHA.
 
 An **owner lease** binds an issue to the orchestrator that acts on it:
 `continuity_owner_leases(issue_key, owner_id, owner_epoch, lease_until)` with
@@ -74,12 +86,13 @@ compare-and-swap renewal (same fence rules as `factory_observer_runs.lease`).
 Wakes for an issue go to the lease holder; an expired lease makes the issue
 claimable again, so a dead orchestrator is detected within one lease period.
 
-**Reaping** replaces the report-only lifecycle scan for sessions that are
+**Reaping** replaces the report-only lifecycle scan. A candidate must be
 `done` and accepted (linked PR merged), `ended`, or `idle_undeclared` past
-24 h with no open PR, no live lease and no enabled watcher. Reap means
-terminate through harnessd (worktree and history kept) plus `archived_at` and an
-audit event. Data is never deleted. A dry run lists candidates first; the
-apply path records each session in the issue/ledger audit trail.
+24 h. **Every candidate**, including `ended`, must also have no open PR, no live
+owner lease and no enabled watcher. Reap means terminate through harnessd when
+still running (worktree and history kept), then set `archived_at` and append an
+audit event. Data is never deleted. A dry run lists candidates first; the apply
+path records each session in the issue/ledger audit trail.
 
 ## 4. The single decision function (gap 1)
 
@@ -101,8 +114,12 @@ hub next to the rules engine and is called from two triggers:
 
 Mechanical PR writes (open draft, update branch, exact-head merge) stay in the
 existing `WorkItemRuleWorker` rules; `decide` only owns continuity actions.
-The two share the durable action identity table (`work_item_rule_actions`, key
-`(item, rule, sha)`), so there is one idempotency mechanism.
+Mechanical rules retain `work_item_rule_actions (item, rule, sha)`.
+Continuity decisions use their own durable identity `(issue_key, action,
+fingerprint)` because nudges, approvals and handoffs need not have a head SHA.
+One transaction claims that identity and enqueues its wake; completion records
+`acknowledged` or `exhausted`, while visibility-timeout redelivery keeps the
+same identity and `wake_id`.
 
 ## 5. Outbox wakes with ack (gap 6)
 
@@ -140,10 +157,16 @@ become optional nudges.
 | d | outbox wakes + ack | none | `continuity_wakes`, consume/ack endpoints |
 | e | flip | `reconcile` becomes: GET hub decisions, apply GitHub writes, consume/ack wakes | hub is the decider; `drover.py` keeps only the GitHub write path until #786 gives the hub its own identity |
 
-Parity gate for (e): zero mismatches on the live approved issues
-(#777 to #781 and today's #784 to #786) over at least three consecutive ticks,
-and the deliberate-kill test (consume a wake, kill the turn, observe
-re-delivery) passes.
+Acceptance gate for (e):
+
+- zero decision mismatches on live approved issues (#777 to #781 and today's
+  #784 to #786) over at least three consecutive ticks;
+- a covered `needs_approval` gate is auto-answered and proceeds without a human;
+- an undeclared-idle worker is flagged within its configured deadline;
+- all roughly 22 stale sessions are reviewed in a dry-run report, then only the
+  eligible set is reaped with per-session audit records and no deletion; and
+- the deliberate-kill test consumes a wake, kills the turn, and observes the
+  same `wake_id` redelivered and then acknowledged.
 
 Rollback at every step is the previous `drover.py` path: the cron command is
 unchanged until (e), and (e) keeps `--local` to decide in-process.
