@@ -14,13 +14,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-from drover.server.control_outbox import canonical_payload, is_postgres_connection
+from drover.server.control_outbox import (
+    canonical_payload,
+    event_payload_expression,
+    event_payload_join,
+    is_postgres_connection,
+)
 from drover.server.db import control_plane_connection
 from drover.server.harness.factory_observer import factory_observer_projection
 from drover.server.harness.registry import HarnessRegistry
 
 MAX_DELIVERIES = 3
 MAX_LEASE_SECONDS = 300
+MAX_COMPLETION_PROJECTION_BATCH = 100
 SCOPES = {
     "implementation": "commit_only",
     "integration": "publish_review",
@@ -41,7 +47,10 @@ class ContinuityConflict(ValueError):
 def continuity_request(store: FactoryObserverContinuity, body: dict) -> dict:
     """Fixed boundary operations for OpenClaw and future owner adapters."""
     contracts = {
-        "initialize": ({"session_id", "objective", "checkpoint"}, {"authority_scope"}),
+        "initialize": (
+            {"session_id", "objective", "checkpoint"},
+            {"authority_scope", "authorized_owner_id"},
+        ),
         "lease": ({"run_id", "owner_id"}, {"owner_epoch", "lease_seconds"}),
         "report": (
             {
@@ -178,35 +187,157 @@ def _record_report(
     return event_id
 
 
+def _record_completion_receipt(
+    con,
+    *,
+    harness_event_id: str,
+    run_id: str | None,
+    session_id: str,
+    sequence: int | None,
+    state: str,
+    reason: str | None,
+    continuity_event_id: str | None,
+    recorded_at: datetime,
+) -> str:
+    """Durably retain one completion-projection result by harness event ID."""
+    existing = _row(
+        con,
+        "SELECT state FROM factory_observer_completion_receipts WHERE harness_event_id = ?",
+        [harness_event_id],
+    )
+    if existing is not None:
+        # A completion received before the run was initialized or its owner
+        # handoff was authorized is a durable pending fact, not a terminal
+        # rejection. Once the authorized handoff exists, reconcile that exact
+        # existing harness event to its one projected action. Other outcomes
+        # are immutable, so replay cannot mutate history.
+        if (
+            existing["state"] != "pending_authorization"
+            or state == "pending_authorization"
+        ):
+            return existing["state"]
+        con.execute(
+            """UPDATE factory_observer_completion_receipts
+               SET run_id = ?, session_id = ?, sequence = ?, state = ?, reason = ?,
+                   continuity_event_id = ?, recorded_at = ?
+             WHERE harness_event_id = ?""",
+            [
+                run_id,
+                session_id,
+                sequence,
+                state,
+                reason,
+                continuity_event_id,
+                recorded_at,
+                harness_event_id,
+            ],
+        )
+        return state
+    con.execute(
+        """INSERT INTO factory_observer_completion_receipts
+        (harness_event_id, run_id, session_id, sequence, state, reason,
+         continuity_event_id, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            harness_event_id,
+            run_id,
+            session_id,
+            sequence,
+            state,
+            reason,
+            continuity_event_id,
+            recorded_at,
+        ],
+    )
+    return state
+
+
 def record_observer_worker_completion(
     con,
     *,
     event_id: str,
     session_id: str,
+    event_type: str,
     sequence: int | None,
     payload: dict | None,
     received_at: datetime,
-) -> bool:
-    """Project a real sequenced Drover completion into an initialized observer run.
+) -> str | None:
+    """Project one Drover completion and retain its truthful durable outcome.
 
-    This is intentionally narrower than generic harness-event projection.  The
-    session-to-run relation must already be initialized in the durable observer
-    ledger, and the structured source sequence must be present.  Drover records
-    the completion fact and leaves owner delivery to the bound adapter; it does
-    not infer an external parent session or send a message to one.
+    Only Factory observer sessions enter this ledger.  Each relevant source
+    event has one receipt, including a malformed completion or a completion
+    received before an authorized owner handoff.  The caller keeps all writes
+    in its existing event transaction, so an inserted event cannot lose a
+    successful projection and a failed projection cannot disappear silently.
     """
     if not isinstance(payload, dict) or payload.get("turn_complete") is not True:
-        return False
-    if type(sequence) is not int or sequence < 0:
-        return False
+        return None
+    session = _row(
+        con,
+        "SELECT handoff_mode FROM harness_sessions WHERE session_id = ?",
+        [session_id],
+    )
+    if session is None or session["handoff_mode"] != "factory_observer":
+        return None
     run = _row(
         con,
         "SELECT run_id FROM factory_observer_runs WHERE session_id = ?",
         [session_id],
     )
     if run is None:
-        return False
-    _record_report(
+        return _record_completion_receipt(
+            con,
+            harness_event_id=event_id,
+            run_id=None,
+            session_id=session_id,
+            sequence=sequence if type(sequence) is int else None,
+            state="pending_authorization",
+            reason="observer_run_not_initialized",
+            continuity_event_id=None,
+            recorded_at=received_at,
+        )
+    if event_type != "status":
+        return _record_completion_receipt(
+            con,
+            harness_event_id=event_id,
+            run_id=run["run_id"],
+            session_id=session_id,
+            sequence=sequence if type(sequence) is int else None,
+            state="rejected",
+            reason="completion_requires_status_event",
+            continuity_event_id=None,
+            recorded_at=received_at,
+        )
+    if type(sequence) is not int or sequence < 0:
+        return _record_completion_receipt(
+            con,
+            harness_event_id=event_id,
+            run_id=run["run_id"],
+            session_id=session_id,
+            sequence=None,
+            state="rejected",
+            reason="completion_requires_nonnegative_sequence",
+            continuity_event_id=None,
+            recorded_at=received_at,
+        )
+    owner = _row(
+        con,
+        "SELECT authorized_owner_id FROM factory_observer_runs WHERE run_id = ?",
+        [run["run_id"]],
+    )
+    if not owner or not owner["authorized_owner_id"]:
+        return _record_completion_receipt(
+            con,
+            harness_event_id=event_id,
+            run_id=run["run_id"],
+            session_id=session_id,
+            sequence=sequence,
+            state="pending_authorization",
+            reason="authorized_owner_handoff_required",
+            continuity_event_id=None,
+            recorded_at=received_at,
+        )
+    continuity_event_id = _record_report(
         con,
         run_id=run["run_id"],
         source="drover",
@@ -217,7 +348,98 @@ def record_observer_worker_completion(
         summary="Drover harness session reported a completed turn.",
         received_at=received_at,
     )
-    return True
+    return _record_completion_receipt(
+        con,
+        harness_event_id=event_id,
+        run_id=run["run_id"],
+        session_id=session_id,
+        sequence=sequence,
+        state="projected",
+        reason=None,
+        continuity_event_id=continuity_event_id,
+        recorded_at=received_at,
+    )
+
+
+def record_observer_worker_completion_batch(con, records: list[dict]) -> dict[str, int]:
+    """Project one bounded batch in source order using the caller transaction."""
+    if len(records) > MAX_COMPLETION_PROJECTION_BATCH:
+        raise ValueError("completion projection batch exceeds maximum")
+    outcomes: dict[str, int] = {}
+    for record in sorted(
+        records,
+        key=lambda item: (
+            str(item["session_id"]),
+            (
+                item["sequence"]
+                if type(item.get("sequence")) is int and item["sequence"] >= 0
+                else 2**63
+            ),
+            item["received_at"],
+            str(item["event_id"]),
+        ),
+    ):
+        state = record_observer_worker_completion(
+            con,
+            event_id=str(record["event_id"]),
+            session_id=str(record["session_id"]),
+            event_type=str(record["event_type"]),
+            sequence=record.get("sequence"),
+            payload=record.get("payload"),
+            received_at=record["received_at"],
+        )
+        if state is not None:
+            outcomes[state] = outcomes.get(state, 0) + 1
+    return outcomes
+
+
+def _recover_pending_completions(con, *, session_id: str) -> None:
+    """Reproject pending source facts after their first authorized handoff.
+
+    Harness-event ingestion cannot reinsert an already durable event ID, so
+    authorization must reconcile the retained pending receipt from the stored
+    immutable event instead of waiting for an unreliable duplicate delivery.
+    This caller is already inside initialize's transaction.
+    """
+    rows = con.execute(
+        f"""SELECT e.event_id, e.session_id, e.event_type,
+                   {event_payload_expression(con)} AS payload_json,
+                   e.seq, e.created_at
+              FROM factory_observer_completion_receipts r
+              JOIN harness_events e ON e.event_id = r.harness_event_id
+                   {event_payload_join(con)}
+             WHERE r.session_id = ? AND r.state = 'pending_authorization'
+             ORDER BY CASE WHEN e.seq IS NULL THEN 1 ELSE 0 END,
+                      e.seq, e.created_at, e.event_id""",
+        [session_id],
+    ).fetchall()
+    records = []
+    for (
+        event_id,
+        event_session_id,
+        event_type,
+        payload_json,
+        sequence,
+        created_at,
+    ) in rows:
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError):
+            payload = None
+        records.append(
+            {
+                "event_id": str(event_id),
+                "session_id": str(event_session_id),
+                "event_type": str(event_type),
+                "sequence": sequence,
+                "payload": payload,
+                "received_at": created_at,
+            }
+        )
+    for offset in range(0, len(records), MAX_COMPLETION_PROJECTION_BATCH):
+        record_observer_worker_completion_batch(
+            con, records[offset : offset + MAX_COMPLETION_PROJECTION_BATCH]
+        )
 
 
 class FactoryObserverContinuity:
@@ -258,11 +480,14 @@ class FactoryObserverContinuity:
         objective: str,
         checkpoint: str,
         authority_scope: str = "implementation",
+        authorized_owner_id: str | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
         _text(objective, "objective")
         _text(checkpoint, "checkpoint")
+        if authorized_owner_id is not None:
+            _text(authorized_owner_id, "authorized_owner_id", 191)
         if authority_scope not in SCOPES:
             raise ValueError("unsupported authority_scope")
         session = HarnessRegistry(self.path).get_session(session_id)
@@ -274,7 +499,8 @@ class FactoryObserverContinuity:
             con.execute(
                 """INSERT INTO factory_observer_runs
                 (run_id, session_id, expected_revision, objective, checkpoint,
-                 authority_scope, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                 authority_scope, authorized_owner_id, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (run_id) DO NOTHING""",
                 [
                     run_id,
@@ -283,6 +509,7 @@ class FactoryObserverContinuity:
                     objective,
                     checkpoint,
                     authority_scope,
+                    authorized_owner_id,
                     self.clock(),
                 ],
             )
@@ -298,6 +525,21 @@ class FactoryObserverContinuity:
             }.items():
                 if existing[name] != value:
                     raise ContinuityConflict(f"run {name} is immutable")
+            existing_owner = existing.get("authorized_owner_id")
+            if existing_owner is None and authorized_owner_id is not None:
+                # An existing local observer can receive its first explicit
+                # authenticated handoff, but that one-way binding cannot be
+                # replaced by a later caller.
+                con.execute(
+                    "UPDATE factory_observer_runs SET authorized_owner_id = ?, updated_at = ? WHERE run_id = ?",
+                    [authorized_owner_id, self.clock(), run_id],
+                )
+            elif existing_owner != authorized_owner_id and (
+                existing_owner is not None or authorized_owner_id is not None
+            ):
+                raise ContinuityConflict("run authorized owner is immutable")
+            if authorized_owner_id is not None:
+                _recover_pending_completions(con, session_id=session_id)
         return run_id
 
     def lease(
@@ -312,6 +554,7 @@ class FactoryObserverContinuity:
         _integer(lease_seconds, "lease_seconds", 1, MAX_LEASE_SECONDS)
         with self._transaction(run_id) as (con, run):
             now = self.clock()
+            self._authorized_owner(run, owner_id)
             # A delayed renewal is a compare-and-swap even after expiry. It
             # must not silently reacquire after a newer owner epoch expired.
             if owner_epoch is not None and (
@@ -335,6 +578,12 @@ class FactoryObserverContinuity:
             "owner_epoch": epoch,
             "lease_until": until.isoformat(),
         }
+
+    @staticmethod
+    def _authorized_owner(run, owner_id):
+        authorized = run.get("authorized_owner_id")
+        if authorized is not None and authorized != owner_id:
+            raise ContinuityConflict("owner is not authorized for this run")
 
     @staticmethod
     def _fence(run, owner_id, owner_epoch, now):
@@ -381,6 +630,7 @@ class FactoryObserverContinuity:
         """
         with self._transaction(run_id) as (con, run):
             now = self.clock()
+            self._authorized_owner(run, owner_id)
             self._fence(run, owner_id, owner_epoch, now)
             action = (
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
@@ -464,6 +714,7 @@ class FactoryObserverContinuity:
         _text(checkpoint, "checkpoint")
         with self._transaction(run_id) as (con, run):
             now = self.clock()
+            self._authorized_owner(run, owner_id)
             self._fence(run, owner_id, owner_epoch, now)
             event = _row(
                 con,
@@ -522,6 +773,35 @@ class FactoryObserverContinuity:
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
             )
             blocked = run["authority_scope"] == "deployment"
+            receipt_counts = dict(
+                con.execute(
+                    "SELECT state, count(*) FROM factory_observer_completion_receipts "
+                    "WHERE run_id = ? GROUP BY state",
+                    [run_id],
+                ).fetchall()
+            )
+            receipt_errors = [
+                {"harness_event_id": event_id, "state": state, "reason": reason}
+                for event_id, state, reason in con.execute(
+                    """SELECT harness_event_id, state, reason
+                    FROM factory_observer_completion_receipts
+                    WHERE run_id = ? AND state <> 'projected'
+                    ORDER BY recorded_at, harness_event_id LIMIT ?""",
+                    [run_id, limit],
+                ).fetchall()
+            ]
+            if receipt_counts.get("rejected"):
+                handoff_state = "failed"
+            elif not run.get("authorized_owner_id"):
+                handoff_state = "authorization_required"
+            elif action:
+                handoff_state = "acknowledgement_required"
+            elif counts.get("pending") or counts.get("delivered"):
+                handoff_state = "owner_lease_required"
+            elif counts.get("acknowledged"):
+                handoff_state = "acknowledged"
+            else:
+                handoff_state = "awaiting_completion"
             recovery = (
                 ("claim_owner" if not run["owner_id"] else "reclaim_expired_owner")
                 if not live
@@ -545,6 +825,10 @@ class FactoryObserverContinuity:
                 "checkpoint": run["checkpoint"],
                 "authority_scope": run["authority_scope"],
                 "scope_limit": SCOPES[run["authority_scope"]],
+                "owner_handoff": {
+                    "authorized_owner_id": run.get("authorized_owner_id"),
+                    "state": handoff_state,
+                },
                 "owner": {
                     "id": run["owner_id"],
                     "epoch": run["owner_epoch"],
@@ -564,6 +848,10 @@ class FactoryObserverContinuity:
                     and (action or counts.get("pending"))
                 ),
                 "inbox_counts": counts,
+                "completion_receipts": {
+                    "counts": receipt_counts,
+                    "errors": receipt_errors,
+                },
                 "events": events,
                 "has_more": sum(
                     n for state, n in counts.items() if state != "acknowledged"

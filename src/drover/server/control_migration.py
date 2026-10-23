@@ -22,7 +22,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import duckdb
 
-from drover.server.continuity_schema import CONTINUITY_TABLES
+from drover.server.continuity_schema import (
+    CONTINUITY_BASE_TABLES,
+    CONTINUITY_RECEIPT_TABLE,
+    CONTINUITY_TABLES,
+)
 from drover.server.control_outbox import payload_sha256
 from drover.server.control_store import is_postgres_control_store
 from drover.server.db import (
@@ -60,6 +64,10 @@ _REQUIRED_SOURCE_COLUMNS: dict[str, frozenset[str]] = {
     "factory_observer_inbox": frozenset(
         "event_id run_id source subject sequence payload_json state action_json "
         "attempts next_delivery_at acknowledged_at received_at".split()
+    ),
+    CONTINUITY_RECEIPT_TABLE: frozenset(
+        "harness_event_id run_id session_id sequence state reason continuity_event_id "
+        "recorded_at".split()
     ),
     "harness_hosts": frozenset(
         {"host_id", "display_name", "kind", "status", "capabilities_json"}
@@ -365,8 +373,8 @@ def _source_table_rows(
             "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
         ).fetchall()
     }
-    continuity_tables = tables.intersection(CONTINUITY_TABLES)
-    if continuity_tables and continuity_tables != set(CONTINUITY_TABLES):
+    continuity_tables = tables.intersection(CONTINUITY_BASE_TABLES)
+    if continuity_tables and continuity_tables != set(CONTINUITY_BASE_TABLES):
         raise ValueError("snapshot must supply both continuity tables or neither")
     missing = [
         table
@@ -546,10 +554,10 @@ def _validate_source_inventory(
     credential_rows: dict[str, list[dict[str, Any]]],
 ) -> None:
     """Fence every supplied source column before writing any target row."""
-    continuity_columns = [
-        _source_columns(source_snapshot, table) for table in CONTINUITY_TABLES
+    base_continuity_columns = [
+        _source_columns(source_snapshot, table) for table in CONTINUITY_BASE_TABLES
     ]
-    if any(continuity_columns) and not all(continuity_columns):
+    if any(base_continuity_columns) and not all(base_continuity_columns):
         raise ValueError("snapshot must supply both continuity tables or neither")
     for table in CONTROL_PLANE_TABLES:
         source_columns = set(_source_columns(source_snapshot, table))

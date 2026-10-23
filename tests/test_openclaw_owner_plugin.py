@@ -25,7 +25,7 @@ from drover.server.web.auth import AuthSettings
 
 PLUGIN = Path(__file__).resolve().parents[1] / "plugins/openclaw-continuity-owner"
 RUN = "run_PLUGIN_CANARY497"
-OWNER = "agent:coder:subagent:synthetic-owner"
+OWNER = "legacy:operator"
 PARENT = "agent:main:synthetic-parent"
 TOKEN = "synthetic-plugin-only-test-token"
 
@@ -75,6 +75,7 @@ def canary(tmp_path):
         session_id="synthetic-canary-observer",
         objective="Isolated read-only canary",
         checkpoint="No owner action acknowledged",
+        authorized_owner_id=OWNER,
     )
     event_id = store.report(
         RUN,

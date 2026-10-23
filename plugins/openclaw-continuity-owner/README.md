@@ -87,7 +87,7 @@ this worker's configuration):
           "droverOrigin": "https://drover.example",
           "tokenEnvName": "DROVER_CONTINUITY_OWNER_TOKEN",
           "runId": "run_CANARY",
-          "ownerSessionKey": "agent:coder:existing-authorized-owner",
+          "ownerSessionKey": "credential:existing-drover-credential-id",
           "canarySessionKey": "agent:main:existing-authorized-parent",
           "authorityScope": "implementation",
           "timeoutMs": 5000
@@ -99,8 +99,11 @@ this worker's configuration):
 ```
 
 Use a preexisting approved bearer credential environment variable and approved
-Drover origin; no model-supplied credential, URL, command, owner, scope, or run
-is accepted. HTTPS or loopback HTTP is required; origins cannot contain paths,
+Drover origin. The configured `ownerSessionKey` must be the server-derived
+principal for that bearer (`credential:<credential-id>`, or
+`legacy:operator` only for the supported legacy bearer); it is not a free-form
+OpenClaw session identity. No model-supplied credential, URL, command, owner,
+scope, or run is accepted. HTTPS or loopback HTTP is required; origins cannot contain paths,
 userinfo, query, or fragment. Requests reject redirects, use a maximum 10-second
 timeout, cap replies at 2 MiB, and sanitize transport errors. Config is strict;
 no arbitrary extra keys. All payloads/replies use exported existing Python

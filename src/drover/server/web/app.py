@@ -2544,17 +2544,50 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 if body is None:
                     raise ValueError("request body must be a JSON object")
+                operation = body.get("operation") if isinstance(body, dict) else None
+                if operation in {"initialize", "lease", "consume", "acknowledge"}:
+                    principal = self._continuity_owner_principal()
+                    if principal is None:
+                        raise PermissionError("bound bearer credential required")
+                    body = dict(body)
+                    if operation == "initialize":
+                        if "authorized_owner_id" in body:
+                            raise PermissionError(
+                                "authorized owner is derived from the bearer credential"
+                            )
+                        body["authorized_owner_id"] = principal
+                    elif body.get("owner_id") != principal:
+                        raise PermissionError(
+                            "owner identity does not match bearer credential"
+                        )
                 result = continuity_request(store, body)
             status = 200
         except ContinuityConflict as exc:
             status, result = 409, {"error": str(exc)}
         except KeyError:
             status, result = 404, {"error": "continuity run or event not found"}
+        except PermissionError as exc:
+            status, result = 403, {"error": str(exc)}
         except (ValueError, TypeError) as exc:
             status, result = 400, {"error": str(exc)}
         except ControlPlaneBusy:
             status, result = 503, {"error": "continuity store busy"}
         self._send(status, "application/json", json.dumps(result) + "\n")
+
+    def _continuity_owner_principal(self) -> str | None:
+        """Derive the only owner identity mutable continuity calls may claim."""
+        credential = bearer_credential(self.auth, self.headers)
+        if credential is not None:
+            return "credential:" + credential.id
+        authorization = self.headers.get("Authorization", "") or ""
+        if (
+            self.auth.enabled
+            and self.auth.legacy_token_enabled
+            and self.auth.api_token
+            and hmac.compare_digest(authorization, f"Bearer {self.auth.api_token}")
+        ):
+            return "legacy:operator"
+        return None
 
     def _send_session_history(self, path: str, query: str) -> None:
         """``GET /sessions/history[/facets]`` from the PostgreSQL control plane."""

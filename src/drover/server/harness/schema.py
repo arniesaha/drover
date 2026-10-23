@@ -348,6 +348,11 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
     """Create Drover harness control-plane tables. Idempotent."""
     for statement in CONTINUITY_DDL:
         con.execute(statement)
+    _ensure_harness_columns(
+        con,
+        "factory_observer_runs",
+        {"authorized_owner_id": "VARCHAR"},
+    )
     con.execute(_HARNESS_HOSTS_DDL)
     _ensure_harness_columns(
         con,

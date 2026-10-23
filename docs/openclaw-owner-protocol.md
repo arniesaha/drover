@@ -19,15 +19,21 @@ steps. No credential, configuration, policy, or service change was made.
 ## Trusted binding and normal invocation
 
 An integration must initialize the existing observer run through the existing
-continuity endpoint first. It then binds the adapter's `run_id`, `owner_id`
-(the trusted owner session identity), and `authority_scope` outside model input.
+continuity endpoint first. The server derives and records the immutable owner
+identity from that initialize caller's bearer: `credential:<credential-id>` for
+a credential or `legacy:operator` for the supported legacy bearer. It then binds
+the adapter's `run_id`, `owner_id` (that exact derived principal), and
+`authority_scope` outside model input.
 The tool request cannot choose another run, impersonate an owner, broaden scope,
 grant approval, or supply a URL, token, command, or arbitrary endpoint path.
 All transport calls use the fixed existing continuity endpoint. The injected
 `ContinuityEndpoint.get/post` transport must enforce ordinary Drover authentication;
 the Python protocol neither implements nor bypasses authentication.
-Before a mutation, a bounded GET checks the run's immutable scope against the
-trusted binding. A wrong scope is refused before any POST, including ack.
+Before a mutation, a bounded GET checks the run's immutable scope and authorized
+owner handoff against the trusted binding. The HTTP endpoint also rejects a
+lease, consume, or ack whose JSON owner differs from the authenticated bearer
+before state mutation. A wrong scope or owner is refused before any POST,
+including ack.
 
 [OpenClaw's supported plugin API](https://docs.openclaw.ai/plugins/sdk-overview/tools-and-commands)
 provides `api.registerTool(...)` for agent-visible tools. The inactive package
@@ -78,12 +84,15 @@ The owner explicitly reconciles the action in its allowed scope and explicitly
 acks with the event ID and updated checkpoint. Initialization, schema generation,
 polling, receipt of a message/tool reply, and tool-result rendering do not ack.
 
-For an initialized Factory observer, Drover also projects a real sequenced
-`turn_complete` harness event into that same durable report path as source
-`drover`. The run/session binding already exists in `factory_observer_runs`; no
-OpenClaw parent identity is added or inferred. The focused completion canary
-therefore proves only completion → durable ledger → trusted bound owner adapter
-→ explicit acknowledgment. It intentionally does not claim that Drover can
+For an initialized Factory observer with an authorized handoff, Drover also
+projects a real sequenced `turn_complete` harness event into that same durable
+report path as source `drover`. Its bounded batch projector retains a receipt
+per harness event (`projected`, `pending_authorization`, or `rejected`) in the
+same transaction; status distinguishes authorization, lease, acknowledgment,
+and failed/rejected states. The run/session binding already exists in
+`factory_observer_runs`; no OpenClaw parent identity is added or inferred. The
+focused completion canary therefore proves only completion → durable ledger →
+trusted bound owner adapter → explicit acknowledgment. It intentionally does not claim that Drover can
 establish OpenClaw parent ownership, deliver a parent message, or resume a
 parent session.
 

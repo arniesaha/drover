@@ -94,8 +94,8 @@ That projection is intentionally not a Factory status API: `expected_revision` i
 No new Drover configuration is required. The target host must already be paired/registered, reachable through its existing direct or relay route, and have the chosen harness's structured adapter and model catalog available. The caller needs an existing authenticated Drover bearer credential accepted by the hub; `preflight` credentials are read-only and are refused by the normal authentication gate. Use a dedicated revocable existing Drover credential for the Factory client rather than the legacy shared token where available.
 
 The launch bridge requires no Factory credential or TaskFlow URL. The optional
-continuity slice adds two tables through the normal control-store bootstrap
-(PostgreSQL migration 10, and additive DuckDB DDL). No credential, configuration,
+continuity slice adds its durable ledger tables through the normal control-store bootstrap
+(PostgreSQL migrations through 28, and additive DuckDB DDL). No credential, configuration,
 permission-policy, or production service change is part of this implementation.
 
 ## Durable owner continuity (#497)
@@ -136,6 +136,16 @@ and checkpoint to 4,000 characters, and report summary to 2,000 characters.
 Bad requests return 400, missing runs/events 404, immutable identity or owner
 fence conflicts 409, and a busy control-store window 503.
 
+Mutable owner operations are additionally bound to the authenticated bearer
+principal before the ledger is touched.  Initialize records that derived
+principal as the run's immutable `authorized_owner_id`; callers may not submit
+it in JSON.  Lease, consume, and acknowledge must submit the same owner ID as
+their bearer-derived principal, and that principal must match the stored handoff.
+Mismatches return 403 before mutation; a different but authenticated owner is a
+409 authorization conflict. Credential bearers use `credential:<credential-id>`;
+the supported legacy bearer uses `legacy:operator`. Report remains a bounded
+fact-ingest operation, not an owner claim.
+
 For example, after initialization and leasing, an OpenClaw adapter can report
 and consume CI results through the same boundary:
 
@@ -170,15 +180,29 @@ producer is automatically rewired by this change.
 
 ### Drover completion canary and ownership boundary
 
-For an **initialized** observer run, a new, sequenced Drover harness event with
-`payload.turn_complete: true` is projected in the same control-store transaction
-as a `factory_observer_inbox` report.  Its immutable source is `drover`, its
-source event ID is the harness event ID, and its subject is the observer session
-ID.  This makes the existing `factory_observer_runs.session_id` relation the
-durable run → session → completion link.  Replay of that harness event cannot
-create a second owner action.
+For an **initialized and authorized** observer run, a new, sequenced Drover
+harness event with `payload.turn_complete: true` is projected in the same
+control-store transaction as a `factory_observer_inbox` report. Its immutable
+source is `drover`, its source event ID is the harness event ID, and its subject
+is the observer session ID. This makes the existing
+`factory_observer_runs.session_id` relation the durable run → session →
+completion link. Replay of that harness event cannot create a second owner
+action. Both structured production ingestion and local batch append paths chunk
+new records into bounded groups of 100 while retaining each source event's
+transactional insert and projection outcome.
 
-The report still waits for a leased, trusted owner to consume it.  Drover has no
+`factory_observer_completion_receipts` retains one durable outcome per relevant
+harness event: `projected`, `pending_authorization`, or `rejected`, including a
+truthful reason for malformed status/sequence or a missing authorized handoff.
+The status projection exposes receipt counts/errors and a handoff state:
+`authorization_required`, `owner_lease_required`,
+`acknowledgement_required`, `acknowledged`, or `failed`. A completion is not
+presented as complete until the authorized owner explicitly consumes and
+acknowledges its durable action. When the first handoff is recorded, retained
+pending harness facts are reconciled from their immutable source events in that
+same transaction; they do not depend on a duplicate delivery to become visible.
+
+The report still waits for a leased, trusted owner to consume it. Drover has no
 OpenClaw parent-session ownership record and does not send a parent message,
 resume an OpenClaw session, or infer one from the observer session.  When the
 optional OpenClaw adapter is used, it is only the authenticated owner-tool

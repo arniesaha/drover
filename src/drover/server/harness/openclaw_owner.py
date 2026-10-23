@@ -100,6 +100,32 @@ class OwnerLease(WireModel):
     live: bool
 
 
+class OwnerHandoff(WireModel):
+    authorized_owner_id: Id | None
+    state: Literal[
+        "awaiting_completion",
+        "authorization_required",
+        "owner_lease_required",
+        "acknowledgement_required",
+        "acknowledged",
+        "failed",
+    ]
+
+
+class CompletionReceiptError(WireModel):
+    harness_event_id: Id
+    state: Literal["pending_authorization", "rejected"]
+    reason: Id
+
+
+class CompletionReceipts(WireModel):
+    counts: dict[
+        Literal["projected", "pending_authorization", "rejected"],
+        Annotated[int, Field(ge=0)],
+    ]
+    errors: Annotated[list[CompletionReceiptError], Field(max_length=50)]
+
+
 class InboxReport(WireModel):
     source: Id
     source_event_id: Id
@@ -127,6 +153,7 @@ class ContinuityProjection(WireModel):
     checkpoint: Checkpoint
     authority_scope: Scope
     scope_limit: Literal["commit_only", "publish_review", "explicit_approval_required"]
+    owner_handoff: OwnerHandoff
     owner: OwnerLease
     worker_state: Literal["unknown", "awaiting_input", "brief_completed"]
     terminal_release: Literal[False]
@@ -143,6 +170,7 @@ class ContinuityProjection(WireModel):
         Literal["pending", "delivered", "acknowledged", "exhausted"],
         Annotated[int, Field(ge=0)],
     ]
+    completion_receipts: CompletionReceipts
     events: Annotated[list[InboxEntry], Field(max_length=50)]
     has_more: bool
 
@@ -277,6 +305,8 @@ class OpenClawOwnerAdapter:
             or projection.authority_scope != self.context.authority_scope
         ):
             raise ValueError("reply does not match the trusted owner run/scope")
+        if projection.owner_handoff.authorized_owner_id != self.context.owner_id:
+            raise ValueError("reply does not match the trusted owner identity")
         return reply
 
 

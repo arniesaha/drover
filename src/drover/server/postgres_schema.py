@@ -20,6 +20,7 @@ WORK_ITEM_EVENTS_MIGRATION = 24
 GITHUB_WORK_ITEM_EVENTS_MIGRATION = 25
 CONTINUITY_RULES_MIGRATION = 26
 GITHUB_ENVIRONMENT_APPROVALS_MIGRATION = 27
+CONTINUITY_OWNER_HANDOFF_MIGRATION = 28
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -885,6 +886,23 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
               notified_at TIMESTAMPTZ, escalated_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ,
               PRIMARY KEY (work_item_id, run_id, environment))""",
             "CREATE INDEX IF NOT EXISTS github_environment_approvals_pending ON github_environment_approvals (state, last_seen_at)",
+        ),
+    ),
+    (
+        CONTINUITY_OWNER_HANDOFF_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS authorized_owner_id TEXT",
+            """
+            CREATE TABLE IF NOT EXISTS factory_observer_completion_receipts (
+              harness_event_id TEXT PRIMARY KEY, run_id TEXT,
+              session_id TEXT NOT NULL, sequence BIGINT,
+              state TEXT NOT NULL CHECK (state IN
+                ('projected', 'pending_authorization', 'rejected')),
+              reason TEXT, continuity_event_id TEXT,
+              recorded_at TIMESTAMPTZ NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS factory_observer_completion_receipts_run ON factory_observer_completion_receipts (run_id, state, recorded_at, harness_event_id)",
         ),
     ),
 )

@@ -177,6 +177,7 @@ ROLE_DEFAULTS: dict[str, dict[str, str]] = {
 CONTROL_PLANE_TABLES = (
     "factory_observer_runs",
     "factory_observer_inbox",
+    "factory_observer_completion_receipts",
     "harness_hosts",
     "harness_sessions",
     "harness_events",
@@ -192,6 +193,7 @@ CONTROL_PLANE_TABLES = (
 CONTROL_PLANE_PRIMARY_KEYS = {
     "factory_observer_runs": "run_id",
     "factory_observer_inbox": "event_id",
+    "factory_observer_completion_receipts": "harness_event_id",
     "harness_hosts": "host_id",
     "harness_sessions": "session_id",
     "harness_events": "event_id",

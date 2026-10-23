@@ -110,6 +110,7 @@ def make_harness(tmp_path):
             objective="Protocol proof",
             checkpoint="Waiting for owner review",
             authority_scope=scope,
+            authorized_owner_id=OWNER,
         )
         adapter = OpenClawOwnerAdapter(
             endpoint, run_id=RUN, owner_id=OWNER, authority_scope=scope

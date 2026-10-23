@@ -237,6 +237,12 @@ def test_duplicate_source_retries_race_before_and_after_ack(pg_bridge):
 def test_sequenced_drover_completion_reaches_leased_owner_on_postgres(pg_bridge):
     store, _ = pg_bridge
     registry = HarnessRegistry(store.path)
+    store.initialize(
+        session_id="pg-observer",
+        objective="Prove #497 on PostgreSQL",
+        checkpoint="Pending",
+        authorized_owner_id="postgres-owner",
+    )
     lease = store.lease(RUN, owner_id="postgres-owner")
     fence = {"owner_id": "postgres-owner", "owner_epoch": lease["owner_epoch"]}
 
@@ -260,6 +266,102 @@ def test_sequenced_drover_completion_reaches_leased_owner_on_postgres(pg_bridge)
         checkpoint="PostgreSQL owner reviewed Drover completion",
     )
     assert store.status(RUN)["inbox_counts"] == {"acknowledged": 1}
+
+
+def test_batched_completion_projection_retains_retry_and_rejection_on_postgres(
+    pg_bridge,
+):
+    store, clock = pg_bridge
+    registry = HarnessRegistry(store.path)
+    store.initialize(
+        session_id="pg-observer",
+        objective="Prove #497 on PostgreSQL",
+        checkpoint="Pending",
+        authorized_owner_id="postgres-batch-owner",
+    )
+    records = [
+        {
+            "event_id": "pg-batch-completion-2",
+            "session_id": "pg-observer",
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "seq": 2,
+            "created_at": clock.now + timedelta(seconds=2),
+        },
+        {
+            "event_id": "pg-batch-completion-1",
+            "session_id": "pg-observer",
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "seq": 1,
+            "created_at": clock.now + timedelta(seconds=1),
+        },
+        {
+            "event_id": "pg-batch-malformed",
+            "session_id": "pg-observer",
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "created_at": clock.now + timedelta(seconds=3),
+        },
+        {
+            "event_id": "pg-batch-completion-1",
+            "session_id": "pg-observer",
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "seq": 1,
+            "created_at": clock.now + timedelta(seconds=1),
+        },
+    ]
+    assert registry.ingest_structured_events(records) == 3
+    status = store.status(RUN)
+    assert [event["report"]["source_event_id"] for event in status["events"]] == [
+        "pg-batch-completion-1",
+        "pg-batch-completion-2",
+    ]
+    assert status["completion_receipts"] == {
+        "counts": {"projected": 2, "rejected": 1},
+        "errors": [
+            {
+                "harness_event_id": "pg-batch-malformed",
+                "state": "rejected",
+                "reason": "completion_requires_nonnegative_sequence",
+            }
+        ],
+    }
+    assert registry.ingest_structured_events(records) == 0
+
+
+def test_pending_completion_recovers_after_authorized_handoff_on_postgres(pg_bridge):
+    store, _ = pg_bridge
+    registry = HarnessRegistry(store.path)
+    registry.append_event(
+        event_id="pg-completion-before-owner-handoff",
+        session_id="pg-observer",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=1,
+    )
+    assert store.status(RUN)["completion_receipts"]["counts"] == {
+        "pending_authorization": 1
+    }
+    store.initialize(
+        session_id="pg-observer",
+        objective="Prove #497 on PostgreSQL",
+        checkpoint="Pending",
+        authorized_owner_id="postgres-recovery-owner",
+    )
+    recovered = store.status(RUN)
+    assert recovered["completion_receipts"] == {
+        "counts": {"projected": 1},
+        "errors": [],
+    }
+    lease = store.lease(RUN, owner_id="postgres-recovery-owner")
+    action = store.consume(
+        RUN,
+        owner_id="postgres-recovery-owner",
+        owner_epoch=lease["owner_epoch"],
+    )
+    assert action["type"] == "review_worker_result"
 
 
 def test_retry_pool_restart_persistence_and_bounded_exhaustion(pg_bridge):

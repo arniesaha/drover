@@ -1546,16 +1546,21 @@ class HarnessRegistry:
                     # same commit as its source event.  The projection itself
                     # never sends to or otherwise claims an external parent.
                     from drover.server.harness.continuity import (
-                        record_observer_worker_completion,
+                        record_observer_worker_completion_batch,
                     )
 
-                    record_observer_worker_completion(
+                    record_observer_worker_completion_batch(
                         con,
-                        event_id=event_id,
-                        session_id=session_id,
-                        sequence=seq,
-                        payload=payload,
-                        received_at=created_at,
+                        [
+                            {
+                                "event_id": event_id,
+                                "session_id": session_id,
+                                "event_type": event_type,
+                                "sequence": seq,
+                                "payload": payload,
+                                "received_at": created_at,
+                            }
+                        ],
                     )
                 con.execute("COMMIT")
             except Exception:
@@ -1655,6 +1660,7 @@ class HarnessRegistry:
                 return 0
             con.execute("BEGIN TRANSACTION")
             try:
+                completion_records: list[dict[str, Any]] = []
                 # Same reasoning as the single-event path above: the SELECT
                 # into `existing` narrows the batch, but it is still a
                 # check-then-act, and two batches carrying the same
@@ -1735,6 +1741,30 @@ class HarnessRegistry:
                             else {}
                         ),
                     )
+                    completion_records.append(
+                        {
+                            "event_id": str(record["event_id"]),
+                            "session_id": str(record["session_id"]),
+                            "event_type": str(record["event_type"]),
+                            "sequence": seq,
+                            "payload": record.get("payload"),
+                            "received_at": created_at,
+                        }
+                    )
+                from drover.server.harness.continuity import (
+                    MAX_COMPLETION_PROJECTION_BATCH,
+                    record_observer_worker_completion_batch,
+                )
+
+                for offset in range(
+                    0, len(completion_records), MAX_COMPLETION_PROJECTION_BATCH
+                ):
+                    record_observer_worker_completion_batch(
+                        con,
+                        completion_records[
+                            offset : offset + MAX_COMPLETION_PROJECTION_BATCH
+                        ],
+                    )
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
@@ -1805,6 +1835,7 @@ class HarnessRegistry:
                 }
 
                 inserted_by_session: dict[str, list[dict[str, Any]]] = {}
+                completion_records: list[dict[str, Any]] = []
                 for record in incoming:
                     event_id = str(record["event_id"])
                     session_id = str(record["session_id"])
@@ -1885,6 +1916,16 @@ class HarnessRegistry:
                         event_type=event_type,
                         payload=payload,
                     )
+                    completion_records.append(
+                        {
+                            "event_id": event_id,
+                            "session_id": session_id,
+                            "event_type": event_type,
+                            "sequence": seq,
+                            "payload": payload,
+                            "received_at": created_at,
+                        }
+                    )
                     inserted_count += 1
                     inserted_by_session.setdefault(session_id, []).append(
                         {
@@ -1894,6 +1935,21 @@ class HarnessRegistry:
                             "created_at": created_at,
                             "seq": seq,
                         }
+                    )
+
+                from drover.server.harness.continuity import (
+                    MAX_COMPLETION_PROJECTION_BATCH,
+                    record_observer_worker_completion_batch,
+                )
+
+                for offset in range(
+                    0, len(completion_records), MAX_COMPLETION_PROJECTION_BATCH
+                ):
+                    record_observer_worker_completion_batch(
+                        con,
+                        completion_records[
+                            offset : offset + MAX_COMPLETION_PROJECTION_BATCH
+                        ],
                     )
 
                 for session_id, inserted_events in inserted_by_session.items():
