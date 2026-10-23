@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Iterable, Mapping
+from contextlib import contextmanager
+from typing import Any, Callable, Iterable, Iterator, Mapping
 from uuid import uuid4
 
 from drover.server.control_outbox import is_postgres_connection
@@ -73,37 +74,44 @@ class OwnerLeaseStore:
         _validate_text(owner_id, "owner_id")
         _validate_lease_seconds(lease_seconds)
         now = _utc(self.clock())
-        row = _one(
-            self.con,
-            "SELECT issue_key, owner_id, owner_epoch, lease_until "
-            "FROM continuity_owner_leases WHERE issue_key = ?" + _lock(self.con),
-            [issue_key],
-        )
-        until = now + timedelta(seconds=lease_seconds)
-        if row is None:
-            epoch = 1
-            self.con.execute(
-                "INSERT INTO continuity_owner_leases "
-                "(issue_key, owner_id, owner_epoch, lease_until, updated_at) VALUES (?, ?, ?, ?, ?)",
-                [issue_key, owner_id, epoch, until, now],
+        # psycopg's control connection is deliberately autocommit=True.  A
+        # transaction-scoped advisory lock makes the missing-row INSERT race
+        # impossible as well as serialising expired-lease takeover.
+        with _transaction(self.con):
+            _advisory_lock(self.con, issue_key)
+            row = _one(
+                self.con,
+                "SELECT issue_key, owner_id, owner_epoch, lease_until "
+                "FROM continuity_owner_leases WHERE issue_key = ?" + _lock(self.con),
+                [issue_key],
             )
-        elif _live(row.get("lease_until"), now):
-            if row["owner_id"] != owner_id:
-                raise LeaseConflict("issue has a live owner lease")
-            # Acquiring our own live lease is a fenced renewal, not a takeover.
-            epoch = row["owner_epoch"]
-            self.con.execute(
-                "UPDATE continuity_owner_leases SET lease_until = ?, updated_at = ? "
-                "WHERE issue_key = ? AND owner_id = ? AND owner_epoch = ?",
-                [until, now, issue_key, owner_id, epoch],
-            )
-        else:
-            epoch = int(row["owner_epoch"]) + 1
-            self.con.execute(
-                "UPDATE continuity_owner_leases SET owner_id = ?, owner_epoch = ?, "
-                "lease_until = ?, updated_at = ? WHERE issue_key = ? AND owner_epoch = ?",
-                [owner_id, epoch, until, now, issue_key, row["owner_epoch"]],
-            )
+            until = now + timedelta(seconds=lease_seconds)
+            if row is None:
+                epoch = 1
+                _write_lease(
+                    self.con,
+                    "INSERT INTO continuity_owner_leases "
+                    "(issue_key, owner_id, owner_epoch, lease_until, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    [issue_key, owner_id, epoch, until, now],
+                )
+            elif _live(row.get("lease_until"), now):
+                if row["owner_id"] != owner_id:
+                    raise LeaseConflict("issue has a live owner lease")
+                epoch = row["owner_epoch"]
+                _write_lease(
+                    self.con,
+                    "UPDATE continuity_owner_leases SET lease_until = ?, updated_at = ? "
+                    "WHERE issue_key = ? AND owner_id = ? AND owner_epoch = ?",
+                    [until, now, issue_key, owner_id, epoch],
+                )
+            else:
+                epoch = int(row["owner_epoch"]) + 1
+                _write_lease(
+                    self.con,
+                    "UPDATE continuity_owner_leases SET owner_id = ?, owner_epoch = ?, "
+                    "lease_until = ?, updated_at = ? WHERE issue_key = ? AND owner_epoch = ?",
+                    [owner_id, epoch, until, now, issue_key, row["owner_epoch"]],
+                )
         return {
             "issue_key": issue_key,
             "owner_id": owner_id,
@@ -120,13 +128,16 @@ class OwnerLeaseStore:
         lease_seconds: int = 60,
     ) -> dict:
         _validate_lease_seconds(lease_seconds)
-        row, now = self._fenced(issue_key, owner_id, owner_epoch)
-        until = now + timedelta(seconds=lease_seconds)
-        self.con.execute(
-            "UPDATE continuity_owner_leases SET lease_until = ?, updated_at = ? "
-            "WHERE issue_key = ? AND owner_id = ? AND owner_epoch = ?",
-            [until, now, issue_key, owner_id, owner_epoch],
-        )
+        with _transaction(self.con):
+            _advisory_lock(self.con, issue_key)
+            row, now = self._fenced(issue_key, owner_id, owner_epoch)
+            until = now + timedelta(seconds=lease_seconds)
+            _write_lease(
+                self.con,
+                "UPDATE continuity_owner_leases SET lease_until = ?, updated_at = ? "
+                "WHERE issue_key = ? AND owner_id = ? AND owner_epoch = ?",
+                [until, now, issue_key, owner_id, owner_epoch],
+            )
         return {
             "issue_key": issue_key,
             "owner_id": owner_id,
@@ -135,12 +146,16 @@ class OwnerLeaseStore:
         }
 
     def release(self, issue_key: str, *, owner_id: str, owner_epoch: int) -> None:
-        self._fenced(issue_key, owner_id, owner_epoch)
-        self.con.execute(
-            "UPDATE continuity_owner_leases SET lease_until = ?, updated_at = ? "
-            "WHERE issue_key = ? AND owner_id = ? AND owner_epoch = ?",
-            [_utc(self.clock()), _utc(self.clock()), issue_key, owner_id, owner_epoch],
-        )
+        with _transaction(self.con):
+            _advisory_lock(self.con, issue_key)
+            self._fenced(issue_key, owner_id, owner_epoch)
+            now = _utc(self.clock())
+            _write_lease(
+                self.con,
+                "UPDATE continuity_owner_leases SET lease_until = ?, updated_at = ? "
+                "WHERE issue_key = ? AND owner_id = ? AND owner_epoch = ?",
+                [now, now, issue_key, owner_id, owner_epoch],
+            )
 
     def _fenced(
         self, issue_key: str, owner_id: str, owner_epoch: int
@@ -171,6 +186,7 @@ class ReapCandidate:
     session_id: str
     reason: str
     state_at: datetime | None = None
+    protections: Mapping[str, bool] = field(default_factory=dict)
 
 
 def select_reap_candidates(
@@ -190,12 +206,21 @@ def select_reap_candidates(
     candidates: list[ReapCandidate] = []
     for row in sessions:
         sid = str(row["session_id"])
-        if sid in watched or row.get("has_open_pr") or row.get("has_live_lease"):
+        protections = {
+            "has_open_pr": row.get("has_open_pr"),
+            "has_live_lease": row.get("has_live_lease"),
+            "has_watcher": True if sid in watched else row.get("has_watcher"),
+        }
+        # Absence is unknown, not false.  Reaping must never use a partially
+        # hydrated projection as evidence that a safeguard is absent.
+        if any(value is not False for value in protections.values()):
             continue
         state = row.get("worker_state")
         if state == "done" and row.get("accepted_pr"):
             candidates.append(
-                ReapCandidate(sid, "accepted_done", _as_datetime(row.get("state_at")))
+                ReapCandidate(
+                    sid, "accepted_done", _as_datetime(row.get("state_at")), protections
+                )
             )
         elif state == "ended" or row.get("status") in {
             "completed",
@@ -204,12 +229,16 @@ def select_reap_candidates(
             "failed",
         }:
             candidates.append(
-                ReapCandidate(sid, "ended", _as_datetime(row.get("state_at")))
+                ReapCandidate(
+                    sid, "ended", _as_datetime(row.get("state_at")), protections
+                )
             )
         elif state == "idle_undeclared":
             at = _as_datetime(row.get("state_at") or row.get("last_activity"))
             if at is not None and now - at > timedelta(hours=24):
-                candidates.append(ReapCandidate(sid, "idle_undeclared_24h", at))
+                candidates.append(
+                    ReapCandidate(sid, "idle_undeclared_24h", at, protections)
+                )
     return candidates
 
 
@@ -220,6 +249,7 @@ def reap(
     actor: str,
     dry_run: bool = True,
     terminator: Callable[[str], None] | None = None,
+    protection_check: Callable[[str], Mapping[str, Any]] | None = None,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Audit candidates and optionally terminate/archive them; never delete data."""
@@ -234,32 +264,137 @@ def reap(
             "applied": False,
         }
         if not dry_run:
-            if terminator is not None:
-                terminator(candidate.session_id)
-            con.execute(
-                "UPDATE harness_sessions SET archived_at = COALESCE(archived_at, ?) WHERE session_id = ?",
-                [at, candidate.session_id],
-            )
+            if terminator is None or protection_check is None:
+                _audit(con, candidate, actor, dry_run, at, "reap_failed")
+                record["error"] = "terminator and protection_check are required"
+                results.append(record)
+                continue
+            # Recheck protections and insert durable intent under a session
+            # fence.  The commit intentionally precedes the external call.
+            if not _prepare_reap(con, candidate, actor, dry_run, at, protection_check):
+                _audit(con, candidate, actor, dry_run, at, "reap_failed")
+                record["error"] = "reap protections are not explicitly false"
+                results.append(record)
+                continue
+            try:
+                acknowledged = terminator(candidate.session_id)
+                if acknowledged is not True:
+                    raise RuntimeError("terminator did not acknowledge termination")
+                con.execute(
+                    "UPDATE harness_sessions SET archived_at = COALESCE(archived_at, ?) WHERE session_id = ?",
+                    [at, candidate.session_id],
+                )
+            except Exception as exc:
+                _audit(con, candidate, actor, dry_run, at, "reap_failed")
+                record["error"] = str(exc)
+                results.append(record)
+                continue
+            _audit(con, candidate, actor, dry_run, at, "reap_confirmed")
             record["applied"] = True
-        con.execute(
-            "INSERT INTO continuity_reap_audit (audit_id, session_id, action, reason, actor, dry_run, applied_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [
-                str(uuid4()),
-                candidate.session_id,
-                "reap",
-                candidate.reason,
-                actor,
-                dry_run,
-                at,
-            ],
-        )
+            results.append(record)
+            continue
+        _audit(con, candidate, actor, dry_run, at, "reap")
         results.append(record)
     return results
 
 
+def _audit(
+    con: Any,
+    candidate: ReapCandidate,
+    actor: str,
+    dry_run: bool,
+    at: datetime,
+    action: str,
+) -> None:
+    con.execute(
+        "INSERT INTO continuity_reap_audit (audit_id, session_id, action, reason, actor, dry_run, applied_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            str(uuid4()),
+            candidate.session_id,
+            "reap",
+            candidate.reason,
+            actor,
+            dry_run,
+            at,
+        ],
+    )
+    if action != "reap":
+        con.execute(
+            "INSERT INTO continuity_reap_operations (operation_id, session_id, action, reason, actor, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                str(uuid4()),
+                candidate.session_id,
+                action.removeprefix("reap_"),
+                candidate.reason,
+                actor,
+                at,
+            ],
+        )
+
+
+def _protections_clear(evidence: Mapping[str, Any]) -> bool:
+    return all(
+        evidence.get(key) is False
+        for key in ("has_open_pr", "has_live_lease", "has_watcher")
+    )
+
+
+def _prepare_reap(
+    con: Any,
+    candidate: ReapCandidate,
+    actor: str,
+    dry_run: bool,
+    at: datetime,
+    protection_check: Callable[[str], Mapping[str, Any]],
+) -> bool:
+    """Fence a just-in-time protection check and its durable action intent."""
+    with _transaction(con):
+        _advisory_lock(con, "reap:" + candidate.session_id)
+        if not _protections_clear(protection_check(candidate.session_id)):
+            return False
+        _audit(con, candidate, actor, dry_run, at, "reap_intent")
+    return True
+
+
 def _lock(con: Any) -> str:
     return " FOR UPDATE" if is_postgres_connection(con) else ""
+
+
+@contextmanager
+def _transaction(con: Any) -> Iterator[None]:
+    """Make lease read-modify-write atomic on autocommit PostgreSQL.
+
+    Compatibility stores already provide their own single-process semantics;
+    keeping them out of explicit transactions also preserves their lightweight
+    test and tooling connections.
+    """
+    if not is_postgres_connection(con):
+        yield
+        return
+    con.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    con.execute("COMMIT")
+
+
+def _advisory_lock(con: Any, issue_key: str) -> None:
+    if is_postgres_connection(con):
+        con.execute("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", [issue_key])
+
+
+def _write_lease(con: Any, statement: str, params: list[Any]) -> None:
+    """Fence every PostgreSQL mutation with a returned row, not optimism."""
+    if not is_postgres_connection(con):
+        con.execute(statement, params)
+        return
+    row = _one(con, statement + " RETURNING issue_key", params)
+    if row is None:
+        raise LeaseConflict("lease changed before the fenced write completed")
 
 
 def _one(con: Any, statement: str, params: list[Any]) -> dict | None:

@@ -26,6 +26,7 @@ DAILY_DIGEST_MIGRATION = 30
 DAILY_DIGEST_LEASE_MIGRATION = 31
 WORKER_STATES_MIGRATION = 32
 CONTINUITY_LEASES_MIGRATION = 33
+CONTINUITY_REAP_OPERATIONS_MIGRATION = 34
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -62,6 +63,20 @@ CONTINUITY_LEASES_DDL = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS continuity_reap_audit_session ON continuity_reap_audit (session_id, applied_at)",
+)
+
+CONTINUITY_REAP_OPERATIONS_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS continuity_reap_operations (
+      operation_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES harness_sessions(session_id),
+      action TEXT NOT NULL CHECK (action IN ('intent', 'confirmed', 'failed')),
+      reason TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS continuity_reap_operations_session ON continuity_reap_operations (session_id, recorded_at)",
 )
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
@@ -987,6 +1002,8 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (WORKER_STATES_MIGRATION, (WORKER_STATES_DDL,)),
     # Fenced issue owners and a permanent (including dry-run) reap audit (#785).
     (CONTINUITY_LEASES_MIGRATION, CONTINUITY_LEASES_DDL),
+    # Intent/outcome journal for external reaping, added without rewriting v33.
+    (CONTINUITY_REAP_OPERATIONS_MIGRATION, CONTINUITY_REAP_OPERATIONS_DDL),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
