@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen
 
 import duckdb
 import pytest
+from _timeouts import scale_timeout
 
 import drover.server.harness.registry as registry_module
 from drover.config import AdvisoryContentConfig, FavoriteCwd
@@ -64,7 +65,6 @@ from drover.server.web.app import _MetricsHandler
 from drover.server.web.auth import AuthSettings, mint_session
 from drover.server.web.credentials import CredentialStore
 from drover.server.web.ui import load_page
-from _timeouts import scale_timeout
 
 
 def _snapshot() -> dict:
