@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen
 
 import duckdb
 import pytest
+from _timeouts import scale_timeout
 
 import drover.server.harness.registry as registry_module
 from drover.config import AdvisoryContentConfig, FavoriteCwd
@@ -555,7 +556,9 @@ def _json_request(url: str, *, payload: dict | None = None):
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = Request(url, data=data, headers=headers)
-    with urlopen(request, timeout=5) as response:
+    # Metrics HTTP tests share xdist workers with subprocess and server tests.
+    # Use the suite-wide CI ceiling rather than a second, unscaled 5s budget.
+    with urlopen(request, timeout=scale_timeout(5)) as response:
         return response.status, json.loads(response.read().decode("utf-8"))
 
 
@@ -574,6 +577,27 @@ def _wait_for_output(sock: socket.socket, needle: str) -> str:
             if needle in collected:
                 return collected
     raise AssertionError(f"did not observe {needle!r}; collected={collected!r}")
+
+
+def _wait_for_terminal_input_and_output(sock: socket.socket, needle: str) -> dict:
+    """Receive both frames regardless of the PTY's output/event ordering."""
+    deadline = monotonic() + 5
+    input_event = None
+    collected = ""
+    while monotonic() < deadline:
+        message = _recv_json(sock)
+        if message.get("type") == "event":
+            event = message.get("event") or {}
+            if event.get("event_type") == "terminal.input":
+                input_event = event
+        elif message.get("type") == "output":
+            collected += message.get("data", "")
+        if input_event is not None and needle in collected:
+            return input_event
+    raise AssertionError(
+        f"did not observe terminal.input and output {needle!r}; "
+        f"collected={collected!r}"
+    )
 
 
 def test_metrics_collector_renders_quality_summarizer_and_redis(monkeypatch, tmp_path):
@@ -3509,7 +3533,7 @@ def test_metrics_http_server_relays_harness_terminal_websocket(tmp_path):
     assert "RELAY_OK" in output
 
 
-def test_metrics_http_server_mirrors_proxied_harness_events(tmp_path):
+def test_metrics_http_server_mirrors_proxied_harness_events(tmp_path, monkeypatch):
     host_duckdb_path = tmp_path / "host-drover.duckdb"
     central_duckdb_path = tmp_path / "central-drover.duckdb"
     bootstrap(parquet_dir=tmp_path / "host-parquet", duckdb_path=host_duckdb_path)
@@ -3543,6 +3567,18 @@ def test_metrics_http_server_mirrors_proxied_harness_events(tmp_path):
         local_url=f"http://127.0.0.1:{harness_port}",
         capabilities={"harnesses": [{"name": "shell", "enabled": True}]},
     )
+    mirrored_input = threading.Event()
+    original_append_events_if_new = HarnessRegistry.append_events_if_new
+
+    def observe_central_input(self, records):
+        inserted = original_append_events_if_new(self, records)
+        if self.duckdb_path == central_duckdb_path and any(
+            record.get("event_type") == "terminal.input" for record in records
+        ):
+            mirrored_input.set()
+        return inserted
+
+    monkeypatch.setattr(HarnessRegistry, "append_events_if_new", observe_central_input)
     collector = MetricsCollector(
         duckdb_path=central_duckdb_path,
         incoming_dir=tmp_path / "incoming",
@@ -3571,7 +3607,10 @@ def test_metrics_http_server_mirrors_proxied_harness_events(tmp_path):
         )
         _recv_json(sock)
         client_send_json(sock, {"type": "input", "data": "echo MIRROR_OK\n"})
-        assert "MIRROR_OK" in _wait_for_output(sock, "MIRROR_OK")
+        input_event = _wait_for_terminal_input_and_output(sock, "MIRROR_OK")
+        assert input_event["normalized_type"] == "command"
+        assert input_event["normalized_source"] == "inferred_terminal"
+        assert mirrored_input.wait(5), "terminal.input was not durably mirrored"
     finally:
         if sock is not None:
             sock.close()

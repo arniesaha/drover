@@ -479,7 +479,7 @@ def test_notification_preferences_are_device_owned_and_persisted(server, tmp_pat
     other, _ = store.issue(scope="device", label="Tablet")
     assert jsonlib.loads(
         request(server, "GET", "/auth/device/notifications", token=token)[1]
-    ) == {"mode": "action"}
+    ) == {"mode": "action", "timezone": "UTC", "hour": None}
     assert request(
         server,
         "PUT",
@@ -489,10 +489,34 @@ def test_notification_preferences_are_device_owned_and_persisted(server, tmp_pat
     ) == (204, b"")
     assert jsonlib.loads(
         request(server, "GET", "/auth/device/notifications", token=token)[1]
-    ) == {"mode": "digest"}
+    ) == {"mode": "digest", "timezone": "UTC", "hour": None}
     assert store.get(other.id).notification_mode == "action"
     reopened = CredentialStore(tmp_path / CREDENTIALS_FILENAME)
     assert reopened.get(device.id).notification_mode == "digest"
+
+
+def test_notification_preferences_accept_local_schedule(server):
+    _, store, _ = server
+    device, token = store.issue(scope="device", label="Phone")
+    assert request(
+        server,
+        "PUT",
+        "/auth/device/notifications",
+        token=token,
+        json={"mode": "digest", "timezone": "America/Los_Angeles", "hour": 8},
+    ) == (204, b"")
+    assert store.get(device.id).notification_timezone == "America/Los_Angeles"
+    assert store.get(device.id).notification_hour == 8
+    assert (
+        request(
+            server,
+            "PUT",
+            "/auth/device/notifications",
+            token=token,
+            json={"mode": "digest", "timezone": "not/a-zone", "hour": 8},
+        )[0]
+        == 400
+    )
 
 
 @pytest.mark.parametrize("mode", ["unknown", None, [], {}])

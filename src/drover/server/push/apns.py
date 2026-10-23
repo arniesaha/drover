@@ -23,10 +23,12 @@ import logging
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +58,38 @@ _HIGH_ENTROPY_SECRET_RE = re.compile(
 def _unavailable_content_consent() -> dict:
     """The safe default when a sender was not given the hub consent reader."""
     return {}
+
+
+def _next_digest_deadline(now: float, timezone_name: str, hour: int | None) -> float:
+    """Return the next preferred wall-clock time, including DST transitions.
+
+    The first valid instant after a skipped wall time is used (for example 03:00
+    after a spring-forward 02:00); an ambiguous fall-back hour uses its first
+    occurrence.  The result is computed from an IANA zone, never a fixed UTC
+    offset, so a device keeps its local schedule across seasonal changes.
+    """
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, TypeError):
+        zone = timezone.utc
+    local_now = datetime.fromtimestamp(now, timezone.utc).astimezone(zone)
+    preferred_hour = 0 if hour is None else hour
+    candidate_date = local_now.date()
+    candidate = datetime.combine(
+        candidate_date, datetime.min.time(), tzinfo=zone
+    ).replace(hour=preferred_hour)
+    if candidate.timestamp() <= now:
+        candidate_date += timedelta(days=1)
+        candidate = datetime.combine(
+            candidate_date, datetime.min.time(), tzinfo=zone
+        ).replace(hour=preferred_hour)
+    # ZoneInfo permits imaginary times. Advance to the first representable
+    # minute after the gap instead of sending at a different UTC offset.
+    while candidate.astimezone(timezone.utc).astimezone(zone).replace(
+        tzinfo=None
+    ) != candidate.replace(tzinfo=None):
+        candidate += timedelta(minutes=1)
+    return candidate.timestamp()
 
 
 # --- rejection classification ------------------------------------------------
@@ -581,6 +615,27 @@ class APNsSender:
         )
         self._pending_lock = threading.Lock()
         self._pending = {}
+        # Used to fence PostgreSQL digest leases across hub workers/restarts.
+        self._digest_owner = uuid.uuid4().hex
+        # Digest entries survive restarts in the control store. They contain
+        # routing state only; previews and other transcript content are never
+        # serialized into this queue.
+        try:
+            for item in credentials.pending_digests():
+                state = AwaitingTransition(
+                    session_id=item["session_id"],
+                    harness="",
+                    cwd=None,
+                    awaiting=item.get("awaiting"),
+                    status=item.get("status") or "",
+                )
+                entry = self._pending.setdefault(
+                    item["credential_id"], [item["due_at"], "digest", {}]
+                )
+                entry[0] = min(entry[0], item["due_at"])
+                entry[2][state.session_id] = [state, item.get("update_count", 1)]
+        except Exception as exc:  # persistence must not make push unavailable
+            log.debug("apns: could not restore digest queue: %s", exc)
         # Per device/session cooldowns: the first question gets through now;
         # follow-ups are folded into one replacement push at the end of this
         # window. It is deliberately in-memory: losing it on a hub restart is
@@ -599,6 +654,10 @@ class APNsSender:
         self._environment_lock = threading.Lock()
         self._environment_failures: dict[str, EnvironmentFailure] = {}
         self._log_limit = _RateLimitedLog()
+        # Re-arm restored durable work; `close()` only clears this process's
+        # in-memory view, never the control-store rows.
+        with self._pending_lock:
+            self._schedule_locked()
 
     @property
     def is_available(self) -> bool:
@@ -717,7 +776,15 @@ class APNsSender:
                         continue
                     cooldown_deadline = recent[transition.session_id]
                 delay = (
-                    (86400 - now % 86400)
+                    max(
+                        0,
+                        _next_digest_deadline(
+                            now,
+                            credential.notification_timezone,
+                            credential.notification_hour,
+                        )
+                        - now,
+                    )
                     if mode == "digest"
                     else (
                         max(0, cooldown_deadline - now)
@@ -737,6 +804,10 @@ class APNsSender:
                     transition,
                     (previous[1] + 1) if previous else 1,
                 ]
+                if mode == "digest":
+                    # Store before scheduling: a restart after this point
+                    # can at worst re-send an APNs collapse-id, never drop it.
+                    self._credentials.queue_digest(credential, transition, entry[0])
             self._schedule_locked()
         for credential, state in immediate:
             self._send_one(credential, state, self._needs_user_count(state))
@@ -774,6 +845,8 @@ class APNsSender:
                 continue
             if credential.notification_mode != mode:
                 # A preference change must never send an alert under the old mode.
+                if mode == "digest":
+                    self._credentials.cancel_digests(credential.id, list(states))
                 continue
             transitions = [
                 replace(state, update_count=count)
@@ -783,11 +856,77 @@ class APNsSender:
             if transitions:
                 if mode == "digest":
                     for offset in range(0, len(transitions), 20):
-                        self._send_one(
-                            credential,
-                            transitions[offset : offset + 20],
-                            self._needs_user_count(transitions[0]),
+                        batch = transitions[offset : offset + 20]
+                        claimed = self._credentials.claim_digests(
+                            credential.id,
+                            [state.session_id for state in batch],
+                            self._clock(),
+                            self._digest_owner,
                         )
+                        if not claimed:
+                            # Another worker may hold the durable lease. Keep
+                            # our view armed so an expired lease is reclaimed
+                            # without requiring a process restart.
+                            deadline = self._clock() + self._batch_seconds
+                            with self._pending_lock:
+                                retry = self._pending.setdefault(
+                                    credential.id, [deadline, "digest", {}]
+                                )
+                                retry[0] = min(retry[0], deadline)
+                                for state in batch:
+                                    retry[2][state.session_id] = [
+                                        state,
+                                        state.update_count,
+                                    ]
+                                self._schedule_locked()
+                            continue
+                        claimed_batch = [
+                            replace(state, update_count=claimed[state.session_id])
+                            for state in batch
+                            if state.session_id in claimed
+                        ]
+                        if self._send_one(
+                            credential,
+                            claimed_batch,
+                            self._needs_user_count(transitions[0]),
+                        ):
+                            # Deletion is fenced by the lease and version. If
+                            # the process dies before it, the stable collapse
+                            # ID makes the reclaimed retry safe for an offline app.
+                            self._credentials.complete_digest(
+                                credential.id, claimed, self._digest_owner
+                            )
+                        else:
+                            # Terminal token rejection clears the registration.
+                            # Do not retain an old-day digest that could be sent
+                            # if this credential later receives a new token.
+                            current = self._credentials.get(credential.id)
+                            if (
+                                current is None
+                                or current.apns_token != credential.apns_token
+                            ):
+                                self._credentials.complete_digest(
+                                    credential.id, claimed, self._digest_owner
+                                )
+                                continue
+                            # Keep transient failures durable and retry with a
+                            # bounded delay; APNs collapse IDs make a reply-
+                            # lost retry idempotent for an offline device.
+                            deadline = self._clock() + self._batch_seconds
+                            self._credentials.defer_digest(
+                                credential.id, claimed, deadline, self._digest_owner
+                            )
+                            with self._pending_lock:
+                                retry = self._pending.setdefault(
+                                    credential.id, [deadline, "digest", {}]
+                                )
+                                retry[0] = min(retry[0], deadline)
+                                for state in claimed_batch:
+                                    retry[2][state.session_id] = [
+                                        state,
+                                        state.update_count,
+                                    ]
+                                self._schedule_locked()
                 else:
                     # One APNs thread and collapse key per session. Do not
                     # turn a burst across sessions into a generic summary.
@@ -957,7 +1096,7 @@ class APNsSender:
         # Re-checked per send: an earlier device in this same batch may just
         # have shown that the environment is unreachable.
         if host is None or not self.environment_available(credential.apns_environment):
-            return
+            return False
         url = f"{host}/3/device/{credential.apns_token}"
         headers = {
             "authorization": f"bearer {self._auth.value()}",
@@ -990,10 +1129,10 @@ class APNsSender:
         except Exception as exc:  # noqa: BLE001
             # Timeouts and connection resets say nothing about the token.
             log.debug("apns: send failed for %s: %s", credential.id, exc)
-            return
-        self._handle_outcome(
-            credential, classify_response(response.status_code, response.text)
-        )
+            return False
+        outcome = classify_response(response.status_code, response.text)
+        self._handle_outcome(credential, outcome)
+        return outcome.kind == DELIVERED
 
     def _handle_outcome(self, credential, outcome: DeliveryOutcome) -> None:
         environment = credential.apns_environment or ""
