@@ -38,7 +38,13 @@ class ContinuityHub:
         _text(issue_key, "issue_key", 191)
         normalized = normalize_facts(facts)
         at = now or datetime.now(timezone.utc)
-        decision = decide(normalized, at, policy)
+        # Shadow comparison defaults to legacy parity; the flipped hub uses
+        # explicit worker/stage deadlines unless the caller supplies a policy.
+        decision = decide(
+            normalized,
+            at,
+            policy or ContinuityPolicy(explicit_deadlines=True),
+        )
         wake_id = None
         # ``enqueue_decision`` opens one transaction for the identity lookup and
         # insert, so two racing thin clients retain one identical durable wake.
