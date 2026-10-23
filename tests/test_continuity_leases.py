@@ -195,10 +195,13 @@ def test_apply_reap_records_intent_then_confirms_acknowledged_termination():
     assert terminated == ["x"]
     assert result[0]["applied"] is True
     assert any("archived_at" in sql for sql, _ in con.calls)
-    assert [p[2] for sql, p in con.calls if "continuity_reap_operations" in sql] == [
-        "intent",
-        "confirmed",
+    operation_calls = [
+        (sql, p)
+        for sql, p in con.calls
+        if "continuity_reap_operations" in sql and not sql.startswith("SELECT")
     ]
+    assert "'intent'" in operation_calls[0][0]
+    assert operation_calls[1][1][0] == "confirmed"
     assert not any("DELETE" in sql for sql, _ in con.calls)
 
 
@@ -227,9 +230,39 @@ def test_reap_fails_closed_for_missing_or_changed_protection_evidence():
     )
     assert terminated == []
     assert result[0]["applied"] is False
-    assert "failed" in [
-        p[2] for sql, p in con.calls if "continuity_reap_operations" in sql
-    ]
+    assert not any(
+        "continuity_reap_operations" in sql and not sql.startswith("SELECT")
+        for sql, _ in con.calls
+    )
+    assert any("continuity_reap_audit" in sql for sql, _ in con.calls)
+
+
+def test_durable_operation_prevents_duplicate_external_termination():
+    duckdb = pytest.importorskip("duckdb")
+    from drover.server.postgres_schema import (
+        CONTINUITY_LEASES_DDL,
+        CONTINUITY_REAP_OPERATIONS_DDL,
+    )
+
+    con = duckdb.connect(":memory:")
+    con.execute(
+        "CREATE TABLE harness_sessions (session_id TEXT PRIMARY KEY, archived_at TIMESTAMPTZ)"
+    )
+    con.execute("INSERT INTO harness_sessions VALUES ('x', NULL)")
+    for statement in (*CONTINUITY_LEASES_DDL, *CONTINUITY_REAP_OPERATIONS_DDL):
+        con.execute(statement)
+    candidate = ReapCandidate("x", "ended")
+    terminated = []
+    kwargs = dict(
+        actor="sweeper",
+        dry_run=False,
+        terminator=lambda sid: terminated.append(sid) or True,
+        protection_check=lambda _: CLEAR,
+        now=NOW,
+    )
+    assert reap(con, [candidate], **kwargs)[0]["applied"] is True
+    assert reap(con, [candidate], **kwargs)[0]["applied"] is False
+    assert terminated == ["x"]
 
 
 def test_reap_records_failed_outcome_when_terminator_does_not_acknowledge():
@@ -255,7 +288,10 @@ def test_reap_records_failed_outcome_when_terminator_does_not_acknowledge():
     )
     assert result[0]["applied"] is False
     assert not any("archived_at" in sql for sql, _ in con.calls)
-    assert [p[2] for sql, p in con.calls if "continuity_reap_operations" in sql] == [
-        "intent",
-        "failed",
+    operation_calls = [
+        (sql, p)
+        for sql, p in con.calls
+        if "continuity_reap_operations" in sql and not sql.startswith("SELECT")
     ]
+    assert "'intent'" in operation_calls[0][0]
+    assert operation_calls[1][1][0] == "failed"

@@ -69,7 +69,7 @@ CONTINUITY_REAP_OPERATIONS_DDL = (
     """
     CREATE TABLE IF NOT EXISTS continuity_reap_operations (
       operation_id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL REFERENCES harness_sessions(session_id),
+      session_id TEXT NOT NULL UNIQUE REFERENCES harness_sessions(session_id),
       action TEXT NOT NULL CHECK (action IN ('intent', 'confirmed', 'failed')),
       reason TEXT NOT NULL,
       actor TEXT NOT NULL,

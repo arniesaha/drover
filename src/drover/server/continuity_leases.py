@@ -8,9 +8,9 @@ both the fence and every applied action auditable.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Iterator, Mapping
 from uuid import uuid4
 
@@ -271,9 +271,10 @@ def reap(
                 continue
             # Recheck protections and insert durable intent under a session
             # fence.  The commit intentionally precedes the external call.
-            if not _prepare_reap(con, candidate, actor, dry_run, at, protection_check):
+            operation_id = _prepare_reap(con, candidate, actor, at, protection_check)
+            if operation_id is None:
                 _audit(con, candidate, actor, dry_run, at, "reap_failed")
-                record["error"] = "reap protections are not explicitly false"
+                record["error"] = "reap protected or already in progress"
                 results.append(record)
                 continue
             try:
@@ -285,10 +286,12 @@ def reap(
                     [at, candidate.session_id],
                 )
             except Exception as exc:
+                _finish_reap(con, operation_id, "failed", at)
                 _audit(con, candidate, actor, dry_run, at, "reap_failed")
                 record["error"] = str(exc)
                 results.append(record)
                 continue
+            _finish_reap(con, operation_id, "confirmed", at)
             _audit(con, candidate, actor, dry_run, at, "reap_confirmed")
             record["applied"] = True
             results.append(record)
@@ -319,19 +322,6 @@ def _audit(
             at,
         ],
     )
-    if action != "reap":
-        con.execute(
-            "INSERT INTO continuity_reap_operations (operation_id, session_id, action, reason, actor, recorded_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                str(uuid4()),
-                candidate.session_id,
-                action.removeprefix("reap_"),
-                candidate.reason,
-                actor,
-                at,
-            ],
-        )
 
 
 def _protections_clear(evidence: Mapping[str, Any]) -> bool:
@@ -345,17 +335,58 @@ def _prepare_reap(
     con: Any,
     candidate: ReapCandidate,
     actor: str,
-    dry_run: bool,
     at: datetime,
     protection_check: Callable[[str], Mapping[str, Any]],
-) -> bool:
-    """Fence a just-in-time protection check and its durable action intent."""
+) -> str | None:
+    """Claim one durable in-flight operation before the external call.
+
+    The transaction lock is released before calling harnessd, but the unique
+    per-session operation row remains the durable fence. A second sweeper sees
+    ``intent``/``confirmed`` and cannot invoke the terminator. Failed operations
+    may be reclaimed after protections are rechecked.
+    """
     with _transaction(con):
         _advisory_lock(con, "reap:" + candidate.session_id)
+        current = _one(
+            con,
+            "SELECT operation_id, action FROM continuity_reap_operations "
+            "WHERE session_id = ?" + _lock(con),
+            [candidate.session_id],
+        )
+        if current is not None and current["action"] in {"intent", "confirmed"}:
+            return None
         if not _protections_clear(protection_check(candidate.session_id)):
-            return False
-        _audit(con, candidate, actor, dry_run, at, "reap_intent")
-    return True
+            return None
+        operation_id = current["operation_id"] if current is not None else str(uuid4())
+        if current is None:
+            con.execute(
+                "INSERT INTO continuity_reap_operations "
+                "(operation_id, session_id, action, reason, actor, recorded_at) "
+                "VALUES (?, ?, 'intent', ?, ?, ?)",
+                [operation_id, candidate.session_id, candidate.reason, actor, at],
+            )
+        else:
+            con.execute(
+                "UPDATE continuity_reap_operations SET action = 'intent', "
+                "reason = ?, actor = ?, recorded_at = ? "
+                "WHERE operation_id = ? AND action = 'failed'",
+                [candidate.reason, actor, at, operation_id],
+            )
+        _audit(con, candidate, actor, False, at, "reap_intent")
+    return operation_id
+
+
+def _finish_reap(con: Any, operation_id: str, action: str, at: datetime) -> None:
+    if action not in {"confirmed", "failed"}:
+        raise ValueError("reap outcome must be confirmed or failed")
+    with _transaction(con):
+        result = con.execute(
+            "UPDATE continuity_reap_operations SET action = ?, recorded_at = ? "
+            "WHERE operation_id = ? AND action = 'intent'",
+            [action, at, operation_id],
+        )
+        if is_postgres_connection(con) and result.rowcount != 1:
+            raise RuntimeError("reap operation fence changed before outcome")
 
 
 def _lock(con: Any) -> str:
@@ -399,6 +430,8 @@ def _write_lease(con: Any, statement: str, params: list[Any]) -> None:
 
 def _one(con: Any, statement: str, params: list[Any]) -> dict | None:
     cursor = con.execute(statement, params)
+    if cursor is None:  # lightweight compatibility/test connections
+        return None
     value = cursor.fetchone()
     if value is None:
         return None
