@@ -1755,6 +1755,10 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
         from drover.server.control_outbox import ensure_legacy_outbox_schema
 
         ensure_legacy_outbox_schema(con)
+        from drover.server.continuity_wakes import CONTINUITY_WAKES_DDL
+
+        for statement in CONTINUITY_WAKES_DDL:
+            con.execute(statement)
         con.execute(_ADVISORY_FINDINGS_DDL)
         con.execute(_ADVISORY_OCCURRENCES_DDL)
         con.execute(
