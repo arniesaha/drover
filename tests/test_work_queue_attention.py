@@ -186,3 +186,22 @@ def test_conflicting_labels_do_not_hide_environment_gate(service):
     diagnostic = next(r for r in result["items"] if r["kind"] == "blocked")
     assert diagnostic["category"] == "inspect_work_labels"
     assert not diagnostic["actions"]
+
+
+def test_attention_reuses_listed_items_without_per_item_reads(service):
+    # Two GitHub round trips per goal item put this view past the MCP read
+    # deadline (drover#778); the listing already has labels and state.
+    provider_attention(service)
+    launch(service)
+    provider = service.providers["goal"]
+    calls = []
+    provider.get_item = lambda ref: pytest.fail("per-item read")
+    provider.authenticate = lambda: calls.append("auth")
+
+    result = attention(service)
+
+    assert calls == ["auth"]
+    assert {row["kind"] for row in result["items"]} >= {
+        "environment_approval",
+        "draft_pr",
+    }
