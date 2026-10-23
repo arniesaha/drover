@@ -426,6 +426,10 @@ class LiveBackupTests(unittest.TestCase):
                     json.dumps({"nas": "backup-user@nas-host", "target_root": target})
                 )
                 with (
+                    mock.patch.dict(
+                        backup.os.environ,
+                        {backup.RECEIPT_KEY_ENV: "fixture-key"},
+                    ),
                     mock.patch.object(backup, "HOME", home),
                     mock.patch.object(backup, "NAS", ""),
                     mock.patch.object(backup, "DATA", {}),
@@ -746,6 +750,10 @@ class LiveBackupTests(unittest.TestCase):
                     return {"failed": "fixture"}
 
                 with (
+                    mock.patch.dict(
+                        backup.os.environ,
+                        {backup.RECEIPT_KEY_ENV: "fixture-key"},
+                    ),
                     mock.patch.object(backup, "HOME", home),
                     mock.patch.object(backup, "DATA", {}),
                     mock.patch.object(backup, "log"),
@@ -803,6 +811,7 @@ class LiveBackupTests(unittest.TestCase):
             real_sync = backup.sync
             real_run = backup.run
             calls = []
+            published = {}
             mutations = iter((b"second", b"third!"))
 
             def sync(src, dest, previous=None, excludes=(), **kwargs):
@@ -834,6 +843,8 @@ class LiveBackupTests(unittest.TestCase):
                     return {"files": nas.inventory(pending, payload["trees"])}
                 if action == "verify":
                     return nas.verify(pending, payload)
+                if action == "publish":
+                    published.update(payload)
                 return {}
 
             with (
@@ -848,7 +859,13 @@ class LiveBackupTests(unittest.TestCase):
                 mock.patch.object(backup, "log"),
             ):
                 backup.backup_generation(
-                    "helper", str(nas_root), date, {"previous": None}, 0, "fixture"
+                    "helper",
+                    str(nas_root),
+                    date,
+                    {"previous": None},
+                    0,
+                    "fixture",
+                    b"fixture-key",
                 )
             lake_calls = [call for call in calls if call[0] == source]
             self.assertEqual(len(lake_calls), 2)
@@ -866,6 +883,16 @@ class LiveBackupTests(unittest.TestCase):
                     "verification_ok"
                 ]
             )
+            self.assertTrue(published["verification_ok"])
+            self.assertEqual(len(published["artifact_manifest_sha256"]), 64)
+            self.assertEqual(
+                published["local_backup_manifest_sha256"],
+                published["artifact_manifest_sha256"],
+            )
+            self.assertEqual(
+                published["producer"]["name"], backup.RECEIPT_PRODUCER["name"]
+            )
+            self.assertEqual(len(published["producer"]["signature"]), 64)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import ctypes.util
 import datetime as dt
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -77,11 +78,31 @@ RISK = (
     "describe the frozen NAS copy after the final pass. Cross-store atomicity "
     "and DuckLake catalog reference completeness are not proven."
 )
+RECEIPT_KEY_ENV = "DROVER_NAS_SNAPSHOT_RECEIPT_KEY"
+RECEIPT_PRODUCER = {"name": "studio_backup", "schema_version": 2}
 
 
 def log(message):
     with LOG.open("a") as f:
         f.write(dt.datetime.now().astimezone().isoformat() + " " + message + "\n")
+
+
+def sign_receipt(receipt, key):
+    """Bind private local evidence to a versioned Studio backup producer."""
+    if not isinstance(key, bytes) or not key:
+        raise RuntimeError("NAS snapshot receipt key missing")
+    signed = json.loads(json.dumps(receipt))
+    producer = signed.setdefault("producer", dict(RECEIPT_PRODUCER))
+    producer.pop("signature", None)
+    payload = json.dumps(signed, sort_keys=True, separators=(",", ":")).encode()
+    producer["signature"] = hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return signed
+
+
+def backup_manifest_identity(date, entries):
+    """Match the private NAS MANIFEST.json bytes before publishing a receipt."""
+    request = {"date": date, "files": entries}
+    return hashlib.sha256(json.dumps(request, indent=2).encode()).hexdigest()
 
 
 def redact_diagnostic(value):
@@ -360,6 +381,12 @@ def backup():
         or ".." in Path(target).parts
     ):
         raise RuntimeError("invalid NAS backup root")
+    key_env = config.get("receipt_key_env", RECEIPT_KEY_ENV)
+    if not isinstance(key_env, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key_env):
+        raise RuntimeError("invalid NAS snapshot receipt key environment")
+    receipt_key = os.environ.get(key_env, "").encode()
+    if not receipt_key:
+        raise RuntimeError("NAS snapshot receipt key missing")
     root = str(Path(target) / host)
     helper = Path(__file__).with_name("nas_snapshot.py").read_text()
     for source in DATA.values():
@@ -368,7 +395,7 @@ def backup():
     log("stage=NAS_preflight")
     preparation = remote(helper, "prepare", root, {"date": date})
     try:
-        backup_generation(helper, root, date, preparation, started, host)
+        backup_generation(helper, root, date, preparation, started, host, receipt_key)
     except Exception:
         try:
             remote(helper, "fail", root, {"date": date})
@@ -380,7 +407,7 @@ def backup():
 
 def verify_generation(helper, root, date, entries):
     verification = remote(helper, "verify", root, {"date": date, "files": entries})
-    if not verification.pop("verification_ok"):
+    if verification.get("verification_ok") is not True:
         for failure in verification["failures"]:
             # JSON escaping prevents filenames injecting additional log lines.
             log("NAS_verification_failure " + json.dumps(failure, ensure_ascii=True))
@@ -388,7 +415,7 @@ def verify_generation(helper, root, date, entries):
     return verification
 
 
-def backup_generation(helper, root, date, preparation, started, host):
+def backup_generation(helper, root, date, preparation, started, host, receipt_key):
     pending = root + "/.pending-" + date
     previous = root + "/" + preparation["previous"] if preparation["previous"] else None
     with tempfile.TemporaryDirectory(prefix="stage-", dir=STATE) as staging:
@@ -483,6 +510,12 @@ def backup_generation(helper, root, date, preparation, started, host):
         )
         log("stage=NAS_checksum_verification")
         verification = verify_generation(helper, root, date, entries)
+        local_backup_manifest_sha256 = backup_manifest_identity(date, entries)
+        if not hmac.compare_digest(
+            verification.get("artifact_manifest_sha256", ""),
+            local_backup_manifest_sha256,
+        ):
+            raise RuntimeError("NAS manifest identity mismatch")
         # Read every archive back from NAS and list it with the matching local tool.
         # NAS does not need PostgreSQL installed. No production restore is performed.
         log("stage=NAS_pg_restore_list")
@@ -500,18 +533,22 @@ def backup_generation(helper, root, date, preparation, started, host):
                 )
             run([str(PG / "pg_restore"), "--list", str(returned)])
             returned.unlink()
-        receipt = {
-            "date": date,
-            "host": host,
-            "nas_path": root + "/" + date,
-            "completed_at": dt.datetime.now().astimezone().isoformat(),
-            "completed_epoch": time.time(),
-            "duration_s": round(time.monotonic() - started, 2),
-            "databases": len(databases),
-            "nas_pg_restore_list": True,
-            "consistency_risk": RISK,
-            **verification,
-        }
+        receipt = sign_receipt(
+            {
+                "date": date,
+                "host": host,
+                "nas_path": root + "/" + date,
+                "completed_at": dt.datetime.now().astimezone().isoformat(),
+                "completed_epoch": time.time(),
+                "duration_s": round(time.monotonic() - started, 2),
+                "databases": len(databases),
+                "nas_pg_restore_list": True,
+                "consistency_risk": RISK,
+                "local_backup_manifest_sha256": local_backup_manifest_sha256,
+                **verification,
+            },
+            receipt_key,
+        )
         retention = remote(helper, "publish", root, receipt)
         temporary = STATE / "last-success.json.tmp"
         temporary.write_text(json.dumps(receipt, indent=2))

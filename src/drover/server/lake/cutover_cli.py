@@ -286,6 +286,38 @@ def backup_cmd(lake, lake_root, gate_root, backup_root, plist, pg_bin, dry_run):
 @click.option("--lock-sha256", required=True, help="Published release lock digest.")
 @click.option("--backup", required=True, type=click.Path(path_type=Path))
 @click.option(
+    "--nas-snapshot-receipt",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Existing Studio NAS success receipt; requires --ledger.",
+)
+@click.option(
+    "--ledger",
+    type=click.Path(path_type=Path),
+    help="New private, immutable snapshot/preflight evidence ledger.",
+)
+@click.option(
+    "--ledger-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Owner-only evidence directory containing the new ledger; requires --ledger.",
+)
+@click.option(
+    "--nas-snapshot-manifest-sha256",
+    help="SHA-256 of the published NAS MANIFEST.json; requires --ledger.",
+)
+@click.option(
+    "--nas-snapshot-key-env",
+    default="DROVER_NAS_SNAPSHOT_RECEIPT_KEY",
+    show_default=True,
+    help="Environment variable holding the NAS snapshot receipt HMAC key.",
+)
+@click.option(
+    "--max-nas-snapshot-age-hours",
+    type=click.FloatRange(min=0, min_open=True),
+    default=36,
+    show_default=True,
+    help="Maximum age of the existing NAS success receipt when using --ledger.",
+)
+@click.option(
     "--device-token-env",
     default="DROVER_RELEASE_GATE_DEVICE_TOKEN",
     show_default=True,
@@ -311,14 +343,35 @@ def release_preflight_cmd(
     wheel_sha256,
     lock_sha256,
     backup,
+    nas_snapshot_receipt,
+    ledger,
+    ledger_root,
+    nas_snapshot_manifest_sha256,
+    nas_snapshot_key_env,
+    max_nas_snapshot_age_hours,
     device_token_env,
     min_free_gb,
     max_backup_age_hours,
     pg_bin,
 ):
     """Read-only staged release checks; schema changes require the full gate."""
+    from .release_workflow import (
+        WorkflowError,
+        build_release_workflow_ledger,
+        snapshot_receipt_check,
+        write_release_workflow_ledger,
+    )
     from .rollout import run_release_preflight
 
+    if not (
+        bool(nas_snapshot_receipt)
+        == bool(ledger)
+        == bool(ledger_root)
+        == bool(nas_snapshot_manifest_sha256)
+    ):
+        raise click.UsageError(
+            "--nas-snapshot-receipt, --nas-snapshot-manifest-sha256, --ledger and --ledger-root must be used together"
+        )
     plan = _plan(lake, lake_root, gate_root, backup_root)
     try:
         _release_preflight_inputs(
@@ -330,17 +383,29 @@ def release_preflight_cmd(
         )
         service = ServiceView.load(plist)
         device_token = os.environ.get(device_token_env, "")
-        checks = run_release_preflight(
-            plan,
-            service,
-            release=release,
-            wheel_sha256=wheel_sha256,
-            lock_sha256=lock_sha256,
-            backup=backup,
-            min_free_bytes=int(min_free_gb * 1024**3),
-            max_backup_age_hours=max_backup_age_hours,
-            pg_bin=pg_bin,
-            device_token=device_token,
+        snapshot = None
+        if nas_snapshot_receipt:
+            snapshot = snapshot_receipt_check(
+                json.loads(nas_snapshot_receipt.read_text(encoding="utf-8")),
+                receipt_key=os.environ.get(nas_snapshot_key_env, ""),
+                expected_manifest_sha256=nas_snapshot_manifest_sha256,
+                max_age_hours=max_nas_snapshot_age_hours,
+            )
+        checks = (
+            run_release_preflight(
+                plan,
+                service,
+                release=release,
+                wheel_sha256=wheel_sha256,
+                lock_sha256=lock_sha256,
+                backup=backup,
+                min_free_bytes=int(min_free_gb * 1024**3),
+                max_backup_age_hours=max_backup_age_hours,
+                pg_bin=pg_bin,
+                device_token=device_token,
+            )
+            if snapshot is None or snapshot.passed
+            else None
         )
     except (OSError, ValueError, CutoverError) as exc:
         _emit(
@@ -351,6 +416,26 @@ def release_preflight_cmd(
                 error="release preflight input invalid",
                 detail=_input_detail(exc, os.environ.get(device_token_env, "")),
             )
+        )
+    if ledger:
+        try:
+            document = build_release_workflow_ledger(
+                plan, release=release, snapshot=snapshot, preflight=checks
+            )
+            write_release_workflow_ledger(ledger, document, evidence_root=ledger_root)
+        except WorkflowError as exc:
+            _emit(
+                verdict(
+                    "release-preflight",
+                    plan,
+                    [],
+                    error="release workflow ledger invalid",
+                    detail=_input_detail(exc),
+                )
+            )
+        click.echo(json.dumps(document, indent=2, default=str))
+        raise SystemExit(
+            0 if document["phases"]["release_preflight"]["state"] == "succeeded" else 1
         )
     _emit(verdict("release-preflight", plan, checks))
 

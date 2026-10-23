@@ -208,6 +208,15 @@ Logs live in `~/Library/Logs/drover/backup.log`. The successful local receipt is
 `~/.drover/backup-state/last-success.json`; `soak-probe.sh` reports its
 `backup_age_h`. Missing evidence is informational before the first success;
 once present, evidence older than 36 hours or invalid evidence fails the probe.
+The receipt can be supplied to `cutover release-preflight --nas-snapshot-receipt
+... --nas-snapshot-manifest-sha256 ... --ledger-root ... --ledger ...` to
+create a separate, immutable local evidence ledger for a release check. The
+Studio process needs a private `DROVER_NAS_SNAPSHOT_RECEIPT_KEY` (or the
+configured `receipt_key_env`) to HMAC the receipt's explicit verification and
+NAS-manifest correlation evidence. The receipt records both the locally
+computed backup-manifest identity and the NAS manifest digest; they must match.
+The adapter only reads the receipt; it never
+reruns, publishes, prunes, or otherwise changes a NAS generation.
 
 WAL/PITR instructions belong in `~/.drover/maintenance/pg-wal-archiving.md`.
 They are a deferred maintenance plan, with no cluster restart or WAL changes

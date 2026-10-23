@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from drover.server.lake.cutover import CutoverPlan, ServiceView
+from drover.server.lake.cutover import Check, CutoverPlan, ServiceView
 from drover.server.runtime import RuntimeLayout
 from drover.server.service_units import render_launchd
 
@@ -667,6 +668,72 @@ def _invoke_release_preflight(runner, arguments, *, env=None, **values):
         ],
         env=env,
     )
+
+
+def test_release_preflight_ledger_records_snapshot_and_never_claims_rollout(
+    tmp_path, monkeypatch
+):
+    from click.testing import CliRunner
+
+    from drover.server.lake import rollout
+    from drover.server.lake.release_workflow import (
+        read_release_workflow_ledger,
+        sign_snapshot_receipt,
+    )
+
+    values = _release_preflight_input_args(tmp_path)
+    receipt = tmp_path / "last-success.json"
+    receipt.write_text(
+        json.dumps(
+            sign_snapshot_receipt(
+                {
+                    "date": "2026-10-22",
+                    "host": "studio",
+                    "nas_path": "/approved/snapshots/studio/2026-10-22",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "databases": 2,
+                    "verification_ok": True,
+                    "nas_pg_restore_list": True,
+                    "verified_files": 3,
+                    "verified_bytes": 100,
+                    "artifact_manifest_sha256": "a" * 64,
+                    "local_backup_manifest_sha256": "a" * 64,
+                    "producer": {"name": "studio_backup", "schema_version": 2},
+                },
+                "test-receipt-key",
+            )
+        )
+    )
+    ledger_root = tmp_path / "evidence"
+    ledger_root.mkdir(mode=0o700)
+    ledger = ledger_root / "release-ledger.json"
+    monkeypatch.setattr(
+        rollout,
+        "run_release_preflight",
+        lambda *args, **kwargs: [Check("backup", True, {"verified": True})],
+    )
+    result = _invoke_release_preflight(
+        CliRunner(),
+        [
+            "--nas-snapshot-receipt",
+            str(receipt),
+            "--ledger",
+            str(ledger),
+            "--ledger-root",
+            str(ledger_root),
+            "--nas-snapshot-manifest-sha256",
+            "a" * 64,
+        ],
+        env={"DROVER_NAS_SNAPSHOT_RECEIPT_KEY": "test-receipt-key"},
+        **values,
+    )
+
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.output)
+    assert document["status"] == "blocked"
+    assert document["phases"]["release_preflight"]["state"] == "succeeded"
+    assert document["phases"]["rollout"]["state"] == "blocked"
+    assert read_release_workflow_ledger(ledger) == document
 
 
 def test_release_preflight_missing_plist_names_the_input(tmp_path):

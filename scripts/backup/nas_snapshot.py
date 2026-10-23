@@ -136,6 +136,7 @@ def verify(pending, request):
         manifest_path(pending, entry["path"])
     with (pending / "MANIFEST.json").open("w") as f:
         json.dump(request, f, indent=2)
+    artifact_manifest_sha256 = digest(pending / "MANIFEST.json")
     failures = []
     total = 0
     for entry in request["files"]:
@@ -164,6 +165,7 @@ def verify(pending, request):
             total += entry["size"]
     result = {
         "verification_ok": not failures,
+        "artifact_manifest_sha256": artifact_manifest_sha256,
         "verified_files": len(request["files"]) - len(failures),
         "verified_bytes": total,
     }
