@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.29] - 2026-10-23
+
+### Added
+
+- `cutover release-preflight` can record a private, append-only evidence ledger that correlates an existing verified Studio NAS snapshot receipt with its read-only preflight result; it does not publish, select, or roll out a release (#772).
+
+### Fixed
+
+- Factory observer completion events are routed through durable, authenticated owner handoff and receipt records, preserving explicit owner acknowledgment boundaries for the inactive continuity plugin (#774).
+
+### Upgrade notes
+
+- Additive control migrations 28–29 extend Factory observer owner handoff and durable completion receipts. No DuckLake schema or engine/runtime pin migration is included. Upgrade the hub and harnessd hosts; NAS keeps `--relay`.
+
 ## [0.6.28] - 2026-10-22
 
 ### Added
