@@ -164,7 +164,12 @@ class WorkService:
 
     def item(self, goal_id, number):
         scope, provider, policy, ref = self.scope(goal_id, number)
-        return provider, policy, ref, self.checked(scope, policy, provider.get_item(ref))
+        return (
+            provider,
+            policy,
+            ref,
+            self.checked(scope, policy, provider.get_item(ref)),
+        )
 
     @staticmethod
     def checked(scope, policy, item):
