@@ -132,7 +132,9 @@ def _write_cache(data):
 
 
 def _expiry(token):
-    return dt.datetime.fromisoformat(token["expires_at"].replace("Z", "+00:00")).timestamp()
+    return dt.datetime.fromisoformat(
+        token["expires_at"].replace("Z", "+00:00")
+    ).timestamp()
 
 
 def mint(cfg, repo=None, now=None):
@@ -147,7 +149,9 @@ def mint(cfg, repo=None, now=None):
     jwt = app_jwt(cfg["DROVER_GH_APP_ID"], cfg["DROVER_GH_APP_KEY_FILE"], now)
     if not inst:
         if not repo:
-            raise MintError("set DROVER_GH_APP_INSTALLATION_ID or pass --repo owner/name")
+            raise MintError(
+                "set DROVER_GH_APP_INSTALLATION_ID or pass --repo owner/name"
+            )
         inst = str(_api("GET", f"/repos/{repo}/installation", jwt)["id"])
     r = _api("POST", f"/app/installations/{inst}/access_tokens", jwt)
     tok = {"token": r["token"], "expires_at": r["expires_at"], "installation_id": inst}
@@ -159,8 +163,12 @@ def mint(cfg, repo=None, now=None):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--repo", default=os.environ.get("DROVER_GH_REPO", "arniesaha/drover"))
-    p.add_argument("--json", action="store_true", help="print {token, expires_at, installation_id}")
+    p.add_argument(
+        "--repo", default=os.environ.get("DROVER_GH_REPO", "arniesaha/drover")
+    )
+    p.add_argument(
+        "--json", action="store_true", help="print {token, expires_at, installation_id}"
+    )
     a = p.parse_args(argv)
     cfg = load_config()
     if not cfg:
