@@ -32,6 +32,10 @@ class Poll(WireModel):
     limit: Annotated[int, Field(ge=1, le=50)] = 20
 
 
+class Initialize(WireModel):
+    operation: Literal["initialize"]
+
+
 class Lease(WireModel):
     operation: Literal["lease"]
     owner_epoch: Epoch | None = None
@@ -62,7 +66,8 @@ class Acknowledge(WireModel):
 class OwnerToolCall(WireModel):
     version: Literal[1]
     request: Annotated[
-        Poll | Lease | Report | Consume | Acknowledge, Field(discriminator="operation")
+        Poll | Initialize | Lease | Report | Consume | Acknowledge,
+        Field(discriminator="operation"),
     ]
 
 
@@ -100,6 +105,32 @@ class OwnerLease(WireModel):
     live: bool
 
 
+class OwnerHandoff(WireModel):
+    authorized_owner_id: Id | None
+    state: Literal[
+        "awaiting_completion",
+        "authorization_required",
+        "owner_lease_required",
+        "acknowledgement_required",
+        "acknowledged",
+        "failed",
+    ]
+
+
+class CompletionReceiptError(WireModel):
+    harness_event_id: Id
+    state: Literal["pending_authorization", "rejected"]
+    reason: Id
+
+
+class CompletionReceipts(WireModel):
+    counts: dict[
+        Literal["projected", "pending_authorization", "rejected"],
+        Annotated[int, Field(ge=0)],
+    ]
+    errors: Annotated[list[CompletionReceiptError], Field(max_length=50)]
+
+
 class InboxReport(WireModel):
     source: Id
     source_event_id: Id
@@ -127,6 +158,7 @@ class ContinuityProjection(WireModel):
     checkpoint: Checkpoint
     authority_scope: Scope
     scope_limit: Literal["commit_only", "publish_review", "explicit_approval_required"]
+    owner_handoff: OwnerHandoff
     owner: OwnerLease
     worker_state: Literal["unknown", "awaiting_input", "brief_completed"]
     terminal_release: Literal[False]
@@ -143,6 +175,7 @@ class ContinuityProjection(WireModel):
         Literal["pending", "delivered", "acknowledged", "exhausted"],
         Annotated[int, Field(ge=0)],
     ]
+    completion_receipts: CompletionReceipts
     events: Annotated[list[InboxEntry], Field(max_length=50)]
     has_more: bool
 
@@ -187,7 +220,7 @@ def owner_tool_definition() -> dict:
     """
     return {
         "name": TOOL_NAME,
-        "description": "Read/report/lease/consume/ack Drover owner continuity. Actions are advisory; no Factory controls, merge or deployment. Ack only after idempotent owner reconciliation.",
+        "description": "Initialize/report/lease/consume/ack Drover owner continuity. Actions are advisory; no Factory controls, merge or deployment. Ack only after idempotent owner reconciliation.",
         "parameters": OwnerToolCall.model_json_schema(),
     }
 
@@ -208,6 +241,10 @@ class OpenClawOwnerAdapter:
         run_id: str,
         owner_id: str,
         authority_scope: Scope,
+        session_id: str | None = None,
+        objective: str | None = None,
+        checkpoint: str | None = None,
+        handoff_token: str | None = None,
     ):
         # Reuse strict field validation without accepting credentials or URLs.
         context = _OwnerContext(
@@ -215,6 +252,10 @@ class OpenClawOwnerAdapter:
         )
         self.endpoint = endpoint
         self.context = context
+        self.session_id = session_id
+        self.objective = objective
+        self.checkpoint = checkpoint
+        self.handoff_token = handoff_token
 
     def invoke(self, payload: dict) -> OwnerToolReply:
         call = OwnerToolCall.model_validate(payload)
@@ -225,18 +266,32 @@ class OpenClawOwnerAdapter:
                 ENDPOINT, query={"run_id": context.run_id, "limit": request.limit}
             )
         else:
-            # Run scope is immutable. Check it before a mutation so a wrongly
-            # bound adapter cannot acknowledge a different authority scope.
+            # Run scope is immutable. A first handoff may be unbound, but its
+            # preflight still must match the trusted run and scope before POST.
             self._reply(
                 self.endpoint.get(
                     ENDPOINT, query={"run_id": context.run_id, "limit": 1}
-                )
+                ),
+                allow_unbound_owner=isinstance(request, Initialize),
             )
-            body = request.model_dump(exclude_none=True)
-            body["run_id"] = context.run_id
+            if isinstance(request, Initialize):
+                if not all((self.session_id, self.objective, self.checkpoint)):
+                    raise ValueError("trusted initialization binding is required")
+                body = {
+                    "operation": "initialize",
+                    "session_id": self.session_id,
+                    "objective": self.objective,
+                    "checkpoint": self.checkpoint,
+                    "authority_scope": context.authority_scope,
+                }
+                if self.handoff_token is not None:
+                    body["handoff_token"] = self.handoff_token
+            else:
+                body = request.model_dump(exclude_none=True)
+                body["run_id"] = context.run_id
             if isinstance(request, Report):
                 body["source"] = "openclaw"
-            else:
+            elif not isinstance(request, Initialize):
                 body["owner_id"] = context.owner_id
             raw = self.endpoint.post(ENDPOINT, body=body)
         reply = self._reply(raw)
@@ -265,7 +320,7 @@ class OpenClawOwnerAdapter:
             raise ValueError("only report may return an event identity")
         return reply
 
-    def _reply(self, raw: dict) -> OwnerToolReply:
+    def _reply(self, raw: dict, *, allow_unbound_owner: bool = False) -> OwnerToolReply:
         # Strict JSON validation permits wire ISO timestamps without coercing
         # epoch strings/bools, unknown action names, or authority expansions.
         if "version" in raw:
@@ -277,6 +332,12 @@ class OpenClawOwnerAdapter:
             or projection.authority_scope != self.context.authority_scope
         ):
             raise ValueError("reply does not match the trusted owner run/scope")
+        if projection.owner_handoff.authorized_owner_id not in (
+            {None, self.context.owner_id}
+            if allow_unbound_owner
+            else {self.context.owner_id}
+        ):
+            raise ValueError("reply does not match the trusted owner identity")
         return reply
 
 

@@ -56,6 +56,7 @@ function reply(raw, config) {
   safeIntegers(result);
   const status = result.continuity;
   requireValue(status.run_id === config.runId && status.authority_scope === config.authorityScope, "Reply differs from trusted run/scope");
+  requireValue(status.owner_handoff.authorized_owner_id === config.ownerPrincipal, "Reply differs from trusted authorized owner");
   requireValue(status.scope_limit === scopes[config.authorityScope], "Reply scope limit is inconsistent");
   checkAction(status.next_action, config.authorityScope);
   checkAction(result.delivery, config.authorityScope);
@@ -119,13 +120,17 @@ async function invoke(config, readOnly, payload, signal, assertCurrent) {
   let raw;
   if (args.operation === "poll") raw = await get(args.limit ?? 20);
   else {
-    const preflight = await get(1);
-    requireValue(!Object.hasOwn(preflight, "delivery") && !Object.hasOwn(preflight, "event_id"), "Status cannot deliver or acknowledge an event");
-    reply(preflight, config); // Immutable scope check before any mutation.
-    const body = { ...args, run_id: config.runId };
+    if (args.operation !== "initialize") {
+      const preflight = await get(1);
+      requireValue(!Object.hasOwn(preflight, "delivery") && !Object.hasOwn(preflight, "event_id"), "Status cannot deliver or acknowledge an event");
+      reply(preflight, config); // Immutable scope check before any mutation.
+    }
+    const body = args.operation === "initialize"
+      ? initializeBody(config)
+      : { ...args, run_id: config.runId };
     if (body.owner_epoch === null) delete body.owner_epoch;
     if (args.operation === "report") body.source = "openclaw";
-    else body.owner_id = config.ownerSessionKey;
+    else if (args.operation !== "initialize") body.owner_id = config.ownerPrincipal;
     raw = await request(config, "POST", body, signal, assertCurrent);
   }
   const result = reply(raw, config);
@@ -135,12 +140,25 @@ async function invoke(config, readOnly, payload, signal, assertCurrent) {
     requireValue(result.delivery === null || (status.next_action && actionFields.every((key) => result.delivery[key] === status.next_action[key])), "Delivery differs from the durable action");
   } else requireValue(!Object.hasOwn(raw, "delivery"), "Only consume may deliver an owner action");
   if (["lease", "consume", "acknowledge"].includes(args.operation)) {
-    requireValue(status.owner.id === config.ownerSessionKey && status.owner.live, "Reply no longer carries the trusted live owner");
+    requireValue(status.owner.id === config.ownerPrincipal && status.owner.live, "Reply no longer carries the trusted live owner");
     if (args.operation !== "lease") requireValue(status.owner.epoch === args.owner_epoch, "Reply no longer carries the requested owner epoch");
   }
   if (args.operation === "report") requireValue(result.event_id !== null, "Report must return its durable identity");
   else requireValue(!Object.hasOwn(raw, "event_id"), "Only report may return an event identity");
   return result;
+}
+
+function initializeBody(config) {
+  requireValue(typeof config.observerSessionId === "string" && config.observerSessionId.length > 0, "Initialize requires a trusted observer session binding");
+  requireValue(typeof config.objective === "string" && config.objective.trim().length > 0, "Initialize requires a trusted objective");
+  requireValue(typeof config.checkpoint === "string" && config.checkpoint.trim().length > 0, "Initialize requires a trusted checkpoint");
+  const body = { operation: "initialize", session_id: config.observerSessionId, objective: config.objective, checkpoint: config.checkpoint, authority_scope: config.authorityScope };
+  if (config.handoffTokenEnvName !== undefined) {
+    const handoffToken = process.env[config.handoffTokenEnvName];
+    requireValue(typeof handoffToken === "string" && handoffToken.length > 0 && handoffToken.length <= 512 && !/\s/.test(handoffToken), "Configured owner handoff token is missing or malformed");
+    body.handoff_token = handoffToken;
+  }
+  return body;
 }
 
 // SDK 2026.9.6: V2 descriptor uses trusted sessionKey and live invocation guard.

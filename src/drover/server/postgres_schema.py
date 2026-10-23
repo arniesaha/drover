@@ -6,7 +6,7 @@ import logging
 from time import monotonic
 from typing import Any
 
-from drover.server.continuity_schema import CONTINUITY_DDL
+from drover.server.continuity_schema import POSTGRES_V10_CONTINUITY_DDL
 from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
 
 log = logging.getLogger(__name__)
@@ -20,6 +20,8 @@ WORK_ITEM_EVENTS_MIGRATION = 24
 GITHUB_WORK_ITEM_EVENTS_MIGRATION = 25
 CONTINUITY_RULES_MIGRATION = 26
 GITHUB_ENVIRONMENT_APPROVALS_MIGRATION = 27
+CONTINUITY_OWNER_HANDOFF_MIGRATION = 28
+CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION = 29
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -531,7 +533,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "SELECT drover_refresh_session_search(session_id) FROM harness_sessions",
         ),
     ),
-    (10, CONTINUITY_DDL),
+    (10, POSTGRES_V10_CONTINUITY_DDL),
     (
         11,
         (
@@ -885,6 +887,33 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
               notified_at TIMESTAMPTZ, escalated_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ,
               PRIMARY KEY (work_item_id, run_id, environment))""",
             "CREATE INDEX IF NOT EXISTS github_environment_approvals_pending ON github_environment_approvals (state, last_seen_at)",
+        ),
+    ),
+    (
+        CONTINUITY_OWNER_HANDOFF_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS authorized_owner_id TEXT",
+            """
+            CREATE TABLE IF NOT EXISTS factory_observer_completion_receipts (
+              harness_event_id TEXT PRIMARY KEY, run_id TEXT,
+              session_id TEXT NOT NULL, sequence BIGINT,
+              state TEXT NOT NULL CHECK (state IN
+                ('projected', 'pending_authorization', 'rejected')),
+              reason TEXT, continuity_event_id TEXT,
+              recorded_at TIMESTAMPTZ NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS factory_observer_completion_receipts_run ON factory_observer_completion_receipts (run_id, state, recorded_at, harness_event_id)",
+        ),
+    ),
+    (
+        CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_owner_id TEXT",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_token_sha256 TEXT",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_issued_by TEXT",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_issued_at TIMESTAMPTZ",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_redeemed_at TIMESTAMPTZ",
         ),
     ),
 )

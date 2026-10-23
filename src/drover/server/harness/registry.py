@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -42,6 +42,7 @@ from drover.server.harness.recap_jobs import (
     LiveRecap,
     enqueue_live_recap,
     latest_live_recaps,
+    lock_live_recap_sessions,
 )
 
 
@@ -323,6 +324,49 @@ def _enqueue_recap_if_completion(
     if not _supports_live_recaps(mode, harness):
         return False
     return enqueue_live_recap(con, session_id, seq, store_path=store_path)
+
+
+def _completion_recap_session_ids(
+    records: Iterable[dict[str, Any]],
+) -> Iterator[str]:
+    """Yield sessions whose records can enqueue a live recap.
+
+    This mirrors the cheap, payload-only part of
+    :func:`_enqueue_recap_if_completion`. Session mode is intentionally
+    deferred to that function, after the globally ordered advisory locks have
+    been acquired.
+    """
+    for record in records:
+        sequence = record.get("seq")
+        payload = record.get("payload")
+        if (
+            record.get("event_type") == "status"
+            and isinstance(payload, dict)
+            and _is_turn_completion_payload(payload)
+            and isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+        ):
+            yield str(record["session_id"])
+
+
+def _lock_completion_recap_sessions(
+    con: object,
+    records: Iterable[dict[str, Any]],
+    *,
+    store_path: str | Path,
+) -> None:
+    """Pre-lock live recap subjects for a bulk delivery in global order."""
+    if not is_postgres_connection(con):
+        return
+    # A session may be created after this event batch begins. Lock all valid
+    # completion candidates, not only sessions visible to an early mode
+    # lookup, so a newly visible structured session cannot fall back to an
+    # input-ordered advisory lock during its eventual enqueue.
+    lock_live_recap_sessions(
+        con,
+        _completion_recap_session_ids(records),
+        store_path=store_path,
+    )
 
 
 def _enqueue_latest_stored_completion(
@@ -902,6 +946,15 @@ class HarnessRegistry:
                         LIMIT ?""",
                     [max(1, int(limit))],
                 ).fetchall()
+                # Reconciliation processes the oldest marker first, which
+                # need not be lexical. Pre-acquire its complete recap-subject
+                # set through the same global order used by bulk ingestion so
+                # it cannot invert a concurrent A/B completion delivery.
+                lock_live_recap_sessions(
+                    con,
+                    (str(session_id) for session_id, in rows),
+                    store_path=self.control_plane_path,
+                )
                 enqueued = 0
                 for (session_id,) in rows:
                     enqueued += _enqueue_latest_stored_completion(
@@ -1540,6 +1593,28 @@ class HarnessRegistry:
                         event_type=event_type,
                         payload=payload or {},
                     )
+                    # An initialized Factory observer run has an explicit,
+                    # durable session binding.  A real sequenced completion
+                    # can therefore become an owner-continuation fact in the
+                    # same commit as its source event.  The projection itself
+                    # never sends to or otherwise claims an external parent.
+                    from drover.server.harness.continuity import (
+                        record_observer_worker_completion_batch,
+                    )
+
+                    record_observer_worker_completion_batch(
+                        con,
+                        [
+                            {
+                                "event_id": event_id,
+                                "session_id": session_id,
+                                "event_type": event_type,
+                                "sequence": seq,
+                                "payload": payload,
+                                "received_at": created_at,
+                            }
+                        ],
+                    )
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
@@ -1638,6 +1713,16 @@ class HarnessRegistry:
                 return 0
             con.execute("BEGIN TRANSACTION")
             try:
+                completion_records: list[dict[str, Any]] = []
+                # ``enqueue_live_recap`` takes a transaction-held advisory
+                # lock for its session. Take every possible recap subject in
+                # lexical order before processing the batch, rather than in
+                # event order, so A->B and B->A deliveries cannot deadlock.
+                _lock_completion_recap_sessions(
+                    con,
+                    (record for record, *_ in inserted_records),
+                    store_path=self.control_plane_path,
+                )
                 # Same reasoning as the single-event path above: the SELECT
                 # into `existing` narrows the batch, but it is still a
                 # check-then-act, and two batches carrying the same
@@ -1718,6 +1803,37 @@ class HarnessRegistry:
                             else {}
                         ),
                     )
+                    completion_records.append(
+                        {
+                            "event_id": str(record["event_id"]),
+                            "session_id": str(record["session_id"]),
+                            "event_type": str(record["event_type"]),
+                            "sequence": seq,
+                            "payload": record.get("payload"),
+                            "received_at": created_at,
+                        }
+                    )
+                from drover.server.harness.continuity import (
+                    MAX_COMPLETION_PROJECTION_BATCH,
+                    lock_observer_sessions,
+                    record_observer_worker_completion_batch,
+                )
+
+                # This transaction retains session locks through every chunk.
+                # Acquire them once in lexical order so concurrent batches
+                # cannot hold the same pair in opposite orders.
+                lock_observer_sessions(
+                    con, (record["session_id"] for record in completion_records)
+                )
+                for offset in range(
+                    0, len(completion_records), MAX_COMPLETION_PROJECTION_BATCH
+                ):
+                    record_observer_worker_completion_batch(
+                        con,
+                        completion_records[
+                            offset : offset + MAX_COMPLETION_PROJECTION_BATCH
+                        ],
+                    )
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
@@ -1762,6 +1878,15 @@ class HarnessRegistry:
                     con.execute("COMMIT")
                     return 0
 
+                # Keep recap advisory locks in the same global order across
+                # the entire bulk delivery, including records projected in
+                # later completion chunks.
+                _lock_completion_recap_sessions(
+                    con,
+                    incoming,
+                    store_path=self.control_plane_path,
+                )
+
                 session_ids = sorted({str(record["session_id"]) for record in incoming})
                 session_placeholders = ", ".join("?" for _ in session_ids)
                 session_rows = {
@@ -1788,6 +1913,7 @@ class HarnessRegistry:
                 }
 
                 inserted_by_session: dict[str, list[dict[str, Any]]] = {}
+                completion_records: list[dict[str, Any]] = []
                 for record in incoming:
                     event_id = str(record["event_id"])
                     session_id = str(record["session_id"])
@@ -1868,6 +1994,16 @@ class HarnessRegistry:
                         event_type=event_type,
                         payload=payload,
                     )
+                    completion_records.append(
+                        {
+                            "event_id": event_id,
+                            "session_id": session_id,
+                            "event_type": event_type,
+                            "sequence": seq,
+                            "payload": payload,
+                            "received_at": created_at,
+                        }
+                    )
                     inserted_count += 1
                     inserted_by_session.setdefault(session_id, []).append(
                         {
@@ -1877,6 +2013,28 @@ class HarnessRegistry:
                             "created_at": created_at,
                             "seq": seq,
                         }
+                    )
+
+                from drover.server.harness.continuity import (
+                    MAX_COMPLETION_PROJECTION_BATCH,
+                    lock_observer_sessions,
+                    record_observer_worker_completion_batch,
+                )
+
+                # This transaction retains session locks through every chunk.
+                # Acquire them once in lexical order so concurrent batches
+                # cannot hold the same pair in opposite orders.
+                lock_observer_sessions(
+                    con, (record["session_id"] for record in completion_records)
+                )
+                for offset in range(
+                    0, len(completion_records), MAX_COMPLETION_PROJECTION_BATCH
+                ):
+                    record_observer_worker_completion_batch(
+                        con,
+                        completion_records[
+                            offset : offset + MAX_COMPLETION_PROJECTION_BATCH
+                        ],
                     )
 
                 for session_id, inserted_events in inserted_by_session.items():

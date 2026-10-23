@@ -6,6 +6,7 @@ import { fakeApi } from "./fake-sdk.js";
 
 const OWNER = "agent:coder:subagent:mock-owner";
 const PARENT = "agent:main:mock-parent";
+const OWNER_PRINCIPAL = "legacy:operator";
 const EVENT = "a".repeat(64);
 const MODEL_CREDENTIAL = "fixture-model-input";
 const action = {
@@ -18,9 +19,11 @@ function projection(overrides = {}) {
     version: 1, run_id: "run_PLUGIN497", session_id: "mock-observer", expected_revision: 4,
     authority: "taskflow", objective: "Canary", checkpoint: "Waiting for explicit owner",
     authority_scope: "implementation", scope_limit: "commit_only",
-    owner: { id: OWNER, epoch: 1, lease_until: "2099-10-03T00:00:00+00:00", live: true },
+    owner_handoff: { authorized_owner_id: OWNER_PRINCIPAL, state: "owner_lease_required" },
+    owner: { id: OWNER_PRINCIPAL, epoch: 1, lease_until: "2099-10-03T00:00:00+00:00", live: true },
     worker_state: "brief_completed", terminal_release: false, next_action: null,
     recovery: "continue_owner", owner_wake: true, inbox_counts: { pending: 1 },
+    completion_receipts: { counts: {}, errors: [] },
     events: [], has_more: true, ...overrides,
   };
 }
@@ -45,7 +48,7 @@ async function fixture(t, handler = (_req, res) => res.end(JSON.stringify({ cont
   const config = {
     enabled: true, droverOrigin: `http://127.0.0.1:${server.address().port}`,
     tokenEnvName: "DROVER_PLUGIN_TEST_TOKEN", runId: "run_PLUGIN497",
-    ownerSessionKey: OWNER, canarySessionKey: PARENT, authorityScope: "implementation",
+    ownerSessionKey: OWNER, ownerPrincipal: OWNER_PRINCIPAL, canarySessionKey: PARENT, authorityScope: "implementation",
   };
   return { config, calls, server };
 }
@@ -93,10 +96,26 @@ test("parent and owner polls retain pending state; never POST or auto-ack", asyn
   }
 });
 
+test("trusted initialization preserves integration and deployment scope", async (t) => {
+  for (const [authorityScope, scopeLimit] of [["integration", "publish_review"], ["deployment", "explicit_approval_required"]]) {
+    const f = await fixture(t, (_req, res) => res.end(JSON.stringify({ continuity: projection({ authority_scope: authorityScope, scope_limit: scopeLimit, owner_wake: authorityScope !== "deployment", recovery: authorityScope === "deployment" ? "approval_required" : "continue_owner" }) })));
+    const config = {
+      ...f.config, mode: "owner", authorityScope,
+      observerSessionId: "trusted-observer", objective: "Trusted initialization", checkpoint: "Pending",
+    };
+    await tool(config).execute("initialize", call("initialize"));
+    assert.equal(f.calls.length, 1);
+    assert.deepEqual(f.calls[0].body, {
+      operation: "initialize", session_id: "trusted-observer",
+      objective: "Trusted initialization", checkpoint: "Pending", authority_scope: authorityScope,
+    });
+  }
+});
+
 test("poll_only and a canary parent cannot mutate even when owner mode exists", async (t) => {
   const f = await fixture(t);
   for (const target of [tool(f.config), tool({ ...f.config, mode: "owner" }, PARENT)]) {
-    for (const payload of [call("lease"), call("consume", { owner_epoch: 1 }),
+  for (const payload of [call("initialize"), call("lease"), call("consume", { owner_epoch: 1 }),
       call("acknowledge", { owner_epoch: 1, event_id: EVENT, checkpoint: "Not authorized" }),
       call("report", { source_event_id: "id", subject: "ci", sequence: 1, kind: "ci_green", summary: "Green" })]) {
       await assert.rejects(target.execute("canary", payload), /Read-only canary/);
@@ -121,7 +140,7 @@ test("model cannot choose URL, credentials, run, owner, scope, messaging or exec
 });
 
 test("trusted configuration rejects unsafe origins, unknown keys and token arguments", () => {
-  const config = { enabled: true, runId: "run_PLUGIN497", ownerSessionKey: OWNER,
+  const config = { enabled: true, runId: "run_PLUGIN497", ownerSessionKey: OWNER, ownerPrincipal: OWNER_PRINCIPAL,
     authorityScope: "implementation", tokenEnvName: "DROVER_PLUGIN_TEST_TOKEN", droverOrigin: "https://drover.example" };
   for (const origin of ["http://remote.invalid", "https://user:secret@drover.example", "https://drover.example/other",
     "https://drover.example?token=secret", "https://drover.example#fragment", "file:///tmp/state"]) {
@@ -187,7 +206,7 @@ test("explicit consume has trusted binding and leaves action until a separate ac
     : { continuity: projection() })));
   const result = await tool({ ...f.config, mode: "owner" }).execute("consume", call("consume", { owner_epoch: 1 }));
   assert.equal(result.details.delivery.type, "review_worker_result");
-  assert.deepEqual(f.calls[1].body, { operation: "consume", owner_epoch: 1, run_id: "run_PLUGIN497", owner_id: OWNER });
+  assert.deepEqual(f.calls[1].body, { operation: "consume", owner_epoch: 1, run_id: "run_PLUGIN497", owner_id: OWNER_PRINCIPAL });
   assert.deepEqual(f.calls.map((req) => req.method), ["GET", "POST"]);
   assert.ok(!f.calls.some((req) => req.body?.operation === "acknowledge"));
 });

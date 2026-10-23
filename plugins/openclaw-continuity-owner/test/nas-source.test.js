@@ -79,7 +79,7 @@ test("NAS 2026.9.6 actual entry resolver and registrar load the declared V2 tool
 
   const enabledRecord = { ...record, toolNames: [] };
   resolved.register({ pluginConfig: {
-    enabled: true, ownerSessionKey: OWNER, runId: "run_NAS497", authorityScope: "implementation",
+    enabled: true, ownerSessionKey: OWNER, ownerPrincipal: "legacy:operator", runId: "run_NAS497", authorityScope: "implementation",
     droverOrigin: "https://drover.example", tokenEnvName: "DROVER_SOURCE_TEST_TOKEN",
   }, registerTool: (tool, options) => registerTool(enabledRecord, tool, options) });
   const currentTool = registry.tools[1].factory({ sessionKey: OWNER,

@@ -94,8 +94,8 @@ That projection is intentionally not a Factory status API: `expected_revision` i
 No new Drover configuration is required. The target host must already be paired/registered, reachable through its existing direct or relay route, and have the chosen harness's structured adapter and model catalog available. The caller needs an existing authenticated Drover bearer credential accepted by the hub; `preflight` credentials are read-only and are refused by the normal authentication gate. Use a dedicated revocable existing Drover credential for the Factory client rather than the legacy shared token where available.
 
 The launch bridge requires no Factory credential or TaskFlow URL. The optional
-continuity slice adds two tables through the normal control-store bootstrap
-(PostgreSQL migration 10, and additive DuckDB DDL). No credential, configuration,
+continuity slice adds its durable ledger tables through the normal control-store bootstrap
+(PostgreSQL migrations through 28, and additive DuckDB DDL). No credential, configuration,
 permission-policy, or production service change is part of this implementation.
 
 ## Durable owner continuity (#497)
@@ -123,7 +123,8 @@ TaskFlow operations):
 
 | operation | Required fields | Optional fields |
 | --- | --- | --- |
-| `initialize` | `session_id`, `objective`, `checkpoint` | `authority_scope` (default `implementation`) |
+| `issue_handoff` | `session_id`, `objective`, `checkpoint`, `authorized_owner_id` | `authority_scope` (default `implementation`) |
+| `initialize` | `session_id`, `objective`, `checkpoint`, `handoff_token` | `authority_scope` (default `implementation`) |
 | `lease` | `run_id`, `owner_id` | `owner_epoch` for active renewal; `lease_seconds` (default 60) |
 | `report` | `run_id`, `source`, `source_event_id`, `subject`, `sequence`, `kind`, `summary` | none |
 | `consume` | `run_id`, `owner_id`, `owner_epoch` | none |
@@ -135,6 +136,25 @@ projection. A report response also contains `event_id`; consume also contains
 and checkpoint to 4,000 characters, and report summary to 2,000 characters.
 Bad requests return 400, missing runs/events 404, immutable identity or owner
 fence conflicts 409, and a busy control-store window 503.
+
+Mutable owner operations are additionally bound to the authenticated bearer
+principal before the ledger is touched. A first `initialize` never treats an
+arbitrary authenticated bearer as ownership proof. Instead, the observer
+session's bound host credential (or the existing legacy operator credential)
+must first call `issue_handoff` for a named device principal. It receives a
+one-time token; only that named device can present the token to `initialize`.
+Drover stores the target, issuer, token digest, and redemption time durably;
+the raw token is returned only to the trusted issuer. Lease, consume, and
+acknowledge must submit the same owner ID as their bearer-derived principal,
+and that principal must match the redeemed handoff. Mismatches return 403
+before mutation; a different but authenticated owner is a 409 authorization
+conflict. Credential bearers use `credential:<credential-id>`; the supported
+legacy bearer uses `legacy:operator`. Report remains a bounded fact-ingest
+operation, not an owner claim. The `drover` report source is reserved for the
+internal harness-completion projector; public report requests using it are
+rejected before they can occupy a completion identity. A migrated/unbound run cannot be initialized,
+leased, consumed, or acknowledged by a device principal until this explicit
+handoff is issued and redeemed.
 
 For example, after initialization and leasing, an OpenClaw adapter can report
 and consume CI results through the same boundary:
@@ -167,6 +187,59 @@ authorized owner has work; it does not merge, deploy, publish, restart, launch
 workers, or call TaskFlow. `owner_wake` is a polling hint, not a delivered push.
 The adapter must actively poll and consume; no existing cron watcher or worker
 producer is automatically rewired by this change.
+
+### Drover completion canary and ownership boundary
+
+For an **initialized and authorized** observer run, a new, sequenced Drover
+harness event with `payload.turn_complete: true` is projected in the same
+control-store transaction as a `factory_observer_inbox` report. Its immutable
+source is `drover`, its source event ID is the harness event ID, and its subject
+is the observer session ID. This makes the existing
+`factory_observer_runs.session_id` relation the durable run → session →
+completion link. Replay of that harness event cannot create a second owner
+action. Both structured production ingestion and local batch append paths chunk
+new records into bounded groups of 100 while retaining each source event's
+transactional insert and projection outcome. Before chunk projection, each
+transaction acquires all participating observer-session locks in lexical order,
+so overlapping batches cannot deadlock by retaining session locks in different
+orders.
+
+The central `POST /harness/events` EventPusher wire envelope nests this as
+`event.payload.turn_complete`. The structured ingester preserves the outer
+event and the completion projector reads the nested member. A nested completion
+without its required status/sequence is retained as a rejected receipt instead
+of being silently deduplicated without an owner action.
+
+`factory_observer_completion_receipts` retains one durable outcome per relevant
+harness event: `projected`, `pending_authorization`, or `rejected`, including a
+truthful reason for malformed status/sequence or a missing authorized handoff.
+The status projection exposes receipt counts/errors and a handoff state:
+`authorization_required`, `owner_lease_required`,
+`acknowledgement_required`, `acknowledged`, or `failed`. A completion is not
+presented as complete until the authorized owner explicitly consumes and
+acknowledges its durable action. Handoff redemption and completion projection
+lock the same stable observer-session row (and the run row once it exists), so
+a bulk ingester cannot commit a newly pending receipt after redemption has
+scanned for retained facts, even during first-run creation. An authorized owner
+may also explicitly replay initialization through its trusted adapter binding to
+recover any retained pending receipt; poll never performs that mutation or an
+acknowledgement implicitly.
+
+The report still waits for a leased, trusted owner to consume it. Drover has no
+OpenClaw parent-session ownership record and does not send a parent message,
+resume an OpenClaw session, or infer one from the observer session.  When the
+optional OpenClaw adapter is used, it is only the authenticated owner-tool
+contract that receives the action; parent delivery remains an OpenClaw
+integration responsibility.  `tests/test_openclaw_owner_protocol.py` contains
+the reproducible completion canary using a real durable Drover store and a mock
+normal-tool host specifically to prove this adapter boundary without claiming
+live parent ownership.
+
+Drover's separate hub work-item/goal mechanisms remain truthful and separate:
+`work_items` and their timeline are created for hub-owned launches, while
+`execution_links` associate configured goal work with its session and parent
+session.  A Factory observer is an externally TaskFlow-owned run, so this
+observer ledger deliberately does not fabricate a work item or goal link for it.
 
 Authority scope is immutable: `implementation` permits owner continuation
 within commit-only authority, `integration` within publish/review authority,

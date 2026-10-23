@@ -88,6 +88,7 @@ this worker's configuration):
           "tokenEnvName": "DROVER_CONTINUITY_OWNER_TOKEN",
           "runId": "run_CANARY",
           "ownerSessionKey": "agent:coder:existing-authorized-owner",
+          "ownerPrincipal": "credential:existing-drover-credential-id",
           "canarySessionKey": "agent:main:existing-authorized-parent",
           "authorityScope": "implementation",
           "timeoutMs": 5000
@@ -99,14 +100,23 @@ this worker's configuration):
 ```
 
 Use a preexisting approved bearer credential environment variable and approved
-Drover origin; no model-supplied credential, URL, command, owner, scope, or run
-is accepted. HTTPS or loopback HTTP is required; origins cannot contain paths,
+Drover origin. `ownerSessionKey` is the trusted OpenClaw `agent:` session that
+may receive the tool; `ownerPrincipal` is the server-derived principal for its
+bearer (`credential:<credential-id>`, or `legacy:operator` only for the
+supported legacy bearer). They are deliberately distinct, so a model cannot
+turn an OpenClaw session key into an HTTP owner claim. No model-supplied
+credential, URL, command, owner, scope, or run is accepted. Trusted
+initialization sends its configured immutable scope, so integration and
+deployment handoffs retain their scope. HTTPS or loopback
+HTTP is required; origins cannot contain paths,
 userinfo, query, or fragment. Requests reject redirects, use a maximum 10-second
 timeout, cap replies at 2 MiB, and sanitize transport errors. Config is strict;
 no arbitrary extra keys. All payloads/replies use exported existing Python
 protocol schemas and semantic authority/fencing checks. JS-unsafe integer epochs
-or sequences are refused rather than rounded. Mutations first check the run's
-immutable scope by GET. Ordinary server authentication is never bypassed.
+or sequences are refused rather than rounded. Mutations other than first
+initialization check the run's immutable scope by GET; trusted first
+initialization posts its fixed binding and validates the bound reply after token
+redemption. Ordinary server authentication is never bypassed.
 
 The optional tool remains subject to existing OpenClaw tool policy. Do not widen
 permissions or enable all plugin tools to make a canary pass. Filtered discovery
@@ -156,10 +166,12 @@ The worker does not perform any step below against a live runtime.
    activation through the host's supported procedures; retain the package's
    `config.enabled: false` until the canary is approved. Any necessary host reload
    or restart is separately owned and authorized, never performed by this worker.
-2. Select an **existing isolated test Factory observer session**; initialize its
-   continuity ledger through the existing authenticated Drover endpoint. This
-   tool deliberately does not initialize or launch sessions. Initialization body:
-   `{"operation":"initialize","session_id":"<existing test session>","objective":"#497 advisory canary","checkpoint":"Canary awaiting read-only receipt","authority_scope":"implementation"}`.
+2. Select an **existing isolated test Factory observer session**. Its bound host
+   credential (or the legacy operator bearer) first issues a one-time
+   `issue_handoff` for the intended `credential:<owner-id>`; that owner then
+   explicitly invokes the plugin's trusted-config `initialize` action with the
+   returned handoff token. The plugin deliberately does not issue handoffs or
+   launch sessions. Poll never initializes or acknowledges implicitly.
    Use the returned `continuity.run_id`. POST one advisory report to the same
    endpoint with `operation: "report"`, that `run_id`, `source: "openclaw"`, a
    unique `source_event_id`, `subject: "canary"`, `sequence: 1`,

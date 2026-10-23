@@ -1,5 +1,73 @@
 {
   "$defs": {
+    "CompletionReceiptError": {
+      "additionalProperties": false,
+      "properties": {
+        "harness_event_id": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Harness Event Id",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Reason",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "pending_authorization",
+            "rejected"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "harness_event_id",
+        "state",
+        "reason"
+      ],
+      "title": "CompletionReceiptError",
+      "type": "object"
+    },
+    "CompletionReceipts": {
+      "additionalProperties": false,
+      "properties": {
+        "counts": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "projected",
+              "pending_authorization",
+              "rejected"
+            ]
+          },
+          "title": "Counts",
+          "type": "object"
+        },
+        "errors": {
+          "items": {
+            "$ref": "#/$defs/CompletionReceiptError"
+          },
+          "maxItems": 50,
+          "title": "Errors",
+          "type": "array"
+        }
+      },
+      "required": [
+        "counts",
+        "errors"
+      ],
+      "title": "CompletionReceipts",
+      "type": "object"
+    },
     "ContinuityProjection": {
       "additionalProperties": false,
       "properties": {
@@ -23,6 +91,9 @@
           "pattern": "\\S",
           "title": "Checkpoint",
           "type": "string"
+        },
+        "completion_receipts": {
+          "$ref": "#/$defs/CompletionReceipts"
         },
         "events": {
           "items": {
@@ -76,6 +147,9 @@
         },
         "owner": {
           "$ref": "#/$defs/OwnerLease"
+        },
+        "owner_handoff": {
+          "$ref": "#/$defs/OwnerHandoff"
         },
         "owner_wake": {
           "title": "Owner Wake",
@@ -145,6 +219,7 @@
         "checkpoint",
         "authority_scope",
         "scope_limit",
+        "owner_handoff",
         "owner",
         "worker_state",
         "terminal_release",
@@ -152,6 +227,7 @@
         "recovery",
         "owner_wake",
         "inbox_counts",
+        "completion_receipts",
         "events",
         "has_more"
       ],
@@ -311,6 +387,43 @@
         "authorized"
       ],
       "title": "OwnerAction",
+      "type": "object"
+    },
+    "OwnerHandoff": {
+      "additionalProperties": false,
+      "properties": {
+        "authorized_owner_id": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Authorized Owner Id"
+        },
+        "state": {
+          "enum": [
+            "awaiting_completion",
+            "authorization_required",
+            "owner_lease_required",
+            "acknowledgement_required",
+            "acknowledged",
+            "failed"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authorized_owner_id",
+        "state"
+      ],
+      "title": "OwnerHandoff",
       "type": "object"
     },
     "OwnerLease": {

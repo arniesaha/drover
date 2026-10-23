@@ -2544,17 +2544,114 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 if body is None:
                     raise ValueError("request body must be a JSON object")
+                operation = body.get("operation") if isinstance(body, dict) else None
+                if operation == "report" and body.get("source") == "drover":
+                    # Harness completion projection owns this identity namespace.
+                    # A caller-supplied report must not be able to occupy a
+                    # pending completion's durable source identity.
+                    raise PermissionError("drover report source is reserved")
+                if operation in {
+                    "initialize",
+                    "issue_handoff",
+                    "lease",
+                    "consume",
+                    "acknowledge",
+                }:
+                    principal = self._continuity_owner_principal()
+                    if principal is None:
+                        raise PermissionError("bound bearer credential required")
+                    body = dict(body)
+                    if operation == "initialize":
+                        if "authorized_owner_id" in body:
+                            raise PermissionError(
+                                "authorized owner is derived from the bearer credential"
+                            )
+                        if not body.get(
+                            "handoff_token"
+                        ) and not self._continuity_owner_is_bound(
+                            store, body.get("session_id"), principal
+                        ):
+                            raise PermissionError(
+                                "host-issued owner handoff token is required"
+                            )
+                        body["authorized_owner_id"] = principal
+                    elif operation == "issue_handoff":
+                        if "issued_by" in body:
+                            raise PermissionError(
+                                "handoff issuer is derived from the bearer credential"
+                            )
+                        body["issued_by"] = self._continuity_handoff_issuer(
+                            body.get("session_id")
+                        )
+                    elif body.get("owner_id") != principal:
+                        raise PermissionError(
+                            "owner identity does not match bearer credential"
+                        )
                 result = continuity_request(store, body)
             status = 200
         except ContinuityConflict as exc:
             status, result = 409, {"error": str(exc)}
         except KeyError:
             status, result = 404, {"error": "continuity run or event not found"}
+        except PermissionError as exc:
+            status, result = 403, {"error": str(exc)}
         except (ValueError, TypeError) as exc:
             status, result = 400, {"error": str(exc)}
         except ControlPlaneBusy:
             status, result = 503, {"error": "continuity store busy"}
         self._send(status, "application/json", json.dumps(result) + "\n")
+
+    def _continuity_owner_principal(self) -> str | None:
+        """Derive the only owner identity mutable continuity calls may claim."""
+        credential = bearer_credential(self.auth, self.headers)
+        if credential is not None:
+            return "credential:" + credential.id
+        authorization = self.headers.get("Authorization", "") or ""
+        if (
+            self.auth.enabled
+            and self.auth.legacy_token_enabled
+            and self.auth.api_token
+            and hmac.compare_digest(authorization, f"Bearer {self.auth.api_token}")
+        ):
+            return "legacy:operator"
+        return None
+
+    def _continuity_handoff_issuer(self, session_id: object) -> str:
+        """Authorize an explicit handoff from its observer host or operator."""
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is required")
+        credential = bearer_credential(self.auth, self.headers)
+        session = HarnessRegistry(self.collector.duckdb_path).get_session(session_id)
+        if session is not None and credential_matches_host(credential, session.host_id):
+            return "credential:" + credential.id
+        authorization = self.headers.get("Authorization", "") or ""
+        if (
+            self.auth.enabled
+            and self.auth.legacy_token_enabled
+            and self.auth.api_token
+            and hmac.compare_digest(authorization, f"Bearer {self.auth.api_token}")
+        ):
+            return "legacy:operator"
+        raise PermissionError(
+            "observer host credential or legacy operator is required for owner handoff"
+        )
+
+    @staticmethod
+    def _continuity_owner_is_bound(store, session_id: object, principal: str) -> bool:
+        """Allow a bound owner to repeat its idempotent initialization safely."""
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        from drover.server.harness.factory_observer import factory_observer_projection
+
+        session = HarnessRegistry(store.path).get_session(session_id)
+        projection = factory_observer_projection(session)
+        if projection is None:
+            return False
+        try:
+            status = store.status(projection["run_id"])
+        except KeyError:
+            return False
+        return status["owner_handoff"]["authorized_owner_id"] == principal
 
     def _send_session_history(self, path: str, query: str) -> None:
         """``GET /sessions/history[/facets]`` from the PostgreSQL control plane."""

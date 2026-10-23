@@ -26,9 +26,30 @@ from drover.server.ledger import (
 )
 from drover.server.memory_store import LiveRecap, MemoryRepository
 
-__all__ = ["LiveRecap", "enqueue_live_recap", "latest_live_recaps"]
+__all__ = [
+    "LiveRecap",
+    "enqueue_live_recap",
+    "latest_live_recaps",
+    "lock_live_recap_sessions",
+]
 
 _ADVANCED = ("queued", "requeued")
+
+
+def lock_live_recap_sessions(
+    con: object, session_ids: Iterable[str], *, store_path: str | Path
+) -> None:
+    """Acquire potential live-recap subjects in one global order.
+
+    A bulk event transaction can enqueue recaps for several structured
+    sessions. ``enqueue_live_recap`` must retain its per-session lock for
+    single-event callers, but bulk callers acquire the complete subject set
+    first so opposite-order deliveries cannot form an advisory-lock cycle.
+    """
+    if not is_postgres_connection(con) or not memory_store_available(store_path):
+        return
+    for session_id in sorted({str(session_id) for session_id in session_ids}):
+        JobLedger.lock_subject(con, RECAP_SESSION, session_id)
 
 
 def _live_job_seq(con: object, session_id: str) -> int | None:

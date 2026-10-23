@@ -110,6 +110,7 @@ def make_harness(tmp_path):
             objective="Protocol proof",
             checkpoint="Waiting for owner review",
             authority_scope=scope,
+            authorized_owner_id=OWNER,
         )
         adapter = OpenClawOwnerAdapter(
             endpoint, run_id=RUN, owner_id=OWNER, authority_scope=scope
@@ -172,6 +173,49 @@ def test_report_owner_action_ack_restart_has_no_duplicate_delivery(
     assert not status["terminal_release"]
     assert reconstructed.call("report", **report)["event_id"] == event_id
     assert reconstructed.call("consume", owner_epoch=epoch)["delivery"] is None
+
+
+def test_drover_completion_canary_routes_to_bound_owner_adapter_only(make_harness):
+    """End-to-end canary for Drover's actual completion-to-owner boundary.
+
+    The normal-tool harness is deliberately an adapter double: it proves the
+    durable Drover contract and trusted owner binding, not OpenClaw parent
+    session ownership or parent-message delivery.
+    """
+    harness, endpoint, _ = make_harness()
+    registry = HarnessRegistry(endpoint.path)
+    registry.append_event(
+        event_id="canary-drover-completion-1",
+        session_id="mock-observer",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=1,
+    )
+
+    pending = endpoint.store().status(RUN)
+    [event] = pending["events"]
+    assert event["report"] == {
+        "source": "drover",
+        "source_event_id": "canary-drover-completion-1",
+        "subject": "mock-observer",
+        "sequence": 1,
+        "kind": "worker_brief_completed",
+        "summary": "Drover harness session reported a completed turn.",
+    }
+    assert pending["owner"]["id"] is None
+
+    epoch = harness.call("lease")["continuity"]["owner"]["epoch"]
+    delivery = harness.call("consume", owner_epoch=epoch)["delivery"]
+    assert delivery["event_id"] == event["event_id"]
+    assert delivery["type"] == "review_worker_result"
+    assert delivery["authorized"]
+    harness.call(
+        "acknowledge",
+        owner_epoch=epoch,
+        event_id=event["event_id"],
+        checkpoint="Bound owner reconciled the Drover completion canary",
+    )
+    assert endpoint.store().status(RUN)["inbox_counts"] == {"acknowledged": 1}
 
 
 def test_lost_delivery_retains_action_and_recovery_is_explicit(make_harness):
@@ -317,6 +361,77 @@ def test_wrong_trusted_scope_is_refused_before_mutating_the_store(make_harness):
     assert endpoint.store().status(RUN)["checkpoint"] == "Waiting for owner review"
 
 
+@pytest.mark.parametrize("scope", ["implementation", "integration", "deployment"])
+def test_trusted_initialize_redeems_first_handoff_with_its_scope(tmp_path, scope):
+    """First initialization posts directly, then validates the bound response."""
+    path = tmp_path / f"first-handoff-{scope}.duckdb"
+    bootstrap_control_plane_store(path)
+    registry = HarnessRegistry(path)
+    registry.create_session(
+        session_id="first-handoff-observer",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{RUN}@4",
+    )
+    store = FactoryObserverContinuity(path)
+    store.initialize(
+        session_id="first-handoff-observer",
+        objective="Redeem first handoff",
+        checkpoint="Pending",
+        authority_scope=scope,
+    )
+    handoff = store.issue_handoff(
+        session_id="first-handoff-observer",
+        objective="Redeem first handoff",
+        checkpoint="Pending",
+        authority_scope=scope,
+        authorized_owner_id=OWNER,
+        issued_by="credential:host",
+    )
+
+    class Endpoint:
+        calls = []
+
+        def get(self, path, *, query):
+            self.calls.append(("GET", query))
+            return {"continuity": store.status(**query)}
+
+        def post(self, path, *, body):
+            self.calls.append(("POST", body))
+            return continuity_request(store, {**body, "authorized_owner_id": OWNER})
+
+    endpoint = Endpoint()
+    adapter = OpenClawOwnerAdapter(
+        endpoint,
+        run_id=RUN,
+        owner_id=OWNER,
+        authority_scope=scope,
+        session_id="first-handoff-observer",
+        objective="Redeem first handoff",
+        checkpoint="Pending",
+        handoff_token=handoff["handoff_token"],
+    )
+    reply = adapter.invoke({"version": 1, "request": {"operation": "initialize"}})
+    assert endpoint.calls == [
+        ("GET", {"run_id": RUN, "limit": 1}),
+        (
+            "POST",
+            {
+                "operation": "initialize",
+                "session_id": "first-handoff-observer",
+                "objective": "Redeem first handoff",
+                "checkpoint": "Pending",
+                "authority_scope": scope,
+                "handoff_token": handoff["handoff_token"],
+            },
+        ),
+    ]
+    assert reply.continuity.owner_handoff.authorized_owner_id == OWNER
+    assert reply.continuity.authority_scope == scope
+
+
 def test_descriptor_has_versioned_object_schema_but_does_not_register_runtime():
     definition = owner_tool_definition()
     assert definition["name"] == TOOL_NAME
@@ -324,6 +439,7 @@ def test_descriptor_has_versioned_object_schema_but_does_not_register_runtime():
     assert schema["type"] == "object" and schema["additionalProperties"] is False
     assert schema["properties"]["version"]["const"] == 1
     assert set(schema["properties"]["request"]["discriminator"]["mapping"]) == {
+        "initialize",
         "lease",
         "report",
         "poll",

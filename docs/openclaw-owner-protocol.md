@@ -18,16 +18,35 @@ steps. No credential, configuration, policy, or service change was made.
 
 ## Trusted binding and normal invocation
 
-An integration must initialize the existing observer run through the existing
-continuity endpoint first. It then binds the adapter's `run_id`, `owner_id`
-(the trusted owner session identity), and `authority_scope` outside model input.
-The tool request cannot choose another run, impersonate an owner, broaden scope,
-grant approval, or supply a URL, token, command, or arbitrary endpoint path.
+Before an owner initializes an observer run, its bound Drover host credential
+(or the existing legacy operator bearer) must issue a one-time `issue_handoff`
+for the intended `credential:<credential-id>`. The named owner redeems that
+token through `initialize`; the server records the immutable owner identity
+only after this proof. It then binds the adapter's `run_id`, `owner_principal`
+(that exact derived principal), and `authority_scope` outside model input. The
+inactive plugin separately binds its
+trusted OpenClaw `ownerSessionKey` for tool discovery; that session key is never
+sent as an HTTP owner identity.
+The tool request cannot choose another run, observer session, objective,
+checkpoint, token, impersonated owner, scope, URL, command, or arbitrary
+endpoint path. A trusted plugin configuration may optionally provide the
+observer session/objective/checkpoint and a handoff-token environment-variable
+name. The owner may then explicitly invoke `initialize` to redeem that token,
+or safely replay initialization to recover durable pending receipts. Poll never
+does this mutation automatically.
 All transport calls use the fixed existing continuity endpoint. The injected
 `ContinuityEndpoint.get/post` transport must enforce ordinary Drover authentication;
 the Python protocol neither implements nor bypasses authentication.
-Before a mutation, a bounded GET checks the run's immutable scope against the
-trusted binding. A wrong scope is refused before any POST, including ack.
+The Python adapter uses a bounded GET before every mutation to check the run's
+immutable scope against the trusted binding. Its first initialization tolerates
+only an unbound owner in that preflight, then requires the returned response to
+bind the configured owner after its fixed trusted configuration, bearer-derived
+owner, and server-validated handoff token are applied. The Node plugin posts
+its equally trusted first-initialization binding directly and validates the
+bound response. The HTTP endpoint also rejects a
+lease, consume, or ack whose JSON owner differs from the authenticated bearer
+before state mutation. A wrong scope or owner is refused before any POST,
+including ack.
 
 [OpenClaw's supported plugin API](https://docs.openclaw.ai/plugins/sdk-overview/tools-and-commands)
 provides `api.registerTool(...)` for agent-visible tools. The inactive package
@@ -77,6 +96,18 @@ the run. CI green becomes `review_ci`, never merge. CI red becomes `correct_ci`.
 The owner explicitly reconciles the action in its allowed scope and explicitly
 acks with the event ID and updated checkpoint. Initialization, schema generation,
 polling, receipt of a message/tool reply, and tool-result rendering do not ack.
+
+For an initialized Factory observer with an authorized handoff, Drover also
+projects a real sequenced `turn_complete` harness event into that same durable
+report path as source `drover`. Its bounded batch projector retains a receipt
+per harness event (`projected`, `pending_authorization`, or `rejected`) in the
+same transaction; status distinguishes authorization, lease, acknowledgment,
+and failed/rejected states. The run/session binding already exists in
+`factory_observer_runs`; no OpenClaw parent identity is added or inferred. The
+focused completion canary therefore proves only completion → durable ledger →
+trusted bound owner adapter → explicit acknowledgment. It intentionally does not claim that Drover can
+establish OpenClaw parent ownership, deliver a parent message, or resume a
+parent session.
 
 Implementation remains commit-only; integration remains review/publish;
 deployment produces an unauthorized `request_explicit_approval` action and the

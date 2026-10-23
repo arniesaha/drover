@@ -16,6 +16,7 @@ import pytest
 from drover.schema import bootstrap_control_plane_store
 from drover.server.db import control_plane_connection
 from drover.server.harness.continuity import (
+    MAX_COMPLETION_PROJECTION_BATCH,
     ContinuityConflict,
     FactoryObserverContinuity,
     continuity_request,
@@ -70,7 +71,17 @@ def report(store, kind="ci_green", *, sequence=1, source_event_id="ci-attempt-1"
     )
 
 
+def handoff(store, owner_id="openclaw-owner"):
+    return store.initialize(
+        session_id=SESSION,
+        objective="Fix #497",
+        checkpoint="Implementation pending",
+        authorized_owner_id=owner_id,
+    )
+
+
 def owner(store, owner_id="openclaw-owner", **kwargs):
+    handoff(store, owner_id)
     lease = store.lease(RUN, owner_id=owner_id, **kwargs)
     return {"owner_id": owner_id, "owner_epoch": lease["owner_epoch"]}
 
@@ -110,7 +121,10 @@ print(json.dumps(s.status(sys.argv[3])))
     assert restarted.status(RUN)["next_action"] is None
     # Initialization and a delayed ack retry cannot overwrite newer progress.
     restarted.initialize(
-        session_id=SESSION, objective="Fix #497", checkpoint="Old checkpoint"
+        session_id=SESSION,
+        objective="Fix #497",
+        checkpoint="Old checkpoint",
+        authorized_owner_id="openclaw-owner",
     )
     restarted.acknowledge(RUN, **fence, event_id=first, checkpoint="Old checkpoint")
     assert restarted.status(RUN)["checkpoint"] == "Corrective commit recorded"
@@ -209,8 +223,355 @@ def test_no_owner_keeps_event_pending_and_projects_recovery(bridge):
     assert projection["recovery"] == "claim_owner"
     assert not projection["owner_wake"]
     assert projection["inbox_counts"] == {"pending": 1}
-    with pytest.raises(ContinuityConflict):
+    with pytest.raises(ContinuityConflict, match="handoff"):
         store.consume(RUN, owner_id="absent", owner_epoch=0)
+
+
+def test_unbound_run_denies_owner_mutations_until_explicit_handoff(bridge):
+    store, _, _ = bridge
+    event_id = report(store, "worker_brief_completed")
+    for mutate in (
+        lambda: store.lease(RUN, owner_id="unrelated-owner"),
+        lambda: store.consume(RUN, owner_id="unrelated-owner", owner_epoch=0),
+        lambda: store.acknowledge(
+            RUN,
+            owner_id="unrelated-owner",
+            owner_epoch=0,
+            event_id=event_id,
+            checkpoint="Unauthorized acknowledgement",
+        ),
+    ):
+        with pytest.raises(ContinuityConflict, match="handoff"):
+            mutate()
+    handoff(store, "authorized-owner")
+    fence = owner(store, "authorized-owner")
+    assert store.consume(RUN, **fence)["type"] == "review_worker_result"
+
+
+def test_sequenced_drover_completion_is_durably_linked_to_observer_owner(bridge):
+    """The worker event and owner action commit through the existing run/session link."""
+    store, _, registry = bridge
+    store.initialize(
+        session_id=SESSION,
+        objective="Fix #497",
+        checkpoint="Implementation pending",
+        authorized_owner_id="authorized-owner",
+    )
+    fence = owner(store, owner_id="authorized-owner")
+
+    registry.append_event(
+        event_id="drover-worker-completion-1",
+        session_id=SESSION,
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=7,
+    )
+
+    pending = store.status(RUN)
+    [event] = pending["events"]
+    assert event["event_id"] == store.report(
+        RUN,
+        source="drover",
+        source_event_id="drover-worker-completion-1",
+        subject=SESSION,
+        sequence=7,
+        kind="worker_brief_completed",
+        summary="Drover harness session reported a completed turn.",
+    )
+    assert event["report"]["source"] == "drover"
+    assert event["report"]["subject"] == SESSION
+    action = store.consume(RUN, **fence)
+    assert action["type"] == "review_worker_result"
+    assert action["authorized"]
+    store.acknowledge(
+        RUN,
+        **fence,
+        event_id=event["event_id"],
+        checkpoint="Authorized owner reviewed Drover completion",
+    )
+
+    # Redelivery of the source event remains the same harness and continuity
+    # fact; it cannot manufacture another continuation or alter the checkpoint.
+    registry.append_event(
+        event_id="drover-worker-completion-1",
+        session_id=SESSION,
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=7,
+    )
+    assert store.status(RUN)["inbox_counts"] == {"acknowledged": 1}
+    assert (
+        store.status(RUN)["checkpoint"] == "Authorized owner reviewed Drover completion"
+    )
+
+
+def test_harness_events_http_nested_completion_projects_and_rejects_malformed(
+    bridge, tmp_path
+):
+    """Exercise the actual EventPusher envelope, not a flattened registry call."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _, _ = bridge
+    handoff(store, "http-event-owner")
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, token = credentials.issue(
+        scope="host", label="HTTP event host", host_id="studio"
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=store.path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}/harness/events"
+
+    def post(events):
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps({"events": events}).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request) as response:
+            return response.status, json.loads(response.read())
+
+    try:
+        status, body = post(
+            [
+                {
+                    "event_id": "http-nested-completion",
+                    "session_id": SESSION,
+                    "seq": 8,
+                    "type": "status",
+                    "role": "system",
+                    "text": "turn complete",
+                    "payload": {"turn_complete": True},
+                    "turn_id": "turn-http-8",
+                    "ts": "2026-10-03T00:00:08+00:00",
+                },
+                {
+                    "event_id": "http-nested-malformed-completion",
+                    "session_id": SESSION,
+                    "type": "status",
+                    "role": "system",
+                    "text": "turn complete without a sequence",
+                    "payload": {"turn_complete": True},
+                    "turn_id": "turn-http-malformed",
+                    "ts": "2026-10-03T00:00:09+00:00",
+                },
+            ]
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert status == 200 and body == {"ingested": 2}
+    projection = store.status(RUN)
+    assert [event["report"]["source_event_id"] for event in projection["events"]] == [
+        "http-nested-completion"
+    ]
+    assert projection["completion_receipts"] == {
+        "counts": {"projected": 1, "rejected": 1},
+        "errors": [
+            {
+                "harness_event_id": "http-nested-malformed-completion",
+                "state": "rejected",
+                "reason": "completion_requires_nonnegative_sequence",
+            }
+        ],
+    }
+
+
+def test_unsequenced_or_uninitialized_harness_completion_does_not_claim_owner(bridge):
+    store, _, registry = bridge
+    registry.append_event(
+        event_id="unsequenced-completion",
+        session_id=SESSION,
+        event_type="status",
+        payload={"turn_complete": True},
+    )
+    assert store.status(RUN)["inbox_counts"] == {}
+
+    registry.create_session(
+        session_id="ordinary-session",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+    )
+    registry.append_event(
+        event_id="ordinary-completion",
+        session_id="ordinary-session",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=1,
+    )
+    assert store.status(RUN)["inbox_counts"] == {}
+
+
+def test_pending_completion_recovers_after_authorized_owner_handoff(bridge):
+    store, _, registry = bridge
+    registry.append_event(
+        event_id="completion-before-owner-handoff",
+        session_id=SESSION,
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=1,
+    )
+    pending = store.status(RUN)
+    assert pending["owner_handoff"] == {
+        "authorized_owner_id": None,
+        "state": "authorization_required",
+    }
+    assert pending["completion_receipts"] == {
+        "counts": {"pending_authorization": 1},
+        "errors": [
+            {
+                "harness_event_id": "completion-before-owner-handoff",
+                "state": "pending_authorization",
+                "reason": "authorized_owner_handoff_required",
+            }
+        ],
+    }
+    store.initialize(
+        session_id=SESSION,
+        objective="Fix #497",
+        checkpoint="Implementation pending",
+        authorized_owner_id="recovery-owner",
+    )
+    recovered = store.status(RUN)
+    assert recovered["owner_handoff"] == {
+        "authorized_owner_id": "recovery-owner",
+        "state": "owner_lease_required",
+    }
+    assert recovered["completion_receipts"] == {
+        "counts": {"projected": 1},
+        "errors": [],
+    }
+    fence = owner(store, "recovery-owner")
+    action = store.consume(RUN, **fence)
+    assert action["type"] == "review_worker_result"
+    assert store.status(RUN)["owner_handoff"]["state"] == "acknowledgement_required"
+    store.acknowledge(
+        RUN,
+        **fence,
+        event_id=action["event_id"],
+        checkpoint="Recovered owner acknowledged retained completion",
+    )
+    assert store.status(RUN)["owner_handoff"]["state"] == "acknowledged"
+
+
+def test_structured_batch_completion_projection_is_ordered_idempotent_and_records_failure(
+    bridge,
+):
+    store, clock, registry = bridge
+    store.initialize(
+        session_id=SESSION,
+        objective="Fix #497",
+        checkpoint="Implementation pending",
+        authorized_owner_id="batch-owner",
+    )
+    records = [
+        {
+            "event_id": "batch-completion-2",
+            "session_id": SESSION,
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "seq": 2,
+            "created_at": clock.now + timedelta(seconds=2),
+        },
+        {
+            "event_id": "batch-completion-1",
+            "session_id": SESSION,
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "seq": 1,
+            "created_at": clock.now + timedelta(seconds=1),
+        },
+        {
+            "event_id": "batch-malformed-completion",
+            "session_id": SESSION,
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "created_at": clock.now + timedelta(seconds=3),
+        },
+        # A retry in the same batch is one source record, not a second action.
+        {
+            "event_id": "batch-completion-1",
+            "session_id": SESSION,
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "seq": 1,
+            "created_at": clock.now + timedelta(seconds=1),
+        },
+    ]
+    # This is the remote/structured production ingestion transaction, not the
+    # local one-event convenience API.
+    assert registry.ingest_structured_events(records) == 3
+
+    pending = store.status(RUN)
+    assert [entry["report"]["source_event_id"] for entry in pending["events"]] == [
+        "batch-completion-1",
+        "batch-completion-2",
+    ]
+    assert pending["owner_handoff"] == {
+        "authorized_owner_id": "batch-owner",
+        # A valid action is waiting too, but the mixed batch is not falsely
+        # presented as wholly ready while one completion was rejected.
+        "state": "failed",
+    }
+    assert pending["completion_receipts"] == {
+        "counts": {"projected": 2, "rejected": 1},
+        "errors": [
+            {
+                "harness_event_id": "batch-malformed-completion",
+                "state": "rejected",
+                "reason": "completion_requires_nonnegative_sequence",
+            }
+        ],
+    }
+    assert registry.ingest_structured_events(records) == 0
+    assert store.status(RUN)["completion_receipts"] == pending["completion_receipts"]
+
+
+def test_structured_completion_projection_chunks_beyond_its_bound(bridge):
+    store, clock, registry = bridge
+    store.initialize(
+        session_id=SESSION,
+        objective="Fix #497",
+        checkpoint="Implementation pending",
+        authorized_owner_id="chunked-owner",
+    )
+    records = [
+        {
+            "event_id": f"chunked-completion-{sequence}",
+            "session_id": SESSION,
+            "event_type": "status",
+            "payload": {"turn_complete": True},
+            "seq": sequence,
+            "created_at": clock.now + timedelta(seconds=sequence),
+        }
+        for sequence in range(MAX_COMPLETION_PROJECTION_BATCH + 1)
+    ]
+    # Ingestion owns one transaction but calls the bounded projector twice.
+    assert registry.ingest_structured_events(records) == len(records)
+    assert store.status(RUN)["completion_receipts"]["counts"] == {
+        "projected": len(records)
+    }
+    assert registry.ingest_structured_events(records) == 0
 
 
 def test_expiry_recovers_same_action_and_fences_stale_owner(bridge):
@@ -316,6 +677,7 @@ def test_scope_is_immutable_and_deployment_approval_is_blocked(
         objective="Review release",
         checkpoint="Waiting",
         authority_scope=scope,
+        authorized_owner_id="owner",
     )
     with pytest.raises(ContinuityConflict, match="immutable"):
         store.initialize(
@@ -444,6 +806,38 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
             )[0]
             == 401
         )
+        status, body = request(
+            {
+                "operation": "lease",
+                "run_id": RUN,
+                "owner_id": "legacy:operator",
+            }
+        )
+        assert status == 409 and "handoff" in body["error"]
+        status, issued = request(
+            {
+                "operation": "issue_handoff",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "authorized_owner_id": "legacy:operator",
+            }
+        )
+        assert status == 200
+        status, payload = request(
+            {
+                "operation": "initialize",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "handoff_token": issued["handoff_token"],
+            }
+        )
+        assert status == 200
+        assert payload["continuity"]["owner_handoff"] == {
+            "authorized_owner_id": "legacy:operator",
+            "state": "awaiting_completion",
+        }
         status, payload = request(
             {
                 "operation": "report",
@@ -462,7 +856,11 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
             "inbox_counts"
         ] == {"pending": 1}
         status, payload = request(
-            {"operation": "lease", "run_id": RUN, "owner_id": "owner"}
+            {
+                "operation": "lease",
+                "run_id": RUN,
+                "owner_id": "legacy:operator",
+            }
         )
         assert status == 200
         epoch = payload["continuity"]["owner"]["epoch"]
@@ -470,7 +868,7 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
             {
                 "operation": "consume",
                 "run_id": RUN,
-                "owner_id": "owner",
+                "owner_id": "legacy:operator",
                 "owner_epoch": epoch,
             }
         )
@@ -480,7 +878,7 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
                 {
                     "operation": "acknowledge",
                     "run_id": RUN,
-                    "owner_id": "owner",
+                    "owner_id": "legacy:operator",
                     "owner_epoch": epoch,
                     "event_id": [],
                     "checkpoint": "Malformed identity",
@@ -509,7 +907,7 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
                 {
                     "operation": "consume",
                     "run_id": RUN,
-                    "owner_id": "owner",
+                    "owner_id": "legacy:operator",
                     "owner_epoch": epoch + 1,
                 }
             )[0]
@@ -517,6 +915,412 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
         )
         assert request(query="?run_id=run_MISSING")[0] == 404
         assert request({"operation": "report", "summary": "x" * 17000})[0] == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_owner_identity_is_bound_to_credential_and_acknowledgement(
+    bridge, tmp_path
+):
+    """Only the credential named in the durable handoff may mutate this run."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _, _ = bridge
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
+    owner_credential, owner_token = credentials.issue(scope="device", label="owner")
+    other_credential, other_token = credentials.issue(scope="device", label="other")
+    owner_principal = "credential:" + owner_credential.id
+    other_principal = "credential:" + other_credential.id
+    collector = MetricsCollector(
+        duckdb_path=store.path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    base = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            base,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    try:
+        status, issued = request(
+            {
+                "operation": "issue_handoff",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "authorized_owner_id": owner_principal,
+            },
+            host_token,
+        )
+        assert status == 200
+        status, payload = request(
+            {
+                "operation": "initialize",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "handoff_token": issued["handoff_token"],
+            },
+            owner_token,
+        )
+        assert status == 200
+        assert payload["continuity"]["owner_handoff"] == {
+            "authorized_owner_id": owner_principal,
+            "state": "awaiting_completion",
+        }
+        # Supplying the configured owner identity is not enough: the bearer
+        # itself must be that owner before any lease state can change.
+        assert (
+            request(
+                {"operation": "lease", "run_id": RUN, "owner_id": owner_principal},
+                other_token,
+            )[0]
+            == 403
+        )
+        assert (
+            request(
+                {"operation": "lease", "run_id": RUN, "owner_id": other_principal},
+                other_token,
+            )[0]
+            == 409
+        )
+        assert store.status(RUN)["owner"]["id"] is None
+
+        status, _ = request(
+            {
+                "operation": "report",
+                "run_id": RUN,
+                "source": "openclaw",
+                "source_event_id": "credential-owner-report",
+                "subject": "worker-1",
+                "sequence": 1,
+                "kind": "worker_brief_completed",
+                "summary": "Ready for authorized owner acknowledgement",
+            },
+            owner_token,
+        )
+        assert status == 200
+        status, payload = request(
+            {"operation": "lease", "run_id": RUN, "owner_id": owner_principal},
+            owner_token,
+        )
+        assert status == 200
+        epoch = payload["continuity"]["owner"]["epoch"]
+        assert payload["continuity"]["owner_handoff"]["state"] == "owner_lease_required"
+        assert (
+            request(
+                {
+                    "operation": "consume",
+                    "run_id": RUN,
+                    "owner_id": owner_principal,
+                    "owner_epoch": epoch,
+                },
+                other_token,
+            )[0]
+            == 403
+        )
+        status, payload = request(
+            {
+                "operation": "consume",
+                "run_id": RUN,
+                "owner_id": owner_principal,
+                "owner_epoch": epoch,
+            },
+            owner_token,
+        )
+        assert status == 200 and payload["delivery"]["authorized"]
+        event_id = payload["delivery"]["event_id"]
+        assert (
+            payload["continuity"]["owner_handoff"]["state"]
+            == "acknowledgement_required"
+        )
+        assert (
+            request(
+                {
+                    "operation": "acknowledge",
+                    "run_id": RUN,
+                    "owner_id": owner_principal,
+                    "owner_epoch": epoch,
+                    "event_id": event_id,
+                    "checkpoint": "intruder acknowledgement",
+                },
+                other_token,
+            )[0]
+            == 403
+        )
+        status, payload = request(
+            {
+                "operation": "acknowledge",
+                "run_id": RUN,
+                "owner_id": owner_principal,
+                "owner_epoch": epoch,
+                "event_id": event_id,
+                "checkpoint": "authorized acknowledgement",
+            },
+            owner_token,
+        )
+        assert status == 200
+        assert payload["continuity"]["owner_handoff"]["state"] == "acknowledged"
+        assert payload["continuity"]["checkpoint"] == "authorized acknowledgement"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_initialize_requires_host_issued_handoff_and_cannot_be_raced(
+    bridge, tmp_path
+):
+    """An unrelated device cannot win an unbound observer run's first init."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _, registry = bridge
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
+    owner_credential, owner_token = credentials.issue(scope="device", label="owner")
+    _, unrelated_token = credentials.issue(scope="device", label="unrelated")
+    owner_principal = "credential:" + owner_credential.id
+    collector = MetricsCollector(
+        duckdb_path=store.path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    base = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            base,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def initialize(session_id, token, handoff_token=None):
+        body = {
+            "operation": "initialize",
+            "session_id": session_id,
+            "objective": "Fix #497",
+            "checkpoint": "Implementation pending",
+        }
+        if handoff_token is not None:
+            body["handoff_token"] = handoff_token
+        return request(body, token)
+
+    def issue(session_id, target):
+        return request(
+            {
+                "operation": "issue_handoff",
+                "session_id": session_id,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "authorized_owner_id": target,
+            },
+            host_token,
+        )
+
+    try:
+        # This is the reviewer's repro: authentication alone is not evidence
+        # that the caller owns this unbound observer run.
+        status, _ = initialize(SESSION, unrelated_token)
+        assert status == 403
+        assert store.status(RUN)["owner_handoff"]["authorized_owner_id"] is None
+
+        status, issued = issue(SESSION, owner_principal)
+        assert status == 200
+        handoff_token = issued["handoff_token"]
+        assert initialize(SESSION, unrelated_token, handoff_token)[0] == 403
+        assert store.status(RUN)["owner_handoff"]["authorized_owner_id"] is None
+        status, initialized = initialize(SESSION, owner_token, handoff_token)
+        assert status == 200
+        assert initialized["continuity"]["owner_handoff"]["authorized_owner_id"] == (
+            owner_principal
+        )
+        assert initialize(SESSION, owner_token)[0] == 200
+
+        race_run = "run_FACTORY498"
+        race_session = "observer-498"
+        registry.create_session(
+            session_id=race_session,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            status="running",
+            handoff_mode="factory_observer",
+            source_session_id=f"factory/{race_run}@4",
+        )
+        status, issued = issue(race_session, owner_principal)
+        assert status == 200
+        race_token = issued["handoff_token"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(
+                    lambda token: initialize(race_session, token, race_token)[0],
+                    [unrelated_token, owner_token],
+                )
+            )
+        assert sorted(outcomes) == [200, 403]
+        assert store.status(race_run)["owner_handoff"]["authorized_owner_id"] == (
+            owner_principal
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_report_cannot_claim_drover_completion_identity(bridge, tmp_path):
+    """An authenticated reporter cannot occupy the internal completion identity."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, clock, registry = bridge
+    event_id = "internal-drover-completion"
+    assert (
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": event_id,
+                    "session_id": SESSION,
+                    "event_type": "status",
+                    "payload": {"payload": {"turn_complete": True}},
+                    "seq": 1,
+                    "created_at": clock.now,
+                }
+            ]
+        )
+        == 1
+    )
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
+    owner, owner_token = credentials.issue(scope="device", label="owner")
+    _, other_token = credentials.issue(scope="device", label="other")
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=store.path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    try:
+        assert (
+            request(
+                {
+                    "operation": "report",
+                    "run_id": RUN,
+                    "source": "drover",
+                    "source_event_id": event_id,
+                    "subject": SESSION,
+                    "sequence": 1,
+                    "kind": "ci_red",
+                    "summary": "Unrelated report cannot replace completion",
+                },
+                other_token,
+            )[0]
+            == 403
+        )
+        assert store.status(RUN)["inbox_counts"] == {}
+        status, issued = request(
+            {
+                "operation": "issue_handoff",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "authorized_owner_id": "credential:" + owner.id,
+            },
+            host_token,
+        )
+        assert status == 200
+        status, initialized = request(
+            {
+                "operation": "initialize",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "handoff_token": issued["handoff_token"],
+            },
+            owner_token,
+        )
+        assert status == 200
+        assert initialized["continuity"]["completion_receipts"]["counts"] == {
+            "projected": 1
+        }
     finally:
         server.shutdown()
         server.server_close()
