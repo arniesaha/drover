@@ -382,7 +382,11 @@ def snapshot_databases(stage):
 
 def backup(generation_id=None):
     global NAS
-    config_path = BACKUP_CONFIG if BACKUP_CONFIG.exists() else HOME / ".drover/maintenance/backup-config.json"
+    config_path = (
+        BACKUP_CONFIG
+        if BACKUP_CONFIG.exists()
+        else HOME / ".drover/maintenance/backup-config.json"
+    )
     config = json.loads(config_path.read_text())
     NAS = config["nas"]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", NAS):
@@ -419,7 +423,9 @@ def backup(generation_id=None):
     log("stage=NAS_preflight")
     preparation = remote(helper, "prepare", root, {"generation_id": generation_id})
     try:
-        backup_generation(helper, root, generation_id, preparation, started, host, receipt_key)
+        backup_generation(
+            helper, root, generation_id, preparation, started, host, receipt_key
+        )
     except Exception:
         try:
             remote(helper, "fail", root, {"generation_id": generation_id})
@@ -430,7 +436,9 @@ def backup(generation_id=None):
 
 
 def verify_generation(helper, root, generation_id, entries):
-    verification = remote(helper, "verify", root, {"generation_id": generation_id, "files": entries})
+    verification = remote(
+        helper, "verify", root, {"generation_id": generation_id, "files": entries}
+    )
     if verification.get("verification_ok") is not True:
         for failure in verification["failures"]:
             # JSON escaping prevents filenames injecting additional log lines.
@@ -439,7 +447,9 @@ def verify_generation(helper, root, generation_id, entries):
     return verification
 
 
-def backup_generation(helper, root, generation_id, preparation, started, host, receipt_key):
+def backup_generation(
+    helper, root, generation_id, preparation, started, host, receipt_key
+):
     pending = root + "/.pending-" + generation_id
     previous = root + "/" + preparation["previous"] if preparation["previous"] else None
     with tempfile.TemporaryDirectory(prefix="stage-", dir=STATE) as staging:
@@ -528,9 +538,12 @@ def backup_generation(helper, root, generation_id, preparation, started, host, r
         # Sources may change immediately after rsync. Hash the now-frozen
         # destination, including files retained by the first pass, instead.
         entries.extend(
-            remote(helper, "inventory", root, {"generation_id": generation_id, "trees": list(DATA)})[
-                "files"
-            ]
+            remote(
+                helper,
+                "inventory",
+                root,
+                {"generation_id": generation_id, "trees": list(DATA)},
+            )["files"]
         )
         log("stage=NAS_checksum_verification")
         verification = verify_generation(helper, root, generation_id, entries)

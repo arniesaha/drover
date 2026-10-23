@@ -101,7 +101,9 @@ class BackupTests(unittest.TestCase):
             cutover = daily + "-cutover-a1b2c3"
             for generation in (daily, cutover):
                 self.assertEqual(
-                    self.remote("prepare", root, {"generation_id": generation}).returncode,
+                    self.remote(
+                        "prepare", root, {"generation_id": generation}
+                    ).returncode,
                     0,
                 )
                 pending = root / (".pending-" + generation)
