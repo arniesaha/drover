@@ -318,7 +318,7 @@ def test_exporter_checkpoints_every_500_exports_and_survives_failures(
 
     assert calls == [("a" * 64, HELD), ("a" * 64, HELD)]
     assert lifecycle._exports_since_checkpoint == 0
-    assert CHECKPOINT_EVERY_EXPORTS == 500
+    assert CHECKPOINT_EVERY_EXPORTS == 50
 
 
 @pytest.fixture
@@ -377,6 +377,26 @@ def test_referenced_files_over_the_limit_fail_closed(referenced):
 def test_a_changed_referenced_file_still_fails_closed(referenced):
     spec, con = referenced(10_001)
     (spec.data_root / "part.parquet").write_bytes(b"x" * 8)
+
+    with pytest.raises(LakeError, match="lake_verification_file_missing_or_changed"):
+        serving_proof._check_referenced_files(spec, con)
+
+
+def test_a_symlink_out_of_the_lake_still_fails_closed(referenced, tmp_path):
+    spec, con = referenced(3)
+    outside = tmp_path / "outside.parquet"
+    outside.write_bytes(b"x" * 7)
+    link = spec.data_root / "link.parquet"
+    link.symlink_to(outside)
+    con.execute("UPDATE files SET data_file=?", [str(link)])
+
+    with pytest.raises(LakeError, match="lake_verification_file_outside_root"):
+        serving_proof._check_referenced_files(spec, con)
+
+
+def test_a_missing_referenced_file_still_fails_closed(referenced):
+    spec, con = referenced(3)
+    (spec.data_root / "part.parquet").unlink()
 
     with pytest.raises(LakeError, match="lake_verification_file_missing_or_changed"):
         serving_proof._check_referenced_files(spec, con)

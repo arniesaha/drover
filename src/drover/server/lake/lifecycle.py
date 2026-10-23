@@ -18,9 +18,11 @@ from .serving_proof import catalog_identity
 
 log = logging.getLogger(__name__)
 
-# Exports between serving-proof checkpoints: ~45 min at prod's peak rate of
-# ~11/min, so a serving child re-checks at most a few hundred exports.
-CHECKPOINT_EVERY_EXPORTS = 500
+# Exports between serving-proof checkpoints: ~5 min at prod's peak rate of
+# ~11/min. Every serving child re-checks the receipts since the checkpoint;
+# at 500 that averaged ~0.5 s of each MCP read (drover#778). A checkpoint is
+# one maintenance-lane child, so this costs ~1.5 s per 50 exports.
+CHECKPOINT_EVERY_EXPORTS = 50
 MAX_RESTARTS = 5
 MAX_SERVER_RESTART_REQUESTS_PER_HOUR = 3
 SERVER_RESTART_EXIT_CODE = 75
