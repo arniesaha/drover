@@ -213,10 +213,11 @@ The status projection exposes receipt counts/errors and a handoff state:
 `acknowledgement_required`, `acknowledged`, or `failed`. A completion is not
 presented as complete until the authorized owner explicitly consumes and
 acknowledges its durable action. Handoff redemption and completion projection
-lock the same run row, so a bulk ingester cannot commit a newly pending receipt
-after redemption has scanned for retained facts. An authorized owner may also
-explicitly replay initialization through its trusted adapter binding to recover
-any retained pending receipt; poll never performs that mutation or an
+lock the same stable observer-session row (and the run row once it exists), so
+a bulk ingester cannot commit a newly pending receipt after redemption has
+scanned for retained facts—even during first-run creation. An authorized owner
+may also explicitly replay initialization through its trusted adapter binding to
+recover any retained pending receipt; poll never performs that mutation or an
 acknowledgement implicitly.
 
 The report still waits for a leased, trusted owner to consume it. Drover has no

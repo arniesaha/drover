@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from threading import Barrier
+from threading import Barrier, Event, Thread
 
 import pytest
 
@@ -22,6 +22,7 @@ from drover.server.control_store import (
     control_store_config,
 )
 from drover.server.db import control_plane_connection
+from drover.server.harness import continuity
 from drover.server.harness.continuity import (
     ContinuityConflict,
     FactoryObserverContinuity,
@@ -531,6 +532,114 @@ def test_pending_completion_recovers_after_authorized_handoff_on_postgres(pg_bri
         checkpoint="PostgreSQL owner acknowledged recovered completion",
     )
     assert store.status(RUN)["inbox_counts"] == {"acknowledged": 1}
+
+
+def test_first_run_completion_projection_serializes_with_handoff_on_postgres(
+    pg_control_path, monkeypatch
+):
+    """A first-run completion cannot commit behind its owner-recovery scan."""
+    run = "run_PG499"
+    session_id = "pg-observer-first-run"
+    event_id = "pg-first-run-completion"
+    clock = Clock()
+    registry = HarnessRegistry(pg_control_path)
+    registry.create_session(
+        session_id=session_id,
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{run}@4",
+    )
+    store = FactoryObserverContinuity(pg_control_path, clock=clock)
+    receipt_entered = Event()
+    release_receipt = Event()
+    initialization_finished = Event()
+    ingestion_errors: list[BaseException] = []
+    initialization_errors: list[BaseException] = []
+    original_receipt = continuity._record_completion_receipt
+
+    def hold_first_pending_receipt(*args, **kwargs):
+        if (
+            kwargs["harness_event_id"] == event_id
+            and kwargs["run_id"] is None
+            and not receipt_entered.is_set()
+        ):
+            receipt_entered.set()
+            assert release_receipt.wait(timeout=5)
+        return original_receipt(*args, **kwargs)
+
+    monkeypatch.setattr(
+        continuity, "_record_completion_receipt", hold_first_pending_receipt
+    )
+    record = {
+        "event_id": event_id,
+        "session_id": session_id,
+        "event_type": "status",
+        "payload": {"payload": {"turn_complete": True}},
+        "seq": 1,
+        "created_at": clock.now,
+    }
+
+    def ingest():
+        try:
+            assert registry.ingest_structured_events([record]) == 1
+        except BaseException as exc:  # preserve assertion failures from the thread
+            ingestion_errors.append(exc)
+
+    def issue_and_redeem():
+        try:
+            handoff = store.issue_handoff(
+                session_id=session_id,
+                objective="Prove first-run completion serialization",
+                checkpoint="Pending",
+                authorized_owner_id="credential:pg-owner",
+                issued_by="credential:pg-host",
+            )
+            store.initialize(
+                session_id=session_id,
+                objective="Prove first-run completion serialization",
+                checkpoint="Pending",
+                authorized_owner_id="credential:pg-owner",
+                handoff_token=handoff["handoff_token"],
+            )
+        except BaseException as exc:  # preserve assertion failures from the thread
+            initialization_errors.append(exc)
+        finally:
+            initialization_finished.set()
+
+    ingestion = Thread(target=ingest)
+    initialization = Thread(target=issue_and_redeem)
+    try:
+        ingestion.start()
+        assert receipt_entered.wait(timeout=5)
+        initialization.start()
+        # The session row serializes first-run projection with handoff creation.
+        # Event coordination proves blocking without an arbitrary sleep.
+        assert not initialization_finished.wait(timeout=0.2)
+        release_receipt.set()
+        ingestion.join(timeout=5)
+        initialization.join(timeout=5)
+        assert not ingestion.is_alive()
+        assert not initialization.is_alive()
+    finally:
+        release_receipt.set()
+        ingestion.join(timeout=5)
+        initialization.join(timeout=5)
+
+    assert not ingestion_errors
+    assert not initialization_errors
+    # A retry cannot hide the same durable source fact after the restart/poll view.
+    assert registry.ingest_structured_events([record]) == 0
+    restarted = FactoryObserverContinuity(pg_control_path, clock=clock)
+    status = restarted.status(run)
+    assert status["completion_receipts"]["counts"] == {"projected": 1}
+    assert status["inbox_counts"] == {"pending": 1}
+    assert status["owner_handoff"] == {
+        "authorized_owner_id": "credential:pg-owner",
+        "state": "owner_lease_required",
+    }
 
 
 def test_unbound_run_denies_mutations_until_authorized_handoff_on_postgres(pg_bridge):

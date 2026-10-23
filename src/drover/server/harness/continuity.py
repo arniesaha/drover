@@ -123,6 +123,16 @@ def _row(con, sql, params):
     return dict(zip((col[0] for col in result.description), row)) if row else None
 
 
+def _lock_observer_session(con, session_id: str):
+    """Lock the stable observer key shared by projection and first handoff."""
+    lock = " FOR UPDATE" if is_postgres_connection(con) else ""
+    return _row(
+        con,
+        "SELECT handoff_mode FROM harness_sessions WHERE session_id = ?" + lock,
+        [session_id],
+    )
+
+
 def _validate_report(
     *,
     source: str,
@@ -300,16 +310,13 @@ def record_observer_worker_completion(
     completion = _completion_payload(payload)
     if completion is None:
         return None
-    session = _row(
-        con,
-        "SELECT handoff_mode FROM harness_sessions WHERE session_id = ?",
-        [session_id],
-    )
+    session = _lock_observer_session(con, session_id)
     if session is None or session["handoff_mode"] != "factory_observer":
         return None
-    # Serialize projection with owner-handoff redemption. Without this lock,
-    # ingestion can observe an unbound row, commit a pending receipt after
-    # redemption's recovery scan, and strand an otherwise valid completion.
+    # Serialize projection with owner-handoff redemption. The session row
+    # exists before a run does, so it also protects the first-run gap where a
+    # missing run cannot be locked. Without it, ingestion can commit a pending
+    # receipt after redemption's recovery scan and strand a valid completion.
     lock = " FOR UPDATE" if is_postgres_connection(con) else ""
     run = _row(
         con,
@@ -545,6 +552,7 @@ class FactoryObserverContinuity:
             raise ValueError("an existing Factory observer session is required")
         run_id = projection["run_id"]
         with self._transaction() as (con, _):
+            _lock_observer_session(con, session_id)
             con.execute(
                 """INSERT INTO factory_observer_runs
                 (run_id, session_id, expected_revision, objective, checkpoint,
@@ -648,6 +656,7 @@ class FactoryObserverContinuity:
         handoff_token = secrets.token_urlsafe(32)
         token_sha256 = _handoff_token_sha256(handoff_token)
         with self._transaction() as (con, _):
+            _lock_observer_session(con, session_id)
             con.execute(
                 """INSERT INTO factory_observer_runs
                 (run_id, session_id, expected_revision, objective, checkpoint,
