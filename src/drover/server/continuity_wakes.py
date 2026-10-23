@@ -134,15 +134,8 @@ class ContinuityWakes:
         ):
             raise ContinuityWakeConflict("current owner lease and epoch are required")
 
-    def enqueue(
-        self,
-        *,
-        issue_key: str,
-        action: str,
-        fingerprint: str,
-        payload: dict,
-    ) -> str:
-        """Record a wake once; a duplicate must retain exactly the same payload."""
+    def _enqueue(self, con, *, issue_key: str, action: str, fingerprint: str, payload: dict) -> str:
+        """Insert or verify one wake in a caller-owned transaction."""
         _text(issue_key, "issue_key", 191)
         _text(action, "action", 191)
         _text(fingerprint, "fingerprint", 512)
@@ -152,30 +145,44 @@ class ContinuityWakes:
         if len(payload_json.encode()) > MAX_WAKE_PAYLOAD_BYTES:
             raise ValueError("payload exceeds bounded wake size")
         wake_id = _wake_id(issue_key, action, fingerprint)
-        with self._transaction() as con:
-            # The unique wake identity is the concurrency fence.  Do not use a
-            # check-then-insert here: two producers can both observe no row,
-            # and one must safely reselect the winner after its conflict.
-            con.execute(
-                """INSERT INTO continuity_wakes
-                (wake_id, issue_key, action, fingerprint, payload_json, next_delivery_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT DO NOTHING""",
-                [wake_id, issue_key, action, fingerprint, payload_json, self.clock()],
-            )
-            existing = _row(
-                con,
-                "SELECT payload_json FROM continuity_wakes WHERE wake_id = ?",
-                [wake_id],
-            )
-            # A successful insert must be immediately visible in our
-            # transaction; failing closed is safer than returning an identity
-            # whose canonical payload we could not verify.
-            if existing is None:
-                raise RuntimeError("wake insert was not durable")
-            if existing["payload_json"] != payload_json:
-                raise ContinuityWakeConflict("wake identity has divergent payload")
+        # The unique wake identity is the concurrency fence. Do not use a
+        # check-then-insert: concurrent producers safely reselect the winner.
+        con.execute(
+            """INSERT INTO continuity_wakes
+            (wake_id, issue_key, action, fingerprint, payload_json, next_delivery_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING""",
+            [wake_id, issue_key, action, fingerprint, payload_json, self.clock()],
+        )
+        existing = _row(
+            con,
+            "SELECT payload_json FROM continuity_wakes WHERE wake_id = ?",
+            [wake_id],
+        )
+        if existing is None:
+            raise RuntimeError("wake insert was not durable")
+        if existing["payload_json"] != payload_json:
+            raise ContinuityWakeConflict("wake identity has divergent payload")
         return wake_id
+
+    def enqueue(
+        self, *, issue_key: str, action: str, fingerprint: str, payload: dict
+    ) -> str:
+        """Record a wake once; a duplicate must retain exactly the same payload."""
+        with self._transaction() as con:
+            return self._enqueue(con, issue_key=issue_key, action=action, fingerprint=fingerprint, payload=payload)
+
+    def enqueue_decision(self, *, issue_key: str, decision, facts: dict, decided_at: datetime) -> str:
+        """Atomically persist the hub's selected action as a bounded wake."""
+        payload = {"decision": decision.payload(), "facts": facts, "decided_at": decided_at.isoformat()}
+        with self._transaction() as con:
+            return self._enqueue(
+                con,
+                issue_key=issue_key,
+                action="continuity:" + decision.action,
+                fingerprint=decision.fingerprint,
+                payload=payload,
+            )
 
     def lease(
         self,
