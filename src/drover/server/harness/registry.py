@@ -1540,6 +1540,23 @@ class HarnessRegistry:
                         event_type=event_type,
                         payload=payload or {},
                     )
+                    # An initialized Factory observer run has an explicit,
+                    # durable session binding.  A real sequenced completion
+                    # can therefore become an owner-continuation fact in the
+                    # same commit as its source event.  The projection itself
+                    # never sends to or otherwise claims an external parent.
+                    from drover.server.harness.continuity import (
+                        record_observer_worker_completion,
+                    )
+
+                    record_observer_worker_completion(
+                        con,
+                        event_id=event_id,
+                        session_id=session_id,
+                        sequence=seq,
+                        payload=payload,
+                        received_at=created_at,
+                    )
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")

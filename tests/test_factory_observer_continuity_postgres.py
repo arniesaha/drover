@@ -234,6 +234,34 @@ def test_duplicate_source_retries_race_before_and_after_ack(pg_bridge):
     assert store.consume(RUN, **fence) is None
 
 
+def test_sequenced_drover_completion_reaches_leased_owner_on_postgres(pg_bridge):
+    store, _ = pg_bridge
+    registry = HarnessRegistry(store.path)
+    lease = store.lease(RUN, owner_id="postgres-owner")
+    fence = {"owner_id": "postgres-owner", "owner_epoch": lease["owner_epoch"]}
+
+    registry.append_event(
+        event_id="pg-drover-completion-1",
+        session_id="pg-observer",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=1,
+    )
+
+    [event] = store.status(RUN)["events"]
+    assert event["report"]["source"] == "drover"
+    assert event["report"]["source_event_id"] == "pg-drover-completion-1"
+    assert event["report"]["subject"] == "pg-observer"
+    assert store.consume(RUN, **fence)["type"] == "review_worker_result"
+    store.acknowledge(
+        RUN,
+        **fence,
+        event_id=event["event_id"],
+        checkpoint="PostgreSQL owner reviewed Drover completion",
+    )
+    assert store.status(RUN)["inbox_counts"] == {"acknowledged": 1}
+
+
 def test_retry_pool_restart_persistence_and_bounded_exhaustion(pg_bridge):
     store, clock = pg_bridge
     lease = store.lease(RUN, owner_id="owner", lease_seconds=5)

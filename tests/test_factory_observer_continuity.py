@@ -213,6 +213,83 @@ def test_no_owner_keeps_event_pending_and_projects_recovery(bridge):
         store.consume(RUN, owner_id="absent", owner_epoch=0)
 
 
+def test_sequenced_drover_completion_is_durably_linked_to_observer_owner(bridge):
+    """The worker event and owner action commit through the existing run/session link."""
+    store, _, registry = bridge
+    fence = owner(store, owner_id="authorized-owner")
+
+    registry.append_event(
+        event_id="drover-worker-completion-1",
+        session_id=SESSION,
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=7,
+    )
+
+    pending = store.status(RUN)
+    [event] = pending["events"]
+    assert event["event_id"] == store.report(
+        RUN,
+        source="drover",
+        source_event_id="drover-worker-completion-1",
+        subject=SESSION,
+        sequence=7,
+        kind="worker_brief_completed",
+        summary="Drover harness session reported a completed turn.",
+    )
+    assert event["report"]["source"] == "drover"
+    assert event["report"]["subject"] == SESSION
+    action = store.consume(RUN, **fence)
+    assert action["type"] == "review_worker_result"
+    assert action["authorized"]
+    store.acknowledge(
+        RUN,
+        **fence,
+        event_id=event["event_id"],
+        checkpoint="Authorized owner reviewed Drover completion",
+    )
+
+    # Redelivery of the source event remains the same harness and continuity
+    # fact; it cannot manufacture another continuation or alter the checkpoint.
+    registry.append_event(
+        event_id="drover-worker-completion-1",
+        session_id=SESSION,
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=7,
+    )
+    assert store.status(RUN)["inbox_counts"] == {"acknowledged": 1}
+    assert (
+        store.status(RUN)["checkpoint"] == "Authorized owner reviewed Drover completion"
+    )
+
+
+def test_unsequenced_or_uninitialized_harness_completion_does_not_claim_owner(bridge):
+    store, _, registry = bridge
+    registry.append_event(
+        event_id="unsequenced-completion",
+        session_id=SESSION,
+        event_type="status",
+        payload={"turn_complete": True},
+    )
+    assert store.status(RUN)["inbox_counts"] == {}
+
+    registry.create_session(
+        session_id="ordinary-session",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+    )
+    registry.append_event(
+        event_id="ordinary-completion",
+        session_id="ordinary-session",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=1,
+    )
+    assert store.status(RUN)["inbox_counts"] == {}
+
+
 def test_expiry_recovers_same_action_and_fences_stale_owner(bridge):
     store, clock, _ = bridge
     stale = owner(store, lease_seconds=5)

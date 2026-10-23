@@ -174,6 +174,49 @@ def test_report_owner_action_ack_restart_has_no_duplicate_delivery(
     assert reconstructed.call("consume", owner_epoch=epoch)["delivery"] is None
 
 
+def test_drover_completion_canary_routes_to_bound_owner_adapter_only(make_harness):
+    """End-to-end canary for Drover's actual completion-to-owner boundary.
+
+    The normal-tool harness is deliberately an adapter double: it proves the
+    durable Drover contract and trusted owner binding, not OpenClaw parent
+    session ownership or parent-message delivery.
+    """
+    harness, endpoint, _ = make_harness()
+    registry = HarnessRegistry(endpoint.path)
+    registry.append_event(
+        event_id="canary-drover-completion-1",
+        session_id="mock-observer",
+        event_type="status",
+        payload={"turn_complete": True},
+        seq=1,
+    )
+
+    pending = endpoint.store().status(RUN)
+    [event] = pending["events"]
+    assert event["report"] == {
+        "source": "drover",
+        "source_event_id": "canary-drover-completion-1",
+        "subject": "mock-observer",
+        "sequence": 1,
+        "kind": "worker_brief_completed",
+        "summary": "Drover harness session reported a completed turn.",
+    }
+    assert pending["owner"]["id"] is None
+
+    epoch = harness.call("lease")["continuity"]["owner"]["epoch"]
+    delivery = harness.call("consume", owner_epoch=epoch)["delivery"]
+    assert delivery["event_id"] == event["event_id"]
+    assert delivery["type"] == "review_worker_result"
+    assert delivery["authorized"]
+    harness.call(
+        "acknowledge",
+        owner_epoch=epoch,
+        event_id=event["event_id"],
+        checkpoint="Bound owner reconciled the Drover completion canary",
+    )
+    assert endpoint.store().status(RUN)["inbox_counts"] == {"acknowledged": 1}
+
+
 def test_lost_delivery_retains_action_and_recovery_is_explicit(make_harness):
     harness, endpoint, clock = make_harness()
     epoch = harness.call("lease")["continuity"]["owner"]["epoch"]

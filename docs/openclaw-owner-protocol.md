@@ -78,6 +78,15 @@ The owner explicitly reconciles the action in its allowed scope and explicitly
 acks with the event ID and updated checkpoint. Initialization, schema generation,
 polling, receipt of a message/tool reply, and tool-result rendering do not ack.
 
+For an initialized Factory observer, Drover also projects a real sequenced
+`turn_complete` harness event into that same durable report path as source
+`drover`. The run/session binding already exists in `factory_observer_runs`; no
+OpenClaw parent identity is added or inferred. The focused completion canary
+therefore proves only completion → durable ledger → trusted bound owner adapter
+→ explicit acknowledgment. It intentionally does not claim that Drover can
+establish OpenClaw parent ownership, deliver a parent message, or resume a
+parent session.
+
 Implementation remains commit-only; integration remains review/publish;
 deployment produces an unauthorized `request_explicit_approval` action and the
 endpoint refuses its ack. A label does not grant worker tools or approval.

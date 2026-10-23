@@ -168,6 +168,32 @@ workers, or call TaskFlow. `owner_wake` is a polling hint, not a delivered push.
 The adapter must actively poll and consume; no existing cron watcher or worker
 producer is automatically rewired by this change.
 
+### Drover completion canary and ownership boundary
+
+For an **initialized** observer run, a new, sequenced Drover harness event with
+`payload.turn_complete: true` is projected in the same control-store transaction
+as a `factory_observer_inbox` report.  Its immutable source is `drover`, its
+source event ID is the harness event ID, and its subject is the observer session
+ID.  This makes the existing `factory_observer_runs.session_id` relation the
+durable run → session → completion link.  Replay of that harness event cannot
+create a second owner action.
+
+The report still waits for a leased, trusted owner to consume it.  Drover has no
+OpenClaw parent-session ownership record and does not send a parent message,
+resume an OpenClaw session, or infer one from the observer session.  When the
+optional OpenClaw adapter is used, it is only the authenticated owner-tool
+contract that receives the action; parent delivery remains an OpenClaw
+integration responsibility.  `tests/test_openclaw_owner_protocol.py` contains
+the reproducible completion canary using a real durable Drover store and a mock
+normal-tool host specifically to prove this adapter boundary without claiming
+live parent ownership.
+
+Drover's separate hub work-item/goal mechanisms remain truthful and separate:
+`work_items` and their timeline are created for hub-owned launches, while
+`execution_links` associate configured goal work with its session and parent
+session.  A Factory observer is an externally TaskFlow-owned run, so this
+observer ledger deliberately does not fabricate a work item or goal link for it.
+
 Authority scope is immutable: `implementation` permits owner continuation
 within commit-only authority, `integration` within publish/review authority,
 and `deployment` projects `request_explicit_approval` with `authorized: false`.

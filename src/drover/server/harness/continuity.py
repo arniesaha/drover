@@ -97,6 +97,129 @@ def _row(con, sql, params):
     return dict(zip((col[0] for col in result.description), row)) if row else None
 
 
+def _validate_report(
+    *,
+    source: str,
+    source_event_id: str,
+    subject: str,
+    sequence: int,
+    kind: str,
+    summary: str,
+) -> str:
+    """Validate one immutable report and return its canonical payload."""
+    for name, value in {
+        "source": source,
+        "source_event_id": source_event_id,
+        "subject": subject,
+    }.items():
+        _text(value, name, 191)
+    _integer(sequence, "sequence", 0, 2**63 - 1)
+    _text(summary, "summary", 2000)
+    if kind not in ACTION_TYPES:
+        raise ValueError("unsupported report kind")
+    payload = canonical_payload(
+        dict(
+            source=source,
+            source_event_id=source_event_id,
+            subject=subject,
+            sequence=sequence,
+            kind=kind,
+            summary=summary,
+        )
+    )
+    return payload
+
+
+def _report_event_id(run_id: str, source: str, source_event_id: str) -> str:
+    return hashlib.sha256(
+        canonical_payload(
+            {"run_id": run_id, "source": source, "source_event_id": source_event_id}
+        ).encode()
+    ).hexdigest()
+
+
+def _record_report(
+    con,
+    *,
+    run_id: str,
+    source: str,
+    source_event_id: str,
+    subject: str,
+    sequence: int,
+    kind: str,
+    summary: str,
+    received_at: datetime,
+) -> str:
+    """Insert a report using the caller's already-open control transaction."""
+    payload = _validate_report(
+        source=source,
+        source_event_id=source_event_id,
+        subject=subject,
+        sequence=sequence,
+        kind=kind,
+        summary=summary,
+    )
+    event_id = _report_event_id(run_id, source, source_event_id)
+    existing = _row(
+        con,
+        "SELECT payload_json FROM factory_observer_inbox WHERE event_id = ?",
+        [event_id],
+    )
+    if existing:
+        if existing["payload_json"] != payload:
+            raise ContinuityConflict("source event identity has divergent content")
+        return event_id
+    con.execute(
+        """INSERT INTO factory_observer_inbox
+        (event_id, run_id, source, subject, sequence, payload_json, received_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [event_id, run_id, source, subject, sequence, payload, received_at],
+    )
+    return event_id
+
+
+def record_observer_worker_completion(
+    con,
+    *,
+    event_id: str,
+    session_id: str,
+    sequence: int | None,
+    payload: dict | None,
+    received_at: datetime,
+) -> bool:
+    """Project a real sequenced Drover completion into an initialized observer run.
+
+    This is intentionally narrower than generic harness-event projection.  The
+    session-to-run relation must already be initialized in the durable observer
+    ledger, and the structured source sequence must be present.  Drover records
+    the completion fact and leaves owner delivery to the bound adapter; it does
+    not infer an external parent session or send a message to one.
+    """
+    if not isinstance(payload, dict) or payload.get("turn_complete") is not True:
+        return False
+    if type(sequence) is not int or sequence < 0:
+        return False
+    run = _row(
+        con,
+        "SELECT run_id FROM factory_observer_runs WHERE session_id = ?",
+        [session_id],
+    )
+    if run is None:
+        return False
+    _record_report(
+        con,
+        run_id=run["run_id"],
+        source="drover",
+        source_event_id=event_id,
+        subject=session_id,
+        sequence=sequence,
+        kind="worker_brief_completed",
+        summary="Drover harness session reported a completed turn.",
+        received_at=received_at,
+    )
+    return True
+
+
 class FactoryObserverContinuity:
     """Local continuity facts correlated to an existing observer launch."""
 
@@ -237,50 +360,18 @@ class FactoryObserverContinuity:
         summary: str,
     ) -> str:
         """Accept only bounded report facts; retries must retain source identity."""
-        for name, value in {
-            "source": source,
-            "source_event_id": source_event_id,
-            "subject": subject,
-        }.items():
-            _text(value, name, 191)
-        _integer(sequence, "sequence", 0, 2**63 - 1)
-        _text(summary, "summary", 2000)
-        if kind not in ACTION_TYPES:
-            raise ValueError("unsupported report kind")
-        payload = canonical_payload(
-            dict(
+        with self._transaction(run_id) as (con, _):
+            return _record_report(
+                con,
+                run_id=run_id,
                 source=source,
                 source_event_id=source_event_id,
                 subject=subject,
                 sequence=sequence,
                 kind=kind,
                 summary=summary,
+                received_at=self.clock(),
             )
-        )
-        event_id = hashlib.sha256(
-            canonical_payload(
-                {"run_id": run_id, "source": source, "source_event_id": source_event_id}
-            ).encode()
-        ).hexdigest()
-        with self._transaction(run_id) as (con, _):
-            existing = _row(
-                con,
-                "SELECT payload_json FROM factory_observer_inbox WHERE event_id = ?",
-                [event_id],
-            )
-            if existing:
-                if existing["payload_json"] != payload:
-                    raise ContinuityConflict(
-                        "source event identity has divergent content"
-                    )
-                return event_id
-            con.execute(
-                """INSERT INTO factory_observer_inbox
-                (event_id, run_id, source, subject, sequence, payload_json, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                [event_id, run_id, source, subject, sequence, payload, self.clock()],
-            )
-        return event_id
 
     def consume(self, run_id: str, *, owner_id: str, owner_epoch: int) -> dict | None:
         """Commit one action intent before delivery; never perform that action.
