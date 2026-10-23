@@ -12,6 +12,23 @@ import time
 from pathlib import Path
 
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+GENERATION = re.compile(r"^\d{4}-\d{2}-\d{2}(?:-[A-Za-z0-9][A-Za-z0-9._-]{0,80})?$")
+
+
+def generation_id(value):
+    """Validate a daily or explicitly unique generation without accepting paths."""
+    if not isinstance(value, str) or not GENERATION.fullmatch(value):
+        raise ValueError("invalid generation id")
+    # Validate the calendar portion as well as its spelling.
+    dt.date.fromisoformat(value[:10])
+    return value
+
+
+def request_generation(request):
+    """Accept legacy daily requests while new callers name their generation."""
+    if not isinstance(request, dict):
+        raise ValueError("invalid generation request")
+    return generation_id(request.get("generation_id", request.get("date")))
 
 
 def retained_dates(names):
@@ -37,25 +54,24 @@ def digest(path):
     return h.hexdigest()
 
 
-def pending_path(root, date):
-    if not isinstance(date, str) or not DATE.fullmatch(date):
-        raise ValueError("invalid generation date")
-    dt.date.fromisoformat(date)
-    pending = root / (".pending-" + date)
+def pending_path(root, generation):
+    generation = generation_id(generation)
+    pending = root / (".pending-" + generation)
     if pending.is_symlink():
         raise ValueError("symlink pending generation")
     return pending
 
 
-def preserve_failed(root, date):
+def preserve_failed(root, generation):
     if root.is_symlink():
         raise ValueError("symlink backup root")
     # Parent write/search permission is sufficient even for unreadable children.
     root.chmod(0o700)
-    pending = pending_path(root, date)
+    generation = generation_id(generation)
+    pending = pending_path(root, generation)
     if not pending.exists():
         return None
-    base = ".failed-" + date + "-" + str(time.time_ns())
+    base = ".failed-" + generation + "-" + str(time.time_ns())
     suffix = 0
     while True:
         failed = root / (base + ("-" + str(suffix) if suffix else ""))
@@ -67,18 +83,18 @@ def preserve_failed(root, date):
         return failed.name
 
 
-def quarantine_pending(root, date):
+def quarantine_pending(root, generation):
     if root.is_symlink():
         raise ValueError("symlink backup root")
     root.chmod(0o700)
-    pending_path(root, date)  # Validate before modifying any generation.
+    generation_id(generation)  # Validate before modifying any generation.
     quarantined = []
     for path in sorted(root.iterdir()):
         old_date = path.name.removeprefix(".pending-")
         if (
             path.name.startswith(".pending-")
             and DATE.fullmatch(old_date)
-            and old_date < date
+            and old_date < generation[:10]
         ):
             quarantined.append(preserve_failed(root, old_date))
     return quarantined
@@ -184,15 +200,15 @@ def main():
     if root.is_symlink():
         raise ValueError("symlink backup root")
     if action == "prepare":
-        date = json.load(sys.stdin)["date"]
-        pending = pending_path(root, date)
-        final = root / date
+        generation = request_generation(json.load(sys.stdin))
+        pending = pending_path(root, generation)
+        final = root / generation
         if final.exists():
             raise ValueError("generation already exists")
         # The Studio holds its local job lock. A leftover pending generation is
         # an interrupted run; retain it and allow the same date to be retried.
-        quarantined = quarantine_pending(root, date)
-        failed = preserve_failed(root, date)
+        quarantined = quarantine_pending(root, generation)
+        failed = preserve_failed(root, generation)
         pending.mkdir(mode=0o700)
         previous = sorted(
             p.name
@@ -211,21 +227,22 @@ def main():
             )
         )
     elif action == "fail":
-        date = json.load(sys.stdin)["date"]
-        failed = preserve_failed(root, date)
-        quarantined = quarantine_pending(root, date)
+        generation = request_generation(json.load(sys.stdin))
+        failed = preserve_failed(root, generation)
+        quarantined = quarantine_pending(root, generation)
         print(json.dumps({"failed": failed, "quarantined": quarantined}))
     elif action == "inventory":
         request = json.load(sys.stdin)
-        pending = pending_path(root, request["date"])
+        pending = pending_path(root, request_generation(request))
         print(json.dumps({"files": inventory(pending, request["trees"])}))
     elif action == "verify":
         request = json.load(sys.stdin)
-        pending = pending_path(root, request["date"])
+        pending = pending_path(root, request_generation(request))
         print(json.dumps(verify(pending, request)))
     elif action == "publish":
         receipt = json.load(sys.stdin)
-        pending = pending_path(root, receipt["date"])
+        generation = request_generation(receipt)
+        pending = pending_path(root, generation)
         # Only the caller's successful read-back pg_restore permits publication.
         if (
             not receipt["nas_pg_restore_list"]
@@ -237,7 +254,7 @@ def main():
             raise ValueError("verification incomplete")
         with (pending / "SUCCESS.json").open("w") as f:
             json.dump(receipt, f, indent=2)
-        pending.rename(root / receipt["date"])
+        pending.rename(root / generation)
         dates = [
             p.name
             for p in root.iterdir()
