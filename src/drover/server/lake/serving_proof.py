@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import stat
 from pathlib import Path
 
 import psycopg
@@ -393,30 +394,54 @@ def check_referenced_files(spec, con, *, limit=REFERENCED_FILE_LIMIT):
     if not required <= tables:
         raise LakeError("lake_verification_tables_missing")
     root = spec.data_root.resolve()
+    # Every serving child runs this over ~24k files on prod. Resolving each
+    # full path and statting it twice cost ~0.65 s a child (drover#778); the
+    # files share a few dozen directories, so resolve those once and lstat
+    # each file once. A symlinked file still takes the full resolve path.
+    # A directory swapped for a symlink mid-scan is seen only by the files
+    # after its first; anyone able to do that already writes the lake.
+    directories = {}
     files = 0
     for table in sorted(required | (optional & tables)):
         cursor = con.execute(
             "SELECT data_file,data_file_size_bytes,delete_file,delete_file_size_bytes FROM ducklake_list_files('lake',?)",
             [table],
         )
-        while row := cursor.fetchone():
-            for name, size in ((row[0], row[1]), (row[2], row[3])):
-                if name is None:
-                    continue
-                files += 1
-                if files > limit:
-                    raise LakeError("lake_verification_file_limit")
-                path = Path(name)
-                if not path.resolve().is_relative_to(root):
-                    raise LakeError("lake_verification_file_outside_root")
-                try:
-                    if not path.is_file() or path.stat().st_size != size:
-                        raise LakeError("lake_verification_file_missing_or_changed")
-                except OSError:
-                    raise LakeError(
-                        "lake_verification_file_missing_or_changed"
-                    ) from None
+        while rows := cursor.fetchmany(1024):
+            for row in rows:
+                for name, size in ((row[0], row[1]), (row[2], row[3])):
+                    if name is None:
+                        continue
+                    files += 1
+                    if files > limit:
+                        raise LakeError("lake_verification_file_limit")
+                    _check_referenced_file(Path(name), size, root, directories)
     return files
+
+
+def _check_referenced_file(path, size, root, directories):
+    """``path`` resolves inside ``root`` and is a regular file of ``size``."""
+    try:
+        status = path.lstat()
+    except OSError:
+        status = None
+    exact = path.name in ("", ".", "..")
+    if status is None or exact or stat.S_ISLNK(status.st_mode):
+        resolved = path.resolve()
+    else:
+        parent = directories.get(path.parent)
+        if parent is None:
+            parent = directories[path.parent] = path.parent.resolve()
+        resolved = parent / path.name
+    if not resolved.is_relative_to(root):
+        raise LakeError("lake_verification_file_outside_root")
+    try:
+        if status is None or exact or stat.S_ISLNK(status.st_mode):
+            status = path.stat()
+    except OSError:
+        raise LakeError("lake_verification_file_missing_or_changed") from None
+    if not stat.S_ISREG(status.st_mode) or status.st_size != size:
+        raise LakeError("lake_verification_file_missing_or_changed")
 
 
 def _check_referenced_files(spec, con):
