@@ -18,12 +18,13 @@ steps. No credential, configuration, policy, or service change was made.
 
 ## Trusted binding and normal invocation
 
-An integration must initialize the existing observer run through the existing
-continuity endpoint first. The server derives and records the immutable owner
-identity from that initialize caller's bearer: `credential:<credential-id>` for
-a credential or `legacy:operator` for the supported legacy bearer. It then binds
-the adapter's `run_id`, `owner_principal` (that exact derived principal), and
-`authority_scope` outside model input. The inactive plugin separately binds its
+Before an owner initializes an observer run, its bound Drover host credential
+(or the existing legacy operator bearer) must issue a one-time `issue_handoff`
+for the intended `credential:<credential-id>`. The named owner redeems that
+token through `initialize`; the server records the immutable owner identity
+only after this proof. It then binds the adapter's `run_id`, `owner_principal`
+(that exact derived principal), and `authority_scope` outside model input. The
+inactive plugin separately binds its
 trusted OpenClaw `ownerSessionKey` for tool discovery; that session key is never
 sent as an HTTP owner identity.
 The tool request cannot choose another run, impersonate an owner, broaden scope,

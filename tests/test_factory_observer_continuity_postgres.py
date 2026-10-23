@@ -7,6 +7,9 @@ No DuckDB fallback and no production control-store DSN are used here.
 
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Barrier
@@ -110,6 +113,121 @@ def handoff(store, owner_id):
         checkpoint="Pending",
         authorized_owner_id=owner_id,
     )
+
+
+def test_http_initialize_requires_host_issued_handoff_on_postgres(pg_bridge, tmp_path):
+    """The real PostgreSQL path cannot let the first device seize a run."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _ = pg_bridge
+    registry = HarnessRegistry(store.path)
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
+    owner_credential, owner_token = credentials.issue(scope="device", label="owner")
+    _, unrelated_token = credentials.issue(scope="device", label="unrelated")
+    owner_principal = "credential:" + owner_credential.id
+    collector = MetricsCollector(
+        duckdb_path=store.path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    base = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            base,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def initialize(session_id, token, handoff_token=None):
+        body = {
+            "operation": "initialize",
+            "session_id": session_id,
+            "objective": "Prove #497 on PostgreSQL",
+            "checkpoint": "Pending",
+        }
+        if handoff_token is not None:
+            body["handoff_token"] = handoff_token
+        return request(body, token)
+
+    def issue(session_id):
+        return request(
+            {
+                "operation": "issue_handoff",
+                "session_id": session_id,
+                "objective": "Prove #497 on PostgreSQL",
+                "checkpoint": "Pending",
+                "authorized_owner_id": owner_principal,
+            },
+            host_token,
+        )
+
+    try:
+        assert initialize("pg-observer", unrelated_token)[0] == 403
+        assert store.status(RUN)["owner_handoff"]["authorized_owner_id"] is None
+        status, issued = issue("pg-observer")
+        assert status == 200
+        assert (
+            initialize("pg-observer", unrelated_token, issued["handoff_token"])[0]
+            == 403
+        )
+        assert store.status(RUN)["owner_handoff"]["authorized_owner_id"] is None
+        assert initialize("pg-observer", owner_token, issued["handoff_token"])[0] == 200
+        assert initialize("pg-observer", owner_token)[0] == 200
+
+        race_run = "run_PG498"
+        race_session = "pg-observer-race"
+        registry.create_session(
+            session_id=race_session,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            status="running",
+            handoff_mode="factory_observer",
+            source_session_id=f"factory/{race_run}@4",
+        )
+        status, issued = issue(race_session)
+        assert status == 200
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(
+                    lambda token: initialize(
+                        race_session, token, issued["handoff_token"]
+                    )[0],
+                    [unrelated_token, owner_token],
+                )
+            )
+        assert sorted(outcomes) == [200, 403]
+        assert store.status(race_run)["owner_handoff"]["authorized_owner_id"] == (
+            owner_principal
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_two_connections_and_two_owners_race_acquisition(pg_bridge):

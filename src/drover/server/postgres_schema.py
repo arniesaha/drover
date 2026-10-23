@@ -21,6 +21,7 @@ GITHUB_WORK_ITEM_EVENTS_MIGRATION = 25
 CONTINUITY_RULES_MIGRATION = 26
 GITHUB_ENVIRONMENT_APPROVALS_MIGRATION = 27
 CONTINUITY_OWNER_HANDOFF_MIGRATION = 28
+CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION = 29
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -903,6 +904,16 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             "CREATE INDEX IF NOT EXISTS factory_observer_completion_receipts_run ON factory_observer_completion_receipts (run_id, state, recorded_at, harness_event_id)",
+        ),
+    ),
+    (
+        CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_owner_id TEXT",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_token_sha256 TEXT",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_issued_by TEXT",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_issued_at TIMESTAMPTZ",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS handoff_redeemed_at TIMESTAMPTZ",
         ),
     ),
 )

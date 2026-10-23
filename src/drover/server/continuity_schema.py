@@ -15,6 +15,9 @@ CONTINUITY_DDL = (
       checkpoint TEXT NOT NULL, authority_scope TEXT NOT NULL CHECK
         (authority_scope IN ('implementation', 'integration', 'deployment')),
       authorized_owner_id TEXT,
+      handoff_owner_id TEXT, handoff_token_sha256 TEXT,
+      handoff_issued_by TEXT, handoff_issued_at TIMESTAMPTZ,
+      handoff_redeemed_at TIMESTAMPTZ,
       owner_id TEXT, owner_epoch BIGINT NOT NULL DEFAULT 0,
       lease_until TIMESTAMPTZ, worker_state TEXT NOT NULL DEFAULT 'unknown',
       next_action_json TEXT, updated_at TIMESTAMPTZ NOT NULL

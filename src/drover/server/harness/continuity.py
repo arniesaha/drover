@@ -8,7 +8,9 @@ is no executor, scheduler, TaskFlow client, or permission/approval mutation.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,7 +51,11 @@ def continuity_request(store: FactoryObserverContinuity, body: dict) -> dict:
     contracts = {
         "initialize": (
             {"session_id", "objective", "checkpoint"},
-            {"authority_scope", "authorized_owner_id"},
+            {"authority_scope", "authorized_owner_id", "handoff_token"},
+        ),
+        "issue_handoff": (
+            {"session_id", "objective", "checkpoint", "authorized_owner_id"},
+            {"authority_scope", "issued_by"},
         ),
         "lease": ({"run_id", "owner_id"}, {"owner_epoch", "lease_seconds"}),
         "report": (
@@ -79,8 +85,14 @@ def continuity_request(store: FactoryObserverContinuity, body: dict) -> dict:
         raise ValueError("missing or unsupported continuity fields")
     # getattr is fenced by the fixed operation allowlist above.
     result = getattr(store, operation)(**args)
-    run_id = result if operation == "initialize" else args["run_id"]
+    run_id = (
+        result["run_id"]
+        if operation == "issue_handoff"
+        else result if operation == "initialize" else args["run_id"]
+    )
     response = {"continuity": store.status(run_id)}
+    if operation == "issue_handoff":
+        response["handoff_token"] = result["handoff_token"]
     if operation == "report":
         response["event_id"] = result
     if operation == "consume":
@@ -92,6 +104,11 @@ def _text(value: str, name: str, limit: int = 4000) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > limit:
         raise ValueError(f"{name} must be non-empty text of at most {limit} characters")
     return value
+
+
+def _handoff_token_sha256(token: str) -> str:
+    _text(token, "handoff_token", 512)
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _integer(value: int, name: str, minimum: int, maximum: int) -> int:
@@ -504,6 +521,7 @@ class FactoryObserverContinuity:
         checkpoint: str,
         authority_scope: str = "implementation",
         authorized_owner_id: str | None = None,
+        handoff_token: str | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
@@ -511,6 +529,10 @@ class FactoryObserverContinuity:
         _text(checkpoint, "checkpoint")
         if authorized_owner_id is not None:
             _text(authorized_owner_id, "authorized_owner_id", 191)
+        if handoff_token is not None:
+            _handoff_token_sha256(handoff_token)
+            if authorized_owner_id is None:
+                raise PermissionError("handoff redemption requires an owner identity")
         if authority_scope not in SCOPES:
             raise ValueError("unsupported authority_scope")
         session = HarnessRegistry(self.path).get_session(session_id)
@@ -536,8 +558,11 @@ class FactoryObserverContinuity:
                     self.clock(),
                 ],
             )
+            lock = " FOR UPDATE" if is_postgres_connection(con) else ""
             existing = _row(
-                con, "SELECT * FROM factory_observer_runs WHERE run_id = ?", [run_id]
+                con,
+                "SELECT * FROM factory_observer_runs WHERE run_id = ?" + lock,
+                [run_id],
             )
             # A replay must not replace an advanced checkpoint or broaden scope.
             for name, value in {
@@ -549,10 +574,33 @@ class FactoryObserverContinuity:
                 if existing[name] != value:
                     raise ContinuityConflict(f"run {name} is immutable")
             existing_owner = existing.get("authorized_owner_id")
-            if existing_owner is None and authorized_owner_id is not None:
+            if handoff_token is not None:
+                handoff_owner = existing.get("handoff_owner_id")
+                token_sha256 = existing.get("handoff_token_sha256")
+                if (
+                    handoff_owner != authorized_owner_id
+                    or not token_sha256
+                    or not hmac.compare_digest(
+                        token_sha256, _handoff_token_sha256(handoff_token)
+                    )
+                ):
+                    # A bearer has proved its identity at the HTTP edge, but
+                    # not that it was named by the observer-session handoff.
+                    raise PermissionError("owner is not authorized for this handoff")
+                if existing_owner is None:
+                    con.execute(
+                        """UPDATE factory_observer_runs
+                        SET authorized_owner_id = ?, handoff_redeemed_at = ?, updated_at = ?
+                        WHERE run_id = ?""",
+                        [authorized_owner_id, self.clock(), self.clock(), run_id],
+                    )
+                    _recover_pending_completions(con, session_id=session_id)
+                elif existing_owner != authorized_owner_id:
+                    raise PermissionError("owner is not authorized for this handoff")
+            elif existing_owner is None and authorized_owner_id is not None:
                 # An existing local observer can receive its first explicit
-                # authenticated handoff, but that one-way binding cannot be
-                # replaced by a later caller.
+                # trusted-adapter handoff. The HTTP boundary requires the
+                # separately issued bearer-bound token path above.
                 con.execute(
                     "UPDATE factory_observer_runs SET authorized_owner_id = ?, updated_at = ? WHERE run_id = ?",
                     [authorized_owner_id, self.clock(), run_id],
@@ -564,6 +612,88 @@ class FactoryObserverContinuity:
             if authorized_owner_id is not None:
                 _recover_pending_completions(con, session_id=session_id)
         return run_id
+
+    def issue_handoff(
+        self,
+        *,
+        session_id: str,
+        objective: str,
+        checkpoint: str,
+        authorized_owner_id: str,
+        issued_by: str,
+        authority_scope: str = "implementation",
+    ) -> dict[str, str]:
+        """Persist a one-time host/operator handoff for a named device owner.
+
+        Only the HTTP boundary may identify a host-bound issuer.  The raw
+        token is returned once to that trusted caller; the ledger retains only
+        its digest and the target identity until the target bearer redeems it.
+        """
+        _text(session_id, "session_id", 191)
+        _text(objective, "objective")
+        _text(checkpoint, "checkpoint")
+        _text(authorized_owner_id, "authorized_owner_id", 191)
+        _text(issued_by, "issued_by", 191)
+        if authority_scope not in SCOPES:
+            raise ValueError("unsupported authority_scope")
+        session = HarnessRegistry(self.path).get_session(session_id)
+        projection = factory_observer_projection(session)
+        if projection is None:
+            raise ValueError("an existing Factory observer session is required")
+        run_id = projection["run_id"]
+        handoff_token = secrets.token_urlsafe(32)
+        token_sha256 = _handoff_token_sha256(handoff_token)
+        with self._transaction() as (con, _):
+            con.execute(
+                """INSERT INTO factory_observer_runs
+                (run_id, session_id, expected_revision, objective, checkpoint,
+                 authority_scope, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (run_id) DO NOTHING""",
+                [
+                    run_id,
+                    session_id,
+                    projection["expected_revision"],
+                    objective,
+                    checkpoint,
+                    authority_scope,
+                    self.clock(),
+                ],
+            )
+            lock = " FOR UPDATE" if is_postgres_connection(con) else ""
+            existing = _row(
+                con,
+                "SELECT * FROM factory_observer_runs WHERE run_id = ?" + lock,
+                [run_id],
+            )
+            for name, value in {
+                "session_id": session_id,
+                "objective": objective,
+                "authority_scope": authority_scope,
+                "expected_revision": projection["expected_revision"],
+            }.items():
+                if existing[name] != value:
+                    raise ContinuityConflict(f"run {name} is immutable")
+            if existing.get("authorized_owner_id"):
+                raise ContinuityConflict("run authorized owner is immutable")
+            previous_target = existing.get("handoff_owner_id")
+            if previous_target not in {None, authorized_owner_id}:
+                raise ContinuityConflict("run handoff owner is immutable")
+            con.execute(
+                """UPDATE factory_observer_runs
+                SET handoff_owner_id = ?, handoff_token_sha256 = ?,
+                    handoff_issued_by = ?, handoff_issued_at = ?, updated_at = ?
+                WHERE run_id = ?""",
+                [
+                    authorized_owner_id,
+                    token_sha256,
+                    issued_by,
+                    self.clock(),
+                    self.clock(),
+                    run_id,
+                ],
+            )
+        return {"run_id": run_id, "handoff_token": handoff_token}
 
     def lease(
         self,

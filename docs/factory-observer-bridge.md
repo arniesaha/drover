@@ -123,7 +123,8 @@ TaskFlow operations):
 
 | operation | Required fields | Optional fields |
 | --- | --- | --- |
-| `initialize` | `session_id`, `objective`, `checkpoint` | `authority_scope` (default `implementation`) |
+| `issue_handoff` | `session_id`, `objective`, `checkpoint`, `authorized_owner_id` | `authority_scope` (default `implementation`) |
+| `initialize` | `session_id`, `objective`, `checkpoint`, `handoff_token` | `authority_scope` (default `implementation`) |
 | `lease` | `run_id`, `owner_id` | `owner_epoch` for active renewal; `lease_seconds` (default 60) |
 | `report` | `run_id`, `source`, `source_event_id`, `subject`, `sequence`, `kind`, `summary` | none |
 | `consume` | `run_id`, `owner_id`, `owner_epoch` | none |
@@ -137,16 +138,21 @@ Bad requests return 400, missing runs/events 404, immutable identity or owner
 fence conflicts 409, and a busy control-store window 503.
 
 Mutable owner operations are additionally bound to the authenticated bearer
-principal before the ledger is touched.  Initialize records that derived
-principal as the run's immutable `authorized_owner_id`; callers may not submit
-it in JSON.  Lease, consume, and acknowledge must submit the same owner ID as
-their bearer-derived principal, and that principal must match the stored handoff.
-Mismatches return 403 before mutation; a different but authenticated owner is a
-409 authorization conflict. Credential bearers use `credential:<credential-id>`;
-the supported legacy bearer uses `legacy:operator`. Report remains a bounded
-fact-ingest operation, not an owner claim. A migrated/unbound run cannot be
-leased, consumed, or acknowledged by any principal: an explicit initialize
-handoff must bind its owner first.
+principal before the ledger is touched. A first `initialize` never treats an
+arbitrary authenticated bearer as ownership proof. Instead, the observer
+session's bound host credential (or the existing legacy operator credential)
+must first call `issue_handoff` for a named device principal. It receives a
+one-time token; only that named device can present the token to `initialize`.
+Drover stores the target, issuer, token digest, and redemption time durably;
+the raw token is returned only to the trusted issuer. Lease, consume, and
+acknowledge must submit the same owner ID as their bearer-derived principal,
+and that principal must match the redeemed handoff. Mismatches return 403
+before mutation; a different but authenticated owner is a 409 authorization
+conflict. Credential bearers use `credential:<credential-id>`; the supported
+legacy bearer uses `legacy:operator`. Report remains a bounded fact-ingest
+operation, not an owner claim. A migrated/unbound run cannot be initialized,
+leased, consumed, or acknowledged by a device principal until this explicit
+handoff is issued and redeemed.
 
 For example, after initialization and leasing, an OpenClaw adapter can report
 and consume CI results through the same boundary:

@@ -814,12 +814,23 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
             }
         )
         assert status == 409 and "handoff" in body["error"]
+        status, issued = request(
+            {
+                "operation": "issue_handoff",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "authorized_owner_id": "legacy:operator",
+            }
+        )
+        assert status == 200
         status, payload = request(
             {
                 "operation": "initialize",
                 "session_id": SESSION,
                 "objective": "Fix #497",
                 "checkpoint": "Implementation pending",
+                "handoff_token": issued["handoff_token"],
             }
         )
         assert status == 200
@@ -920,6 +931,7 @@ def test_http_owner_identity_is_bound_to_credential_and_acknowledgement(
 
     store, _, _ = bridge
     credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
     owner_credential, owner_token = credentials.issue(scope="device", label="owner")
     other_credential, other_token = credentials.issue(scope="device", label="other")
     owner_principal = "credential:" + owner_credential.id
@@ -959,12 +971,24 @@ def test_http_owner_identity_is_bound_to_credential_and_acknowledgement(
             return error.code, json.loads(error.read())
 
     try:
+        status, issued = request(
+            {
+                "operation": "issue_handoff",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "authorized_owner_id": owner_principal,
+            },
+            host_token,
+        )
+        assert status == 200
         status, payload = request(
             {
                 "operation": "initialize",
                 "session_id": SESSION,
                 "objective": "Fix #497",
                 "checkpoint": "Implementation pending",
+                "handoff_token": issued["handoff_token"],
             },
             owner_token,
         )
@@ -1067,6 +1091,127 @@ def test_http_owner_identity_is_bound_to_credential_and_acknowledgement(
         assert status == 200
         assert payload["continuity"]["owner_handoff"]["state"] == "acknowledged"
         assert payload["continuity"]["checkpoint"] == "authorized acknowledgement"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_initialize_requires_host_issued_handoff_and_cannot_be_raced(
+    bridge, tmp_path
+):
+    """An unrelated device cannot win an unbound observer run's first init."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _, registry = bridge
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
+    owner_credential, owner_token = credentials.issue(scope="device", label="owner")
+    _, unrelated_token = credentials.issue(scope="device", label="unrelated")
+    owner_principal = "credential:" + owner_credential.id
+    collector = MetricsCollector(
+        duckdb_path=store.path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    base = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            base,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def initialize(session_id, token, handoff_token=None):
+        body = {
+            "operation": "initialize",
+            "session_id": session_id,
+            "objective": "Fix #497",
+            "checkpoint": "Implementation pending",
+        }
+        if handoff_token is not None:
+            body["handoff_token"] = handoff_token
+        return request(body, token)
+
+    def issue(session_id, target):
+        return request(
+            {
+                "operation": "issue_handoff",
+                "session_id": session_id,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "authorized_owner_id": target,
+            },
+            host_token,
+        )
+
+    try:
+        # This is the reviewer's repro: authentication alone is not evidence
+        # that the caller owns this unbound observer run.
+        status, _ = initialize(SESSION, unrelated_token)
+        assert status == 403
+        assert store.status(RUN)["owner_handoff"]["authorized_owner_id"] is None
+
+        status, issued = issue(SESSION, owner_principal)
+        assert status == 200
+        handoff_token = issued["handoff_token"]
+        assert initialize(SESSION, unrelated_token, handoff_token)[0] == 403
+        assert store.status(RUN)["owner_handoff"]["authorized_owner_id"] is None
+        status, initialized = initialize(SESSION, owner_token, handoff_token)
+        assert status == 200
+        assert initialized["continuity"]["owner_handoff"]["authorized_owner_id"] == (
+            owner_principal
+        )
+        assert initialize(SESSION, owner_token)[0] == 200
+
+        race_run = "run_FACTORY498"
+        race_session = "observer-498"
+        registry.create_session(
+            session_id=race_session,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            status="running",
+            handoff_mode="factory_observer",
+            source_session_id=f"factory/{race_run}@4",
+        )
+        status, issued = issue(race_session, owner_principal)
+        assert status == 200
+        race_token = issued["handoff_token"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(
+                    lambda token: initialize(race_session, token, race_token)[0],
+                    [unrelated_token, owner_token],
+                )
+            )
+        assert sorted(outcomes) == [200, 403]
+        assert store.status(race_run)["owner_handoff"]["authorized_owner_id"] == (
+            owner_principal
+        )
     finally:
         server.shutdown()
         server.server_close()
