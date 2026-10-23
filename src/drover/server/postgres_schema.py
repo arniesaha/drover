@@ -1032,9 +1032,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     # deployed stores have already recorded it.
     (
         CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION,
-        (
-            "ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",
-        ),
+        ("ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",),
     ),
 )
 

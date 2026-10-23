@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from threading import Barrier
 
 import pytest
@@ -153,7 +153,9 @@ def test_stale_delivery_cannot_acknowledge_redelivery(wakes):
     second = store.consume(ISSUE, owner_id=OWNER, owner_epoch=epoch)
     assert second["wake_id"] == wake_id
     assert second["delivery_token"] != first["delivery_token"]
-    with pytest.raises(ContinuityWakeConflict, match="different owner epoch or delivery"):
+    with pytest.raises(
+        ContinuityWakeConflict, match="different owner epoch or delivery"
+    ):
         store.acknowledge(
             ISSUE,
             owner_id=OWNER,
@@ -201,7 +203,9 @@ def test_postgres_concurrent_enqueue_and_stale_delivery_ack(pg_control_path):
     first = store.consume(ISSUE, owner_id=OWNER, owner_epoch=epoch)
     clock.advance(5)
     second = store.consume(ISSUE, owner_id=OWNER, owner_epoch=epoch)
-    with pytest.raises(ContinuityWakeConflict, match="different owner epoch or delivery"):
+    with pytest.raises(
+        ContinuityWakeConflict, match="different owner epoch or delivery"
+    ):
         store.acknowledge(
             ISSUE,
             owner_id=OWNER,
