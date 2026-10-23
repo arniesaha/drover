@@ -100,7 +100,8 @@ class GitHubProvider:
                 raise ProviderUnavailable("github_rate_limit_backoff")
             if response.status_code == 304 and cached:
                 with self._lock:
-                    self._cache[key] = (cached[0], cached[1], now)
+                    if digest == self._credential_digest:
+                        self._cache[key] = (cached[0], cached[1], now)
                 return cached[1]
             if not 200 <= response.status_code < 300:
                 raise ProviderUnavailable(f"github_http_{response.status_code}")
@@ -110,7 +111,10 @@ class GitHubProvider:
         except (requests.RequestException, ValueError) as exc:
             raise ProviderUnavailable("github_read_failed") from None
         with self._lock:
-            if method == "GET":
+            if digest != self._credential_digest:
+                # The token rotated while this read was in flight.
+                pass
+            elif method == "GET":
                 self._cache[key] = (response.headers.get("ETag"), data, now)
                 self._cache.move_to_end(key)
                 while len(self._cache) > 128:
@@ -361,7 +365,8 @@ class GitHubProvider:
         # Each open PR's check runs and each waiting run's gates are separate
         # requests. Serially they cost ~0.3 s apiece and pushed the attention
         # view past the MCP read deadline as PRs piled up (drover#778).
-        with ThreadPoolExecutor(READ_CONCURRENCY) as pool:
+        pool = ThreadPoolExecutor(READ_CONCURRENCY)
+        try:
             runs = (
                 pool.submit(
                     self._pages,
@@ -392,6 +397,9 @@ class GitHubProvider:
                     runs,
                 )
             )
+        finally:
+            # A failed read must not wait behind every queued one.
+            pool.shutdown(wait=True, cancel_futures=True)
         rows = []
         for pr, pr_checks in zip(prs, checks):
             kind = "draft_pr" if pr.get("draft") else "pr_review"
