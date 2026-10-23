@@ -14,7 +14,9 @@ spec = importlib.util.spec_from_file_location("github_app_token", SCRIPT)
 gat = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gat)
 
-needs_openssl = pytest.mark.skipif(not shutil.which("openssl"), reason="openssl CLI missing")
+needs_openssl = pytest.mark.skipif(
+    not shutil.which("openssl"), reason="openssl CLI missing"
+)
 
 
 @pytest.fixture
@@ -100,8 +102,15 @@ def test_mint_discovers_installation_and_caches(key, monkeypatch, cache):
     cfg = {"DROVER_GH_APP_ID": "7", "DROVER_GH_APP_KEY_FILE": str(key)}
     now = gat._expiry({"expires_at": "2026-10-23T18:00:00Z"})
     tok = gat.mint(cfg, "o/r", now=now)
-    assert tok == {"token": "ghs_x", "expires_at": "2026-10-23T19:00:00Z", "installation_id": "42"}
-    assert calls == [("GET", "/repos/o/r/installation"), ("POST", "/app/installations/42/access_tokens")]
+    assert tok == {
+        "token": "ghs_x",
+        "expires_at": "2026-10-23T19:00:00Z",
+        "installation_id": "42",
+    }
+    assert calls == [
+        ("GET", "/repos/o/r/installation"),
+        ("POST", "/app/installations/42/access_tokens"),
+    ]
     assert oct(cache.stat().st_mode & 0o777) == "0o600"
     # Fresh cache: no API call. Inside the 5-minute skew window: mint again.
     assert gat.mint(cfg, "o/r", now=now + 600)["token"] == "ghs_x"
