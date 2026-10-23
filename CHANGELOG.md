@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.30] - 2026-10-23
+
+### Fixed
+
+- MCP hub reads and work-queue attention-source collection stay within their request deadlines, reducing latency under concurrent load (#782, #793).
+- Continuity work queue control now records explicit worker states and authority, enforces deadlines and owner leases with non-destructive reaping, keeps hub decisions pure with shadow parity checks, persists fenced wakes with acknowledgment, and makes the hub the decision authority (#789–#794).
+
+### Upgrade notes
+
+- Additive control migrations 30–36 extend continuity control state. No DuckLake schema or engine/runtime pin change is intended; the point-release classifier and installed-artifact `release-preflight` remain authoritative.
+
 ## [0.6.29] - 2026-10-23
 
 ### Added
