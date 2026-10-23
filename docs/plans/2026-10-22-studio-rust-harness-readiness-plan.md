@@ -35,7 +35,7 @@ No later gate may be started, represented as passed, or used as compensating
 evidence for an earlier one. Nix records each result as **accepted**, **rejected**,
 or **blocked**; anything other than accepted stops the sequence.
 
-### Gate 1 — current release fully complete
+### Gate 1: current release fully complete
 
 The current release must be independently closed before either the
 reliable-task-followthrough canary or any Studio Rust consideration. Required
@@ -54,7 +54,7 @@ The tag and workflow definitions are present in this checkout, but the four
 items above are not present here as completed release evidence. **Gate 1 is
 blocked, not inferred.**
 
-### Gate 2 — independently accepted reliable-task-followthrough
+### Gate 2: independently accepted reliable-task-followthrough
 
 Only after Gate 1 is accepted, conduct a separately authorized, genuine
 authenticated OpenClaw parent-resume canary and obtain independent acceptance.
@@ -84,7 +84,7 @@ state that normal Gateway transport, runtime discovery, parent messaging, and a
 live canary remain untested. **Gate 2 is blocked until this real canary is
 authorized, performed, and independently accepted.**
 
-### Gate 3 — Studio Rust migration consideration
+### Gate 3: Studio Rust migration consideration
 
 Only after Gates 1 and 2 are accepted may Nix authorize a Studio-specific
 readiness review. That review may approve a separately scoped cutover proposal;
@@ -148,7 +148,7 @@ Before a Studio proposal can be approved, retain the proposed Rust binary,
 SHA-256, source digest, CI provenance/attestation verification, architecture,
 and release record together. For a macOS artifact, require the actual
 Developer-ID signature details, hardened-runtime verification, notarization
-`Accepted` submission, and Gatekeeper assessment from the released asset—not
+`Accepted` submission, and Gatekeeper assessment from the released asset, not
 merely the workflow YAML. The previous Python executable, unit/plist/service
 definition, configuration, credentials reference, registry backup location, and
 rollback artifact/digest must be identified privately and remain intact.
@@ -216,19 +216,19 @@ Gate 3 ready for a separately authorized decision.
 
 ## Evidence sources inspected for this plan
 
-- [Rust Phase 2 audit](../runbooks/harnessd-rs-phase2-audit.md) — implementation
+- [Rust Phase 2 audit](../runbooks/harnessd-rs-phase2-audit.md): implementation
   claims, known later-phase limits, migration and CI status terminology.
-- [Rust GPU pilot runbook](../runbooks/harnessd-rs-gpu-pc-pilot.md) — documented
+- [Rust GPU pilot runbook](../runbooks/harnessd-rs-gpu-pc-pilot.md): documented
   future drain/export/import/rollback evidence model; it remains GPU-only and
   is not executed or adopted as Studio authorization here.
 - [macOS harness distribution](../harnessd-macos-distribution.md) and
-  [notarization workflow](../../.github/workflows/harnessd-macos-notarize.yml)
-  — supported signing/notarization verification mechanism.
+  [notarization workflow](../../.github/workflows/harnessd-macos-notarize.yml):
+  supported signing/notarization verification mechanism.
 - [Contract porting ledger](../../tests/contract/PORTING.md) and
-  [Rust migration contract](../../tests/contract/test_rust_migration_contract.py)
-  — parity accounting and replay/import coverage basis.
+  [Rust migration contract](../../tests/contract/test_rust_migration_contract.py):
+  parity accounting and replay/import coverage basis.
 - [OpenClaw owner package README](../../plugins/openclaw-continuity-owner/README.md),
   [owner protocol](../openclaw-owner-protocol.md),
   [Factory observer bridge](../factory-observer-bridge.md), and
-  [roadmap ledger](../../roadmap/ledger.md) — explicit boundary between mock/
+  [roadmap ledger](../../roadmap/ledger.md): explicit boundary between mock/
   synthetic evidence and untested live OpenClaw integration.
