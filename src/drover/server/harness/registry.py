@@ -946,6 +946,15 @@ class HarnessRegistry:
                         LIMIT ?""",
                     [max(1, int(limit))],
                 ).fetchall()
+                # Reconciliation processes the oldest marker first, which
+                # need not be lexical. Pre-acquire its complete recap-subject
+                # set through the same global order used by bulk ingestion so
+                # it cannot invert a concurrent A/B completion delivery.
+                lock_live_recap_sessions(
+                    con,
+                    (str(session_id) for session_id, in rows),
+                    store_path=self.control_plane_path,
+                )
                 enqueued = 0
                 for (session_id,) in rows:
                     enqueued += _enqueue_latest_stored_completion(

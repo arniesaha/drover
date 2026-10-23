@@ -1008,6 +1008,102 @@ def test_structured_bulk_completion_recaps_lock_sessions_in_one_order_on_postgre
         }
 
 
+@pytest.mark.parametrize("method", ["append_events_if_new", "ingest_structured_events"])
+def test_reconciliation_and_bulk_recaps_share_one_lock_order_on_postgres(
+    pg_control_path, monkeypatch, method
+):
+    """Reconciliation cannot invert a structured bulk recap lock order."""
+    registry = HarnessRegistry(pg_control_path)
+    sessions = ("pg-reconcile-lock-a", "pg-reconcile-lock-b")
+    for session_id in sessions:
+        registry.create_session(
+            session_id=session_id,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            mode="structured",
+        )
+        registry.append_event(
+            event_id=f"{session_id}-stored-completion",
+            session_id=session_id,
+            event_type="status",
+            payload={"payload": {"turn_complete": True}},
+            seq=1,
+        )
+
+    now = datetime(2026, 10, 3, tzinfo=timezone.utc)
+    with control_plane_connection(pg_control_path) as con:
+        # Reconciliation reads B then A, deliberately opposite the lexical
+        # order required by the concurrent A/B bulk delivery.
+        con.execute(
+            "UPDATE harness_sessions SET recap_reconcile_needed = TRUE, updated_at = ? "
+            "WHERE session_id = ?",
+            [now, "pg-reconcile-lock-b"],
+        )
+        con.execute(
+            "UPDATE harness_sessions SET recap_reconcile_needed = TRUE, updated_at = ? "
+            "WHERE session_id = ?",
+            [now + timedelta(seconds=1), "pg-reconcile-lock-a"],
+        )
+
+    first_lock_barrier = Barrier(2)
+    opposite_first_lock_barrier = Barrier(2)
+    seen_threads: set[int] = set()
+    first_subjects: dict[int, str] = {}
+    seen_lock = Lock()
+    original_lock = JobLedger.lock_subject
+
+    def coordinated_lock(con, job_kind, subject_key):
+        with seen_lock:
+            first_for_thread = get_ident() not in seen_threads
+            seen_threads.add(get_ident())
+            if first_for_thread:
+                first_subjects[get_ident()] = subject_key
+        if first_for_thread:
+            # Before the repair, reconciliation first locks B and the bulk
+            # path first locks A. After both call the shared lexical helper,
+            # they contend for A and must serialize instead.
+            first_lock_barrier.wait(timeout=5)
+        original_lock(con, job_kind, subject_key)
+        if first_for_thread:
+            with seen_lock:
+                opposite_first_subjects = len(set(first_subjects.values())) == 2
+            if opposite_first_subjects:
+                opposite_first_lock_barrier.wait(timeout=5)
+
+    monkeypatch.setattr(JobLedger, "lock_subject", staticmethod(coordinated_lock))
+
+    def bulk_records():
+        return [
+            {
+                "event_id": f"{session_id}-bulk-completion",
+                "session_id": session_id,
+                "event_type": "status",
+                "payload": {"payload": {"turn_complete": True}},
+                "seq": 2,
+                "created_at": now + timedelta(seconds=2),
+            }
+            for session_id in sessions
+        ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reconciliation = pool.submit(registry.reconcile_orphan_completions, limit=2)
+        bulk = pool.submit(getattr(registry, method), bulk_records())
+        assert reconciliation.result(timeout=20) == 0
+        assert bulk.result(timeout=20) == 2
+
+    with control_plane_connection(pg_control_path) as con:
+        markers = con.execute(
+            "SELECT session_id, recap_reconcile_needed FROM harness_sessions "
+            "WHERE session_id IN (?, ?) ORDER BY session_id",
+            list(sessions),
+        ).fetchall()
+    assert markers == [
+        ("pg-reconcile-lock-a", False),
+        ("pg-reconcile-lock-b", False),
+    ]
+
+
 def test_unbound_run_denies_mutations_until_authorized_handoff_on_postgres(pg_bridge):
     store, _ = pg_bridge
     event_id = report(store)
