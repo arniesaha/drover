@@ -193,6 +193,54 @@ def test_snapshot_receipt_rejects_stale_or_incomplete_evidence():
     assert check.evidence["reason"] == "snapshot_local_manifest_mismatch"
 
 
+@pytest.mark.parametrize("malformed", ["g" * 64, "é" * 64])
+def test_malformed_expected_manifest_creates_failed_blocked_ledger(tmp_path, malformed):
+    plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
+    check = snapshot_receipt_check(
+        receipt(), receipt_key=RECEIPT_KEY, expected_manifest_sha256=malformed
+    )
+
+    assert not check.passed
+    assert check.evidence["reason"] == "snapshot_manifest_mismatch"
+    document = build_release_workflow_ledger(
+        plan, release="0.6.28", snapshot=check, preflight=None
+    )
+    assert document["status"] == "failed"
+    assert document["phases"]["nas_snapshot_execution"]["state"] == "failed"
+    assert document["phases"]["nas_snapshot_publication"]["state"] == "blocked"
+    assert document["phases"]["release_preflight"]["state"] == "blocked"
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir(mode=0o700)
+    ledger = evidence_root / "malformed-manifest.json"
+    write_release_workflow_ledger(ledger, document, evidence_root=evidence_root)
+    assert read_release_workflow_ledger(ledger) == document
+
+
+@pytest.mark.parametrize("malformed", ["g" * 64, "é" * 64])
+def test_malformed_producer_signature_creates_failed_blocked_ledger(
+    tmp_path, malformed
+):
+    plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
+    value = receipt()
+    value["producer"]["signature"] = malformed
+    check = checked(value)
+
+    assert not check.passed
+    assert check.evidence["reason"] == "snapshot_provenance_invalid"
+    document = build_release_workflow_ledger(
+        plan, release="0.6.28", snapshot=check, preflight=None
+    )
+    assert document["status"] == "failed"
+    assert document["phases"]["nas_snapshot_execution"]["state"] == "failed"
+    assert document["phases"]["nas_snapshot_publication"]["state"] == "blocked"
+    assert document["phases"]["release_preflight"]["state"] == "blocked"
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir(mode=0o700)
+    ledger = evidence_root / "malformed-provenance.json"
+    write_release_workflow_ledger(ledger, document, evidence_root=evidence_root)
+    assert read_release_workflow_ledger(ledger) == document
+
+
 def test_ledger_validator_rejects_a_false_success_shape(tmp_path):
     plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
     document = build_release_workflow_ledger(
@@ -327,6 +375,44 @@ def test_ledger_write_rejects_symlinked_parent_traversal(tmp_path):
             document,
             evidence_root=linked_parent / "evidence",
         )
+
+
+def test_ledger_write_fails_closed_when_ancestor_is_swapped_during_creation(
+    tmp_path, monkeypatch
+):
+    import drover.server.lake.release_workflow as workflow
+
+    plan = CutoverPlan.from_name("blue", lake_root=tmp_path)
+    document = build_release_workflow_ledger(
+        plan, release="0.6.28", snapshot=checked(receipt()), preflight=preflight()
+    )
+    parent = tmp_path / "parent"
+    evidence_root = parent / "evidence"
+    evidence_root.mkdir(parents=True, mode=0o700)
+    attacker = tmp_path / "attacker"
+    (attacker / "evidence").mkdir(parents=True, mode=0o700)
+    displaced = tmp_path / "displaced-parent"
+    real_open = workflow.os.open
+    swapped = False
+
+    def swap_ancestor(*args, **kwargs):
+        nonlocal swapped
+        descriptor = real_open(*args, **kwargs)
+        if not swapped and args[0] == "evidence" and kwargs.get("dir_fd") is not None:
+            parent.rename(displaced)
+            parent.symlink_to(attacker, target_is_directory=True)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(workflow.os, "open", swap_ancestor)
+
+    with pytest.raises(WorkflowError, match="workflow_ledger_path_unsafe"):
+        write_release_workflow_ledger(
+            evidence_root / "ledger.json", document, evidence_root=evidence_root
+        )
+
+    assert not (attacker / "evidence" / "ledger.json").exists()
+    assert not (displaced / "evidence" / "ledger.json").exists()
 
 
 def test_ledger_write_fsyncs_the_file_and_evidence_directory(tmp_path, monkeypatch):

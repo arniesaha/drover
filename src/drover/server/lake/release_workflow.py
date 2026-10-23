@@ -12,7 +12,8 @@ import hashlib
 import hmac
 import json
 import os
-import tempfile
+import secrets
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -175,7 +176,7 @@ def snapshot_receipt_check(
             False,
             evidence | {"reason": "snapshot_local_manifest_mismatch"},
         )
-    if not isinstance(expected_manifest_sha256, str) or not hmac.compare_digest(
+    if not _sha256(expected_manifest_sha256) or not hmac.compare_digest(
         manifest.lower(), expected_manifest_sha256.lower()
     ):
         return Check(
@@ -190,8 +191,7 @@ def snapshot_receipt_check(
     if (
         producer.get("name") != _RECEIPT_PRODUCER["name"]
         or producer.get("schema_version") != _RECEIPT_PRODUCER["schema_version"]
-        or not isinstance(signature, str)
-        or len(signature) != 64
+        or not _sha256(signature)
     ):
         return Check(
             "nas_snapshot", False, evidence | {"reason": "snapshot_provenance_invalid"}
@@ -486,14 +486,55 @@ def read_release_workflow_ledger(path: Path) -> dict[str, Any]:
     return document
 
 
-def _symlinked_path(path: Path) -> bool:
-    """Reject any symlink component instead of resolving outside evidence root."""
-    current = Path(path.anchor)
-    for component in path.parts[1:]:
-        current /= component
-        if current.is_symlink():
-            return True
-    return False
+def _open_evidence_root(path: Path) -> tuple[int, os.stat_result]:
+    """Open every component without following links and retain the root handle."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise WorkflowError("workflow_ledger_path_unsafe")
+    flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+    descriptor = -1
+    try:
+        descriptor = os.open(path.anchor, flags)
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        root_stat = os.fstat(descriptor)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise WorkflowError("workflow_ledger_path_unsafe") from exc
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != os.getuid()
+        or root_stat.st_mode & 0o077
+    ):
+        os.close(descriptor)
+        raise WorkflowError("workflow_ledger_path_unsafe")
+    return descriptor, root_stat
+
+
+def _same_evidence_root(path: Path, expected: os.stat_result) -> bool:
+    """Confirm the configured pathname still identifies the retained directory."""
+    try:
+        descriptor, observed = _open_evidence_root(path)
+    except WorkflowError:
+        return False
+    try:
+        return (observed.st_dev, observed.st_ino) == (expected.st_dev, expected.st_ino)
+    finally:
+        os.close(descriptor)
+
+
+def _create_private_temporary(root_fd: int, ledger_name: str) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(32):
+        temporary = f".{ledger_name}.{secrets.token_hex(16)}.tmp"
+        try:
+            return os.open(temporary, flags, 0o600, dir_fd=root_fd), temporary
+        except FileExistsError:
+            continue
+    raise WorkflowError("workflow_ledger_write_failed")
 
 
 def write_release_workflow_ledger(
@@ -507,46 +548,49 @@ def write_release_workflow_ledger(
     validate_release_workflow_ledger(document)
     path = Path(os.path.abspath(path))
     evidence_root = Path(os.path.abspath(evidence_root))
+    root_fd = -1
+    temporary = None
     try:
-        root_stat = evidence_root.lstat()
-        if (
-            _symlinked_path(evidence_root)
-            or not evidence_root.is_dir()
-            or root_stat.st_uid != os.getuid()
-            or root_stat.st_mode & 0o077
-            or path.parent != evidence_root
-            or path.name in {"", ".", ".."}
-            or path.is_symlink()
-        ):
+        if path.parent != evidence_root or path.name in {"", ".", ".."}:
             raise WorkflowError("workflow_ledger_path_unsafe")
-        if path.exists() or path.is_symlink():
+        root_fd, root_stat = _open_evidence_root(evidence_root)
+        try:
+            existing = os.stat(path.name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(existing.st_mode):
+                raise WorkflowError("workflow_ledger_path_unsafe")
             raise WorkflowError("workflow_ledger_exists")
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
+        descriptor, temporary = _create_private_temporary(root_fd, path.name)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o600)
             json.dump(document, stream, indent=2, sort_keys=True)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if not _same_evidence_root(evidence_root, root_stat):
+            raise WorkflowError("workflow_ledger_path_unsafe")
         try:
-            os.link(temporary, path)
+            os.link(
+                temporary,
+                path.name,
+                src_dir_fd=root_fd,
+                dst_dir_fd=root_fd,
+            )
         except FileExistsError as exc:
             raise WorkflowError("workflow_ledger_exists") from exc
-        directory = os.open(
-            evidence_root,
-            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        if not _same_evidence_root(evidence_root, root_stat):
+            os.unlink(path.name, dir_fd=root_fd)
+            raise WorkflowError("workflow_ledger_path_unsafe")
+        os.fsync(root_fd)
     except OSError as exc:
         raise WorkflowError("workflow_ledger_write_failed") from exc
     finally:
-        if "temporary" in locals():
+        if temporary is not None and root_fd >= 0:
             try:
-                Path(temporary).unlink(missing_ok=True)
+                os.unlink(temporary, dir_fd=root_fd)
             except OSError:
                 pass
+        if root_fd >= 0:
+            os.close(root_fd)
