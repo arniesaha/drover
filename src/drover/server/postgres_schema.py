@@ -25,6 +25,7 @@ CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION = 29
 DAILY_DIGEST_MIGRATION = 30
 DAILY_DIGEST_LEASE_MIGRATION = 31
 WORKER_STATES_MIGRATION = 32
+CONTINUITY_LEASES_MIGRATION = 33
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -37,6 +38,31 @@ CREATE TABLE IF NOT EXISTS harness_worker_states (
   state_at TIMESTAMPTZ NOT NULL
 )
 """
+
+CONTINUITY_LEASES_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS continuity_owner_leases (
+      issue_key TEXT PRIMARY KEY,
+      owner_id TEXT NOT NULL,
+      owner_epoch BIGINT NOT NULL CHECK (owner_epoch > 0),
+      lease_until TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS continuity_owner_leases_live ON continuity_owner_leases (lease_until)",
+    """
+    CREATE TABLE IF NOT EXISTS continuity_reap_audit (
+      audit_id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES harness_sessions(session_id),
+      action TEXT NOT NULL CHECK (action = 'reap'),
+      reason TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      dry_run BOOLEAN NOT NULL DEFAULT TRUE,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS continuity_reap_audit_session ON continuity_reap_audit (session_id, applied_at)",
+)
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -959,6 +985,8 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     ),
     # Explicit worker states projected from Drover-State lines (#785).
     (WORKER_STATES_MIGRATION, (WORKER_STATES_DDL,)),
+    # Fenced issue owners and a permanent (including dry-run) reap audit (#785).
+    (CONTINUITY_LEASES_MIGRATION, CONTINUITY_LEASES_DDL),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
