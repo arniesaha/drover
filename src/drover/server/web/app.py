@@ -1495,6 +1495,16 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 self.collector.render_harness_json(include_hosts=False),
             )
             return
+        if path == "/harness/worker-states":
+            ids = [
+                part
+                for value in parse_qs(parsed.query).get("session_id", [])
+                for part in value.split(",")
+                if part.strip()
+            ]
+            status, body = self.collector.harness_worker_states(ids)
+            self._send(status, "application/json", body)
+            return
         if path == "/harness/factory-observer/continuity":
             self._factory_observer_continuity(parsed.query)
             return

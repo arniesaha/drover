@@ -73,8 +73,8 @@ class Harness:
     def eligible(self, goal_id=None, parent_session_id=None):
         return {("host", "codex")}
 
-    def launch(self, host, harness, key, ref, role, parent, goal_id):
-        self.calls.append((key, role))
+    def launch(self, host, harness, key, ref, role, parent, goal_id, *, authority=None):
+        self.calls.append((key, role, authority))
         session = SimpleNamespace(
             session_id="session-" + str(len(self.calls)),
             parent_session_id=parent,
@@ -252,6 +252,19 @@ def test_third_failure_blocks_and_writes_systemic_review(service):
         launch(service, "fourth")
     assert len(service.harness.calls) == 3
     assert max(l["failure_count"] for l in service.store.links()) == 3
+
+
+def test_launch_passes_issue_authority_to_harness(service):
+    service.providers["goal"].data["labels"].append({"name": "autonomy:through-merge"})
+    service.providers["goal"].data[
+        "body"
+    ] = "Public behavioral acceptance\nHard stop: gateway restart"
+    launch(service)
+    authority = service.harness.calls[0][2]
+    assert authority == {
+        "labels": ["goal:test", "status:queued", "autonomy:through-merge"],
+        "body": "Public behavioral acceptance\nHard stop: gateway restart",
+    }
 
 
 def test_audit_metadata_only_and_append_only(service):
