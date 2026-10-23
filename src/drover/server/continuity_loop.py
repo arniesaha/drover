@@ -45,6 +45,7 @@ class ContinuityPolicy:
     idle_undeclared_minutes: float = 10.0
     ci_pending_minutes: float = 40.0
     release_running_minutes: float = 60.0
+    explicit_deadlines: bool = False
 
 
 @dataclass(frozen=True)
@@ -272,14 +273,19 @@ def normalize_policy(
     if not isinstance(policy, dict):
         raise ValueError("policy must be an object")
     allowed = set(ContinuityPolicy.__dataclass_fields__)
-    if set(policy) - allowed or any(
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value < 0
-        for value in policy.values()
-    ):
-        raise ValueError("policy values must be finite non-negative minutes")
+    if set(policy) - allowed:
+        raise ValueError("policy contains unsupported fields")
+    for key, value in policy.items():
+        if key == "explicit_deadlines":
+            if not isinstance(value, bool):
+                raise ValueError("policy.explicit_deadlines must be boolean")
+        elif (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError("policy values must be finite non-negative minutes")
     return ContinuityPolicy(**policy)
 
 
@@ -387,7 +393,9 @@ def decide(
     active = _activity(facts)
     if active is None:
         return _decision(facts, "none", "missing_activity", stage)
-    deadline, deadline_kind = _deadline(facts, policy)
+    deadline, deadline_kind = (
+        _deadline(facts, policy) if policy.explicit_deadlines else (None, None)
+    )
     # Old reconcile behavior uses a 30 minute idle window and starts the next
     # window after a post-activity marker (not the original activity event).
     due = deadline or _legacy_touched(facts, active) + timedelta(

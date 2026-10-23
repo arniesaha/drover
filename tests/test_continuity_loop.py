@@ -1,22 +1,22 @@
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
 import json
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from drover.server.continuity_loop import (
-    ContinuityPolicy,
     HANDOFF_MARK,
     NUDGE_MARK,
+    ContinuityPolicy,
     ShadowCompareService,
     action_identity,
     decide,
 )
 from drover.server.metrics import MetricsCollector
-from drover.server.web.auth import AuthSettings
 from drover.server.web.app import start_metrics_server
+from drover.server.web.auth import AuthSettings
 
 NOW = datetime(2026, 10, 23, 18, 0, tzinfo=timezone.utc)
 
@@ -78,9 +78,10 @@ def test_decide_nudges_then_stalls_without_provider_writes():
             "state_at": (NOW - timedelta(minutes=46)).isoformat(),
         }
     )
-    assert decide(overdue, NOW).action == "nudge"
+    policy = ContinuityPolicy(explicit_deadlines=True)
+    assert decide(overdue, NOW, policy).action == "nudge"
     overdue["bot"] = [{"mark": "nudge", "at": (NOW - timedelta(minutes=1)).isoformat()}]
-    assert decide(overdue, NOW).action == "stall"
+    assert decide(overdue, NOW, policy).action == "stall"
 
 
 def test_decide_worker_states_and_approval_coverage():
@@ -101,7 +102,35 @@ def test_decide_idle_undeclared_uses_short_deadline():
             "state_at": (NOW - timedelta(minutes=11)).isoformat(),
         }
     )
-    assert decide(idle, NOW, ContinuityPolicy(stall_minutes=60)).action == "nudge"
+    assert (
+        decide(
+            idle,
+            NOW,
+            ContinuityPolicy(stall_minutes=60, explicit_deadlines=True),
+        ).action
+        == "nudge"
+    )
+
+
+def test_shadow_default_preserves_legacy_window_with_explicit_worker_states():
+    working = facts(
+        created=(NOW - timedelta(minutes=31)).isoformat(),
+        worker={
+            "state": "working",
+            "state_at": (NOW - timedelta(minutes=31)).isoformat(),
+            "last_activity": (NOW - timedelta(minutes=31)).isoformat(),
+        },
+    )
+    assert decide(working, NOW).action == "nudge"
+    idle = facts(
+        created=(NOW - timedelta(minutes=11)).isoformat(),
+        worker={
+            "state": "idle_undeclared",
+            "state_at": (NOW - timedelta(minutes=11)).isoformat(),
+            "last_activity": (NOW - timedelta(minutes=11)).isoformat(),
+        },
+    )
+    assert decide(idle, NOW).action == "none"
 
 
 def test_shadow_compare_records_bounded_action_mismatches_with_rule_identity():
