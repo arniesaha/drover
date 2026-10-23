@@ -220,7 +220,7 @@ presented as complete until the authorized owner explicitly consumes and
 acknowledges its durable action. Handoff redemption and completion projection
 lock the same stable observer-session row (and the run row once it exists), so
 a bulk ingester cannot commit a newly pending receipt after redemption has
-scanned for retained facts—even during first-run creation. An authorized owner
+scanned for retained facts, even during first-run creation. An authorized owner
 may also explicitly replay initialization through its trusted adapter binding to
 recover any retained pending receipt; poll never performs that mutation or an
 acknowledgement implicitly.
