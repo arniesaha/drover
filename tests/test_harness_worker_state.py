@@ -1,3 +1,4 @@
+import drover.server.harness.worker_state as worker_state
 from drover.server.harness.worker_state import (
     STATE_CONTRACT,
     authority_block,
@@ -73,6 +74,25 @@ def test_authority_block_uses_live_label_and_hard_stops():
     assert "approval labels: autonomy:through-merge" in block
     assert "hard stops: gateway restart; public post" in block
     assert "always human: money, public action, deletion, gateway restart" in block
+
+
+def test_stream_delta_cannot_project_a_terminal_state(monkeypatch):
+    class NoWrites:
+        def execute(self, *args, **kwargs):
+            raise AssertionError("stream delta must not write worker state")
+
+    monkeypatch.setattr(worker_state, "is_postgres_connection", lambda con: True)
+    assert not worker_state.project_worker_state(
+        NoWrites(),
+        event_id="delta-1",
+        session_id="session-1",
+        event_type="assistant_output",
+        payload={
+            "text": f"Drover-State: done sha={SHA}",
+            "text_stream_delta": True,
+        },
+        created_at="2026-10-23T18:00:00Z",
+    )
 
 
 def test_worker_brief_wraps_authority_and_state_contract():

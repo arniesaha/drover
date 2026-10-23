@@ -22,6 +22,7 @@ import re
 from typing import Any
 
 from drover.server.control_outbox import is_postgres_connection
+from drover.server.harness.events import is_text_stream_delta
 
 DECLARED_STATES = ("working", "done", "blocked", "needs_approval")
 GATES = ("pr", "merge", "rollout", "canary", "human")
@@ -134,6 +135,11 @@ def project_worker_state(
     control plane is PostgreSQL; local DuckDB daemons keep no worker state.
     """
     if not is_postgres_connection(con):
+        return False
+    # Structured adapters may emit provisional assistant_output chunks. Only
+    # final snapshots/non-streamed messages can satisfy the end-of-turn state
+    # contract; persisting a delta could falsely mark a worker done.
+    if event_type == "assistant_output" and is_text_stream_delta(payload):
         return False
     if event_type == "user_input":
         parsed: dict[str, Any] | None = {"state": "working"}
