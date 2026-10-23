@@ -134,7 +134,9 @@ class ContinuityWakes:
         ):
             raise ContinuityWakeConflict("current owner lease and epoch are required")
 
-    def _enqueue(self, con, *, issue_key: str, action: str, fingerprint: str, payload: dict) -> str:
+    def _enqueue(
+        self, con, *, issue_key: str, action: str, fingerprint: str, payload: dict
+    ) -> str:
         """Insert or verify one wake in a caller-owned transaction."""
         _text(issue_key, "issue_key", 191)
         _text(action, "action", 191)
@@ -170,11 +172,23 @@ class ContinuityWakes:
     ) -> str:
         """Record a wake once; a duplicate must retain exactly the same payload."""
         with self._transaction() as con:
-            return self._enqueue(con, issue_key=issue_key, action=action, fingerprint=fingerprint, payload=payload)
+            return self._enqueue(
+                con,
+                issue_key=issue_key,
+                action=action,
+                fingerprint=fingerprint,
+                payload=payload,
+            )
 
-    def enqueue_decision(self, *, issue_key: str, decision, facts: dict, decided_at: datetime) -> str:
+    def enqueue_decision(
+        self, *, issue_key: str, decision, facts: dict, decided_at: datetime
+    ) -> str:
         """Atomically persist the hub's selected action as a bounded wake."""
-        payload = {"decision": decision.payload(), "facts": facts, "decided_at": decided_at.isoformat()}
+        payload = {
+            "decision": decision.payload(),
+            "facts": facts,
+            "decided_at": decided_at.isoformat(),
+        }
         with self._transaction() as con:
             return self._enqueue(
                 con,

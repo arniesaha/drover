@@ -2634,9 +2634,18 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             hub = ContinuityHub(self.collector.duckdb_path)
             if query is not None:
                 params = parse_qs(query, keep_blank_values=True)
-                if set(params) - {"issue_key", "limit"} or not {"issue_key"} <= set(params) or any(len(v) != 1 for v in params.values()):
+                if (
+                    set(params) - {"issue_key", "limit"}
+                    or not {"issue_key"} <= set(params)
+                    or any(len(v) != 1 for v in params.values())
+                ):
                     raise ValueError("issue_key and optional limit are required")
-                result = {"continuity": hub.status(params["issue_key"][0], limit=int(params.get("limit", ["20"])[0]))}
+                result = {
+                    "continuity": hub.status(
+                        params["issue_key"][0],
+                        limit=int(params.get("limit", ["20"])[0]),
+                    )
+                }
             else:
                 length = int(self.headers.get("Content-Length") or "0")
                 if not 0 < length <= 32 * 1024:
@@ -2664,13 +2673,37 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         now = datetime.fromisoformat(now.replace("Z", "+00:00"))
                     if now is not None and not isinstance(now, datetime):
                         raise ValueError("now must be an ISO timestamp")
-                    result = hub.decide(issue_key=args["issue_key"], facts=args["facts"], now=now, policy=args.get("policy"))
+                    result = hub.decide(
+                        issue_key=args["issue_key"],
+                        facts=args["facts"],
+                        now=now,
+                        policy=args.get("policy"),
+                    )
                 elif operation == "lease":
-                    result = {"lease": hub.lease(args["issue_key"], owner_id=principal, lease_seconds=args.get("lease_seconds", 60), owner_epoch=args.get("owner_epoch"))}
+                    result = {
+                        "lease": hub.lease(
+                            args["issue_key"],
+                            owner_id=principal,
+                            lease_seconds=args.get("lease_seconds", 60),
+                            owner_epoch=args.get("owner_epoch"),
+                        )
+                    }
                 elif operation == "consume":
-                    result = {"delivery": hub.consume(args["issue_key"], owner_id=principal, owner_epoch=args["owner_epoch"])}
+                    result = {
+                        "delivery": hub.consume(
+                            args["issue_key"],
+                            owner_id=principal,
+                            owner_epoch=args["owner_epoch"],
+                        )
+                    }
                 else:
-                    hub.acknowledge(args["issue_key"], owner_id=principal, owner_epoch=args["owner_epoch"], wake_id=args["wake_id"])
+                    hub.acknowledge(
+                        args["issue_key"],
+                        owner_id=principal,
+                        owner_epoch=args["owner_epoch"],
+                        wake_id=args["wake_id"],
+                        delivery_token=args["delivery_token"],
+                    )
                     result = {"acknowledged": True}
             status = 200
         except ContinuityWakeConflict as exc:

@@ -5,13 +5,19 @@ when actionable, commits its durable wake in the same control-plane transaction.
 Clients may execute the resulting work locally, but cannot choose a different
 continuity action through this API.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from drover.server.continuity_loop import ContinuityPolicy, Decision, decide, normalize_facts
+from drover.server.continuity_loop import (
+    ContinuityPolicy,
+    Decision,
+    decide,
+    normalize_facts,
+)
 from drover.server.continuity_wakes import ContinuityWakes, _text
 
 
