@@ -5,6 +5,7 @@ import json
 import math
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -148,22 +149,32 @@ class WorkService:
         provider = self.providers[goal_id]
         provider.authenticate()
         policy = load_policy(scope.policy_path)
-        ref = None
-        if number is not None:
-            if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
-                raise ValueError("positive issue number required")
-            ref = ItemRef(
-                self.config.workspace_id,
-                "github",
-                scope.repo,
-                number,
-                f"https://github.com/{scope.repo}/issues/{number}",
-            )
+        ref = None if number is None else self.ref(scope, number)
         return scope, provider, policy, ref
+
+    def ref(self, scope, number):
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            raise ValueError("positive issue number required")
+        return ItemRef(
+            self.config.workspace_id,
+            "github",
+            scope.repo,
+            number,
+            f"https://github.com/{scope.repo}/issues/{number}",
+        )
 
     def item(self, goal_id, number):
         scope, provider, policy, ref = self.scope(goal_id, number)
-        item = provider.get_item(ref)
+        return (
+            provider,
+            policy,
+            ref,
+            self.checked(scope, policy, provider.get_item(ref)),
+        )
+
+    @staticmethod
+    def checked(scope, policy, item):
+        """Reject an item outside the goal or with ambiguous workflow labels."""
         labels = {l["name"] for l in item["labels"]}
         milestone = item.get("milestone") or {}
         if (
@@ -189,7 +200,7 @@ class WorkService:
                 raise ValueError("invalid assignment or priority labels")
         if sum(l.startswith(policy.labels.goal_prefix) for l in labels) > 1:
             raise ValueError("conflicting goal labels")
-        return provider, policy, ref, item
+        return item
 
     @staticmethod
     def coordinator(actor, policy):
@@ -274,18 +285,26 @@ class WorkService:
                     },
                 )
 
-            for entry in provider.list_attention():
+            # The issue listing is independent of the PR and run reads.
+            with ThreadPoolExecutor(1) as pool:
+                listed = pool.submit(provider.list_items)
+                flagged = provider.list_attention()
+                observed_items = listed.result()
+            for entry in flagged:
                 row(
                     entry["source_key"],
                     entry["kind"],
                     entry["url"],
                     source_updated_at=entry.get("updated_at"),
                 )
-            for observed in provider.list_items():
+            # The listing already carries each issue's labels, state and
+            # milestone. Re-reading every item (plus a token check per read)
+            # was two GitHub round trips per goal item and pushed this view
+            # past the MCP read deadline (drover#778).
+            for observed in observed_items:
                 try:
-                    provider, policy, ref, item = self.item(
-                        goal.goal_id, observed["number"]
-                    )
+                    ref = self.ref(scope, observed["number"])
+                    item = self.checked(scope, policy, observed)
                 except ValueError:
                     if observed["state"] == "open":
                         row(
