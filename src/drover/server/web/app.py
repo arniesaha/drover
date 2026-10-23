@@ -1508,6 +1508,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/harness/factory-observer/continuity":
             self._factory_observer_continuity(parsed.query)
             return
+        if path == "/continuity":
+            self._continuity_hub(query=parsed.query)
+            return
         if path == "/harness/relay":
             self._accept_relay_websocket()
             return
@@ -1774,6 +1777,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             return
         if path == "/harness/factory-observer/continuity":
             self._factory_observer_continuity()
+            return
+        if path == "/continuity":
+            self._continuity_hub()
             return
         if path == "/continuity/shadow-compare":
             self._continuity_shadow_compare()
@@ -2615,6 +2621,106 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             status, result = 503, {"error": "continuity store busy"}
         self._send(status, "application/json", json.dumps(result) + "\n")
 
+    def _continuity_hub(self, query: str | None = None) -> None:
+        """Hub-owned decide/enqueue and fenced owner wake operations."""
+        from drover.server.continuity_hub import ContinuityHub
+        from drover.server.continuity_wakes import ContinuityWakeConflict
+        from drover.server.db import ControlPlaneBusy
+
+        try:
+            principal = self._continuity_coordinator_principal()
+            if principal is None:
+                raise PermissionError("bound bearer credential required")
+            hub = ContinuityHub(self.collector.duckdb_path)
+            if query is not None:
+                params = parse_qs(query, keep_blank_values=True)
+                if (
+                    set(params) - {"issue_key", "limit"}
+                    or not {"issue_key"} <= set(params)
+                    or any(len(v) != 1 for v in params.values())
+                ):
+                    raise ValueError("issue_key and optional limit are required")
+                result = {
+                    "continuity": hub.status(
+                        params["issue_key"][0],
+                        limit=int(params.get("limit", ["20"])[0]),
+                    )
+                }
+            else:
+                length = int(self.headers.get("Content-Length") or "0")
+                if not 0 < length <= 32 * 1024:
+                    self.close_connection = True
+                    raise ValueError("continuity body must be 1..32768 bytes")
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    raise ValueError("request body must be a JSON object")
+                operation = body.get("operation")
+                contracts = {
+                    "decide": ({"issue_key", "facts"}, {"now", "policy"}),
+                    "lease": ({"issue_key"}, {"owner_epoch", "lease_seconds"}),
+                    "consume": ({"issue_key", "owner_epoch"}, set()),
+                    "acknowledge": (
+                        {"issue_key", "owner_epoch", "wake_id", "delivery_token"},
+                        set(),
+                    ),
+                }
+                if operation not in contracts:
+                    raise ValueError("unsupported continuity operation")
+                required, optional = contracts[operation]
+                args = {k: v for k, v in body.items() if k != "operation"}
+                if not required <= args.keys() or args.keys() - (required | optional):
+                    raise ValueError("missing or unsupported continuity fields")
+                if operation == "decide":
+                    now = args.get("now")
+                    if isinstance(now, str):
+                        now = datetime.fromisoformat(now.replace("Z", "+00:00"))
+                    if now is not None and not isinstance(now, datetime):
+                        raise ValueError("now must be an ISO timestamp")
+                    result = hub.decide(
+                        issue_key=args["issue_key"],
+                        facts=args["facts"],
+                        now=now,
+                        policy=args.get("policy"),
+                    )
+                elif operation == "lease":
+                    result = {
+                        "lease": hub.lease(
+                            args["issue_key"],
+                            owner_id=principal,
+                            lease_seconds=args.get("lease_seconds", 60),
+                            owner_epoch=args.get("owner_epoch"),
+                        )
+                    }
+                elif operation == "consume":
+                    result = {
+                        "delivery": hub.consume(
+                            args["issue_key"],
+                            owner_id=principal,
+                            owner_epoch=args["owner_epoch"],
+                        )
+                    }
+                else:
+                    hub.acknowledge(
+                        args["issue_key"],
+                        owner_id=principal,
+                        owner_epoch=args["owner_epoch"],
+                        wake_id=args["wake_id"],
+                        delivery_token=args["delivery_token"],
+                    )
+                    result = {"acknowledged": True}
+            status = 200
+        except ContinuityWakeConflict as exc:
+            status, result = 409, {"error": str(exc)}
+        except KeyError:
+            status, result = 404, {"error": "continuity wake not found"}
+        except PermissionError as exc:
+            status, result = 403, {"error": str(exc)}
+        except (TypeError, ValueError) as exc:
+            status, result = 400, {"error": str(exc)}
+        except ControlPlaneBusy:
+            status, result = 503, {"error": "continuity store busy"}
+        self._send(status, "application/json", json.dumps(result) + "\n")
+
     def _continuity_shadow_compare(self) -> None:
         """Compare legacy and hub decisions without granting provider write access."""
         from drover.server.continuity_loop import shadow_compare_service
@@ -2654,10 +2760,34 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(status, "application/json", json.dumps(result) + "\n")
 
     def _continuity_owner_principal(self) -> str | None:
-        """Derive the only owner identity mutable continuity calls may claim."""
+        """Derive the bearer identity; observer handoffs enforce its authority."""
         credential = bearer_credential(self.auth, self.headers)
         if credential is not None:
             return "credential:" + credential.id
+        return self._continuity_coordinator_principal()
+
+    def _continuity_coordinator_principal(self) -> str | None:
+        """Allow only an explicitly configured coordinator or legacy operator."""
+        credential = bearer_credential(self.auth, self.headers)
+        if credential is not None:
+            principal = "credential:" + credential.id
+            service = getattr(self.collector, "work_control", None)
+            config = getattr(service, "config", None)
+            role = (
+                getattr(config, "principal_roles", {}).get(principal)
+                if config is not None
+                else None
+            )
+            if role is not None:
+                from drover.server.work_queue.config import load_policy
+
+                coordinators = {
+                    load_policy(goal.policy_path).authority.coordinator
+                    for goal in config.goals
+                }
+                if role in coordinators:
+                    return principal
+            return None
         authorization = self.headers.get("Authorization", "") or ""
         if (
             self.auth.enabled
