@@ -537,3 +537,48 @@ def test_native_freshness_metadata_does_not_certify_legacy_rollup(verified_lake)
     assert metadata["native_usage"]["freshness"] == "unavailable"
     assert metadata["native_usage"]["observed_at"].startswith("2026-10-02")
     assert metadata["native_usage"]["reason"] == "lake_coverage_unverified"
+
+
+def test_recent_sessions_is_one_lake_child_over_the_daily_rollup(
+    verified_lake, monkeypatch
+):
+    # A SELECT 1 check child plus a full agent_events grouping put this tool
+    # past the five-second MCP deadline on prod (drover#778).
+    from memory_helpers import put_summary
+
+    from drover.server.lake import serving
+    from drover.server.mcp import tools
+
+    spec, path, config = verified_lake
+    configure_analytics(path, config)
+    put_summary(path, "s")  # No project_key: only the lake links it to o/r.
+    seen = []
+    real = serving.query
+
+    def counted(spec, sql, *args, **kwargs):
+        seen.append(sql)
+        return real(spec, sql, *args, **kwargs)
+
+    monkeypatch.setattr(serving, "query", counted)
+
+    recent = tools.drover_recent_sessions(duckdb_path=path, project_key="o/r")
+
+    assert [s["session_id"] for s in recent["sessions"]] == ["s"]
+    assert len(seen) == 1 and "lake.activity_daily" in seen[0]
+
+
+def test_recent_sessions_without_memory_still_fails_closed(verified_lake, monkeypatch):
+    from drover.server.mcp import tools
+
+    spec, path, config = verified_lake
+    configure_analytics(path, config)
+    monkeypatch.setattr(tools, "_memory", lambda path: None)
+    assert (
+        tools.drover_recent_sessions(duckdb_path=path, project_key="o/r")["sessions"]
+        == []
+    )
+    (spec.data_root / "verification/serving-proof.json").write_text("{}")
+
+    result = tools.drover_recent_sessions(duckdb_path=path, project_key="o/r")
+
+    assert result["status"] == "unavailable"
