@@ -1324,3 +1324,55 @@ def test_http_report_cannot_claim_drover_completion_identity(bridge, tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_hub_continuity_requires_coordinator_even_for_observer_credentials(
+    bridge, tmp_path
+):
+    """Observer owner identity must not grant access to the issue coordinator API."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _, _ = bridge
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
+    _, owner_token = credentials.issue(scope="device", label="owner")
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=store.path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    try:
+        for token in (host_token, owner_token):
+            for body in (
+                None,
+                {"operation": "lease", "issue_key": "arniesaha/drover#784"},
+            ):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_address[1]}/continuity"
+                    + ("?issue_key=arniesaha%2Fdrover%23784" if body is None else ""),
+                    data=None if body is None else json.dumps(body).encode(),
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                with pytest.raises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(req)
+                assert error.value.code == 403
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -2628,7 +2628,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         from drover.server.db import ControlPlaneBusy
 
         try:
-            principal = self._continuity_owner_principal()
+            principal = self._continuity_coordinator_principal()
             if principal is None:
                 raise PermissionError("bound bearer credential required")
             hub = ContinuityHub(self.collector.duckdb_path)
@@ -2760,6 +2760,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(status, "application/json", json.dumps(result) + "\n")
 
     def _continuity_owner_principal(self) -> str | None:
+        """Derive the bearer identity; observer handoffs enforce its authority."""
+        credential = bearer_credential(self.auth, self.headers)
+        if credential is not None:
+            return "credential:" + credential.id
+        return self._continuity_coordinator_principal()
+
+    def _continuity_coordinator_principal(self) -> str | None:
         """Allow only an explicitly configured coordinator or legacy operator."""
         credential = bearer_credential(self.auth, self.headers)
         if credential is not None:
