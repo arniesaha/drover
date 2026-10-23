@@ -67,6 +67,8 @@ class Credential:
     last_used_at: str | None = None
     revoked_at: str | None = None
     notification_mode: str = "action"
+    notification_timezone: str = "UTC"
+    notification_hour: int | None = None
     apns_token: str | None = None
     apns_environment: str | None = None
     #: Set when Apple permanently rejected this device's registration. The
@@ -98,6 +100,8 @@ class Credential:
             "last_used_at": self.last_used_at,
             "revoked_at": self.revoked_at,
             "notification_mode": self.notification_mode,
+            "notification_timezone": self.notification_timezone,
+            "notification_hour": self.notification_hour,
             "apns_token": self.apns_token,
             "apns_environment": self.apns_environment,
             "apns_failure_reason": self.apns_failure_reason,
@@ -129,6 +133,7 @@ class CredentialStore:
         self._by_id: dict[str, Credential] = {}
         self._by_verifier: dict[str, str] = {}
         self._touched_at: dict[str, float] = {}
+        self._digest_pending: dict[tuple[str, str], dict] = {}
         self._load()
 
     @property
@@ -229,9 +234,20 @@ class CredentialStore:
             self._write()
             return True
 
-    def set_notification_mode(self, credential_id: str, mode: str) -> bool:
+    def set_notification_preferences(
+        self,
+        credential_id: str,
+        mode: str,
+        *,
+        timezone: str = "UTC",
+        hour: int | None = None,
+    ) -> bool:
         if mode not in {"all", "action", "digest"}:
             raise ValueError("invalid notification mode")
+        if not isinstance(timezone, str) or not timezone:
+            raise ValueError("invalid notification timezone")
+        if hour is not None and (type(hour) is not int or not 0 <= hour <= 23):
+            raise ValueError("invalid notification hour")
         with self._lock:
             credential = self._by_id.get(credential_id)
             if (
@@ -240,9 +256,77 @@ class CredentialStore:
                 or credential.scope != "device"
             ):
                 return False
-            self._by_id[credential_id] = replace(credential, notification_mode=mode)
+            self._by_id[credential_id] = replace(
+                credential,
+                notification_mode=mode,
+                notification_timezone=timezone,
+                notification_hour=hour,
+            )
             self._write()
             return True
+
+    def set_notification_mode(self, credential_id: str, mode: str) -> bool:
+        return self.set_notification_preferences(credential_id, mode)
+
+    def queue_digest(self, credential: Credential, transition, due_at: float) -> None:
+        """Persist only digest routing metadata, never transcript previews/content."""
+        item = {
+            "credential_id": credential.id,
+            "session_id": transition.session_id,
+            "awaiting": transition.awaiting,
+            "status": transition.status,
+            "due_at": due_at,
+            "update_count": 1,
+        }
+        with self._lock:
+            previous = self._digest_pending.get((credential.id, transition.session_id))
+            if previous:
+                item["update_count"] = int(previous.get("update_count", 1)) + 1
+            self._digest_pending[(credential.id, transition.session_id)] = item
+            self._write()
+
+    def pending_digests(self) -> list[dict]:
+        with self._lock:
+            return [dict(item) for item in self._digest_pending.values()]
+
+    def claim_digests(
+        self, credential_id: str, session_ids: list[str], now: float, owner: str
+    ) -> dict[str, int]:
+        """Claim local-file items. The PostgreSQL implementation fences workers."""
+        with self._lock:
+            return {
+                session_id: int(item.get("update_count", 1))
+                for session_id in session_ids
+                if (item := self._digest_pending.get((credential_id, session_id)))
+                and float(item.get("due_at", 0)) <= now
+            }
+
+    def cancel_digests(self, credential_id: str, session_ids: list[str]) -> None:
+        with self._lock:
+            for session_id in session_ids:
+                self._digest_pending.pop((credential_id, session_id), None)
+            self._write()
+
+    def complete_digest(
+        self, credential_id: str, claimed: dict[str, int], owner: str
+    ) -> None:
+        # Do not erase an update queued while the batch was in flight.
+        with self._lock:
+            for session_id, version in claimed.items():
+                item = self._digest_pending.get((credential_id, session_id))
+                if item is not None and int(item.get("update_count", 1)) == version:
+                    self._digest_pending.pop((credential_id, session_id), None)
+            self._write()
+
+    def defer_digest(
+        self, credential_id: str, claimed: dict[str, int], due_at: float, owner: str
+    ) -> None:
+        with self._lock:
+            for session_id, version in claimed.items():
+                item = self._digest_pending.get((credential_id, session_id))
+                if item is not None and int(item.get("update_count", 1)) == version:
+                    item["due_at"] = due_at
+            self._write()
 
     def clear_apns_registration(
         self, credential_id: str, *, expected_token: str | None = None
@@ -368,6 +452,8 @@ class CredentialStore:
                     last_used_at=item.get("last_used_at"),
                     revoked_at=item.get("revoked_at"),
                     notification_mode=item.get("notification_mode", "action"),
+                    notification_timezone=item.get("notification_timezone", "UTC"),
+                    notification_hour=item.get("notification_hour"),
                     apns_token=item.get("apns_token"),
                     apns_environment=item.get("apns_environment"),
                     apns_failure_reason=item.get("apns_failure_reason"),
@@ -377,6 +463,13 @@ class CredentialStore:
             except KeyError:
                 continue
             self._index(credential)
+        for item in raw.get("digest_pending") or []:
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("credential_id"), str)
+                and isinstance(item.get("session_id"), str)
+            ):
+                self._digest_pending[(item["credential_id"], item["session_id"])] = item
         if not self._path.exists():
             # Persist server_id immediately so it survives a restart even if
             # no credential is ever issued.
@@ -389,6 +482,7 @@ class CredentialStore:
             "server_id": self._server_id,
             "fleet_name": self._fleet_name,
             "credentials": [item.as_json() for item in self._by_id.values()],
+            "digest_pending": list(self._digest_pending.values()),
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_name(self._path.name + ".tmp")
@@ -403,7 +497,7 @@ class CredentialStore:
 _CREDENTIAL_COLUMNS = """
 credential_id, scope, label, verifier, created_at, host_id, last_used_at,
 revoked_at, apns_token, apns_environment, apns_failure_reason, apns_failed_at,
-apns_failed_fingerprint, notification_mode
+apns_failed_fingerprint, notification_mode, notification_timezone, notification_hour
 """
 
 
@@ -432,6 +526,8 @@ def _credential_from_row(row: tuple[object, ...]) -> Credential:
         apns_failed_at=timestamp(row[11]),
         apns_failed_fingerprint=str(row[12]) if row[12] is not None else None,
         notification_mode=str(row[13]),
+        notification_timezone=str(row[14] or "UTC"),
+        notification_hour=int(row[15]) if row[15] is not None else None,
     )
 
 
@@ -581,17 +677,136 @@ class PostgresCredentialStore:
                 raise
         return True
 
-    def set_notification_mode(self, credential_id: str, mode: str) -> bool:
+    def set_notification_preferences(
+        self,
+        credential_id: str,
+        mode: str,
+        *,
+        timezone: str = "UTC",
+        hour: int | None = None,
+    ) -> bool:
         if mode not in {"all", "action", "digest"}:
             raise ValueError("invalid notification mode")
+        if not isinstance(timezone, str) or not timezone:
+            raise ValueError("invalid notification timezone")
+        if hour is not None and (type(hour) is not int or not 0 <= hour <= 23):
+            raise ValueError("invalid notification hour")
         with self._connection() as con:
             row = con.execute(
-                "UPDATE control_credentials SET notification_mode = ? "
-                "WHERE credential_id = ? AND revoked_at IS NULL AND scope = 'device' "
-                "RETURNING credential_id",
-                [mode, credential_id],
+                "UPDATE control_credentials SET notification_mode = ?, notification_timezone = ?, notification_hour = ? "
+                "WHERE credential_id = ? AND revoked_at IS NULL AND scope = 'device' RETURNING credential_id",
+                [mode, timezone, hour, credential_id],
             ).fetchone()
         return row is not None
+
+    def set_notification_mode(self, credential_id: str, mode: str) -> bool:
+        return self.set_notification_preferences(credential_id, mode)
+
+    def queue_digest(self, credential: Credential, transition, due_at: float) -> None:
+        from datetime import datetime, timezone
+
+        due = datetime.fromtimestamp(due_at, timezone.utc)
+        local_date = (
+            datetime.fromtimestamp(due_at, timezone.utc)
+            .astimezone(
+                __import__("zoneinfo").ZoneInfo(credential.notification_timezone)
+            )
+            .date()
+        )
+        with self._connection() as con:
+            con.execute(
+                """INSERT INTO notification_digest_items
+                   (credential_id, local_date, session_id, kind, awaiting, status, due_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (credential_id, local_date, session_id) DO UPDATE
+                   SET kind = EXCLUDED.kind, awaiting = EXCLUDED.awaiting, status = EXCLUDED.status,
+                       due_at = LEAST(notification_digest_items.due_at, EXCLUDED.due_at),
+                       update_count = notification_digest_items.update_count + 1""",
+                [
+                    credential.id,
+                    local_date,
+                    transition.session_id,
+                    transition.kind,
+                    transition.awaiting,
+                    transition.status,
+                    due,
+                ],
+            )
+
+    def pending_digests(self) -> list[dict]:
+        with self._connection() as con:
+            rows = con.execute(
+                "SELECT credential_id, session_id, awaiting, status, EXTRACT(EPOCH FROM due_at), update_count FROM notification_digest_items WHERE sent_at IS NULL"
+            ).fetchall()
+        return [
+            {
+                "credential_id": str(r[0]),
+                "session_id": str(r[1]),
+                "awaiting": r[2],
+                "status": r[3],
+                "due_at": float(r[4]),
+                "update_count": int(r[5]),
+            }
+            for r in rows
+        ]
+
+    def claim_digests(
+        self, credential_id: str, session_ids: list[str], now: float, owner: str
+    ) -> dict[str, int]:
+        """Atomically lease due items so hub workers never send the same batch."""
+        if not session_ids:
+            return {}
+        with self._connection() as con:
+            rows = con.execute(
+                """UPDATE notification_digest_items
+                   SET lease_until = to_timestamp(?) + interval '2 minutes', lease_token = ?
+                   WHERE credential_id = ? AND session_id = ANY(?) AND sent_at IS NULL
+                     AND due_at <= to_timestamp(?)
+                     AND (lease_until IS NULL OR lease_until < to_timestamp(?))
+                   RETURNING session_id, update_count""",
+                [now, owner, credential_id, session_ids, now, now],
+            ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def cancel_digests(self, credential_id: str, session_ids: list[str]) -> None:
+        if not session_ids:
+            return
+        with self._connection() as con:
+            con.execute(
+                "DELETE FROM notification_digest_items WHERE credential_id = ? AND session_id = ANY(?)",
+                [credential_id, session_ids],
+            )
+
+    def complete_digest(
+        self, credential_id: str, claimed: dict[str, int], owner: str
+    ) -> None:
+        # Match both the lease owner and version: a later notification must
+        # remain queued instead of being deleted by this earlier APNs response.
+        if not claimed:
+            return
+        with self._connection() as con:
+            for session_id, version in claimed.items():
+                con.execute(
+                    """DELETE FROM notification_digest_items
+                       WHERE credential_id = ? AND session_id = ? AND update_count = ?
+                         AND lease_token = ? AND sent_at IS NULL""",
+                    [credential_id, session_id, version, owner],
+                )
+
+    def defer_digest(
+        self, credential_id: str, claimed: dict[str, int], due_at: float, owner: str
+    ) -> None:
+        if not claimed:
+            return
+        with self._connection() as con:
+            for session_id, version in claimed.items():
+                con.execute(
+                    """UPDATE notification_digest_items
+                       SET due_at = to_timestamp(?), lease_until = NULL, lease_token = NULL
+                       WHERE credential_id = ? AND session_id = ? AND update_count = ?
+                         AND lease_token = ? AND sent_at IS NULL""",
+                    [due_at, credential_id, session_id, version, owner],
+                )
 
     def clear_apns_registration(
         self, credential_id: str, *, expected_token: str | None = None
