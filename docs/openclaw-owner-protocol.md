@@ -27,13 +27,20 @@ only after this proof. It then binds the adapter's `run_id`, `owner_principal`
 inactive plugin separately binds its
 trusted OpenClaw `ownerSessionKey` for tool discovery; that session key is never
 sent as an HTTP owner identity.
-The tool request cannot choose another run, impersonate an owner, broaden scope,
-grant approval, or supply a URL, token, command, or arbitrary endpoint path.
+The tool request cannot choose another run, observer session, objective,
+checkpoint, token, impersonated owner, scope, URL, command, or arbitrary
+endpoint path. A trusted plugin configuration may optionally provide the
+observer session/objective/checkpoint and a handoff-token environment-variable
+name. The owner may then explicitly invoke `initialize` to redeem that token,
+or safely replay initialization to recover durable pending receipts. Poll never
+does this mutation automatically.
 All transport calls use the fixed existing continuity endpoint. The injected
 `ContinuityEndpoint.get/post` transport must enforce ordinary Drover authentication;
 the Python protocol neither implements nor bypasses authentication.
-Before a mutation, a bounded GET checks the run's immutable scope and authorized
-owner handoff against the trusted binding. The HTTP endpoint also rejects a
+Before every mutation other than first `initialize`, a bounded GET checks the
+run's immutable scope and authorized owner handoff against the trusted binding.
+First initialization is instead bound by its fixed trusted configuration, the
+bearer-derived owner, and the server-validated handoff token. The HTTP endpoint also rejects a
 lease, consume, or ack whose JSON owner differs from the authenticated bearer
 before state mutation. A wrong scope or owner is refused before any POST,
 including ack.

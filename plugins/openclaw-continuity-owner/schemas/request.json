@@ -56,6 +56,21 @@
       "title": "Consume",
       "type": "object"
     },
+    "Initialize": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "initialize",
+          "title": "Operation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "title": "Initialize",
+      "type": "object"
+    },
     "Lease": {
       "additionalProperties": false,
       "properties": {
@@ -178,6 +193,7 @@
         "mapping": {
           "acknowledge": "#/$defs/Acknowledge",
           "consume": "#/$defs/Consume",
+          "initialize": "#/$defs/Initialize",
           "lease": "#/$defs/Lease",
           "poll": "#/$defs/Poll",
           "report": "#/$defs/Report"
@@ -187,6 +203,9 @@
       "oneOf": [
         {
           "$ref": "#/$defs/Poll"
+        },
+        {
+          "$ref": "#/$defs/Initialize"
         },
         {
           "$ref": "#/$defs/Lease"

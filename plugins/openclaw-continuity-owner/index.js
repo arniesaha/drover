@@ -120,13 +120,17 @@ async function invoke(config, readOnly, payload, signal, assertCurrent) {
   let raw;
   if (args.operation === "poll") raw = await get(args.limit ?? 20);
   else {
-    const preflight = await get(1);
-    requireValue(!Object.hasOwn(preflight, "delivery") && !Object.hasOwn(preflight, "event_id"), "Status cannot deliver or acknowledge an event");
-    reply(preflight, config); // Immutable scope check before any mutation.
-    const body = { ...args, run_id: config.runId };
+    if (args.operation !== "initialize") {
+      const preflight = await get(1);
+      requireValue(!Object.hasOwn(preflight, "delivery") && !Object.hasOwn(preflight, "event_id"), "Status cannot deliver or acknowledge an event");
+      reply(preflight, config); // Immutable scope check before any mutation.
+    }
+    const body = args.operation === "initialize"
+      ? initializeBody(config)
+      : { ...args, run_id: config.runId };
     if (body.owner_epoch === null) delete body.owner_epoch;
     if (args.operation === "report") body.source = "openclaw";
-    else body.owner_id = config.ownerPrincipal;
+    else if (args.operation !== "initialize") body.owner_id = config.ownerPrincipal;
     raw = await request(config, "POST", body, signal, assertCurrent);
   }
   const result = reply(raw, config);
@@ -142,6 +146,19 @@ async function invoke(config, readOnly, payload, signal, assertCurrent) {
   if (args.operation === "report") requireValue(result.event_id !== null, "Report must return its durable identity");
   else requireValue(!Object.hasOwn(raw, "event_id"), "Only report may return an event identity");
   return result;
+}
+
+function initializeBody(config) {
+  requireValue(typeof config.observerSessionId === "string" && config.observerSessionId.length > 0, "Initialize requires a trusted observer session binding");
+  requireValue(typeof config.objective === "string" && config.objective.trim().length > 0, "Initialize requires a trusted objective");
+  requireValue(typeof config.checkpoint === "string" && config.checkpoint.trim().length > 0, "Initialize requires a trusted checkpoint");
+  const body = { operation: "initialize", session_id: config.observerSessionId, objective: config.objective, checkpoint: config.checkpoint };
+  if (config.handoffTokenEnvName !== undefined) {
+    const handoffToken = process.env[config.handoffTokenEnvName];
+    requireValue(typeof handoffToken === "string" && handoffToken.length > 0 && handoffToken.length <= 512 && !/\s/.test(handoffToken), "Configured owner handoff token is missing or malformed");
+    body.handoff_token = handoffToken;
+  }
+  return body;
 }
 
 // SDK 2026.9.6: V2 descriptor uses trusted sessionKey and live invocation guard.

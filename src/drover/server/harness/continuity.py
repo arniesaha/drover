@@ -307,9 +307,13 @@ def record_observer_worker_completion(
     )
     if session is None or session["handoff_mode"] != "factory_observer":
         return None
+    # Serialize projection with owner-handoff redemption. Without this lock,
+    # ingestion can observe an unbound row, commit a pending receipt after
+    # redemption's recovery scan, and strand an otherwise valid completion.
+    lock = " FOR UPDATE" if is_postgres_connection(con) else ""
     run = _row(
         con,
-        "SELECT run_id FROM factory_observer_runs WHERE session_id = ?",
+        "SELECT run_id FROM factory_observer_runs WHERE session_id = ?" + lock,
         [session_id],
     )
     if run is None:

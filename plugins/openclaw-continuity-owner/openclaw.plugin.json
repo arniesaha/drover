@@ -2,7 +2,7 @@
   "id": "drover-continuity-owner",
   "name": "Drover Continuity Owner",
   "version": "0.1.0",
-  "description": "Explicit report-only continuity transport; no messaging or executor",
+  "description": "Explicit continuity owner transport; no messaging or executor",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -26,6 +26,30 @@
       "tokenEnvName": {
         "type": "string",
         "pattern": "^[A-Z_][A-Z0-9_]*$"
+      },
+      "handoffTokenEnvName": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Z_][A-Z0-9_]*$"
+      },
+      "observerSessionId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 191,
+        "pattern": "\\S"
+      },
+      "objective": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000,
+        "pattern": "\\S"
+      },
+      "checkpoint": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000,
+        "pattern": "\\S"
       },
       "runId": {
         "type": "string",

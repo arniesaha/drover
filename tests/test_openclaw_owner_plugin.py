@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -116,7 +117,7 @@ def canary(tmp_path):
         server.server_close()
 
 
-def invoke(node, config, session, calls, *, token=TOKEN):
+def invoke(node, config, session, calls, *, token=TOKEN, handoff_token=None):
     # Only a synthetic test credential is supplied to the Node child; no host
     # credentials/config/production DSN are forwarded or resolved.
     return subprocess.run(
@@ -126,7 +127,14 @@ def invoke(node, config, session, calls, *, token=TOKEN):
         capture_output=True,
         timeout=15,
         cwd=PLUGIN,
-        env={"DROVER_PLUGIN_TEST_TOKEN": token},
+        env={
+            "DROVER_PLUGIN_TEST_TOKEN": token,
+            **(
+                {"DROVER_PLUGIN_TEST_HANDOFF_TOKEN": handoff_token}
+                if handoff_token is not None
+                else {}
+            ),
+        },
     )
 
 
@@ -235,3 +243,155 @@ def test_real_drover_authentication_refuses_bad_credential_without_side_effects(
     assert denied.returncode != 0 and "HTTP 401" in denied.stderr
     assert "wrong-synthetic-token" not in denied.stderr
     assert store.status(RUN) == before
+
+
+def test_owner_plugin_recovers_bulk_pending_completion_before_acknowledgement(
+    node, tmp_path
+):
+    """A trusted owner can redeem/replay initialization without losing a batch fact."""
+    run = "run_PLUGIN_PENDING498"
+    session_id = "synthetic-pending-observer"
+    other_run = "run_PLUGIN_OTHER498"
+    other_session_id = "synthetic-other-observer"
+    path = tmp_path / "pending.duckdb"
+    bootstrap_control_plane_store(path)
+    registry = HarnessRegistry(path)
+    registry.create_session(
+        session_id=session_id,
+        host_id="studio",
+        harness="codex",
+        command="never-executed",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{run}@4",
+    )
+    store = FactoryObserverContinuity(path)
+    store.initialize(
+        session_id=session_id,
+        objective="Recover a retained completion",
+        checkpoint="Awaiting authorized owner",
+    )
+    registry.create_session(
+        session_id=other_session_id,
+        host_id="studio",
+        harness="codex",
+        command="never-executed",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{other_run}@4",
+    )
+    store.initialize(
+        session_id=other_session_id,
+        objective="Recover a retained completion",
+        checkpoint="Awaiting authorized owner",
+    )
+    assert (
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": "plugin-pending-batch-1",
+                    "session_id": session_id,
+                    "event_type": "status",
+                    "payload": {"payload": {"turn_complete": True}},
+                    "seq": 1,
+                    "created_at": datetime.now(timezone.utc),
+                }
+            ]
+        )
+        == 1
+    )
+    assert store.status(run)["completion_receipts"]["counts"] == {
+        "pending_authorization": 1
+    }
+    handoff_token = store.issue_handoff(
+        session_id=session_id,
+        objective="Recover a retained completion",
+        checkpoint="Awaiting authorized owner",
+        authorized_owner_id=OWNER_PRINCIPAL,
+        issued_by="legacy:operator",
+    )["handoff_token"]
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(enabled=True, api_token=TOKEN),
+    )
+    config = {
+        "enabled": True,
+        "mode": "owner",
+        "droverOrigin": f"http://127.0.0.1:{server.server_address[1]}",
+        "tokenEnvName": "DROVER_PLUGIN_TEST_TOKEN",
+        "handoffTokenEnvName": "DROVER_PLUGIN_TEST_HANDOFF_TOKEN",
+        "runId": run,
+        "observerSessionId": session_id,
+        "objective": "Recover a retained completion",
+        "checkpoint": "Awaiting authorized owner",
+        "ownerSessionKey": OWNER,
+        "ownerPrincipal": OWNER_PRINCIPAL,
+        "authorityScope": "implementation",
+    }
+    try:
+        forged = invoke(
+            node,
+            {**config, "runId": other_run, "observerSessionId": other_session_id},
+            OWNER,
+            [payload("initialize")],
+            handoff_token=handoff_token,
+        )
+        assert forged.returncode != 0
+        assert "HTTP 403" in forged.stderr
+        assert handoff_token not in forged.stderr
+        assert store.status(other_run)["owner_handoff"]["authorized_owner_id"] is None
+        [initialized] = results(
+            invoke(
+                node,
+                config,
+                OWNER,
+                [payload("initialize")],
+                handoff_token=handoff_token,
+            )
+        )
+        assert initialized["continuity"]["completion_receipts"]["counts"] == {
+            "projected": 1
+        }
+        [lease] = results(invoke(node, config, OWNER, [payload("lease")]))
+        epoch = lease["continuity"]["owner"]["epoch"]
+        [delivery] = results(
+            invoke(node, config, OWNER, [payload("consume", owner_epoch=epoch)])
+        )
+        event_id = delivery["delivery"]["event_id"]
+        [acknowledged] = results(
+            invoke(
+                node,
+                config,
+                OWNER,
+                [
+                    payload(
+                        "acknowledge",
+                        owner_epoch=epoch,
+                        event_id=event_id,
+                        checkpoint="Owner explicitly acknowledged recovered completion",
+                    )
+                ],
+            )
+        )
+        assert acknowledged["continuity"]["inbox_counts"] == {"acknowledged": 1}
+        [replayed] = results(
+            invoke(
+                node,
+                config,
+                OWNER,
+                [payload("initialize")],
+                handoff_token=handoff_token,
+            )
+        )
+        assert replayed["continuity"]["completion_receipts"]["counts"] == {
+            "projected": 1
+        }
+        assert replayed["continuity"]["inbox_counts"] == {"acknowledged": 1}
+    finally:
+        server.shutdown()
+        server.server_close()

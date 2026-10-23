@@ -212,9 +212,12 @@ The status projection exposes receipt counts/errors and a handoff state:
 `authorization_required`, `owner_lease_required`,
 `acknowledgement_required`, `acknowledged`, or `failed`. A completion is not
 presented as complete until the authorized owner explicitly consumes and
-acknowledges its durable action. When the first handoff is recorded, retained
-pending harness facts are reconciled from their immutable source events in that
-same transaction; they do not depend on a duplicate delivery to become visible.
+acknowledges its durable action. Handoff redemption and completion projection
+lock the same run row, so a bulk ingester cannot commit a newly pending receipt
+after redemption has scanned for retained facts. An authorized owner may also
+explicitly replay initialization through its trusted adapter binding to recover
+any retained pending receipt; poll never performs that mutation or an
+acknowledgement implicitly.
 
 The report still waits for a leased, trusted owner to consume it. Drover has no
 OpenClaw parent-session ownership record and does not send a parent message,

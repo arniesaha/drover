@@ -6,7 +6,7 @@ import logging
 from time import monotonic
 from typing import Any
 
-from drover.server.continuity_schema import CONTINUITY_DDL
+from drover.server.continuity_schema import POSTGRES_V10_CONTINUITY_DDL
 from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
 
 log = logging.getLogger(__name__)
@@ -533,7 +533,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "SELECT drover_refresh_session_search(session_id) FROM harness_sessions",
         ),
     ),
-    (10, CONTINUITY_DDL),
+    (10, POSTGRES_V10_CONTINUITY_DDL),
     (
         11,
         (

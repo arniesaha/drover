@@ -99,7 +99,7 @@ test("parent and owner polls retain pending state; never POST or auto-ack", asyn
 test("poll_only and a canary parent cannot mutate even when owner mode exists", async (t) => {
   const f = await fixture(t);
   for (const target of [tool(f.config), tool({ ...f.config, mode: "owner" }, PARENT)]) {
-    for (const payload of [call("lease"), call("consume", { owner_epoch: 1 }),
+  for (const payload of [call("initialize"), call("lease"), call("consume", { owner_epoch: 1 }),
       call("acknowledge", { owner_epoch: 1, event_id: EVENT, checkpoint: "Not authorized" }),
       call("report", { source_event_id: "id", subject: "ci", sequence: 1, kind: "ci_green", summary: "Green" })]) {
       await assert.rejects(target.execute("canary", payload), /Read-only canary/);

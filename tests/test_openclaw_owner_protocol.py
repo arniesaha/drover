@@ -368,6 +368,7 @@ def test_descriptor_has_versioned_object_schema_but_does_not_register_runtime():
     assert schema["type"] == "object" and schema["additionalProperties"] is False
     assert schema["properties"]["version"]["const"] == 1
     assert set(schema["properties"]["request"]["discriminator"]["mapping"]) == {
+        "initialize",
         "lease",
         "report",
         "poll",

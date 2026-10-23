@@ -469,23 +469,47 @@ def test_batched_completion_projection_retains_retry_and_rejection_on_postgres(
 
 
 def test_pending_completion_recovers_after_authorized_handoff_on_postgres(pg_bridge):
-    store, _ = pg_bridge
+    store, clock = pg_bridge
     registry = HarnessRegistry(store.path)
-    registry.append_event(
-        event_id="pg-completion-before-owner-handoff",
-        session_id="pg-observer",
-        event_type="status",
-        payload={"turn_complete": True},
-        seq=1,
+    assert (
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": "pg-completion-before-owner-handoff",
+                    "session_id": "pg-observer",
+                    "event_type": "status",
+                    "payload": {"payload": {"turn_complete": True}},
+                    "seq": 1,
+                    "created_at": clock.now,
+                }
+            ]
+        )
+        == 1
     )
     assert store.status(RUN)["completion_receipts"]["counts"] == {
         "pending_authorization": 1
     }
+    handoff_token = store.issue_handoff(
+        session_id="pg-observer",
+        objective="Prove #497 on PostgreSQL",
+        checkpoint="Pending",
+        authorized_owner_id="postgres-recovery-owner",
+        issued_by="credential:postgres-host",
+    )["handoff_token"]
+    with pytest.raises(PermissionError, match="not authorized"):
+        store.initialize(
+            session_id="pg-observer",
+            objective="Prove #497 on PostgreSQL",
+            checkpoint="Pending",
+            authorized_owner_id="postgres-forged-owner",
+            handoff_token=handoff_token,
+        )
     store.initialize(
         session_id="pg-observer",
         objective="Prove #497 on PostgreSQL",
         checkpoint="Pending",
         authorized_owner_id="postgres-recovery-owner",
+        handoff_token=handoff_token,
     )
     recovered = store.status(RUN)
     assert recovered["completion_receipts"] == {
@@ -499,6 +523,14 @@ def test_pending_completion_recovers_after_authorized_handoff_on_postgres(pg_bri
         owner_epoch=lease["owner_epoch"],
     )
     assert action["type"] == "review_worker_result"
+    store.acknowledge(
+        RUN,
+        owner_id="postgres-recovery-owner",
+        owner_epoch=lease["owner_epoch"],
+        event_id=action["event_id"],
+        checkpoint="PostgreSQL owner acknowledged recovered completion",
+    )
+    assert store.status(RUN)["inbox_counts"] == {"acknowledged": 1}
 
 
 def test_unbound_run_denies_mutations_until_authorized_handoff_on_postgres(pg_bridge):

@@ -32,6 +32,10 @@ class Poll(WireModel):
     limit: Annotated[int, Field(ge=1, le=50)] = 20
 
 
+class Initialize(WireModel):
+    operation: Literal["initialize"]
+
+
 class Lease(WireModel):
     operation: Literal["lease"]
     owner_epoch: Epoch | None = None
@@ -62,7 +66,8 @@ class Acknowledge(WireModel):
 class OwnerToolCall(WireModel):
     version: Literal[1]
     request: Annotated[
-        Poll | Lease | Report | Consume | Acknowledge, Field(discriminator="operation")
+        Poll | Initialize | Lease | Report | Consume | Acknowledge,
+        Field(discriminator="operation"),
     ]
 
 
@@ -215,7 +220,7 @@ def owner_tool_definition() -> dict:
     """
     return {
         "name": TOOL_NAME,
-        "description": "Read/report/lease/consume/ack Drover owner continuity. Actions are advisory; no Factory controls, merge or deployment. Ack only after idempotent owner reconciliation.",
+        "description": "Initialize/report/lease/consume/ack Drover owner continuity. Actions are advisory; no Factory controls, merge or deployment. Ack only after idempotent owner reconciliation.",
         "parameters": OwnerToolCall.model_json_schema(),
     }
 
@@ -236,6 +241,10 @@ class OpenClawOwnerAdapter:
         run_id: str,
         owner_id: str,
         authority_scope: Scope,
+        session_id: str | None = None,
+        objective: str | None = None,
+        checkpoint: str | None = None,
+        handoff_token: str | None = None,
     ):
         # Reuse strict field validation without accepting credentials or URLs.
         context = _OwnerContext(
@@ -243,6 +252,10 @@ class OpenClawOwnerAdapter:
         )
         self.endpoint = endpoint
         self.context = context
+        self.session_id = session_id
+        self.objective = objective
+        self.checkpoint = checkpoint
+        self.handoff_token = handoff_token
 
     def invoke(self, payload: dict) -> OwnerToolReply:
         call = OwnerToolCall.model_validate(payload)
@@ -260,11 +273,23 @@ class OpenClawOwnerAdapter:
                     ENDPOINT, query={"run_id": context.run_id, "limit": 1}
                 )
             )
-            body = request.model_dump(exclude_none=True)
-            body["run_id"] = context.run_id
+            if isinstance(request, Initialize):
+                if not all((self.session_id, self.objective, self.checkpoint)):
+                    raise ValueError("trusted initialization binding is required")
+                body = {
+                    "operation": "initialize",
+                    "session_id": self.session_id,
+                    "objective": self.objective,
+                    "checkpoint": self.checkpoint,
+                }
+                if self.handoff_token is not None:
+                    body["handoff_token"] = self.handoff_token
+            else:
+                body = request.model_dump(exclude_none=True)
+                body["run_id"] = context.run_id
             if isinstance(request, Report):
                 body["source"] = "openclaw"
-            else:
+            elif not isinstance(request, Initialize):
                 body["owner_id"] = context.owner_id
             raw = self.endpoint.post(ENDPOINT, body=body)
         reply = self._reply(raw)

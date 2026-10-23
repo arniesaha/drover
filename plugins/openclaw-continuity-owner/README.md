@@ -165,8 +165,9 @@ The worker does not perform any step below against a live runtime.
 2. Select an **existing isolated test Factory observer session**. Its bound host
    credential (or the legacy operator bearer) first issues a one-time
    `issue_handoff` for the intended `credential:<owner-id>`; that owner then
-   initializes the continuity ledger with the returned handoff token. This tool
-   deliberately does not issue handoffs, initialize, or launch sessions.
+   explicitly invokes the plugin's trusted-config `initialize` action with the
+   returned handoff token. The plugin deliberately does not issue handoffs or
+   launch sessions. Poll never initializes or acknowledges implicitly.
    Use the returned `continuity.run_id`. POST one advisory report to the same
    endpoint with `operation: "report"`, that `run_id`, `source: "openclaw"`, a
    unique `source_event_id`, `subject: "canary"`, `sequence: 1`,
