@@ -2617,7 +2617,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
 
     def _continuity_shadow_compare(self) -> None:
         """Compare legacy and hub decisions without granting provider write access."""
-        from drover.server.continuity_loop import ShadowCompareService
+        from drover.server.continuity_loop import shadow_compare_service
 
         try:
             length = int(self.headers.get("Content-Length") or "0")
@@ -2644,12 +2644,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if not isinstance(now, datetime):
                 raise ValueError("now must be an ISO timestamp")
             policy = body.get("policy")
-            if policy is not None and not isinstance(policy, dict):
-                raise ValueError("policy must be an object")
-            service = getattr(self.collector, "continuity_shadow_compare", None)
-            if service is None:
-                service = ShadowCompareService()
-                self.collector.continuity_shadow_compare = service
+            service = shadow_compare_service(self.collector)
             result = service.compare(
                 body["facts"], body["local_decision"], now=now, policy=policy
             )

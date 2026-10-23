@@ -1,11 +1,22 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import json
+import urllib.error
+import urllib.request
+
+import pytest
 
 from drover.server.continuity_loop import (
     ContinuityPolicy,
+    HANDOFF_MARK,
+    NUDGE_MARK,
     ShadowCompareService,
     action_identity,
     decide,
 )
+from drover.server.metrics import MetricsCollector
+from drover.server.web.auth import AuthSettings
+from drover.server.web.app import start_metrics_server
 
 NOW = datetime(2026, 10, 23, 18, 0, tzinfo=timezone.utc)
 
@@ -44,7 +55,7 @@ def test_decide_ports_legacy_stage_reach_and_handoff_once():
     assert decision.action == "handoff"
     assert decision.stage == "pr"
     reached["bot"] = [
-        {"mark": "handoff", "at": (NOW + timedelta(seconds=1)).isoformat()}
+        {"mark": HANDOFF_MARK, "at": (NOW + timedelta(seconds=1)).isoformat()}
     ]
     assert decide(reached, NOW).action == "none"
 
@@ -52,8 +63,12 @@ def test_decide_ports_legacy_stage_reach_and_handoff_once():
 def test_decide_ports_legacy_nudge_and_stall_when_worker_state_is_absent():
     legacy = facts(worker={}, created=(NOW - timedelta(minutes=61)).isoformat())
     assert decide(legacy, NOW).action == "nudge"
-    legacy["bot"] = [{"mark": "nudge", "at": (NOW - timedelta(minutes=1)).isoformat()}]
-    assert decide(legacy, NOW).action == "stall"
+    legacy["bot"] = [
+        {"mark": NUDGE_MARK, "at": (NOW - timedelta(minutes=1)).isoformat()}
+    ]
+    # The real wire marker starts a new legacy 30-minute idle window.
+    assert decide(legacy, NOW).action == "none"
+    assert decide(legacy, NOW + timedelta(minutes=31)).action == "stall"
 
 
 def test_decide_nudges_then_stalls_without_provider_writes():
@@ -107,3 +122,67 @@ def test_shadow_compare_accepts_legacy_action_only_payload():
     result = service.compare(facts(), {"action": "nudge"}, now=NOW)
     assert result["matches"]
     assert not service.mismatches
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(labels="not-a-list"),
+        lambda value: value.update(prs=["not-an-object"]),
+        lambda value: value.update(bot=[{"mark": NUDGE_MARK, "at": "not-a-time"}]),
+        lambda value: value.update(worker="not-an-object"),
+        lambda value: value.update(markers={"done": "not-a-list"}),
+        lambda value: value.update(release={"running": "yes"}),
+    ],
+)
+def test_shadow_compare_rejects_malformed_nested_facts(mutate):
+    value = facts()
+    mutate(value)
+    with pytest.raises(ValueError):
+        ShadowCompareService().compare(value, {"action": "none"}, now=NOW)
+
+
+def test_shadow_compare_mutation_is_thread_safe_and_bounded():
+    service = ShadowCompareService(limit=7)
+
+    def compare(number):
+        return service.compare(facts(number=number), {"action": "none"}, now=NOW)
+
+    with ThreadPoolExecutor(max_workers=12) as workers:
+        results = list(workers.map(compare, range(1000, 1050)))
+    assert all(result["recorded"] for result in results)
+    assert len(service.mismatches) == 7
+
+
+def test_shadow_compare_http_returns_400_for_malformed_nested_facts(tmp_path):
+    collector = MetricsCollector(
+        duckdb_path=tmp_path / "metrics.duckdb",
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        auth=AuthSettings(enabled=True, api_token="test-token"),
+    )
+    payload = facts(worker="not-an-object")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{server.server_address[1]}/continuity/shadow-compare",
+        data=json.dumps(
+            {"facts": payload, "local_decision": {"action": "none"}}
+        ).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer test-token",
+        },
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=2)
+        assert raised.value.code == 400
+        assert "facts.worker" in json.loads(raised.value.read())["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
