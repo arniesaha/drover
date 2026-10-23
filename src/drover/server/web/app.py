@@ -2659,7 +2659,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     "decide": ({"issue_key", "facts"}, {"now", "policy"}),
                     "lease": ({"issue_key"}, {"owner_epoch", "lease_seconds"}),
                     "consume": ({"issue_key", "owner_epoch"}, set()),
-                    "acknowledge": ({"issue_key", "owner_epoch", "wake_id"}, set()),
+                    "acknowledge": (
+                        {"issue_key", "owner_epoch", "wake_id", "delivery_token"},
+                        set(),
+                    ),
                 }
                 if operation not in contracts:
                     raise ValueError("unsupported continuity operation")
@@ -2757,10 +2760,27 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(status, "application/json", json.dumps(result) + "\n")
 
     def _continuity_owner_principal(self) -> str | None:
-        """Derive the only owner identity mutable continuity calls may claim."""
+        """Allow only an explicitly configured coordinator or legacy operator."""
         credential = bearer_credential(self.auth, self.headers)
         if credential is not None:
-            return "credential:" + credential.id
+            principal = "credential:" + credential.id
+            service = getattr(self.collector, "work_control", None)
+            config = getattr(service, "config", None)
+            role = (
+                getattr(config, "principal_roles", {}).get(principal)
+                if config is not None
+                else None
+            )
+            if role is not None:
+                from drover.server.work_queue.config import load_policy
+
+                coordinators = {
+                    load_policy(goal.policy_path).authority.coordinator
+                    for goal in config.goals
+                }
+                if role in coordinators:
+                    return principal
+            return None
         authorization = self.headers.get("Authorization", "") or ""
         if (
             self.auth.enabled
