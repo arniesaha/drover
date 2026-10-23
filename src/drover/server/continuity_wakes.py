@@ -338,11 +338,26 @@ class ContinuityWakes:
                 raise ContinuityWakeConflict(
                     "wake was delivered under a different owner epoch or delivery"
                 )
-            con.execute(
-                """UPDATE continuity_wakes SET state = 'acknowledged', acknowledged_at = ?
-                   WHERE wake_id = ?""",
-                [now, wake_id],
+            updated = _row(
+                con,
+                """UPDATE continuity_wakes
+                      SET state = 'acknowledged', acknowledged_at = ?
+                    WHERE issue_key = ? AND wake_id = ? AND state = 'delivered'
+                      AND owner_id = ? AND owner_epoch = ? AND delivery_token = ?
+                    RETURNING wake_id""",
+                [
+                    now,
+                    issue_key,
+                    wake_id,
+                    owner_id,
+                    owner_epoch,
+                    delivery_token,
+                ],
             )
+            if updated is None:
+                raise ContinuityWakeConflict(
+                    "delivery changed before acknowledgement completed"
+                )
 
     def status(self, issue_key: str, *, limit: int = 20) -> dict:
         """Bounded recovery projection; polling never delivers or acknowledges."""
