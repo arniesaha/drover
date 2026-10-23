@@ -1,4 +1,5 @@
 import json
+import threading
 from dataclasses import replace
 
 import pytest
@@ -27,6 +28,21 @@ class Session:
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
         return self.responses.pop(0)
+
+
+class Routed(Session):
+    """Answers by URL path, for reads that run concurrently."""
+
+    def __init__(self, routes):
+        super().__init__()
+        self.routes = routes
+        self.lock = threading.Lock()
+
+    def request(self, method, url, **kwargs):
+        with self.lock:
+            self.calls.append((method, url, kwargs))
+        target = url + "?"
+        return next(r for key, r in self.routes.items() if key in target)
 
 
 @pytest.fixture
@@ -145,31 +161,6 @@ def test_reads_labels_milestones_comments_pulls_checks_and_environment_gates(
         Response([]),
         Response({"number": 7}),
         Response({"check_runs": [{"conclusion": "failure"}]}),
-        Response(
-            [
-                {
-                    "number": 8,
-                    "head": {"sha": sha},
-                    "draft": True,
-                    "html_url": "https://github.com/example/project/pull/8",
-                    "updated_at": "2026-10-13T00:00:00Z",
-                }
-            ]
-        ),
-        Response({"check_runs": [{"id": 11, "conclusion": "failure"}]}),
-        Response(
-            {
-                "workflow_runs": [
-                    {
-                        "id": 9,
-                        "run_attempt": 2,
-                        "html_url": "https://github.com/example/project/actions/runs/9",
-                        "updated_at": "2026-10-13T00:00:00Z",
-                    }
-                ]
-            }
-        ),
-        Response([{"environment": {"id": 10}, "current_user_can_approve": True}]),
     )
     provider = GitHubProvider("workspace-test", scope(), session=session)
     assert (
@@ -180,6 +171,41 @@ def test_reads_labels_milestones_comments_pulls_checks_and_environment_gates(
     )
     assert provider.get_pull(ref())["number"] == 7
     assert provider.list_checks(sha)[0]["conclusion"] == "failure"
+    # Attention reads run concurrently, so responses are routed by URL.
+    session = Routed(
+        {
+            "/pulls?": Response(
+                [
+                    {
+                        "number": 8,
+                        "head": {"sha": sha},
+                        "draft": True,
+                        "html_url": "https://github.com/example/project/pull/8",
+                        "updated_at": "2026-10-13T00:00:00Z",
+                    }
+                ]
+            ),
+            "/check-runs?": Response(
+                {"check_runs": [{"id": 11, "conclusion": "failure"}]}
+            ),
+            "/actions/runs?": Response(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 9,
+                            "run_attempt": 2,
+                            "html_url": "https://github.com/example/project/actions/runs/9",
+                            "updated_at": "2026-10-13T00:00:00Z",
+                        }
+                    ]
+                }
+            ),
+            "/pending_deployments?": Response(
+                [{"environment": {"id": 10}, "current_user_can_approve": True}]
+            ),
+        }
+    )
+    provider.session = session
     attention = provider.list_attention()
     assert [r["kind"] for r in attention] == [
         "draft_pr",
@@ -189,7 +215,9 @@ def test_reads_labels_milestones_comments_pulls_checks_and_environment_gates(
     assert attention[2]["source_key"] == "environment:9:2:10"
     assert attention[2]["actions"] == ["open"]
     assert all(c[0] == "GET" for c in session.calls)
-    assert session.calls[-2][2]["params"]["status"] == "waiting"
+    assert len(session.calls) == 4
+    waiting = [c for c in session.calls if c[1].endswith("/actions/runs")]
+    assert waiting[0][2]["params"]["status"] == "waiting"
 
 
 def test_cross_workspace_refs_missing_permissions_and_public_text_fail_closed(

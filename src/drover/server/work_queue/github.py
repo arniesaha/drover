@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import requests
@@ -14,6 +16,8 @@ from .config import GoalScope
 from .provider import ItemRef
 
 API = "https://api.github.com"
+# Independent attention reads run concurrently; GitHub tolerates this few.
+READ_CONCURRENCY = 8
 
 
 class ProviderUnavailable(RuntimeError):
@@ -40,6 +44,8 @@ class GitHubProvider:
         self.clock = clock
         self.public_text_validator = public_text_validator
         self._cache = OrderedDict()
+        # Guards the ETag cache, credential digest and backoff across reads.
+        self._lock = threading.Lock()
         self._credential_digest = ""
         self.retry_at = 0.0
 
@@ -52,18 +58,19 @@ class GitHubProvider:
         if not token:
             raise ProviderUnavailable("github_credential_unavailable")
         digest = hashlib.sha256(token.encode()).hexdigest()
-        if digest != self._credential_digest:
-            self._cache.clear()
-            self.actor_principal = ""
-            self._credential_digest = digest
-        now = self.clock()
-        if now < self.retry_at:
-            raise ProviderUnavailable("github_rate_limit_backoff")
         key = (path, tuple(sorted((params or {}).items())))
-        cached = self._cache.get(key)
-        if cached and now - cached[2] > 300:
-            self._cache.pop(key)
-            cached = None
+        with self._lock:
+            if digest != self._credential_digest:
+                self._cache.clear()
+                self.actor_principal = ""
+                self._credential_digest = digest
+            now = self.clock()
+            if now < self.retry_at:
+                raise ProviderUnavailable("github_rate_limit_backoff")
+            cached = self._cache.get(key)
+            if cached and now - cached[2] > 300:
+                self._cache.pop(key)
+                cached = None
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -88,10 +95,12 @@ class GitHubProvider:
             ):
                 delay = float(response.headers.get("Retry-After", "60"))
                 reset = float(response.headers.get("X-RateLimit-Reset", "0"))
-                self.retry_at = max(now + delay, reset)
+                with self._lock:
+                    self.retry_at = max(self.retry_at, now + delay, reset)
                 raise ProviderUnavailable("github_rate_limit_backoff")
             if response.status_code == 304 and cached:
-                self._cache[key] = (cached[0], cached[1], now)
+                with self._lock:
+                    self._cache[key] = (cached[0], cached[1], now)
                 return cached[1]
             if not 200 <= response.status_code < 300:
                 raise ProviderUnavailable(f"github_http_{response.status_code}")
@@ -100,13 +109,14 @@ class GitHubProvider:
             data = response.json() if response.content else None
         except (requests.RequestException, ValueError) as exc:
             raise ProviderUnavailable("github_read_failed") from None
-        if method == "GET":
-            self._cache[key] = (response.headers.get("ETag"), data, now)
-            self._cache.move_to_end(key)
-            while len(self._cache) > 128:
-                self._cache.popitem(last=False)
-        else:
-            self._cache.clear()
+        with self._lock:
+            if method == "GET":
+                self._cache[key] = (response.headers.get("ETag"), data, now)
+                self._cache.move_to_end(key)
+                while len(self._cache) > 128:
+                    self._cache.popitem(last=False)
+            else:
+                self._cache.clear()
         return data
 
     def _pages(self, path, params=None, collection=None):
@@ -348,54 +358,78 @@ class GitHubProvider:
         return rows
 
     def list_attention(self):
-        rows = []
-        if "pulls_read" in self.capabilities:
-            for pr in self._pages(self.base + "/pulls", {"state": "open"}):
-                kind = "draft_pr" if pr.get("draft") else "pr_review"
-                rows.append(
-                    {
-                        "source_key": f"pr:{pr['number']}",
-                        "kind": kind,
-                        "url": f"https://github.com/{self.scope.repo}/pull/{pr['number']}",
-                        "updated_at": pr["updated_at"],
-                    }
+        # Each open PR's check runs and each waiting run's gates are separate
+        # requests. Serially they cost ~0.3 s apiece and pushed the attention
+        # view past the MCP read deadline as PRs piled up (drover#778).
+        with ThreadPoolExecutor(READ_CONCURRENCY) as pool:
+            runs = (
+                pool.submit(
+                    self._pages,
+                    self.base + "/actions/runs",
+                    {"status": "waiting"},
+                    "workflow_runs",
                 )
-                if "checks_read" in self.capabilities:
-                    checks = self.list_checks(pr["head"]["sha"])
-                    for check in checks:
-                        if check.get("conclusion") in {
-                            "failure",
-                            "timed_out",
-                            "cancelled",
-                            "action_required",
-                            "startup_failure",
-                        }:
-                            rows.append(
-                                {
-                                    "source_key": f"check:{check['id']}",
-                                    "kind": "failed_check",
-                                    "url": f"https://github.com/{self.scope.repo}/pull/{pr['number']}/checks",
-                                    "updated_at": pr["updated_at"],
-                                }
-                            )
-        if "actions_read" in self.capabilities:
-            runs = self._pages(
-                self.base + "/actions/runs", {"status": "waiting"}, "workflow_runs"
+                if "actions_read" in self.capabilities
+                else None
             )
-            for run in runs:
-                pending = self._request(
-                    "GET", self.base + f"/actions/runs/{run['id']}/pending_deployments"
+            prs = (
+                self._pages(self.base + "/pulls", {"state": "open"})
+                if "pulls_read" in self.capabilities
+                else []
+            )
+            checks = (
+                list(pool.map(lambda pr: self.list_checks(pr["head"]["sha"]), prs))
+                if "checks_read" in self.capabilities
+                else [[] for _ in prs]
+            )
+            runs = runs.result() if runs is not None else []
+            gates = list(
+                pool.map(
+                    lambda run: self._request(
+                        "GET",
+                        self.base + f"/actions/runs/{run['id']}/pending_deployments",
+                    ),
+                    runs,
                 )
-                for gate in pending:
+            )
+        rows = []
+        for pr, pr_checks in zip(prs, checks):
+            kind = "draft_pr" if pr.get("draft") else "pr_review"
+            rows.append(
+                {
+                    "source_key": f"pr:{pr['number']}",
+                    "kind": kind,
+                    "url": f"https://github.com/{self.scope.repo}/pull/{pr['number']}",
+                    "updated_at": pr["updated_at"],
+                }
+            )
+            for check in pr_checks:
+                if check.get("conclusion") in {
+                    "failure",
+                    "timed_out",
+                    "cancelled",
+                    "action_required",
+                    "startup_failure",
+                }:
                     rows.append(
                         {
-                            "source_key": f"environment:{run['id']}:{run.get('run_attempt', 1)}:{gate['environment']['id']}",
-                            "kind": "environment_approval",
-                            "url": f"https://github.com/{self.scope.repo}/actions/runs/{run['id']}",
-                            "updated_at": run["updated_at"],
-                            "actions": ["open"],
+                            "source_key": f"check:{check['id']}",
+                            "kind": "failed_check",
+                            "url": f"https://github.com/{self.scope.repo}/pull/{pr['number']}/checks",
+                            "updated_at": pr["updated_at"],
                         }
                     )
+        for run, pending in zip(runs, gates):
+            for gate in pending:
+                rows.append(
+                    {
+                        "source_key": f"environment:{run['id']}:{run.get('run_attempt', 1)}:{gate['environment']['id']}",
+                        "kind": "environment_approval",
+                        "url": f"https://github.com/{self.scope.repo}/actions/runs/{run['id']}",
+                        "updated_at": run["updated_at"],
+                        "actions": ["open"],
+                    }
+                )
         return rows
 
     def _write(self, ref, method, suffix="", body=None):
