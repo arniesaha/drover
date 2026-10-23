@@ -62,6 +62,46 @@ checksum manifests from the same published release.
    mode-600 file such as `~/.drover/release-gate.env`, and load it first with
    `set -a; . ~/.drover/release-gate.env; set +a`. Hosts whose harnessd predates
    folder listing answer 404 and fail this check until they are upgraded.
+
+### NAS snapshot + release-preflight evidence ledger
+
+When a point-release operator also needs the supported Studio NAS snapshot in
+the same evidence trail, append these options to the command above:
+
+```sh
+  --nas-snapshot-receipt "$HOME/.drover/backup-state/last-success.json" \
+  --ledger "$EVIDENCE_DIR/release-preflight.json"
+```
+
+This is an evidence adapter around the existing snapshot receipt and the
+existing `release-preflight` checks. It does **not** start a NAS backup, write
+to the NAS, publish a release, select a runtime, restart a service, or execute
+a rollout. The ledger path is created once, mode 600, and cannot be rewritten;
+use a new path for a new attempt. It validates that the receipt attests to NAS
+verification and `pg_restore --list` readback, and by default rejects receipts
+older than 36 hours. `--max-nas-snapshot-age-hours` changes only that evidence
+bound.
+
+The JSON document has one explicit state for each phase:
+
+| Phase | What a successful state proves | What it never implies |
+| --- | --- | --- |
+| `nas_snapshot_execution` | The existing local receipt attests to a verified snapshot run. | A new snapshot was run by this command. |
+| `nas_snapshot_publication` | The same receipt attests that its verified generation was published. | Any release artifact was published. |
+| `release_preflight` | Every existing read-only preflight check passed. | Runtime selection, rollout, or acceptance. |
+| `release_publication` | Always `skipped` here. | Release publication happened. |
+| `rollout` | Always `blocked` here with a `human_release_operator` next action. | Approval or execution of a rollout. |
+| `acceptance` | Always `blocked` until a separate owner records it. | Production acceptance. |
+
+An invalid or stale receipt records snapshot failure, snapshot publication and
+preflight as blocked, and does not call the preflight checks. A preflight check
+failure is preserved with every failed check ID and a `release_operator`
+next-action. Do not edit the ledger to change either outcome; repair the real
+condition and create a new evidence ledger. This wrapper is deliberately not a
+work-item creator: use the configured Drover/GitHub work-item mechanism only
+when an authorized live hub is available, then link its externally assigned
+reference in the operator's approved evidence system rather than inventing one
+locally.
 5. If `release_kind` reports `lake_schema`, stop this sequence and follow the
    [full lake cutover gate](lake-cutover.md). `control_migration` is eligible
    for this path only when its `control_migrations_allowed` evidence is true.
