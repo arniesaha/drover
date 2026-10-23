@@ -27,6 +27,8 @@ DAILY_DIGEST_LEASE_MIGRATION = 31
 WORKER_STATES_MIGRATION = 32
 CONTINUITY_LEASES_MIGRATION = 33
 CONTINUITY_REAP_OPERATIONS_MIGRATION = 34
+CONTINUITY_WAKES_MIGRATION = 35
+CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1004,6 +1006,34 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (CONTINUITY_LEASES_MIGRATION, CONTINUITY_LEASES_DDL),
     # Intent/outcome journal for external reaping, added without rewriting v33.
     (CONTINUITY_REAP_OPERATIONS_MIGRATION, CONTINUITY_REAP_OPERATIONS_DDL),
+    # Durable issue-level owner wakes (#784). Ownership is migration 33.
+    (
+        CONTINUITY_WAKES_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS continuity_wakes (
+              wake_id TEXT PRIMARY KEY,
+              issue_key TEXT NOT NULL, action TEXT NOT NULL, fingerprint TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN
+                ('pending', 'delivered', 'acknowledged', 'exhausted')),
+              owner_id TEXT, owner_epoch BIGINT,
+              attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0 AND attempts <= 3),
+              next_delivery_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(), delivered_at TIMESTAMPTZ,
+              acknowledged_at TIMESTAMPTZ, exhausted_at TIMESTAMPTZ,
+              UNIQUE (issue_key, action, fingerprint)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS continuity_wakes_delivery ON continuity_wakes (issue_key, state, next_delivery_at, created_at, wake_id)",
+        ),
+    ),
+    # Each redelivery gets a fresh claim token. Never amend migration 35:
+    # deployed stores have already recorded it.
+    (
+        CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION,
+        ("ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
