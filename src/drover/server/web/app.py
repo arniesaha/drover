@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, unquote_to_bytes, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from drover.server.analytics_boundary import (
     ANALYTICS_ADMISSION_WAIT_SECONDS,
@@ -3344,19 +3345,50 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if (
                 not isinstance(body, dict)
                 or not isinstance(body.get("mode"), str)
-                or body.get("mode") not in {"all", "action", "digest"}
+                or body["mode"] not in {"all", "action", "digest"}
             ):
                 self._send(
                     400, "application/json", '{"error":"invalid notification mode"}\n'
                 )
                 return
-            self.auth.credentials.set_notification_mode(credential.id, body["mode"])
+            zone = body.get("timezone", "UTC")
+            hour = body.get("hour")
+            if not isinstance(zone, str):
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error":"invalid notification timezone"}\n',
+                )
+                return
+            try:
+                ZoneInfo(zone)
+            except ZoneInfoNotFoundError:
+                self._send(
+                    400,
+                    "application/json",
+                    '{"error":"invalid notification timezone"}\n',
+                )
+                return
+            if hour is not None and (type(hour) is not int or not 0 <= hour <= 23):
+                self._send(
+                    400, "application/json", '{"error":"invalid notification hour"}\n'
+                )
+                return
+            self.auth.credentials.set_notification_preferences(
+                credential.id, body["mode"], timezone=zone, hour=hour
+            )
             self._send(204, "application/json", "")
         else:
             self._send(
                 200,
                 "application/json",
-                json.dumps({"mode": credential.notification_mode}),
+                json.dumps(
+                    {
+                        "mode": credential.notification_mode,
+                        "timezone": credential.notification_timezone,
+                        "hour": credential.notification_hour,
+                    }
+                ),
             )
 
     def _set_device_apns_registration(self) -> None:
