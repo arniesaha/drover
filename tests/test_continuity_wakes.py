@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -77,7 +79,11 @@ def test_killed_owner_turn_is_redelivered_then_acknowledged(wakes):
     assert redelivery["wake_id"] == wake_id
     assert redelivery["attempts"] == 2
     store.acknowledge(
-        ISSUE, owner_id=OWNER, owner_epoch=lease["owner_epoch"], wake_id=wake_id
+        ISSUE,
+        owner_id=OWNER,
+        owner_epoch=lease["owner_epoch"],
+        wake_id=wake_id,
+        delivery_token=redelivery["delivery_token"],
     )
     assert store.status(ISSUE)["wake_counts"] == {"acknowledged": 1}
 
@@ -106,8 +112,107 @@ def test_stale_epoch_cannot_consume_or_ack_after_reclaim(wakes):
     replacement = store.lease(ISSUE, owner_id="replacement")
     with pytest.raises(ContinuityWakeConflict, match="current owner lease"):
         store.acknowledge(
-            ISSUE, owner_id=OWNER, owner_epoch=first["owner_epoch"], wake_id=wake_id
+            ISSUE,
+            owner_id=OWNER,
+            owner_epoch=first["owner_epoch"],
+            wake_id=wake_id,
+            delivery_token="a" * 32,
         )
     with pytest.raises(ContinuityWakeConflict, match="current owner lease"):
         store.consume(ISSUE, owner_id=OWNER, owner_epoch=first["owner_epoch"])
     assert replacement["owner_epoch"] == first["owner_epoch"] + 1
+
+
+def test_concurrent_enqueue_reselects_one_durable_identity(wakes):
+    store, _ = wakes
+    barrier = Barrier(2)
+
+    def enqueue():
+        barrier.wait()
+        return store.enqueue(
+            issue_key=ISSUE,
+            action="wake",
+            fingerprint="concurrent",
+            payload={"reason": "idle"},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        identities = list(workers.map(lambda _: enqueue(), range(2)))
+    assert identities[0] == identities[1]
+    assert store.status(ISSUE)["wake_counts"] == {"pending": 1}
+
+
+def test_stale_delivery_cannot_acknowledge_redelivery(wakes):
+    store, clock = wakes
+    wake_id = store.enqueue(
+        issue_key=ISSUE, action="wake", fingerprint="stale-ack", payload={}
+    )
+    epoch = store.lease(ISSUE, owner_id=OWNER)["owner_epoch"]
+    first = store.consume(ISSUE, owner_id=OWNER, owner_epoch=epoch)
+    clock.advance(5)
+    second = store.consume(ISSUE, owner_id=OWNER, owner_epoch=epoch)
+    assert second["wake_id"] == wake_id
+    assert second["delivery_token"] != first["delivery_token"]
+    with pytest.raises(ContinuityWakeConflict, match="different owner epoch or delivery"):
+        store.acknowledge(
+            ISSUE,
+            owner_id=OWNER,
+            owner_epoch=epoch,
+            wake_id=wake_id,
+            delivery_token=first["delivery_token"],
+        )
+    store.acknowledge(
+        ISSUE,
+        owner_id=OWNER,
+        owner_epoch=epoch,
+        wake_id=wake_id,
+        delivery_token=second["delivery_token"],
+    )
+    # Retrying the exact acknowledged delivery is idempotent.
+    store.acknowledge(
+        ISSUE,
+        owner_id=OWNER,
+        owner_epoch=epoch,
+        wake_id=wake_id,
+        delivery_token=second["delivery_token"],
+    )
+
+
+def test_postgres_concurrent_enqueue_and_stale_delivery_ack(pg_control_path):
+    """Use the real PostgreSQL adapter for the conflict/re-delivery contract."""
+    clock = Clock()
+    store = ContinuityWakes(pg_control_path, clock=clock, visibility_seconds=5)
+    barrier = Barrier(2)
+
+    def enqueue():
+        barrier.wait()
+        return store.enqueue(
+            issue_key=ISSUE,
+            action="wake",
+            fingerprint="postgres-concurrent",
+            payload={"reason": "idle"},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        identities = list(workers.map(lambda _: enqueue(), range(2)))
+    assert identities[0] == identities[1]
+
+    epoch = store.lease(ISSUE, owner_id=OWNER)["owner_epoch"]
+    first = store.consume(ISSUE, owner_id=OWNER, owner_epoch=epoch)
+    clock.advance(5)
+    second = store.consume(ISSUE, owner_id=OWNER, owner_epoch=epoch)
+    with pytest.raises(ContinuityWakeConflict, match="different owner epoch or delivery"):
+        store.acknowledge(
+            ISSUE,
+            owner_id=OWNER,
+            owner_epoch=epoch,
+            wake_id=first["wake_id"],
+            delivery_token=first["delivery_token"],
+        )
+    store.acknowledge(
+        ISSUE,
+        owner_id=OWNER,
+        owner_epoch=epoch,
+        wake_id=second["wake_id"],
+        delivery_token=second["delivery_token"],
+    )

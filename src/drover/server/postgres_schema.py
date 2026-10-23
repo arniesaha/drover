@@ -28,6 +28,7 @@ WORKER_STATES_MIGRATION = 32
 CONTINUITY_LEASES_MIGRATION = 33
 CONTINUITY_REAP_OPERATIONS_MIGRATION = 34
 CONTINUITY_WAKES_MIGRATION = 35
+CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1025,6 +1026,14 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             "CREATE INDEX IF NOT EXISTS continuity_wakes_delivery ON continuity_wakes (issue_key, state, next_delivery_at, created_at, wake_id)",
+        ),
+    ),
+    # Each redelivery gets a fresh claim token. Never amend migration 35:
+    # deployed stores have already recorded it.
+    (
+        CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION,
+        (
+            "ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",
         ),
     ),
 )

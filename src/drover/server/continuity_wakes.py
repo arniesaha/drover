@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 from drover.server.continuity_leases import LeaseConflict, OwnerLeaseStore
 from drover.server.control_outbox import canonical_payload, is_postgres_connection
@@ -37,13 +38,15 @@ CONTINUITY_WAKES_DDL = (
       fingerprint TEXT NOT NULL, payload_json TEXT NOT NULL,
       state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN
         ('pending', 'delivered', 'acknowledged', 'exhausted')),
-      owner_id TEXT, owner_epoch BIGINT,
+      owner_id TEXT, owner_epoch BIGINT, delivery_token TEXT,
       attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0 AND attempts <= 3),
       next_delivery_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(), delivered_at TIMESTAMPTZ,
       acknowledged_at TIMESTAMPTZ, exhausted_at TIMESTAMPTZ,
       UNIQUE (issue_key, action, fingerprint)
     )""",
+    # Existing DuckDB compatibility stores predate the per-delivery fence.
+    "ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",
     "CREATE INDEX IF NOT EXISTS continuity_wakes_delivery ON continuity_wakes (issue_key, state, next_delivery_at, created_at, wake_id)",
 )
 
@@ -150,21 +153,28 @@ class ContinuityWakes:
             raise ValueError("payload exceeds bounded wake size")
         wake_id = _wake_id(issue_key, action, fingerprint)
         with self._transaction() as con:
+            # The unique wake identity is the concurrency fence.  Do not use a
+            # check-then-insert here: two producers can both observe no row,
+            # and one must safely reselect the winner after its conflict.
+            con.execute(
+                """INSERT INTO continuity_wakes
+                (wake_id, issue_key, action, fingerprint, payload_json, next_delivery_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (wake_id) DO NOTHING""",
+                [wake_id, issue_key, action, fingerprint, payload_json, self.clock()],
+            )
             existing = _row(
                 con,
                 "SELECT payload_json FROM continuity_wakes WHERE wake_id = ?",
                 [wake_id],
             )
-            if existing is not None:
-                if existing["payload_json"] != payload_json:
-                    raise ContinuityWakeConflict("wake identity has divergent payload")
-                return wake_id
-            con.execute(
-                """INSERT INTO continuity_wakes
-                (wake_id, issue_key, action, fingerprint, payload_json, next_delivery_at)
-                VALUES (?, ?, ?, ?, ?, ?)""",
-                [wake_id, issue_key, action, fingerprint, payload_json, self.clock()],
-            )
+            # A successful insert must be immediately visible in our
+            # transaction; failing closed is safer than returning an identity
+            # whose canonical payload we could not verify.
+            if existing is None:
+                raise RuntimeError("wake insert was not durable")
+            if existing["payload_json"] != payload_json:
+                raise ContinuityWakeConflict("wake identity has divergent payload")
         return wake_id
 
     def lease(
@@ -216,9 +226,11 @@ class ContinuityWakes:
     ) -> dict | None:
         """Deliver the oldest due wake under a live owner lease.
 
-        The returned ``wake_id`` is the consumer's idempotency key.  Delivery
-        is at-least-once: failed or killed consumers leave the row delivered
-        until its visibility deadline, at which point it is eligible again.
+        The returned ``delivery_token`` fences this specific delivery and is
+        required to acknowledge it; ``wake_id`` remains its durable identity.
+        Delivery is at-least-once: failed or killed consumers leave the row
+        delivered until its visibility deadline, at which point it is eligible
+        again.
         """
         _text(issue_key, "issue_key", 191)
         _text(owner_id, "owner_id", 191)
@@ -251,12 +263,21 @@ class ContinuityWakes:
             visible_until = now + timedelta(
                 seconds=self.visibility_seconds * 2 ** (attempts - 1)
             )
+            delivery_token = uuid4().hex
             con.execute(
                 """UPDATE continuity_wakes
                    SET state = 'delivered', attempts = ?, next_delivery_at = ?,
-                       owner_id = ?, owner_epoch = ?, delivered_at = ?
+                       owner_id = ?, owner_epoch = ?, delivery_token = ?, delivered_at = ?
                  WHERE wake_id = ?""",
-                [attempts, visible_until, owner_id, owner_epoch, now, wake["wake_id"]],
+                [
+                    attempts,
+                    visible_until,
+                    owner_id,
+                    owner_epoch,
+                    delivery_token,
+                    now,
+                    wake["wake_id"],
+                ],
             )
             return {
                 "wake_id": wake["wake_id"],
@@ -265,16 +286,25 @@ class ContinuityWakes:
                 "fingerprint": wake["fingerprint"],
                 "payload": json.loads(wake["payload_json"]),
                 "attempts": attempts,
+                "delivery_token": delivery_token,
                 "next_delivery_at": visible_until.isoformat(),
             }
 
     def acknowledge(
-        self, issue_key: str, *, owner_id: str, owner_epoch: int, wake_id: str
+        self,
+        issue_key: str,
+        *,
+        owner_id: str,
+        owner_epoch: int,
+        wake_id: str,
+        delivery_token: str,
     ) -> None:
         _text(issue_key, "issue_key", 191)
         _text(owner_id, "owner_id", 191)
         if not isinstance(wake_id, str) or len(wake_id) != 64:
             raise ValueError("wake_id must be a SHA-256 identity")
+        if not isinstance(delivery_token, str) or len(delivery_token) != 32:
+            raise ValueError("delivery_token must be a delivery claim token")
         with self._transaction() as con:
             now = self.clock()
             self._fence(self._lease(con, issue_key), owner_id, owner_epoch, now)
@@ -285,13 +315,28 @@ class ContinuityWakes:
             )
             if wake is None:
                 raise KeyError(wake_id)
+            # Only the exact delivery can be retried idempotently.  In
+            # particular, attempt 1 must never be able to acknowledge an
+            # attempt-2 redelivery under the same owner epoch.
             if wake["state"] == "acknowledged":
-                return
+                if (
+                    wake["owner_id"] == owner_id
+                    and wake["owner_epoch"] == owner_epoch
+                    and wake["delivery_token"] == delivery_token
+                ):
+                    return
+                raise ContinuityWakeConflict(
+                    "wake was acknowledged by a different delivery"
+                )
             if wake["state"] != "delivered":
                 raise ContinuityWakeConflict("consume the wake before acknowledging")
-            if wake["owner_id"] != owner_id or wake["owner_epoch"] != owner_epoch:
+            if (
+                wake["owner_id"] != owner_id
+                or wake["owner_epoch"] != owner_epoch
+                or wake["delivery_token"] != delivery_token
+            ):
                 raise ContinuityWakeConflict(
-                    "wake was delivered under a different owner epoch"
+                    "wake was delivered under a different owner epoch or delivery"
                 )
             con.execute(
                 """UPDATE continuity_wakes SET state = 'acknowledged', acknowledged_at = ?
