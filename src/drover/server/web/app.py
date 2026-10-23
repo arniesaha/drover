@@ -1775,6 +1775,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/harness/factory-observer/continuity":
             self._factory_observer_continuity()
             return
+        if path == "/continuity/shadow-compare":
+            self._continuity_shadow_compare()
+            return
         if path.startswith("/harness/hosts/") and path.rsplit("/", 1)[-1] in {
             "retire",
             "unretire",
@@ -2610,6 +2613,44 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             status, result = 400, {"error": str(exc)}
         except ControlPlaneBusy:
             status, result = 503, {"error": "continuity store busy"}
+        self._send(status, "application/json", json.dumps(result) + "\n")
+
+    def _continuity_shadow_compare(self) -> None:
+        """Compare legacy and hub decisions without granting provider write access."""
+        from drover.server.continuity_loop import shadow_compare_service
+
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+            if not 0 < length <= 32 * 1024:
+                self.close_connection = True
+                raise ValueError("shadow compare body must be 1..32768 bytes")
+            body = self._read_json()
+            if not isinstance(body, dict) or set(body) - {
+                "facts",
+                "local_decision",
+                "now",
+                "policy",
+            }:
+                raise ValueError("facts and local_decision are required")
+            if not isinstance(body.get("facts"), dict) or not isinstance(
+                body.get("local_decision"), dict
+            ):
+                raise ValueError("facts and local_decision are required")
+            now = body.get("now")
+            if now is None:
+                now = datetime.now(timezone.utc)
+            elif isinstance(now, str):
+                now = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            if not isinstance(now, datetime):
+                raise ValueError("now must be an ISO timestamp")
+            policy = body.get("policy")
+            service = shadow_compare_service(self.collector)
+            result = service.compare(
+                body["facts"], body["local_decision"], now=now, policy=policy
+            )
+            status = 200
+        except (TypeError, ValueError) as exc:
+            status, result = 400, {"error": str(exc)}
         self._send(status, "application/json", json.dumps(result) + "\n")
 
     def _continuity_owner_principal(self) -> str | None:
