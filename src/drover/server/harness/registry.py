@@ -38,13 +38,13 @@ from drover.server.harness.models import (
     HarnessHost,
     HarnessSession,
 )
-from drover.server.harness.worker_state import project_worker_state
 from drover.server.harness.recap_jobs import (
     LiveRecap,
     enqueue_live_recap,
     latest_live_recaps,
     lock_live_recap_sessions,
 )
+from drover.server.harness.worker_state import project_worker_state
 
 
 class HostRetiredError(ValueError):
