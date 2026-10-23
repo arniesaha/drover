@@ -395,3 +395,78 @@ def test_owner_plugin_recovers_bulk_pending_completion_before_acknowledgement(
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize("scope", ["integration", "deployment"])
+def test_owner_plugin_initialize_preserves_trusted_scope_on_postgres(
+    node, pg_control_path, tmp_path, scope
+):
+    """The local Node plugin carries its configured scope to real PostgreSQL."""
+    run = f"run_PLUGIN_PG_{scope.upper()}"
+    session_id = f"plugin-pg-{scope}"
+    registry = HarnessRegistry(pg_control_path)
+    registry.create_session(
+        session_id=session_id,
+        host_id="studio",
+        harness="codex",
+        command="never-executed",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{run}@4",
+    )
+    store = FactoryObserverContinuity(pg_control_path)
+    store.initialize(
+        session_id=session_id,
+        objective="Initialize trusted scope",
+        checkpoint="Pending",
+        authority_scope=scope,
+    )
+    handoff_token = store.issue_handoff(
+        session_id=session_id,
+        objective="Initialize trusted scope",
+        checkpoint="Pending",
+        authority_scope=scope,
+        authorized_owner_id=OWNER_PRINCIPAL,
+        issued_by="legacy:operator",
+    )["handoff_token"]
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=pg_control_path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(enabled=True, api_token=TOKEN),
+    )
+    config = {
+        "enabled": True,
+        "mode": "owner",
+        "droverOrigin": f"http://127.0.0.1:{server.server_address[1]}",
+        "tokenEnvName": "DROVER_PLUGIN_TEST_TOKEN",
+        "handoffTokenEnvName": "DROVER_PLUGIN_TEST_HANDOFF_TOKEN",
+        "runId": run,
+        "observerSessionId": session_id,
+        "objective": "Initialize trusted scope",
+        "checkpoint": "Pending",
+        "ownerSessionKey": OWNER,
+        "ownerPrincipal": OWNER_PRINCIPAL,
+        "authorityScope": scope,
+    }
+    try:
+        [initialized] = results(
+            invoke(
+                node,
+                config,
+                OWNER,
+                [payload("initialize")],
+                handoff_token=handoff_token,
+            )
+        )
+        assert initialized["continuity"]["authority_scope"] == scope
+        assert initialized["continuity"]["owner_handoff"]["authorized_owner_id"] == (
+            OWNER_PRINCIPAL
+        )
+    finally:
+        server.shutdown()
+        server.server_close()

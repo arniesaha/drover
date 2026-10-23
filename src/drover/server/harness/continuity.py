@@ -133,6 +133,12 @@ def _lock_observer_session(con, session_id: str):
     )
 
 
+def lock_observer_sessions(con, session_ids) -> None:
+    """Acquire all observer-session locks in one global order for a batch."""
+    for session_id in sorted({str(session_id) for session_id in session_ids}):
+        _lock_observer_session(con, session_id)
+
+
 def _validate_report(
     *,
     source: str,

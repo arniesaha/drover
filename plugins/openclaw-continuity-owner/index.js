@@ -152,7 +152,7 @@ function initializeBody(config) {
   requireValue(typeof config.observerSessionId === "string" && config.observerSessionId.length > 0, "Initialize requires a trusted observer session binding");
   requireValue(typeof config.objective === "string" && config.objective.trim().length > 0, "Initialize requires a trusted objective");
   requireValue(typeof config.checkpoint === "string" && config.checkpoint.trim().length > 0, "Initialize requires a trusted checkpoint");
-  const body = { operation: "initialize", session_id: config.observerSessionId, objective: config.objective, checkpoint: config.checkpoint };
+  const body = { operation: "initialize", session_id: config.observerSessionId, objective: config.objective, checkpoint: config.checkpoint, authority_scope: config.authorityScope };
   if (config.handoffTokenEnvName !== undefined) {
     const handoffToken = process.env[config.handoffTokenEnvName];
     requireValue(typeof handoffToken === "string" && handoffToken.length > 0 && handoffToken.length <= 512 && !/\s/.test(handoffToken), "Configured owner handoff token is missing or malformed");

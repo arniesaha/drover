@@ -1215,3 +1215,112 @@ def test_http_initialize_requires_host_issued_handoff_and_cannot_be_raced(
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_http_report_cannot_claim_drover_completion_identity(bridge, tmp_path):
+    """An authenticated reporter cannot occupy the internal completion identity."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, clock, registry = bridge
+    event_id = "internal-drover-completion"
+    assert (
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": event_id,
+                    "session_id": SESSION,
+                    "event_type": "status",
+                    "payload": {"payload": {"turn_complete": True}},
+                    "seq": 1,
+                    "created_at": clock.now,
+                }
+            ]
+        )
+        == 1
+    )
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
+    owner, owner_token = credentials.issue(scope="device", label="owner")
+    _, other_token = credentials.issue(scope="device", label="other")
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=store.path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    try:
+        assert (
+            request(
+                {
+                    "operation": "report",
+                    "run_id": RUN,
+                    "source": "drover",
+                    "source_event_id": event_id,
+                    "subject": SESSION,
+                    "sequence": 1,
+                    "kind": "ci_red",
+                    "summary": "Unrelated report cannot replace completion",
+                },
+                other_token,
+            )[0]
+            == 403
+        )
+        assert store.status(RUN)["inbox_counts"] == {}
+        status, issued = request(
+            {
+                "operation": "issue_handoff",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "authorized_owner_id": "credential:" + owner.id,
+            },
+            host_token,
+        )
+        assert status == 200
+        status, initialized = request(
+            {
+                "operation": "initialize",
+                "session_id": SESSION,
+                "objective": "Fix #497",
+                "checkpoint": "Implementation pending",
+                "handoff_token": issued["handoff_token"],
+            },
+            owner_token,
+        )
+        assert status == 200
+        assert initialized["continuity"]["completion_receipts"]["counts"] == {
+            "projected": 1
+        }
+    finally:
+        server.shutdown()
+        server.server_close()

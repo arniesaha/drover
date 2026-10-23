@@ -150,7 +150,9 @@ and that principal must match the redeemed handoff. Mismatches return 403
 before mutation; a different but authenticated owner is a 409 authorization
 conflict. Credential bearers use `credential:<credential-id>`; the supported
 legacy bearer uses `legacy:operator`. Report remains a bounded fact-ingest
-operation, not an owner claim. A migrated/unbound run cannot be initialized,
+operation, not an owner claim. The `drover` report source is reserved for the
+internal harness-completion projector; public report requests using it are
+rejected before they can occupy a completion identity. A migrated/unbound run cannot be initialized,
 leased, consumed, or acknowledged by a device principal until this explicit
 handoff is issued and redeemed.
 
@@ -197,7 +199,10 @@ is the observer session ID. This makes the existing
 completion link. Replay of that harness event cannot create a second owner
 action. Both structured production ingestion and local batch append paths chunk
 new records into bounded groups of 100 while retaining each source event's
-transactional insert and projection outcome.
+transactional insert and projection outcome. Before chunk projection, each
+transaction acquires all participating observer-session locks in lexical order,
+so overlapping batches cannot deadlock by retaining session locks in different
+orders.
 
 The central `POST /harness/events` EventPusher wire envelope nests this as
 `event.payload.turn_complete`. The structured ingester preserves the outer

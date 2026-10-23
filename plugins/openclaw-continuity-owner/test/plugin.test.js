@@ -96,6 +96,22 @@ test("parent and owner polls retain pending state; never POST or auto-ack", asyn
   }
 });
 
+test("trusted initialization preserves integration and deployment scope", async (t) => {
+  for (const [authorityScope, scopeLimit] of [["integration", "publish_review"], ["deployment", "explicit_approval_required"]]) {
+    const f = await fixture(t, (_req, res) => res.end(JSON.stringify({ continuity: projection({ authority_scope: authorityScope, scope_limit: scopeLimit, owner_wake: authorityScope !== "deployment", recovery: authorityScope === "deployment" ? "approval_required" : "continue_owner" }) })));
+    const config = {
+      ...f.config, mode: "owner", authorityScope,
+      observerSessionId: "trusted-observer", objective: "Trusted initialization", checkpoint: "Pending",
+    };
+    await tool(config).execute("initialize", call("initialize"));
+    assert.equal(f.calls.length, 1);
+    assert.deepEqual(f.calls[0].body, {
+      operation: "initialize", session_id: "trusted-observer",
+      objective: "Trusted initialization", checkpoint: "Pending", authority_scope: authorityScope,
+    });
+  }
+});
+
 test("poll_only and a canary parent cannot mutate even when owner mode exists", async (t) => {
   const f = await fixture(t);
   for (const target of [tool(f.config), tool({ ...f.config, mode: "owner" }, PARENT)]) {

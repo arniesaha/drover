@@ -266,12 +266,13 @@ class OpenClawOwnerAdapter:
                 ENDPOINT, query={"run_id": context.run_id, "limit": request.limit}
             )
         else:
-            # Run scope is immutable. Check it before a mutation so a wrongly
-            # bound adapter cannot acknowledge a different authority scope.
+            # Run scope is immutable. A first handoff may be unbound, but its
+            # preflight still must match the trusted run and scope before POST.
             self._reply(
                 self.endpoint.get(
                     ENDPOINT, query={"run_id": context.run_id, "limit": 1}
-                )
+                ),
+                allow_unbound_owner=isinstance(request, Initialize),
             )
             if isinstance(request, Initialize):
                 if not all((self.session_id, self.objective, self.checkpoint)):
@@ -281,6 +282,7 @@ class OpenClawOwnerAdapter:
                     "session_id": self.session_id,
                     "objective": self.objective,
                     "checkpoint": self.checkpoint,
+                    "authority_scope": context.authority_scope,
                 }
                 if self.handoff_token is not None:
                     body["handoff_token"] = self.handoff_token
@@ -318,7 +320,7 @@ class OpenClawOwnerAdapter:
             raise ValueError("only report may return an event identity")
         return reply
 
-    def _reply(self, raw: dict) -> OwnerToolReply:
+    def _reply(self, raw: dict, *, allow_unbound_owner: bool = False) -> OwnerToolReply:
         # Strict JSON validation permits wire ISO timestamps without coercing
         # epoch strings/bools, unknown action names, or authority expansions.
         if "version" in raw:
@@ -330,7 +332,11 @@ class OpenClawOwnerAdapter:
             or projection.authority_scope != self.context.authority_scope
         ):
             raise ValueError("reply does not match the trusted owner run/scope")
-        if projection.owner_handoff.authorized_owner_id != self.context.owner_id:
+        if projection.owner_handoff.authorized_owner_id not in (
+            {None, self.context.owner_id}
+            if allow_unbound_owner
+            else {self.context.owner_id}
+        ):
             raise ValueError("reply does not match the trusted owner identity")
         return reply
 

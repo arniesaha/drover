@@ -37,10 +37,13 @@ does this mutation automatically.
 All transport calls use the fixed existing continuity endpoint. The injected
 `ContinuityEndpoint.get/post` transport must enforce ordinary Drover authentication;
 the Python protocol neither implements nor bypasses authentication.
-Before every mutation other than first `initialize`, a bounded GET checks the
-run's immutable scope and authorized owner handoff against the trusted binding.
-First initialization is instead bound by its fixed trusted configuration, the
-bearer-derived owner, and the server-validated handoff token. The HTTP endpoint also rejects a
+The Python adapter uses a bounded GET before every mutation to check the run's
+immutable scope against the trusted binding. Its first initialization tolerates
+only an unbound owner in that preflight, then requires the returned response to
+bind the configured owner after its fixed trusted configuration, bearer-derived
+owner, and server-validated handoff token are applied. The Node plugin posts
+its equally trusted first-initialization binding directly and validates the
+bound response. The HTTP endpoint also rejects a
 lease, consume, or ack whose JSON owner differs from the authenticated bearer
 before state mutation. A wrong scope or owner is refused before any POST,
 including ack.

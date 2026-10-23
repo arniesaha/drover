@@ -1753,9 +1753,16 @@ class HarnessRegistry:
                     )
                 from drover.server.harness.continuity import (
                     MAX_COMPLETION_PROJECTION_BATCH,
+                    lock_observer_sessions,
                     record_observer_worker_completion_batch,
                 )
 
+                # This transaction retains session locks through every chunk.
+                # Acquire them once in lexical order so concurrent batches
+                # cannot hold the same pair in opposite orders.
+                lock_observer_sessions(
+                    con, (record["session_id"] for record in completion_records)
+                )
                 for offset in range(
                     0, len(completion_records), MAX_COMPLETION_PROJECTION_BATCH
                 ):
@@ -1939,9 +1946,16 @@ class HarnessRegistry:
 
                 from drover.server.harness.continuity import (
                     MAX_COMPLETION_PROJECTION_BATCH,
+                    lock_observer_sessions,
                     record_observer_worker_completion_batch,
                 )
 
+                # This transaction retains session locks through every chunk.
+                # Acquire them once in lexical order so concurrent batches
+                # cannot hold the same pair in opposite orders.
+                lock_observer_sessions(
+                    con, (record["session_id"] for record in completion_records)
+                )
                 for offset in range(
                     0, len(completion_records), MAX_COMPLETION_PROJECTION_BATCH
                 ):

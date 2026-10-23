@@ -361,6 +361,77 @@ def test_wrong_trusted_scope_is_refused_before_mutating_the_store(make_harness):
     assert endpoint.store().status(RUN)["checkpoint"] == "Waiting for owner review"
 
 
+@pytest.mark.parametrize("scope", ["implementation", "integration", "deployment"])
+def test_trusted_initialize_redeems_first_handoff_with_its_scope(tmp_path, scope):
+    """First initialization posts directly, then validates the bound response."""
+    path = tmp_path / f"first-handoff-{scope}.duckdb"
+    bootstrap_control_plane_store(path)
+    registry = HarnessRegistry(path)
+    registry.create_session(
+        session_id="first-handoff-observer",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{RUN}@4",
+    )
+    store = FactoryObserverContinuity(path)
+    store.initialize(
+        session_id="first-handoff-observer",
+        objective="Redeem first handoff",
+        checkpoint="Pending",
+        authority_scope=scope,
+    )
+    handoff = store.issue_handoff(
+        session_id="first-handoff-observer",
+        objective="Redeem first handoff",
+        checkpoint="Pending",
+        authority_scope=scope,
+        authorized_owner_id=OWNER,
+        issued_by="credential:host",
+    )
+
+    class Endpoint:
+        calls = []
+
+        def get(self, path, *, query):
+            self.calls.append(("GET", query))
+            return {"continuity": store.status(**query)}
+
+        def post(self, path, *, body):
+            self.calls.append(("POST", body))
+            return continuity_request(store, {**body, "authorized_owner_id": OWNER})
+
+    endpoint = Endpoint()
+    adapter = OpenClawOwnerAdapter(
+        endpoint,
+        run_id=RUN,
+        owner_id=OWNER,
+        authority_scope=scope,
+        session_id="first-handoff-observer",
+        objective="Redeem first handoff",
+        checkpoint="Pending",
+        handoff_token=handoff["handoff_token"],
+    )
+    reply = adapter.invoke({"version": 1, "request": {"operation": "initialize"}})
+    assert endpoint.calls == [
+        ("GET", {"run_id": RUN, "limit": 1}),
+        (
+            "POST",
+            {
+                "operation": "initialize",
+                "session_id": "first-handoff-observer",
+                "objective": "Redeem first handoff",
+                "checkpoint": "Pending",
+                "authority_scope": scope,
+                "handoff_token": handoff["handoff_token"],
+            },
+        ),
+    ]
+    assert reply.continuity.owner_handoff.authorized_owner_id == OWNER
+    assert reply.continuity.authority_scope == scope
+
+
 def test_descriptor_has_versioned_object_schema_but_does_not_register_runtime():
     definition = owner_tool_definition()
     assert definition["name"] == TOOL_NAME

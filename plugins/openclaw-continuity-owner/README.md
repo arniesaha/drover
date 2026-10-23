@@ -105,14 +105,18 @@ may receive the tool; `ownerPrincipal` is the server-derived principal for its
 bearer (`credential:<credential-id>`, or `legacy:operator` only for the
 supported legacy bearer). They are deliberately distinct, so a model cannot
 turn an OpenClaw session key into an HTTP owner claim. No model-supplied
-credential, URL, command, owner, scope, or run is accepted. HTTPS or loopback
+credential, URL, command, owner, scope, or run is accepted. Trusted
+initialization sends its configured immutable scope, so integration and
+deployment handoffs retain their scope. HTTPS or loopback
 HTTP is required; origins cannot contain paths,
 userinfo, query, or fragment. Requests reject redirects, use a maximum 10-second
 timeout, cap replies at 2 MiB, and sanitize transport errors. Config is strict;
 no arbitrary extra keys. All payloads/replies use exported existing Python
 protocol schemas and semantic authority/fencing checks. JS-unsafe integer epochs
-or sequences are refused rather than rounded. Mutations first check the run's
-immutable scope by GET. Ordinary server authentication is never bypassed.
+or sequences are refused rather than rounded. Mutations other than first
+initialization check the run's immutable scope by GET; trusted first
+initialization posts its fixed binding and validates the bound reply after token
+redemption. Ordinary server authentication is never bypassed.
 
 The optional tool remains subject to existing OpenClaw tool policy. Do not widen
 permissions or enable all plugin tools to make a canary pass. Filtered discovery

@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from threading import Barrier, Event, Thread
+from threading import Barrier, Event, Lock, Thread, get_ident
 
 import pytest
 
@@ -26,7 +26,9 @@ from drover.server.harness import continuity
 from drover.server.harness.continuity import (
     ContinuityConflict,
     FactoryObserverContinuity,
+    continuity_request,
 )
+from drover.server.harness.openclaw_owner import ENDPOINT, OpenClawOwnerAdapter
 from drover.server.harness.registry import HarnessRegistry
 
 RUN = "run_PG497"
@@ -640,6 +642,263 @@ def test_first_run_completion_projection_serializes_with_handoff_on_postgres(
         "authorized_owner_id": "credential:pg-owner",
         "state": "owner_lease_required",
     }
+
+
+def test_http_report_cannot_claim_drover_completion_identity_on_postgres(
+    pg_bridge, tmp_path
+):
+    """A different authenticated device cannot poison an internal completion."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, clock = pg_bridge
+    event_id = "pg-internal-drover-completion"
+    registry = HarnessRegistry(store.path)
+    assert (
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": event_id,
+                    "session_id": "pg-observer",
+                    "event_type": "status",
+                    "payload": {"payload": {"turn_complete": True}},
+                    "seq": 1,
+                    "created_at": clock.now,
+                }
+            ]
+        )
+        == 1
+    )
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, host_token = credentials.issue(scope="host", label="studio", host_id="studio")
+    owner, owner_token = credentials.issue(scope="device", label="owner")
+    _, other_token = credentials.issue(scope="device", label="other")
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=store.path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(
+            enabled=True,
+            api_token="",
+            credentials=credentials,
+            legacy_token_enabled=False,
+        ),
+    )
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    try:
+        assert (
+            request(
+                {
+                    "operation": "report",
+                    "run_id": RUN,
+                    "source": "drover",
+                    "source_event_id": event_id,
+                    "subject": "pg-observer",
+                    "sequence": 1,
+                    "kind": "ci_red",
+                    "summary": "Unrelated report cannot replace completion",
+                },
+                other_token,
+            )[0]
+            == 403
+        )
+        assert store.status(RUN)["inbox_counts"] == {}
+        status, issued = request(
+            {
+                "operation": "issue_handoff",
+                "session_id": "pg-observer",
+                "objective": "Prove #497 on PostgreSQL",
+                "checkpoint": "Pending",
+                "authorized_owner_id": "credential:" + owner.id,
+            },
+            host_token,
+        )
+        assert status == 200
+        status, initialized = request(
+            {
+                "operation": "initialize",
+                "session_id": "pg-observer",
+                "objective": "Prove #497 on PostgreSQL",
+                "checkpoint": "Pending",
+                "handoff_token": issued["handoff_token"],
+            },
+            owner_token,
+        )
+        assert status == 200
+        assert initialized["continuity"]["completion_receipts"]["counts"] == {
+            "projected": 1
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("scope", ["integration", "deployment"])
+def test_python_adapter_first_handoff_preserves_scope_on_postgres(
+    pg_control_path, scope
+):
+    """The trusted adapter can bind a fresh PostgreSQL run without a GET race."""
+    run_id = f"run_PG_ADAPTER_{scope.upper()}"
+    session_id = f"pg-adapter-{scope}"
+    registry = HarnessRegistry(pg_control_path)
+    registry.create_session(
+        session_id=session_id,
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{run_id}@4",
+    )
+    store = FactoryObserverContinuity(pg_control_path)
+    store.initialize(
+        session_id=session_id,
+        objective="Redeem adapter handoff",
+        checkpoint="Pending",
+        authority_scope=scope,
+    )
+    handoff = store.issue_handoff(
+        session_id=session_id,
+        objective="Redeem adapter handoff",
+        checkpoint="Pending",
+        authority_scope=scope,
+        authorized_owner_id="credential:pg-owner",
+        issued_by="credential:pg-host",
+    )
+
+    class Endpoint:
+        def get(self, path, *, query):
+            assert path == ENDPOINT
+            return {"continuity": store.status(**query)}
+
+        def post(self, path, *, body):
+            assert path == ENDPOINT
+            return continuity_request(
+                store, {**body, "authorized_owner_id": "credential:pg-owner"}
+            )
+
+    reply = OpenClawOwnerAdapter(
+        Endpoint(),
+        run_id=run_id,
+        owner_id="credential:pg-owner",
+        authority_scope=scope,
+        session_id=session_id,
+        objective="Redeem adapter handoff",
+        checkpoint="Pending",
+        handoff_token=handoff["handoff_token"],
+    ).invoke({"version": 1, "request": {"operation": "initialize"}})
+    assert reply.continuity.authority_scope == scope
+    assert reply.continuity.owner_handoff.authorized_owner_id == "credential:pg-owner"
+
+
+@pytest.mark.parametrize("method", ["append_events_if_new", "ingest_structured_events"])
+def test_bulk_completion_projection_locks_sessions_in_one_order_on_postgres(
+    pg_control_path, monkeypatch, method
+):
+    """Opposite-order batches cannot deadlock while retaining their whole commit."""
+    registry = HarnessRegistry(pg_control_path)
+    store = FactoryObserverContinuity(pg_control_path)
+    for session_id, run_id in (
+        ("pg-lock-order-a", "run_PG_LOCK_A"),
+        ("pg-lock-order-b", "run_PG_LOCK_B"),
+    ):
+        registry.create_session(
+            session_id=session_id,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            handoff_mode="factory_observer",
+            source_session_id=f"factory/{run_id}@4",
+        )
+        store.initialize(
+            session_id=session_id,
+            objective="Prove global completion lock order",
+            checkpoint="Pending",
+            authorized_owner_id="credential:pg-owner",
+        )
+    barrier = Barrier(2)
+    seen_threads: set[int] = set()
+    seen_lock = Lock()
+    original_lock = continuity._lock_observer_session
+
+    def coordinated_lock(con, session_id):
+        with seen_lock:
+            first_for_thread = get_ident() not in seen_threads
+            seen_threads.add(get_ident())
+        if first_for_thread:
+            barrier.wait(timeout=5)
+        return original_lock(con, session_id)
+
+    monkeypatch.setattr(continuity, "_lock_observer_session", coordinated_lock)
+    errors: list[BaseException] = []
+
+    def records(first, second):
+        now = datetime(2026, 10, 3, tzinfo=timezone.utc)
+        batch = [
+            {
+                "event_id": f"{first}-completion-{sequence}",
+                "session_id": first,
+                "event_type": "status",
+                "payload": {"payload": {"turn_complete": True}},
+                "seq": sequence,
+                "created_at": now + timedelta(seconds=sequence),
+            }
+            for sequence in range(1, 101)
+        ]
+        batch.append(
+            {
+                "event_id": f"{first}-then-{second}",
+                "session_id": second,
+                "event_type": "status",
+                "payload": {"payload": {"turn_complete": True}},
+                "seq": 101,
+                "created_at": now + timedelta(seconds=101),
+            }
+        )
+        return batch
+
+    def ingest(first, second):
+        try:
+            assert getattr(registry, method)(records(first, second)) == 101
+        except BaseException as exc:  # preserve thread failures for the assertion
+            errors.append(exc)
+
+    threads = [
+        Thread(target=ingest, args=("pg-lock-order-b", "pg-lock-order-a")),
+        Thread(target=ingest, args=("pg-lock-order-a", "pg-lock-order-b")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+    assert not errors
+    for run_id in ("run_PG_LOCK_A", "run_PG_LOCK_B"):
+        assert store.status(run_id)["completion_receipts"]["counts"] == {
+            "projected": 101
+        }
 
 
 def test_unbound_run_denies_mutations_until_authorized_handoff_on_postgres(pg_bridge):

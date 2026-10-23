@@ -2545,6 +2545,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 if body is None:
                     raise ValueError("request body must be a JSON object")
                 operation = body.get("operation") if isinstance(body, dict) else None
+                if operation == "report" and body.get("source") == "drover":
+                    # Harness completion projection owns this identity namespace.
+                    # A caller-supplied report must not be able to occupy a
+                    # pending completion's durable source identity.
+                    raise PermissionError("drover report source is reserved")
                 if operation in {
                     "initialize",
                     "issue_handoff",
