@@ -5,6 +5,7 @@ import json
 import math
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -284,7 +285,12 @@ class WorkService:
                     },
                 )
 
-            for entry in provider.list_attention():
+            # The issue listing is independent of the PR and run reads.
+            with ThreadPoolExecutor(1) as pool:
+                listed = pool.submit(provider.list_items)
+                flagged = provider.list_attention()
+                observed_items = listed.result()
+            for entry in flagged:
                 row(
                     entry["source_key"],
                     entry["kind"],
@@ -295,7 +301,7 @@ class WorkService:
             # milestone. Re-reading every item (plus a token check per read)
             # was two GitHub round trips per goal item and pushed this view
             # past the MCP read deadline (drover#778).
-            for observed in provider.list_items():
+            for observed in observed_items:
                 try:
                     ref = self.ref(scope, observed["number"])
                     item = self.checked(scope, policy, observed)
