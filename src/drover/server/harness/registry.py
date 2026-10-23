@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -42,6 +42,7 @@ from drover.server.harness.recap_jobs import (
     LiveRecap,
     enqueue_live_recap,
     latest_live_recaps,
+    lock_live_recap_sessions,
 )
 
 
@@ -323,6 +324,49 @@ def _enqueue_recap_if_completion(
     if not _supports_live_recaps(mode, harness):
         return False
     return enqueue_live_recap(con, session_id, seq, store_path=store_path)
+
+
+def _completion_recap_session_ids(
+    records: Iterable[dict[str, Any]],
+) -> Iterator[str]:
+    """Yield sessions whose records can enqueue a live recap.
+
+    This mirrors the cheap, payload-only part of
+    :func:`_enqueue_recap_if_completion`. Session mode is intentionally
+    deferred to that function, after the globally ordered advisory locks have
+    been acquired.
+    """
+    for record in records:
+        sequence = record.get("seq")
+        payload = record.get("payload")
+        if (
+            record.get("event_type") == "status"
+            and isinstance(payload, dict)
+            and _is_turn_completion_payload(payload)
+            and isinstance(sequence, int)
+            and not isinstance(sequence, bool)
+        ):
+            yield str(record["session_id"])
+
+
+def _lock_completion_recap_sessions(
+    con: object,
+    records: Iterable[dict[str, Any]],
+    *,
+    store_path: str | Path,
+) -> None:
+    """Pre-lock live recap subjects for a bulk delivery in global order."""
+    if not is_postgres_connection(con):
+        return
+    # A session may be created after this event batch begins. Lock all valid
+    # completion candidates, not only sessions visible to an early mode
+    # lookup, so a newly visible structured session cannot fall back to an
+    # input-ordered advisory lock during its eventual enqueue.
+    lock_live_recap_sessions(
+        con,
+        _completion_recap_session_ids(records),
+        store_path=store_path,
+    )
 
 
 def _enqueue_latest_stored_completion(
@@ -1661,6 +1705,15 @@ class HarnessRegistry:
             con.execute("BEGIN TRANSACTION")
             try:
                 completion_records: list[dict[str, Any]] = []
+                # ``enqueue_live_recap`` takes a transaction-held advisory
+                # lock for its session. Take every possible recap subject in
+                # lexical order before processing the batch, rather than in
+                # event order, so A->B and B->A deliveries cannot deadlock.
+                _lock_completion_recap_sessions(
+                    con,
+                    (record for record, *_ in inserted_records),
+                    store_path=self.control_plane_path,
+                )
                 # Same reasoning as the single-event path above: the SELECT
                 # into `existing` narrows the batch, but it is still a
                 # check-then-act, and two batches carrying the same
@@ -1815,6 +1868,15 @@ class HarnessRegistry:
                 if not incoming:
                     con.execute("COMMIT")
                     return 0
+
+                # Keep recap advisory locks in the same global order across
+                # the entire bulk delivery, including records projected in
+                # later completion chunks.
+                _lock_completion_recap_sessions(
+                    con,
+                    incoming,
+                    store_path=self.control_plane_path,
+                )
 
                 session_ids = sorted({str(record["session_id"]) for record in incoming})
                 session_placeholders = ", ".join("?" for _ in session_ids)

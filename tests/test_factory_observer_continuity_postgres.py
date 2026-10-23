@@ -23,6 +23,7 @@ from drover.server.control_store import (
 )
 from drover.server.db import control_plane_connection
 from drover.server.harness import continuity
+from drover.server.harness import registry as harness_registry
 from drover.server.harness.continuity import (
     ContinuityConflict,
     FactoryObserverContinuity,
@@ -30,6 +31,7 @@ from drover.server.harness.continuity import (
 )
 from drover.server.harness.openclaw_owner import ENDPOINT, OpenClawOwnerAdapter
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.ledger import JobLedger
 
 RUN = "run_PG497"
 
@@ -842,6 +844,13 @@ def test_bulk_completion_projection_locks_sessions_in_one_order_on_postgres(
     seen_threads: set[int] = set()
     seen_lock = Lock()
     original_lock = continuity._lock_observer_session
+    # This regression isolates observer-session row locking. The structured
+    # recap advisory-lock ordering has a dedicated test immediately below.
+    monkeypatch.setattr(
+        harness_registry,
+        "lock_live_recap_sessions",
+        lambda *_args, **_kwargs: None,
+    )
 
     def coordinated_lock(con, session_id):
         with seen_lock:
@@ -896,6 +905,104 @@ def test_bulk_completion_projection_locks_sessions_in_one_order_on_postgres(
         assert not thread.is_alive()
     assert not errors
     for run_id in ("run_PG_LOCK_A", "run_PG_LOCK_B"):
+        assert store.status(run_id)["completion_receipts"]["counts"] == {
+            "projected": 101
+        }
+
+
+@pytest.mark.parametrize("method", ["append_events_if_new", "ingest_structured_events"])
+def test_structured_bulk_completion_recaps_lock_sessions_in_one_order_on_postgres(
+    pg_control_path, monkeypatch, method
+):
+    """Structured recap advisory locks are acquired lexically across all chunks."""
+    registry = HarnessRegistry(pg_control_path)
+    store = FactoryObserverContinuity(pg_control_path)
+    for session_id, run_id in (
+        ("pg-recap-lock-order-a", "run_PG_RECAP_LOCK_A"),
+        ("pg-recap-lock-order-b", "run_PG_RECAP_LOCK_B"),
+    ):
+        registry.create_session(
+            session_id=session_id,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            mode="structured",
+            handoff_mode="factory_observer",
+            source_session_id=f"factory/{run_id}@4",
+        )
+        store.initialize(
+            session_id=session_id,
+            objective="Prove global recap lock order",
+            checkpoint="Pending",
+            authorized_owner_id="credential:pg-owner",
+        )
+
+    first_lock_barrier = Barrier(2)
+    opposite_first_lock_barrier = Barrier(2)
+    seen_threads: set[int] = set()
+    first_subjects: dict[int, str] = {}
+    seen_lock = Lock()
+    original_lock = JobLedger.lock_subject
+
+    def coordinated_lock(con, job_kind, subject_key):
+        with seen_lock:
+            first_for_thread = get_ident() not in seen_threads
+            seen_threads.add(get_ident())
+            if first_for_thread:
+                first_subjects[get_ident()] = subject_key
+        if first_for_thread:
+            # Both old input-order paths first acquire different subjects and
+            # then proceed to a second conflicting lock. A repaired lexical
+            # pre-lock instead has both threads contend for the same first
+            # subject, so it must be allowed to serialize without a barrier.
+            first_lock_barrier.wait(timeout=5)
+        original_lock(con, job_kind, subject_key)
+        if first_for_thread:
+            with seen_lock:
+                opposite_first_subjects = len(set(first_subjects.values())) == 2
+            if opposite_first_subjects:
+                opposite_first_lock_barrier.wait(timeout=5)
+
+    monkeypatch.setattr(JobLedger, "lock_subject", staticmethod(coordinated_lock))
+
+    def records(first, second):
+        now = datetime(2026, 10, 3, tzinfo=timezone.utc)
+        batch = [
+            {
+                "event_id": f"{first}-recap-completion-{sequence}",
+                "session_id": first,
+                "event_type": "status",
+                "payload": {"payload": {"turn_complete": True}},
+                "seq": sequence,
+                "created_at": now + timedelta(seconds=sequence),
+            }
+            for sequence in range(1, 101)
+        ]
+        batch.append(
+            {
+                "event_id": f"{first}-recap-then-{second}",
+                "session_id": second,
+                "event_type": "status",
+                "payload": {"payload": {"turn_complete": True}},
+                "seq": 101,
+                "created_at": now + timedelta(seconds=101),
+            }
+        )
+        return batch
+
+    def ingest(first, second):
+        return getattr(registry, method)(records(first, second))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = [
+            future.result(timeout=20)
+            for future in (
+                pool.submit(ingest, "pg-recap-lock-order-b", "pg-recap-lock-order-a"),
+                pool.submit(ingest, "pg-recap-lock-order-a", "pg-recap-lock-order-b"),
+            )
+        ]
+    assert outcomes == [101, 101]
+    for run_id in ("run_PG_RECAP_LOCK_A", "run_PG_RECAP_LOCK_B"):
         assert store.status(run_id)["completion_receipts"]["counts"] == {
             "projected": 101
         }
