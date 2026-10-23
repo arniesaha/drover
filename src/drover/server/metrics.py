@@ -1991,6 +1991,22 @@ class MetricsCollector:
         except ValueError as exc:
             return _json_response(400, {"error": str(exc)})
 
+    def harness_worker_states(self, session_ids: list[str]) -> tuple[int, str]:
+        """Explicit worker states (#785); PostgreSQL control plane only."""
+        from drover.server.control_outbox import is_postgres_connection
+        from drover.server.harness.registry import HarnessRegistry
+        from drover.server.harness.worker_state import worker_states
+
+        if len(session_ids) > 200:
+            return _json_response(400, {"error": "at most 200 session ids"})
+        with HarnessRegistry(self.duckdb_path)._connect() as con:
+            if not is_postgres_connection(con):
+                return _json_response(
+                    501, {"error": "worker states need the PostgreSQL control plane"}
+                )
+            rows = worker_states(con, session_ids or None)
+        return _json_response(200, {"worker_states": rows})
+
     def proxy_terminate_harness_session(self, session_id: str) -> tuple[int, str]:
         with self._session_lock_for(session_id):
             return self._proxy_terminate_harness_session(session_id)

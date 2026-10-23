@@ -484,7 +484,17 @@ class WorkService:
         )
         # The intent is committed before this call. Any exception leaves it inspectable.
         session_id = self.harness.launch(
-            host, harness, run_key, ref, run_role, parent_session_id, goal_id
+            host,
+            harness,
+            run_key,
+            ref,
+            run_role,
+            parent_session_id,
+            goal_id,
+            authority={
+                "labels": [label["name"] for label in item.get("labels", [])],
+                "body": item.get("body"),
+            },
         )
         linked = self.store.associate(row["run_key"], session_id)
         if run_role == "work":

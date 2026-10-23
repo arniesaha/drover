@@ -44,6 +44,7 @@ from drover.server.harness.recap_jobs import (
     latest_live_recaps,
     lock_live_recap_sessions,
 )
+from drover.server.harness.worker_state import project_worker_state
 
 
 class HostRetiredError(ValueError):
@@ -1993,6 +1994,14 @@ class HarnessRegistry:
                         session_id=session_id,
                         event_type=event_type,
                         payload=payload,
+                    )
+                    project_worker_state(
+                        con,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        payload=payload,
+                        created_at=created_at,
                     )
                     completion_records.append(
                         {

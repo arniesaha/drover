@@ -31,10 +31,12 @@ from drover.server.postgres_schema import (
     HUB_WORK_ITEMS_MIGRATION,
     PROFILE_MIGRATION,
     WORK_ITEM_EVENTS_MIGRATION,
+    WORKER_STATES_MIGRATION,
 )
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    WORKER_STATES_MIGRATION: "aa9ff5f3db8d55fe6629fea8dcddc545f9c8e4e52ddb5a0ad74737d2b426f0de",
     CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION: "30bf38eb05be55650ca75c256d7fd6f25e0c3712dc9084da22a4d2c485f8dea6",
     CONTINUITY_OWNER_HANDOFF_MIGRATION: "fbf01d89ff51d8b58df9d96833a729fa2d9c193f67eff3d896b3deea637289f4",
     DAILY_DIGEST_LEASE_MIGRATION: "f41b2434fbc8bd9eb448aef4d4dd15fd06feeb99e4ffbb247c3e1d74ed9d8b00",

@@ -5,6 +5,7 @@ import json
 
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.worker_state import worker_brief
 from drover.server.mcp.contract import ReadCaps, bound_response
 from drover.server.web.auth import bearer_credential
 
@@ -77,7 +78,9 @@ class HarnessBridge:
 
         return drover_provider_quota(duckdb_path=self.collector.duckdb_path)["accounts"]
 
-    def launch(self, host, harness, run_key, ref, role, parent, goal_id):
+    def launch(
+        self, host, harness, run_key, ref, role, parent, goal_id, *, authority=None
+    ):
         scope = next(g for g in self.config.goals if g.goal_id == goal_id)
         parent_session = self.registry.get_session(parent) if parent else None
         cwd = (
@@ -87,6 +90,12 @@ class HarnessBridge:
         )
         if not cwd:
             raise ValueError("configured execution checkout required")
+        brief = (
+            f"Read {ref.url}. Run role: {role}. Follow the authorized goal brief "
+            f"ref {scope.brief_ref or scope.goal_id} and versioned policy. Report "
+            "behavioral evidence through the work tools."
+        )
+        authority = authority or {}
         payload = {
             "cwd": cwd,
             "harness": harness,
@@ -95,7 +104,11 @@ class HarnessBridge:
             "parent_session_id": parent,
             "repo_owner": ref.repo.split("/")[0],
             "repo_name": ref.repo.split("/")[1],
-            "prompt": f"Read {ref.url}. Run role: {role}. Follow the authorized goal brief ref {scope.brief_ref or scope.goal_id} and versioned policy. Report behavioral evidence through the work tools.",
+            "prompt": worker_brief(
+                brief,
+                list(authority.get("labels") or []),
+                authority.get("body"),
+            ),
         }
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:

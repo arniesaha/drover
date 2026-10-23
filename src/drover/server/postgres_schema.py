@@ -24,6 +24,19 @@ CONTINUITY_OWNER_HANDOFF_MIGRATION = 28
 CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION = 29
 DAILY_DIGEST_MIGRATION = 30
 DAILY_DIGEST_LEASE_MIGRATION = 31
+WORKER_STATES_MIGRATION = 32
+
+#: Released with migration 32 and pinned by hash: never edit, add a version.
+WORKER_STATES_DDL = """
+CREATE TABLE IF NOT EXISTS harness_worker_states (
+  session_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('working', 'done', 'blocked', 'needs_approval')),
+  sha TEXT, pr INTEGER, gate TEXT, reason TEXT,
+  source_event_id TEXT NOT NULL,
+  declared BOOLEAN NOT NULL,
+  state_at TIMESTAMPTZ NOT NULL
+)
+"""
 
 _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
@@ -944,6 +957,8 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE notification_digest_items ADD COLUMN IF NOT EXISTS lease_token TEXT",
         ),
     ),
+    # Explicit worker states projected from Drover-State lines (#785).
+    (WORKER_STATES_MIGRATION, (WORKER_STATES_DDL,)),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
