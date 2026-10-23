@@ -398,6 +398,8 @@ def check_referenced_files(spec, con, *, limit=REFERENCED_FILE_LIMIT):
     # full path and statting it twice cost ~0.65 s a child (drover#778); the
     # files share a few dozen directories, so resolve those once and lstat
     # each file once. A symlinked file still takes the full resolve path.
+    # A directory swapped for a symlink mid-scan is seen only by the files
+    # after its first; anyone able to do that already writes the lake.
     directories = {}
     files = 0
     for table in sorted(required | (optional & tables)):

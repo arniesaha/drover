@@ -351,10 +351,16 @@ def _repo_summaries(
             # repo" from a few thousand rows. Grouping the identity-filtered
             # agent_events view scanned every event: ~3 s a call on prod and
             # sometimes over the 2 GiB child cap (drover#778). It has no task
-            # column, so tasks come from the summaries it finds.
+            # column, so tasks come from the summaries it finds. The alias
+            # rule is the agent_events view's: native rows of a mapped
+            # harness/native session pair never name the session.
             rows = con.execute(
-                """SELECT session_id FROM lake.activity_daily
+                """SELECT session_id FROM lake.activity_daily d
                 WHERE repo_owner=? AND repo_name=? AND session_id IS NOT NULL
+                  AND (source='control' OR NOT EXISTS (
+                    SELECT 1 FROM memory_session_identity m
+                    WHERE d.session_id IN (m.harness_session_id,m.native_session_id)
+                      AND m.native_session_id IS DISTINCT FROM m.harness_session_id))
                 GROUP BY session_id ORDER BY max(last_event_at) DESC LIMIT ?""",
                 [owner, name, _RECALL_SCOPE_LIMIT],
             ).fetchall()
@@ -1001,6 +1007,13 @@ def drover_recent_sessions(
         finally:
             con.close()
         sessions = [_summary_row(s, _RECENT_SESSION_KEYS) for s in found]
+    else:
+        # No lake read happened, so prove the selection here: an empty list
+        # must not stand in for an unavailable lake.
+        from drover.server.lake.serving import check_selected, selected_config
+
+        if selected_config(duckdb_path).backend != "legacy":
+            check_selected(duckdb_path)
     return {
         "project_key": project_key or f"{owner}/{name}",
         "repo_owner": owner,

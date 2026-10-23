@@ -565,3 +565,20 @@ def test_recent_sessions_is_one_lake_child_over_the_daily_rollup(
 
     assert [s["session_id"] for s in recent["sessions"]] == ["s"]
     assert len(seen) == 1 and "lake.activity_daily" in seen[0]
+
+
+def test_recent_sessions_without_memory_still_fails_closed(verified_lake, monkeypatch):
+    from drover.server.mcp import tools
+
+    spec, path, config = verified_lake
+    configure_analytics(path, config)
+    monkeypatch.setattr(tools, "_memory", lambda path: None)
+    assert (
+        tools.drover_recent_sessions(duckdb_path=path, project_key="o/r")["sessions"]
+        == []
+    )
+    (spec.data_root / "verification/serving-proof.json").write_text("{}")
+
+    result = tools.drover_recent_sessions(duckdb_path=path, project_key="o/r")
+
+    assert result["status"] == "unavailable"
