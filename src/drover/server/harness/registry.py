@@ -1601,8 +1601,18 @@ class HarnessRegistry:
                     # never sends to or otherwise claims an external parent.
                     from drover.server.harness.continuity import (
                         record_observer_worker_completion_batch,
+                        record_work_coordinator_state,
                     )
 
+                    record_work_coordinator_state(
+                        con,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        sequence=seq,
+                        payload=payload,
+                        received_at=created_at,
+                    )
                     record_observer_worker_completion_batch(
                         con,
                         [

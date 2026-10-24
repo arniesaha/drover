@@ -110,6 +110,17 @@ class HarnessBridge:
                 authority.get("body"),
             ),
         }
+        if scope.continuity_owner_id:
+            # The committed run key is the producer identity and binds the
+            # exact launched session to the coordinator work item.  The host
+            # atomically initializes the durable ledger before the worker can
+            # emit its first completion event.
+            payload["work_coordinator_continuity"] = {
+                "run_id": "work-" + run_key,
+                "owner_id": scope.continuity_owner_id,
+                "authority_scope": "implementation",
+                "objective": f"Work coordinator {role} for {ref.url}",
+            }
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:
             raise RuntimeError("harness launch uncertain; inspect persisted intent")

@@ -174,6 +174,9 @@ class GoalScope(Model):
     execution_budget: float | None = Field(default=None, gt=0)
     execution_estimated_cost: float = Field(default=5.0, gt=0)
     execution_max_workers: int | None = Field(default=None, gt=0)
+    # Explicit opt-in: the one OpenClaw session allowed to receive durable
+    # work-completion wakes for this goal.  No default owner exists.
+    continuity_owner_id: str | None = None
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -187,6 +190,11 @@ class GoalScope(Model):
             policy.labels.goal_prefix
         ):
             raise ValueError("goal label must use the policy goal namespace")
+        if self.continuity_owner_id is not None and (
+            not self.continuity_owner_id.startswith("agent:")
+            or len(self.continuity_owner_id) > 191
+        ):
+            raise ValueError("continuity owner must be a canonical agent key")
         return self
 
 

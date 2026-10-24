@@ -65,6 +65,7 @@ from drover.server.harness.factory_observer import (
     factory_observer_command,
     parse_factory_observer_launch,
 )
+from drover.server.harness.work_coordinator import parse_work_coordinator_continuity
 from drover.server.harness.model_catalog import (
     CatalogSelectionError,
     ModelCatalogService,
@@ -2516,6 +2517,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 if "factory_observer" in body
                 else None
             )
+            work_continuity, body = parse_work_coordinator_continuity(body)
         except FactoryObserverRequestError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -2523,6 +2525,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             factory_launch, body = factory_observer
         else:
             factory_launch = None
+        if work_continuity is not None and factory_launch is not None:
+            self._write_json({"error": "work continuity cannot use factory observer"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if work_continuity is not None:
+            body["_work_coordinator_continuity"] = work_continuity
         from drover.server.staging_credentials import is_staging
 
         if is_staging() and (
@@ -2818,6 +2825,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # it is ever called directly.
         client_session_id = _optional_text(body.get("client_session_id"))
         factory_launch = body.get("_factory_observer_launch")
+        work_continuity = body.get("_work_coordinator_continuity")
         harness = str(body.get("harness") or "")
         try:
             adapter = self.server.state.adapters.resolve(
@@ -3011,8 +3019,16 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 cwd=session_cwd,
                 status="starting",
                 started_at=datetime.now(timezone.utc),
-                source_session_id=_optional_text(body.get("source_session_id")),
-                handoff_mode=_optional_text(body.get("handoff_mode")),
+                source_session_id=(
+                    work_continuity.source_session_id
+                    if work_continuity is not None
+                    else _optional_text(body.get("source_session_id"))
+                ),
+                handoff_mode=(
+                    "work_coordinator"
+                    if work_continuity is not None
+                    else _optional_text(body.get("handoff_mode"))
+                ),
                 native_session_id=native_session_id,
                 native_resume_label=_native_resume_label(native_resume),
                 mode="structured",
@@ -3024,6 +3040,26 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             session_id = session.session_id
             registry_created = True
+            if work_continuity is not None:
+                from drover.server.harness.continuity import FactoryObserverContinuity
+
+                continuity = FactoryObserverContinuity(self.server.state.registry.path)
+                run_id = continuity.initialize(
+                    session_id=session_id,
+                    objective=work_continuity.objective,
+                    checkpoint="Work coordinator launch recorded",
+                    authority_scope=work_continuity.authority_scope,
+                    authorized_owner_id=work_continuity.owner_id,
+                )
+                continuity.report(
+                    run_id,
+                    source="drover-work-coordinator",
+                    source_event_id="launch:" + session_id,
+                    subject=session_id,
+                    sequence=0,
+                    kind="worker_started",
+                    summary="Work coordinator launched the bound worker.",
+                )
         except Exception:
             registry_created = False
         if session_worktree is not None:
