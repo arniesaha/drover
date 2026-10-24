@@ -135,9 +135,20 @@ class ContinuityWakes:
             raise ContinuityWakeConflict("current owner lease and epoch are required")
 
     def _enqueue(
-        self, con, *, issue_key: str, action: str, fingerprint: str, payload: dict
+        self,
+        con,
+        *,
+        issue_key: str,
+        action: str,
+        fingerprint: str,
+        payload: dict,
+        identity_key: str | None = None,
     ) -> str:
-        """Insert or verify one wake in a caller-owned transaction."""
+        """Insert or verify one wake in a caller-owned transaction.
+
+        With ``identity_key``, only that payload member must match a stored
+        wake; the rest is observation data that may differ between ticks.
+        """
         _text(issue_key, "issue_key", 191)
         _text(action, "action", 191)
         _text(fingerprint, "fingerprint", 512)
@@ -163,7 +174,13 @@ class ContinuityWakes:
         )
         if existing is None:
             raise RuntimeError("wake insert was not durable")
-        if existing["payload_json"] != payload_json:
+        if existing["payload_json"] != payload_json and (
+            identity_key is None
+            or json.loads(existing["payload_json"]).get(identity_key)
+            != json.loads(canonical_payload({identity_key: payload[identity_key]}))[
+                identity_key
+            ]
+        ):
             raise ContinuityWakeConflict("wake identity has divergent payload")
         return wake_id
 
@@ -196,6 +213,9 @@ class ContinuityWakes:
                 action="continuity:" + decision.action,
                 fingerprint=decision.fingerprint,
                 payload=payload,
+                # Re-deciding the same action on a later tick yields the same
+                # fingerprint with fresh facts and decided_at: same wake (#784).
+                identity_key="decision",
             )
 
     def lease(

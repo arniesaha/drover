@@ -220,3 +220,36 @@ def test_postgres_concurrent_enqueue_and_stale_delivery_ack(pg_control_path):
         wake_id=second["wake_id"],
         delivery_token=second["delivery_token"],
     )
+
+
+def test_redeciding_the_same_action_reuses_the_wake(wakes):
+    store, clock = wakes
+    from types import SimpleNamespace
+
+    def decision(action="nudge"):
+        return SimpleNamespace(
+            action=action,
+            fingerprint="nudge:784:abc",
+            payload=lambda: {"action": action, "issue": 784},
+        )
+
+    first = store.enqueue_decision(
+        issue_key=ISSUE, decision=decision(), facts={"idle_min": 31}, decided_at=clock()
+    )
+    clock.advance(600)
+    again = store.enqueue_decision(
+        issue_key=ISSUE, decision=decision(), facts={"idle_min": 41}, decided_at=clock()
+    )
+    assert again == first
+    assert store.status(ISSUE)["wake_counts"] == {"pending": 1}
+    with pytest.raises(ContinuityWakeConflict, match="divergent"):
+        store.enqueue_decision(
+            issue_key=ISSUE,
+            decision=SimpleNamespace(
+                action="nudge",
+                fingerprint="nudge:784:abc",
+                payload=lambda: {"action": "stall", "issue": 784},
+            ),
+            facts={},
+            decided_at=clock(),
+        )
