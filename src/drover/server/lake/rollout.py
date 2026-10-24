@@ -263,6 +263,36 @@ def _qualified_name(tokens: list[str]) -> bool:
     )
 
 
+def _literal_numeric(tokens: list[str]) -> bool:
+    """Return whether *tokens* are one signed or unsigned numeric literal."""
+    if tokens[:1] in (["+"], ["-"]):
+        tokens = tokens[1:]
+    return len(tokens) == 1 and bool(re.fullmatch(r"\d+(?:\.\d+)?", tokens[0]))
+
+
+def _safe_inline_column_check(column: str, tokens: list[str]) -> bool:
+    """Prove the narrow inline ``column BETWEEN literal AND literal`` form."""
+    if (
+        column == "IDENT"
+        or len(tokens) < 7
+        or tokens[:1] != ["("]
+        or tokens[-1:] != [")"]
+    ):
+        return False
+    body = tokens[1:-1]
+    if len(body) < 5 or body[0] != column or body[1] != "BETWEEN":
+        return False
+    try:
+        and_index = body.index("AND", 2)
+    except ValueError:
+        return False
+    if body.count("AND") != 1:
+        return False
+    return _literal_numeric(body[2:and_index]) and _literal_numeric(
+        body[and_index + 1 :]
+    )
+
+
 def _classify_control_statement(statement: object) -> tuple[bool, str]:
     """Mechanically prove that one migration statement is additive DDL."""
     if not isinstance(statement, str) or not statement.strip():
@@ -336,10 +366,20 @@ def _classify_control_statement(statement: object) -> tuple[bool, str]:
     if len(remaining) < 2 or _top_level_comma(remaining):
         return False, "alter_table_add_column_unparsed"
     column, definition = remaining[0], remaining[1:]
-    if column in {"(", ")", ",", ";"}:
+    if column in {
+        "(",
+        ")",
+        ",",
+        ";",
+        "CHECK",
+        "CONSTRAINT",
+        "EXCLUDE",
+        "FOREIGN",
+        "PRIMARY",
+        "UNIQUE",
+    }:
         return False, "alter_table_add_column_unparsed"
     forbidden = {
-        "CHECK",
         "CONSTRAINT",
         "GENERATED",
         "PRIMARY",
@@ -348,6 +388,25 @@ def _classify_control_statement(statement: object) -> tuple[bool, str]:
     }
     if forbidden.intersection(definition):
         return False, "alter_table_add_column_unparsed"
+    checks = [index for index, token in enumerate(definition) if token == "CHECK"]
+    if checks:
+        if len(checks) != 1:
+            return False, "alter_table_add_column_unparsed"
+        check = checks[0]
+        # An inline check is accepted only on a nullable new column, in the
+        # exact simple numeric range form.  This deliberately excludes named,
+        # table-level, cross-column, expression, and function checks.
+        if (
+            check == 0
+            or "DEFAULT" in definition
+            or any(
+                definition[index : index + 2] == ["NOT", "NULL"]
+                for index in range(len(definition) - 1)
+            )
+            or not _safe_inline_column_check(column, definition[check + 1 :])
+        ):
+            return False, "alter_table_add_column_unparsed"
+        return True, "alter_table_add_nullable_column_inline_check"
     default_positions = [
         index for index, token in enumerate(definition) if token == "DEFAULT"
     ]
