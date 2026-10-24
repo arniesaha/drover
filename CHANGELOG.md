@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.31] - 2026-10-23
+
+### Fixed
+
+- Release preflight now conservatively recognizes an inline numeric `CHECK` on the same newly added nullable control column, while rejecting quoted non-ASCII identifiers and other non-equivalent forms (#796).
+
+### Upgrade notes
+
+- Additive control migration 30 includes `notification_hour`, a nullable integer with literal `0..23` bounds. No DuckLake schema or engine/runtime pin change is intended; installed-artifact `release-preflight` remains authoritative.
+
 ## [0.6.30] - 2026-10-23
 
 ### Added
