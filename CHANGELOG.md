@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.34] - 2026-10-24
+
+### Added
+
+- Work-coordinator implementation and integration launches now bind one canonical OpenClaw owner, record durable worker-start facts, and project explicit done, blocked, and needs-approval states into the continuity ledger (#804).
+
+### Fixed
+
+- Packaged the continuity-owner plugin with static tool-authoring metadata and schemas, and route durable owner wakes to the exact fenced OpenClaw session while preserving inert deployment and poll-only modes (#802, #803).
+
 ## [0.6.33] - 2026-10-23
 
 ### Fixed
