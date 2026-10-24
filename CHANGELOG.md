@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.32] - 2026-10-23
+
+### Fixed
+
+- Replaced the unsafe DuckDB reconciliation-pending ART index with an immutable reconciliation cursor index, avoiding failures when acknowledgement updates change pending state (#798).
+
 ## [0.6.31] - 2026-10-23
 
 ### Fixed
