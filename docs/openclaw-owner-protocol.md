@@ -10,11 +10,15 @@ continuity ledger. TaskFlow/Factory retains lifecycle authority.
 The standalone [inactive OpenClaw plugin](../plugins/openclaw-continuity-owner/README.md)
 now implements normal `api.registerTool` registration, trusted host session/config
 binding, and authenticated Drover HTTP. It is not installed or activated. Tests
-execute the current NAS 2026.9.6 source entry resolver/registrar with fake registry
+execute the current NAS 2026.9.9 source entry resolver/registrar with fake registry
 bookkeeping and real synthetic authenticated Drover HTTP;
 live Gateway discovery, parent messaging, and activation remain unverified.
 The linked README records SDK/version evidence, packaging and exact parent canary
 steps. No credential, configuration, policy, or service change was made.
+OpenClaw 2026.9.9 artifact packing additionally requires the entry's static
+tool-authoring metadata; the package exposes that metadata while retaining its
+V2 session-authority factory. A plain runtime-loadable entry alone is not
+packable.
 
 ## Trusted binding and normal invocation
 
@@ -141,8 +145,8 @@ Observed in worker `harness-f5032b0f-837b-4769-8fcd-f39fb48d6281` on 2026-10-03:
   has that first-class tool. Child catalog absence is not a core defect.
 - The prior missing Drover registration/execute transport is implemented in the
   inactive standalone package. No messaging call or RPC/shell substitution was used.
-- Corrected target evidence: NAS OpenClaw 2026.9.6,
-  `88027bc85c0a4eebbea49a2a5522faec71ecdc14`, at
+- Corrected target evidence: NAS OpenClaw 2026.9.9,
+  `157d65380817f3d3b8b2b7a58bbe91574ad03707`, at
   `~/clawd/projects/openclaw`, read through the existing
   `${OPENCLAW_NAS_SOURCE}` mount. Prior Studio 2026.3.13
   proof targeted the wrong checkout and is superseded. Current SDK requires

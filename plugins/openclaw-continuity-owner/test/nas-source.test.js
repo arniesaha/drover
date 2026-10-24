@@ -1,4 +1,4 @@
-// Executes the NAS 2026.9.6 entry resolver, contract helpers and registrar body.
+// Executes the NAS 2026.9.9 entry resolver, contract helpers and registrar body.
 // The surrounding registry/lifecycle is a bounded fake, never a live Gateway.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -13,11 +13,11 @@ const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", impo
 const OWNER = "agent:coder:source-contract-owner";
 const root = process.env.DROVER_TEST_OPENCLAW_NAS_SOURCE;
 
-test("NAS 2026.9.6 actual entry resolver and registrar load the declared V2 tool", async (t) => {
+test("NAS 2026.9.9 actual entry resolver and registrar load the declared V2 tool", async (t) => {
   assert.ok(root, "DROVER_TEST_OPENCLAW_NAS_SOURCE is required; Studio 2026.3.13 is not target evidence");
   const read = (file) => readFileSync(join(root, file), "utf8");
   const pkg = JSON.parse(read("package.json"));
-  assert.equal(pkg.version, "2026.9.6");
+  assert.equal(pkg.version, "2026.9.9");
   assert.equal(pkg.exports["./plugin-sdk/plugin-entry"].default, "./dist/plugin-sdk/plugin-entry.js");
   assert.equal(pkg.exports["./plugin-sdk/tool-plugin"].default, "./dist/plugin-sdk/tool-plugin.js");
   assert.match(read("src/plugin-sdk/plugin-entry.ts"), /export function definePluginEntry/);
@@ -57,7 +57,7 @@ test("NAS 2026.9.6 actual entry resolver and registrar load the declared V2 tool
   const errors = [];
   const registry = { tools: [] };
   const registerTool = runInNewContext(stripTypeScriptTypes(source.slice(start, end)) + "\nregisterTool;", {
-    ...contracts, registry, pluginsWithChannelRegistrationConflict: new Set(),
+    ...contracts, registry, declaredToolNames: new Map(), pluginsWithChannelRegistrationConflict: new Set(),
     reportRegistrationError: (_record, message) => errors.push(message),
     createRegistration: (record, entry) => ({ pluginId: record.id, ...entry }),
   });
@@ -89,5 +89,5 @@ test("NAS 2026.9.6 actual entry resolver and registrar load the declared V2 tool
   try {
     await assert.rejects(currentTool.execute("retired", { version: 1, request: { operation: "poll" } }), /host invocation retired/);
   } finally { delete process.env.DROVER_SOURCE_TEST_TOKEN; }
-  t.diagnostic("Actual NAS 2026.9.6 source resolver/contract helpers/registrar body executed; registry bookkeeping fake, no Gateway loaded");
+  t.diagnostic("Actual NAS 2026.9.9 source resolver/contract helpers/registrar body executed; registry bookkeeping fake, no Gateway loaded");
 });

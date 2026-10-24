@@ -1,16 +1,15 @@
 // Normal OpenClaw registerTool factory; see README for exact local SDK evidence.
-// No SDK runtime import is needed for this supported plain ESM plugin shape.
-import { readFileSync } from "node:fs";
+// The symbol below is the public static authoring metadata contract consumed by
+// `openclaw plugins build|validate|pack`. Keep it in step with this V2 factory.
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
+import replySchema from "./schemas/reply.json" with { type: "json" };
+import requestSchema from "./schemas/request.json" with { type: "json" };
 
 export const TOOL_NAME = "drover_continuity_owner";
 const ENDPOINT = "/harness/factory-observer/continuity";
 const MAX_REPLY_BYTES = 2 * 1024 * 1024;
-const schema = (path) => JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8"));
-const requestSchema = schema("./schemas/request.json");
-const replySchema = schema("./schemas/reply.json");
-const manifest = schema("./openclaw.plugin.json");
 // Pydantic's discriminator is an annotation; oneOf still strictly validates.
 const ajv = new Ajv({ strict: false, coerceTypes: false, useDefaults: false, removeAdditional: false });
 addFormats(ajv);
@@ -79,7 +78,7 @@ async function request(config, method, data, signal, assertCurrent) {
   const timeout = AbortSignal.timeout(config.timeoutMs);
   const boundedSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   let response;
-  // 2026.9.6 V2 host authority must be checked after awaits, immediately before effects.
+  // 2026.9.9 V2 host authority must be checked after awaits, immediately before effects.
   assertCurrent();
   try {
     response = await fetch(url, { method, headers, body, signal: boundedSignal, redirect: "error", cache: "no-store" });
@@ -161,7 +160,7 @@ function initializeBody(config) {
   return body;
 }
 
-// SDK 2026.9.6: V2 descriptor uses trusted sessionKey and live invocation guard.
+// SDK 2026.9.9: V2 descriptor uses trusted sessionKey and live invocation guard.
 export function register(api) {
   const config = configuration(api.pluginConfig ?? {});
   api.registerTool({ contextVersion: 2, create(context) {
@@ -187,6 +186,28 @@ export function register(api) {
   } }, { name: TOOL_NAME, optional: true });
 }
 
-// Current SDK accepts a default definition object; no runtime SDK import is needed.
-export default { id: manifest.id, name: manifest.name, version: manifest.version,
+const definition = { id: manifest.id, name: manifest.name, version: manifest.version,
   description: manifest.description, register };
+
+// `defineToolPlugin` attaches this exact global symbol. This plugin needs the
+// V2 factory API for per-session authority, so it retains its explicit
+// registration while exposing equivalent static metadata for artifact authoring.
+Object.defineProperty(definition, Symbol.for("openclaw.plugin-sdk.tool-plugin.metadata"), {
+  value: Object.freeze({
+    id: manifest.id,
+    name: manifest.name,
+    description: manifest.description,
+    activation: structuredClone(manifest.activation),
+    configSchema: structuredClone(manifest.configSchema),
+    tools: Object.freeze([Object.freeze({
+      name: TOOL_NAME,
+      label: "Drover Continuity Owner",
+      description: "Explicit Drover continuity calls for the bound owner. Advisory actions only; no executor, merge, deployment or messaging. Ack only after idempotent reconciliation.",
+      parameters: structuredClone(requestSchema),
+      optional: true,
+    })]),
+  }),
+  enumerable: false,
+});
+
+export default definition;
