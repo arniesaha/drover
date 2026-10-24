@@ -1120,6 +1120,9 @@ class MetricsCollector:
     job_streams: Mapping[str, RedisJobStream] = field(default_factory=dict)
     ttl_seconds: float = 60.0
     api_token: str = ""
+    # Kept only by the hub. It must never reuse a harness bearer token, which
+    # would let a host authenticate arbitrary coordinator bindings.
+    work_coordinator_continuity_secret: str = ""
     # Installed by the HTTP server from its credential store. Bound host
     # credentials authenticate the spoke to the hub, not the hub to harnessd,
     # so those hosts must use the authenticated relay in both directions.
@@ -1771,9 +1774,32 @@ class MetricsCollector:
             timeout_s=CREATE_SESSION_TIMEOUT_S,
         )
         if 200 <= status < 300:
-            self._sync_created_harness_session(
-                host_id, payload, body, work_item_owner=work_item_owner
-            )
+            try:
+                self._sync_created_harness_session(
+                    host_id, payload, body, work_item_owner=work_item_owner
+                )
+            except (RuntimeError, ValueError):
+                # Never claim a coordinator launch succeeded unless the hub
+                # committed the binding and durable ledger first. Best-effort
+                # termination keeps a failed binding from becoming an
+                # untracked live worker.
+                try:
+                    session_id = str(json.loads(body).get("session_id") or "")
+                    if session_id:
+                        self._harness_request(
+                            host,
+                            f"/sessions/{session_id}/terminate",
+                            method="POST",
+                            payload={},
+                            timeout_s=10,
+                        )
+                except Exception:  # noqa: BLE001 - fail closed regardless
+                    log.exception(
+                        "failed to terminate uninitialized coordinator worker"
+                    )
+                return _json_response(
+                    503, {"error": "hub continuity initialization failed"}
+                )
         return status, body
 
     def fetch_harness_provider_usage(self, host: Any) -> Mapping[str, Any]:
@@ -2907,13 +2933,27 @@ class MetricsCollector:
     ) -> None:
         try:
             payload = json.loads(response_body)
-        except json.JSONDecodeError:
-            return
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "successful harness create response must be valid JSON"
+            ) from exc
         if not isinstance(payload, dict):
-            return
+            raise ValueError("successful harness create response must be an object")
+        work_continuity = None
+        if request_payload.get("work_coordinator_continuity") is not None:
+            from drover.server.harness.work_coordinator import (
+                parse_work_coordinator_continuity,
+            )
+
+            # Verify the exact hub-issued binding before the hub writes the
+            # sole authoritative continuity ledger.
+            work_continuity, _ = parse_work_coordinator_continuity(
+                request_payload,
+                hub_secret=self.work_coordinator_continuity_secret,
+            )
         session_id = str(payload.get("session_id") or "").strip()
         if not session_id:
-            return
+            raise ValueError("successful harness create response lacks session_id")
         if request_payload.get("factory_observer") is not None:
             from drover.server.harness.factory_observer import (
                 FactoryObserverRequestError,
@@ -2952,6 +2992,17 @@ class MetricsCollector:
         registry = HarnessRegistry(self.duckdb_path)
         try:
             existing = registry.get_session(session_id)
+            if (
+                work_continuity is not None
+                and existing is not None
+                and (
+                    existing.handoff_mode != "work_coordinator"
+                    or existing.source_session_id != work_continuity.source_session_id
+                )
+            ):
+                raise ValueError(
+                    "existing session conflicts with hub continuity binding"
+                )
             if existing is None:
 
                 def register_work_item(con, created_session_id):
@@ -2981,10 +3032,16 @@ class MetricsCollector:
                     native_resume_label=_native_resume_label(
                         request_payload.get("native_resume")
                     ),
-                    source_session_id=_optional_str(
-                        request_payload.get("source_session_id")
+                    source_session_id=(
+                        work_continuity.source_session_id
+                        if work_continuity is not None
+                        else _optional_str(request_payload.get("source_session_id"))
                     ),
-                    handoff_mode=_optional_str(request_payload.get("handoff_mode")),
+                    handoff_mode=(
+                        "work_coordinator"
+                        if work_continuity is not None
+                        else _optional_str(request_payload.get("handoff_mode"))
+                    ),
                     permission_mode=_optional_str(
                         payload.get("permission_mode")
                         or request_payload.get("permission_mode")
@@ -3008,10 +3065,32 @@ class MetricsCollector:
                 )
             else:
                 registry.update_session_status(session_id, status)
+            if work_continuity is not None:
+                from drover.server.harness.continuity import FactoryObserverContinuity
+
+                continuity = FactoryObserverContinuity(self.duckdb_path)
+                run_id = continuity.initialize(
+                    session_id=session_id,
+                    objective=work_continuity.objective,
+                    checkpoint="Work coordinator launch recorded",
+                    authority_scope=work_continuity.authority_scope,
+                    authorized_owner_id=work_continuity.owner_id,
+                )
+                continuity.report(
+                    run_id,
+                    source="drover-work-coordinator",
+                    source_event_id="launch:" + session_id,
+                    subject=session_id,
+                    sequence=0,
+                    kind="worker_started",
+                    summary="Work coordinator launched the bound worker.",
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "failed to sync created harness session %s: %s", session_id, exc
             )
+            if work_continuity is not None:
+                raise RuntimeError("hub continuity initialization failed") from exc
 
     def _sync_harness_session_preferences(
         self, session_id: str, payload: Mapping[str, Any]

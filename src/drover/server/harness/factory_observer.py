@@ -188,13 +188,23 @@ def parse_factory_observer_launch(
 
 
 def factory_observer_projection(session: Any) -> dict[str, Any] | None:
-    """Derive a bounded, observer-only projection from an existing session."""
-    if getattr(session, "handoff_mode", None) != _MODE:
-        return None
+    """Derive a bounded continuity projection from an explicitly opted-in session.
+
+    ``work_coordinator`` is deliberately a separate handoff mode: ordinary
+    coordinator launches do not impersonate Factory/TaskFlow, but can use the
+    same durable fenced inbox after their own committed work intent.
+    """
+    mode = getattr(session, "handoff_mode", None)
     source = getattr(session, "source_session_id", None) or ""
-    if not source.startswith("factory/") or "@" not in source:
+    if mode == _MODE:
+        prefix, authority = "factory/", "taskflow"
+    elif mode == "work_coordinator":
+        prefix, authority = "work/", "work_coordinator"
+    else:
         return None
-    run_id, _, raw_revision = source.removeprefix("factory/").rpartition("@")
+    if not source.startswith(prefix) or "@" not in source:
+        return None
+    run_id, _, raw_revision = source.removeprefix(prefix).rpartition("@")
     try:
         revision = int(raw_revision)
     except ValueError:
@@ -206,7 +216,7 @@ def factory_observer_projection(session: Any) -> dict[str, Any] | None:
         "expected_revision": revision,
         "target_hostname": getattr(session, "host_id", ""),
         "status": getattr(session, "status", "unknown"),
-        "authority": "taskflow",
+        "authority": authority,
     }
 
 

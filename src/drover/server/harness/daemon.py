@@ -93,6 +93,9 @@ from drover.server.harness.websocket import (
     send_close,
     send_json,
 )
+from drover.server.harness.work_coordinator import (
+    parse_unverified_work_coordinator_continuity,
+)
 from drover.server.harness.worktree import (
     SessionWorktree,
     WorktreeIsolationUnavailable,
@@ -2516,6 +2519,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 if "factory_observer" in body
                 else None
             )
+            work_continuity, body = parse_unverified_work_coordinator_continuity(body)
         except FactoryObserverRequestError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -2523,6 +2527,14 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             factory_launch, body = factory_observer
         else:
             factory_launch = None
+        if work_continuity is not None and factory_launch is not None:
+            self._write_json(
+                {"error": "work continuity cannot use factory observer"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if work_continuity is not None:
+            body["_work_coordinator_continuity"] = work_continuity
         from drover.server.staging_credentials import is_staging
 
         if is_staging() and (
@@ -2818,6 +2830,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # it is ever called directly.
         client_session_id = _optional_text(body.get("client_session_id"))
         factory_launch = body.get("_factory_observer_launch")
+        work_continuity = body.get("_work_coordinator_continuity")
         harness = str(body.get("harness") or "")
         try:
             adapter = self.server.state.adapters.resolve(
@@ -3011,8 +3024,16 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 cwd=session_cwd,
                 status="starting",
                 started_at=datetime.now(timezone.utc),
-                source_session_id=_optional_text(body.get("source_session_id")),
-                handoff_mode=_optional_text(body.get("handoff_mode")),
+                source_session_id=(
+                    work_continuity.source_session_id
+                    if work_continuity is not None
+                    else _optional_text(body.get("source_session_id"))
+                ),
+                handoff_mode=(
+                    "work_coordinator"
+                    if work_continuity is not None
+                    else _optional_text(body.get("handoff_mode"))
+                ),
                 native_session_id=native_session_id,
                 native_resume_label=_native_resume_label(native_resume),
                 mode="structured",
@@ -3024,7 +3045,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             session_id = session.session_id
             registry_created = True
-        except Exception:
+            # The host records only the signed session binding. The hub is the
+            # sole authority that initializes and writes the continuity ledger.
+        except Exception as exc:
+            # A coordinator launch cannot continue without its signed durable
+            # binding. Never turn a failed binding/session write into an
+            # untracked running worker.
+            if work_continuity is not None:
+                self._write_json(
+                    {"error": f"work continuity initialization failed: {exc}"},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
             registry_created = False
         if session_worktree is not None:
             self.server.state.session_worktrees[session_id] = session_worktree

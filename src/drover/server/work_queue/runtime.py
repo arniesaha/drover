@@ -5,6 +5,7 @@ import json
 
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.work_coordinator import sign_work_coordinator_continuity
 from drover.server.harness.worker_state import worker_brief
 from drover.server.mcp.contract import ReadCaps, bound_response
 from drover.server.web.auth import bearer_credential
@@ -39,11 +40,67 @@ class HarnessBridge:
                 raise RuntimeError("harness inspection unavailable")
             for row in json.loads(body).get("sessions", []):
                 if row.get("client_session_id") == run_key:
+                    # A recovered daemon row does not include the create
+                    # request. Reconstruct the hub-signed continuity binding
+                    # from the committed work intent before syncing it, or
+                    # refuse to link a coordinator run without its ledger.
+                    payload = self._recovery_payload(run_key, row)
                     self.collector._sync_created_harness_session(
-                        host.host_id, row, json.dumps(row)
+                        host.host_id, payload, json.dumps(row)
                     )
                     return self.registry.session_by_client_id(run_key)
         return None
+
+    def _recovery_payload(self, run_key, row):
+        payload = {
+            "client_session_id": run_key,
+            "harness": row.get("harness"),
+        }
+        service = getattr(self.collector, "work_control", None)
+        store = getattr(service, "store", None)
+        if store is None:
+            if any(
+                getattr(scope, "continuity_owner_id", None)
+                for scope in getattr(getattr(self, "config", None), "goals", [])
+            ):
+                raise RuntimeError("cannot recover work continuity launch intent")
+            return payload
+        links = store.links(run_key=run_key)
+        if len(links) != 1:
+            raise RuntimeError("cannot recover unique work launch intent")
+        link = links[0]
+        binding = self._work_coordinator_binding(
+            run_key,
+            link.get("run_role"),
+            link.get("item_url"),
+            link.get("goal_id"),
+        )
+        if binding is not None:
+            payload["work_coordinator_continuity"] = binding
+        return payload
+
+    def _work_coordinator_binding(self, run_key, role, item_url, goal_id):
+        scope = next(
+            (scope for scope in self.config.goals if scope.goal_id == goal_id), None
+        )
+        if scope is None or not getattr(scope, "continuity_owner_id", None):
+            return None
+        if (
+            role not in {"work", "verify"}
+            or not isinstance(item_url, str)
+            or not item_url
+        ):
+            raise RuntimeError("cannot reconstruct work continuity binding")
+        binding = {
+            "run_id": "work-" + run_key,
+            "owner_id": scope.continuity_owner_id,
+            "authority_scope": "implementation",
+            "objective": f"Work coordinator {role} for {item_url}",
+        }
+        binding["binding_signature"] = sign_work_coordinator_continuity(
+            binding, self.collector.work_coordinator_continuity_secret
+        )
+        return binding
 
     def active(self, links):
         active = []
@@ -110,6 +167,17 @@ class HarnessBridge:
                 authority.get("body"),
             ),
         }
+        if scope.continuity_owner_id:
+            # The committed run key is the producer identity and binds the
+            # exact launched session to the coordinator work item. The hub
+            # verifies and initializes the durable ledger before reporting
+            # launch success to the work coordinator.
+            # The daemon accepts coordinator mode only when this exact binding
+            # was signed by the hub's continuity secret. The host receives the
+            # binding but never the HMAC secret or the hub bearer token.
+            payload["work_coordinator_continuity"] = self._work_coordinator_binding(
+                run_key, role, ref.url, goal_id
+            )
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:
             raise RuntimeError("harness launch uncertain; inspect persisted intent")

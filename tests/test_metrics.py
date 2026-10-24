@@ -5784,6 +5784,26 @@ def test_creating_a_session_is_given_longer_than_the_default_budget(tmp_path):
     ), "a create cuts a worktree; 15s is the reason handoff failed"
 
 
+def test_successful_create_without_session_id_fails_closed(tmp_path):
+    collector = _collector_for_proxy(tmp_path)
+    collector._harness_request = lambda *args, **kwargs: (  # type: ignore[method-assign]
+        200,
+        '{"status": "running"}',
+    )
+    collector._harness_host = lambda host_id: type(  # type: ignore[method-assign]
+        "H",
+        (),
+        {"host_id": host_id, "connection_kind": "direct"},
+    )()
+
+    status, body = collector.proxy_create_harness_session(
+        "mac-mini", {"harness": "agy"}
+    )
+
+    assert status == 503
+    assert json.loads(body) == {"error": "hub continuity initialization failed"}
+
+
 def test_a_create_that_outruns_the_hub_is_not_reported_as_unreachable(
     tmp_path, monkeypatch
 ):

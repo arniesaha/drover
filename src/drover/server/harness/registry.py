@@ -1601,8 +1601,18 @@ class HarnessRegistry:
                     # never sends to or otherwise claims an external parent.
                     from drover.server.harness.continuity import (
                         record_observer_worker_completion_batch,
+                        record_work_coordinator_state,
                     )
 
+                    record_work_coordinator_state(
+                        con,
+                        event_id=event_id,
+                        session_id=session_id,
+                        event_type=event_type,
+                        sequence=seq,
+                        payload=payload,
+                        received_at=created_at,
+                    )
                     record_observer_worker_completion_batch(
                         con,
                         [
@@ -2028,7 +2038,22 @@ class HarnessRegistry:
                     MAX_COMPLETION_PROJECTION_BATCH,
                     lock_observer_sessions,
                     record_observer_worker_completion_batch,
+                    record_work_coordinator_state,
                 )
+
+                # Relay delivery and durable replay must project the same
+                # coordinator state as a locally-originated event before the
+                # source event commit becomes visible.
+                for record in completion_records:
+                    record_work_coordinator_state(
+                        con,
+                        event_id=str(record["event_id"]),
+                        session_id=str(record["session_id"]),
+                        event_type=str(record["event_type"]),
+                        sequence=record.get("sequence"),
+                        payload=record.get("payload"),
+                        received_at=record["received_at"],
+                    )
 
                 # This transaction retains session locks through every chunk.
                 # Acquire them once in lexical order so concurrent batches
