@@ -218,9 +218,13 @@ def test_additive_latest_control_migration_uses_point_release_path():
                         "alter_table_add_column_constant_default"
                         if " DEFAULT " in statement
                         else (
-                            "alter_table_add_nullable_column"
-                            if statement.startswith("ALTER TABLE")
-                            else "create_index"
+                            "alter_table_add_nullable_column_inline_check"
+                            if " CHECK " in statement
+                            else (
+                                "alter_table_add_nullable_column"
+                                if statement.startswith("ALTER TABLE")
+                                else "create_index"
+                            )
                         )
                     )
                 ),
@@ -259,6 +263,87 @@ def test_control_migration_accepts_only_the_documented_additive_ddl_subset():
         "alter_table_add_column_constant_default",
         "grant",
     ]
+
+
+def test_control_migration_accepts_nullable_inline_numeric_range_check():
+    from drover.server.lake.rollout import classify_release_kind
+
+    current, _, migration_id = _latest_control_migration_fixture()
+    target = [
+        *current,
+        [
+            migration_id,
+            [
+                "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS "
+                "notification_hour INTEGER CHECK (notification_hour BETWEEN 0 AND 23)"
+            ],
+        ],
+    ]
+
+    allowed, evidence = classify_release_kind(
+        _release_metadata(current), _release_metadata(target)
+    )
+
+    assert allowed
+    assert evidence["migration_verdicts"][0]["verdict"] == (
+        "alter_table_add_nullable_column_inline_check"
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (other_hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour my_not_null_domain CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour public.integer_domain CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour NUMERIC CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN lower_bound AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN 0 AND random())",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN 0 AND 23 OR hour = 99)",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN 0 AND (SELECT 23))",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN 0 AND 23) CHECK (hour > 0)",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER NOT NULL CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER DEFAULT 0 CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER CONSTRAINT range CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD CONSTRAINT hour_range CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN 0 AND 23",
+    ],
+)
+def test_control_migration_refuses_unsafe_inline_checks(statement):
+    from drover.server.lake.rollout import classify_release_kind
+
+    current, _, migration_id = _latest_control_migration_fixture()
+    allowed, evidence = classify_release_kind(
+        _release_metadata(current),
+        _release_metadata([*current, [migration_id, [statement]]]),
+    )
+
+    assert not allowed
+    assert evidence["migration_verdicts"][0]["verdict"] in {
+        "alter_table_add_column_unparsed",
+        "multiple_or_empty_statement",
+    }
+
+
+def test_control_migrations_28_through_36_classify_from_v0628_baseline():
+    from drover.server.lake.rollout import classify_release_kind
+    from drover.server.postgres_schema import _MIGRATIONS
+
+    current = [
+        [version, list(statements)]
+        for version, statements in _MIGRATIONS
+        if version <= 27
+    ]
+    target = [[version, list(statements)] for version, statements in _MIGRATIONS]
+    assert [version for version, _ in target if version > 27] == list(range(28, 37))
+
+    allowed, evidence = classify_release_kind(
+        _release_metadata(current), _release_metadata(target)
+    )
+
+    assert allowed
+    assert evidence["new_migration_ids"] == list(range(28, 37))
 
 
 @pytest.mark.parametrize(
