@@ -36,7 +36,12 @@ test("NAS 2026.9.9 actual entry resolver and registrar load the declared V2 tool
   assert.deepEqual(packageMetadata.openclaw.runtimeExtensions, packageMetadata.openclaw.extensions);
   assert.equal(packageMetadata.engines.node, pkg.engines.node);
   assert.equal(manifest.enabledByDefault, false);
-  assert.deepEqual(manifest.activation, { onStartup: false });
+  assert.deepEqual(manifest.activation, { onStartup: true });
+  assert.match(apiTypes, /registerService: \(service: OpenClawPluginService\)/);
+  assert.match(apiTypes, /runtime: PluginRuntime/);
+  const runtimeTypes = read("src/plugins/runtime/types-core.ts");
+  assert.match(runtimeTypes, /enqueueSystemEvent/);
+  assert.match(runtimeTypes, /requestHeartbeat/);
   assert.deepEqual(manifest.toolMetadata.drover_continuity_owner,
     { optional: true, replaySafe: false, sideEffecting: true });
 
@@ -85,6 +90,24 @@ test("NAS 2026.9.9 actual entry resolver and registrar load the declared V2 tool
   const currentTool = registry.tools[1].factory({ sessionKey: OWNER,
     assertInvocationCurrent() { throw new Error("host invocation retired"); } });
   assert.equal(currentTool.name, "drover_continuity_owner");
+
+  const services = [];
+  const serviceRecord = { ...record, toolNames: [] };
+  resolved.register({
+    pluginConfig: {
+      enabled: true, mode: "owner", ownerSessionKey: OWNER, ownerPrincipal: "legacy:operator",
+      runId: "run_NAS497", authorityScope: "implementation", droverOrigin: "https://drover.example",
+      tokenEnvName: "DROVER_SOURCE_TEST_TOKEN",
+    },
+    runtime: { system: { enqueueSystemEvent() { return true; }, requestHeartbeat() {} } },
+    registerService(service) { services.push(service); },
+    registerTool: (tool, options) => registerTool(serviceRecord, tool, options),
+  });
+  assert.equal(services.length, 1);
+  assert.equal(services[0].id, "drover-continuity-owner-wake");
+  assert.equal(typeof services[0].start, "function");
+  assert.equal(typeof services[0].stop, "function");
+
   process.env.DROVER_SOURCE_TEST_TOKEN = "synthetic-test-token";
   try {
     await assert.rejects(currentTool.execute("retired", { version: 1, request: { operation: "poll" } }), /host invocation retired/);

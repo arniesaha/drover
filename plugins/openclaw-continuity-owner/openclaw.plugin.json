@@ -1,8 +1,8 @@
 {
   "id": "drover-continuity-owner",
   "name": "Drover Continuity Owner",
-  "version": "0.1.0",
-  "description": "Explicit continuity owner transport; no messaging or executor",
+  "version": "0.1.1",
+  "description": "Fenced continuity owner transport with exact-session wake dispatch; no executor",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -88,6 +88,24 @@
         "minimum": 1,
         "maximum": 10000,
         "default": 5000
+      },
+      "wakePollIntervalMs": {
+        "type": "integer",
+        "minimum": 10,
+        "maximum": 300000,
+        "default": 15000
+      },
+      "wakeRetryIntervalMs": {
+        "type": "integer",
+        "minimum": 10,
+        "maximum": 3600000,
+        "default": 60000
+      },
+      "ownerLeaseSeconds": {
+        "type": "integer",
+        "minimum": 30,
+        "maximum": 300,
+        "default": 60
       }
     },
     "if": {
@@ -118,7 +136,7 @@
   },
   "enabledByDefault": false,
   "activation": {
-    "onStartup": false
+    "onStartup": true
   },
   "toolMetadata": {
     "drover_continuity_owner": {
