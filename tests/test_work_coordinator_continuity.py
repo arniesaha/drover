@@ -209,3 +209,49 @@ def test_hub_sync_is_the_only_ledger_initializer(tmp_path):
     assert session.source_session_id == "work/work-hub-init@0"
     status = FactoryObserverContinuity(path).status("work-hub-init")
     assert [event["report"]["kind"] for event in status["events"]] == ["worker_started"]
+
+
+def test_hub_sync_fails_closed_when_binding_cannot_initialize(tmp_path):
+    import json
+
+    from drover.server.metrics import MetricsCollector
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    HarnessRegistry(path).create_session(
+        session_id="harness-conflict",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        source_session_id="work/other-run@0",
+        handoff_mode="work_coordinator",
+    )
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        api_token="hub-secret",
+    )
+    unsigned = {
+        "run_id": "work-hub-conflict",
+        "owner_id": "agent:main:telegram:owner",
+        "authority_scope": "implementation",
+        "objective": "Must not be rebound",
+    }
+    with pytest.raises(RuntimeError, match="hub continuity initialization failed"):
+        MetricsCollector._sync_created_harness_session(
+            collector,
+            "studio",
+            {
+                "harness": "codex",
+                "work_coordinator_continuity": {
+                    **unsigned,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        unsigned, "hub-secret"
+                    ),
+                },
+            },
+            json.dumps({"session_id": "harness-conflict", "status": "running"}),
+        )
+    with pytest.raises(KeyError):
+        FactoryObserverContinuity(path).status("work-hub-conflict")

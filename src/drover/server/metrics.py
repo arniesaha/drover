@@ -2986,6 +2986,17 @@ class MetricsCollector:
         registry = HarnessRegistry(self.duckdb_path)
         try:
             existing = registry.get_session(session_id)
+            if (
+                work_continuity is not None
+                and existing is not None
+                and (
+                    existing.handoff_mode != "work_coordinator"
+                    or existing.source_session_id != work_continuity.source_session_id
+                )
+            ):
+                raise ValueError(
+                    "existing session conflicts with hub continuity binding"
+                )
             if existing is None:
 
                 def register_work_item(con, created_session_id):
