@@ -7,9 +7,12 @@ run or grants authority to an unbound session.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from drover.server.control_outbox import canonical_payload
 from drover.server.harness.factory_observer import _RUN_ID, FactoryObserverRequestError
 
 
@@ -25,8 +28,17 @@ class WorkCoordinatorContinuity:
         return f"work/{self.run_id}@0"
 
 
+def sign_work_coordinator_continuity(binding: Mapping[str, Any], secret: str) -> str:
+    """Authenticate the hub-issued immutable launch binding for one host."""
+    if not isinstance(secret, str) or not secret:
+        raise FactoryObserverRequestError("hub continuity authentication is required")
+    return hmac.new(
+        secret.encode(), canonical_payload(dict(binding)).encode(), hashlib.sha256
+    ).hexdigest()
+
+
 def parse_work_coordinator_continuity(
-    body: Mapping[str, Any],
+    body: Mapping[str, Any], *, hub_secret: str | None = None
 ) -> tuple[WorkCoordinatorContinuity | None, dict[str, Any]]:
     """Remove and validate the private coordinator-only launch extension."""
     raw = body.get("work_coordinator_continuity")
@@ -39,8 +51,21 @@ def parse_work_coordinator_continuity(
         "owner_id",
         "authority_scope",
         "objective",
+        "binding_signature",
     }:
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
+    signature = raw["binding_signature"]
+    unsigned = {key: value for key, value in raw.items() if key != "binding_signature"}
+    if (
+        not isinstance(signature, str)
+        or hub_secret is None
+        or not hmac.compare_digest(
+            signature, sign_work_coordinator_continuity(unsigned, hub_secret)
+        )
+    ):
+        raise FactoryObserverRequestError(
+            "work continuity binding is not hub authenticated"
+        )
     run_id, owner_id, scope, objective = (
         raw["run_id"],
         raw["owner_id"],

@@ -5,6 +5,7 @@ import json
 
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.work_coordinator import sign_work_coordinator_continuity
 from drover.server.harness.worker_state import worker_brief
 from drover.server.mcp.contract import ReadCaps, bound_response
 from drover.server.web.auth import bearer_credential
@@ -112,15 +113,21 @@ class HarnessBridge:
         }
         if scope.continuity_owner_id:
             # The committed run key is the producer identity and binds the
-            # exact launched session to the coordinator work item.  The host
-            # atomically initializes the durable ledger before the worker can
-            # emit its first completion event.
-            payload["work_coordinator_continuity"] = {
+            # exact launched session to the coordinator work item. The hub
+            # verifies and initializes the durable ledger before reporting
+            # launch success to the work coordinator.
+            binding = {
                 "run_id": "work-" + run_key,
                 "owner_id": scope.continuity_owner_id,
                 "authority_scope": "implementation",
                 "objective": f"Work coordinator {role} for {ref.url}",
             }
+            # The daemon accepts coordinator mode only when this exact binding
+            # was signed by the authenticated hub.
+            binding["binding_signature"] = sign_work_coordinator_continuity(
+                binding, self.collector.api_token
+            )
+            payload["work_coordinator_continuity"] = binding
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:
             raise RuntimeError("harness launch uncertain; inspect persisted intent")

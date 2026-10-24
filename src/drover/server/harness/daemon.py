@@ -2517,7 +2517,9 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 if "factory_observer" in body
                 else None
             )
-            work_continuity, body = parse_work_coordinator_continuity(body)
+            work_continuity, body = parse_work_coordinator_continuity(
+                body, hub_secret=self.server.state.api_token
+            )
         except FactoryObserverRequestError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
@@ -3043,27 +3045,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             session_id = session.session_id
             registry_created = True
+            # The host records only the signed session binding. The hub is the
+            # sole authority that initializes and writes the continuity ledger.
+        except Exception as exc:
+            # A coordinator launch cannot continue without its signed durable
+            # binding. Never turn a failed binding/session write into an
+            # untracked running worker.
             if work_continuity is not None:
-                from drover.server.harness.continuity import FactoryObserverContinuity
-
-                continuity = FactoryObserverContinuity(self.server.state.registry.path)
-                run_id = continuity.initialize(
-                    session_id=session_id,
-                    objective=work_continuity.objective,
-                    checkpoint="Work coordinator launch recorded",
-                    authority_scope=work_continuity.authority_scope,
-                    authorized_owner_id=work_continuity.owner_id,
+                self._write_json(
+                    {"error": f"work continuity initialization failed: {exc}"},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-                continuity.report(
-                    run_id,
-                    source="drover-work-coordinator",
-                    source_event_id="launch:" + session_id,
-                    subject=session_id,
-                    sequence=0,
-                    kind="worker_started",
-                    summary="Work coordinator launched the bound worker.",
-                )
-        except Exception:
+                return
             registry_created = False
         if session_worktree is not None:
             self.server.state.session_worktrees[session_id] = session_worktree
