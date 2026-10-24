@@ -2943,6 +2943,9 @@ def _run_api_role(
         incoming_dir=cfg.incoming_dir,
         summarizer_report={},
         api_token=auth.api_token if auth.enabled else "",
+        work_coordinator_continuity_secret=os.environ.get(
+            "DROVER_WORK_COORDINATOR_CONTINUITY_SECRET", ""
+        ).strip(),
         lifecycle_config=cfg.lifecycle,
         favorite_cwds=cfg.harness_favorite_cwds,
         content_consent_reader=lambda: consent.state().heartbeat(),
@@ -3625,6 +3628,9 @@ def run(
                     lake_health=lake_compactor.health if lake_compactor else None,
                     embeddings_state=embeddings_state,
                     api_token=auth.api_token if auth.enabled else "",
+                    work_coordinator_continuity_secret=os.environ.get(
+                        "DROVER_WORK_COORDINATOR_CONTINUITY_SECRET", ""
+                    ).strip(),
                     lifecycle_config=cfg.lifecycle,
                     favorite_cwds=cfg.harness_favorite_cwds,
                     advisory_service=InsightsService(

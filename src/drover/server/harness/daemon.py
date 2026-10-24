@@ -93,7 +93,9 @@ from drover.server.harness.websocket import (
     send_close,
     send_json,
 )
-from drover.server.harness.work_coordinator import parse_work_coordinator_continuity
+from drover.server.harness.work_coordinator import (
+    parse_unverified_work_coordinator_continuity,
+)
 from drover.server.harness.worktree import (
     SessionWorktree,
     WorktreeIsolationUnavailable,
@@ -2517,9 +2519,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 if "factory_observer" in body
                 else None
             )
-            work_continuity, body = parse_work_coordinator_continuity(
-                body, hub_secret=self.server.state.api_token
-            )
+            work_continuity, body = parse_unverified_work_coordinator_continuity(body)
         except FactoryObserverRequestError as exc:
             self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return

@@ -1120,6 +1120,9 @@ class MetricsCollector:
     job_streams: Mapping[str, RedisJobStream] = field(default_factory=dict)
     ttl_seconds: float = 60.0
     api_token: str = ""
+    # Kept only by the hub. It must never reuse a harness bearer token, which
+    # would let a host authenticate arbitrary coordinator bindings.
+    work_coordinator_continuity_secret: str = ""
     # Installed by the HTTP server from its credential store. Bound host
     # credentials authenticate the spoke to the hub, not the hub to harnessd,
     # so those hosts must use the authenticated relay in both directions.
@@ -2930,10 +2933,12 @@ class MetricsCollector:
     ) -> None:
         try:
             payload = json.loads(response_body)
-        except json.JSONDecodeError:
-            return
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "successful harness create response must be valid JSON"
+            ) from exc
         if not isinstance(payload, dict):
-            return
+            raise ValueError("successful harness create response must be an object")
         work_continuity = None
         if request_payload.get("work_coordinator_continuity") is not None:
             from drover.server.harness.work_coordinator import (
@@ -2943,11 +2948,12 @@ class MetricsCollector:
             # Verify the exact hub-issued binding before the hub writes the
             # sole authoritative continuity ledger.
             work_continuity, _ = parse_work_coordinator_continuity(
-                request_payload, hub_secret=self.api_token
+                request_payload,
+                hub_secret=self.work_coordinator_continuity_secret,
             )
         session_id = str(payload.get("session_id") or "").strip()
         if not session_id:
-            return
+            raise ValueError("successful harness create response lacks session_id")
         if request_payload.get("factory_observer") is not None:
             from drover.server.harness.factory_observer import (
                 FactoryObserverRequestError,

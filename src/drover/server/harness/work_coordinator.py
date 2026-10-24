@@ -40,11 +40,47 @@ def sign_work_coordinator_continuity(binding: Mapping[str, Any], secret: str) ->
 def parse_work_coordinator_continuity(
     body: Mapping[str, Any], *, hub_secret: str | None = None
 ) -> tuple[WorkCoordinatorContinuity | None, dict[str, Any]]:
-    """Remove and validate the private coordinator-only launch extension."""
+    """Remove and validate the hub-only coordinator launch extension."""
+    continuity, normalized, unsigned, signature = _parse_work_coordinator_continuity(
+        body
+    )
+    if continuity is None:
+        return None, normalized
+    if (
+        signature is None
+        or hub_secret is None
+        or not hmac.compare_digest(
+            signature, sign_work_coordinator_continuity(unsigned, hub_secret)
+        )
+    ):
+        raise FactoryObserverRequestError(
+            "work continuity binding is not hub authenticated"
+        )
+    return continuity, normalized
+
+
+def parse_unverified_work_coordinator_continuity(
+    body: Mapping[str, Any],
+) -> tuple[WorkCoordinatorContinuity | None, dict[str, Any]]:
+    """Parse a hub-forwarded binding without exposing its HMAC secret to a host.
+
+    Harnessd authenticates the request with its bearer token. The hub remains
+    the only component that verifies the continuity HMAC before recording the
+    authoritative ledger entry.
+    """
+    continuity, normalized, _, _ = _parse_work_coordinator_continuity(body)
+    return continuity, normalized
+
+
+def _parse_work_coordinator_continuity(
+    body: Mapping[str, Any],
+) -> tuple[
+    WorkCoordinatorContinuity | None, dict[str, Any], dict[str, Any], str | None
+]:
     raw = body.get("work_coordinator_continuity")
     normalized = dict(body)
     if raw is None:
-        return None, normalized
+        return None, normalized, {}, None
     normalized.pop("work_coordinator_continuity")
     if not isinstance(raw, Mapping) or set(raw) != {
         "run_id",
@@ -56,16 +92,8 @@ def parse_work_coordinator_continuity(
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
     signature = raw["binding_signature"]
     unsigned = {key: value for key, value in raw.items() if key != "binding_signature"}
-    if (
-        not isinstance(signature, str)
-        or hub_secret is None
-        or not hmac.compare_digest(
-            signature, sign_work_coordinator_continuity(unsigned, hub_secret)
-        )
-    ):
-        raise FactoryObserverRequestError(
-            "work continuity binding is not hub authenticated"
-        )
+    if not isinstance(signature, str) or not signature:
+        raise FactoryObserverRequestError("work continuity binding is invalid")
     run_id, owner_id, scope, objective = (
         raw["run_id"],
         raw["owner_id"],
@@ -89,4 +117,6 @@ def parse_work_coordinator_continuity(
     return (
         WorkCoordinatorContinuity(run_id, owner_id, scope, objective.strip()),
         normalized,
+        unsigned,
+        signature,
     )

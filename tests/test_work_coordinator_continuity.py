@@ -9,6 +9,7 @@ from drover.server.harness.continuity import (
 )
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.work_coordinator import (
+    parse_unverified_work_coordinator_continuity,
     parse_work_coordinator_continuity,
     sign_work_coordinator_continuity,
 )
@@ -135,6 +136,31 @@ def test_work_coordinator_binding_rejects_forged_hub_signature():
         )
 
 
+def test_hub_only_binding_secret_is_not_a_harness_bearer_token():
+    unsigned = {
+        "run_id": "work-abc123",
+        "owner_id": "agent:main:telegram:owner",
+        "authority_scope": "implementation",
+        "objective": "Issue #804 work",
+    }
+    body = {
+        "work_coordinator_continuity": {
+            **unsigned,
+            "binding_signature": sign_work_coordinator_continuity(
+                unsigned, "hub-continuity-secret"
+            ),
+        }
+    }
+    with pytest.raises(ValueError, match="hub authenticated"):
+        parse_work_coordinator_continuity(body, hub_secret="harness-bearer-token")
+    binding, _ = parse_work_coordinator_continuity(
+        body, hub_secret="hub-continuity-secret"
+    )
+    assert binding is not None
+    host_binding, _ = parse_unverified_work_coordinator_continuity(body)
+    assert host_binding == binding
+
+
 def test_hub_relay_replay_projects_coordinator_state_once(tmp_path):
     path = tmp_path / "control.duckdb"
     bootstrap_control_plane_store(path)
@@ -181,6 +207,7 @@ def test_hub_sync_is_the_only_ledger_initializer(tmp_path):
         incoming_dir=tmp_path / "incoming",
         summarizer_report={},
         api_token="hub-secret",
+        work_coordinator_continuity_secret="hub-continuity-secret",
     )
     unsigned = {
         "run_id": "work-hub-init",
@@ -194,7 +221,7 @@ def test_hub_sync_is_the_only_ledger_initializer(tmp_path):
         "work_coordinator_continuity": {
             **unsigned,
             "binding_signature": sign_work_coordinator_continuity(
-                unsigned, "hub-secret"
+                unsigned, "hub-continuity-secret"
             ),
         },
     }
@@ -231,6 +258,7 @@ def test_hub_sync_fails_closed_when_binding_cannot_initialize(tmp_path):
         incoming_dir=tmp_path / "incoming",
         summarizer_report={},
         api_token="hub-secret",
+        work_coordinator_continuity_secret="hub-continuity-secret",
     )
     unsigned = {
         "run_id": "work-hub-conflict",
@@ -247,7 +275,7 @@ def test_hub_sync_fails_closed_when_binding_cannot_initialize(tmp_path):
                 "work_coordinator_continuity": {
                     **unsigned,
                     "binding_signature": sign_work_coordinator_continuity(
-                        unsigned, "hub-secret"
+                        unsigned, "hub-continuity-secret"
                     ),
                 },
             },
@@ -255,3 +283,19 @@ def test_hub_sync_fails_closed_when_binding_cannot_initialize(tmp_path):
         )
     with pytest.raises(KeyError):
         FactoryObserverContinuity(path).status("work-hub-conflict")
+
+
+def test_hub_sync_rejects_success_response_without_session_id(tmp_path):
+    from drover.server.metrics import MetricsCollector
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+    )
+    with pytest.raises(ValueError, match="lacks session_id"):
+        collector._sync_created_harness_session("studio", {}, '{"status": "running"}')
+    with pytest.raises(ValueError, match="valid JSON"):
+        collector._sync_created_harness_session("studio", {}, "not-json")

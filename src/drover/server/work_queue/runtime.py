@@ -123,9 +123,10 @@ class HarnessBridge:
                 "objective": f"Work coordinator {role} for {ref.url}",
             }
             # The daemon accepts coordinator mode only when this exact binding
-            # was signed by the authenticated hub.
+            # was signed by the hub's continuity secret. The host receives the
+            # binding but never the HMAC secret or the hub bearer token.
             binding["binding_signature"] = sign_work_coordinator_continuity(
-                binding, self.collector.api_token
+                binding, self.collector.work_coordinator_continuity_secret
             )
             payload["work_coordinator_continuity"] = binding
         status, body = self.collector.proxy_create_harness_session(host, payload)
