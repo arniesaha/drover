@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
 
 from drover.schema import bootstrap_control_plane_store
-from drover.server.harness.continuity import FactoryObserverContinuity, record_work_coordinator_state
+from drover.server.harness.continuity import (
+    FactoryObserverContinuity,
+    record_work_coordinator_state,
+)
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.work_coordinator import parse_work_coordinator_continuity
 

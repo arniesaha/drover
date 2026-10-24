@@ -65,7 +65,6 @@ from drover.server.harness.factory_observer import (
     factory_observer_command,
     parse_factory_observer_launch,
 )
-from drover.server.harness.work_coordinator import parse_work_coordinator_continuity
 from drover.server.harness.model_catalog import (
     CatalogSelectionError,
     ModelCatalogService,
@@ -94,6 +93,7 @@ from drover.server.harness.websocket import (
     send_close,
     send_json,
 )
+from drover.server.harness.work_coordinator import parse_work_coordinator_continuity
 from drover.server.harness.worktree import (
     SessionWorktree,
     WorktreeIsolationUnavailable,
