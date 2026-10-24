@@ -327,8 +327,8 @@ def test_control_migration_refuses_unsafe_inline_checks(statement):
 
 
 def test_control_migrations_28_through_36_classify_from_v0628_baseline():
-    from drover.server.postgres_schema import _MIGRATIONS
     from drover.server.lake.rollout import classify_release_kind
+    from drover.server.postgres_schema import _MIGRATIONS
 
     current = [
         [version, list(statements)]
