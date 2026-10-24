@@ -6,8 +6,16 @@ const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", impo
 
 export function fakeApi(pluginConfig = {}) {
   const registrations = [];
+  const services = [];
+  const systemEvents = [];
+  const wakeRequests = [];
   const api = {
     pluginConfig,
+    runtime: { system: {
+      enqueueSystemEvent(text, options) { systemEvents.push({ text, options }); return true; },
+      requestHeartbeat(options) { wakeRequests.push(options); },
+    } },
+    registerService(service) { services.push(service); },
     registerTool(descriptor, options) {
       assert.deepEqual(manifest.contracts.tools, ["drover_continuity_owner"]);
       assert.equal(descriptor.contextVersion, 2);
@@ -20,5 +28,5 @@ export function fakeApi(pluginConfig = {}) {
       registrations.push({ factory, options, descriptor });
     },
   };
-  return { api, registrations };
+  return { api, registrations, services, systemEvents, wakeRequests };
 }

@@ -3,9 +3,13 @@
 This standalone ESM package registers exactly `drover_continuity_owner` through
 normal `api.registerTool({contextVersion: 2, create}, {name, optional: true})`.
 Its execute handler uses authenticated HTTP at the fixed `/harness/factory-observer/continuity`
-endpoint. It has no messaging client, executor, scheduler, implicit ack, or
-automatic retry. Installing/loading/activating it is an integration-owner task;
-none was performed by this implementation worker.
+endpoint. In explicitly approved `owner` mode, a plugin-owned service maintains the
+fenced Drover owner lease and translates `owner_wake` into a system event plus an
+immediate heartbeat for the exact trusted owner session. The durable Drover event
+remains the retry source across reload/reconnect; the service never consumes,
+executes, acknowledges, merges, deploys, or infers terminal release. `poll_only`
+and deployment-scope bindings keep the reload-safe service registration inert.
+Installing, loading, and activating the plugin remain integration-owner operations.
 
 The explicit V2 factory is paired with the static authoring metadata symbol
 used by OpenClaw's `plugins build`, `validate`, and `pack` commands. The
@@ -17,7 +21,7 @@ module-relative filesystem reads.
 ## SDK evidence and limits
 
 Current target source: **NAS OpenClaw 2026.9.9**, commit
-`157d65380817f3d3b8b2b7a58bbe91574ad03707`, at
+`70f61827e0be4c1f099369c4947c1e7740c60e42`, at
 `~/clawd/projects/openclaw`. This worker reads it through the existing
 SMB mount `${OPENCLAW_NAS_SOURCE}`
 (host-specific mount details omitted). The checkout is read-only to this task.
@@ -72,8 +76,10 @@ The remaining tool tests use a minimal V2 fake matching that tested registrar.
 Current NAS source has dependencies/build output; this proof deliberately loads
 only these bounded source helpers, without plugin installation or host activation.
 Live tool discovery, schema normalization, host lifetime/continuation behavior,
-normal authenticated transport in the Gateway and parent messaging remain untested.
-The parent has first-class `sessions_send`; child catalog absence is not a core defect.
+normal authenticated transport in the Gateway and exact-session heartbeat delivery
+remain live-acceptance gates. Focused tests cover service cancellation, lease fencing,
+bounded retry, reconnect replay before acknowledgment, and suppression after durable
+acknowledgment.
 
 ## Trusted configuration
 
@@ -82,7 +88,11 @@ Both an absent configuration and `config.enabled: false` return no tool from the
 factory. Default mode is `poll_only`. A configured parent canary binding is
 always read-only, including in owner mode, and must differ from the owner key.
 Unbound/missing host session keys receive no tool. Exactly one owner binding is
-supported; the store's lease/epoch remains the authority for mutations.
+supported; the store's lease/epoch remains the authority for mutations. A stable,
+reload-safe service registration reads committed config on every start and runs
+only for an enabled non-deployment `owner` binding. It renews only the configured
+principal's lease, refuses a competing live owner, emits only to a canonical
+`ownerSessionKey`, and retries one event no faster than `wakeRetryIntervalMs`.
 
 Example **inactive** host configuration (placeholders, not instructions to edit
 this worker's configuration):
@@ -103,7 +113,10 @@ this worker's configuration):
           "ownerPrincipal": "credential:existing-drover-credential-id",
           "canarySessionKey": "agent:main:existing-authorized-parent",
           "authorityScope": "implementation",
-          "timeoutMs": 5000
+          "timeoutMs": 5000,
+          "wakePollIntervalMs": 15000,
+          "wakeRetryIntervalMs": 60000,
+          "ownerLeaseSeconds": 60
         }
       }
     }
@@ -157,8 +170,9 @@ points at another version; it cannot silently substitute the old Studio source.
 The Python tests skip Node execution when compatible Node/dependencies are missing. They
 exercise real authenticated Drover HTTP with synthetic credentials, a durable
 local store and reconstructed store, but a fake SDK host. They prove read-only
-parent/owner polling, explicit owner lease/consume/ack, post-reconstruction no
-duplicate delivery, and 401 refusal. Protocol tests prove CI green → `review_ci`,
+parent/owner polling, explicit owner lease/consume/ack, service-owned lease renewal,
+exact-session wake routing, competing-owner refusal, bounded reconnect retry,
+post-ack suppression, post-reconstruction no duplicate delivery, and 401 refusal. Protocol tests prove CI green → `review_ci`,
 CI red → `correct_ci`, blocked deployment and lost-delivery recovery. Node tests
 also cover current source load/registration, session isolation, strict requests,
 transport refusal/redirect/cancellation, scope preflight, live authority revoked
@@ -197,24 +211,20 @@ The worker does not perform any step below against a live runtime.
    `drover_continuity_owner` with:
    `{"version":1,"request":{"operation":"poll","limit":1}}`.
    Verify TaskFlow authority, bound run/scope, pending event and no terminal release.
-4. Parent may invoke its existing **first-class `sessions_send`** targeting that
-   existing owner session, asking it to invoke the same read-only poll envelope
-   and return the observed event ID/run ID. Use the parent's normal supported
-   messaging tool and permissions; this adapter does not call it. Message text
-   must request poll only, no consume/ack/execution. No new worker is launched.
-5. Parent verifies its poll and the owner's normal tool/message receipt match.
-   This is a receipt check, **not a durable acknowledgment**. Missing/failed
-   delivery leaves the event pending; retain traces and poll for recovery.
-6. Only after verified receipts and explicit permission for owner mutations,
-   integration owner may authorize `mode: "owner"` activation. The parent canary
-   key remains read-only. Owner explicitly invokes `lease` (e.g. 60 seconds),
-   then `consume` using the returned live epoch. Verify `review_worker_result`
-   and stable action/event IDs. Reconcile only the synthetic advisory in the
-   permitted scope, then explicitly invoke
+4. Only after the read-only receipt and explicit permission for owner mutations,
+   authorize `mode: "owner"` activation. The parent canary key remains read-only.
+   The service acquires/renews the configured owner lease and, when the durable
+   projection says `owner_wake`, queues a system event and immediate heartbeat to
+   exactly `ownerSessionKey`. Capture the service wake and exact-session turn trace;
+   no parent `sessions_send` nudge is permitted in this acceptance.
+5. The awakened owner polls, consumes using the returned live epoch, verifies the
+   stable `review_worker_result` action/event IDs, and advances only the permitted
+   scope. The plugin service is not an executor and cannot perform this step.
+6. Only after durable advancement, the owner explicitly invokes
    `{"version":1,"request":{"operation":"acknowledge","owner_epoch":<returned epoch>,"event_id":"<recorded SHA256>","checkpoint":"Synthetic canary reconciled; no release"}}`.
-   Poll confirms acknowledgment and no next action; reconstruct/retry confirms
-   no duplicate delivery. Real runtime restart recovery requires separately
-   authorized host operations, not this worker's tests.
+   Poll confirms acknowledgment and no next action. Stop/start the service while
+   the event is pending to prove retry, then after acknowledgment to prove no
+   duplicate wake. A full Gateway restart remains separately authorized.
 
 If a mutation reply is lost, poll before retrying: the mutation may have committed.
 Use stable action/event identities for reconciliation, never infer ack from a
