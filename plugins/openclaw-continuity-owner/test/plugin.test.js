@@ -70,11 +70,12 @@ async function eventually(predicate, message = "condition was not reached") {
   assert.fail(message);
 }
 
-function serviceContext() {
+function serviceContext(pluginConfig) {
   const failures = [];
   return {
     failures,
     context: {
+      config: { plugins: { entries: { "drover-continuity-owner": { config: pluginConfig } } } },
       logger: { warn(message) { failures.push(message); } },
       serviceHealth: {
         reportFailure(error) { failures.push(error); },
@@ -106,7 +107,7 @@ test("registers exactly one optional normal tool; default inactive and unknown c
   const { api, registrations, services } = fakeApi();
   register(api);
   assert.equal(registrations.length, 1);
-  assert.equal(services.length, 0);
+  assert.equal(services.length, 1);
   assert.equal(registrations[0].factory({ sessionKey: OWNER, assertInvocationCurrent() {} }), null);
   assert.equal(registrations[0].factory({ assertInvocationCurrent() {} }), null);
 });
@@ -122,10 +123,11 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
   const f = await fixture(t, (req, res, body) => res.end(JSON.stringify({
     continuity: req.method === "POST" && body.operation === "lease" ? live : stale,
   })));
-  const runtime = fakeApi({ ...f.config, mode: "owner", wakePollIntervalMs: 1000 });
+  const ownerConfig = { ...f.config, mode: "owner", wakePollIntervalMs: 1000 };
+  const runtime = fakeApi(f.config); // Registered while poll-only; committed reload config activates it.
   register(runtime.api);
   assert.equal(runtime.services.length, 1);
-  const health = serviceContext();
+  const health = serviceContext(ownerConfig);
   runtime.services[0].start(health.context);
   await eventually(() => runtime.wakeRequests.length === 1, "owner wake was not dispatched");
   await runtime.services[0].stop(health.context);
@@ -157,7 +159,7 @@ test("wake retries are bounded and durable acknowledgement suppresses replay", a
   });
   const runtime = fakeApi({ ...f.config, mode: "owner", wakePollIntervalMs: 10, wakeRetryIntervalMs: 1000 });
   register(runtime.api);
-  const health = serviceContext();
+  const health = serviceContext(runtime.api.pluginConfig);
   runtime.services[0].start(health.context);
   await eventually(() => polls >= 3);
   await runtime.services[0].stop(health.context);
@@ -166,13 +168,18 @@ test("wake retries are bounded and durable acknowledgement suppresses replay", a
   assert.equal(health.failures.length, 0);
 });
 
-test("poll-only and deployment bindings never register an automatic owner service", async (t) => {
+test("poll-only and deployment bindings retain an inert reload-safe service", async (t) => {
   const f = await fixture(t);
   for (const config of [f.config, { ...f.config, mode: "owner", authorityScope: "deployment" }]) {
     const runtime = fakeApi(config);
     register(runtime.api);
-    assert.equal(runtime.services.length, 0);
+    assert.equal(runtime.services.length, 1);
+    const health = serviceContext(runtime.api.pluginConfig);
+    runtime.services[0].start(health.context);
+    await runtime.services[0].stop(health.context);
+    assert.equal(runtime.wakeRequests.length, 0);
   }
+  assert.equal(f.calls.length, 0);
 });
 
 test("service reconnect replays an unacknowledged wake but not an acknowledged event", async (t) => {
@@ -186,7 +193,7 @@ test("service reconnect replays an unacknowledged wake but not an acknowledged e
   const start = async () => {
     const runtime = fakeApi({ ...f.config, mode: "owner", wakePollIntervalMs: 1000 });
     register(runtime.api);
-    const health = serviceContext();
+    const health = serviceContext(runtime.api.pluginConfig);
     runtime.services[0].start(health.context);
     await eventually(() => requests > 0);
     return { runtime, health };
@@ -205,13 +212,38 @@ test("service reconnect replays an unacknowledged wake but not an acknowledged e
   assert.equal(final.runtime.wakeRequests.length, 0);
 });
 
+test("service stop during lease acquisition cannot emit a stale wake", async (t) => {
+  let releaseLease;
+  const live = projection({
+    owner: { id: OWNER_PRINCIPAL, epoch: 2, lease_until: "2099-10-03T00:00:00+00:00", live: true },
+    events: [{ event_id: EVENT, state: "pending", attempts: 0, next_delivery_at: null,
+      report: { source: "drover", source_event_id: "worker-1", subject: "worker", sequence: 1,
+        kind: "worker_brief_completed", summary: "Worker completed" } }],
+  });
+  const stale = projection({ owner: { id: null, epoch: 1, lease_until: null, live: false }, owner_wake: false });
+  const f = await fixture(t, (req, res, body) => {
+    if (req.method === "POST" && body.operation === "lease") releaseLease = () => res.end(JSON.stringify({ continuity: live }));
+    else res.end(JSON.stringify({ continuity: stale }));
+  });
+  const runtime = fakeApi({ ...f.config, mode: "owner", wakePollIntervalMs: 1000 });
+  register(runtime.api);
+  const health = serviceContext(runtime.api.pluginConfig);
+  runtime.services[0].start(health.context);
+  await eventually(() => typeof releaseLease === "function");
+  const stopped = runtime.services[0].stop(health.context);
+  releaseLease();
+  await stopped;
+  assert.equal(runtime.systemEvents.length, 0);
+  assert.equal(runtime.wakeRequests.length, 0);
+});
+
 test("a competing live owner is fenced without a wake or lease mutation", async (t) => {
   const f = await fixture(t, (_req, res) => res.end(JSON.stringify({ continuity: projection({
     owner: { id: "credential:other", epoch: 9, lease_until: "2099-10-03T00:00:00+00:00", live: true },
   }) })));
   const runtime = fakeApi({ ...f.config, mode: "owner", wakePollIntervalMs: 1000 });
   register(runtime.api);
-  const health = serviceContext();
+  const health = serviceContext(runtime.api.pluginConfig);
   runtime.services[0].start(health.context);
   await eventually(() => health.failures.length > 0);
   await runtime.services[0].stop(health.context);
@@ -298,6 +330,8 @@ test("trusted configuration rejects unsafe origins, unknown keys and token argum
     assert.throws(() => tool({ ...config, droverOrigin: origin }), /origin|configuration/);
   }
   assert.throws(() => tool({ ...config, canarySessionKey: OWNER }), /distinct/);
+  for (const sessionKey of ["agent:coder", "agent::owner", "agent:coder:", "coder:owner:session"])
+    assert.throws(() => tool({ ...config, ownerSessionKey: sessionKey }), /configuration|canonical/);
   assert.throws(() => tool({ ...config, token: MODEL_CREDENTIAL }), /configuration/);
   assert.throws(() => tool({ ...config, tokenEnvName: "bad variable" }), /configuration/);
 });

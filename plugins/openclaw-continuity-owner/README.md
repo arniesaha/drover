@@ -8,8 +8,8 @@ fenced Drover owner lease and translates `owner_wake` into a system event plus a
 immediate heartbeat for the exact trusted owner session. The durable Drover event
 remains the retry source across reload/reconnect; the service never consumes,
 executes, acknowledges, merges, deploys, or infers terminal release. `poll_only`
-and deployment-scope bindings register no wake service. Installing, loading, and
-activating the plugin remain integration-owner operations.
+and deployment-scope bindings keep the reload-safe service registration inert.
+Installing, loading, and activating the plugin remain integration-owner operations.
 
 The explicit V2 factory is paired with the static authoring metadata symbol
 used by OpenClaw's `plugins build`, `validate`, and `pack` commands. The
@@ -88,9 +88,10 @@ Both an absent configuration and `config.enabled: false` return no tool from the
 factory. Default mode is `poll_only`. A configured parent canary binding is
 always read-only, including in owner mode, and must differ from the owner key.
 Unbound/missing host session keys receive no tool. Exactly one owner binding is
-supported; the store's lease/epoch remains the authority for mutations. The wake
-service exists only for an enabled non-deployment `owner` binding. It renews only
-the configured principal's lease, refuses a competing live owner, emits only to
+supported; the store's lease/epoch remains the authority for mutations. A stable,
+reload-safe service registration reads committed config on every start and runs
+only for an enabled non-deployment `owner` binding. It renews only the configured
+principal's lease, refuses a competing live owner, emits only to a canonical
 `ownerSessionKey`, and retries one event no faster than `wakeRetryIntervalMs`.
 
 Example **inactive** host configuration (placeholders, not instructions to edit

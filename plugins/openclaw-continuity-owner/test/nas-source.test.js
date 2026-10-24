@@ -67,7 +67,7 @@ test("NAS 2026.9.9 actual entry resolver and registrar load the declared V2 tool
     createRegistration: (record, entry) => ({ pluginId: record.id, ...entry }),
   });
   const record = { id: manifest.id, contracts: manifest.contracts, toolNames: [], origin: "global" };
-  resolved.register({ pluginConfig: {}, registerTool: (tool, options) => registerTool(record, tool, options) });
+  resolved.register({ pluginConfig: {}, registerService() {}, registerTool: (tool, options) => registerTool(record, tool, options) });
   assert.deepEqual(errors, []);
   assert.equal(registry.tools.length, 1);
   const entry = registry.tools[0];
@@ -86,7 +86,7 @@ test("NAS 2026.9.9 actual entry resolver and registrar load the declared V2 tool
   resolved.register({ pluginConfig: {
     enabled: true, ownerSessionKey: OWNER, ownerPrincipal: "legacy:operator", runId: "run_NAS497", authorityScope: "implementation",
     droverOrigin: "https://drover.example", tokenEnvName: "DROVER_SOURCE_TEST_TOKEN",
-  }, registerTool: (tool, options) => registerTool(enabledRecord, tool, options) });
+  }, registerService() {}, registerTool: (tool, options) => registerTool(enabledRecord, tool, options) });
   const currentTool = registry.tools[1].factory({ sessionKey: OWNER,
     assertInvocationCurrent() { throw new Error("host invocation retired"); } });
   assert.equal(currentTool.name, "drover_continuity_owner");

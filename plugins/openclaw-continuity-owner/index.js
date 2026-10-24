@@ -37,6 +37,8 @@ function configuration(raw) {
   };
   if (config.enabled !== true) return Object.freeze(config);
   requireValue(!config.canarySessionKey || config.canarySessionKey !== config.ownerSessionKey, "Canary and owner session bindings must be distinct");
+  requireValue(/^agent:[^:\s]+(?::[^:\s]+)+$/.test(config.ownerSessionKey), "Owner session binding must be a canonical agent session key");
+  if (config.canarySessionKey !== undefined) requireValue(/^agent:[^:\s]+(?::[^:\s]+)+$/.test(config.canarySessionKey), "Canary session binding must be a canonical agent session key");
   const origin = new URL(config.droverOrigin);
   const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(origin.hostname);
   requireValue(origin.protocol === "https:" || (origin.protocol === "http:" && loopback), "Drover origin requires HTTPS or loopback HTTP");
@@ -84,8 +86,11 @@ async function maintainOwnerLease(config, status, signal, assertCurrent) {
   return leased.continuity;
 }
 
-function registerWakeService(api, config) {
-  if (config.enabled !== true || config.mode !== "owner" || config.authorityScope === "deployment") return;
+function committedServiceConfiguration(ctx) {
+  return configuration(ctx.config?.plugins?.entries?.[manifest.id]?.config ?? {});
+}
+
+function registerWakeService(api) {
   let controller;
   let running;
   let lastWake = { fingerprint: null, at: 0 };
@@ -93,6 +98,8 @@ function registerWakeService(api, config) {
     id: WAKE_SERVICE_ID,
     reload: { configPrefixes: ["plugins.entries.drover-continuity-owner.config"] },
     start(ctx) {
+      const config = committedServiceConfiguration(ctx);
+      if (config.enabled !== true || config.mode !== "owner" || config.authorityScope === "deployment") return;
       controller = new AbortController();
       const signal = controller.signal;
       const assertCurrent = () => requireValue(!signal.aborted, "Drover owner wake service stopped");
@@ -101,6 +108,7 @@ function registerWakeService(api, config) {
           try {
             const polled = reply(await request(config, "GET", { run_id: config.runId, limit: 1 }, signal, assertCurrent), config);
             const status = await maintainOwnerLease(config, polled.continuity, signal, assertCurrent);
+            assertCurrent();
             const fingerprint = status.owner_wake ? wakeFingerprint(status) : null;
             if (fingerprint && (lastWake.fingerprint !== fingerprint || Date.now() - lastWake.at >= config.wakeRetryIntervalMs)) {
               const eventId = fingerprint.slice(fingerprint.lastIndexOf(":") + 1);
@@ -110,6 +118,7 @@ function registerWakeService(api, config) {
                 "and acknowledge only after that advancement is durably verified. Never infer terminal release.",
                 { sessionKey: config.ownerSessionKey, contextKey: fingerprint },
               );
+              assertCurrent();
               api.runtime.system.requestHeartbeat({
                 source: "other", intent: "immediate", reason: "drover-continuity-owner-wake",
                 agentId: ownerAgentId(config.ownerSessionKey), sessionKey: config.ownerSessionKey,
@@ -257,7 +266,7 @@ function initializeBody(config) {
 // SDK 2026.9.9: V2 descriptor uses trusted sessionKey and live invocation guard.
 export function register(api) {
   const config = configuration(api.pluginConfig ?? {});
-  registerWakeService(api, config);
+  registerWakeService(api);
   api.registerTool({ contextVersion: 2, create(context) {
     if (config.enabled !== true || !context?.sessionKey) return null;
     const owner = context.sessionKey === config.ownerSessionKey;

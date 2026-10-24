@@ -61,7 +61,7 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 191,
-        "pattern": "^agent:[^\\s]+$"
+        "pattern": "^agent:[^:\\s]+(?::[^:\\s]+)+$"
       },
       "ownerPrincipal": {
         "type": "string",
@@ -73,7 +73,7 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 191,
-        "pattern": "^agent:[^\\s]+$"
+        "pattern": "^agent:[^:\\s]+(?::[^:\\s]+)+$"
       },
       "authorityScope": {
         "type": "string",
