@@ -1,4 +1,6 @@
+import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +15,71 @@ from drover.server.harness.work_coordinator import (
     parse_work_coordinator_continuity,
     sign_work_coordinator_continuity,
 )
+
+
+def test_bridge_recovery_reconstructs_signed_continuity_and_initializes_ledger(
+    tmp_path,
+):
+    from drover.server.metrics import MetricsCollector
+    from drover.server.work_queue.runtime import HarnessBridge
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    run_key = "recovery-key"
+    remote = {
+        "session_id": "harness-recovery",
+        "client_session_id": run_key,
+        "harness": "codex",
+        "status": "running",
+    }
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        api_token="hub-secret",
+        work_coordinator_continuity_secret="hub-continuity-secret",
+    )
+    collector.work_control = SimpleNamespace(
+        store=SimpleNamespace(
+            links=lambda *, run_key: [
+                {
+                    "run_key": run_key,
+                    "goal_id": "goal",
+                    "run_role": "work",
+                    "item_url": "https://github.com/example/project/issues/804",
+                }
+            ]
+        ),
+        register_hub_launch=lambda *args, **kwargs: None,
+    )
+    collector._harness_request = lambda *args, **kwargs: (
+        200,
+        json.dumps({"sessions": [remote]}),
+    )
+    registry = HarnessRegistry(path)
+    bridge = object.__new__(HarnessBridge)
+    bridge.collector = collector
+    bridge.config = SimpleNamespace(
+        goals=[
+            SimpleNamespace(
+                goal_id="goal", continuity_owner_id="agent:main:telegram:owner"
+            )
+        ]
+    )
+    bridge.registry = SimpleNamespace(
+        session_by_client_id=registry.session_by_client_id,
+        list_hosts=lambda: [
+            SimpleNamespace(
+                host_id="studio", liveness=lambda: SimpleNamespace(usable=True)
+            )
+        ],
+    )
+
+    session = bridge.resolve(run_key)
+
+    assert session.session_id == "harness-recovery"
+    status = FactoryObserverContinuity(path).status("work-" + run_key)
+    assert [event["report"]["kind"] for event in status["events"]] == ["worker_started"]
 
 
 def test_work_coordinator_binding_is_exact_and_projects_start_done_blocked_and_approval(
