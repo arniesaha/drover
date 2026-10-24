@@ -7,10 +7,17 @@ endpoint. It has no messaging client, executor, scheduler, implicit ack, or
 automatic retry. Installing/loading/activating it is an integration-owner task;
 none was performed by this implementation worker.
 
+The explicit V2 factory is paired with the static authoring metadata symbol
+used by OpenClaw's `plugins build`, `validate`, and `pack` commands. The
+metadata is required for reviewable artifact creation; a plain default plugin
+definition can load at runtime but cannot be packed by OpenClaw 2026.9.9. Runtime
+schemas and manifest metadata are statically imported so the packed bundle has no
+module-relative filesystem reads.
+
 ## SDK evidence and limits
 
-Current target source: **NAS OpenClaw 2026.9.6**, commit
-`88027bc85c0a4eebbea49a2a5522faec71ecdc14`, at
+Current target source: **NAS OpenClaw 2026.9.9**, commit
+`157d65380817f3d3b8b2b7a58bbe91574ad03707`, at
 `~/clawd/projects/openclaw`. This worker reads it through the existing
 SMB mount `${OPENCLAW_NAS_SOURCE}`
 (host-specific mount details omitted). The checkout is read-only to this task.
@@ -51,9 +58,14 @@ Current-source evidence:
   explicit user authorization; installation is not read-only staging.
 - `package.json:2370–2372` and `docs/plugins/tool-plugins.md`: supported Node range
   `>=24.16.0 <25 || >=26.1.0`, now mirrored by the package engine declaration.
+- Installed OpenClaw **2026.9.9** (`157d653`): `plugins pack` calls
+  `getToolPluginMetadata` before it builds the review artifact. The entry now
+  exposes the same non-enumerable `Symbol.for("openclaw.plugin-sdk.tool-plugin.metadata")`
+  contract used by `defineToolPlugin`, while preserving the required V2 factory
+  for trusted session and live-invocation authority.
 
 `test/nas-source.test.js` requires `DROVER_TEST_OPENCLAW_NAS_SOURCE` and rejects
-versions other than 2026.9.6. It imports the actual pure source entry resolver
+versions other than 2026.9.9. It imports the actual pure source entry resolver
 and contract helpers and executes the actual registrar body with fake surrounding
 registry bookkeeping. It does not load the whole Gateway or SDK lifecycle.
 The remaining tool tests use a minimal V2 fake matching that tested registrar.
@@ -134,9 +146,10 @@ PYTHONPATH=src .venv/bin/python scripts/export_openclaw_owner_schema.py --check
 From this package directory:
 
 ```sh
-npm ci --ignore-scripts --no-audit --no-fund
+npm ci --no-audit --no-fund
 DROVER_TEST_OPENCLAW_NAS_SOURCE="$OPENCLAW_NAS_SOURCE" npm test
-npm pack --ignore-scripts
+openclaw plugins validate --root . --json
+openclaw plugins pack --root . --out /tmp/drover-openclaw-continuity-owner.tgz --json
 ```
 
 The current-source test fails explicitly if the NAS path/environment is missing or

@@ -1,4 +1,4 @@
-// Minimal 2026.9.6 V2 registrar fake. NAS-source.test.js executes actual source
+// Minimal 2026.9.9 V2 registrar fake. NAS-source.test.js executes actual source
 // resolver/registrar code separately. This fake does not load a Gateway.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";

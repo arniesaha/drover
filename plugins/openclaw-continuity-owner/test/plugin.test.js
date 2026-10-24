@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { register, TOOL_NAME } from "../index.js";
+import ownerPlugin, { register, TOOL_NAME } from "../index.js";
 import { fakeApi } from "./fake-sdk.js";
 
 const OWNER = "agent:coder:subagent:mock-owner";
@@ -60,6 +61,24 @@ function tool(config, sessionKey = OWNER) {
   return registrations[0].factory({ sessionKey, assertInvocationCurrent() {} });
 }
 const call = (operation, fields = {}) => ({ version: 1, request: { operation, ...fields } });
+
+test("exposes static tool authoring metadata required by OpenClaw pack", () => {
+  const metadata = ownerPlugin[Symbol.for("openclaw.plugin-sdk.tool-plugin.metadata")];
+  assert.deepEqual(metadata, {
+    id: "drover-continuity-owner",
+    name: "Drover Continuity Owner",
+    description: "Explicit continuity owner transport; no messaging or executor",
+    activation: { onStartup: false },
+    configSchema: JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8")).configSchema,
+    tools: [{
+      name: TOOL_NAME,
+      label: "Drover Continuity Owner",
+      description: "Explicit Drover continuity calls for the bound owner. Advisory actions only; no executor, merge, deployment or messaging. Ack only after idempotent reconciliation.",
+      parameters: JSON.parse(readFileSync(new URL("../schemas/request.json", import.meta.url), "utf8")),
+      optional: true,
+    }],
+  });
+});
 
 test("registers exactly one optional normal tool; default inactive and unknown contexts get none", () => {
   const { api, registrations } = fakeApi();
