@@ -2450,7 +2450,7 @@ def test_dedupe_apply_creates_the_identity_column_it_writes(tmp_path):
     try:
         con.execute("DROP INDEX IF EXISTS harness_events_dedup_key")
         con.execute("DROP INDEX IF EXISTS harness_events_session_seq")
-        con.execute("DROP INDEX IF EXISTS harness_events_reconciliation_pending")
+        con.execute("DROP INDEX IF EXISTS harness_events_reconciliation_cursor")
         con.execute("ALTER TABLE harness_events DROP COLUMN dedup_key")
     finally:
         con.close()

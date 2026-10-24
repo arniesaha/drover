@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import duckdb
 import pytest
@@ -79,7 +80,7 @@ def test_quarantine_protects_previously_acknowledged_events_from_retention(tmp_p
     assert registry.list_events_for_reconciliation() == []
 
 
-def test_control_registry_adds_event_sequence_and_pending_reconciliation_indexes(
+def test_control_registry_adds_event_sequence_and_reconciliation_cursor_indexes(
     tmp_path,
 ):
     _, duckdb_path = _registry(tmp_path)
@@ -94,8 +95,74 @@ def test_control_registry_adds_event_sequence_and_pending_reconciliation_indexes
 
     assert {
         "harness_events_session_seq",
-        "harness_events_reconciliation_pending",
+        "harness_events_reconciliation_cursor",
     }.issubset(indexes)
+    assert "harness_events_reconciliation_pending" not in indexes
+
+
+def test_control_registry_repairs_unsafe_reconciliation_index_idempotently(tmp_path):
+    event_id = f"evt-{uuid4().hex}"
+    _, duckdb_path = _registry(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        for index_name in (
+            "harness_events_dedup_key",
+            "harness_events_session_seq",
+            "harness_events_reconciliation_cursor",
+        ):
+            con.execute(f"DROP INDEX {index_name}")
+        con.execute("ALTER TABLE harness_events DROP COLUMN dedup_key")
+        con.execute(
+            "CREATE INDEX harness_events_session_seq ON harness_events (session_id, seq)"
+        )
+        # Existing registries can have the DuckDB 1.5.5-corrupting index.
+        con.execute(
+            "CREATE INDEX harness_events_reconciliation_pending "
+            "ON harness_events (reconcile_pending, created_at, event_id)"
+        )
+        con.execute(
+            "INSERT INTO harness_events "
+            "(event_id, session_id, event_type, payload_json, created_at, seq) "
+            "VALUES (?, 'session-real-like', 'assistant_output', "
+            '\'{"text": "reconcile me"}\', '
+            "TIMESTAMP '2026-10-23 21:00:00', 42)",
+            [event_id],
+        )
+
+        # Startup repair must be repeatable, preserve dedup/session sequence,
+        # and make the reconciliation state transition safe again.
+        bootstrap_harness_tables(con)
+        bootstrap_harness_tables(con)
+        con.execute(
+            "UPDATE harness_events SET reconciled_at = now(), reconcile_pending = FALSE "
+            "WHERE event_id = ?",
+            [event_id],
+        )
+        con.execute("CHECKPOINT")
+
+        columns = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('harness_events')").fetchall()
+        }
+        indexes = {
+            row[0]
+            for row in con.execute(
+                "SELECT index_name FROM duckdb_indexes() "
+                "WHERE table_name = 'harness_events'"
+            ).fetchall()
+        }
+        reconciliation_state = con.execute(
+            "SELECT reconcile_pending, reconciled_at IS NOT NULL FROM harness_events "
+            "WHERE event_id = ?",
+            [event_id],
+        ).fetchone()
+    assert "dedup_key" in columns
+    assert {
+        "harness_events_dedup_key",
+        "harness_events_session_seq",
+        "harness_events_reconciliation_cursor",
+    }.issubset(indexes)
+    assert "harness_events_reconciliation_pending" not in indexes
+    assert reconciliation_state == (False, True)
 
 
 def test_control_registry_rebuilds_event_indexes_for_legacy_dedup_column(tmp_path):
@@ -104,7 +171,7 @@ def test_control_registry_rebuilds_event_indexes_for_legacy_dedup_column(tmp_pat
         for index_name in (
             "harness_events_dedup_key",
             "harness_events_session_seq",
-            "harness_events_reconciliation_pending",
+            "harness_events_reconciliation_cursor",
         ):
             con.execute(f"DROP INDEX {index_name}")
         con.execute("ALTER TABLE harness_events DROP COLUMN dedup_key")
@@ -133,8 +200,9 @@ def test_control_registry_rebuilds_event_indexes_for_legacy_dedup_column(tmp_pat
     assert {
         "harness_events_dedup_key",
         "harness_events_session_seq",
-        "harness_events_reconciliation_pending",
+        "harness_events_reconciliation_cursor",
     }.issubset(indexes)
+    assert "harness_events_reconciliation_pending" not in indexes
 
 
 def test_reconciliation_pending_predicate_excludes_acknowledged_events(tmp_path):
