@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.33] - 2026-10-23
+
+### Fixed
+
+- Rebuilt corrupt persisted legacy harness session-sequence ART indexes into the versioned v2 form, preserving recovery from prior state; the unified production-backup clone rehearsal validated the migration path (#800).
+
 ## [0.6.32] - 2026-10-23
 
 ### Fixed
