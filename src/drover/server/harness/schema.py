@@ -459,11 +459,18 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS harness_events_dedup_key "
         "ON harness_events (dedup_key)"
     )
+    # DuckDB 1.5.5 can preserve a corrupt ART index across upgrades.  The
+    # legacy name is intentionally dropped once, then the versioned name is
+    # created: existing registries repair on their next bootstrap while fresh
+    # registries only ever create the replacement.  Do not use CREATE OR
+    # REPLACE here -- rebuilding on every harnessd boot is needless catalog
+    # reload/checkpoint work.
+    con.execute("DROP INDEX IF EXISTS harness_events_session_seq")
     # Additive control-registry indexes for the two hot host-ledger paths.
     # These are deliberately separate from the lake schema: harnessd owns a
     # local control spool and must not open or migrate analytical tables.
     con.execute(
-        "CREATE INDEX IF NOT EXISTS harness_events_session_seq "
+        "CREATE INDEX IF NOT EXISTS harness_events_session_seq_v2 "
         "ON harness_events (session_id, seq)"
     )
     # DuckDB 1.5.5 can raise `Failed to delete all rows from index` when an
