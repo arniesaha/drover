@@ -212,10 +212,12 @@ byte-for-byte unchanged and new ids must be strictly appended above the current
 maximum. The point-release classifier allows only `CREATE TABLE`, `CREATE INDEX`
 (including `CONCURRENTLY`), `CREATE SCHEMA IF NOT EXISTS`, `GRANT`, and `ALTER
 TABLE ... ADD COLUMN` when the column is nullable or has a constant default. It
-also accepts one narrow inline check on a newly added nullable column:
+also accepts one narrow inline check on a newly added nullable direct built-in
+integer column (`SMALLINT`, `INTEGER`, or `BIGINT`):
 `CHECK (column BETWEEN <numeric literal> AND <numeric literal>)`. The check
 must reference that same unquoted new column exactly and contain no other
-expression. Named or table-level constraints, multiple checks, cross-column
+expression. Domains, user-defined or qualified types, named or table-level
+constraints, multiple checks, cross-column
 checks, functions, subqueries, `OR`, nonliteral bounds, and `NOT NULL` with a
 check are refused, along with drops, renames, type/constraint changes, data
 writes/backfills, functions, triggers, and any SQL it cannot parse into that

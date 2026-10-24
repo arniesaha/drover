@@ -270,6 +270,11 @@ def _literal_numeric(tokens: list[str]) -> bool:
     return len(tokens) == 1 and bool(re.fullmatch(r"\d+(?:\.\d+)?", tokens[0]))
 
 
+def _direct_integer_type(tokens: list[str]) -> bool:
+    """Accept only direct built-in integer types, never domains/user types."""
+    return tokens in (["SMALLINT"], ["INTEGER"], ["BIGINT"])
+
+
 def _safe_inline_column_check(column: str, tokens: list[str]) -> bool:
     """Prove the narrow inline ``column BETWEEN literal AND literal`` form."""
     if (
@@ -403,6 +408,7 @@ def _classify_control_statement(statement: object) -> tuple[bool, str]:
                 definition[index : index + 2] == ["NOT", "NULL"]
                 for index in range(len(definition) - 1)
             )
+            or not _direct_integer_type(definition[:check])
             or not _safe_inline_column_check(column, definition[check + 1 :])
         ):
             return False, "alter_table_add_column_unparsed"

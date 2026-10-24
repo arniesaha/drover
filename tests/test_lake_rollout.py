@@ -294,6 +294,9 @@ def test_control_migration_accepts_nullable_inline_numeric_range_check():
     "statement",
     [
         "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (other_hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour my_not_null_domain CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour public.integer_domain CHECK (hour BETWEEN 0 AND 23)",
+        "ALTER TABLE entries ADD COLUMN hour NUMERIC CHECK (hour BETWEEN 0 AND 23)",
         "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN lower_bound AND 23)",
         "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN 0 AND random())",
         "ALTER TABLE entries ADD COLUMN hour INTEGER CHECK (hour BETWEEN 0 AND 23 OR hour = 99)",
