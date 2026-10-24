@@ -423,8 +423,14 @@ def record_observer_worker_completion(
 
 
 def record_work_coordinator_state(
-    con, *, event_id: str, session_id: str, event_type: str, sequence: int | None,
-    payload: dict | None, received_at: datetime,
+    con,
+    *,
+    event_id: str,
+    session_id: str,
+    event_type: str,
+    sequence: int | None,
+    payload: dict | None,
+    received_at: datetime,
 ) -> str | None:
     """Project explicit coordinator worker states into the same durable inbox.
 
@@ -437,21 +443,38 @@ def record_work_coordinator_state(
     session = _lock_observer_session(con, session_id)
     if session is None or session["handoff_mode"] != "work_coordinator":
         return None
-    run = _row(con, "SELECT run_id FROM factory_observer_runs WHERE session_id = ?", [session_id])
+    run = _row(
+        con,
+        "SELECT run_id FROM factory_observer_runs WHERE session_id = ?",
+        [session_id],
+    )
     if run is None:
         return None
     from drover.server.harness.worker_state import parse_state_line
 
-    body = payload.get("payload") if isinstance(payload, dict) and isinstance(payload.get("payload"), dict) else payload
+    body = (
+        payload.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("payload"), dict)
+        else payload
+    )
     parsed = parse_state_line(body.get("text") if isinstance(body, dict) else None)
-    kinds = {"done": "worker_done", "blocked": "worker_blocked", "needs_approval": "worker_needs_approval"}
+    kinds = {
+        "done": "worker_done",
+        "blocked": "worker_blocked",
+        "needs_approval": "worker_needs_approval",
+    }
     if not parsed or parsed["state"] not in kinds:
         return None
     detail = parsed.get("reason") or parsed.get("sha") or parsed["state"]
     return _record_report(
-        con, run_id=run["run_id"], source="drover-work-coordinator",
-        source_event_id=event_id, subject=session_id, sequence=sequence,
-        kind=kinds[parsed["state"]], summary=f"Worker declared {parsed['state']}: {detail}",
+        con,
+        run_id=run["run_id"],
+        source="drover-work-coordinator",
+        source_event_id=event_id,
+        subject=session_id,
+        sequence=sequence,
+        kind=kinds[parsed["state"]],
+        summary=f"Worker declared {parsed['state']}: {detail}",
         received_at=received_at,
     )
 

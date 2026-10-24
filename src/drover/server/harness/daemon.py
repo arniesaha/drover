@@ -2526,7 +2526,10 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         else:
             factory_launch = None
         if work_continuity is not None and factory_launch is not None:
-            self._write_json({"error": "work continuity cannot use factory observer"}, status=HTTPStatus.BAD_REQUEST)
+            self._write_json(
+                {"error": "work continuity cannot use factory observer"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
             return
         if work_continuity is not None:
             body["_work_coordinator_continuity"] = work_continuity
