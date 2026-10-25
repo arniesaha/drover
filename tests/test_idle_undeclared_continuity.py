@@ -109,10 +109,49 @@ def test_inside_deadline_no_output_declared_or_working_are_skipped(run):
     assert run.store.sweep_idle_undeclared(300) == []  # produced no output
 
 
-def test_declared_terminal_state_is_left_to_the_explicit_projection(run):
-    _turn(run, "result", "Drover-State: done sha=" + "a" * 40)
+def test_missed_declaration_is_reconciled_to_the_explicit_projection_identity(run):
+    sha = "a" * 40
+    _turn(run, "result", "Drover-State: done sha=" + sha)
     _state(run)
-    assert run.store.sweep_idle_undeclared(300) == []
+    assert len(run.store.sweep_idle_undeclared(300)) == 1
+    [report] = _kinds(run)
+    assert report["kind"] == "worker_done"
+    assert report["source"] == "drover-work-coordinator"
+    assert sha in report["summary"]
+    # The late ingest-time projection of the same event is a no-op, not a conflict.
+    from drover.server.harness.continuity import record_work_coordinator_state
+
+    with run.store._transaction() as (con, _):
+        record_work_coordinator_state(
+            con,
+            event_id="harness-w-e3",
+            session_id="harness-w",
+            event_type="assistant_output",
+            sequence=3,
+            payload={"payload": {}, "text": "Drover-State: done sha=" + sha},
+            received_at=T0,
+        )
+    assert len(_kinds(run)) == 1
+
+
+def test_persisted_envelope_with_empty_inner_payload_projects_the_declaration(run):
+    from drover.server.harness.continuity import record_work_coordinator_state
+
+    with run.store._transaction() as (con, _):
+        record_work_coordinator_state(
+            con,
+            event_id="envelope-1",
+            session_id="harness-w",
+            event_type="assistant_output",
+            sequence=5,
+            payload={
+                "payload": {},
+                "text": "findings\nDrover-State: blocked reason=no-key",
+            },
+            received_at=T0,
+        )
+    [report] = _kinds(run)
+    assert report["kind"] == "worker_blocked" and "no-key" in report["summary"]
 
 
 def test_new_idle_turn_is_a_new_fact_and_unauthorized_run_is_ignored(run):
