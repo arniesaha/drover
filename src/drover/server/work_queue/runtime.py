@@ -133,7 +133,15 @@ class HarnessBridge:
     def quota(self):
         from drover.server.mcp.tools import drover_provider_quota
 
-        return drover_provider_quota(duckdb_path=self.collector.duckdb_path)["accounts"]
+        # Queue admission is consequential, so it must not route from a stale
+        # lake projection.  The public quota tool can refresh through the hub's
+        # relay-aware collector transport; use that same path here rather than
+        # its unconfigured direct-fetch fallback.
+        return drover_provider_quota(
+            duckdb_path=self.collector.duckdb_path,
+            fresh=True,
+            fetch=self.collector.fetch_harness_provider_usage,
+        )["accounts"]
 
     def launch(
         self, host, harness, run_key, ref, role, parent, goal_id, *, authority=None
