@@ -228,6 +228,33 @@ def test_hub_only_binding_secret_is_not_a_harness_bearer_token():
     assert host_binding == binding
 
 
+def test_bridge_quota_refreshes_through_collector_transport(monkeypatch, tmp_path):
+    from drover.server.work_queue.runtime import HarnessBridge
+
+    collector = SimpleNamespace(
+        duckdb_path=tmp_path / "control.duckdb",
+        fetch_harness_provider_usage=object(),
+    )
+    bridge = object.__new__(HarnessBridge)
+    bridge.collector = collector
+    calls = []
+
+    def quota(**kwargs):
+        calls.append(kwargs)
+        return {"accounts": [{"provider": "openai"}]}
+
+    monkeypatch.setattr("drover.server.mcp.tools.drover_provider_quota", quota)
+
+    assert bridge.quota() == [{"provider": "openai"}]
+    assert calls == [
+        {
+            "duckdb_path": collector.duckdb_path,
+            "fresh": True,
+            "fetch": collector.fetch_harness_provider_usage,
+        }
+    ]
+
+
 def test_hub_relay_replay_projects_coordinator_state_once(tmp_path):
     path = tmp_path / "control.duckdb"
     bootstrap_control_plane_store(path)
