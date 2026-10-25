@@ -2556,7 +2556,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     "authority_scope",
                     "offset",
                 }:
-                    raise ValueError("authority_scope and offset apply to owner_id only")
+                    raise ValueError(
+                        "authority_scope and offset apply to owner_id only"
+                    )
                 limit = int(params.get("limit", ["20"])[0])
                 if "owner_id" in params:
                     listed_owner = params["owner_id"][0]
