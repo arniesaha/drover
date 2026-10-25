@@ -539,3 +539,33 @@ test("tool takes run_id per call without a fixed runId, but never overrides a fi
   await assert.rejects(tool({ ...f.config, mode: "owner" }).execute("poll", call("poll", { run_id: "run_OTHER" })), /differs from the trusted fixed run/);
   assert.throws(() => tool({ ...sessionConfig, mode: "poll_only" }), /fixed runId is required/);
 });
+
+test("a fixed runId restricts discovery to that run; null run_id means omitted", async (t) => {
+  const f = await fixture(t);
+  f.listing.runs = ["run_OTHER"];
+  const runtime = fakeApi({ ...f.config, mode: "owner", wakePollIntervalMs: 1000 });
+  register(runtime.api);
+  const health = serviceContext(runtime.api.pluginConfig);
+  runtime.services[0].start(health.context);
+  await eventually(() => f.calls.length >= 1);
+  await runtime.services[0].stop(health.context);
+  assert.equal(f.listings.length, 0);
+  assert.ok(f.calls.every((request) => new URL(request.url, "http://x").searchParams.get("run_id") === "run_PLUGIN497"));
+  const polled = await tool({ ...f.config, mode: "owner" }).execute("poll", call("poll", { run_id: null }));
+  assert.equal(polled.details.continuity.run_id, "run_PLUGIN497");
+});
+
+test("session listing pages past a full page and filters by the configured scope", async (t) => {
+  const f = await fixture(t);
+  f.listing.runs = Array.from({ length: 50 }, (_, index) => `run_${index}`);
+  const { runId: _fixed, ...sessionConfig } = f.config;
+  const runtime = fakeApi({ ...sessionConfig, mode: "owner", wakePollIntervalMs: 1000 });
+  register(runtime.api);
+  const health = serviceContext(runtime.api.pluginConfig);
+  runtime.services[0].start(health.context);
+  await eventually(() => f.listings.length >= 5);
+  await runtime.services[0].stop(health.context);
+  const params = new URL(f.listings[1], "http://x").searchParams;
+  assert.equal(params.get("authority_scope"), "implementation");
+  assert.equal(params.get("offset"), "50");
+});

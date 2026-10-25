@@ -53,10 +53,21 @@ function scopedTo(config, runId) {
   return Object.freeze({ ...config, runId });
 }
 
+const LISTING_PAGE = 50;
+const LISTING_PAGES = 5;
+
 async function wakeRunIds(config, signal, assertCurrent) {
-  const listed = await request(config, "GET", { owner_id: config.ownerSessionKey, limit: 20 }, signal, assertCurrent);
-  requireValue(Array.isArray(listed.owner_runs) && listed.owner_runs.every((id) => typeof id === "string" && id.length > 0), "Invalid owner run listing");
-  return [...new Set([...(config.runId ? [config.runId] : []), ...listed.owner_runs])];
+  if (config.runId) return [config.runId]; // A fixed run keeps the pre-0.1.4 single-run binding.
+  const ids = [];
+  for (let page = 0; page < LISTING_PAGES; page++) {
+    const listed = await request(config, "GET", {
+      owner_id: config.ownerSessionKey, authority_scope: config.authorityScope, limit: LISTING_PAGE, offset: page * LISTING_PAGE,
+    }, signal, assertCurrent);
+    requireValue(Array.isArray(listed.owner_runs) && listed.owner_runs.every((id) => typeof id === "string" && id.length > 0), "Invalid owner run listing");
+    ids.push(...listed.owner_runs);
+    if (listed.owner_runs.length < LISTING_PAGE) break;
+  }
+  return [...new Set(ids)];
 }
 
 function waitFor(signal, milliseconds) {
@@ -256,8 +267,8 @@ async function invoke(base, readOnly, payload, signal, assertCurrent) {
   requireValue(validateRequest(payload), "Invalid owner tool request schema");
   safeIntegers(payload);
   const { run_id: requestedRun, ...args } = payload.request;
-  requireValue(requestedRun === undefined || base.runId === undefined || requestedRun === base.runId, "Request run_id differs from the trusted fixed run");
-  const runId = requestedRun ?? base.runId;
+  requireValue(requestedRun == null || base.runId === undefined || requestedRun === base.runId, "Request run_id differs from the trusted fixed run");
+  const runId = requestedRun ?? base.runId; // null means omitted, as in the Python adapter
   requireValue(runId !== undefined, "run_id is required when no fixed runId is bound");
   const config = scopedTo(base, runId);
   requireValue(!readOnly || args.operation === "poll", "Read-only canary permits poll only");

@@ -2546,7 +2546,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if query is not None:
                 params = parse_qs(query, keep_blank_values=True)
                 if (
-                    set(params) - {"run_id", "owner_id", "limit"}
+                    set(params) - {"run_id", "owner_id", "authority_scope", "limit", "offset"}
                     or ("run_id" in params) == ("owner_id" in params)
                     or any(len(values) != 1 for values in params.values())
                 ):
@@ -2555,7 +2555,10 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 if "owner_id" in params:
                     result = {
                         "owner_runs": store.owner_runs(
-                            params["owner_id"][0], limit=limit
+                            params["owner_id"][0],
+                            authority_scope=params.get("authority_scope", [None])[0],
+                            limit=limit,
+                            offset=int(params.get("offset", ["0"])[0]),
                         )
                     }
                 else:

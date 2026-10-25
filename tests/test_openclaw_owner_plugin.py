@@ -510,3 +510,12 @@ def test_run_id_may_ride_a_call_only_when_it_matches_the_trusted_run(node, canar
     assert receipt["continuity"]["run_id"] == RUN
     denied = invoke(node, config, OWNER, [payload("poll", run_id="run_OTHER")])
     assert denied.returncode != 0 and "trusted fixed run" in denied.stderr
+
+
+def test_owner_runs_scope_filter_and_paging(canary):
+    store, _event_id, _config = canary
+    assert store.owner_runs(OWNER_PRINCIPAL, authority_scope="implementation") == [RUN]
+    assert store.owner_runs(OWNER_PRINCIPAL, authority_scope="integration") == []
+    assert store.owner_runs(OWNER_PRINCIPAL, offset=1) == []
+    with pytest.raises(ValueError):
+        store.owner_runs(OWNER_PRINCIPAL, authority_scope="bogus")
