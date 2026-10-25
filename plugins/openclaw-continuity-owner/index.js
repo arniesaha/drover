@@ -55,6 +55,14 @@ function waitFor(signal, milliseconds) {
   });
 }
 
+// A Work-coordinator run is owned by its canonical agent session key; a Factory
+// observer run by the bearer principal. Both are exact, trusted configuration.
+function ownerIdFor(config, status) {
+  return status.owner_handoff?.authorized_owner_id === config.ownerSessionKey
+    ? config.ownerSessionKey
+    : config.ownerPrincipal;
+}
+
 function wakeFingerprint(status) {
   const event = status.next_action?.event_id ?? status.events?.[0]?.event_id;
   return event ? `${status.run_id}:${event}` : null;
@@ -68,18 +76,19 @@ function ownerAgentId(sessionKey) {
 
 async function maintainOwnerLease(config, status, signal, assertCurrent) {
   const owner = status.owner;
-  if (owner.live && owner.id !== config.ownerPrincipal) {
+  const ownerId = ownerIdFor(config, status);
+  if (owner.live && owner.id !== ownerId) {
     throw new Error("Drover continuity run has a competing live owner");
   }
   const leaseUntil = owner.lease_until ? Date.parse(owner.lease_until) : 0;
-  if (owner.live && owner.id === config.ownerPrincipal && leaseUntil - Date.now() > config.ownerLeaseSeconds * 500) {
+  if (owner.live && owner.id === ownerId && leaseUntil - Date.now() > config.ownerLeaseSeconds * 500) {
     return status;
   }
   const leased = await invoke(config, false, {
     version: 1,
     request: {
       operation: "lease",
-      owner_epoch: owner.id === config.ownerPrincipal && owner.epoch > 0 ? owner.epoch : null,
+      owner_epoch: owner.id === ownerId && owner.epoch > 0 ? owner.epoch : null,
       lease_seconds: config.ownerLeaseSeconds,
     },
   }, signal, assertCurrent);
@@ -158,7 +167,7 @@ function reply(raw, config) {
   safeIntegers(result);
   const status = result.continuity;
   requireValue(status.run_id === config.runId && status.authority_scope === config.authorityScope, "Reply differs from trusted run/scope");
-  requireValue(status.owner_handoff.authorized_owner_id === config.ownerPrincipal, "Reply differs from trusted authorized owner");
+  requireValue(status.owner_handoff.authorized_owner_id === ownerIdFor(config, status), "Reply differs from trusted authorized owner");
   requireValue(status.scope_limit === scopes[config.authorityScope], "Reply scope limit is inconsistent");
   checkAction(status.next_action, config.authorityScope);
   checkAction(result.delivery, config.authorityScope);
@@ -220,19 +229,20 @@ async function invoke(config, readOnly, payload, signal, assertCurrent) {
   requireValue(!readOnly || args.operation === "poll", "Read-only canary permits poll only");
   const get = (limit) => request(config, "GET", { run_id: config.runId, limit }, signal, assertCurrent);
   let raw;
+  let ownerId = config.ownerPrincipal;
   if (args.operation === "poll") raw = await get(args.limit ?? 20);
   else {
     if (args.operation !== "initialize") {
       const preflight = await get(1);
       requireValue(!Object.hasOwn(preflight, "delivery") && !Object.hasOwn(preflight, "event_id"), "Status cannot deliver or acknowledge an event");
-      reply(preflight, config); // Immutable scope check before any mutation.
+      ownerId = ownerIdFor(config, reply(preflight, config).continuity); // Immutable scope check before any mutation.
     }
     const body = args.operation === "initialize"
       ? initializeBody(config)
       : { ...args, run_id: config.runId };
     if (body.owner_epoch === null) delete body.owner_epoch;
     if (args.operation === "report") body.source = "openclaw";
-    else if (args.operation !== "initialize") body.owner_id = config.ownerPrincipal;
+    else if (args.operation !== "initialize") body.owner_id = ownerId;
     raw = await request(config, "POST", body, signal, assertCurrent);
   }
   const result = reply(raw, config);
@@ -242,7 +252,7 @@ async function invoke(config, readOnly, payload, signal, assertCurrent) {
     requireValue(result.delivery === null || (status.next_action && actionFields.every((key) => result.delivery[key] === status.next_action[key])), "Delivery differs from the durable action");
   } else requireValue(!Object.hasOwn(raw, "delivery"), "Only consume may deliver an owner action");
   if (["lease", "consume", "acknowledge"].includes(args.operation)) {
-    requireValue(status.owner.id === config.ownerPrincipal && status.owner.live, "Reply no longer carries the trusted live owner");
+    requireValue(status.owner.id === ownerIdFor(config, status) && status.owner.live, "Reply no longer carries the trusted live owner");
     if (args.operation !== "lease") requireValue(status.owner.epoch === args.owner_epoch, "Reply no longer carries the requested owner epoch");
   }
   if (args.operation === "report") requireValue(result.event_id !== null, "Report must return its durable identity");

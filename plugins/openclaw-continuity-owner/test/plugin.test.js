@@ -147,6 +147,36 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
   assert.equal(health.failures.length, 0);
 });
 
+test("a coordinator run authorized to the agent session key is leased and woken as that owner", async (t) => {
+  const bound = (extra = {}) => projection({
+    owner_handoff: { authorized_owner_id: OWNER, state: "owner_lease_required" },
+    ...extra,
+  });
+  const live = bound({
+    owner: { id: OWNER, epoch: 2, lease_until: "2099-10-03T00:00:00+00:00", live: true },
+    events: [{ event_id: EVENT, state: "pending", attempts: 0, next_delivery_at: null,
+      report: { source: "drover-work-coordinator-idle", source_event_id: "worker-1", subject: "worker", sequence: 1,
+        kind: "worker_brief_completed", summary: "idle_undeclared: final output" } },
+      { event_id: "b".repeat(64), state: "pending", attempts: 0, next_delivery_at: null,
+        report: { source: "drover-work-coordinator", source_event_id: "launch:1", subject: "worker", sequence: 0,
+          kind: "worker_started", summary: "Work coordinator launched the bound worker." } }],
+  });
+  const stale = bound({ owner: { id: null, epoch: 1, lease_until: null, live: false }, owner_wake: false });
+  const f = await fixture(t, (req, res, body) => res.end(JSON.stringify({
+    continuity: req.method === "POST" && body.operation === "lease" ? live : stale,
+  })));
+  const ownerConfig = { ...f.config, mode: "owner", wakePollIntervalMs: 1000 };
+  const runtime = fakeApi(f.config);
+  register(runtime.api);
+  const health = serviceContext(ownerConfig);
+  runtime.services[0].start(health.context);
+  await eventually(() => runtime.wakeRequests.length === 1, "owner wake was not dispatched");
+  await runtime.services[0].stop(health.context);
+  assert.equal(f.calls[2].body.operation, "lease");
+  assert.equal(f.calls[2].body.owner_id, OWNER);
+  assert.equal(health.failures.length, 0);
+});
+
 test("wake retries are bounded and durable acknowledgement suppresses replay", async (t) => {
   let polls = 0;
   const pending = projection({ events: [{ event_id: EVENT, state: "pending", attempts: 0, next_delivery_at: null,

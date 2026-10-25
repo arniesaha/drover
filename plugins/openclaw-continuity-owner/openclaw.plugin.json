@@ -1,7 +1,7 @@
 {
   "id": "drover-continuity-owner",
   "name": "Drover Continuity Owner",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Fenced continuity owner transport with exact-session wake dispatch; no executor",
   "configSchema": {
     "type": "object",
