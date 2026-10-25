@@ -1376,3 +1376,64 @@ def test_hub_continuity_requires_coordinator_even_for_observer_credentials(
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_http_coordinator_may_act_only_for_the_runs_bound_agent_owner(bridge, tmp_path):
+    """A Work-coordinator run is owned by an agent key no bearer can equal."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _, _ = bridge
+    bound = "agent:coder:subagent:bound"
+    handoff(store, bound)
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, device_token = credentials.issue(scope="device", label="other")
+    collector = MetricsCollector(
+        duckdb_path=store.path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        auth=AuthSettings(
+            enabled=True,
+            api_token="operator-secret",
+            credentials=credentials,
+            legacy_token_enabled=True,
+        ),
+    )
+    base = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            base,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    lease = {"operation": "lease", "run_id": RUN, "owner_id": bound}
+    try:
+        # An ordinary credential cannot claim the agent owner.
+        assert request(lease, device_token)[0] == 403
+        # The coordinator/operator can, but only for the exact bound owner.
+        other = {**lease, "owner_id": "agent:coder:subagent:other"}
+        assert request(other, "operator-secret")[0] == 403
+        status, payload = request(lease, "operator-secret")
+        assert status == 200
+        assert payload["continuity"]["owner"]["id"] == bound
+    finally:
+        server.shutdown()
+        server.server_close()

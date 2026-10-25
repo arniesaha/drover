@@ -1,6 +1,6 @@
 {
   "name": "@drover/openclaw-continuity-owner",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Inactive-by-default fenced Drover owner tool with exact-session wake dispatch",
   "type": "module",
   "main": "index.js",

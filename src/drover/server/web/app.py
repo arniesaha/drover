@@ -2603,7 +2603,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         body["issued_by"] = self._continuity_handoff_issuer(
                             body.get("session_id")
                         )
-                    elif body.get("owner_id") != principal:
+                    elif body.get(
+                        "owner_id"
+                    ) != principal and not self._coordinator_acts_for_bound_owner(
+                        store, body, principal
+                    ):
                         raise PermissionError(
                             "owner identity does not match bearer credential"
                         )
@@ -2758,6 +2762,27 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError) as exc:
             status, result = 400, {"error": str(exc)}
         self._send(status, "application/json", json.dumps(result) + "\n")
+
+    def _coordinator_acts_for_bound_owner(self, store, body, principal) -> bool:
+        """A Work-coordinator run is owned by a canonical agent session key.
+
+        No bearer principal can equal that key, so only the explicit
+        coordinator/operator principal may act for exactly the owner the run
+        was authorized for at launch; every other caller is still bound to its
+        own credential identity.
+        """
+        owner = body.get("owner_id")
+        if (
+            not isinstance(owner, str)
+            or not owner.startswith("agent:")
+            or principal != self._continuity_coordinator_principal()
+        ):
+            return False
+        try:
+            handoff = store.status(body["run_id"])["owner_handoff"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        return handoff["authorized_owner_id"] == owner
 
     def _continuity_owner_principal(self) -> str | None:
         """Derive the bearer identity; observer handoffs enforce its authority."""
