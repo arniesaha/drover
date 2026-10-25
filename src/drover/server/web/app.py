@@ -2546,7 +2546,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if query is not None:
                 params = parse_qs(query, keep_blank_values=True)
                 if (
-                    set(params) - {"run_id", "owner_id", "authority_scope", "limit", "offset"}
+                    set(params)
+                    - {"run_id", "owner_id", "authority_scope", "limit", "offset"}
                     or ("run_id" in params) == ("owner_id" in params)
                     or any(len(values) != 1 for values in params.values())
                 ):
