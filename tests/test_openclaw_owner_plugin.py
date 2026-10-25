@@ -548,10 +548,10 @@ def test_owner_listing_is_limited_to_the_owner_principal_or_a_coordinator(tmp_pa
         auth=AuthSettings(enabled=True, api_token="", credentials=credentials),
     )
 
-    def get(owner):
+    def get(owner, extra=""):
         request = urllib.request.Request(
             f"http://127.0.0.1:{server.server_address[1]}"
-            f"/harness/factory-observer/continuity?owner_id={owner}",
+            f"/harness/factory-observer/continuity?{extra or 'owner_id=' + owner}",
             headers={"Authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -562,6 +562,10 @@ def test_owner_listing_is_limited_to_the_owner_principal_or_a_coordinator(tmp_pa
         with pytest.raises(urllib.error.HTTPError) as error:
             get(OWNER)
         assert error.value.code == 403
+        for extra in ("offset=1", "authority_scope=implementation"):
+            with pytest.raises(urllib.error.HTTPError) as error:
+                get("", f"run_id={RUN}&{extra}")
+            assert error.value.code == 400
     finally:
         server.shutdown()
         server.server_close()
