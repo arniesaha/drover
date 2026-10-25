@@ -470,3 +470,43 @@ def test_owner_plugin_initialize_preserves_trusted_scope_on_postgres(
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_owner_runs_lists_only_actionable_runs_of_that_authorized_owner(canary):
+    store, _event_id, _config = canary
+    assert store.owner_runs(OWNER_PRINCIPAL) == [RUN]
+    assert store.owner_runs(OWNER) == []
+    with pytest.raises(ValueError):
+        store.owner_runs(OWNER, limit=0)
+
+
+def test_owner_listing_endpoint_is_exclusive_with_run_id_and_session_bound(
+    node, canary
+):
+    import urllib.error
+    import urllib.request
+
+    _store, _event_id, config = canary
+
+    def get(query):
+        request = urllib.request.Request(
+            f"{config['droverOrigin']}/harness/factory-observer/continuity?{query}",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read())
+
+    assert get(f"owner_id={OWNER_PRINCIPAL}") == {"owner_runs": [RUN]}
+    assert get(f"owner_id={OWNER}") == {"owner_runs": []}
+    for query in (f"owner_id={OWNER}&run_id={RUN}", "limit=1"):
+        with pytest.raises(urllib.error.HTTPError) as error:
+            get(query)
+        assert error.value.code == 400
+
+
+def test_run_id_may_ride_a_call_only_when_it_matches_the_trusted_run(node, canary):
+    _store, _event_id, config = canary
+    [receipt] = results(invoke(node, config, OWNER, [payload("poll", run_id=RUN)]))
+    assert receipt["continuity"]["run_id"] == RUN
+    denied = invoke(node, config, OWNER, [payload("poll", run_id="run_OTHER")])
+    assert denied.returncode != 0 and "trusted fixed run" in denied.stderr

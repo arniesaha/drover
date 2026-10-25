@@ -42,6 +42,7 @@ class WireModel(BaseModel):
 
 class Poll(WireModel):
     operation: Literal["poll"]
+    run_id: Id | None = None
     limit: Annotated[int, Field(ge=1, le=50)] = 20
 
 
@@ -51,12 +52,14 @@ class Initialize(WireModel):
 
 class Lease(WireModel):
     operation: Literal["lease"]
+    run_id: Id | None = None
     owner_epoch: Epoch | None = None
     lease_seconds: Annotated[int, Field(ge=1, le=300)] = 60
 
 
 class Report(WireModel):
     operation: Literal["report"]
+    run_id: Id | None = None
     source_event_id: Id
     subject: Id
     sequence: Annotated[int, Field(ge=0, le=2**63 - 1)]
@@ -66,11 +69,13 @@ class Report(WireModel):
 
 class Consume(WireModel):
     operation: Literal["consume"]
+    run_id: Id | None = None
     owner_epoch: Epoch
 
 
 class Acknowledge(WireModel):
     operation: Literal["acknowledge"]
+    run_id: Id | None = None
     owner_epoch: Epoch
     event_id: EventId
     checkpoint: Checkpoint
@@ -285,6 +290,8 @@ class OpenClawOwnerAdapter:
         call = OwnerToolCall.model_validate(payload)
         request = call.request
         context = self.context
+        if getattr(request, "run_id", None) not in (None, context.run_id):
+            raise ValueError("request run_id differs from the trusted owner run")
         if isinstance(request, Poll):
             raw = self.endpoint.get(
                 ENDPOINT, query={"run_id": context.run_id, "limit": request.limit}

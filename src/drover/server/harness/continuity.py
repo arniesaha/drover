@@ -1142,6 +1142,22 @@ class FactoryObserverContinuity:
                 [checkpoint, now, run_id],
             )
 
+    def owner_runs(self, owner_id: str, *, limit: int = 20) -> list[str]:
+        """Run ids with undelivered or unacknowledged work for one authorized owner."""
+        _text(owner_id, "owner_id", 191)
+        _integer(limit, "limit", 1, 50)
+        with self._transaction() as (con, _):
+            rows = con.execute(
+                """SELECT r.run_id FROM factory_observer_runs r
+                WHERE r.authorized_owner_id = ? AND r.authority_scope <> 'deployment'
+                AND (r.next_action_json IS NOT NULL OR EXISTS (
+                    SELECT 1 FROM factory_observer_inbox i WHERE i.run_id = r.run_id
+                    AND i.state IN ('pending', 'delivered')))
+                ORDER BY r.updated_at, r.run_id LIMIT ?""",
+                [owner_id, limit],
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def status(self, run_id: str, *, limit: int = 20) -> dict:
         """Bounded recovery projection; polling neither delivers nor acknowledges."""
         _integer(limit, "limit", 1, 50)

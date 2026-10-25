@@ -31,10 +31,17 @@ function projection(overrides = {}) {
 
 async function fixture(t, handler = (_req, res) => res.end(JSON.stringify({ continuity: projection() }))) {
   const calls = [];
+  const listings = [];
+  const listing = { runs: [] };
   const server = createServer(async (req, res) => {
     const parts = [];
     for await (const chunk of req) parts.push(chunk);
     const body = parts.length ? JSON.parse(Buffer.concat(parts)) : null;
+    if (new URL(req.url, "http://x").searchParams.has("owner_id")) {
+      listings.push(req.url);
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({ owner_runs: listing.runs }));
+    }
     calls.push({ method: req.method, url: req.url, authorization: req.headers.authorization, body });
     res.setHeader("Content-Type", "application/json");
     handler(req, res, body);
@@ -51,7 +58,7 @@ async function fixture(t, handler = (_req, res) => res.end(JSON.stringify({ cont
     tokenEnvName: "DROVER_PLUGIN_TEST_TOKEN", runId: "run_PLUGIN497",
     ownerSessionKey: OWNER, ownerPrincipal: OWNER_PRINCIPAL, canarySessionKey: PARENT, authorityScope: "implementation",
   };
-  return { config, calls, server };
+  return { config, calls, listings, listing, server };
 }
 
 function tool(config, sessionKey = OWNER) {
@@ -90,7 +97,7 @@ test("exposes static tool authoring metadata required by OpenClaw pack", () => {
   assert.deepEqual(metadata, {
     id: "drover-continuity-owner",
     name: "Drover Continuity Owner",
-    description: "Fenced continuity owner transport with exact-session wake dispatch; no executor",
+    description: "Fenced continuity owner transport with exact-session wake dispatch (per owner session); no executor",
     activation: { onStartup: true },
     configSchema: JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8")).configSchema,
     tools: [{
@@ -140,7 +147,7 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
     contextKey: `run_PLUGIN497:${EVENT}`,
   });
   assert.deepEqual(runtime.wakeRequests[0], {
-    source: "other", intent: "immediate", reason: "drover-continuity-owner-wake",
+    source: "hook", intent: "immediate", reason: "hook:drover-continuity-owner-wake",
     agentId: "coder", sessionKey: OWNER, heartbeat: { target: "last" },
   });
   assert.match(runtime.systemEvents[0].text, /acknowledge only after.*durably verified/);
@@ -341,7 +348,7 @@ test("model cannot choose URL, credentials, run, owner, scope, messaging or exec
   const f = await fixture(t);
   const target = tool({ ...f.config, mode: "owner" });
   for (const fields of [{ url: "https://attacker.invalid" }, { token: MODEL_CREDENTIAL },
-    { run_id: "run_OTHER" }, { owner_id: "impostor" }, { authority_scope: "deployment" },
+    { owner_id: "impostor" }, { authority_scope: "deployment" },
     { command: "anything" }, { approve: true }]) {
     await assert.rejects(target.execute("bad", call("poll", fields)), /request schema/);
   }
@@ -467,4 +474,68 @@ test("cancellation stops the read without retry or mutation", async (t) => {
   controller.abort();
   await assert.rejects(tool(f.config).execute("cancelled", call("poll"), controller.signal), /cancelled/);
   assert.equal(f.calls.length, 0);
+});
+
+test("owner mode binds the owner session: wakes every listed run, no fixed runId needed", async (t) => {
+  const runs = { run_A: "a".repeat(64), run_B: "b".repeat(64) };
+  const bound = (runId, extra = {}) => projection({
+    run_id: runId, owner_handoff: { authorized_owner_id: OWNER, state: "owner_lease_required" },
+    owner: { id: OWNER, epoch: 1, lease_until: "2099-10-03T00:00:00+00:00", live: true },
+    events: [{ event_id: runs[runId], state: "pending", attempts: 0, next_delivery_at: null,
+      report: { source: "drover", source_event_id: runId, subject: "worker", sequence: 1,
+        kind: "worker_brief_completed", summary: "Worker completed" } }], ...extra,
+  });
+  const f = await fixture(t, (req, res) => {
+    const runId = new URL(req.url, "http://x").searchParams.get("run_id");
+    res.end(JSON.stringify({ continuity: bound(runId) }));
+  });
+  f.listing.runs = ["run_A", "run_B"];
+  const { runId: _fixed, ...sessionConfig } = f.config;
+  const runtime = fakeApi({ ...sessionConfig, mode: "owner", wakePollIntervalMs: 1000 });
+  register(runtime.api);
+  const health = serviceContext(runtime.api.pluginConfig);
+  runtime.services[0].start(health.context);
+  await eventually(() => runtime.systemEvents.length === 2, "both runs were not woken");
+  await runtime.services[0].stop(health.context);
+  assert.deepEqual(runtime.systemEvents.map((event) => event.options.contextKey).sort(),
+    [`run_A:${runs.run_A}`, `run_B:${runs.run_B}`]);
+  assert.match(runtime.systemEvents[0].text, /standing continuity brief/);
+  assert.equal(runtime.wakeRequests.length, 1);
+  assert.equal(new URL(f.listings[0], "http://x").searchParams.get("owner_id"), OWNER);
+  assert.equal(health.failures.length, 0);
+});
+
+test("a run owned by someone else in the listing is skipped without blocking other runs", async (t) => {
+  const f = await fixture(t, (req, res) => {
+    const runId = new URL(req.url, "http://x").searchParams.get("run_id");
+    res.end(JSON.stringify({ continuity: runId === "run_BAD"
+      ? projection({ run_id: runId, owner_handoff: { authorized_owner_id: "agent:other:main", state: "owner_lease_required" } })
+      : projection({ run_id: runId, owner_handoff: { authorized_owner_id: OWNER, state: "owner_lease_required" },
+        owner: { id: OWNER, epoch: 1, lease_until: "2099-10-03T00:00:00+00:00", live: true },
+        events: [{ event_id: EVENT, state: "pending", attempts: 0, next_delivery_at: null,
+          report: { source: "drover", source_event_id: "w", subject: "worker", sequence: 1,
+            kind: "worker_brief_completed", summary: "Worker completed" } }] }) }));
+  });
+  f.listing.runs = ["run_BAD", "run_GOOD"];
+  const { runId: _fixed, ...sessionConfig } = f.config;
+  const runtime = fakeApi({ ...sessionConfig, mode: "owner", wakePollIntervalMs: 1000 });
+  register(runtime.api);
+  const health = serviceContext(runtime.api.pluginConfig);
+  runtime.services[0].start(health.context);
+  await eventually(() => runtime.systemEvents.length === 1, "good run was not woken");
+  await runtime.services[0].stop(health.context);
+  assert.equal(runtime.systemEvents[0].options.contextKey, `run_GOOD:${EVENT}`);
+  assert.ok(health.failures.some((m) => typeof m === "string" && /run_BAD/.test(m)));
+});
+
+test("tool takes run_id per call without a fixed runId, but never overrides a fixed one", async (t) => {
+  const f = await fixture(t, (req, res) => res.end(JSON.stringify({
+    continuity: projection({ run_id: new URL(req.url, "http://x").searchParams.get("run_id") }) })));
+  const { runId: _fixed, ...sessionConfig } = f.config;
+  const session = tool({ ...sessionConfig, mode: "owner" });
+  const result = await session.execute("poll", call("poll", { run_id: "run_B" }));
+  assert.equal(result.details.continuity.run_id, "run_B");
+  await assert.rejects(session.execute("poll", call("poll")), /run_id is required/);
+  await assert.rejects(tool({ ...f.config, mode: "owner" }).execute("poll", call("poll", { run_id: "run_OTHER" })), /differs from the trusted fixed run/);
+  assert.throws(() => tool({ ...sessionConfig, mode: "poll_only" }), /fixed runId is required/);
 });

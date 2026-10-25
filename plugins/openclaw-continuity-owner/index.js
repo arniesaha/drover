@@ -36,6 +36,7 @@ function configuration(raw) {
     wakeRetryIntervalMs: 60000, ownerLeaseSeconds: 60, ...raw,
   };
   if (config.enabled !== true) return Object.freeze(config);
+  requireValue(config.runId !== undefined || config.mode === "owner", "A fixed runId is required unless owner mode binds the whole owner session");
   requireValue(!config.canarySessionKey || config.canarySessionKey !== config.ownerSessionKey, "Canary and owner session bindings must be distinct");
   requireValue(/^agent:[^:\s]+(?::[^:\s]+)+$/.test(config.ownerSessionKey), "Owner session binding must be a canonical agent session key");
   if (config.canarySessionKey !== undefined) requireValue(/^agent:[^:\s]+(?::[^:\s]+)+$/.test(config.canarySessionKey), "Canary session binding must be a canonical agent session key");
@@ -45,6 +46,17 @@ function configuration(raw) {
   requireValue(!origin.username && !origin.password && !origin.search && !origin.hash && origin.pathname === "/", "Drover origin must contain no credentials, path, query or fragment");
   config.droverOrigin = origin.origin;
   return Object.freeze(config);
+}
+
+// Owner mode binds the owner SESSION; a fixed runId stays optional for older setups.
+function scopedTo(config, runId) {
+  return Object.freeze({ ...config, runId });
+}
+
+async function wakeRunIds(config, signal, assertCurrent) {
+  const listed = await request(config, "GET", { owner_id: config.ownerSessionKey, limit: 20 }, signal, assertCurrent);
+  requireValue(Array.isArray(listed.owner_runs) && listed.owner_runs.every((id) => typeof id === "string" && id.length > 0), "Invalid owner run listing");
+  return [...new Set([...(config.runId ? [config.runId] : []), ...listed.owner_runs])];
 }
 
 function waitFor(signal, milliseconds) {
@@ -102,7 +114,7 @@ function committedServiceConfiguration(ctx) {
 function registerWakeService(api) {
   let controller;
   let running;
-  let lastWake = { fingerprint: null, at: 0 };
+  const wakes = new Map();
   api.registerService({
     id: WAKE_SERVICE_ID,
     reload: { configPrefixes: ["plugins.entries.drover-continuity-owner.config"] },
@@ -115,26 +127,44 @@ function registerWakeService(api) {
       running = (async () => {
         while (!signal.aborted) {
           try {
-            const polled = reply(await request(config, "GET", { run_id: config.runId, limit: 1 }, signal, assertCurrent), config);
-            const status = await maintainOwnerLease(config, polled.continuity, signal, assertCurrent);
-            assertCurrent();
-            const fingerprint = status.owner_wake ? wakeFingerprint(status) : null;
-            if (fingerprint && (lastWake.fingerprint !== fingerprint || Date.now() - lastWake.at >= config.wakeRetryIntervalMs)) {
-              const eventId = fingerprint.slice(fingerprint.lastIndexOf(":") + 1);
-              api.runtime.system.enqueueSystemEvent(
-                `Drover continuity event ${eventId} is pending for trusted run ${config.runId}. ` +
-                "Poll the bound owner tool, consume only with its current fenced epoch, advance only the authorized scoped next action, " +
-                "and acknowledge only after that advancement is durably verified. Never infer terminal release.",
-                { sessionKey: config.ownerSessionKey, contextKey: fingerprint },
-              );
+            const pending = [];
+            for (const runId of await wakeRunIds(config, signal, assertCurrent)) {
+              try {
+                const scoped = scopedTo(config, runId);
+                const polled = reply(await request(scoped, "GET", { run_id: runId, limit: 1 }, signal, assertCurrent), scoped);
+                const status = await maintainOwnerLease(scoped, polled.continuity, signal, assertCurrent);
+                assertCurrent();
+                const fingerprint = status.owner_wake ? wakeFingerprint(status) : null;
+                if (fingerprint) pending.push({ runId, fingerprint });
+                else wakes.delete(runId);
+              } catch (error) {
+                if (signal.aborted) break;
+                ctx.logger.warn(`continuity wake skipped run ${runId}: ${error instanceof Error ? error.message : "unknown error"}`);
+              }
+            }
+            const due = pending.filter(({ runId, fingerprint }) => {
+              const last = wakes.get(runId);
+              return !last || last.fingerprint !== fingerprint || Date.now() - last.at >= config.wakeRetryIntervalMs;
+            });
+            if (due.length > 0) {
               assertCurrent();
+              for (const { runId, fingerprint } of due) {
+                const eventId = fingerprint.slice(fingerprint.lastIndexOf(":") + 1);
+                api.runtime.system.enqueueSystemEvent(
+                  `Drover continuity event ${eventId} is pending for trusted run ${runId}. ` +
+                  "Read your standing continuity brief, poll the bound owner tool with this run_id, consume only with its current fenced epoch, advance only the authorized scoped next action, " +
+                  "and acknowledge only after that advancement is durably verified. Never infer terminal release.",
+                  { sessionKey: config.ownerSessionKey, contextKey: fingerprint },
+                );
+                wakes.set(runId, { fingerprint, at: Date.now() });
+              }
+              // source "hook" is what the heartbeat policy treats as a wake payload; "other" is dropped.
               api.runtime.system.requestHeartbeat({
-                source: "other", intent: "immediate", reason: "drover-continuity-owner-wake",
+                source: "hook", intent: "immediate", reason: "hook:drover-continuity-owner-wake",
                 agentId: ownerAgentId(config.ownerSessionKey), sessionKey: config.ownerSessionKey,
                 heartbeat: { target: "last" },
               });
-              lastWake = { fingerprint, at: Date.now() };
-            } else if (!fingerprint) lastWake = { fingerprint: null, at: 0 };
+            }
             ctx.serviceHealth?.clearFailure();
           } catch (error) {
             if (!signal.aborted) {
@@ -222,10 +252,14 @@ async function request(config, method, data, signal, assertCurrent) {
   }
 }
 
-async function invoke(config, readOnly, payload, signal, assertCurrent) {
+async function invoke(base, readOnly, payload, signal, assertCurrent) {
   requireValue(validateRequest(payload), "Invalid owner tool request schema");
   safeIntegers(payload);
-  const args = payload.request;
+  const { run_id: requestedRun, ...args } = payload.request;
+  requireValue(requestedRun === undefined || base.runId === undefined || requestedRun === base.runId, "Request run_id differs from the trusted fixed run");
+  const runId = requestedRun ?? base.runId;
+  requireValue(runId !== undefined, "run_id is required when no fixed runId is bound");
+  const config = scopedTo(base, runId);
   requireValue(!readOnly || args.operation === "poll", "Read-only canary permits poll only");
   const get = (limit) => request(config, "GET", { run_id: config.runId, limit }, signal, assertCurrent);
   let raw;
