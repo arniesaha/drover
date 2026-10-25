@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.38] - 2026-10-25
+
+### Fixed
+
+- Work-coordinator workers' `Drover-State: done|blocked|needs-approval` declarations now reach the continuity ledger: the persisted event envelope keeps the message in `text` beside an empty `payload`, which the projection previously missed. The idle sweep also reconciles any declaration that ingest missed (#816).
+
 ## [0.6.37] - 2026-10-25
 
 ### Fixed
