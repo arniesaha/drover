@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.36] - 2026-10-24
+
+### Fixed
+
+- A bound Work-coordinator worker that finishes and idles at `awaiting: input` without a `Drover-State` line now wakes its owner after `work_queue.idle_undeclared_seconds` (default 300) with its final output attached as an `idle_undeclared` continuity fact; the worker brief now says to put the result before the state line (#810).
+
 ## [0.6.35] - 2026-10-24
 
 ### Fixed
