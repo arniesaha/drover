@@ -147,7 +147,8 @@ function registerWakeService(api) {
           try {
             const pending = [];
             const listed = await wakeRunIds(config, signal, assertCurrent, ctx.logger);
-            for (const known of wakes.keys()) if (!listed.includes(known)) wakes.delete(known);
+            const present = new Set(listed);
+            for (const known of wakes.keys()) if (!present.has(known)) wakes.delete(known);
             for (const runId of listed) {
               try {
                 const scoped = scopedTo(config, runId);
