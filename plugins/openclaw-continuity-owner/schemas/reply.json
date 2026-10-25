@@ -288,8 +288,12 @@
       "properties": {
         "kind": {
           "enum": [
+            "worker_started",
             "worker_awaiting_input",
             "worker_brief_completed",
+            "worker_done",
+            "worker_blocked",
+            "worker_needs_approval",
             "ci_red",
             "ci_green"
           ],

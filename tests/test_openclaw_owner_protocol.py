@@ -446,3 +446,26 @@ def test_descriptor_has_versioned_object_schema_but_does_not_register_runtime():
         "consume",
         "acknowledge",
     }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "worker_started",
+        "worker_done",
+        "worker_blocked",
+        "worker_needs_approval",
+        "worker_brief_completed",
+    ],
+)
+def test_inbox_accepts_every_hub_projected_worker_kind(kind):
+    from drover.server.harness.openclaw_owner import InboxReport
+
+    InboxReport(
+        source="drover-work-coordinator",
+        source_event_id="e1",
+        subject="harness-1",
+        sequence=0,
+        kind=kind,
+        summary="projected fact",
+    )
