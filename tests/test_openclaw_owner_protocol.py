@@ -446,3 +446,49 @@ def test_descriptor_has_versioned_object_schema_but_does_not_register_runtime():
         "consume",
         "acknowledge",
     }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "worker_started",
+        "worker_done",
+        "worker_blocked",
+        "worker_needs_approval",
+        "worker_brief_completed",
+    ],
+)
+def test_inbox_accepts_every_hub_projected_worker_kind(kind):
+    from drover.server.harness.openclaw_owner import InboxReport
+
+    InboxReport(
+        source="drover-work-coordinator",
+        source_event_id="e1",
+        subject="harness-1",
+        sequence=0,
+        kind=kind,
+        summary="projected fact",
+    )
+
+
+@pytest.mark.parametrize(
+    "kind,action",
+    [
+        ("worker_started", "observe_worker_start"),
+        ("worker_done", "review_worker_result"),
+        ("worker_blocked", "resolve_worker_block"),
+        ("worker_needs_approval", "request_approved_gate"),
+    ],
+)
+def test_hub_projected_worker_facts_poll_consume_and_ack(make_harness, kind, action):
+    harness, endpoint, _ = make_harness()
+    epoch = harness.call("lease")["continuity"]["owner"]["epoch"]
+    # The hub (not the owner tool) writes these; the owner must still read them.
+    event_id = endpoint.store().report(RUN, **worker_report(kind), source="hub")
+    assert harness.call("poll")["continuity"]["owner_wake"]
+    delivery = harness.call("consume", owner_epoch=epoch)["delivery"]
+    assert delivery["type"] == action and delivery["event_id"] == event_id
+    reply = harness.call(
+        "acknowledge", owner_epoch=epoch, event_id=event_id, checkpoint="decided"
+    )
+    assert reply["continuity"]["worker_state"] == kind.removeprefix("worker_")

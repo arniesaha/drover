@@ -21,6 +21,19 @@ Checkpoint = Annotated[str, Field(min_length=1, max_length=4000, pattern=r"\S")]
 EventId = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
 Epoch = Annotated[int, Field(ge=1)]
 Kind = Literal["worker_awaiting_input", "worker_brief_completed", "ci_red", "ci_green"]
+# The owner only reports the kinds above, but its inbox also carries the
+# hub-projected worker facts (launch and explicit Drover-State declarations).
+# A reply schema that rejects them fails the whole poll, so the owner never wakes.
+InboxKind = Literal[
+    "worker_started",
+    "worker_awaiting_input",
+    "worker_brief_completed",
+    "worker_done",
+    "worker_blocked",
+    "worker_needs_approval",
+    "ci_red",
+    "ci_green",
+]
 
 
 class WireModel(BaseModel):
@@ -75,8 +88,11 @@ class OwnerAction(WireModel):
     action_id: str
     event_id: EventId
     type: Literal[
+        "observe_worker_start",
         "request_input",
         "review_worker_result",
+        "resolve_worker_block",
+        "request_approved_gate",
         "correct_ci",
         "review_ci",
         "review_late_report",
@@ -136,7 +152,7 @@ class InboxReport(WireModel):
     source_event_id: Id
     subject: Id
     sequence: Annotated[int, Field(ge=0, le=2**63 - 1)]
-    kind: Kind
+    kind: InboxKind
     summary: Annotated[str, Field(min_length=1, max_length=2000)]
 
 
@@ -160,7 +176,15 @@ class ContinuityProjection(WireModel):
     scope_limit: Literal["commit_only", "publish_review", "explicit_approval_required"]
     owner_handoff: OwnerHandoff
     owner: OwnerLease
-    worker_state: Literal["unknown", "awaiting_input", "brief_completed"]
+    worker_state: Literal[
+        "unknown",
+        "started",
+        "awaiting_input",
+        "brief_completed",
+        "done",
+        "blocked",
+        "needs_approval",
+    ]
     terminal_release: Literal[False]
     next_action: OwnerAction | None
     recovery: Literal[

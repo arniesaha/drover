@@ -202,8 +202,12 @@
         "worker_state": {
           "enum": [
             "unknown",
+            "started",
             "awaiting_input",
-            "brief_completed"
+            "brief_completed",
+            "done",
+            "blocked",
+            "needs_approval"
           ],
           "title": "Worker State",
           "type": "string"
@@ -288,8 +292,12 @@
       "properties": {
         "kind": {
           "enum": [
+            "worker_started",
             "worker_awaiting_input",
             "worker_brief_completed",
+            "worker_done",
+            "worker_blocked",
+            "worker_needs_approval",
             "ci_red",
             "ci_green"
           ],
@@ -368,8 +376,11 @@
         },
         "type": {
           "enum": [
+            "observe_worker_start",
             "request_input",
             "review_worker_result",
+            "resolve_worker_block",
+            "request_approved_gate",
             "correct_ci",
             "review_ci",
             "review_late_report",
