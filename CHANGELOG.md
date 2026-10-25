@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.39] - 2026-10-25
+
+### Added
+
+- Continuity owner plugin 0.1.4 binds the owner SESSION: `GET /harness/factory-observer/continuity?owner_id=` lists an owner's actionable runs (optional `authority_scope`, `limit`, `offset`), the plugin wakes for any run whose `authorized_owner_id` equals `ownerSessionKey`, and tool calls may carry `run_id`. The wake uses heartbeat `source: "hook"` so OpenClaw does not drop it.
+
 ## [0.6.38] - 2026-10-25
 
 ### Fixed
