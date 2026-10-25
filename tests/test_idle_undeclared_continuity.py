@@ -155,3 +155,28 @@ def test_brief_tells_workers_how_to_declare_and_what_happens_otherwise():
 
     assert "Drover-State: done sha=<40-hex>" in STATE_CONTRACT
     assert "idle_undeclared" in STATE_CONTRACT
+
+
+def test_scan_stops_at_the_newest_user_turn_with_mixed_null_sequences(run):
+    with run.store._transaction() as (con, _):
+        _event(con, "harness-w", 1, "assistant_output", "old turn answer", T0)
+        con.execute(
+            "INSERT INTO harness_events (event_id, session_id, event_type, "
+            "payload_json, created_at, seq) VALUES ('null-user', 'harness-w', "
+            "'user_input', '{\"text\": \"next\"}', ?, NULL)",
+            [T0 + timedelta(seconds=5)],
+        )
+        # Many outputs from the new turn must not hide its boundary.
+        for seq in range(2, 260):
+            _event(
+                con,
+                "harness-w",
+                seq,
+                "assistant_output",
+                f"chunk {seq}",
+                T0 + timedelta(seconds=10 + seq),
+            )
+    _state(run)
+    [event_id] = run.store.sweep_idle_undeclared(300)
+    [report] = _kinds(run)
+    assert "chunk 259" in report["summary"] and "old turn" not in report["summary"]

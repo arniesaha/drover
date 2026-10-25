@@ -502,8 +502,7 @@ def _final_turn_output(con, session_id: str) -> tuple[str, int, str] | None:
                    {event_payload_expression(con)} AS payload_json
               FROM harness_events e {event_payload_join(con)}
              WHERE e.session_id = ? AND e.event_type IN ('assistant_output', 'user_input')
-             ORDER BY CASE WHEN e.seq IS NULL THEN 0 ELSE 1 END DESC,
-                      e.seq DESC, e.created_at DESC, e.event_id DESC
+             ORDER BY e.created_at DESC, e.seq DESC, e.event_id DESC
              LIMIT {_IDLE_EVENT_SCAN}""",
         [session_id],
     ).fetchall()
@@ -546,7 +545,7 @@ def sweep_idle_undeclared(
     """
     _integer(deadline_seconds, "deadline_seconds", 1, 7 * 24 * 3600)
     cutoff = now - timedelta(seconds=deadline_seconds)
-    lock = " FOR UPDATE OF r SKIP LOCKED" if is_postgres_connection(con) else ""
+    lock = " FOR UPDATE OF s, r SKIP LOCKED" if is_postgres_connection(con) else ""
     placeholders = ", ".join("?" for _ in _ENDED)
     candidates = con.execute(
         f"""SELECT s.session_id, r.run_id

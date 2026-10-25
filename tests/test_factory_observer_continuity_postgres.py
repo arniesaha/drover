@@ -1167,3 +1167,50 @@ def test_retry_pool_restart_persistence_and_bounded_exhaustion(pg_bridge):
     assert recovered.status(RUN)["checkpoint"] == "Recovered checkpoint"
     assert recovered.status(RUN)["inbox_counts"] == {"acknowledged": 1}
     assert recovered.consume(RUN, **fence) is None
+
+
+def test_idle_undeclared_sweep_concurrent_sweepers_report_once(pg_control_path):
+    now = datetime(2026, 10, 25, 5, tzinfo=timezone.utc)
+    HarnessRegistry(pg_control_path).create_session(
+        session_id="pg-idle",
+        host_id="studio",
+        harness="agy",
+        command="agy",
+        status="running",
+        handoff_mode="work_coordinator",
+        source_session_id="work/work-pg-idle@0",
+    )
+    store = FactoryObserverContinuity(pg_control_path, clock=lambda: now)
+    run_id = store.initialize(
+        session_id="pg-idle",
+        objective="review",
+        checkpoint="launched",
+        authorized_owner_id="agent:coder:subagent:owner",
+    )
+    with store._transaction() as (con, _):
+        con.execute(
+            "UPDATE harness_sessions SET awaiting = 'input', last_activity = ? "
+            "WHERE session_id = 'pg-idle'",
+            [now - timedelta(minutes=10)],
+        )
+        for seq, (kind, text) in enumerate(
+            (("user_input", "go"), ("assistant_output", "final review"))
+        ):
+            con.execute(
+                """INSERT INTO harness_events
+                   (event_id, session_id, event_type, payload_json, created_at, seq)
+                   VALUES (?, 'pg-idle', ?, ?, ?, ?)""",
+                [
+                    f"pg-idle-{seq}",
+                    kind,
+                    json.dumps({"text": text}),
+                    now - timedelta(minutes=10, seconds=-seq),
+                    seq,
+                ],
+            )
+    with ThreadPoolExecutor(4) as pool:
+        results = list(pool.map(lambda _: store.sweep_idle_undeclared(300), range(4)))
+    assert sum(len(ids) for ids in results) == 1
+    [event] = store.status(run_id)["events"]
+    assert event["report"]["source"] == continuity.IDLE_SOURCE
+    assert "final review" in event["report"]["summary"]
