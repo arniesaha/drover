@@ -267,6 +267,9 @@ class WorkQueueConfig(Model):
     rules: WorkItemRulesConfig = Field(default_factory=WorkItemRulesConfig)
     github_approvals: GitHubApprovalConfig = Field(default_factory=GitHubApprovalConfig)
     execution: QueueExecutionConfig = Field(default_factory=QueueExecutionConfig)
+    # A bound worker idle at awaiting:input with output but no declared state
+    # wakes its owner after this many seconds (continuity owner goals only).
+    idle_undeclared_seconds: int = Field(default=300, ge=30, le=86400)
 
     @model_validator(mode="after")
     def valid(self):

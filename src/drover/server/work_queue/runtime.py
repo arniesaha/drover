@@ -2,6 +2,8 @@
 
 import hmac
 import json
+import logging
+import threading
 
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
@@ -13,6 +15,8 @@ from drover.server.web.auth import bearer_credential
 from .github import GitHubProvider
 from .service import SYSTEMIC_COMMENT, WorkActor, WorkService
 from .store import WorkStore
+
+log = logging.getLogger(__name__)
 
 
 class HarnessBridge:
@@ -276,6 +280,47 @@ def start_queue_execution_worker(collector, config, shutdown_event):
     worker = QueueExecutionWorker(service)
     worker.start(shutdown_event)
     collector.work_queue_execution_worker = worker
+    return worker
+
+
+class IdleUndeclaredWorker:
+    """Polls for workers that went idle without a declared state (#785)."""
+
+    def __init__(self, path, deadline_seconds, *, interval=30.0, clock=None):
+        from drover.server.harness.continuity import FactoryObserverContinuity
+
+        self.store = FactoryObserverContinuity(path, clock=clock)
+        self.deadline_seconds = deadline_seconds
+        self.interval = interval
+        self._stop = threading.Event()
+
+    def process_once(self) -> int:
+        return len(self.store.sweep_idle_undeclared(self.deadline_seconds))
+
+    def start(self, shutdown_event):
+        def run():
+            while not self._stop.is_set() and not shutdown_event.is_set():
+                try:
+                    self.process_once()
+                except Exception:  # noqa: BLE001 - the next pass retries
+                    log.exception("idle-undeclared continuity sweep failed")
+                self._stop.wait(self.interval)
+
+        threading.Thread(target=run, name="idle-undeclared", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def start_idle_undeclared_worker(collector, config, shutdown_event):
+    """Only goals that opted into an owner get idle-worker wakes."""
+    if getattr(collector, "work_control", None) is None or not any(
+        g.continuity_owner_id for g in config.goals
+    ):
+        return None
+    worker = IdleUndeclaredWorker(collector.duckdb_path, config.idle_undeclared_seconds)
+    worker.start(shutdown_event)
+    collector.idle_undeclared_worker = worker
     return worker
 
 
