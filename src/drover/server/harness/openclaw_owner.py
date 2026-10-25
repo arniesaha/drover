@@ -88,8 +88,11 @@ class OwnerAction(WireModel):
     action_id: str
     event_id: EventId
     type: Literal[
+        "observe_worker_start",
         "request_input",
         "review_worker_result",
+        "resolve_worker_block",
+        "request_approved_gate",
         "correct_ci",
         "review_ci",
         "review_late_report",
@@ -173,7 +176,15 @@ class ContinuityProjection(WireModel):
     scope_limit: Literal["commit_only", "publish_review", "explicit_approval_required"]
     owner_handoff: OwnerHandoff
     owner: OwnerLease
-    worker_state: Literal["unknown", "awaiting_input", "brief_completed"]
+    worker_state: Literal[
+        "unknown",
+        "started",
+        "awaiting_input",
+        "brief_completed",
+        "done",
+        "blocked",
+        "needs_approval",
+    ]
     terminal_release: Literal[False]
     next_action: OwnerAction | None
     recovery: Literal[
