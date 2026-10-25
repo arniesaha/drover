@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.37] - 2026-10-25
+
+### Fixed
+
+- A Work-coordinator run authorized to a canonical agent session key can now be leased, woken, consumed and acknowledged: only the coordinator/operator principal may act, and only for exactly the run's bound owner. Owner plugin 0.1.2/0.1.3 also accept the hub-projected worker kinds (`worker_started`, `worker_done`, `worker_blocked`, `worker_needs_approval`) in its inbox reply, which previously failed the whole poll (#813, #814).
+
 ## [0.6.36] - 2026-10-24
 
 ### Fixed
