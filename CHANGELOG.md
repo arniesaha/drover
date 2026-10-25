@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.35] - 2026-10-24
+
+### Fixed
+
+- Continuity re-decisions reuse their already-fenced wake instead of failing on divergent delivery payloads, and WorkQueue refreshes capacity before routing a launch so newly available quota is honored (#806, #807).
+
+
 ## [0.6.34] - 2026-10-24
 
 ### Added
