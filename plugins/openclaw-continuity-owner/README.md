@@ -238,3 +238,15 @@ No core issue is asserted. A real failure report must include parent runtime
 version, registration/loading diagnostics, existing authorized tool discovery,
 normal invocation/result and session-message traces with secrets removed. Child
 catalog absence alone does not qualify.
+
+## 0.1.4: owner-session binding
+
+In `owner` mode the wake service binds the owner SESSION, not a single run. Each
+cycle it asks the hub for `GET /harness/factory-observer/continuity?owner_id=<ownerSessionKey>`
+(runs whose `authorized_owner_id` equals the session key and that hold pending or
+unacknowledged work), leases and wakes per run, and sends the wake with
+`source: "hook"` so OpenClaw's heartbeat policy treats it as a wake payload
+(`source: "other"` is dropped as `empty-heartbeat-file`). `runId` is optional and
+kept for backward compatibility; tool calls may carry `run_id`, which must equal a
+fixed `runId` when one is configured. The hub sets `authorized_owner_id` at launch
+from the goal's `continuity_owner_id`, so no database rebind is needed.

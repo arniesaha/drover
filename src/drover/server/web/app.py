@@ -2546,16 +2546,26 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if query is not None:
                 params = parse_qs(query, keep_blank_values=True)
                 if (
-                    set(params) - {"run_id", "limit"}
-                    or "run_id" not in params
+                    set(params)
+                    - {"run_id", "owner_id", "authority_scope", "limit", "offset"}
+                    or ("run_id" in params) == ("owner_id" in params)
                     or any(len(values) != 1 for values in params.values())
                 ):
-                    raise ValueError("run_id and optional limit are required")
-                result = {
-                    "continuity": store.status(
-                        params["run_id"][0], limit=int(params.get("limit", ["20"])[0])
-                    )
-                }
+                    raise ValueError("exactly one of run_id or owner_id is required")
+                limit = int(params.get("limit", ["20"])[0])
+                if "owner_id" in params:
+                    result = {
+                        "owner_runs": store.owner_runs(
+                            params["owner_id"][0],
+                            authority_scope=params.get("authority_scope", [None])[0],
+                            limit=limit,
+                            offset=int(params.get("offset", ["0"])[0]),
+                        )
+                    }
+                else:
+                    result = {
+                        "continuity": store.status(params["run_id"][0], limit=limit)
+                    }
             else:
                 length = int(self.headers.get("Content-Length") or "0")
                 if not 0 < length <= 16384:

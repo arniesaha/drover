@@ -290,7 +290,6 @@ def test_trusted_scope_is_preserved_without_automatic_release(
         {"operation": "consume", "owner_epoch": "1"},
         {"operation": "consume", "owner_epoch": True},
         {"operation": "consume", "owner_epoch": 1, "authority_scope": "deployment"},
-        {"operation": "poll", "run_id": "run_OTHER"},
         {
             "operation": "acknowledge",
             "owner_epoch": 1,
@@ -492,3 +491,13 @@ def test_hub_projected_worker_facts_poll_consume_and_ack(make_harness, kind, act
         "acknowledge", owner_epoch=epoch, event_id=event_id, checkpoint="decided"
     )
     assert reply["continuity"]["worker_state"] == kind.removeprefix("worker_")
+
+
+def test_foreign_run_id_never_reaches_transport(make_harness):
+    harness, endpoint, _ = make_harness()
+    with pytest.raises(ValueError, match="trusted owner run"):
+        harness.invoke_tool(
+            TOOL_NAME,
+            {"version": 1, "request": {"operation": "poll", "run_id": "run_OTHER"}},
+        )
+    assert endpoint.calls == []

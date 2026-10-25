@@ -1142,6 +1142,35 @@ class FactoryObserverContinuity:
                 [checkpoint, now, run_id],
             )
 
+    def owner_runs(
+        self,
+        owner_id: str,
+        *,
+        authority_scope: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[str]:
+        """Run ids with undelivered or unacknowledged work for one authorized owner."""
+        _text(owner_id, "owner_id", 191)
+        _integer(limit, "limit", 1, 50)
+        _integer(offset, "offset", 0, 10_000)
+        if authority_scope is not None and authority_scope not in SCOPES:
+            raise ValueError("unknown authority_scope")
+        with self._transaction() as (con, _):
+            scope_filter = "AND r.authority_scope = ?" if authority_scope else ""
+            args = [owner_id, *filter(None, [authority_scope]), limit, offset]
+            rows = con.execute(
+                f"""SELECT r.run_id FROM factory_observer_runs r
+                WHERE r.authorized_owner_id = ? AND r.authority_scope <> 'deployment'
+                {scope_filter}
+                AND (r.next_action_json IS NOT NULL OR EXISTS (
+                    SELECT 1 FROM factory_observer_inbox i WHERE i.run_id = r.run_id
+                    AND i.state IN ('pending', 'delivered')))
+                ORDER BY r.updated_at, r.run_id LIMIT ? OFFSET ?""",
+                args,
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def status(self, run_id: str, *, limit: int = 20) -> dict:
         """Bounded recovery projection; polling neither delivers nor acknowledges."""
         _integer(limit, "limit", 1, 50)

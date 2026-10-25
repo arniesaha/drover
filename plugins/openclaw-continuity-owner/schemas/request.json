@@ -24,6 +24,21 @@
           "minimum": 1,
           "title": "Owner Epoch",
           "type": "integer"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
         }
       },
       "required": [
@@ -47,6 +62,21 @@
           "minimum": 1,
           "title": "Owner Epoch",
           "type": "integer"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
         }
       },
       "required": [
@@ -98,6 +128,21 @@
           ],
           "default": null,
           "title": "Owner Epoch"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
         }
       },
       "required": [
@@ -120,6 +165,21 @@
           "const": "poll",
           "title": "Operation",
           "type": "string"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
         }
       },
       "required": [
@@ -145,6 +205,21 @@
           "const": "report",
           "title": "Operation",
           "type": "string"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
         },
         "sequence": {
           "maximum": 9223372036854775807,
