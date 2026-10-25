@@ -31,7 +31,9 @@ STATE_CONTRACT = (
     "End every turn with exactly one line: `Drover-State: done sha=<40-hex>`, "
     "`Drover-State: blocked reason=<why>`, "
     "`Drover-State: needs-approval gate=<pr|merge|rollout|canary|human> reason=<why>` "
-    "or `Drover-State: working`. Idling without it counts as a stall."
+    "or `Drover-State: working`. Put your final result in that same message, "
+    "before the line. Stopping without it is reported to your owner as "
+    "`idle_undeclared` after a few minutes."
 )
 
 _LINE = re.compile(r"^\s*[-*]?\s*`?drover-state\s*:\s*(.+?)`?\s*$", re.I | re.M)

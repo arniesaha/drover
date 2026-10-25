@@ -479,6 +479,122 @@ def record_work_coordinator_state(
     )
 
 
+IDLE_SOURCE = "drover-work-coordinator-idle"
+DEFAULT_IDLE_UNDECLARED_SECONDS = 300
+_IDLE_SWEEP_LIMIT = 50
+_IDLE_EVENT_SCAN = 200
+_IDLE_EXCERPT = 1200
+_DECLARED_TERMINAL = frozenset({"done", "blocked", "needs_approval"})
+_ENDED = ("completed", "terminated", "errored", "failed")
+
+
+def _final_turn_output(con, session_id: str) -> tuple[str, int, str] | None:
+    """Event id, sequence and text of the last output of the current turn.
+
+    None when the turn produced no final output, or when the worker already
+    declared done/blocked/needs-approval (the explicit projection owns that).
+    """
+    from drover.server.harness.events import is_text_stream_delta
+    from drover.server.harness.worker_state import _message_text, parse_state_line
+
+    rows = con.execute(
+        f"""SELECT e.event_id, e.event_type, e.seq,
+                   {event_payload_expression(con)} AS payload_json
+              FROM harness_events e {event_payload_join(con)}
+             WHERE e.session_id = ? AND e.event_type IN ('assistant_output', 'user_input')
+             ORDER BY e.created_at DESC, e.seq DESC, e.event_id DESC
+             LIMIT {_IDLE_EVENT_SCAN}""",
+        [session_id],
+    ).fetchall()
+    final = None
+    for event_id, event_type, seq, payload_json in rows:
+        if event_type == "user_input":
+            break
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or is_text_stream_delta(payload):
+            continue
+        text = _message_text(payload)
+        if not text or not text.strip():
+            continue
+        parsed = parse_state_line(text)
+        if parsed and parsed["state"] in _DECLARED_TERMINAL:
+            return None
+        if final is None:
+            final = (str(event_id), seq if type(seq) is int and seq >= 0 else 0, text)
+    return final
+
+
+def sweep_idle_undeclared(
+    con,
+    *,
+    now: datetime,
+    deadline_seconds: int = DEFAULT_IDLE_UNDECLARED_SECONDS,
+    limit: int = _IDLE_SWEEP_LIMIT,
+) -> list[str]:
+    """Return the new report ids for workers idle at ``awaiting: input`` that never declared a state.
+
+    Real workers routinely finish and stop without a ``Drover-State`` line. Once
+    such a worker has produced output and been idle for the deadline, one
+    ``worker_brief_completed`` fact carrying its final output wakes the bound
+    owner, who decides done or blocked. The identity is the worker's last output
+    event, so repeated sweeps and replays are no-ops while a new turn that ends
+    idle again is a new fact. Runs inside the caller's transaction.
+    """
+    _integer(deadline_seconds, "deadline_seconds", 1, 7 * 24 * 3600)
+    cutoff = now - timedelta(seconds=deadline_seconds)
+    lock = " FOR UPDATE OF s, r SKIP LOCKED" if is_postgres_connection(con) else ""
+    placeholders = ", ".join("?" for _ in _ENDED)
+    candidates = con.execute(
+        f"""SELECT s.session_id, r.run_id
+              FROM harness_sessions s
+              JOIN factory_observer_runs r ON r.session_id = s.session_id
+             WHERE s.handoff_mode = 'work_coordinator' AND s.awaiting = 'input'
+               AND s.status NOT IN ({placeholders})
+               AND s.last_activity <= ?
+               AND r.authorized_owner_id IS NOT NULL
+             ORDER BY s.last_activity, s.session_id
+             LIMIT ?{lock}""",
+        [*_ENDED, cutoff, limit],
+    ).fetchall()
+    recorded = []
+    for session_id, run_id in candidates:
+        final = _final_turn_output(con, str(session_id))
+        if final is None:
+            continue
+        source_event_id, sequence, text = final
+        if _row(
+            con,
+            "SELECT 1 AS present FROM factory_observer_inbox WHERE event_id = ?",
+            [_report_event_id(run_id, IDLE_SOURCE, source_event_id)],
+        ):
+            continue
+        excerpt = " ".join(text.split())[:_IDLE_EXCERPT]
+        try:
+            recorded.append(
+                _record_report(
+                    con,
+                    run_id=run_id,
+                    source=IDLE_SOURCE,
+                    source_event_id=source_event_id,
+                    subject=str(session_id),
+                    sequence=sequence,
+                    kind="worker_brief_completed",
+                    summary=(
+                        f"idle_undeclared: worker idle at awaiting:input for "
+                        f"{deadline_seconds}s without declaring done, blocked or "
+                        f"needs-approval. Decide which from its final output: {excerpt}"
+                    ),
+                    received_at=now,
+                )
+            )
+        except ContinuityConflict:
+            continue
+    return recorded
+
+
 def record_observer_worker_completion_batch(con, records: list[dict]) -> dict[str, int]:
     """Project one bounded batch in source order using the caller transaction."""
     if len(records) > MAX_COMPLETION_PROJECTION_BATCH:
@@ -590,6 +706,15 @@ class FactoryObserverContinuity:
             except Exception:
                 con.execute("ROLLBACK")
                 raise
+
+    def sweep_idle_undeclared(
+        self, deadline_seconds: int = DEFAULT_IDLE_UNDECLARED_SECONDS
+    ) -> list[str]:
+        """One bounded sweep; see :func:`sweep_idle_undeclared`."""
+        with self._transaction() as (con, _):
+            return sweep_idle_undeclared(
+                con, now=self.clock(), deadline_seconds=deadline_seconds
+            )
 
     def initialize(
         self,
