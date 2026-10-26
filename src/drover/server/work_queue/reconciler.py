@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timezone
@@ -12,6 +13,9 @@ from datetime import datetime, timezone
 from .config import WorkQueueConfig, load_policy
 from .github import GitHubProvider, ProviderUnavailable
 from .service import WorkActor, identity
+
+
+log = logging.getLogger(__name__)
 
 
 class QueueExecutionCoordinator:
@@ -72,9 +76,13 @@ class QueueExecutionWorker:
         report = self.reconciler.poll()
         for candidate in report["actions"]:
             if candidate["kind"] == "launch_candidate":
-                self.coordinator.launch_candidate(
-                    candidate["goal_id"], candidate["number"]
-                )
+                try:
+                    self.coordinator.launch_candidate(
+                        candidate["goal_id"], candidate["number"]
+                    )
+                except Exception:
+                    # A malformed candidate or failed launch must not stop the daemon.
+                    log.exception("work queue launch candidate failed")
 
     def start(self, shutdown_event=None):
         if self._thread is not None:
@@ -221,6 +229,7 @@ class ShadowReconciler:
                         row = self._row(report, source, action)
                         row.update(
                             {
+                                "goal_id": scope.goal_id,
                                 "number": item["number"],
                                 "url": f"https://github.com/{scope.repo}/issues/{item['number']}",
                                 "priority": next(
