@@ -387,7 +387,9 @@ def dispatch(service, auth, headers, operation, args):
         log.warning("work %s invalid: %s: %s", operation, type(exc).__name__, exc)
         return 400, {"error": "invalid work request"}
     except ProviderUnavailable as exc:
-        log.warning("work %s provider unavailable %s: %s", operation, _target(args), exc)
+        log.warning(
+            "work %s provider unavailable %s: %s", operation, _target(args), exc
+        )
         return 409, {
             "error": "work operation denied",
             "reason": "item provider unavailable",

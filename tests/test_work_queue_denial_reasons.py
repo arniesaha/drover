@@ -39,7 +39,11 @@ ARGS = {"goal_id": "continuity-soak-819", "number": 828}
             "launch intent uncertain; inspection required",
         ),
         (PermissionError("coordinator required"), 403, "coordinator required"),
-        (ProviderUnavailable("token ghp_SECRET rejected"), 409, "item provider unavailable"),
+        (
+            ProviderUnavailable("token ghp_SECRET rejected"),
+            409,
+            "item provider unavailable",
+        ),
     ],
 )
 def test_dispatch_returns_and_logs_the_denial_reason(caplog, exc, status, reason):
