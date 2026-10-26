@@ -104,6 +104,32 @@ function ownerAgentId(sessionKey) {
   return parts[1];
 }
 
+function isSubagentSessionKey(sessionKey) {
+  return /^agent:[^:]+:subagent:/i.test(sessionKey);
+}
+
+// Subagent owners need the contract-gated live-session wake; main owners use the plain heartbeat.
+// source "hook" is what the heartbeat policy treats as a wake payload; "other" is dropped.
+function requestOwnerWake(api, ownerSessionKey, logger) {
+  const system = api.runtime.system;
+  if (isSubagentSessionKey(ownerSessionKey)) {
+    if (typeof system.requestLiveSubagentOwnerWake === "function") {
+      const result = system.requestLiveSubagentOwnerWake({ sessionKey: ownerSessionKey });
+      if (result?.ok !== true) {
+        logger?.warn?.(`continuity wake skipped: subagent owner not live (${result?.reason ?? "unknown"})`);
+      }
+      return;
+    }
+    // Older gateway without the API: fall back to the hook-source wake (it reroutes to the agent main session).
+    logger?.warn?.("this OpenClaw has no requestLiveSubagentOwnerWake; falling back to the plain hook wake");
+  }
+  system.requestHeartbeat({
+    source: "hook", intent: "immediate", reason: "hook:drover-continuity-owner-wake",
+    agentId: ownerAgentId(ownerSessionKey), sessionKey: ownerSessionKey,
+    heartbeat: { target: "last" },
+  });
+}
+
 async function maintainOwnerLease(config, status, signal, assertCurrent) {
   const owner = status.owner;
   const ownerId = ownerIdFor(config, status);
@@ -179,12 +205,7 @@ function registerWakeService(api) {
                 );
                 wakes.set(runId, { fingerprint, at: Date.now() });
               }
-              // source "hook" is what the heartbeat policy treats as a wake payload; "other" is dropped.
-              api.runtime.system.requestHeartbeat({
-                source: "hook", intent: "immediate", reason: "hook:drover-continuity-owner-wake",
-                agentId: ownerAgentId(config.ownerSessionKey), sessionKey: config.ownerSessionKey,
-                heartbeat: { target: "last" },
-              });
+              requestOwnerWake(api, config.ownerSessionKey, ctx.logger);
             }
             ctx.serviceHealth?.clearFailure();
           } catch (error) {
