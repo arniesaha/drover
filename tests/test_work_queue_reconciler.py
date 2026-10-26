@@ -12,6 +12,7 @@ from drover.server.web.credentials import CredentialStore
 from drover.server.work_queue.config import WorkQueueConfig, load_policy
 from drover.server.work_queue.github import ProviderUnavailable
 from drover.server.work_queue.reconciler import (
+    QueueExecutionWorker,
     ShadowReconciler,
     start_shadow_reconciler,
 )
@@ -81,6 +82,42 @@ def test_repeated_polls_are_level_triggered_without_duplicate_actions():
     assert r.providers["goal-1"].polls == 4
     assert action["workspace_id"] == "workspace-test"
     assert action["actor_principal"] == "github:user:42"
+
+
+def test_queued_issue_launch_candidate_has_goal_id_and_worker_launches_it():
+    reconciler = service()
+    report = reconciler.poll()
+    candidate = report["actions"][0]
+    assert candidate["kind"] == "launch_candidate"
+    assert candidate["goal_id"] == "goal-1"
+
+    worker = QueueExecutionWorker(SimpleNamespace(config=reconciler.config))
+    worker.reconciler = SimpleNamespace(poll=lambda: report)
+    launched = []
+    worker.coordinator = SimpleNamespace(
+        launch_candidate=lambda goal_id, number: launched.append((goal_id, number))
+    )
+    worker.process_once()
+    assert launched == [("goal-1", 7)]
+
+
+def test_bad_launch_candidate_is_logged_and_does_not_stop_other_candidates(caplog):
+    worker = QueueExecutionWorker(SimpleNamespace(config=WorkQueueConfig()))
+    worker.reconciler = SimpleNamespace(
+        poll=lambda: {
+            "actions": [
+                {"kind": "launch_candidate", "number": 1},
+                {"kind": "launch_candidate", "goal_id": "goal-1", "number": 2},
+            ]
+        }
+    )
+    launched = []
+    worker.coordinator = SimpleNamespace(
+        launch_candidate=lambda goal_id, number: launched.append((goal_id, number))
+    )
+    worker.process_once()
+    assert launched == [("goal-1", 2)]
+    assert "work queue launch candidate failed" in caplog.text
 
 
 @pytest.mark.parametrize(
