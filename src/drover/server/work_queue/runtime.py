@@ -106,7 +106,15 @@ class HarnessBridge:
         )
         return binding
 
-    def active(self, links):
+    def active(self, links, *, release_finalised=True):
+        """Links that still hold a session.
+
+        With ``release_finalised`` (capacity), a worker that declared done or was
+        reported by the idle sweep is dropped: it is idle at awaiting:input with
+        nothing left to run. Pass False for duplicate-execution checks, where the
+        resumable session still counts. Fails closed: if the finalised lookup is
+        unavailable every live worker keeps its slot.
+        """
         active = []
         for link in links:
             session = (
@@ -116,13 +124,15 @@ class HarnessBridge:
             )
             if session is None or session.status not in TERMINAL_SESSION_STATUSES:
                 active.append(link)
-        # A worker that declared done (or was finalised by the idle sweep) sits
-        # at awaiting:input but has no work left; it must not hold a slot.
         live = [l["session_id"] for l in active if l["session_id"]]
-        if live:
+        if release_finalised and live:
             from drover.server.harness.continuity import finalised_session_ids
 
-            released = finalised_session_ids(self.collector.duckdb_path, live)
+            try:
+                released = finalised_session_ids(self.collector.duckdb_path, live)
+            except Exception:  # noqa: BLE001 - never free a slot on a failed read
+                log.exception("finalised-worker lookup failed; holding all slots")
+                released = set()
             active = [l for l in active if l["session_id"] not in released]
         return active
 

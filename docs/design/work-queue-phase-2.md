@@ -36,7 +36,9 @@ server-side; the MCP tool reports `work control HTTP <status>: <error>; <reason>
 
 **Slots.** A worker whose final turn declared `done`, or that the idle-undeclared
 sweep reported, is idle at `awaiting: input` and no longer counts against the
-goal/workspace worker caps. A new user turn makes it count again. `blocked` and
+goal/workspace worker caps. A new user turn makes it count again, so a goal can briefly exceed its cap if the
+owner resumes a released worker. The same item still cannot be launched twice while
+the finalised session exists. If the lookup fails, every live worker keeps its slot. `blocked` and
 `needs-approval` workers keep their slot. Each goal accepts `execution_cwds`, a host ID to authorized
 checkout mapping, and an optional opaque `brief_ref`. Keep local paths in private
 runtime configuration. Set `analytics_boundary.api_url` to the control API for

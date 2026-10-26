@@ -53,7 +53,7 @@ class Harness:
     def resolve(self, key):
         return self.sessions.get(key)
 
-    def active(self, links):
+    def active(self, links, *, release_finalised=True):
         return [
             l
             for l in links
@@ -412,3 +412,17 @@ def test_policy_capacity_and_retry_override(service, tmp_path):
     service.harness.sessions[row["run_key"]].status = "failed"
     update(service, row, "failed")
     assert service.providers["goal"].comments
+
+
+def test_finalised_worker_frees_the_slot_but_not_the_item(service):
+    launch(service)
+    original = service.harness.active
+    # The first worker declared done: capacity ignores it, duplicates do not.
+    service.harness.active = lambda links, *, release_finalised=True: (
+        [] if release_finalised else original(links)
+    )
+    # The owner re-queues the item while the finalised session still exists.
+    provider = service.providers["goal"]
+    provider.set_labels(None, ["goal:test", "status:queued"])
+    with pytest.raises(RuntimeError, match="existing execution requires inspection"):
+        launch(service, "another")
