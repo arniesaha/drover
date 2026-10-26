@@ -12,8 +12,8 @@ from drover.server.harness.worker_state import worker_brief
 from drover.server.mcp.contract import ReadCaps, bound_response
 from drover.server.web.auth import bearer_credential
 
-from .github import GitHubProvider
-from .service import SYSTEMIC_COMMENT, WorkActor, WorkService
+from .github import GitHubProvider, ProviderUnavailable
+from .service import SYSTEMIC_COMMENT, WorkActor, WorkDenied, WorkService
 from .store import WorkStore
 
 log = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ class HarnessBridge:
                 timeout_s=10,
             )
             if status != 200:
-                raise RuntimeError("harness inspection unavailable")
+                raise WorkDenied("harness inspection unavailable")
             for row in json.loads(body).get("sessions", []):
                 if row.get("client_session_id") == run_key:
                     # A recovered daemon row does not include the create
@@ -67,11 +67,11 @@ class HarnessBridge:
                 getattr(scope, "continuity_owner_id", None)
                 for scope in getattr(getattr(self, "config", None), "goals", [])
             ):
-                raise RuntimeError("cannot recover work continuity launch intent")
+                raise WorkDenied("cannot recover work continuity launch intent")
             return payload
         links = store.links(run_key=run_key)
         if len(links) != 1:
-            raise RuntimeError("cannot recover unique work launch intent")
+            raise WorkDenied("cannot recover unique work launch intent")
         link = links[0]
         binding = self._work_coordinator_binding(
             run_key,
@@ -94,7 +94,7 @@ class HarnessBridge:
             or not isinstance(item_url, str)
             or not item_url
         ):
-            raise RuntimeError("cannot reconstruct work continuity binding")
+            raise WorkDenied("cannot reconstruct work continuity binding")
         binding = {
             "run_id": "work-" + run_key,
             "owner_id": scope.continuity_owner_id,
@@ -106,7 +106,15 @@ class HarnessBridge:
         )
         return binding
 
-    def active(self, links):
+    def active(self, links, *, release_finalised=True):
+        """Links that still hold a session.
+
+        With ``release_finalised`` (capacity), a worker that declared done or was
+        reported by the idle sweep is dropped: it is idle at awaiting:input with
+        nothing left to run. Pass False for duplicate-execution checks, where the
+        resumable session still counts. Fails closed: if the finalised lookup is
+        unavailable every live worker keeps its slot.
+        """
         active = []
         for link in links:
             session = (
@@ -116,6 +124,16 @@ class HarnessBridge:
             )
             if session is None or session.status not in TERMINAL_SESSION_STATUSES:
                 active.append(link)
+        live = [l["session_id"] for l in active if l["session_id"]]
+        if release_finalised and live:
+            from drover.server.harness.continuity import finalised_session_ids
+
+            try:
+                released = finalised_session_ids(self.collector.duckdb_path, live)
+            except Exception:  # noqa: BLE001 - never free a slot on a failed read
+                log.exception("finalised-worker lookup failed; holding all slots")
+                released = set()
+            active = [l for l in active if l["session_id"] not in released]
         return active
 
     def eligible(self, goal_id, parent_session_id=None):
@@ -192,7 +210,7 @@ class HarnessBridge:
             )
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:
-            raise RuntimeError("harness launch uncertain; inspect persisted intent")
+            raise WorkDenied("harness launch uncertain; inspect persisted intent")
         return json.loads(body)["session_id"]
 
 
@@ -362,15 +380,45 @@ def dispatch(service, auth, headers, operation, args):
         if operation in {"list", "get"}:
             result = bound_response(result, ReadCaps())
         return 200, result
-    except PermissionError:
-        return 403, {"error": "work operation forbidden"}
-    except (ValueError, TypeError, KeyError):
+    except PermissionError as exc:
+        log.warning("work %s forbidden %s: %s", operation, _target(args), exc)
+        return 403, {"error": "work operation forbidden", "reason": _reason(exc)}
+    except (ValueError, TypeError, KeyError) as exc:
+        log.warning("work %s invalid: %s: %s", operation, type(exc).__name__, exc)
         return 400, {"error": "invalid work request"}
-    except Exception:
-        # No exception/provider/session text is reflected to public callers.
+    except ProviderUnavailable as exc:
+        log.warning(
+            "work %s provider unavailable %s: %s", operation, _target(args), exc
+        )
         return 409, {
-            "error": "work operation paused; inspect provider or execution intent"
+            "error": "work operation denied",
+            "reason": "item provider unavailable",
         }
+    except WorkDenied as exc:
+        log.warning("work %s denied %s: %s", operation, _target(args), exc)
+        return 409, {"error": "work operation denied", "reason": _reason(exc)}
+    except Exception as exc:
+        # Only the exception class is reflected; provider/session text may carry
+        # secrets, so the detail stays in the server log.
+        log.exception("work %s failed %s", operation, _target(args))
+        return 409, {
+            "error": "work operation paused; inspect provider or execution intent",
+            "reason": "unexpected " + type(exc).__name__,
+        }
+
+
+def _reason(exc):
+    # PermissionError/WorkDenied messages are fixed strings written in this package.
+    return str(exc)[:200]
+
+
+def _target(args):
+    if not isinstance(args, dict):
+        return ""
+    return "goal=%s item=%s" % (
+        str(args.get("goal_id"))[:64],
+        str(args.get("number"))[:12],
+    )
 
 
 def dispatch_hub_items(service, auth, headers, operation, args):

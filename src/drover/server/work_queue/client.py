@@ -45,5 +45,20 @@ def control_call(url, headers, operation, args):
             if len(data) > 65536:
                 raise RuntimeError("work control response exceeds bound")
         if response.status_code != 200:
-            raise RuntimeError("work control unavailable or action blocked")
+            raise RuntimeError(_failure(response.status_code, data))
         return json.loads(data)
+
+
+def _failure(status, body):
+    """Status plus the hub's own fixed ``error``/``reason`` strings, nothing else."""
+    detail = []
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("error", "reason"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value:
+                detail.append(value[:200])
+    return f"work control HTTP {status}: " + ("; ".join(detail) or "unavailable")
