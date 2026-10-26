@@ -219,3 +219,50 @@ def test_scan_stops_at_the_newest_user_turn_with_mixed_null_sequences(run):
     [event_id] = run.store.sweep_idle_undeclared(300)
     [report] = _kinds(run)
     assert "chunk 259" in report["summary"] and "old turn" not in report["summary"]
+
+
+def test_finalised_session_releases_slot_until_a_new_turn(run):
+    from drover.server.harness.continuity import finalised_session_ids
+
+    _turn(run, "Review: no blocking findings in PR 788.")
+    _state(run)
+    # Output but no report yet: still holds its slot.
+    assert finalised_session_ids(run.path, ["harness-w"]) == set()
+    run.store.sweep_idle_undeclared(300)
+    assert finalised_session_ids(run.path, ["harness-w"]) == {"harness-w"}
+    # The owner sends a new turn: the worker is working again and holds a slot.
+    with run.store._transaction() as (con, _):
+        _event(con, "harness-w", 9, "user_input", "one more thing", T0 + timedelta(1))
+    assert finalised_session_ids(run.path, ["harness-w"]) == set()
+
+
+def test_declared_done_releases_but_blocked_keeps_slot(run):
+    from drover.server.harness.continuity import finalised_session_ids
+
+    _turn(run, "Drover-State: blocked reason=needs token")
+    _state(run)
+    run.store.sweep_idle_undeclared(300)
+    assert finalised_session_ids(run.path, ["harness-w"]) == set()
+    with run.store._transaction() as (con, _):
+        con.execute("DELETE FROM harness_events")
+        con.execute("DELETE FROM factory_observer_inbox")
+    _turn(run, "Drover-State: done sha=0123456789abcdef0123456789abcdef01234567")
+    run.store.sweep_idle_undeclared(300)
+    assert finalised_session_ids(run.path, ["harness-w"]) == {"harness-w"}
+    _state(run, status="running", awaiting="working")
+    assert finalised_session_ids(run.path, ["harness-w"]) == set()
+
+
+def test_bridge_active_excludes_finalised_workers(run):
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.work_queue.runtime import HarnessBridge
+
+    bridge = object.__new__(HarnessBridge)
+    bridge.collector = SimpleNamespace(duckdb_path=run.path)
+    bridge.registry = HarnessRegistry(run.path)
+    links = [{"session_id": "harness-w"}, {"session_id": None}]
+    _turn(run, "Review: no blocking findings in PR 788.")
+    _state(run)
+    assert len(bridge.active(links)) == 2
+    run.store.sweep_idle_undeclared(300)
+    assert bridge.active(links) == [{"session_id": None}]
