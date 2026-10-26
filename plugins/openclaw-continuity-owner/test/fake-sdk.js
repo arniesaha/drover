@@ -9,11 +9,14 @@ export function fakeApi(pluginConfig = {}) {
   const services = [];
   const systemEvents = [];
   const wakeRequests = [];
+  const subagentWakeRequests = [];
+  const subagentWakeResult = { ok: true };
   const api = {
     pluginConfig,
     runtime: { system: {
       enqueueSystemEvent(text, options) { systemEvents.push({ text, options }); return true; },
       requestHeartbeat(options) { wakeRequests.push(options); },
+      requestLiveSubagentOwnerWake(options) { subagentWakeRequests.push(options); return subagentWakeResult; },
     } },
     registerService(service) { services.push(service); },
     registerTool(descriptor, options) {
@@ -28,5 +31,5 @@ export function fakeApi(pluginConfig = {}) {
       registrations.push({ factory, options, descriptor });
     },
   };
-  return { api, registrations, services, systemEvents, wakeRequests };
+  return { api, registrations, services, systemEvents, wakeRequests, subagentWakeRequests };
 }

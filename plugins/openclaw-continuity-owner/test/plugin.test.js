@@ -136,7 +136,7 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
   assert.equal(runtime.services.length, 1);
   const health = serviceContext(ownerConfig);
   runtime.services[0].start(health.context);
-  await eventually(() => runtime.wakeRequests.length === 1, "owner wake was not dispatched");
+  await eventually(() => runtime.subagentWakeRequests.length === 1, "owner wake was not dispatched");
   await runtime.services[0].stop(health.context);
   assert.deepEqual(f.calls.map((request) => request.method), ["GET", "GET", "POST"]);
   assert.equal(f.calls[2].body.operation, "lease");
@@ -146,10 +146,8 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
     sessionKey: OWNER,
     contextKey: `run_PLUGIN497:${EVENT}`,
   });
-  assert.deepEqual(runtime.wakeRequests[0], {
-    source: "hook", intent: "immediate", reason: "hook:drover-continuity-owner-wake",
-    agentId: "coder", sessionKey: OWNER, heartbeat: { target: "last" },
-  });
+  assert.deepEqual(runtime.subagentWakeRequests[0], { sessionKey: OWNER });
+  assert.equal(runtime.wakeRequests.length, 0, "subagent owners must not use the plain heartbeat");
   assert.match(runtime.systemEvents[0].text, /acknowledge only after.*durably verified/);
   assert.equal(health.failures.length, 0);
 });
@@ -177,7 +175,7 @@ test("a coordinator run authorized to the agent session key is leased and woken 
   register(runtime.api);
   const health = serviceContext(ownerConfig);
   runtime.services[0].start(health.context);
-  await eventually(() => runtime.wakeRequests.length === 1, "owner wake was not dispatched");
+  await eventually(() => runtime.subagentWakeRequests.length === 1, "owner wake was not dispatched");
   await runtime.services[0].stop(health.context);
   assert.equal(f.calls[2].body.operation, "lease");
   assert.equal(f.calls[2].body.owner_id, OWNER);
@@ -200,7 +198,7 @@ test("wake retries are bounded and durable acknowledgement suppresses replay", a
   runtime.services[0].start(health.context);
   await eventually(() => polls >= 3);
   await runtime.services[0].stop(health.context);
-  assert.equal(runtime.wakeRequests.length, 1);
+  assert.equal(runtime.subagentWakeRequests.length, 1);
   assert.equal(runtime.systemEvents.length, 1);
   assert.equal(health.failures.length, 0);
 });
@@ -214,7 +212,7 @@ test("poll-only and deployment bindings retain an inert reload-safe service", as
     const health = serviceContext(runtime.api.pluginConfig);
     runtime.services[0].start(health.context);
     await runtime.services[0].stop(health.context);
-    assert.equal(runtime.wakeRequests.length, 0);
+    assert.equal(runtime.subagentWakeRequests.length, 0);
   }
   assert.equal(f.calls.length, 0);
 });
@@ -236,17 +234,17 @@ test("service reconnect replays an unacknowledged wake but not an acknowledged e
     return { runtime, health };
   };
   const first = await start();
-  await eventually(() => first.runtime.wakeRequests.length === 1);
+  await eventually(() => first.runtime.subagentWakeRequests.length === 1);
   await first.runtime.services[0].stop(first.health.context);
   requests = 0;
   const replay = await start();
-  await eventually(() => replay.runtime.wakeRequests.length === 1);
+  await eventually(() => replay.runtime.subagentWakeRequests.length === 1);
   await replay.runtime.services[0].stop(replay.health.context);
   acknowledged = true;
   requests = 0;
   const final = await start();
   await final.runtime.services[0].stop(final.health.context);
-  assert.equal(final.runtime.wakeRequests.length, 0);
+  assert.equal(final.runtime.subagentWakeRequests.length, 0);
 });
 
 test("service stop during lease acquisition cannot emit a stale wake", async (t) => {
@@ -271,7 +269,7 @@ test("service stop during lease acquisition cannot emit a stale wake", async (t)
   releaseLease();
   await stopped;
   assert.equal(runtime.systemEvents.length, 0);
-  assert.equal(runtime.wakeRequests.length, 0);
+  assert.equal(runtime.subagentWakeRequests.length, 0);
 });
 
 test("a competing live owner is fenced without a wake or lease mutation", async (t) => {
@@ -285,7 +283,7 @@ test("a competing live owner is fenced without a wake or lease mutation", async 
   await eventually(() => health.failures.length > 0);
   await runtime.services[0].stop(health.context);
   assert.deepEqual(f.calls.map((request) => request.method), ["GET"]);
-  assert.equal(runtime.wakeRequests.length, 0);
+  assert.equal(runtime.subagentWakeRequests.length, 0);
   assert.match(String(health.failures[0]), /competing live owner/);
 });
 
@@ -500,7 +498,7 @@ test("owner mode binds the owner session: wakes every listed run, no fixed runId
   assert.deepEqual(runtime.systemEvents.map((event) => event.options.contextKey).sort(),
     [`run_A:${runs.run_A}`, `run_B:${runs.run_B}`]);
   assert.match(runtime.systemEvents[0].text, /standing continuity brief/);
-  assert.equal(runtime.wakeRequests.length, 1);
+  assert.equal(runtime.subagentWakeRequests.length, 1);
   assert.equal(new URL(f.listings[0], "http://x").searchParams.get("owner_id"), OWNER);
   assert.equal(health.failures.length, 0);
 });
