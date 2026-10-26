@@ -4,16 +4,19 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
 
-export function fakeApi(pluginConfig = {}) {
+export function fakeApi(pluginConfig = {}, { withSubagentWake = true } = {}) {
   const registrations = [];
   const services = [];
   const systemEvents = [];
   const wakeRequests = [];
+  const subagentWakeRequests = [];
+  const subagentWakeResult = { ok: true };
   const api = {
     pluginConfig,
     runtime: { system: {
       enqueueSystemEvent(text, options) { systemEvents.push({ text, options }); return true; },
       requestHeartbeat(options) { wakeRequests.push(options); },
+      requestLiveSubagentOwnerWake(options) { subagentWakeRequests.push(options); return subagentWakeResult; },
     } },
     registerService(service) { services.push(service); },
     registerTool(descriptor, options) {
@@ -28,5 +31,6 @@ export function fakeApi(pluginConfig = {}) {
       registrations.push({ factory, options, descriptor });
     },
   };
-  return { api, registrations, services, systemEvents, wakeRequests };
+  if (!withSubagentWake) delete api.runtime.system.requestLiveSubagentOwnerWake;
+  return { api, registrations, services, systemEvents, wakeRequests, subagentWakeRequests };
 }
