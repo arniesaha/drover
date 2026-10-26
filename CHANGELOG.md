@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.43] - 2026-10-26
+
+### Fixed
+
+- Work queue automatic execution now carries the scoped goal ID into candidate actions and logs/skips an individual malformed candidate instead of terminating the execution worker (#845, #846).
+
 ## [0.6.42] - 2026-10-26
 
 ### Added
