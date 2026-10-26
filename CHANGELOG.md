@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.42] - 2026-10-26
+
+### Added
+
+- Continuity owner plugin 0.1.6: wakes live subagent owners through OpenClaw's `requestLiveSubagentOwnerWake` (openclaw fork PR #16). A gateway without that API falls back to the plain hook wake, and main-session owners are unchanged (#818, #835).
+
 ## [0.6.41] - 2026-10-25
 
 ### Fixed
