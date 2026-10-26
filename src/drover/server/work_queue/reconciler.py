@@ -14,7 +14,6 @@ from .config import WorkQueueConfig, load_policy
 from .github import GitHubProvider, ProviderUnavailable
 from .service import WorkActor, identity
 
-
 log = logging.getLogger(__name__)
 
 
