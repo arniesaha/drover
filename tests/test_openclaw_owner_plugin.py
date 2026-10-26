@@ -498,7 +498,12 @@ def test_owner_listing_endpoint_is_exclusive_with_run_id_and_session_bound(
 
     assert get(f"owner_id={OWNER_PRINCIPAL}") == {"owner_runs": [RUN]}
     assert get(f"owner_id={OWNER}") == {"owner_runs": []}
-    for query in (f"owner_id={OWNER}&run_id={RUN}", "limit=1"):
+    for query in (
+        f"owner_id={OWNER}&run_id={RUN}",
+        "limit=1",
+        f"run_id={RUN}&offset=1",
+        f"run_id={RUN}&authority_scope=implementation",
+    ):
         with pytest.raises(urllib.error.HTTPError) as error:
             get(query)
         assert error.value.code == 400
@@ -519,3 +524,48 @@ def test_owner_runs_scope_filter_and_paging(canary):
     assert store.owner_runs(OWNER_PRINCIPAL, offset=1) == []
     with pytest.raises(ValueError):
         store.owner_runs(OWNER_PRINCIPAL, authority_scope="bogus")
+
+
+def test_owner_listing_is_limited_to_the_owner_principal_or_a_coordinator(tmp_path):
+    import urllib.error
+    import urllib.request
+
+    from drover.server.web.credentials import CredentialStore
+
+    path = tmp_path / "listing.duckdb"
+    bootstrap_control_plane_store(path)
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    record, token = credentials.issue(scope="host", label="reader", host_id="studio")
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=MetricsCollector(
+            duckdb_path=path,
+            incoming_dir=tmp_path / "incoming",
+            summarizer_report={},
+            ttl_seconds=60,
+        ),
+        auth=AuthSettings(enabled=True, api_token="", credentials=credentials),
+    )
+
+    def get(owner, extra=""):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}"
+            f"/harness/factory-observer/continuity?{extra or 'owner_id=' + owner}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read())
+
+    try:
+        assert get(f"credential:{record.id}") == {"owner_runs": []}
+        with pytest.raises(urllib.error.HTTPError) as error:
+            get(OWNER)
+        assert error.value.code == 403
+        for extra in ("offset=1", "authority_scope=implementation"):
+            with pytest.raises(urllib.error.HTTPError) as error:
+                get("", f"run_id={RUN}&{extra}")
+            assert error.value.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -36,7 +36,6 @@ function configuration(raw) {
     wakeRetryIntervalMs: 60000, ownerLeaseSeconds: 60, ...raw,
   };
   if (config.enabled !== true) return Object.freeze(config);
-  requireValue(config.runId !== undefined || config.mode === "owner", "A fixed runId is required unless owner mode binds the whole owner session");
   requireValue(!config.canarySessionKey || config.canarySessionKey !== config.ownerSessionKey, "Canary and owner session bindings must be distinct");
   requireValue(/^agent:[^:\s]+(?::[^:\s]+)+$/.test(config.ownerSessionKey), "Owner session binding must be a canonical agent session key");
   if (config.canarySessionKey !== undefined) requireValue(/^agent:[^:\s]+(?::[^:\s]+)+$/.test(config.canarySessionKey), "Canary session binding must be a canonical agent session key");
@@ -49,23 +48,30 @@ function configuration(raw) {
 }
 
 // Owner mode binds the owner SESSION; a fixed runId stays optional for older setups.
+// Without a fixed runId the binding is per-owner: only runs authorized to ownerSessionKey qualify.
 function scopedTo(config, runId) {
-  return Object.freeze({ ...config, runId });
+  return Object.freeze({ ...config, runId, perOwner: config.perOwner ?? config.runId === undefined });
 }
 
 const LISTING_PAGE = 50;
 const LISTING_PAGES = 5;
+const RUN_ID = /^[\w.:-]{1,191}$/;
 
-async function wakeRunIds(config, signal, assertCurrent) {
+async function wakeRunIds(config, signal, assertCurrent, logger) {
   if (config.runId) return [config.runId]; // A fixed run keeps the pre-0.1.4 single-run binding.
   const ids = [];
   for (let page = 0; page < LISTING_PAGES; page++) {
     const listed = await request(config, "GET", {
       owner_id: config.ownerSessionKey, authority_scope: config.authorityScope, limit: LISTING_PAGE, offset: page * LISTING_PAGE,
     }, signal, assertCurrent);
-    requireValue(Array.isArray(listed.owner_runs) && listed.owner_runs.every((id) => typeof id === "string" && id.length > 0), "Invalid owner run listing");
-    ids.push(...listed.owner_runs);
+    requireValue(Array.isArray(listed.owner_runs), "Invalid owner run listing");
+    // Listed ids reach system-event text, so drop anything the request schema would not accept.
+    for (const id of listed.owner_runs) {
+      if (typeof id === "string" && RUN_ID.test(id)) ids.push(id);
+      else logger?.warn("continuity wake ignored a malformed listed run id");
+    }
     if (listed.owner_runs.length < LISTING_PAGE) break;
+    if (page === LISTING_PAGES - 1) logger?.warn(`continuity owner listing truncated at ${LISTING_PAGE * LISTING_PAGES} runs`);
   }
   return [...new Set(ids)];
 }
@@ -81,6 +87,7 @@ function waitFor(signal, milliseconds) {
 // A Work-coordinator run is owned by its canonical agent session key; a Factory
 // observer run by the bearer principal. Both are exact, trusted configuration.
 function ownerIdFor(config, status) {
+  if (config.perOwner) return config.ownerSessionKey; // never the shared bearer principal's runs
   return status.owner_handoff?.authorized_owner_id === config.ownerSessionKey
     ? config.ownerSessionKey
     : config.ownerPrincipal;
@@ -139,7 +146,10 @@ function registerWakeService(api) {
         while (!signal.aborted) {
           try {
             const pending = [];
-            for (const runId of await wakeRunIds(config, signal, assertCurrent)) {
+            const listed = await wakeRunIds(config, signal, assertCurrent, ctx.logger);
+            const present = new Set(listed);
+            for (const known of wakes.keys()) if (!present.has(known)) wakes.delete(known);
+            for (const runId of listed) {
               try {
                 const scoped = scopedTo(config, runId);
                 const polled = reply(await request(scoped, "GET", { run_id: runId, limit: 1 }, signal, assertCurrent), scoped);

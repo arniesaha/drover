@@ -2552,11 +2552,25 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     or any(len(values) != 1 for values in params.values())
                 ):
                     raise ValueError("exactly one of run_id or owner_id is required")
+                if "run_id" in params and params.keys() & {
+                    "authority_scope",
+                    "offset",
+                }:
+                    raise ValueError(
+                        "authority_scope and offset apply to owner_id only"
+                    )
                 limit = int(params.get("limit", ["20"])[0])
                 if "owner_id" in params:
+                    listed_owner = params["owner_id"][0]
+                    if listed_owner != self._continuity_owner_principal() and (
+                        self._continuity_coordinator_principal() is None
+                    ):
+                        raise PermissionError(
+                            "owner listing requires the owner principal or a coordinator"
+                        )
                     result = {
                         "owner_runs": store.owner_runs(
-                            params["owner_id"][0],
+                            listed_owner,
                             authority_scope=params.get("authority_scope", [None])[0],
                             limit=limit,
                             offset=int(params.get("offset", ["0"])[0]),
