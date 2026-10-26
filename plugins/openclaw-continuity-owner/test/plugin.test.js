@@ -152,9 +152,9 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
   assert.equal(health.failures.length, 0);
 });
 
-for (const [name, key, withApi, expectPlain] of [
-  ["a gateway without requestLiveSubagentOwnerWake falls back to the hook wake for a subagent owner", OWNER, false, true],
-  ["a main-session owner always uses the plain hook wake", "agent:coder:main", true, true],
+for (const [name, key, withApi] of [
+  ["a gateway without requestLiveSubagentOwnerWake falls back to the hook wake for a subagent owner", OWNER, false],
+  ["a main-session owner always uses the plain hook wake", "agent:coder:main", true],
 ]) {
   test(name, async (t) => {
     const live = projection({
@@ -177,7 +177,6 @@ for (const [name, key, withApi, expectPlain] of [
     assert.equal(runtime.wakeRequests[0].source, "hook");
     assert.equal(runtime.wakeRequests[0].sessionKey, key);
     assert.equal(runtime.subagentWakeRequests.length, 0);
-    assert.equal(expectPlain, true);
   });
 }
 
