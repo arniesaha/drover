@@ -113,15 +113,15 @@ function isSubagentSessionKey(sessionKey) {
 function requestOwnerWake(api, ownerSessionKey, logger) {
   const system = api.runtime.system;
   if (isSubagentSessionKey(ownerSessionKey)) {
-    if (typeof system.requestLiveSubagentOwnerWake !== "function") {
-      logger?.warn?.("continuity wake skipped: this OpenClaw has no requestLiveSubagentOwnerWake for subagent owners");
+    if (typeof system.requestLiveSubagentOwnerWake === "function") {
+      const result = system.requestLiveSubagentOwnerWake({ sessionKey: ownerSessionKey });
+      if (result?.ok !== true) {
+        logger?.warn?.(`continuity wake skipped: subagent owner not live (${result?.reason ?? "unknown"})`);
+      }
       return;
     }
-    const result = system.requestLiveSubagentOwnerWake({ sessionKey: ownerSessionKey });
-    if (result?.ok !== true) {
-      logger?.warn?.(`continuity wake skipped: subagent owner not live (${result?.reason ?? "unknown"})`);
-    }
-    return;
+    // Older gateway without the API: fall back to the hook-source wake (it reroutes to the agent main session).
+    logger?.warn?.("this OpenClaw has no requestLiveSubagentOwnerWake; falling back to the plain hook wake");
   }
   system.requestHeartbeat({
     source: "hook", intent: "immediate", reason: "hook:drover-continuity-owner-wake",

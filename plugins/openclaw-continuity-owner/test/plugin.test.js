@@ -152,6 +152,35 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
   assert.equal(health.failures.length, 0);
 });
 
+for (const [name, key, withApi, expectPlain] of [
+  ["a gateway without requestLiveSubagentOwnerWake falls back to the hook wake for a subagent owner", OWNER, false, true],
+  ["a main-session owner always uses the plain hook wake", "agent:coder:main", true, true],
+]) {
+  test(name, async (t) => {
+    const live = projection({
+      owner: { id: OWNER_PRINCIPAL, epoch: 2, lease_until: "2099-10-03T00:00:00+00:00", live: true },
+      events: [{ event_id: EVENT, state: "pending", attempts: 0, next_delivery_at: null,
+        report: { source: "drover", source_event_id: "worker-1", subject: "worker", sequence: 1,
+          kind: "worker_brief_completed", summary: "Worker completed" } }],
+    });
+    const stale = projection({ owner: { id: null, epoch: 1, lease_until: null, live: false }, owner_wake: false });
+    const f = await fixture(t, (req, res, body) => res.end(JSON.stringify({
+      continuity: req.method === "POST" && body.operation === "lease" ? live : stale,
+    })));
+    const ownerConfig = { ...f.config, ownerSessionKey: key, mode: "owner", wakePollIntervalMs: 1000 };
+    const runtime = fakeApi(f.config, { withSubagentWake: withApi });
+    register(runtime.api);
+    const health = serviceContext(ownerConfig);
+    runtime.services[0].start(health.context);
+    await eventually(() => runtime.wakeRequests.length === 1, "fallback wake was not dispatched");
+    await runtime.services[0].stop(health.context);
+    assert.equal(runtime.wakeRequests[0].source, "hook");
+    assert.equal(runtime.wakeRequests[0].sessionKey, key);
+    assert.equal(runtime.subagentWakeRequests.length, 0);
+    assert.equal(expectPlain, true);
+  });
+}
+
 test("a coordinator run authorized to the agent session key is leased and woken as that owner", async (t) => {
   const bound = (extra = {}) => projection({
     owner_handoff: { authorized_owner_id: OWNER, state: "owner_lease_required" },
