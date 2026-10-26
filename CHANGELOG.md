@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.41] - 2026-10-25
+
+### Fixed
+
+- Work queue: a worker that declared `done`, or that the idle-undeclared sweep reported, no longer holds a goal/workspace concurrency slot (the same item still cannot be launched twice; a failed lookup holds all slots) (#831)
+- `/work/launch` and the other work operations now return and log the real denial `reason` (capacity, launch intent uncertain, systemic review, provider unavailable, coordinator required) instead of a generic 409; unexpected errors are logged with a traceback and return only the exception class (#831)
+- MCP `drover_work_launch` reports the hub status and reason; docs explain that a `credential:<id>` needs a `principal_roles` coordinator mapping (the legacy operator bearer is mapped separately) (#831)
+
 ## [0.6.40] - 2026-10-25
 
 ### Fixed
