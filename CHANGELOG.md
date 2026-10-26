@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.40] - 2026-10-25
+
+### Fixed
+
+- Continuity owner plugin 0.1.5: without a fixed `runId`, only runs authorized to `ownerSessionKey` are accepted (no longer `ownerPrincipal`); listed run ids are validated, the 250-run truncation warns, and finished runs leave the wake map. `poll_only` is valid without a `runId`.
+- `GET /harness/factory-observer/continuity?owner_id=` is limited to the owner principal or a coordinator/operator; `authority_scope`/`offset` with `run_id` is a 400.
+
 ## [0.6.39] - 2026-10-25
 
 ### Added
