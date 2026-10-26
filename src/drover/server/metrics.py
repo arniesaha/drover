@@ -515,6 +515,66 @@ def _append_operational_health_metrics(
         )
 
 
+def _append_continuity_metrics(lines: list[str], db_path: Path) -> None:
+    """Export the bounded continuity read model without failing a scrape."""
+    from drover.server.continuity_hub import ContinuityHub
+
+    try:
+        status = ContinuityHub(db_path).observability_status()
+    except Exception:  # noqa: BLE001 - metrics remain available on a bad store
+        return
+    pending = status["pending_wakes"]
+    lines.extend(
+        [
+            "# HELP drover_continuity_pending_wakes Pending continuity wakes by age.",
+            "# TYPE drover_continuity_pending_wakes gauge",
+            _metric(
+                "drover_continuity_pending_wakes",
+                pending["under_2m"],
+                age_bucket="under_2m",
+            ),
+            _metric(
+                "drover_continuity_pending_wakes",
+                pending["between_2m_and_10m"],
+                age_bucket="2m_to_10m",
+            ),
+            _metric(
+                "drover_continuity_pending_wakes",
+                pending["over_10m"],
+                age_bucket="over_10m",
+            ),
+            "# TYPE drover_continuity_latency_seconds gauge",
+        ]
+    )
+    for kind, values in status["latencies"].items():
+        if kind == "sample_count":
+            continue
+        for quantile in ("p50", "p95"):
+            lines.append(
+                _metric(
+                    "drover_continuity_latency_seconds",
+                    values[quantile] / 1000,
+                    kind=kind,
+                    quantile=quantile.removeprefix("p"),
+                )
+            )
+    lines.extend(
+        [
+            "# TYPE drover_continuity_stuck_wakes gauge",
+            _metric("drover_continuity_stuck_wakes", pending["over_10m"]),
+            "# TYPE drover_continuity_poll_failures gauge",
+        ]
+    )
+    for heartbeat in status["plugin_heartbeats"]:
+        lines.append(
+            _metric(
+                "drover_continuity_poll_failures",
+                heartbeat["consecutive_failures"],
+                session_key=heartbeat["session_key"],
+            )
+        )
+
+
 def _append_summarizer_metrics(lines: list[str], report: Mapping[str, Any]) -> None:
     policy = str(report.get("backend_policy") or "unknown")
     allows_anthropic = policy in {"hybrid", "cloud"}
@@ -3373,6 +3433,7 @@ class MetricsCollector:
         lines = [format_prometheus(snapshot).rstrip()]
         _append_details_metrics(lines, snapshot)
         _append_operational_health_metrics(lines, self.duckdb_path, snapshot)
+        _append_continuity_metrics(lines, self.duckdb_path)
         _append_summarizer_metrics(lines, self.summarizer_report)
         _append_redis_metrics(lines, self.job_streams)
         _append_adoption_metrics(lines, snapshot)

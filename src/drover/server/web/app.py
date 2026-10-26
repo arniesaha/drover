@@ -1511,6 +1511,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path == "/continuity":
             self._continuity_hub(query=parsed.query)
             return
+        if path == "/continuity/status":
+            self._continuity_status()
+            return
         if path == "/harness/relay":
             self._accept_relay_websocket()
             return
@@ -2748,6 +2751,21 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             status, result = 400, {"error": str(exc)}
         except ControlPlaneBusy:
             status, result = 503, {"error": "continuity store busy"}
+        self._send(status, "application/json", json.dumps(result) + "\n")
+
+    def _continuity_status(self) -> None:
+        """Authenticated aggregate continuity read model."""
+        from drover.server.continuity_hub import ContinuityHub
+
+        try:
+            if self._continuity_coordinator_principal() is None:
+                raise PermissionError("bound bearer credential required")
+            result = ContinuityHub(self.collector.duckdb_path).observability_status()
+            status = 200
+        except PermissionError as exc:
+            status, result = 403, {"error": str(exc)}
+        except Exception:  # bounded operational read must not leak store details
+            status, result = 503, {"error": "continuity status unavailable"}
         self._send(status, "application/json", json.dumps(result) + "\n")
 
     def _continuity_shadow_compare(self) -> None:

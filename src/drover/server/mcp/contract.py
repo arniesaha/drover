@@ -30,6 +30,7 @@ READ_CAPS = {
     for name, rows in {
         "work_list": 100,
         "work_get": 100,
+        "continuity_status": 100,
         "profile": 100,
         "memory_acceptance": 25,
         "handoff": 20,
