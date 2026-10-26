@@ -636,6 +636,51 @@ def sweep_idle_undeclared(
     return recorded
 
 
+def finalised_session_ids(path: str | Path, session_ids) -> set[str]:
+    """Sessions idle at ``awaiting: input`` whose final turn is already reported.
+
+    A worker that declared done, or that the idle-undeclared sweep reported, has
+    nothing left to run. It must not hold a work-queue concurrency slot while the
+    owner reviews it. A new user turn reopens the slot claim because the final
+    turn then has no reported output. Blocked and needs-approval declarations
+    keep their slot: the worker is still waiting on a decision.
+    """
+    ids = sorted({str(session_id) for session_id in session_ids})
+    released: set[str] = set()
+    if not ids:
+        return released
+    placeholders = ", ".join("?" for _ in ids)
+    ended = ", ".join("?" for _ in _ENDED)
+    with control_plane_connection(Path(path), timeout=5) as con:
+        rows = con.execute(
+            f"""SELECT s.session_id, r.run_id
+                  FROM harness_sessions s
+                  JOIN factory_observer_runs r ON r.session_id = s.session_id
+                 WHERE s.handoff_mode = 'work_coordinator' AND s.awaiting = 'input'
+                   AND s.status NOT IN ({ended})
+                   AND s.session_id IN ({placeholders})""",
+            [*_ENDED, *ids],
+        ).fetchall()
+        for session_id, run_id in rows:
+            final = _final_turn_output(con, str(session_id))
+            if final is None:
+                continue
+            source_event_id, _, _, declared = final
+            if declared is None:
+                source = IDLE_SOURCE
+            elif declared["state"] == "done":
+                source = "drover-work-coordinator"
+            else:
+                continue
+            if _row(
+                con,
+                "SELECT 1 AS present FROM factory_observer_inbox WHERE event_id = ?",
+                [_report_event_id(run_id, source, source_event_id)],
+            ):
+                released.add(str(session_id))
+    return released
+
+
 def record_observer_worker_completion_batch(con, records: list[dict]) -> dict[str, int]:
     """Project one bounded batch in source order using the caller transaction."""
     if len(records) > MAX_COMPLETION_PROJECTION_BATCH:

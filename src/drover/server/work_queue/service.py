@@ -20,6 +20,10 @@ SYSTEMIC_COMMENT = (
 )
 
 
+class WorkDenied(RuntimeError):
+    """A launch or update refused for a reason safe to show the caller."""
+
+
 @dataclass(frozen=True)
 class WorkActor:
     principal: str
@@ -81,7 +85,7 @@ def route(accounts, policy, estimate, eligible):
                     if (host_id, canonical) in eligible:
                         choices.append((available, host_id, canonical))
     if not choices:
-        raise RuntimeError("quota or capability unavailable")
+        raise WorkDenied("quota or capability unavailable")
     _, host, harness = max(choices)
     return host, harness
 
@@ -422,7 +426,7 @@ class WorkService:
             if not row["session_id"]:
                 session = self.harness.resolve(run_key)
                 if session is None:
-                    raise RuntimeError("launch intent uncertain; inspection required")
+                    raise WorkDenied("launch intent uncertain; inspection required")
                 row = self.store.associate(run_key, session.session_id)
             if (
                 run_role == "work"
@@ -437,7 +441,7 @@ class WorkService:
         links = self.store.links(goal_id=goal_id, number=number)
         failures = max((l["failure_count"] for l in links), default=0)
         if failures >= policy.retries.attempts:
-            raise RuntimeError("systemic review required before further attempts")
+            raise WorkDenied("systemic review required before further attempts")
         status = policy.labels.status_prefix + (
             "review" if run_role == "verify" else "queued"
         )
@@ -449,9 +453,9 @@ class WorkService:
             or sum(l["goal_id"] == goal_id for l in active)
             >= policy.capacity.goal_workers
         ):
-            raise RuntimeError("worker capacity unavailable")
+            raise WorkDenied("worker capacity unavailable")
         if any(l["goal_id"] == goal_id and l["item_number"] == number for l in active):
-            raise RuntimeError("existing execution requires inspection")
+            raise WorkDenied("existing execution requires inspection")
         if run_role == "verify":
             parent = next(
                 (
@@ -572,7 +576,7 @@ class WorkService:
         if any(e["event_kind"] == "outcome" for e in events):
             return {"outcome": events[-1]["outcome"]}
         if events:
-            raise RuntimeError("provider operation uncertain; inspection required")
+            raise WorkDenied("provider operation uncertain; inspection required")
         if item["state"] != "open":
             raise ValueError("item already closed")
         if action == "complete":
@@ -591,7 +595,7 @@ class WorkService:
                     )
                     >= policy.retries.attempts
                 ):
-                    raise RuntimeError("systemic review required before verification")
+                    raise WorkDenied("systemic review required before verification")
                 session = self.harness.resolve(run_key)
                 if session is None or session.status != "completed":
                     raise ValueError("work session must complete before verification")
@@ -736,7 +740,7 @@ class WorkService:
         if any(e["event_kind"] == "outcome" for e in events):
             return {"outcome": events[-1]["outcome"], "resolved": True}
         if len(events) > 1:
-            raise RuntimeError("decision uncertain; provider inspection required")
+            raise WorkDenied("decision uncertain; provider inspection required")
         if action not in events[0]["options"]:
             raise ValueError("action not offered")
         if action == "open":

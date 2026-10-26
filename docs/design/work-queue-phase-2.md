@@ -20,7 +20,24 @@ Enable the live service with `work_queue.enabled = true`,
 versioned goal policy reference from phase 1. Configure `principal_roles` to map
 an authenticated `credential:<id>` to the coordinator role from that policy.
 The legacy operator bearer is identified as `control:operator` and also needs an
-explicit role mapping. Each goal accepts `execution_cwds`, a host ID to authorized
+explicit role mapping.
+
+**Who may launch.** `launch`, `link`, `update`, `question` and `decide` require the
+policy's coordinator role (`authority.coordinator`, `nix` in policy v1). An
+unmapped principal is a `worker` and gets a 403 `coordinator required`. The direct
+hub API call uses the legacy bearer (`control:operator`); the MCP
+`drover_work_launch` tool forwards the *caller's own* device/host credential, which
+is `credential:<id>` and so needs its own `principal_roles` entry. A config that
+only maps `control:operator` accepts curl but refuses MCP. Grant the role
+deliberately, per credential. Launch denials now return `reason` (capacity,
+`launch intent uncertain`, `systemic review required`, `item provider
+unavailable`, `quota or capability unavailable`, `coordinator required`) and log it
+server-side; the MCP tool reports `work control HTTP <status>: <error>; <reason>`.
+
+**Slots.** A worker whose final turn declared `done`, or that the idle-undeclared
+sweep reported, is idle at `awaiting: input` and no longer counts against the
+goal/workspace worker caps. A new user turn makes it count again. `blocked` and
+`needs-approval` workers keep their slot. Each goal accepts `execution_cwds`, a host ID to authorized
 checkout mapping, and an optional opaque `brief_ref`. Keep local paths in private
 runtime configuration. Set `analytics_boundary.api_url` to the control API for
 MCP proxying. No real credentials, paths or workspace identities belong here.
