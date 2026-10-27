@@ -202,7 +202,9 @@ class GoalScope(Model):
         if owner is not None and not (
             owner.startswith("agent:") or owner == native_owner
         ):
-            raise ValueError("continuity owner must be an agent key or this goal's native owner")
+            raise ValueError(
+                "continuity owner must be an agent key or this goal's native owner"
+            )
         if owner and owner.startswith("drover:"):
             if not (
                 self.execution_enabled
@@ -210,7 +212,9 @@ class GoalScope(Model):
                 and self.brief_ref
                 and self.continuity_owner_harness
             ):
-                raise ValueError("native continuity owner requires an enabled harness profile")
+                raise ValueError(
+                    "native continuity owner requires an enabled harness profile"
+                )
         return self
 
 

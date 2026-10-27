@@ -1091,7 +1091,8 @@ class FactoryObserverContinuity:
                     return None
                 if event["attempts"] >= MAX_DELIVERIES:
                     action["escalation"] = {
-                        "state": "blocked:human", "wake_id": event["event_id"]
+                        "state": "blocked:human",
+                        "wake_id": event["event_id"],
                     }
                     con.execute(
                         "UPDATE factory_observer_inbox SET state = 'exhausted', action_json = ? WHERE event_id = ?",

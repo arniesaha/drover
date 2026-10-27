@@ -110,7 +110,8 @@ class NativeOwnerRunner:
                     isinstance(harness, dict)
                     and harness.get("name") == scope.continuity_owner_harness
                     and harness.get("enabled")
-                    and "structured" in harness.get("capabilities", {}).get("launch_modes", [])
+                    and "structured"
+                    in harness.get("capabilities", {}).get("launch_modes", [])
                 ):
                     return host
         return None
@@ -118,7 +119,9 @@ class NativeOwnerRunner:
     def _session(self, scope, *, launch=True) -> str | None:
         link = self._link(scope)
         session = (
-            self.registry.get_session(link["session_id"]) if link["session_id"] else None
+            self.registry.get_session(link["session_id"])
+            if link["session_id"]
+            else None
         )
         if session is None:
             session = self.registry.session_by_client_id(link["client_session_id"])
@@ -133,7 +136,12 @@ class NativeOwnerRunner:
                 with self._transaction() as con:
                     con.execute(
                         "UPDATE continuity_owner_sessions SET session_id = ?, updated_at = ? WHERE goal_id = ? AND owner_id = ?",
-                        [session.session_id, self.clock(), scope.goal_id, link["owner_id"]],
+                        [
+                            session.session_id,
+                            self.clock(),
+                            scope.goal_id,
+                            link["owner_id"],
+                        ],
                     )
             return session.session_id
         if session is not None:
@@ -154,7 +162,9 @@ class NativeOwnerRunner:
         }
         if scope.continuity_owner_model:
             payload["model"] = scope.continuity_owner_model
-        status, body = self.collector.proxy_create_harness_session(host.host_id, payload)
+        status, body = self.collector.proxy_create_harness_session(
+            host.host_id, payload
+        )
         if not 200 <= status < 300:
             return None
         session_id = str(json.loads(body).get("session_id") or "")
@@ -236,7 +246,17 @@ class NativeOwnerRunner:
                     (wake_id, goal_id, owner_id, run_id, session_id, client_turn_id,
                      state, claim_until, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
-                    [wake_id, scope.goal_id, owner_id, run_id, session_id, turn_id, until, now, now],
+                    [
+                        wake_id,
+                        scope.goal_id,
+                        owner_id,
+                        run_id,
+                        session_id,
+                        turn_id,
+                        until,
+                        now,
+                        now,
+                    ],
                 )
         return turn_id
 
