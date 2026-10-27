@@ -50,6 +50,71 @@
       "title": "Acknowledge",
       "type": "object"
     },
+    "ActionIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "action_fingerprint": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Action Fingerprint",
+          "type": "string"
+        },
+        "artifact": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Artifact"
+        },
+        "operation": {
+          "const": "action_intent",
+          "title": "Operation",
+          "type": "string"
+        },
+        "owner_epoch": {
+          "minimum": 1,
+          "title": "Owner Epoch",
+          "type": "integer"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Id"
+        },
+        "wake_id": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Wake Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation",
+        "owner_epoch",
+        "wake_id",
+        "action_fingerprint"
+      ],
+      "title": "ActionIntent",
+      "type": "object"
+    },
     "Consume": {
       "additionalProperties": false,
       "properties": {
@@ -267,6 +332,7 @@
       "discriminator": {
         "mapping": {
           "acknowledge": "#/$defs/Acknowledge",
+          "action_intent": "#/$defs/ActionIntent",
           "consume": "#/$defs/Consume",
           "initialize": "#/$defs/Initialize",
           "lease": "#/$defs/Lease",
@@ -293,6 +359,9 @@
         },
         {
           "$ref": "#/$defs/Acknowledge"
+        },
+        {
+          "$ref": "#/$defs/ActionIntent"
         }
       ],
       "title": "Request"

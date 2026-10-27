@@ -11,7 +11,7 @@ import json
 from datetime import datetime
 from typing import Annotated, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 ENDPOINT = "/harness/factory-observer/continuity"
 TOOL_NAME = "drover_continuity_owner"
@@ -81,10 +81,19 @@ class Acknowledge(WireModel):
     checkpoint: Checkpoint
 
 
+class ActionIntent(WireModel):
+    operation: Literal["action_intent"]
+    run_id: Id | None = None
+    owner_epoch: Epoch
+    wake_id: EventId
+    action_fingerprint: Id
+    artifact: Checkpoint | None = None
+
+
 class OwnerToolCall(WireModel):
     version: Literal[1]
     request: Annotated[
-        Poll | Initialize | Lease | Report | Consume | Acknowledge,
+        Poll | Initialize | Lease | Report | Consume | Acknowledge | ActionIntent,
         Field(discriminator="operation"),
     ]
 
@@ -105,6 +114,7 @@ class OwnerAction(WireModel):
     ]
     authority_scope: Scope
     authorized: bool
+    action_intent: ActionIntentReceipt | None = None
 
     @model_validator(mode="after")
     def check_authority(self):
@@ -117,6 +127,20 @@ class OwnerAction(WireModel):
         ):
             raise ValueError("deployment requires explicit external approval")
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler):
+        value = handler(self)
+        if value.get("action_intent") is None:
+            value.pop("action_intent")
+        return value
+
+
+class ActionIntentReceipt(WireModel):
+    wake_id: EventId
+    action_fingerprint: Id
+    state: Literal["intent", "complete"]
+    artifact: Checkpoint | None
 
 
 class OwnerLease(WireModel):
@@ -232,6 +256,7 @@ class OwnerToolReply(WireModel):
     continuity: ContinuityProjection
     event_id: EventId | None = None
     delivery: OwnerAction | None = None
+    action_intent: ActionIntentReceipt | None = None
 
 
 class ContinuityEndpoint(Protocol):
@@ -336,7 +361,7 @@ class OpenClawOwnerAdapter:
                 )
         elif "delivery" in raw:
             raise ValueError("only consume may deliver an owner action")
-        if isinstance(request, (Lease, Consume, Acknowledge)):
+        if isinstance(request, (Lease, Consume, Acknowledge, ActionIntent)):
             if projection.owner.id != context.owner_id or not projection.owner.live:
                 raise ValueError("reply no longer carries the trusted live owner")
             if (
@@ -349,6 +374,11 @@ class OpenClawOwnerAdapter:
                 raise ValueError("report reply must carry the durable event identity")
         elif "event_id" in raw:
             raise ValueError("only report may return an event identity")
+        if isinstance(request, ActionIntent):
+            if reply.action_intent is None:
+                raise ValueError("action intent reply must carry its durable receipt")
+        elif "action_intent" in raw:
+            raise ValueError("only action intent may return a receipt")
         return reply
 
     def _reply(self, raw: dict, *, allow_unbound_owner: bool = False) -> OwnerToolReply:

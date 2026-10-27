@@ -30,6 +30,17 @@ NATIVE_OWNER_DDL = (
     "CREATE INDEX IF NOT EXISTS continuity_owner_turn_live ON continuity_owner_turn_claims (goal_id, owner_id, state, claim_until)",
 )
 
+NATIVE_OWNER_RECEIPT_DDL = (
+    """CREATE TABLE IF NOT EXISTS continuity_owner_action_intents (
+      wake_id TEXT NOT NULL, action_fingerprint TEXT NOT NULL, run_id TEXT NOT NULL,
+      owner_id TEXT NOT NULL, owner_epoch BIGINT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('intent', 'complete')),
+      artifact TEXT, created_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ,
+      PRIMARY KEY (wake_id, action_fingerprint)
+    )""",
+    "CREATE INDEX IF NOT EXISTS continuity_owner_action_intents_run ON continuity_owner_action_intents (run_id, wake_id)",
+)
+
 CONTINUITY_DDL = (
     """
     CREATE TABLE IF NOT EXISTS factory_observer_runs (
