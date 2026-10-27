@@ -2600,6 +2600,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     "lease",
                     "consume",
                     "acknowledge",
+                    "action_intent",
                 }:
                     principal = self._continuity_owner_principal()
                     if principal is None:

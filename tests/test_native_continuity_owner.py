@@ -2,9 +2,14 @@ import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from drover.schema import bootstrap_control_plane_store
 from drover.server.db import control_plane_connection
-from drover.server.harness.continuity import FactoryObserverContinuity
+from drover.server.harness.continuity import (
+    ContinuityConflict,
+    FactoryObserverContinuity,
+)
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.work_queue.config import GoalScope
 from drover.server.work_queue.native_owner import NativeOwnerRunner
@@ -166,6 +171,45 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     assert runner.process_once() == 1
     assert runner.process_once() == 0
     assert len(collector.turn_attempts) == 1
+
+
+def test_native_ack_requires_completed_intent_across_redelivery(tmp_path):
+    runner, _, store, run_id, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    owner = status["owner"]
+    action = status["next_action"]
+    fence = {"owner_id": owner["id"], "owner_epoch": owner["epoch"]}
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="bypass"
+        )
+
+    store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+    )
+    clock.advance(5)
+    assert store.consume(run_id, **fence)["action_intent"]["state"] == "intent"
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="still bypass"
+        )
+
+    store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact="commit:deadbeef",
+    )
+    store.acknowledge(
+        run_id, **fence, event_id=action["event_id"], checkpoint="reconciled"
+    )
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
 
 
 def test_expired_claim_after_restart_never_redispatches_a_mid_turn(tmp_path):

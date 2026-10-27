@@ -8,6 +8,7 @@ from typing import Any
 
 from drover.server.continuity_schema import (
     NATIVE_OWNER_DDL,
+    NATIVE_OWNER_RECEIPT_DDL,
     POSTGRES_V10_CONTINUITY_DDL,
 )
 from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
@@ -33,6 +34,7 @@ CONTINUITY_REAP_OPERATIONS_MIGRATION = 34
 CONTINUITY_WAKES_MIGRATION = 35
 CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
 NATIVE_CONTINUITY_OWNER_MIGRATION = 37
+NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION = 38
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1040,6 +1042,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     ),
     # Hub-native owner session links and turn fencing (#848).
     (NATIVE_CONTINUITY_OWNER_MIGRATION, NATIVE_OWNER_DDL),
+    (NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION, NATIVE_OWNER_RECEIPT_DDL),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

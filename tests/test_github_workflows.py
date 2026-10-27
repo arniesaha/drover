@@ -334,10 +334,30 @@ def test_public_workflows_select_expensive_suites_from_changed_paths() -> None:
     ):
         expensive_step = next(step for step in python_steps if step.get("name") == name)
         assert expensive_step["if"] == "steps.scope.outputs.python == 'true'"
-    # The generic PR tier may defer service-bound duplicates, but these are
-    # separate core-capability gates and must remain on every pull request.
+    integration_scope = python_ci["jobs"]["integration-changes"]
+    assert integration_scope["outputs"]["integration"] == (
+        "${{ steps.scope.outputs.integration }}"
+    )
+    integration_selector = next(
+        step
+        for step in integration_scope["steps"]
+        if step.get("name") == "Select database integration scope"
+    )
+    assert integration_selector["env"]["BASE_SHA"] == (
+        "${{ github.event.pull_request.base.sha }}"
+    )
+    assert "release:*" in integration_selector["run"]
     for job_name in ("postgres-integration", "pgvector-memory-integration"):
-        assert "if" not in python_ci["jobs"][job_name]
+        job = python_ci["jobs"][job_name]
+        assert job["needs"] == "integration-changes"
+        assert job["if"] == "needs.integration-changes.outputs.integration == 'true'"
+        assert job["timeout-minutes"] == "30"
+    ducklake_acceptance = next(
+        step
+        for step in python_ci["jobs"]["postgres-integration"]["steps"]
+        if step.get("name") == "Run DuckLake v2 acceptance contracts"
+    )
+    assert ducklake_acceptance["timeout-minutes"] == "20"
     ios_xcode = next(
         step for step in ios_steps if step.get("name") == "Show Xcode version"
     )
