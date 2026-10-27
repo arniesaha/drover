@@ -468,3 +468,15 @@ def test_finalised_worker_frees_the_slot_but_not_the_item(service):
     provider.set_labels(None, ["goal:test", "status:queued"])
     with pytest.raises(RuntimeError, match="existing execution requires inspection"):
         launch(service, "another")
+
+
+def test_sessionless_intent_is_retried_without_duplicate_execution(service):
+    service.harness.timeout = True
+    with pytest.raises(TimeoutError):
+        launch(service)
+    intent = service.store.links()[0]
+    assert intent["session_id"] is None
+    service.harness.timeout = False
+    retried = launch(service)
+    assert retried["session_id"] == "session-2"
+    assert len(service.store.links()) == 1
