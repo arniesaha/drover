@@ -252,6 +252,36 @@ def test_lost_delivery_retains_action_and_recovery_is_explicit(make_harness):
     assert endpoint.store().status(RUN)["next_action"] is None
 
 
+def test_action_intent_is_fenced_and_reconciled_on_redelivery(make_harness):
+    harness, endpoint, clock = make_harness()
+    epoch = harness.call("lease")["continuity"]["owner"]["epoch"]
+    harness.call("report", **worker_report())
+    action = harness.call("consume", owner_epoch=epoch)["delivery"]
+
+    receipt = harness.call(
+        "action_intent",
+        owner_epoch=epoch,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+    )["action_intent"]
+    assert receipt == {
+        "wake_id": action["event_id"],
+        "action_fingerprint": action["action_id"],
+        "state": "intent",
+        "artifact": None,
+    }
+    clock.advance(5)
+    redelivery = harness.call("consume", owner_epoch=epoch)["delivery"]
+    assert redelivery["action_intent"] == receipt
+    assert endpoint.store().action_intent(
+        RUN,
+        owner_id=OWNER,
+        owner_epoch=epoch,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+    ) == receipt
+
+
 @pytest.mark.parametrize(
     "scope,expected,authorized",
     [
@@ -444,6 +474,7 @@ def test_descriptor_has_versioned_object_schema_but_does_not_register_runtime():
         "poll",
         "consume",
         "acknowledge",
+        "action_intent",
     }
 
 

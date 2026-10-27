@@ -79,6 +79,10 @@ def continuity_request(store: FactoryObserverContinuity, body: dict) -> dict:
             {"run_id", "owner_id", "owner_epoch", "event_id", "checkpoint"},
             set(),
         ),
+        "action_intent": (
+            {"run_id", "owner_id", "owner_epoch", "wake_id", "action_fingerprint"},
+            {"artifact"},
+        ),
     }
     operation = body.get("operation")
     if not isinstance(operation, str) or operation not in contracts:
@@ -101,6 +105,8 @@ def continuity_request(store: FactoryObserverContinuity, body: dict) -> dict:
         response["event_id"] = result
     if operation == "consume":
         response["delivery"] = result
+    if operation == "action_intent":
+        response["action_intent"] = result
     return response
 
 
@@ -125,6 +131,15 @@ def _row(con, sql, params):
     result = con.execute(sql, params)
     row = result.fetchone()
     return dict(zip((col[0] for col in result.description), row)) if row else None
+
+
+def _intent_wire(row: dict) -> dict:
+    return {
+        "wake_id": row["wake_id"],
+        "action_fingerprint": row["action_fingerprint"],
+        "state": row["state"],
+        "artifact": row["artifact"],
+    }
 
 
 def _lock_observer_session(con, session_id: str):
@@ -1176,7 +1191,83 @@ class FactoryObserverContinuity:
                     event["event_id"],
                 ],
             )
+            receipt = _row(
+                con,
+                """SELECT wake_id, action_fingerprint, state, artifact
+                FROM continuity_owner_action_intents
+                WHERE wake_id = ? AND action_fingerprint = ?""",
+                [action["event_id"], action["action_id"]],
+            )
+            if receipt is not None:
+                action["action_intent"] = _intent_wire(receipt)
         return action
+
+    def action_intent(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        owner_epoch: int,
+        wake_id: str,
+        action_fingerprint: str,
+        artifact: str | None = None,
+    ) -> dict:
+        """Write or reconcile one fenced external-action intent receipt."""
+        _text(wake_id, "wake_id", 64)
+        _text(action_fingerprint, "action_fingerprint", 191)
+        if artifact is not None:
+            _text(artifact, "artifact", 2000)
+        with self._transaction(run_id) as (con, run):
+            now = self.clock()
+            self._authorized_owner(run, owner_id)
+            self._fence(run, owner_id, owner_epoch, now)
+            event = _row(
+                con,
+                """SELECT state, action_json FROM factory_observer_inbox
+                WHERE run_id = ? AND event_id = ?""",
+                [run_id, wake_id],
+            )
+            if event is None:
+                raise KeyError(wake_id)
+            action = json.loads(event["action_json"] or "null")
+            if (
+                event["state"] != "delivered"
+                or not isinstance(action, dict)
+                or action.get("action_id") != action_fingerprint
+            ):
+                raise ContinuityConflict("action intent must match the consumed delivery")
+            existing = _row(
+                con,
+                """SELECT wake_id, action_fingerprint, state, artifact
+                FROM continuity_owner_action_intents
+                WHERE wake_id = ? AND action_fingerprint = ?""",
+                [wake_id, action_fingerprint],
+            )
+            if existing is None:
+                con.execute(
+                    """INSERT INTO continuity_owner_action_intents
+                    (wake_id, action_fingerprint, run_id, owner_id, owner_epoch,
+                     state, artifact, created_at)
+                    VALUES (?, ?, ?, ?, ?, 'intent', ?, ?)""",
+                    [wake_id, action_fingerprint, run_id, owner_id, owner_epoch, artifact, now],
+                )
+                existing = {
+                    "wake_id": wake_id,
+                    "action_fingerprint": action_fingerprint,
+                    "state": "intent",
+                    "artifact": artifact,
+                }
+            elif artifact is not None and existing["artifact"] not in {None, artifact}:
+                raise ContinuityConflict("action intent artifact is immutable")
+            if artifact is not None and existing["state"] == "intent":
+                con.execute(
+                    """UPDATE continuity_owner_action_intents
+                    SET state = 'complete', artifact = ?, completed_at = ?
+                    WHERE wake_id = ? AND action_fingerprint = ?""",
+                    [artifact, now, wake_id, action_fingerprint],
+                )
+                existing.update(state="complete", artifact=artifact)
+        return _intent_wire(existing)
 
     def acknowledge(
         self,
@@ -1279,6 +1370,16 @@ class FactoryObserverContinuity:
             action = (
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
             )
+            if action:
+                receipt = _row(
+                    con,
+                    """SELECT wake_id, action_fingerprint, state, artifact
+                    FROM continuity_owner_action_intents
+                    WHERE wake_id = ? AND action_fingerprint = ?""",
+                    [action["event_id"], action["action_id"]],
+                )
+                if receipt is not None:
+                    action["action_intent"] = _intent_wire(receipt)
             blocked = run["authority_scope"] == "deployment"
             receipt_counts = dict(
                 con.execute(
