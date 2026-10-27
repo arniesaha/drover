@@ -20,7 +20,9 @@ def stale_sessionless_intent(link, *, minutes: int, now=None) -> bool:
     """Whether an unassociated launch intent has exceeded its recovery window."""
     if link["session_id"] is not None:
         return False
-    created_at = link["created_at"]
+    created_at = link.get("created_at")
+    if created_at is None:  # unknown age: keep holding capacity (fail closed)
+        return False
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
     return created_at <= (now or datetime.now(timezone.utc)) - timedelta(

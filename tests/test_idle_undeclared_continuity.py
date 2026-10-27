@@ -260,7 +260,9 @@ def test_bridge_active_excludes_finalised_workers(run):
     bridge = object.__new__(HarnessBridge)
     bridge.collector = SimpleNamespace(duckdb_path=run.path)
     bridge.config = SimpleNamespace(
-        execution=SimpleNamespace(idle_awaiting_input_minutes=10_080)
+        execution=SimpleNamespace(
+            idle_awaiting_input_minutes=10_080, orphan_intent_minutes=10
+        )
     )
     bridge.registry = HarnessRegistry(run.path)
     links = [{"session_id": "harness-w"}, {"session_id": None}]
