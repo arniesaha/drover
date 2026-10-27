@@ -351,13 +351,14 @@ def test_public_workflows_select_expensive_suites_from_changed_paths() -> None:
         job = python_ci["jobs"][job_name]
         assert job["needs"] == "integration-changes"
         assert job["if"] == "needs.integration-changes.outputs.integration == 'true'"
-        assert job["timeout-minutes"] == "30"
+    assert python_ci["jobs"]["postgres-integration"]["timeout-minutes"] == "45"
+    assert python_ci["jobs"]["pgvector-memory-integration"]["timeout-minutes"] == "30"
     ducklake_acceptance = next(
         step
         for step in python_ci["jobs"]["postgres-integration"]["steps"]
         if step.get("name") == "Run DuckLake v2 acceptance contracts"
     )
-    assert ducklake_acceptance["timeout-minutes"] == "20"
+    assert ducklake_acceptance["timeout-minutes"] == "35"
     ios_xcode = next(
         step for step in ios_steps if step.get("name") == "Show Xcode version"
     )

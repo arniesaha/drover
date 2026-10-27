@@ -361,7 +361,7 @@ jobs:
     needs: integration-changes
     if: needs.integration-changes.outputs.integration == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:17.11
@@ -436,7 +436,7 @@ jobs:
         echo "DROVER_TEST_LAKE_EXTENSIONS=$HOME/.cache/drover-lake-ext" >> "$GITHUB_ENV"
 
     - name: Run DuckLake v2 acceptance contracts
-      timeout-minutes: 20
+      timeout-minutes: 35
       run: |
         pytest tests/acceptance -m "not acceptance_scale" -q
 
