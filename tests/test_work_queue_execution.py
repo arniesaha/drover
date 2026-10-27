@@ -497,3 +497,46 @@ def test_stale_sessionless_intent_handles_naive_timestamps():
     assert stale_sessionless_intent(stale, minutes=10, now=now)
     assert not stale_sessionless_intent(fresh, minutes=10, now=now)
     assert not stale_sessionless_intent(linked, minutes=10, now=now)
+
+
+def _age_intent(service, row, minutes=11):
+    with service.store.connection() as con:
+        con.execute(
+            "UPDATE execution_links SET created_at = now() - (? * interval '1 minute'), updated_at = now() - (? * interval '1 minute') WHERE id = ?",
+            [minutes, minutes, row["id"]],
+        )
+
+
+def test_stale_unresolved_intent_relaunches_once(service):
+    service.harness.timeout = True
+    with pytest.raises(TimeoutError):
+        launch(service)
+    row = service.store.links()[0]
+    service.harness.sessions.clear()
+    _age_intent(service, row)
+    service.harness.timeout = False
+    retried = launch(service)
+    assert retried["run_key"] == row["run_key"]
+    assert retried["failure_count"] == row["failure_count"] + 1
+    assert len(service.store.links()) == 1
+
+
+def test_fresh_unresolved_intent_stays_uncertain(service):
+    service.harness.timeout = True
+    with pytest.raises(TimeoutError):
+        launch(service)
+    service.harness.sessions.clear()
+    with pytest.raises(RuntimeError, match="launch intent uncertain"):
+        launch(service)
+
+
+def test_stale_unresolved_intent_at_retry_limit_is_systemic(service):
+    service.harness.timeout = True
+    with pytest.raises(TimeoutError):
+        launch(service)
+    row = service.store.links()[0]
+    service.harness.sessions.clear()
+    _age_intent(service, row)
+    service.store.failure(row["run_key"], load_policy().retries.attempts - 1)
+    with pytest.raises(RuntimeError, match="systemic review required"):
+        launch(service)
