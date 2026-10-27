@@ -457,7 +457,9 @@ class WorkService:
         # A finalised worker frees its slot but its session is still resumable,
         # so it keeps blocking a second execution of the same item.
         if any(
-            l["goal_id"] == goal_id and l["item_number"] == number
+            l["goal_id"] == goal_id
+            and l["item_number"] == number
+            and l["session_id"] is not None
             for l in self.harness.active(self.store.links(), release_finalised=False)
         ):
             raise WorkDenied("existing execution requires inspection")

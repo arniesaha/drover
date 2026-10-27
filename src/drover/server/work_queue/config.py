@@ -275,6 +275,7 @@ class QueueExecutionConfig(Model):
     global_max_workers: int = Field(default=1, ge=1)
     # Awaiting-input workers remain resumable, but cannot reserve capacity forever.
     idle_awaiting_input_minutes: int = Field(default=30, ge=1, le=10_080)
+    orphan_intent_minutes: int = Field(default=10, ge=1, le=1_440)
     kill_switch: bool = False
 
 

@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import threading
+from datetime import datetime, timedelta, timezone
 
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
@@ -116,7 +117,13 @@ class HarnessBridge:
         unavailable every live worker keeps its slot.
         """
         active = []
+        orphan_cutoff = datetime.now(timezone.utc) - timedelta(
+            minutes=self.config.execution.orphan_intent_minutes
+        )
         for link in links:
+            if link["session_id"] is None and link["created_at"] <= orphan_cutoff:
+                log.warning("releasing stale launch intent capacity run_key=%s", link["run_key"])
+                continue
             session = (
                 self.registry.get_session(link["session_id"])
                 if link["session_id"]
