@@ -35,7 +35,6 @@ CONTINUITY_WAKES_MIGRATION = 35
 CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
 NATIVE_CONTINUITY_OWNER_MIGRATION = 37
 NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION = 38
-CONTINUITY_OBSERVABILITY_MIGRATION = 39
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1044,20 +1043,6 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     # Hub-native owner session links and turn fencing (#848).
     (NATIVE_CONTINUITY_OWNER_MIGRATION, NATIVE_OWNER_DDL),
     (NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION, NATIVE_OWNER_RECEIPT_DDL),
-    # Operational status read model. 37 and 38 are already released.
-    (
-        CONTINUITY_OBSERVABILITY_MIGRATION,
-        (
-            """CREATE TABLE IF NOT EXISTS continuity_plugin_heartbeats (
-              session_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
-              last_poll_at TIMESTAMPTZ NOT NULL,
-              status TEXT NOT NULL CHECK (status IN ('ok', 'error')),
-              consecutive_failures INTEGER NOT NULL DEFAULT 0,
-              last_error TEXT, latency_ms INTEGER
-            )""",
-            "CREATE INDEX IF NOT EXISTS idx_continuity_wakes_pending_age ON continuity_wakes (state, created_at) WHERE state = 'pending'",
-        ),
-    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

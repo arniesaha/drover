@@ -543,36 +543,25 @@ def _append_continuity_metrics(lines: list[str], db_path: Path) -> None:
                 pending["over_10m"],
                 age_bucket="over_10m",
             ),
-            "# TYPE drover_continuity_latency_seconds gauge",
-        ]
-    )
-    for kind, values in status["latencies"].items():
-        if kind == "sample_count":
-            continue
-        for quantile in ("p50", "p95"):
-            lines.append(
-                _metric(
-                    "drover_continuity_latency_seconds",
-                    values[quantile] / 1000,
-                    kind=kind,
-                    quantile=quantile.removeprefix("p"),
-                )
-            )
-    lines.extend(
-        [
             "# TYPE drover_continuity_stuck_wakes gauge",
             _metric("drover_continuity_stuck_wakes", pending["over_10m"]),
-            "# TYPE drover_continuity_poll_failures gauge",
+            "# HELP drover_continuity_dead_letter Dead-lettered native owner wakes.",
+            "# TYPE drover_continuity_dead_letter gauge",
+            _metric(
+                "drover_continuity_dead_letter",
+                status["native_owner"]["dead_lettered_wakes"]["count"],
+            ),
+            "# HELP drover_continuity_stuck_owner_turn Active native owner turns past their claim deadline.",
+            "# TYPE drover_continuity_stuck_owner_turn gauge",
+            _metric(
+                "drover_continuity_stuck_owner_turn",
+                sum(
+                    claim["stuck"]
+                    for claim in status["native_owner"]["active_turn_claims"]
+                ),
+            ),
         ]
     )
-    for heartbeat in status["plugin_heartbeats"]:
-        lines.append(
-            _metric(
-                "drover_continuity_poll_failures",
-                heartbeat["consecutive_failures"],
-                session_key=heartbeat["session_key"],
-            )
-        )
 
 
 def _append_summarizer_metrics(lines: list[str], report: Mapping[str, Any]) -> None:

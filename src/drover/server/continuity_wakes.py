@@ -47,11 +47,6 @@ CONTINUITY_WAKES_DDL = (
     )""",
     # Existing DuckDB compatibility stores predate the per-delivery fence.
     "ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",
-    """CREATE TABLE IF NOT EXISTS continuity_plugin_heartbeats (
-      session_key TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
-      last_poll_at TIMESTAMPTZ NOT NULL, status TEXT NOT NULL CHECK (status IN ('ok', 'error')),
-      consecutive_failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, latency_ms INTEGER
-    )""",
     "CREATE INDEX IF NOT EXISTS continuity_wakes_delivery ON continuity_wakes (issue_key, state, next_delivery_at, created_at, wake_id)",
 )
 

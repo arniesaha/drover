@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -11,33 +10,10 @@ from drover.server.db import control_plane_connection
 
 
 class ContinuityStatusService:
-    """Collect lightweight latency samples and project durable wake state."""
+    """Project durable continuity health without process-local state."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        self._latencies = {
-            "wake_to_consume": deque(maxlen=1000),
-            "consume_to_ack": deque(maxlen=1000),
-        }
-
-    def record_transition(self, kind: str, latency_ms: int) -> None:
-        if kind not in self._latencies or type(latency_ms) is not int or latency_ms < 0:
-            raise ValueError("bounded continuity latency is required")
-        self._latencies[kind].append(latency_ms)
-
-    @staticmethod
-    def _summary(values: deque[int]) -> dict[str, int]:
-        if not values:
-            return {"avg": 0, "p50": 0, "p95": 0}
-        ordered = sorted(values)
-        percentile = lambda fraction: ordered[
-            min(len(ordered) - 1, int((len(ordered) - 1) * fraction + 0.5))
-        ]
-        return {
-            "avg": round(sum(ordered) / len(ordered)),
-            "p50": percentile(0.50),
-            "p95": percentile(0.95),
-        }
 
     @staticmethod
     def _rows(cursor) -> list[dict[str, Any]]:
@@ -68,11 +44,6 @@ class ContinuityStatusService:
                     [at],
                 )
             )
-            heartbeats = self._rows(
-                con.execute("""SELECT session_key, owner_id, last_poll_at, status,
-                          consecutive_failures, last_error, latency_ms
-                   FROM continuity_plugin_heartbeats ORDER BY session_key""")
-            )
             has_worker_states = con.execute(
                 "SELECT count(*) FROM information_schema.tables WHERE table_name = 'harness_worker_states'"
             ).fetchone()[0]
@@ -86,9 +57,49 @@ class ContinuityStatusService:
             redelivered = con.execute(
                 "SELECT count(*) FROM continuity_wakes WHERE attempts > 1 AND state <> 'acknowledged'"
             ).fetchone()[0]
+            claims = self._rows(
+                con.execute("""SELECT wake_id, goal_id, owner_id, run_id, session_id,
+                       client_turn_id, state, claim_until, created_at
+                    FROM continuity_owner_turn_claims
+                    WHERE state IN ('claimed', 'sent')
+                    ORDER BY created_at, wake_id""")
+            )
+            attempts = con.execute("""SELECT coalesce(sum(i.attempts), 0)
+                FROM factory_observer_inbox i
+                JOIN factory_observer_runs r ON r.run_id = i.run_id
+                WHERE r.authorized_owner_id LIKE 'drover:owner/%'""").fetchone()[0]
+            dead_letters = con.execute("""SELECT count(*), min(i.received_at)
+                FROM factory_observer_inbox i
+                JOIN factory_observer_runs r ON r.run_id = i.run_id
+                WHERE i.state = 'exhausted'
+                AND r.authorized_owner_id LIKE 'drover:owner/%'""").fetchone()
+            incomplete_receipts = self._rows(
+                con.execute("""SELECT wake_id, action_fingerprint, run_id, owner_id,
+                       owner_epoch, created_at
+                    FROM continuity_owner_action_intents
+                    WHERE state = 'intent' AND owner_id LIKE 'drover:owner/%'
+                    ORDER BY created_at, wake_id, action_fingerprint""")
+            )
 
         def iso(value):
-            return value.isoformat() if isinstance(value, datetime) else value
+            return (
+                value.astimezone(timezone.utc).isoformat()
+                if isinstance(value, datetime)
+                else value
+            )
+
+        def age_seconds(value):
+            return max(0, round((at - value).total_seconds())) if value else 0
+
+        active_claims = [
+            {
+                **claim,
+                "claim_until": iso(claim["claim_until"]),
+                "created_at": iso(claim["created_at"]),
+                "stuck": claim["claim_until"] <= at,
+            }
+            for claim in claims
+        ]
 
         return {
             "version": 1,
@@ -97,11 +108,6 @@ class ContinuityStatusService:
                 "under_2m": int(pending[1] or 0),
                 "between_2m_and_10m": int(pending[2] or 0),
                 "over_10m": int(pending[3] or 0),
-            },
-            "latencies": {
-                "sample_count": sum(len(values) for values in self._latencies.values()),
-                "wake_to_consume_ms": self._summary(self._latencies["wake_to_consume"]),
-                "consume_to_ack_ms": self._summary(self._latencies["consume_to_ack"]),
             },
             "active_leases": [
                 {
@@ -115,8 +121,17 @@ class ContinuityStatusService:
             ],
             "idle_undeclared_sessions": int(idle),
             "redelivered_wakes_count": int(redelivered),
-            "plugin_heartbeats": [
-                {**row, "last_poll_at": iso(row["last_poll_at"])} for row in heartbeats
-            ],
+            "native_owner": {
+                "active_turn_claims": active_claims,
+                "attempts": int(attempts or 0),
+                "dead_lettered_wakes": {
+                    "count": int(dead_letters[0] or 0),
+                    "oldest_age_seconds": age_seconds(dead_letters[1]),
+                },
+                "incomplete_receipts": [
+                    {**receipt, "created_at": iso(receipt["created_at"])}
+                    for receipt in incomplete_receipts
+                ],
+            },
             "active_alerts": [],
         }
