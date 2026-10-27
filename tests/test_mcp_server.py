@@ -32,6 +32,7 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
     assert names == {
         "drover_work_list",
         "drover_work_get",
+        "drover_continuity_status",
         "drover_work_launch",
         "drover_work_link",
         "drover_work_update",
