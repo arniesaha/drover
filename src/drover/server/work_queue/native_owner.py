@@ -213,6 +213,22 @@ class NativeOwnerRunner:
             ).fetchone()
             return row is not None
 
+    def _release_failed_claim(
+        self, session_id: str, wake_id: str, turn_id: str
+    ) -> None:
+        if turn_id in self.registry.recent_user_input_turn_ids(session_id, limit=20):
+            with self._transaction() as con:
+                con.execute(
+                    "UPDATE continuity_owner_turn_claims SET state = 'sent', updated_at = ? WHERE wake_id = ? AND client_turn_id = ?",
+                    [self.clock(), wake_id, turn_id],
+                )
+            return
+        with self._transaction() as con:
+            con.execute(
+                "DELETE FROM continuity_owner_turn_claims WHERE wake_id = ? AND client_turn_id = ? AND state = 'claimed'",
+                [wake_id, turn_id],
+            )
+
     def _claim(self, scope, run_id: str, session_id: str, wake_id: str) -> str | None:
         now = self.clock()
         until = now + timedelta(seconds=self.claim_seconds)
@@ -318,6 +334,7 @@ class NativeOwnerRunner:
                     [self.clock(), action["event_id"]],
                 )
             return True
+        self._release_failed_claim(session_id, action["event_id"], turn_id)
         return False
 
     def process_once(self) -> int:
