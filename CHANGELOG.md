@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.45] - 2026-10-27
+
+### Fixed
+
+- Releases stale sessionless work-queue launch intents after a bounded recovery window while retaining fresh intent and duplicate-execution protections (#851, #858).
+- Includes the #853/#854 queue reliability fixes.
+
 ## [0.6.44] - 2026-10-26
 
 ### Fixed
