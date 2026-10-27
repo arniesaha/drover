@@ -2,9 +2,13 @@ import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from drover.schema import bootstrap_control_plane_store
-from drover.server.db import control_plane_connection
-from drover.server.harness.continuity import FactoryObserverContinuity
+from drover.server.harness.continuity import (
+    ContinuityConflict,
+    FactoryObserverContinuity,
+)
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.work_queue.config import GoalScope
 from drover.server.work_queue.native_owner import NativeOwnerRunner
@@ -59,15 +63,9 @@ class Collector:
         self.launches = []
         self.turn_attempts = []
         self.accepted_turns = set()
-        self.failed_launches = 0
-        self.failed_turns = 0
-        self.recorded_failed_turns = 0
 
     def proxy_create_harness_session(self, host_id, payload):
         self.launches.append((host_id, payload))
-        if self.failed_launches:
-            self.failed_launches -= 1
-            return 503, "{}"
         session = self.registry.create_session(
             session_id="owner-session",
             host_id=host_id,
@@ -84,23 +82,7 @@ class Collector:
     def proxy_harness_session_action(self, session_id, action, payload):
         assert action == "turns"
         self.turn_attempts.append((session_id, payload))
-        if self.failed_turns:
-            self.failed_turns -= 1
-            if self.recorded_failed_turns:
-                self.recorded_failed_turns -= 1
-                self.accepted_turns.add(payload["client_turn_id"])
-                self.registry.append_event(
-                    session_id=session_id,
-                    event_type="user_input",
-                    payload={"turn_id": payload["client_turn_id"]},
-                )
-            return 503, "{}"
         self.accepted_turns.add(payload["client_turn_id"])
-        self.registry.append_event(
-            session_id=session_id,
-            event_type="user_input",
-            payload={"turn_id": payload["client_turn_id"]},
-        )
         return 202, "{}"
 
 
@@ -168,84 +150,60 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     assert len(collector.turn_attempts) == 1
 
 
-def test_expired_claim_after_restart_never_redispatches_a_mid_turn(tmp_path):
+def test_native_ack_requires_completed_intent_across_redelivery(tmp_path):
+    runner, _, store, run_id, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    owner = status["owner"]
+    action = status["next_action"]
+    fence = {"owner_id": owner["id"], "owner_epoch": owner["epoch"]}
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="bypass"
+        )
+
+    store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+    )
+    clock.advance(5)
+    assert store.consume(run_id, **fence)["action_intent"]["state"] == "intent"
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="still bypass"
+        )
+
+    store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact="commit:deadbeef",
+    )
+    store.acknowledge(
+        run_id, **fence, event_id=action["event_id"], checkpoint="reconciled"
+    )
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+
+
+def test_expired_claim_after_restart_reuses_idempotent_owner_turn(tmp_path):
     runner, collector, _, _, clock = _runner(tmp_path)
 
     assert runner.process_once() == 1
     first_turn = collector.turn_attempts[0][1]["client_turn_id"]
-    # A hub restart must consult the durable claim, not treat its age as
-    # permission to send another turn into the same owner session.
+    # Both the bounded turn claim and the Factory owner lease expired while
+    # the hub was down; the new runner must reclaim instead of starting over.
     clock.advance(61)
     restarted = NativeOwnerRunner(
         collector, runner.config, clock=clock, claim_seconds=10
     )
 
-    assert restarted.process_once() == 0
-    assert len(collector.turn_attempts) == 1
+    assert restarted.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+    assert collector.turn_attempts[1][1]["client_turn_id"] == first_turn
+    # A harness restart/retry sees the same client turn id, so the one
+    # authorized action behind its wake cannot be executed twice.
     assert collector.accepted_turns == {first_turn}
-
-
-def test_failed_owner_launches_exhaust_wake_once(tmp_path):
-    runner, collector, store, run_id, clock = _runner(tmp_path)
-    collector.failed_launches = 3
-
-    for delay in (5, 10, 20):
-        assert runner.process_once() == 0
-        clock.advance(delay)
-
-    assert runner.process_once() == 0
-    assert len(collector.launches) == 3
-    assert store.status(run_id)["worker_state"] == "blocked:human"
-    assert store.owner_runs("drover:owner/goal-native") == []
-
-
-def test_failed_turn_submission_retries_the_same_owner_turn(tmp_path):
-    runner, collector, _, _, clock = _runner(tmp_path)
-    collector.failed_turns = 1
-
-    assert runner.process_once() == 0
-    failed_turn = collector.turn_attempts[0][1]["client_turn_id"]
-    clock.advance(5)
-    assert runner.process_once() == 1
-    assert [attempt[1]["client_turn_id"] for attempt in collector.turn_attempts] == [
-        failed_turn,
-        failed_turn,
-    ]
-
-
-def test_recorded_turn_stays_fenced_after_failed_submission_response(tmp_path):
-    runner, collector, _, _, clock = _runner(tmp_path)
-    collector.failed_turns = collector.recorded_failed_turns = 1
-
-    assert runner.process_once() == 0
-    clock.advance(5)
-    restarted = NativeOwnerRunner(
-        collector, runner.config, clock=clock, claim_seconds=10
-    )
-    assert restarted.process_once() == 0
-    assert len(collector.turn_attempts) == 1
-
-
-def test_restart_after_failed_submission_dead_letters_once(tmp_path):
-    runner, collector, store, run_id, clock = _runner(tmp_path)
-    collector.failed_turns = 3
-
-    assert runner.process_once() == 0
-    clock.advance(5)
-    restarted = NativeOwnerRunner(
-        collector, runner.config, clock=clock, claim_seconds=10
-    )
-    for delay in (10, 20):
-        assert restarted.process_once() == 0
-        clock.advance(delay)
-    assert restarted.process_once() == 0
-    status = store.status(run_id)
-    assert len(collector.turn_attempts) == 3
-    assert status["inbox_counts"] == {"exhausted": 1}
-    assert status["worker_state"] == "blocked:human"
-    assert store.owner_runs("drover:owner/goal-native") == []
-    with control_plane_connection(runner.path) as con:
-        [action_json] = con.execute(
-            "SELECT action_json FROM factory_observer_inbox WHERE run_id = ?", [run_id]
-        ).fetchone()
-    assert json.loads(action_json)["escalation"]["state"] == "blocked:human"

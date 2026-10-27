@@ -1296,10 +1296,19 @@ class FactoryObserverContinuity:
                 return  # A replay must never clobber a newer checkpoint/action.
             if not event["action_json"]:
                 raise ContinuityConflict("consume the report before acknowledging")
-            if not json.loads(event["action_json"])["authorized"]:
+            action = json.loads(event["action_json"])
+            if not action["authorized"]:
                 raise ContinuityConflict(
                     "explicit deployment approval is required outside this bridge"
                 )
+            if owner_id.startswith("drover:owner/") and _row(
+                con,
+                """SELECT 1 AS present FROM continuity_owner_action_intents
+                WHERE wake_id = ? AND action_fingerprint = ? AND run_id = ?
+                AND owner_id = ? AND state = 'complete'""",
+                [event_id, action["action_id"], run_id, owner_id],
+            ) is None:
+                raise ContinuityConflict("completed action intent receipt is required")
             con.execute(
                 "UPDATE factory_observer_inbox SET state = 'acknowledged', acknowledged_at = ? WHERE event_id = ?",
                 [now, event_id],
