@@ -189,21 +189,18 @@ def test_native_ack_requires_completed_intent_across_redelivery(tmp_path):
     assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
 
 
-def test_expired_claim_after_restart_reuses_idempotent_owner_turn(tmp_path):
+def test_expired_claim_after_restart_never_redispatches_a_mid_turn(tmp_path):
     runner, collector, _, _, clock = _runner(tmp_path)
 
     assert runner.process_once() == 1
     first_turn = collector.turn_attempts[0][1]["client_turn_id"]
-    # Both the bounded turn claim and the Factory owner lease expired while
-    # the hub was down; the new runner must reclaim instead of starting over.
+    # A hub restart must consult the durable claim, not treat its age as
+    # permission to send another turn into the same owner session.
     clock.advance(61)
     restarted = NativeOwnerRunner(
         collector, runner.config, clock=clock, claim_seconds=10
     )
 
-    assert restarted.process_once() == 1
-    assert len(collector.turn_attempts) == 2
-    assert collector.turn_attempts[1][1]["client_turn_id"] == first_turn
-    # A harness restart/retry sees the same client turn id, so the one
-    # authorized action behind its wake cannot be executed twice.
+    assert restarted.process_once() == 0
+    assert len(collector.turn_attempts) == 1
     assert collector.accepted_turns == {first_turn}
