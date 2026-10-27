@@ -1113,9 +1113,18 @@ class FactoryObserverContinuity:
                 if event["state"] == "exhausted" or event["next_delivery_at"] > now:
                     return None
                 if event["attempts"] >= MAX_DELIVERIES:
+                    action["escalation"] = {
+                        "state": "blocked:human",
+                        "wake_id": event["event_id"],
+                    }
                     con.execute(
-                        "UPDATE factory_observer_inbox SET state = 'exhausted' WHERE event_id = ?",
-                        [event["event_id"]],
+                        "UPDATE factory_observer_inbox SET state = 'exhausted', action_json = ? WHERE event_id = ?",
+                        [canonical_payload(action), event["event_id"]],
+                    )
+                    con.execute(
+                        """UPDATE factory_observer_runs SET next_action_json = NULL,
+                        worker_state = 'blocked:human', updated_at = ? WHERE run_id = ?""",
+                        [now, run_id],
                     )
                     return None
             else:

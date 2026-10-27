@@ -177,6 +177,11 @@ class GoalScope(Model):
     # Explicit opt-in: the one OpenClaw session allowed to receive durable
     # work-completion wakes for this goal.  No default owner exists.
     continuity_owner_id: str | None = None
+    # Native owners use the normal structured harness launch contract.  The
+    # harness is deliberately explicit: a native owner must not inherit a
+    # provider/model default from an unrelated worker.
+    continuity_owner_harness: str | None = None
+    continuity_owner_model: str | None = None
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -190,11 +195,26 @@ class GoalScope(Model):
             policy.labels.goal_prefix
         ):
             raise ValueError("goal label must use the policy goal namespace")
-        if self.continuity_owner_id is not None and (
-            not self.continuity_owner_id.startswith("agent:")
-            or len(self.continuity_owner_id) > 191
+        owner = self.continuity_owner_id
+        native_owner = "drover:owner/" + self.goal_id
+        if owner is not None and len(owner) > 191:
+            raise ValueError("continuity owner exceeds the control-plane limit")
+        if owner is not None and not (
+            owner.startswith("agent:") or owner == native_owner
         ):
-            raise ValueError("continuity owner must be a canonical agent key")
+            raise ValueError(
+                "continuity owner must be an agent key or this goal's native owner"
+            )
+        if owner and owner.startswith("drover:"):
+            if not (
+                self.execution_enabled
+                and self.execution_cwds
+                and self.brief_ref
+                and self.continuity_owner_harness
+            ):
+                raise ValueError(
+                    "native continuity owner requires an enabled harness profile"
+                )
         return self
 
 

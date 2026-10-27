@@ -6,7 +6,10 @@ import logging
 from time import monotonic
 from typing import Any
 
-from drover.server.continuity_schema import POSTGRES_V10_CONTINUITY_DDL
+from drover.server.continuity_schema import (
+    NATIVE_OWNER_DDL,
+    POSTGRES_V10_CONTINUITY_DDL,
+)
 from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
 
 log = logging.getLogger(__name__)
@@ -29,6 +32,7 @@ CONTINUITY_LEASES_MIGRATION = 33
 CONTINUITY_REAP_OPERATIONS_MIGRATION = 34
 CONTINUITY_WAKES_MIGRATION = 35
 CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
+NATIVE_CONTINUITY_OWNER_MIGRATION = 37
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1034,6 +1038,8 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION,
         ("ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",),
     ),
+    # Hub-native owner session links and turn fencing (#848).
+    (NATIVE_CONTINUITY_OWNER_MIGRATION, NATIVE_OWNER_DDL),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the
