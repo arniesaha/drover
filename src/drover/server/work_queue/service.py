@@ -427,16 +427,30 @@ class WorkService:
             if not row["session_id"]:
                 session = self.harness.resolve(run_key)
                 if session is None:
-                    raise WorkDenied("launch intent uncertain; inspection required")
-                row = self.store.associate(run_key, session.session_id)
-            if (
+                    if not stale_sessionless_intent(
+                        row, minutes=self.config.execution.orphan_intent_minutes
+                    ):
+                        raise WorkDenied("launch intent uncertain; inspection required")
+                    failures = row["failure_count"] + 1
+                    self.store.failure(run_key, failures)
+                    if failures >= policy.retries.attempts:
+                        raise WorkDenied(
+                            "systemic review required before further attempts"
+                        )
+                    # Re-enter the normal launch path with the durable intent row.
+                    # ``intent`` is idempotent on run_key, so no duplicate is created.
+                    existing = []
+                else:
+                    row = self.store.associate(run_key, session.session_id)
+            if existing and (
                 run_role == "work"
                 and item["state"] == "open"
                 and policy.labels.status_prefix + "queued"
                 in {l["name"] for l in item["labels"]}
             ):
                 self.status(provider, policy, ref, item, "running")
-            return row
+            if existing:
+                return row
         if item["state"] != "open":
             raise ValueError("closed item cannot launch")
         links = self.store.links(goal_id=goal_id, number=number)
