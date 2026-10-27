@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [ "main" ]
+    tags: [ "**" ]
   pull_request:
     branches: [ "main" ]
   schedule:
@@ -13,6 +14,51 @@ permissions:
   contents: read
 
 jobs:
+  integration-changes:
+    # Keep the costly database contracts on main/tags and release PRs, and run
+    # them for changes that can affect serving, continuity, or DuckLake state.
+    runs-on: ubuntu-latest
+    outputs:
+      integration: ${{ steps.scope.outputs.integration }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Select database integration scope
+      id: scope
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+      run: |
+        if [ "$EVENT_NAME" != pull_request ] || [[ "$PR_TITLE" == release:* ]]; then
+          echo 'integration=true' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        mapfile -t paths < <(git diff --name-only "$BASE_SHA"...HEAD)
+        for path in "${paths[@]}"; do
+          case "$path" in
+            .github/workflows/ci.yml|pyproject.toml|uv.lock|poetry.lock|requirements*.txt|\
+            src/drover/schema.py|src/drover/server/postgres_schema.py|\
+            src/drover/server/continuity*|src/drover/server/harness/continuity*|\
+            src/drover/server/work_queue/*|src/drover/server/lake/*|\
+            src/drover/server/control_store.py|src/drover/server/postgres_control_store.py|\
+            src/drover/server/control_exporter.py|src/drover/server/ledger.py|\
+            src/drover/server/analytical_ledger.py|src/drover/server/memory*.py|\
+            tests/acceptance/*|tests/test_postgres_control_store.py|\
+            tests/test_control_outbox.py|tests/test_control_migration.py|\
+            tests/test_control_exporter.py|tests/test_runtime_roles.py|\
+            tests/test_postgres_control_benchmark.py|tests/test_memory_store.py|\
+            tests/test_embeddings.py|tests/test_ledger.py|tests/test_memory_integrity.py|\
+            tests/test_readiness_memory.py)
+              echo 'integration=true' >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+        done
+        echo 'integration=false' >> "$GITHUB_OUTPUT"
+
   build-and-test:
     runs-on: ubuntu-latest
     steps:
@@ -312,10 +358,10 @@ jobs:
           contract-${{ matrix.target }}.xml
 
   postgres-integration:
-    # This job is intentionally unconditional. A documentation-only change may
-    # skip the general Python suite, but the PostgreSQL serving contract must
-    # keep running on every pull request and main push.
+    needs: integration-changes
+    if: needs.integration-changes.outputs.integration == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17.11
@@ -390,12 +436,15 @@ jobs:
         echo "DROVER_TEST_LAKE_EXTENSIONS=$HOME/.cache/drover-lake-ext" >> "$GITHUB_ENV"
 
     - name: Run DuckLake v2 acceptance contracts
+      timeout-minutes: 20
       run: |
         pytest tests/acceptance -m "not acceptance_scale" -q
 
   pgvector-memory-integration:
-    # Unconditional release gate; keep the plain PostgreSQL job above as well.
+    needs: integration-changes
+    if: needs.integration-changes.outputs.integration == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
@@ -420,6 +469,7 @@ jobs:
     - name: Install locked test runner
       run: python -m pip install "uv==0.12.19"
     - name: Run mandatory pgvector memory contracts (no skips)
+      timeout-minutes: 20
       run: |
         uv run --python 3.11 --locked --extra dev pytest --require-pgvector -m pgvector \
           tests/test_memory_store.py tests/test_embeddings.py -v -s
