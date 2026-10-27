@@ -268,9 +268,9 @@ def test_bridge_active_excludes_finalised_workers(run):
     links = [{"session_id": "harness-w"}, {"session_id": None}]
     _turn(run, "Review: no blocking findings in PR 788.")
     _state(run)
-    assert len(bridge.active(links)) == 2
+    assert bridge.active(links) == [{"session_id": "harness-w"}]
     run.store.sweep_idle_undeclared(300)
-    assert bridge.active(links) == [{"session_id": None}]
+    assert bridge.active(links) == []
 
 
 def test_sessionless_intents_never_hold_capacity_but_still_block_duplicates(run):
