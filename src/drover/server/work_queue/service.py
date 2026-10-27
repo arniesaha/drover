@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from .config import load_policy
 from .provider import ItemRef
+from .store import stale_sessionless_intent
 
 SYSTEMIC_COMMENT = (
     "Systemic review: the attempt budget is exhausted. Repeated failures show "
@@ -459,7 +460,9 @@ class WorkService:
         if any(
             l["goal_id"] == goal_id
             and l["item_number"] == number
-            and l["session_id"] is not None
+            and not stale_sessionless_intent(
+                l, minutes=self.config.execution.orphan_intent_minutes
+            )
             for l in self.harness.active(self.store.links(), release_finalised=False)
         ):
             raise WorkDenied("existing execution requires inspection")

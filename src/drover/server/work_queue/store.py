@@ -3,6 +3,7 @@
 import json
 import re
 import secrets
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from uuid import uuid4
 
@@ -13,6 +14,18 @@ from drover.server.work_queue.work_item_events import (
     append_timeline_event,
     event_payload,
 )
+
+
+def stale_sessionless_intent(link, *, minutes: int, now=None) -> bool:
+    """Whether an unassociated launch intent has exceeded its recovery window."""
+    if link["session_id"] is not None:
+        return False
+    created_at = link["created_at"]
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at <= (now or datetime.now(timezone.utc)) - timedelta(
+        minutes=minutes
+    )
 
 
 class WorkStore:

@@ -480,3 +480,19 @@ def test_sessionless_intent_is_retried_without_duplicate_execution(service):
     retried = launch(service)
     assert retried["session_id"] == "session-2"
     assert len(service.store.links()) == 1
+
+
+def test_stale_sessionless_intent_handles_naive_timestamps():
+    from datetime import datetime, timedelta, timezone
+    from drover.server.work_queue.store import stale_sessionless_intent
+
+    now = datetime(2026, 10, 27, tzinfo=timezone.utc)
+    stale = {
+        "session_id": None,
+        "created_at": (now - timedelta(minutes=11)).replace(tzinfo=None),
+    }
+    fresh = {"session_id": None, "created_at": now - timedelta(minutes=9)}
+    linked = {"session_id": "session", "created_at": now - timedelta(hours=1)}
+    assert stale_sessionless_intent(stale, minutes=10, now=now)
+    assert not stale_sessionless_intent(fresh, minutes=10, now=now)
+    assert not stale_sessionless_intent(linked, minutes=10, now=now)
