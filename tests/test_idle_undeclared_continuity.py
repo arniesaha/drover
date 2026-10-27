@@ -259,6 +259,9 @@ def test_bridge_active_excludes_finalised_workers(run):
 
     bridge = object.__new__(HarnessBridge)
     bridge.collector = SimpleNamespace(duckdb_path=run.path)
+    bridge.config = SimpleNamespace(
+        execution=SimpleNamespace(idle_awaiting_input_minutes=10_080)
+    )
     bridge.registry = HarnessRegistry(run.path)
     links = [{"session_id": "harness-w"}, {"session_id": None}]
     _turn(run, "Review: no blocking findings in PR 788.")
@@ -266,3 +269,25 @@ def test_bridge_active_excludes_finalised_workers(run):
     assert len(bridge.active(links)) == 2
     run.store.sweep_idle_undeclared(300)
     assert bridge.active(links) == [{"session_id": None}]
+
+
+def test_stale_awaiting_input_releases_capacity_but_recent_worker_does_not(run):
+    from drover.server.harness.continuity import finalised_session_ids
+
+    _state(run, activity=T0)
+    assert finalised_session_ids(
+        run.path,
+        ["harness-w"],
+        idle_awaiting_input_seconds=30 * 60,
+        now=T0 + timedelta(minutes=31),
+    ) == {"harness-w"}
+    _state(run, activity=T0 + timedelta(minutes=30, seconds=30))
+    assert (
+        finalised_session_ids(
+            run.path,
+            ["harness-w"],
+            idle_awaiting_input_seconds=30 * 60,
+            now=T0 + timedelta(minutes=31),
+        )
+        == set()
+    )

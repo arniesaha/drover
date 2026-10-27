@@ -636,22 +636,45 @@ def sweep_idle_undeclared(
     return recorded
 
 
-def finalised_session_ids(path: str | Path, session_ids) -> set[str]:
-    """Sessions idle at ``awaiting: input`` whose final turn is already reported.
+def finalised_session_ids(
+    path: str | Path,
+    session_ids,
+    *,
+    idle_awaiting_input_seconds: int | None = None,
+    now: datetime | None = None,
+) -> set[str]:
+    """Sessions that are finalised or have outlived their capacity claim.
 
     A worker that declared done, or that the idle-undeclared sweep reported, has
-    nothing left to run. It must not hold a work-queue concurrency slot while the
-    owner reviews it. A new user turn reopens the slot claim because the final
-    turn then has no reported output. Blocked and needs-approval declarations
-    keep their slot: the worker is still waiting on a decision.
+    nothing left to run. Independently, an ``awaiting: input`` worker with no
+    activity beyond the configured bound releases *capacity* without losing its
+    resumable execution link. Callers use ``release_finalised=False`` for
+    duplicate-execution checks, so this never permits a second execution of the
+    same item. Blocked and needs-approval declarations keep their slot unless
+    they later become stale under the configured bound.
     """
     ids = sorted({str(session_id) for session_id in session_ids})
     released: set[str] = set()
     if not ids:
         return released
+    if idle_awaiting_input_seconds is not None:
+        _integer(
+            idle_awaiting_input_seconds, "idle_awaiting_input_seconds", 1, 7 * 24 * 3600
+        )
     placeholders = ", ".join("?" for _ in ids)
     ended = ", ".join("?" for _ in _ENDED)
     with control_plane_connection(Path(path), timeout=5) as con:
+        if idle_awaiting_input_seconds is not None:
+            cutoff = (now or datetime.now(timezone.utc)) - timedelta(
+                seconds=idle_awaiting_input_seconds
+            )
+            stale = con.execute(
+                f"""SELECT session_id FROM harness_sessions
+                      WHERE awaiting = 'input' AND status NOT IN ({ended})
+                        AND last_activity <= ? AND session_id IN ({placeholders})""",
+                [*_ENDED, cutoff, *ids],
+            ).fetchall()
+            released.update(str(session_id) for (session_id,) in stale)
         rows = con.execute(
             f"""SELECT s.session_id, r.run_id
                   FROM harness_sessions s
