@@ -14,7 +14,7 @@ from drover.server.web.auth import bearer_credential
 
 from .github import GitHubProvider, ProviderUnavailable
 from .service import SYSTEMIC_COMMENT, WorkActor, WorkDenied, WorkService
-from .store import WorkStore
+from .store import WorkStore, stale_sessionless_intent
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +117,13 @@ class HarnessBridge:
         """
         active = []
         for link in links:
+            if stale_sessionless_intent(
+                link, minutes=self.config.execution.orphan_intent_minutes
+            ):
+                log.warning(
+                    "releasing stale launch intent capacity run_key=%s", link["run_key"]
+                )
+                continue
             session = (
                 self.registry.get_session(link["session_id"])
                 if link["session_id"]
