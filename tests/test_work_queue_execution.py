@@ -484,6 +484,7 @@ def test_sessionless_intent_is_retried_without_duplicate_execution(service):
 
 def test_stale_sessionless_intent_handles_naive_timestamps():
     from datetime import datetime, timedelta, timezone
+
     from drover.server.work_queue.store import stale_sessionless_intent
 
     now = datetime(2026, 10, 27, tzinfo=timezone.utc)

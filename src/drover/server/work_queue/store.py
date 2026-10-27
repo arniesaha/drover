@@ -3,8 +3,8 @@
 import json
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from drover.server.control_outbox import is_postgres_connection
