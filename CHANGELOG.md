@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.44] - 2026-10-26
+
+### Fixed
+
+- Work queue releases capacity held by `awaiting: input` workers after a configurable 30-minute idle bound while retaining duplicate-execution protection; all automatic launch denials are logged, counted, and exposed through the queue status report (#851, #852).
+
 ## [0.6.43] - 2026-10-26
 
 ### Fixed

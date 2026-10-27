@@ -3437,7 +3437,13 @@ class MetricsCollector:
         execution_worker = getattr(self, "work_queue_execution_worker", None)
         if execution_worker is not None:
             health = execution_worker.coordinator.health
-            for key in ("launches", "cap_denials", "budget_denials"):
+            for key in (
+                "launches",
+                "cap_denials",
+                "budget_denials",
+                "execution_disabled_denials",
+                "kill_switch_denials",
+            ):
                 lines.extend(
                     [
                         f"# TYPE drover_work_queue_{key} counter",

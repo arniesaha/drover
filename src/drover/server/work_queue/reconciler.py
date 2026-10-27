@@ -22,7 +22,27 @@ class QueueExecutionCoordinator:
 
     def __init__(self, service):
         self.service = service
-        self.health = {"launches": 0, "cap_denials": 0, "budget_denials": 0}
+        self.health = {
+            "launches": 0,
+            "cap_denials": 0,
+            "budget_denials": 0,
+            "execution_disabled_denials": 0,
+            "kill_switch_denials": 0,
+        }
+
+    def _denied(self, reason, goal_id, number):
+        self.health[
+            {"global_cap": "cap_denials", "budget": "budget_denials"}.get(
+                reason, reason + "_denials"
+            )
+        ] += 1
+        log.warning(
+            "work queue launch denied reason=%s goal_id=%s issue_number=%s",
+            reason,
+            goal_id,
+            number,
+        )
+        return {"denied": reason}
 
     def launch_candidate(self, goal_id, number):
         with self.service.lock:
@@ -31,22 +51,20 @@ class QueueExecutionCoordinator:
                 (item for item in config.goals if item.goal_id == goal_id), None
             )
             if scope is None or not scope.execution_enabled or config.shadow_mode:
-                return {"denied": "execution_disabled"}
+                return self._denied("execution_disabled", goal_id, number)
             if self.service.execution_kill_switch or config.execution.kill_switch:
-                return {"denied": "kill_switch"}
+                return self._denied("kill_switch", goal_id, number)
             active = self.service.harness.active(self.service.store.links())
             if len(active) >= config.execution.global_max_workers or (
                 sum(row["goal_id"] == goal_id for row in active)
                 >= (scope.execution_max_workers or config.execution.global_max_workers)
             ):
-                self.health["cap_denials"] += 1
-                return {"denied": "global_cap"}
+                return self._denied("global_cap", goal_id, number)
             if (
                 scope.execution_budget is not None
                 and scope.execution_estimated_cost > scope.execution_budget
             ):
-                self.health["budget_denials"] += 1
-                return {"denied": "budget"}
+                return self._denied("budget", goal_id, number)
             actor = WorkActor("control:queue-execution", "nix")
             row = self.service.launch(
                 goal_id,
@@ -70,6 +88,11 @@ class QueueExecutionWorker:
         )
         self._stop = threading.Event()
         self._thread = None
+
+    def report(self):
+        report = self.reconciler.report()
+        report["execution"] = dict(self.coordinator.health)
+        return report
 
     def process_once(self):
         report = self.reconciler.poll()
