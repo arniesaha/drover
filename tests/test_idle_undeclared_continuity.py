@@ -273,6 +273,24 @@ def test_bridge_active_excludes_finalised_workers(run):
     assert bridge.active(links) == [{"session_id": None}]
 
 
+def test_sessionless_intents_never_hold_capacity_but_still_block_duplicates(run):
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.work_queue.runtime import HarnessBridge
+
+    bridge = object.__new__(HarnessBridge)
+    bridge.collector = SimpleNamespace(duckdb_path=run.path)
+    bridge.config = SimpleNamespace(
+        execution=SimpleNamespace(idle_awaiting_input_minutes=30)
+    )
+    bridge.registry = HarnessRegistry(run.path)
+    intents = [
+        {"session_id": None, "run_key": "one"},
+        {"session_id": None, "run_key": "two"},
+    ]
+    assert bridge.active(intents) == []
+    assert bridge.active(intents, release_finalised=False) == intents
+
+
 def test_stale_awaiting_input_releases_capacity_but_recent_worker_does_not(run):
     from drover.server.harness.continuity import finalised_session_ids
 
