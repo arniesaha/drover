@@ -129,7 +129,13 @@ class HarnessBridge:
             from drover.server.harness.continuity import finalised_session_ids
 
             try:
-                released = finalised_session_ids(self.collector.duckdb_path, live)
+                released = finalised_session_ids(
+                    self.collector.duckdb_path,
+                    live,
+                    idle_awaiting_input_seconds=(
+                        self.config.execution.idle_awaiting_input_minutes * 60
+                    ),
+                )
             except Exception:  # noqa: BLE001 - never free a slot on a failed read
                 log.exception("finalised-worker lookup failed; holding all slots")
                 released = set()
@@ -298,6 +304,8 @@ def start_queue_execution_worker(collector, config, shutdown_event):
     worker = QueueExecutionWorker(service)
     worker.start(shutdown_event)
     collector.work_queue_execution_worker = worker
+    # The device-authenticated queue report is also the execution status model.
+    collector.work_queue = worker
     return worker
 
 

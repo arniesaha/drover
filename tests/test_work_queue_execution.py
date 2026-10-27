@@ -390,6 +390,48 @@ def test_opt_in_execution_uses_launch_and_respects_budget_caps_and_kill_switch(s
     )
 
 
+def test_launch_denials_are_logged_and_counted_with_goal_and_issue(service, caplog):
+    from drover.server.work_queue.reconciler import QueueExecutionCoordinator
+
+    coordinator = QueueExecutionCoordinator(service)
+    assert coordinator.launch_candidate("goal", 1)["denied"] == "execution_disabled"
+    scope = service.config.goals[0].model_copy(update={"execution_enabled": True})
+    service.config = service.config.model_copy(
+        update={
+            "goals": [scope],
+            "shadow_mode": False,
+            "execution": service.config.execution.model_copy(
+                update={"kill_switch": True}
+            ),
+        }
+    )
+    assert coordinator.launch_candidate("goal", 1)["denied"] == "kill_switch"
+    service.config = service.config.model_copy(
+        update={
+            "execution": service.config.execution.model_copy(
+                update={"kill_switch": False, "global_max_workers": 1}
+            )
+        }
+    )
+    launch(service)
+    assert coordinator.launch_candidate("goal", 2)["denied"] == "global_cap"
+    for session in service.harness.sessions.values():
+        session.status = "completed"
+    scope = scope.model_copy(
+        update={"execution_budget": 1.0, "execution_estimated_cost": 2.0}
+    )
+    service.config = service.config.model_copy(update={"goals": [scope]})
+    assert coordinator.launch_candidate("goal", 3)["denied"] == "budget"
+    assert coordinator.health == {
+        "launches": 0,
+        "cap_denials": 1,
+        "budget_denials": 1,
+        "execution_disabled_denials": 1,
+        "kill_switch_denials": 1,
+    }
+    assert "goal_id=goal issue_number=3" in caplog.text
+
+
 def test_policy_capacity_and_retry_override(service, tmp_path):
     data = load_policy().model_dump()
     data["capacity"]["workspace_workers"] = 1

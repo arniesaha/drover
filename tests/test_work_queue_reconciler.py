@@ -101,6 +101,13 @@ def test_queued_issue_launch_candidate_has_goal_id_and_worker_launches_it():
     assert launched == [("goal-1", 7)]
 
 
+def test_execution_report_exposes_denial_counters():
+    worker = QueueExecutionWorker(SimpleNamespace(config=WorkQueueConfig()))
+    worker.reconciler = SimpleNamespace(report=lambda: {"actions": []})
+    worker.coordinator.health["kill_switch_denials"] = 2
+    assert worker.report()["execution"]["kill_switch_denials"] == 2
+
+
 def test_bad_launch_candidate_is_logged_and_does_not_stop_other_candidates(caplog):
     worker = QueueExecutionWorker(SimpleNamespace(config=WorkQueueConfig()))
     worker.reconciler = SimpleNamespace(
