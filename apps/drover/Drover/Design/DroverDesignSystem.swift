@@ -81,6 +81,7 @@ struct ScreenHeader<Actions: View, Filters: View>: View {
                             .font(DroverTypeScale.caption)
                             .foregroundStyle(DroverTheme.textSecondary)
                             .textCase(.uppercase)
+                            .accessibilityIdentifier(eyebrow.caseInsensitiveCompare("demo") == .orderedSame ? "demo-badge" : "screen-header-eyebrow")
                     }
                     Text(title)
                         .font(DroverTypeScale.title)

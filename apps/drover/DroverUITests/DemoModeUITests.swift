@@ -32,6 +32,34 @@ final class DemoModeUITests: XCTestCase {
     }
 
     @MainActor
+    private func selectTab(title: String, id: String, in app: XCUIApplication) {
+        let tabButton = app.tabBars.buttons[title].firstMatch
+        if tabButton.waitForExistence(timeout: 2) {
+            tabButton.tap()
+            return
+        }
+        let btn = app.buttons[title].firstMatch
+        if btn.waitForExistence(timeout: 2) {
+            btn.tap()
+            return
+        }
+        let identButton = app.buttons[id].firstMatch
+        if identButton.waitForExistence(timeout: 2) {
+            identButton.tap()
+            return
+        }
+        let desc = app.descendants(matching: .any)[id].firstMatch
+        if desc.waitForExistence(timeout: 2) {
+            desc.tap()
+            return
+        }
+        let staticText = app.staticTexts[title].firstMatch
+        if staticText.waitForExistence(timeout: 2) {
+            staticText.tap()
+        }
+    }
+
+    @MainActor
     private func captureScreenshot(named name: String, in app: XCUIApplication) {
         let screenshot = app.screenshot()
         let attachment = XCTAttachment(screenshot: screenshot)
@@ -126,8 +154,17 @@ final class DemoModeUITests: XCTestCase {
         app.navigationBars.firstMatch.buttons.firstMatch.tap()
         XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
 
-        // 4. Open Approval Request Session
-        let approvalSession = app.buttons[sessionApproval]
+        // 4. Open Approval Request Session (lives in Inbox in 1.0 IA)
+        let openInbox = app.buttons["home-open-inbox"]
+        if openInbox.waitForExistence(timeout: 2) && openInbox.isHittable {
+            openInbox.tap()
+        } else {
+            selectTab(title: "Inbox", id: "tab-inbox", in: app)
+        }
+
+        let approvalSession = app.buttons["inbox-session-\(sessionApproval)"].exists
+            ? app.buttons["inbox-session-\(sessionApproval)"]
+            : app.buttons[sessionApproval]
         XCTAssertTrue(approvalSession.waitForExistence(timeout: 5))
         approvalSession.tap()
 
@@ -140,11 +177,18 @@ final class DemoModeUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Migration 004 applied successfully. 3 tables and index created."].waitForExistence(timeout: 5))
         captureScreenshot(named: "05_Session_Approved", in: app)
 
-        // Back to fleet
-        app.navigationBars.firstMatch.buttons.firstMatch.tap()
+        // Back to inbox/fleet
+        let inboxDismiss = app.buttons["Inbox"]
+        if inboxDismiss.waitForExistence(timeout: 2) && inboxDismiss.isHittable {
+            inboxDismiss.tap()
+        } else {
+            app.navigationBars.firstMatch.buttons.firstMatch.tap()
+        }
+
+        // 5. Open Diff & Artifacts Session (on Home)
+        selectTab(title: "Home", id: "tab-home", in: app)
         XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
 
-        // 5. Open Diff & Artifacts Session
         let diffSession = app.buttons[sessionDiffArtifacts]
         if diffSession.waitForExistence(timeout: 3) {
             diffSession.tap()
@@ -155,23 +199,14 @@ final class DemoModeUITests: XCTestCase {
         }
 
         // 6. View Analytics
-        app.buttons["dock-analytics"].tap()
+        selectTab(title: "Analytics", id: "tab-analytics", in: app)
 
         let analyticsFilters = app.descendants(matching: .any)["analytics-filters"]
         XCTAssertTrue(analyticsFilters.waitForExistence(timeout: 5))
         captureScreenshot(named: "07_Analytics_Overview", in: app)
 
-        // Back to fleet
-        app.buttons["dock-home"].tap()
-        XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
-
         // 7. Settings & Exit Demo
-        let settingsButton = app.buttons["settings-button"]
-        if !settingsButton.isHittable {
-            app.scrollViews["fleet-list"].swipeDown()
-        }
-        XCTAssertTrue(settingsButton.waitForExistence(timeout: 5))
-        settingsButton.tap()
+        selectTab(title: "Settings", id: "tab-settings", in: app)
 
         let settingsDemoBadge = app.descendants(matching: .any)["settings-demo-badge"]
         XCTAssertTrue(settingsDemoBadge.waitForExistence(timeout: 5))

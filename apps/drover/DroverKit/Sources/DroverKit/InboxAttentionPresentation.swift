@@ -8,7 +8,7 @@ import Foundation
 public enum InboxAttentionPresentation {
     public static func sessionsAwaitingAnswer(_ sessions: [SessionSummary]) -> [SessionSummary] {
         sessions
-            .filter { $0.attention == .needsInput }
+            .filter { $0.attention == .needsInput || $0.attention == .needsApproval }
             .sorted { ($0.activityDate ?? .distantPast) > ($1.activityDate ?? .distantPast) }
     }
 
