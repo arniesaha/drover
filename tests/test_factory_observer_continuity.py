@@ -724,7 +724,8 @@ def test_delivery_backoff_and_retry_budget_survive_owner_recovery(bridge):
     assert status["recovery"] == "manual_attention"
     assert status["events"][0]["attempts"] == 3
     assert status["events"][0]["state"] == "exhausted"
-    assert status["next_action"] == action
+    assert status["next_action"] is None
+    assert status["worker_state"] == "blocked:human"
     # The owner can inspect/reconcile a delivery that exceeded its budget.
     store.acknowledge(RUN, **fence, event_id=event_id, checkpoint="Manually reconciled")
     assert store.status(RUN)["inbox_counts"] == {"acknowledged": 1}

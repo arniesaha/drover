@@ -27,7 +27,7 @@ def _now() -> datetime:
 class NativeOwnerRunner:
     """Deliver at most one outstanding observer action to each native owner."""
 
-    def __init__(self, collector, config, *, clock=_now, claim_seconds=60):
+    def __init__(self, collector, config, *, clock=_now, claim_seconds=3600):
         self.collector = collector
         self.config = config
         self.path = collector.duckdb_path
@@ -115,7 +115,7 @@ class NativeOwnerRunner:
                     return host
         return None
 
-    def _session(self, scope) -> str | None:
+    def _session(self, scope, *, launch=True) -> str | None:
         link = self._link(scope)
         session = (
             self.registry.get_session(link["session_id"]) if link["session_id"] else None
@@ -138,6 +138,8 @@ class NativeOwnerRunner:
             return session.session_id
         if session is not None:
             link = self._replace_link(scope, link)
+        if not launch:
+            return None
         host = self._host_for(scope)
         if host is None:
             return None
@@ -166,6 +168,17 @@ class NativeOwnerRunner:
         return session_id
 
     def _complete_finished_claim(self, scope, session_id: str) -> None:
+        with control_plane_connection(self.path, timeout=5) as con:
+            row = con.execute(
+                """SELECT wake_id, client_turn_id FROM continuity_owner_turn_claims
+                WHERE goal_id = ? AND owner_id = ? AND session_id = ?
+                AND state IN ('claimed', 'sent') LIMIT 1""",
+                [scope.goal_id, self._owner(scope), session_id],
+            ).fetchone()
+        if row is None or row[1] not in self.registry.recent_user_input_turn_ids(
+            session_id, limit=20
+        ):
+            return
         session = self.registry.get_session(session_id)
         if session is None or session.effective_awaiting != "input":
             return
@@ -174,10 +187,21 @@ class NativeOwnerRunner:
         with self._transaction() as con:
             con.execute(
                 """UPDATE continuity_owner_turn_claims SET state = 'completed',
-                updated_at = ? WHERE goal_id = ? AND owner_id = ? AND session_id = ?
+                updated_at = ? WHERE wake_id = ? AND client_turn_id = ?
                 AND state IN ('claimed', 'sent')""",
-                [self.clock(), scope.goal_id, self._owner(scope), session_id],
+                [self.clock(), row[0], row[1]],
             )
+
+    def _has_active_claim(self, scope) -> bool:
+        # A passed claim deadline marks a stuck claim; it never authorizes redelivery.
+        with self._transaction() as con:
+            row = con.execute(
+                """SELECT wake_id FROM continuity_owner_turn_claims
+                WHERE goal_id = ? AND owner_id = ? AND state IN ('claimed', 'sent')
+                LIMIT 1""",
+                [scope.goal_id, self._owner(scope)],
+            ).fetchone()
+            return row is not None
 
     def _claim(self, scope, run_id: str, session_id: str, wake_id: str) -> str | None:
         now = self.clock()
@@ -188,9 +212,8 @@ class NativeOwnerRunner:
         with self._transaction() as con:
             active = con.execute(
                 """SELECT wake_id FROM continuity_owner_turn_claims
-                WHERE goal_id = ? AND owner_id = ? AND state IN ('claimed', 'sent')
-                AND claim_until > ? LIMIT 1""",
-                [scope.goal_id, owner_id, now],
+                WHERE goal_id = ? AND owner_id = ? AND state IN ('claimed', 'sent') LIMIT 1""",
+                [scope.goal_id, owner_id],
             ).fetchone()
             if active and active[0] != wake_id:
                 return None
@@ -198,7 +221,7 @@ class NativeOwnerRunner:
                 "SELECT state, claim_until FROM continuity_owner_turn_claims WHERE wake_id = ?",
                 [wake_id],
             ).fetchone()
-            if row and row[0] in {"claimed", "sent"} and row[1] > now:
+            if row and row[0] in {"claimed", "sent"}:
                 return None
             if row:
                 con.execute(
@@ -237,10 +260,11 @@ class NativeOwnerRunner:
     def _process_run(self, scope, run_id: str) -> bool:
         owner_id = self._owner(scope)
         assert owner_id is not None
-        session_id = self._session(scope)
-        if session_id is None:
+        session_id = self._session(scope, launch=False)
+        if session_id:
+            self._complete_finished_claim(scope, session_id)
+        if self._has_active_claim(scope):
             return False
-        self._complete_finished_claim(scope, session_id)
         status = self.continuity.status(run_id)
         owner = status["owner"]
         epoch = owner["epoch"] if owner["id"] == owner_id and owner["live"] else None
@@ -250,6 +274,10 @@ class NativeOwnerRunner:
         )
         if action is None:
             return False
+        if session_id is None:
+            session_id = self._session(scope)
+            if session_id is None:
+                return False
         turn_id = self._claim(scope, run_id, session_id, action["event_id"])
         if turn_id is None:
             return False

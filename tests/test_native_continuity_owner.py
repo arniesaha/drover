@@ -58,9 +58,13 @@ class Collector:
         self.launches = []
         self.turn_attempts = []
         self.accepted_turns = set()
+        self.failed_launches = 0
 
     def proxy_create_harness_session(self, host_id, payload):
         self.launches.append((host_id, payload))
+        if self.failed_launches:
+            self.failed_launches -= 1
+            return 503, "{}"
         session = self.registry.create_session(
             session_id="owner-session",
             host_id=host_id,
@@ -78,6 +82,11 @@ class Collector:
         assert action == "turns"
         self.turn_attempts.append((session_id, payload))
         self.accepted_turns.add(payload["client_turn_id"])
+        self.registry.append_event(
+            session_id=session_id,
+            event_type="user_input",
+            payload={"turn_id": payload["client_turn_id"]},
+        )
         return 202, "{}"
 
 
@@ -145,21 +154,32 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     assert len(collector.turn_attempts) == 1
 
 
-def test_expired_claim_after_restart_reuses_idempotent_owner_turn(tmp_path):
+def test_expired_claim_after_restart_never_redispatches_a_mid_turn(tmp_path):
     runner, collector, _, _, clock = _runner(tmp_path)
 
     assert runner.process_once() == 1
     first_turn = collector.turn_attempts[0][1]["client_turn_id"]
-    # Both the bounded turn claim and the Factory owner lease expired while
-    # the hub was down; the new runner must reclaim instead of starting over.
+    # A hub restart must consult the durable claim, not treat its age as
+    # permission to send another turn into the same owner session.
     clock.advance(61)
     restarted = NativeOwnerRunner(
         collector, runner.config, clock=clock, claim_seconds=10
     )
 
-    assert restarted.process_once() == 1
-    assert len(collector.turn_attempts) == 2
-    assert collector.turn_attempts[1][1]["client_turn_id"] == first_turn
-    # A harness restart/retry sees the same client turn id, so the one
-    # authorized action behind its wake cannot be executed twice.
+    assert restarted.process_once() == 0
+    assert len(collector.turn_attempts) == 1
     assert collector.accepted_turns == {first_turn}
+
+
+def test_failed_owner_launches_exhaust_wake_once(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    collector.failed_launches = 3
+
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 0
+        clock.advance(delay)
+
+    assert runner.process_once() == 0
+    assert len(collector.launches) == 3
+    assert store.status(run_id)["worker_state"] == "blocked:human"
+    assert store.owner_runs("drover:owner/goal-native") == []
