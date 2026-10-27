@@ -1,5 +1,52 @@
 {
   "$defs": {
+    "ActionIntentReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "action_fingerprint": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Action Fingerprint",
+          "type": "string"
+        },
+        "artifact": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Artifact"
+        },
+        "state": {
+          "enum": [
+            "intent",
+            "complete"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "wake_id": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Wake Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wake_id",
+        "action_fingerprint",
+        "state",
+        "artifact"
+      ],
+      "title": "ActionIntentReceipt",
+      "type": "object"
+    },
     "CompletionReceiptError": {
       "additionalProperties": false,
       "properties": {
@@ -356,6 +403,17 @@
           "title": "Action Id",
           "type": "string"
         },
+        "action_intent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionIntentReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "authority_scope": {
           "enum": [
             "implementation",
@@ -488,6 +546,17 @@
   },
   "additionalProperties": false,
   "properties": {
+    "action_intent": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ActionIntentReceipt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "continuity": {
       "$ref": "#/$defs/ContinuityProjection"
     },
