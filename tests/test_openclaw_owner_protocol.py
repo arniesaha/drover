@@ -273,13 +273,16 @@ def test_action_intent_is_fenced_and_reconciled_on_redelivery(make_harness):
     clock.advance(5)
     redelivery = harness.call("consume", owner_epoch=epoch)["delivery"]
     assert redelivery["action_intent"] == receipt
-    assert endpoint.store().action_intent(
-        RUN,
-        owner_id=OWNER,
-        owner_epoch=epoch,
-        wake_id=action["event_id"],
-        action_fingerprint=action["action_id"],
-    ) == receipt
+    assert (
+        endpoint.store().action_intent(
+            RUN,
+            owner_id=OWNER,
+            owner_epoch=epoch,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+        == receipt
+    )
 
 
 @pytest.mark.parametrize(

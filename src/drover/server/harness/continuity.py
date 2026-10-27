@@ -1235,7 +1235,9 @@ class FactoryObserverContinuity:
                 or not isinstance(action, dict)
                 or action.get("action_id") != action_fingerprint
             ):
-                raise ContinuityConflict("action intent must match the consumed delivery")
+                raise ContinuityConflict(
+                    "action intent must match the consumed delivery"
+                )
             existing = _row(
                 con,
                 """SELECT wake_id, action_fingerprint, state, artifact
@@ -1249,7 +1251,15 @@ class FactoryObserverContinuity:
                     (wake_id, action_fingerprint, run_id, owner_id, owner_epoch,
                      state, artifact, created_at)
                     VALUES (?, ?, ?, ?, ?, 'intent', ?, ?)""",
-                    [wake_id, action_fingerprint, run_id, owner_id, owner_epoch, artifact, now],
+                    [
+                        wake_id,
+                        action_fingerprint,
+                        run_id,
+                        owner_id,
+                        owner_epoch,
+                        artifact,
+                        now,
+                    ],
                 )
                 existing = {
                     "wake_id": wake_id,
@@ -1301,13 +1311,17 @@ class FactoryObserverContinuity:
                 raise ContinuityConflict(
                     "explicit deployment approval is required outside this bridge"
                 )
-            if owner_id.startswith("drover:owner/") and _row(
-                con,
-                """SELECT 1 AS present FROM continuity_owner_action_intents
+            if (
+                owner_id.startswith("drover:owner/")
+                and _row(
+                    con,
+                    """SELECT 1 AS present FROM continuity_owner_action_intents
                 WHERE wake_id = ? AND action_fingerprint = ? AND run_id = ?
                 AND owner_id = ? AND state = 'complete'""",
-                [event_id, action["action_id"], run_id, owner_id],
-            ) is None:
+                    [event_id, action["action_id"], run_id, owner_id],
+                )
+                is None
+            ):
                 raise ContinuityConflict("completed action intent receipt is required")
             con.execute(
                 "UPDATE factory_observer_inbox SET state = 'acknowledged', acknowledged_at = ? WHERE event_id = ?",
