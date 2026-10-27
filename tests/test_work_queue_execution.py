@@ -524,6 +524,8 @@ def test_stale_unresolved_intent_relaunches_once(service):
     retried = launch(service)
     assert retried["run_key"] == row["run_key"]
     assert retried["failure_count"] == row["failure_count"] + 1
+    assert retried["session_id"] == "session-2"
+    assert len(service.harness.calls) == 2
     assert len(service.store.links()) == 1
 
 
