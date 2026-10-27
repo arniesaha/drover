@@ -25,10 +25,13 @@ Drover owns execution, context, and continuity through its harness adapter
 contract, not a named harness. When the decision/outbox transaction creates or
 redelivers an owner wake, the runtime resolves the goal and queues a separate
 owner-run candidate. It keeps a durable owner-session link keyed by
-`(goal_id, owner_id)`. A usable linked session receives one turn through the
-existing session-turn API. Otherwise the hub launches exactly one harness
-session with the configured profile and brief, records the link atomically, then
-sends the delivery turn.
+`(goal_id, owner_id)`. A usable linked session is nonterminal, belongs to that
+exact link, has completed its prior owner turn, and has current adapter status.
+The hub atomically claims one turn for the link before sending it; the claim
+remains until a terminal adapter event or bounded expiry. It therefore never
+sends concurrent turns to an owner session. An unusable/expired link is fenced
+and replaced: the hub launches exactly one harness session with the configured
+profile and brief, records the link atomically, then sends the delivery turn.
 
 The turn contains the wake id, goal/repository context, verified authority, and
 lease/consume/ack contract, not untrusted issue text as authority. The owner
@@ -43,11 +46,16 @@ owner makes stale sessions unable to consume or ack. The wake id is the
 idempotency key: consume returns one oldest visible delivery and gives it a
 visibility timeout; redelivery preserves its id and payload.
 
-Before its single authorized next action, the owner records/checks an action
-receipt keyed by wake id and action fingerprint. On re-wake it verifies that
-receipt and outcome rather than repeating an external write, then acknowledges
-the original wake. Killed turns, duplicate candidates, and at-least-once
-outbox delivery therefore cannot make a second authorized action.
+Before its single authorized next action, the owner durably writes an
+`action_intent` receipt keyed by `(wake_id, action_fingerprint)` before touching
+an external system. The target write carries a deterministic idempotency marker
+derived from the wake id (for example an issue/PR comment trailer, request id,
+or external idempotency key), and post-write verification stores its artifact
+URL/id in the receipt. On re-wake, the owner first finds that marker/receipt and
+reconciles an intent left in-progress; it never repeats the write merely because
+a completion record is absent. Only then may it mark the receipt complete and
+acknowledge the original wake. Killed turns, duplicate candidates, and
+at-least-once outbox delivery therefore cannot make a second authorized action.
 
 Authority is hub-verified data. Deployment, release publication, configuration
 outside the goal, deletion, money, and public-facing actions require explicit
@@ -63,8 +71,10 @@ A restart may resume work but cannot duplicate action.
 
 The execution runtime retains global/per-goal worker limits plus a distinct
 bounded owner cap. Owner turns neither consume worker slots nor bypass budget
-or kill-switch checks. Exhaustion becomes one actionable stall/alert, never a
-busy loop.
+or kill-switch checks. Every wake has a bounded delivery/launch/turn-failure
+budget. On exhaustion the hub atomically dead-letters that wake, creates exactly
+one `blocked:human` escalation with its wake id and failure evidence, and stops
+requeueing it. This is an actionable alert, never a busy loop.
 
 ## Dependency check
 
