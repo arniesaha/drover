@@ -132,6 +132,21 @@ def test_scope_and_app_config_reject_ambiguity_and_unscoped_credentials():
     assert not WorkQueueConfig(shadow_mode=False).shadow_mode
 
 
+def test_continuity_owner_accepts_legacy_or_its_exact_native_goal_identity():
+    assert scope(continuity_owner_id="agent:coder:main").continuity_owner_id
+    native = scope(
+        continuity_owner_id="drover:owner/goal-1",
+        execution_enabled=True,
+        execution_cwds={"studio": "/workspace/project"},
+        brief_ref="docs/brief.md",
+        continuity_owner_harness="codex",
+    )
+    assert native.continuity_owner_id == "drover:owner/goal-1"
+    for owner in ("drover:owner/other-goal", "drover:worker/goal-1", "owner"):
+        with pytest.raises(ValidationError):
+            scope(continuity_owner_id=owner)
+
+
 def test_runtime_config_defaults_and_toml_opt_in(tmp_path):
     assert not default_config().work_queue.enabled
     path = tmp_path / "config.toml"

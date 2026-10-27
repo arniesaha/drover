@@ -304,16 +304,22 @@ def start_queue_execution_worker(collector, config, shutdown_event):
 class IdleUndeclaredWorker:
     """Polls for workers that went idle without a declared state (#785)."""
 
-    def __init__(self, path, deadline_seconds, *, interval=30.0, clock=None):
+    def __init__(
+        self, path, deadline_seconds, *, interval=30.0, clock=None, owner_runner=None
+    ):
         from drover.server.harness.continuity import FactoryObserverContinuity
 
         self.store = FactoryObserverContinuity(path, clock=clock)
         self.deadline_seconds = deadline_seconds
         self.interval = interval
+        self.owner_runner = owner_runner
         self._stop = threading.Event()
 
     def process_once(self) -> int:
-        return len(self.store.sweep_idle_undeclared(self.deadline_seconds))
+        swept = len(self.store.sweep_idle_undeclared(self.deadline_seconds))
+        if self.owner_runner is not None:
+            self.owner_runner.process_once()
+        return swept
 
     def start(self, shutdown_event):
         def run():
@@ -336,7 +342,21 @@ def start_idle_undeclared_worker(collector, config, shutdown_event):
         g.continuity_owner_id for g in config.goals
     ):
         return None
-    worker = IdleUndeclaredWorker(collector.duckdb_path, config.idle_undeclared_seconds)
+    native_scopes = [
+        scope
+        for scope in config.goals
+        if scope.continuity_owner_id == "drover:owner/" + scope.goal_id
+    ]
+    owner_runner = None
+    if native_scopes:
+        from drover.server.work_queue.native_owner import NativeOwnerRunner
+
+        owner_runner = NativeOwnerRunner(collector, config)
+    worker = IdleUndeclaredWorker(
+        collector.duckdb_path,
+        config.idle_undeclared_seconds,
+        owner_runner=owner_runner,
+    )
     worker.start(shutdown_event)
     collector.idle_undeclared_worker = worker
     return worker

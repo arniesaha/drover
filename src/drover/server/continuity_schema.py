@@ -7,6 +7,29 @@ CONTINUITY_BASE_TABLES = ("factory_observer_runs", "factory_observer_inbox")
 CONTINUITY_RECEIPT_TABLE = "factory_observer_completion_receipts"
 CONTINUITY_TABLES = (*CONTINUITY_BASE_TABLES, CONTINUITY_RECEIPT_TABLE)
 
+# Native owner execution records are control-plane state, not harness-local
+# state.  A turn claim is intentionally separate from the observer delivery:
+# a lost hub process may retry the same client turn id, but cannot overlap a
+# second turn on its linked owner session.
+NATIVE_OWNER_DDL = (
+    """CREATE TABLE IF NOT EXISTS continuity_owner_sessions (
+      goal_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+      session_id TEXT, client_session_id TEXT NOT NULL,
+      generation INTEGER NOT NULL DEFAULT 1,
+      updated_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY (goal_id, owner_id), UNIQUE (client_session_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS continuity_owner_turn_claims (
+      wake_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+      run_id TEXT NOT NULL, session_id TEXT NOT NULL,
+      client_turn_id TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN
+        ('claimed', 'sent', 'completed')),
+      claim_until TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS continuity_owner_turn_live ON continuity_owner_turn_claims (goal_id, owner_id, state, claim_until)",
+)
+
 CONTINUITY_DDL = (
     """
     CREATE TABLE IF NOT EXISTS factory_observer_runs (
