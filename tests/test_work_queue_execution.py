@@ -493,9 +493,15 @@ def test_stale_sessionless_intent_handles_naive_timestamps():
         "created_at": (now - timedelta(minutes=11)).replace(tzinfo=None),
     }
     fresh = {"session_id": None, "created_at": now - timedelta(minutes=9)}
+    retried = {
+        "session_id": None,
+        "created_at": now - timedelta(hours=1),
+        "updated_at": now - timedelta(minutes=1),
+    }
     linked = {"session_id": "session", "created_at": now - timedelta(hours=1)}
     assert stale_sessionless_intent(stale, minutes=10, now=now)
     assert not stale_sessionless_intent(fresh, minutes=10, now=now)
+    assert not stale_sessionless_intent(retried, minutes=10, now=now)
     assert not stale_sessionless_intent(linked, minutes=10, now=now)
 
 
