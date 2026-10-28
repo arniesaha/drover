@@ -351,7 +351,7 @@ def _main_fixture(tmp_path: Path, monkeypatch, *, changed: bool = True):
 
 
 def test_main_rolls_back_unexpected_exception_with_plists_and_stop_clear(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     args, runtime, old, _target, plists, calls = _main_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -387,6 +387,12 @@ def test_main_rolls_back_unexpected_exception_with_plists_and_stop_clear(
     assert len(bootouts) == 2  # Forward reload and rollback reload.
     assert len(bootstraps) == 2
     assert any(command[-2:] == ["planned-stop", "complete"] for command in calls)
+    report = json.loads(capsys.readouterr().out)
+    assert report["rollback"]["restored"] == "runtime_and_plists"
+    assert not any(
+        error.startswith("rollback_running_plist_mismatch:")
+        for error in report["rollback"].get("errors", [])
+    )
 
 
 def test_main_preserves_backup_when_rollback_raises(tmp_path, monkeypatch, capsys):
@@ -480,12 +486,105 @@ def test_wait_for_health_reports_named_failed_check(monkeypatch):
     assert report["hub"]["error"] == "URLError"
 
 
-def test_relay_reconnect_and_work_queue_decisions_are_explicit():
+def test_relay_reconnect_excludes_offline_hosts_from_the_before_set():
     payload = {
-        "hosts": [{"host_id": "nas", "connection_kind": "relay", "status": "online"}]
+        "hosts": [
+            {
+                "host_id": "nas",
+                "connection_kind": "relay",
+                "liveness": "online",
+                "status": "online",
+            },
+            {
+                "host_id": "gpu-pc",
+                "connection_kind": "relay",
+                "liveness": "offline",
+                "status": "offline",
+            },
+        ]
     }
     assert ROLLOUT.relay_hosts(payload) == {"nas"}
+    assert ROLLOUT.offline_relay_hosts(payload) == {"gpu-pc"}
     assert ROLLOUT.relay_reconnected(payload, {"nas"}) == (True, [])
+
+
+def test_main_dry_run_reports_offline_relay_without_requiring_reconnect(
+    tmp_path, monkeypatch, capsys
+):
+    args, _runtime, _old, _target, _plists, _calls = _main_fixture(
+        tmp_path, monkeypatch
+    )
+    args.append("--dry-run")
+    monkeypatch.setattr(
+        ROLLOUT,
+        "api_json",
+        lambda *_: (
+            True,
+            {
+                "hosts": [
+                    {
+                        "host_id": "nas",
+                        "connection_kind": "relay",
+                        "liveness": "online",
+                    },
+                    {
+                        "host_id": "gpu-pc",
+                        "connection_kind": "relay",
+                        "liveness": "offline",
+                    },
+                ]
+            },
+        ),
+    )
+
+    assert ROLLOUT.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["checks"]["relay_before"] == ["nas"]
+    assert report["checks"]["relay_offline_before"] == ["gpu-pc"]
+
+
+def test_main_rolls_back_when_an_online_relay_does_not_reconnect(
+    tmp_path, monkeypatch, capsys
+):
+    args, runtime, old, _target, _plists, _calls = _main_fixture(tmp_path, monkeypatch)
+    hosts = iter(
+        [
+            {
+                "hosts": [
+                    {
+                        "host_id": "nas",
+                        "connection_kind": "relay",
+                        "liveness": "online",
+                        "status": "online",
+                    }
+                ]
+            },
+            {
+                "hosts": [
+                    {
+                        "host_id": "nas",
+                        "connection_kind": "relay",
+                        "liveness": "offline",
+                        "status": "offline",
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(ROLLOUT, "api_json", lambda *_: (True, next(hosts)))
+    monkeypatch.setattr(ROLLOUT, "wait_for_health", lambda *_: (True, {}))
+
+    assert ROLLOUT.main(args) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["failure"] == "relay_reconnect_failed"
+    assert report["checks"]["relay_reconnect"] == {
+        "ok": False,
+        "missing": ["nas"],
+    }
+    assert (runtime / "current").resolve() == old
+
+
+def test_work_queue_decisions_are_explicit():
     assert ROLLOUT.work_queue_settled({"actions": []}) is True
     assert (
         ROLLOUT.work_queue_settled(

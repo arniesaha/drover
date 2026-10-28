@@ -352,6 +352,7 @@ def api_json(url: str, token: str) -> tuple[bool, dict]:
 
 
 def relay_hosts(payload: Mapping[str, object]) -> set[str]:
+    """Return relay hosts that were live before the rollout began."""
     hosts = payload.get("hosts", [])
     if not isinstance(hosts, list):
         return set()
@@ -360,6 +361,22 @@ def relay_hosts(payload: Mapping[str, object]) -> set[str]:
         for row in hosts
         if isinstance(row, dict)
         and row.get("connection_kind") == "relay"
+        and row.get("liveness") == "online"
+        and isinstance(row.get("host_id"), str)
+    }
+
+
+def offline_relay_hosts(payload: Mapping[str, object]) -> set[str]:
+    """Return relay hosts that are offline for informational reporting."""
+    hosts = payload.get("hosts", [])
+    if not isinstance(hosts, list):
+        return set()
+    return {
+        row["host_id"]
+        for row in hosts
+        if isinstance(row, dict)
+        and row.get("connection_kind") == "relay"
+        and row.get("liveness") == "offline"
         and isinstance(row.get("host_id"), str)
     }
 
@@ -374,7 +391,7 @@ def relay_reconnected(
         else {}
     )
     missing = sorted(
-        host for host in expected if rows.get(host, {}).get("status") != "online"
+        host for host in expected if rows.get(host, {}).get("liveness") != "online"
     )
     return not missing, missing
 
@@ -664,7 +681,6 @@ def _rollback(
     original: str,
     rollback_dir: Path,
     current_plists: Mapping[str, Path],
-    candidate: Mapping[str, PlistView],
     tailscale_url: str,
     health_timeout: float,
     actions: list[list[str]],
@@ -695,7 +711,8 @@ def _rollback(
                 dry_run=False,
                 actions=actions,
             )
-            if not running_plist_matches(candidate[label], printed):
+            running_candidate = load_plist(current_plists[label])
+            if not running_plist_matches(running_candidate, printed):
                 errors.append(f"rollback_running_plist_mismatch:{label}")
             plist_changed = previous.read_bytes() != current_plists[label].read_bytes()
             _copy_atomic(previous, current_plists[label])
@@ -877,11 +894,13 @@ def main(argv: list[str] | None = None) -> int:
         token = rollout_token(config_path, home, override_env=args.device_token_env)
         local = "http://127.0.0.1:7080"
         listed, hosts_before = api_json(local + "/harness/hosts", token)
-        report["checks"]["relay_before"] = (
-            sorted(relay_hosts(hosts_before)) if listed else hosts_before
-        )
         if not listed:
+            report["checks"]["relay_before"] = hosts_before
             raise RolloutError("relay_inventory_unavailable")
+        report["checks"]["relay_before"] = sorted(relay_hosts(hosts_before))
+        report["checks"]["relay_offline_before"] = sorted(
+            offline_relay_hosts(hosts_before)
+        )
         supplemental_queue = (
             (lambda: optional_work_queue_report(local + "/work-queue/report", token))
             if args.device_token_env
@@ -1046,7 +1065,6 @@ def main(argv: list[str] | None = None) -> int:
                         original=original,
                         rollback_dir=rollback_dir,
                         current_plists=current_plists,
-                        candidate=candidate,
                         tailscale_url=args.tailscale_url,
                         health_timeout=args.health_timeout,
                         actions=report["actions"],
