@@ -31,6 +31,7 @@ class HarnessBridge:
             return session
         # A response may have been lost before the control registry was synced.
         # Read each reachable daemon, never replay POST to discover the outcome.
+        inspection_unavailable = False
         for host in self.registry.list_hosts():
             if not host.liveness().usable:
                 continue
@@ -42,13 +43,14 @@ class HarnessBridge:
             )
             if status != 200:
                 # One detached relay must not hide a matching session on a
-                # different usable host.  A later launch decision still fails
-                # closed when no host can account for its persisted intent.
+                # different usable host, but it also means this intent cannot
+                # safely be declared orphaned if no other host resolves it.
                 log.warning(
                     "harness inspection unavailable host_id=%s status=%s",
                     host.host_id,
                     status,
                 )
+                inspection_unavailable = True
                 continue
             for row in json.loads(body).get("sessions", []):
                 if row.get("client_session_id") == run_key:
@@ -61,6 +63,8 @@ class HarnessBridge:
                         host.host_id, payload, json.dumps(row)
                     )
                     return self.registry.session_by_client_id(run_key)
+        if inspection_unavailable:
+            raise WorkDenied("harness inspection unavailable")
         return None
 
     def _recovery_payload(self, run_key, row):

@@ -359,3 +359,44 @@ def test_resolve_skips_detached_relay_and_finds_the_reachable_host(launch_path):
     session = bridge.resolve("remote-key")
 
     assert session and session.session_id == "remote-session"
+
+
+def test_stale_intent_with_detached_relay_stays_denied_without_relaunch(launch_path):
+    service, _bridge, registry, _provider, harnessd = launch_path
+    registry.register_host(
+        host_id="detached-relay",
+        display_name="Detached relay",
+        kind="linux",
+        connection_kind="relay",
+        capabilities={"harnesses": []},
+        status="online",
+    )
+    request_key = "uninspectable-intent"
+    run_key = identity(service.config.workspace_id, "launch", 866, request_key, "work")
+    row = service.store.intent(
+        "control:test",
+        REF,
+        "launch",
+        run_key,
+        "work",
+        0,
+        "goal:launch",
+    )
+    with service.store.connection() as con:
+        con.execute(
+            "UPDATE execution_links SET created_at = now() - interval '11 minutes', "
+            "updated_at = now() - interval '11 minutes' WHERE id = ?",
+            [row["id"]],
+        )
+
+    with pytest.raises(WorkDenied, match="harness inspection unavailable"):
+        service.launch(
+            "launch",
+            866,
+            request_key,
+            5,
+            actor=WorkActor("control:queue-execution", "nix"),
+        )
+
+    assert service.store.links(run_key=run_key)[0]["failure_count"] == 0
+    assert harnessd.requests == []
