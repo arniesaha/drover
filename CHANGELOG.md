@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.47] - 2026-10-27
+
+### Fixed
+
+- Prevent sessionless launch intents from consuming queue capacity, while preserving duplicate-execution protection and same-intent retry safety (#851, #863, #864).
+
 ## [0.6.46] - 2026-10-27
 
 ### Fixed
