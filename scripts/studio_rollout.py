@@ -372,13 +372,19 @@ def relay_reconnected(
 
 
 def work_queue_settled(payload: Mapping[str, object]) -> bool:
-    """A queued automatic launch is not safe to race with a hub restart."""
+    """Interpret either local state or an optional hub report safely.
+
+    Older hubs predate ``execution.active``.  Their report is diagnostic only,
+    so missing active state must not turn a compatible rollout into a block.
+    """
+    if "active" in payload:
+        return payload.get("active") == 0
     actions = payload.get("actions", [])
     execution = payload.get("execution", {})
+    active = execution.get("active") if isinstance(execution, dict) else None
     return (
         isinstance(actions, list)
-        and isinstance(execution, dict)
-        and execution.get("active") == 0
+        and (active is None or active == 0)
         and not any(
             isinstance(action, dict) and action.get("kind") == "launch_candidate"
             for action in actions
@@ -386,12 +392,116 @@ def work_queue_settled(payload: Mapping[str, object]) -> bool:
     )
 
 
-def wait_for_work_queue(url: str, token: str, timeout: float) -> tuple[bool, dict]:
+def queue_settlement(
+    links: list[Mapping[str, object]],
+    *,
+    orphan_intent_minutes: int,
+    systemic_attempts: Mapping[str, int],
+    now: datetime | None = None,
+) -> dict:
+    """Classify durable links without contacting a hub or changing the store."""
+    from drover.server.harness.models import TERMINAL_SESSION_STATUSES
+    from drover.server.work_queue.store import stale_sessionless_intent
+
+    active = 0
+    stuck_intents = []
+    for link in links:
+        session_id = link.get("session_id")
+        if session_id:
+            # HarnessBridge.active() deliberately fails closed when a linked
+            # session cannot be resolved; a missing status therefore blocks.
+            if link.get("session_status") not in TERMINAL_SESSION_STATUSES:
+                active += 1
+            continue
+        failures = int(link.get("failure_count") or 0)
+        attempts = systemic_attempts.get(str(link.get("goal_id")), 3)
+        if failures >= attempts:
+            reason = "systemic"
+        elif stale_sessionless_intent(link, minutes=orphan_intent_minutes, now=now):
+            reason = "stale"
+        else:
+            active += 1
+            continue
+        stuck_intents.append(
+            {
+                "id": str(link.get("id", "")),
+                "goal_id": str(link.get("goal_id", "")),
+                "run_key": str(link.get("run_key", "")),
+                "failure_count": failures,
+                "reason": reason,
+            }
+        )
+    return {"active": active, "stuck_intents": stuck_intents}
+
+
+def local_work_queue_state(
+    dsn: str,
+    *,
+    schema: str,
+    workspace_id: str,
+    orphan_intent_minutes: int,
+    systemic_attempts: Mapping[str, int],
+) -> dict:
+    """Read rollout settledness directly from PostgreSQL in a read-only txn."""
+    try:
+        import psycopg
+        from psycopg import sql
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise RolloutError("control_store_postgres_driver_missing") from exc
+    query = sql.SQL("""SELECT link.id, link.goal_id, link.run_key, link.session_id,
+                  link.failure_count, link.created_at, link.updated_at,
+                  session.status AS session_status
+             FROM {} AS link
+             LEFT JOIN {} AS session ON session.session_id = link.session_id
+            WHERE link.workspace_id = %s
+            ORDER BY link.created_at, link.id""").format(
+        sql.Identifier(schema, "execution_links"),
+        sql.Identifier(schema, "harness_sessions"),
+    )
+    try:
+        with psycopg.connect(dsn, row_factory=dict_row) as connection:
+            with connection.transaction():
+                connection.execute("SET TRANSACTION READ ONLY")
+                links = list(connection.execute(query, [workspace_id]))
+    except Exception as exc:
+        raise RolloutError(f"control_store_read_failed:{type(exc).__name__}") from exc
+    return queue_settlement(
+        links,
+        orphan_intent_minutes=orphan_intent_minutes,
+        systemic_attempts=systemic_attempts,
+    )
+
+
+def optional_work_queue_report(url: str, token: str) -> dict:
+    """Return, but never gate on, a paired-device queue report."""
+    ok, payload = api_json(url, token)
+    return {"ok": ok, "report": payload}
+
+
+def work_queue_attempts(config) -> dict[str, int]:
+    """Return each goal's systemic-stop threshold from the hub policy files."""
+    from drover.server.work_queue.config import load_policy
+
+    return {
+        goal.goal_id: load_policy(goal.policy_path).retries.attempts
+        for goal in config.goals
+    }
+
+
+def wait_for_work_queue(
+    read_local: Callable[[], dict],
+    timeout: float,
+    *,
+    supplemental: Callable[[], dict] | None = None,
+) -> tuple[bool, dict]:
     deadline = time.monotonic() + timeout
     last: dict = {}
     while True:
-        ok, last = api_json(url, token)
-        if ok and work_queue_settled(last):
+        last = read_local()
+        if supplemental is not None:
+            last["http_report"] = supplemental()
+        if work_queue_settled(last):
             return True, last
         if time.monotonic() >= deadline:
             return False, last
@@ -733,6 +843,21 @@ def main(argv: list[str] | None = None) -> int:
         report["checks"]["disk"] = {"free_bytes": free, "minimum_bytes": MIN_FREE_BYTES}
         if free < MIN_FREE_BYTES:
             raise RolloutError("insufficient_disk")
+        if cfg.control_store.backend != "postgres":
+            raise RolloutError("control_store_not_postgres")
+        control_dsn = deployed["com.drover.server"].environment.get(
+            cfg.control_store.dsn_env, ""
+        )
+        if not control_dsn:
+            raise RolloutError("control_store_dsn_missing")
+        systemic_attempts = work_queue_attempts(cfg.work_queue)
+        read_queue = lambda: local_work_queue_state(
+            control_dsn,
+            schema=cfg.control_store.schema,
+            workspace_id=cfg.work_queue.workspace_id,
+            orphan_intent_minutes=cfg.work_queue.execution.orphan_intent_minutes,
+            systemic_attempts=systemic_attempts,
+        )
         token = rollout_token(config_path, home, override_env=args.device_token_env)
         local = "http://127.0.0.1:7080"
         listed, hosts_before = api_json(local + "/harness/hosts", token)
@@ -741,9 +866,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not listed:
             raise RolloutError("relay_inventory_unavailable")
+        supplemental_queue = (
+            (lambda: optional_work_queue_report(local + "/work-queue/report", token))
+            if args.device_token_env
+            else None
+        )
         if args.dry_run:
             settled, queue_before = wait_for_work_queue(
-                local + "/work-queue/report", token, timeout=0
+                read_queue, timeout=0, supplemental=supplemental_queue
             )
             report["checks"]["work_queue_before"] = queue_before
             if not settled:
@@ -806,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         marker_started = True
         settled, queue_before = wait_for_work_queue(
-            local + "/work-queue/report", token, args.health_timeout
+            read_queue, args.health_timeout, supplemental=supplemental_queue
         )
         report["checks"]["work_queue_before"] = queue_before
         if not settled:
@@ -860,6 +990,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not service_runs_target(printed, target):
                 raise RolloutError(f"service_not_running_target:{label}")
+        settled, queue_after = wait_for_work_queue(
+            read_queue, args.health_timeout, supplemental=supplemental_queue
+        )
+        report["checks"]["work_queue_after"] = queue_after
+        if not settled:
+            raise RolloutError("work_queue_launches_not_settled_after_switch")
         relayed, hosts_after = api_json(local + "/harness/hosts", token)
         relay_ok, missing_relays = relay_reconnected(
             hosts_after, relay_hosts(hosts_before)
