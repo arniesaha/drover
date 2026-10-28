@@ -516,6 +516,15 @@ def _health_checks(tailscale_url: str) -> dict[str, str]:
     }
 
 
+def _preserve_failed_rollback(rollback_dir: Path, rollout_root: Path) -> Path:
+    """Move the only original-plist copy into durable operator-visible history."""
+    failed = rollout_root / "failed"
+    failed.mkdir(parents=True, exist_ok=True)
+    destination = failed / _snapshot_name(datetime.now(timezone.utc))
+    os.replace(rollback_dir, destination)
+    return destination
+
+
 def _rollback(
     *,
     runtime: Path,
@@ -534,15 +543,18 @@ def _rollback(
     the tool from restoring the files that are already known good.
     """
     errors: list[str] = []
+    restoration_complete = True
     staging = runtime / ".current.rollback"
     try:
         staging.symlink_to(original)
         os.replace(staging, current)
     except (Exception, KeyboardInterrupt) as exc:
+        restoration_complete = False
         errors.append(f"runtime_restore:{type(exc).__name__}")
     for label in LABELS:
         previous = rollback_dir / current_plists[label].name
         if not previous.is_file():
+            restoration_complete = False
             errors.append(f"plist_restore_missing:{label}")
             continue
         try:
@@ -562,6 +574,7 @@ def _rollback(
                 actions=actions,
             )
         except (Exception, KeyboardInterrupt) as exc:
+            restoration_complete = False
             errors.append(f"plist_restore:{label}:{type(exc).__name__}")
     try:
         healthy, details = wait_for_health(
@@ -570,7 +583,11 @@ def _rollback(
     except (Exception, KeyboardInterrupt) as exc:
         healthy, details = False, {"error": type(exc).__name__}
         errors.append(f"rollback_health:{type(exc).__name__}")
-    result = {"restored": "runtime_and_plists", "healthy": healthy, "checks": details}
+    result = {
+        "restored": "runtime_and_plists" if restoration_complete else "incomplete",
+        "healthy": healthy,
+        "checks": details,
+    }
     if errors:
         result["errors"] = errors
     return result
@@ -739,7 +756,14 @@ def main(argv: list[str] | None = None) -> int:
                         ]
                     )
                 else:
-                    restart_actions.append(["launchctl", "kickstart", "-k", label])
+                    restart_actions.append(
+                        [
+                            "launchctl",
+                            "kickstart",
+                            "-k",
+                            f"gui/{os.getuid()}/{label}",
+                        ]
+                    )
             report["actions"] = [
                 [str(current / "bin/drover-server"), "planned-stop", "begin"],
                 ["copy", "candidate plists atomically"],
@@ -849,23 +873,29 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(exc, RolloutError)
             else f"unexpected_exception:{type(exc).__name__}"
         )
-        if mutation_started and rollback_dir is not None and original:
-            try:
-                report["rollback"] = _rollback(
-                    runtime=runtime,
-                    current=current,
-                    original=original,
-                    rollback_dir=rollback_dir,
-                    current_plists=current_plists,
-                    candidate=candidate,
-                    tailscale_url=args.tailscale_url,
-                    health_timeout=args.health_timeout,
-                    actions=report["actions"],
-                )
-            except (Exception, KeyboardInterrupt) as rollback_exc:
+        if mutation_started and rollback_dir is not None:
+            if original:
+                try:
+                    report["rollback"] = _rollback(
+                        runtime=runtime,
+                        current=current,
+                        original=original,
+                        rollback_dir=rollback_dir,
+                        current_plists=current_plists,
+                        candidate=candidate,
+                        tailscale_url=args.tailscale_url,
+                        health_timeout=args.health_timeout,
+                        actions=report["actions"],
+                    )
+                except (Exception, KeyboardInterrupt) as rollback_exc:
+                    report["rollback"] = {
+                        "restored": "incomplete",
+                        "errors": [type(rollback_exc).__name__],
+                    }
+            else:
                 report["rollback"] = {
-                    "restored": "incomplete",
-                    "errors": [type(rollback_exc).__name__],
+                    "restored": "skipped",
+                    "errors": ["original_runtime_unavailable"],
                 }
         exit_code = 1
     finally:
@@ -890,8 +920,26 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 report.setdefault("failure", "planned_stop_clear_failed")
                 exit_code = 1
-        if rollback_dir is not None:
-            shutil.rmtree(rollback_dir, ignore_errors=True)
+        if rollback_dir is not None and rollback_dir.exists():
+            rollback = report.get("rollback", {})
+            clean_rollout = exit_code == 0
+            complete_rollback = rollback.get("restored") == "runtime_and_plists"
+            if clean_rollout or complete_rollback:
+                shutil.rmtree(rollback_dir, ignore_errors=True)
+            else:
+                try:
+                    preserved = _preserve_failed_rollback(
+                        rollback_dir, home / "rollout"
+                    )
+                    report.setdefault("rollback", {"restored": "skipped"})[
+                        "preserved_snapshot"
+                    ] = str(preserved)
+                except (Exception, KeyboardInterrupt) as preserve_exc:
+                    rollback_report = report.setdefault(
+                        "rollback", {"restored": "incomplete"}
+                    )
+                    rollback_report["preserved_snapshot"] = str(rollback_dir)
+                    rollback_report["preserve_error"] = type(preserve_exc).__name__
     print(json.dumps(report, sort_keys=True))
     return exit_code
 

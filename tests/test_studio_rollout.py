@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import plistlib
 import sys
 from datetime import datetime, timezone
@@ -288,6 +289,28 @@ def test_main_rolls_back_unexpected_exception_with_plists_and_stop_clear(
     assert len(bootouts) == 2  # Forward reload and rollback reload.
     assert len(bootstraps) == 2
     assert any(command[-2:] == ["planned-stop", "complete"] for command in calls)
+
+
+def test_main_preserves_backup_when_rollback_raises(tmp_path, monkeypatch, capsys):
+    args, runtime, _old, _target, _plists, _calls = _main_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        ROLLOUT, "wait_for_health", lambda *_: (False, {"hub_loopback": {"ok": False}})
+    )
+
+    def rollback_raises(**_kwargs):
+        raise RuntimeError("rollback failed")
+
+    monkeypatch.setattr(ROLLOUT, "_rollback", rollback_raises)
+
+    assert ROLLOUT.main(args) == 1
+    report = json.loads(capsys.readouterr().out)
+    preserved = Path(report["rollback"]["preserved_snapshot"])
+    assert report["rollback"]["restored"] == "incomplete"
+    assert preserved.parent == runtime.parent / "rollout" / "failed"
+    assert (
+        ROLLOUT.load_plist(preserved / "com.drover.server.plist").environment["MARKER"]
+        == "old"
+    )
 
 
 def test_main_refuses_stale_rollout_link_before_copy(tmp_path, monkeypatch):
