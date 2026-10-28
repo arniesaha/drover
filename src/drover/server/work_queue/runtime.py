@@ -41,7 +41,15 @@ class HarnessBridge:
                 timeout_s=10,
             )
             if status != 200:
-                raise WorkDenied("harness inspection unavailable")
+                # One detached relay must not hide a matching session on a
+                # different usable host.  A later launch decision still fails
+                # closed when no host can account for its persisted intent.
+                log.warning(
+                    "harness inspection unavailable host_id=%s status=%s",
+                    host.host_id,
+                    status,
+                )
+                continue
             for row in json.loads(body).get("sessions", []):
                 if row.get("client_session_id") == run_key:
                     # A recovered daemon row does not include the create

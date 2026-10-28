@@ -51,7 +51,8 @@ jobs:
             tests/test_control_exporter.py|tests/test_runtime_roles.py|\
             tests/test_postgres_control_benchmark.py|tests/test_memory_store.py|\
             tests/test_embeddings.py|tests/test_ledger.py|tests/test_memory_integrity.py|\
-            tests/test_readiness_memory.py)
+            tests/test_readiness_memory.py|tests/test_work_queue_launch_postgres.py|\
+            tests/fixtures/work_queue_launch_snapshot.json|scripts/export_work_queue_launch_snapshot.py)
               echo 'integration=true' >> "$GITHUB_OUTPUT"
               exit 0
               ;;
@@ -417,7 +418,8 @@ jobs:
           tests/test_embeddings.py \
           tests/test_ledger.py \
           tests/test_memory_integrity.py \
-          tests/test_readiness_memory.py -m 'not pgvector' -q
+          tests/test_readiness_memory.py \
+          tests/test_work_queue_launch_postgres.py -m 'not pgvector' -q
 
     - name: Get DuckDB extension cache version
       id: lake-extension-version

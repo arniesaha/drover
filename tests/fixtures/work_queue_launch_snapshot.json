@@ -1,0 +1,26 @@
+{
+  "format": 1,
+  "workspace_id": "sanitized-launch-workspace",
+  "hosts": [
+    {
+      "host_id": "launch-host",
+      "display_name": "Sanitized launch host",
+      "kind": "linux",
+      "capabilities": {
+        "harnesses": [
+          {
+            "name": "codex",
+            "enabled": true,
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "codex",
+              "launch_modes": ["structured"]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "work_items": [],
+  "execution_links": []
+}
