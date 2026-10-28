@@ -1,7 +1,10 @@
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from drover.schema import bootstrap_control_plane_store
 from drover.server.continuity_hub import ContinuityHub
+from drover.server.continuity_sweeper import ContinuityAlertSweeper
 from drover.server.db import control_plane_connection
 from drover.server.mcp.tools import drover_continuity_status
 from drover.server.metrics import _append_continuity_metrics
@@ -161,3 +164,199 @@ def test_mcp_status_read_matches_hub_projection(tmp_path):
     bootstrap_control_plane_store(path)
 
     assert drover_continuity_status(duckdb_path=path)["pending_wakes"]["total"] == 0
+
+
+def test_alert_unconsumed_wake_attribution(tmp_path):
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    now = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
+    issue_key = "arniesaha/drover#821"
+
+    with control_plane_connection(path) as con:
+        # 1. Lease bound to an owner
+        con.execute(
+            """INSERT INTO continuity_owner_leases
+            (issue_key, owner_id, owner_epoch, lease_until)
+            VALUES (?, 'agent:coder:main', 1, ?)""",
+            [issue_key, now + timedelta(minutes=30)],
+        )
+        # 2. Unconsumed wake pending for 11 minutes (> 10m threshold)
+        con.execute(
+            """INSERT INTO continuity_wakes
+            (wake_id, issue_key, action, fingerprint, payload_json, state, created_at, next_delivery_at)
+            VALUES ('wake-stuck-1', ?, 'wake', 'fp-stuck', '{"reason": "review"}', 'pending', ?, ?)""",
+            [issue_key, now - timedelta(minutes=11), now - timedelta(minutes=11)],
+        )
+        # 3. Recent unconsumed wake pending for only 5 minutes (<= 10m threshold)
+        con.execute(
+            """INSERT INTO continuity_wakes
+            (wake_id, issue_key, action, fingerprint, payload_json, state, created_at, next_delivery_at)
+            VALUES ('wake-fresh-1', ?, 'wake', 'fp-fresh', '{"reason": "review"}', 'pending', ?, ?)""",
+            [issue_key, now - timedelta(minutes=5), now - timedelta(minutes=5)],
+        )
+
+    sweeper = ContinuityAlertSweeper(path)
+    with control_plane_connection(path) as con:
+        alert_ids = sweeper.sweep_alerts(con, now=now)
+
+    assert len(alert_ids) == 1
+
+    with control_plane_connection(path) as con:
+        row = con.execute(
+            """SELECT wake_id, issue_key, action, fingerprint, payload_json, state, owner_id
+                 FROM continuity_wakes WHERE wake_id = ?""",
+            [alert_ids[0]],
+        ).fetchone()
+
+    assert row is not None
+    assert row[1] == issue_key
+    assert row[2] == "wake"
+    assert row[5] == "pending"
+    assert row[6] == "agent:coder:main"
+
+    payload = json.loads(row[4])
+    assert payload["alert_type"] == "stuck_wake"
+    assert payload["responsible_actor"] == "agent:coder:main"
+    assert payload["wake_id"] == "wake-stuck-1"
+    assert payload["reason"] == "alert"
+    assert payload["age_seconds"] >= 660
+
+
+def test_alert_stale_ack_attribution(tmp_path):
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    now = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
+    issue_key = "arniesaha/drover#821"
+
+    with control_plane_connection(path) as con:
+        # Delivered wake unacknowledged for 16 minutes (> 15m threshold)
+        con.execute(
+            """INSERT INTO continuity_wakes
+            (wake_id, issue_key, action, fingerprint, payload_json, state,
+             owner_id, owner_epoch, delivery_token, attempts, created_at, delivered_at, next_delivery_at)
+            VALUES ('wake-delivered-1', ?, 'wake', 'fp-deliv', '{"reason": "review"}', 'delivered',
+                    'agent:coder:subworker-1', 1, 'tok-1', 1, ?, ?, ?)""",
+            [
+                issue_key,
+                now - timedelta(minutes=20),
+                now - timedelta(minutes=16),
+                now + timedelta(minutes=5),
+            ],
+        )
+        # Delivered wake unacknowledged for only 10 minutes (<= 15m threshold)
+        con.execute(
+            """INSERT INTO continuity_wakes
+            (wake_id, issue_key, action, fingerprint, payload_json, state,
+             owner_id, owner_epoch, delivery_token, attempts, created_at, delivered_at, next_delivery_at)
+            VALUES ('wake-delivered-fresh', ?, 'wake', 'fp-deliv-fresh', '{"reason": "review"}', 'delivered',
+                    'agent:coder:subworker-1', 1, 'tok-2', 1, ?, ?, ?)""",
+            [
+                issue_key,
+                now - timedelta(minutes=12),
+                now - timedelta(minutes=10),
+                now + timedelta(minutes=5),
+            ],
+        )
+
+    with control_plane_connection(path) as con:
+        alert_ids = ContinuityAlertSweeper.sweep_alerts(con, now=now)
+
+    assert len(alert_ids) == 1
+
+    with control_plane_connection(path) as con:
+        row = con.execute(
+            """SELECT wake_id, issue_key, action, fingerprint, payload_json, state, owner_id
+                 FROM continuity_wakes WHERE wake_id = ?""",
+            [alert_ids[0]],
+        ).fetchone()
+
+    assert row is not None
+    assert row[1] == issue_key
+    assert row[2] == "wake"
+    assert row[5] == "pending"
+    assert row[6] == "agent:coder:subworker-1"
+
+    payload = json.loads(row[4])
+    assert payload["alert_type"] == "stale_ack"
+    assert payload["responsible_actor"] == "agent:coder:subworker-1"
+    assert payload["wake_id"] == "wake-delivered-1"
+    assert payload["reason"] == "alert"
+    assert payload["elapsed_seconds"] >= 960
+
+
+def test_alert_recursion_prevented(tmp_path):
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    now = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
+    issue_key = "arniesaha/drover#821"
+
+    with control_plane_connection(path) as con:
+        # Existing alert wake in pending state older than 10 minutes
+        con.execute(
+            """INSERT INTO continuity_wakes
+            (wake_id, issue_key, action, fingerprint, payload_json, state,
+             owner_id, created_at, next_delivery_at)
+            VALUES ('alert-wake-1', ?, 'wake', 'fp-alert-1',
+                    '{"alert_type": "stuck_wake", "reason": "alert", "responsible_actor": "agent:coder:main"}',
+                    'pending', 'agent:coder:main', ?, ?)""",
+            [issue_key, now - timedelta(minutes=20), now - timedelta(minutes=20)],
+        )
+        # Existing alert wake in delivered state older than 15 minutes
+        con.execute(
+            """INSERT INTO continuity_wakes
+            (wake_id, issue_key, action, fingerprint, payload_json, state,
+             owner_id, delivery_token, attempts, created_at, delivered_at, next_delivery_at)
+            VALUES ('alert-wake-2', ?, 'wake', 'fp-alert-2',
+                    '{"alert_type": "stale_ack", "reason": "alert", "responsible_actor": "agent:coder:main"}',
+                    'delivered', 'agent:coder:main', 'tok-3', 1, ?, ?, ?)""",
+            [
+                issue_key,
+                now - timedelta(minutes=30),
+                now - timedelta(minutes=25),
+                now + timedelta(minutes=5),
+            ],
+        )
+
+    with control_plane_connection(path) as con:
+        alert_ids = ContinuityAlertSweeper.sweep_alerts(con, now=now)
+        total_wakes = con.execute("SELECT count(*) FROM continuity_wakes").fetchone()[0]
+
+    assert alert_ids == []
+    assert total_wakes == 2
+
+
+def test_dashboard_json_continuity_row():
+    dashboard_path = (
+        Path(__file__).resolve().parent.parent
+        / "deploy"
+        / "grafana"
+        / "drover-pipeline-observatory.json"
+    )
+    with open(dashboard_path, "r", encoding="utf-8") as f:
+        dashboard = json.load(f)
+
+    assert dashboard["title"] == "Drover Pipeline Observatory"
+    panels = dashboard.get("panels", [])
+
+    # Find the row panel
+    row_panels = [
+        p
+        for p in panels
+        if p.get("type") == "row" and p.get("title") == "Continuity Health & Latency"
+    ]
+    assert len(row_panels) == 1
+
+    panel_titles = {p.get("title") for p in panels}
+    expected_titles = {
+        "Continuity Health & Latency",
+        "Pending Wakes by Age",
+        "Wake-to-Consume & Consume-to-Ack Latency",
+        "Active Owner Leases & Epochs",
+        "Attributed Continuity Alerts",
+    }
+    assert expected_titles.issubset(panel_titles)
+
+    # Check datasource bindings
+    for panel in panels:
+        if panel.get("type") != "row":
+            assert panel.get("datasource", {}).get("type") == "prometheus"
