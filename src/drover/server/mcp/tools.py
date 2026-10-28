@@ -139,6 +139,13 @@ _BRIEF_KEYS = (
 )
 
 
+def drover_continuity_status(*, duckdb_path: Path) -> dict[str, Any]:
+    """Return the bounded, authenticated continuity health projection."""
+    from drover.server.continuity_hub import ContinuityHub
+
+    return ContinuityHub(duckdb_path).observability_status()
+
+
 def _connect(duckdb_path: Path) -> duckdb.DuckDBPyConnection:
     # Read-write open even for read paths: a read_only connection has a
     # different config and DuckDB rejects it beside live writers (issue #2).

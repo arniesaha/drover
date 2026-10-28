@@ -18,6 +18,7 @@ from drover.server.continuity_loop import (
     decide,
     normalize_facts,
 )
+from drover.server.continuity_status import ContinuityStatusService
 from drover.server.continuity_wakes import ContinuityWakes, _text
 
 
@@ -26,6 +27,7 @@ class ContinuityHub:
 
     def __init__(self, path: str | Path, **kwargs: Any):
         self.wakes = ContinuityWakes(path, **kwargs)
+        self.status_service = ContinuityStatusService(path)
 
     def decide(
         self,
@@ -73,3 +75,6 @@ class ContinuityHub:
 
     def status(self, issue_key: str, **kwargs: Any) -> dict:
         return self.wakes.status(issue_key, **kwargs)
+
+    def observability_status(self, now: datetime | None = None) -> dict[str, Any]:
+        return self.status_service.get_status(now)

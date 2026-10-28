@@ -129,6 +129,11 @@ def build_mcp_server(
         """Read a live item and its workspace-scoped execution links."""
         return work_call("get", dict(goal_id=goal_id, number=number))
 
+    @read_tool()
+    def drover_continuity_status() -> dict:
+        """Read continuity wake backlog, owner leases, and poll health."""
+        return t.drover_continuity_status(duckdb_path=db)
+
     @mutation_tool(path="/work/launch")
     def drover_work_launch(
         goal_id: str,
