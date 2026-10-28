@@ -14,7 +14,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/plugin.test.js $([ -n \"$DROVER_TEST_OPENCLAW_NAS_SOURCE\" ] && echo test/nas-source.test.js)"
   },
   "dependencies": {
     "ajv": "8.18.0",
