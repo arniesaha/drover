@@ -26,7 +26,6 @@ from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-
 LABELS = ("com.drover.server", "com.drover.harnessd")
 CONTINUITY_SECRET = "DROVER_WORK_COORDINATOR_CONTINUITY_SECRET"
 MIN_FREE_BYTES = 5 * 1024**3
@@ -50,12 +49,17 @@ def _secret_fingerprint(value: str) -> str:
 
 def _env_file(arguments: list[object]) -> Path | None:
     """Return the fixed env-file argument rendered by ``render_launchd``."""
-    if len(arguments) >= 5 and arguments[:4] == [
-        "/bin/sh",
-        "-c",
-        'set -a; . "$1" || exit $?; shift; exec "$@"',
-        "drover-service-env",
-    ] and isinstance(arguments[4], str):
+    if (
+        len(arguments) >= 5
+        and arguments[:4]
+        == [
+            "/bin/sh",
+            "-c",
+            'set -a; . "$1" || exit $?; shift; exec "$@"',
+            "drover-service-env",
+        ]
+        and isinstance(arguments[4], str)
+    ):
         return Path(arguments[4])
     return None
 
@@ -157,7 +161,10 @@ def required_environment(config_path: Path) -> set[str]:
         required.add(cfg.analytics.catalog_dsn_env)
         required.update(
             name
-            for name in (cfg.analytics.exporter_dsn_env, cfg.analytics.maintenance_dsn_env)
+            for name in (
+                cfg.analytics.exporter_dsn_env,
+                cfg.analytics.maintenance_dsn_env,
+            )
             if name
         )
     return required
@@ -232,7 +239,9 @@ def record_last_good(
     else:
         os.replace(staged, last_good)
     snapshots = sorted(
-        entry for entry in history.iterdir() if entry.is_dir() and not entry.is_symlink()
+        entry
+        for entry in history.iterdir()
+        if entry.is_dir() and not entry.is_symlink()
     )
     for obsolete in snapshots[:-5]:
         shutil.rmtree(obsolete)
@@ -258,7 +267,9 @@ def bootstrap_last_good(
     """Seed script-owned history only from a complete, live-safe baseline."""
     for label in LABELS:
         current = load_plist(plists / f"{label}.plist")
-        diff = environment_diff(required, current.environment, running_environments[label])
+        diff = environment_diff(
+            required, current.environment, running_environments[label]
+        )
         if diff["missing_required"]:
             raise RolloutError(f"required_environment_missing:{label}")
     if not apply:
@@ -270,7 +281,10 @@ def runtime_preflight(target: Path, engine_sha256: str = "") -> dict:
     python = target / "bin/python"
     server = target / "bin/drover-server"
     harnessd = target / "bin/drover-harnessd"
-    if not all(path.is_file() and os.access(path, os.X_OK) for path in (python, server, harnessd)):
+    if not all(
+        path.is_file() and os.access(path, os.X_OK)
+        for path in (python, server, harnessd)
+    ):
         raise RolloutError("target_runtime_incomplete")
     probe = (
         "import hashlib,json,sys; import _duckdb; "
@@ -301,7 +315,10 @@ def health(url: str, *, timeout: float = 5) -> tuple[bool, dict]:
     try:
         with urlopen(Request(url), timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")
-            return 200 <= response.status < 300, {"status": response.status, "body": body[:200]}
+            return 200 <= response.status < 300, {
+                "status": response.status,
+                "body": body[:200],
+            }
     except (HTTPError, URLError, OSError) as exc:
         return False, {"error": type(exc).__name__}
 
@@ -329,10 +346,18 @@ def relay_hosts(payload: Mapping[str, object]) -> set[str]:
     }
 
 
-def relay_reconnected(payload: Mapping[str, object], expected: set[str]) -> tuple[bool, list[str]]:
+def relay_reconnected(
+    payload: Mapping[str, object], expected: set[str]
+) -> tuple[bool, list[str]]:
     hosts = payload.get("hosts", [])
-    rows = {row.get("host_id"): row for row in hosts if isinstance(row, dict)} if isinstance(hosts, list) else {}
-    missing = sorted(host for host in expected if rows.get(host, {}).get("status") != "online")
+    rows = (
+        {row.get("host_id"): row for row in hosts if isinstance(row, dict)}
+        if isinstance(hosts, list)
+        else {}
+    )
+    missing = sorted(
+        host for host in expected if rows.get(host, {}).get("status") != "online"
+    )
     return not missing, missing
 
 
@@ -345,8 +370,8 @@ def work_queue_settled(payload: Mapping[str, object]) -> bool:
         and isinstance(execution, dict)
         and execution.get("active") == 0
         and not any(
-        isinstance(action, dict) and action.get("kind") == "launch_candidate"
-        for action in actions
+            isinstance(action, dict) and action.get("kind") == "launch_candidate"
+            for action in actions
         )
     )
 
@@ -361,11 +386,6 @@ def wait_for_work_queue(url: str, token: str, timeout: float) -> tuple[bool, dic
         if time.monotonic() >= deadline:
             return False, last
         time.sleep(2)
-
-
-def should_rollback(*, switched: bool, health_ok: bool, dry_run: bool) -> bool:
-    """Keep rollback policy independent from launchctl for direct unit tests."""
-    return switched and not health_ok and not dry_run
 
 
 def _copy_atomic(source: Path, destination: Path) -> None:
@@ -396,7 +416,69 @@ def _service_pid(launchctl_print: str) -> str | None:
     return match.group(1) if match else None
 
 
-def service_runs_target(launchctl_print: str, target: Path, *, run: Callable = subprocess.run) -> bool:
+def running_plist_matches(view: PlistView, launchctl_print: str) -> bool:
+    """Compare the launchd facts that `launchctl print` exposes to a plist.
+
+    launchctl does not retain the source plist as a byte-for-byte object, so
+    this deliberately compares its recorded path, executable and effective
+    environment.  It prevents overwriting a plist while launchd is actually
+    serving a different unit (the failure mode from the October incident).
+    """
+    path = re.search(r"(?m)^\s*path\s*=\s*(.*?)\s*$", launchctl_print)
+    program = re.search(r"(?m)^\s*program\s*=\s*(.*?)\s*$", launchctl_print)
+    if path is None or program is None:
+        return False
+    try:
+        expected_path = str(view.path.resolve(strict=True))
+    except OSError:
+        return False
+    if (
+        path.group(1).strip() != expected_path
+        or program.group(1).strip() != view.arguments[0]
+    ):
+        return False
+    running = launchctl_environment(launchctl_print)
+    return all(running.get(name) == value for name, value in view.environment.items())
+
+
+def _stale_staging_link(runtime: Path) -> str | None:
+    for name in (".current.rollout", ".current.rollback"):
+        path = runtime / name
+        if path.exists() or path.is_symlink():
+            return name
+    return None
+
+
+def _restart_service(
+    label: str,
+    plist: Path,
+    *,
+    plist_changed: bool,
+    actions: list[list[str]],
+) -> None:
+    domain = f"gui/{os.getuid()}"
+    if plist_changed:
+        _run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            dry_run=False,
+            actions=actions,
+        )
+        _run(
+            ["launchctl", "bootstrap", domain, str(plist)],
+            dry_run=False,
+            actions=actions,
+        )
+        return
+    _run(
+        ["launchctl", "kickstart", "-k", f"{domain}/{label}"],
+        dry_run=False,
+        actions=actions,
+    )
+
+
+def service_runs_target(
+    launchctl_print: str, target: Path, *, run: Callable = subprocess.run
+) -> bool:
     """Require an actual service pid whose command resolved into target runtime."""
     pid = _service_pid(launchctl_print)
     if pid is None:
@@ -414,7 +496,11 @@ def wait_for_health(checks: Mapping[str, str], timeout: float) -> tuple[bool, di
     deadline = time.monotonic() + timeout
     result: dict[str, dict] = {}
     while True:
-        result = {name: {"ok": ok, **detail} for name, url in checks.items() for ok, detail in [health(url)]}
+        result = {
+            name: {"ok": ok, **detail}
+            for name, url in checks.items()
+            for ok, detail in [health(url)]
+        }
         if all(item["ok"] for item in result.values()):
             return True, result
         if time.monotonic() >= deadline:
@@ -422,11 +508,81 @@ def wait_for_health(checks: Mapping[str, str], timeout: float) -> tuple[bool, di
         time.sleep(2)
 
 
+def _health_checks(tailscale_url: str) -> dict[str, str]:
+    return {
+        "hub_loopback": "http://127.0.0.1:7080/healthz",
+        "hub_tailscale": tailscale_url.rstrip("/") + "/healthz",
+        "harnessd": "http://127.0.0.1:7081/healthz",
+    }
+
+
+def _rollback(
+    *,
+    runtime: Path,
+    current: Path,
+    original: str,
+    rollback_dir: Path,
+    current_plists: Mapping[str, Path],
+    candidate: Mapping[str, PlistView],
+    tailscale_url: str,
+    health_timeout: float,
+    actions: list[list[str]],
+) -> dict:
+    """Restore the recorded runtime and plists, preserving all failures.
+
+    A rollback is recovery work, so a mismatch is reported but does not keep
+    the tool from restoring the files that are already known good.
+    """
+    errors: list[str] = []
+    staging = runtime / ".current.rollback"
+    try:
+        staging.symlink_to(original)
+        os.replace(staging, current)
+    except (Exception, KeyboardInterrupt) as exc:
+        errors.append(f"runtime_restore:{type(exc).__name__}")
+    for label in LABELS:
+        previous = rollback_dir / current_plists[label].name
+        if not previous.is_file():
+            errors.append(f"plist_restore_missing:{label}")
+            continue
+        try:
+            printed = _run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                dry_run=False,
+                actions=actions,
+            )
+            if not running_plist_matches(candidate[label], printed):
+                errors.append(f"rollback_running_plist_mismatch:{label}")
+            plist_changed = previous.read_bytes() != current_plists[label].read_bytes()
+            _copy_atomic(previous, current_plists[label])
+            _restart_service(
+                label,
+                current_plists[label],
+                plist_changed=plist_changed,
+                actions=actions,
+            )
+        except (Exception, KeyboardInterrupt) as exc:
+            errors.append(f"plist_restore:{label}:{type(exc).__name__}")
+    try:
+        healthy, details = wait_for_health(
+            _health_checks(tailscale_url), health_timeout
+        )
+    except (Exception, KeyboardInterrupt) as exc:
+        healthy, details = False, {"error": type(exc).__name__}
+        errors.append(f"rollback_health:{type(exc).__name__}")
+    result = {"restored": "runtime_and_plists", "healthy": healthy, "checks": details}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target_version", nargs="?")
     parser.add_argument("--drover-home", type=Path, default=Path.home() / ".drover")
-    parser.add_argument("--plist-dir", type=Path, default=Path.home() / "Library/LaunchAgents")
+    parser.add_argument(
+        "--plist-dir", type=Path, default=Path.home() / "Library/LaunchAgents"
+    )
     parser.add_argument("--candidate-plists", type=Path)
     parser.add_argument("--last-good-plists", type=Path)
     parser.add_argument("--bootstrap-last-good", action="store_true")
@@ -448,8 +604,10 @@ def main(argv: list[str] | None = None) -> int:
     target = runtime / args.target_version if args.target_version else None
     current = runtime / "current"
     original = os.readlink(current) if current.is_symlink() else None
-    changed = False
     marker_started = False
+    mutation_started = False
+    rollback_dir: Path | None = None
+    exit_code = 1
     try:
         current_plists = {label: args.plist_dir / f"{label}.plist" for label in LABELS}
         if args.bootstrap_last_good:
@@ -488,18 +646,29 @@ def main(argv: list[str] | None = None) -> int:
                 report["actions"] = [["snapshot", str(last_good_path)]]
             print(json.dumps(report, sort_keys=True))
             return 0
-        if not args.target_version or args.candidate_plists is None or not args.tailscale_url:
-            parser.error("target_version, --candidate-plists, and --tailscale-url are required")
+        if (
+            not args.target_version
+            or args.candidate_plists is None
+            or not args.tailscale_url
+        ):
+            parser.error(
+                "target_version, --candidate-plists, and --tailscale-url are required"
+            )
+        stale = _stale_staging_link(runtime)
+        if stale:
+            raise RolloutError(f"stale_runtime_staging_link:{stale}")
         candidate = {
             label: load_plist(args.candidate_plists / f"{label}.plist")
             for label in LABELS
         }
+        deployed = {label: load_plist(current_plists[label]) for label in LABELS}
         last_good = {
-            label: load_plist(last_good_path / f"{label}.plist")
-            for label in LABELS
+            label: load_plist(last_good_path / f"{label}.plist") for label in LABELS
         }
         if any(
-            candidate[label].label != label or last_good[label].label != label
+            candidate[label].label != label
+            or deployed[label].label != label
+            or last_good[label].label != label
             for label in LABELS
         ):
             raise RolloutError("plist_label_mismatch")
@@ -526,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
             if report["checks"][f"{label}:environment"]["missing_required"]:
                 raise RolloutError(f"required_environment_missing:{label}")
         from drover.config import load_config
+
         cfg = load_config(config_path)
         report["checks"]["runtime"] = runtime_preflight(
             target, cfg.analytics.engine_sha256
@@ -534,12 +704,12 @@ def main(argv: list[str] | None = None) -> int:
         report["checks"]["disk"] = {"free_bytes": free, "minimum_bytes": MIN_FREE_BYTES}
         if free < MIN_FREE_BYTES:
             raise RolloutError("insufficient_disk")
-        token = rollout_token(
-            config_path, home, override_env=args.device_token_env
-        )
+        token = rollout_token(config_path, home, override_env=args.device_token_env)
         local = "http://127.0.0.1:7080"
         listed, hosts_before = api_json(local + "/harness/hosts", token)
-        report["checks"]["relay_before"] = sorted(relay_hosts(hosts_before)) if listed else hosts_before
+        report["checks"]["relay_before"] = (
+            sorted(relay_hosts(hosts_before)) if listed else hosts_before
+        )
         if not listed:
             raise RolloutError("relay_inventory_unavailable")
         if args.dry_run:
@@ -549,20 +719,32 @@ def main(argv: list[str] | None = None) -> int:
             report["checks"]["work_queue_before"] = queue_before
             if not settled:
                 raise RolloutError("work_queue_launches_not_settled")
-            _, details = wait_for_health(
-                {
-                    "hub_loopback": "http://127.0.0.1:7080/healthz",
-                    "hub_tailscale": args.tailscale_url.rstrip("/") + "/healthz",
-                    "harnessd": "http://127.0.0.1:7081/healthz",
-                },
-                timeout=0,
-            )
+            _, details = wait_for_health(_health_checks(args.tailscale_url), timeout=0)
             report["checks"]["health_before"] = details
+            restart_actions = []
+            for label in LABELS:
+                if (
+                    candidate[label].path.read_bytes()
+                    != current_plists[label].read_bytes()
+                ):
+                    restart_actions.extend(
+                        [
+                            ["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
+                            [
+                                "launchctl",
+                                "bootstrap",
+                                f"gui/{os.getuid()}",
+                                str(current_plists[label]),
+                            ],
+                        ]
+                    )
+                else:
+                    restart_actions.append(["launchctl", "kickstart", "-k", label])
             report["actions"] = [
                 [str(current / "bin/drover-server"), "planned-stop", "begin"],
                 ["copy", "candidate plists atomically"],
                 ["flip", str(current), args.target_version],
-                *[["launchctl", "kickstart", "-k", label] for label in LABELS],
+                *restart_actions,
                 ["snapshot", "deployed plists as last-good"],
                 [str(target / "bin/drover-server"), "planned-stop", "complete"],
             ]
@@ -593,33 +775,63 @@ def main(argv: list[str] | None = None) -> int:
         report["checks"]["work_queue_before"] = queue_before
         if not settled:
             raise RolloutError("work_queue_launches_not_settled")
-        rollback_dir = Path(tempfile.mkdtemp(prefix=".studio-rollout-", dir=runtime))
-        changed = True
+        # Re-read launchctl immediately before copying: a deployment may have
+        # raced the preflight and changed what launchd is serving.
         for label in LABELS:
-            _copy_atomic(current_plists[label], rollback_dir / current_plists[label].name)
+            printed = _run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                dry_run=False,
+                actions=report["actions"],
+            )
+            if not running_plist_matches(deployed[label], printed):
+                raise RolloutError(f"running_plist_mismatch:{label}")
+        rollback_dir = Path(tempfile.mkdtemp(prefix=".studio-rollout-", dir=runtime))
+        mutation_started = True
+        for label in LABELS:
+            _copy_atomic(
+                current_plists[label], rollback_dir / current_plists[label].name
+            )
+        plist_changed = {
+            label: candidate[label].path.read_bytes()
+            != current_plists[label].read_bytes()
+            for label in LABELS
+        }
+        for label in LABELS:
             _copy_atomic(candidate[label].path, current_plists[label])
         staging = runtime / ".current.rollout"
         staging.symlink_to(args.target_version)
         os.replace(staging, current)
         for label in LABELS:
-            _run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"], dry_run=False, actions=report["actions"])
+            _restart_service(
+                label,
+                current_plists[label],
+                plist_changed=plist_changed[label],
+                actions=report["actions"],
+            )
         if not runtime_points_to(current, target):
             raise RolloutError("runtime_repointed_after_harnessd_restart")
-        ok, details = wait_for_health({
-            "hub_loopback": "http://127.0.0.1:7080/healthz",
-            "hub_tailscale": args.tailscale_url.rstrip("/") + "/healthz",
-            "harnessd": "http://127.0.0.1:7081/healthz",
-        }, args.health_timeout)
+        ok, details = wait_for_health(
+            _health_checks(args.tailscale_url), args.health_timeout
+        )
         report["checks"]["health"] = details
         if not ok:
             raise RolloutError("health_check_failed")
         for label in LABELS:
-            printed = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], dry_run=False, actions=report["actions"])
+            printed = _run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                dry_run=False,
+                actions=report["actions"],
+            )
             if not service_runs_target(printed, target):
                 raise RolloutError(f"service_not_running_target:{label}")
         relayed, hosts_after = api_json(local + "/harness/hosts", token)
-        relay_ok, missing_relays = relay_reconnected(hosts_after, relay_hosts(hosts_before))
-        report["checks"]["relay_reconnect"] = {"ok": relayed and relay_ok, "missing": missing_relays}
+        relay_ok, missing_relays = relay_reconnected(
+            hosts_after, relay_hosts(hosts_before)
+        )
+        report["checks"]["relay_reconnect"] = {
+            "ok": relayed and relay_ok,
+            "missing": missing_relays,
+        }
         if not relayed or not relay_ok:
             raise RolloutError("relay_reconnect_failed")
         report["last_good_snapshot"] = str(
@@ -629,31 +841,59 @@ def main(argv: list[str] | None = None) -> int:
                 last_good_name=last_good_path.name,
             )
         )
-        _run([str(current / "bin/drover-server"), "--config", str(config_path), "planned-stop", "complete"], dry_run=False, actions=report["actions"])
-        shutil.rmtree(rollback_dir)
         report["result"] = "rolled_out"
-        print(json.dumps(report, sort_keys=True))
-        return 0
-    except RolloutError as exc:
-        report["failure"] = str(exc)
-        if should_rollback(switched=changed, health_ok=False, dry_run=args.dry_run) and original:
-            (runtime / ".current.rollback").symlink_to(original)
-            os.replace(runtime / ".current.rollback", current)
-            for label in LABELS:
-                if "rollback_dir" in locals():
-                    _copy_atomic(rollback_dir / current_plists[label].name, current_plists[label])
-                _run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"], dry_run=False, actions=report["actions"])
-            healthy, details = wait_for_health({
-                "hub_loopback": "http://127.0.0.1:7080/healthz",
-                "hub_tailscale": args.tailscale_url.rstrip("/") + "/healthz",
-                "harnessd": "http://127.0.0.1:7081/healthz",
-            }, args.health_timeout)
-            report["rollback"] = {"restored": "runtime_and_plists", "healthy": healthy, "checks": details}
-        elif marker_started:
-            # The hub was never changed, so remove the outage fence we wrote.
-            _run([str(current / "bin/drover-server"), "--config", str(config_path), "planned-stop", "complete"], dry_run=False, actions=report["actions"])
-        print(json.dumps(report, sort_keys=True))
-        return 1
+        exit_code = 0
+    except (Exception, KeyboardInterrupt) as exc:
+        report["failure"] = (
+            str(exc)
+            if isinstance(exc, RolloutError)
+            else f"unexpected_exception:{type(exc).__name__}"
+        )
+        if mutation_started and rollback_dir is not None and original:
+            try:
+                report["rollback"] = _rollback(
+                    runtime=runtime,
+                    current=current,
+                    original=original,
+                    rollback_dir=rollback_dir,
+                    current_plists=current_plists,
+                    candidate=candidate,
+                    tailscale_url=args.tailscale_url,
+                    health_timeout=args.health_timeout,
+                    actions=report["actions"],
+                )
+            except (Exception, KeyboardInterrupt) as rollback_exc:
+                report["rollback"] = {
+                    "restored": "incomplete",
+                    "errors": [type(rollback_exc).__name__],
+                }
+        exit_code = 1
+    finally:
+        if marker_started:
+            try:
+                _run(
+                    [
+                        str(current / "bin/drover-server"),
+                        "--config",
+                        str(config_path),
+                        "planned-stop",
+                        "complete",
+                    ],
+                    dry_run=False,
+                    actions=report["actions"],
+                )
+                report["checks"]["planned_stop_clear"] = {"ok": True}
+            except (Exception, KeyboardInterrupt) as clear_exc:
+                report["checks"]["planned_stop_clear"] = {
+                    "ok": False,
+                    "error": type(clear_exc).__name__,
+                }
+                report.setdefault("failure", "planned_stop_clear_failed")
+                exit_code = 1
+        if rollback_dir is not None:
+            shutil.rmtree(rollback_dir, ignore_errors=True)
+    print(json.dumps(report, sort_keys=True))
+    return exit_code
 
 
 if __name__ == "__main__":
