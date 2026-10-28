@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.48] - 2026-10-27
+
+### Added
+
+- Add Postgres-backed end-to-end launch coverage and fail closed when harness inspection is unavailable (#866).
+- Add a guarded Studio rollout script with preflight, health verification, and automatic rollback (#867).
+
 ## [0.6.47] - 2026-10-27
 
 ### Fixed
