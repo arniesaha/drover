@@ -150,8 +150,10 @@ For DuckLake hubs, `/readyz` includes `exporter`: `state`, `running`,
 `unacknowledged_batches`, `oldest_unacknowledged_age_seconds`,
 `oldest_outstanding_age_seconds`, `last_error`, `restart_count`,
 `recovery_attempt_age_seconds`, `recovery_escalation_count`,
-`recovery_exhausted` and `recovery_action`. During backoff, `recovery_pending` is true and the action
-reports the scheduled restart. The outstanding age also includes pending ingress that has
+`recovery_exhausted`, `recovery_retry_count`, `recovery_retry_delay_seconds`,
+`recovery_next_retry_at` and `recovery_action`. During backoff,
+`recovery_pending` is true and the action reports the scheduled retry. The
+outstanding age also includes pending ingress that has
 not yet formed a batch. A running idle exporter is `ok` even if its last export
 was hours ago. Outstanding work is `lagging` at 30 seconds and `stalled` at
 120 seconds. An unavailable freshness probe reports `stalled`; an exporter
@@ -200,8 +202,14 @@ If recovery blocks before it acquires an owner, the same attempt deadline
 stops the exporter directly; this covers a stuck fence, exporter startup
 or serving proof that cannot be cooperatively cancelled. The health counter
 `recovery_escalation_count` records this transition. After the fifth replacement
-fails, the supervisor leaves the exporter stopped with `recovery_exhausted=true`.
-Analytics remains unavailable until inspection, while control API and relay traffic continue.
+fails, the supervisor marks the exporter `recovery_exhausted=true`, leaves the
+control API and relay running, and schedules one fenced retry after five minutes.
+Each failed recovery round doubles that delay up to one hour; a successful batch
+resets it to five minutes and clears the exhaustion state. Readiness and
+`drover doctor` expose the UTC `recovery_next_retry_at`. The state-change warning
+is emitted once when retry is scheduled and once when exports resume, not on
+each freshness tick. The next retry still waits for the prior owner to unwind;
+the supervisor never overlaps fence owners.
 
 Exporter catalog checks, serving checkpoints and task projection children use
 a separate file-backed admission lane from cockpit/analytics reads. Each lane
@@ -216,10 +224,11 @@ attachment, receipt validation, merge, daily rollup, append and commit.
 For lagging work, wait briefly and run doctor again. For stalled or stopped
 work, check exporter error codes and control/catalog connectivity, runtime pins,
 provisioning and disk capacity. Correct the underlying error first. Once the
-replacement budget is exhausted, the managed hub restarts automatically. Confirm running
-status, decreasing outstanding age and batch count, and a new successful export
-time after synthetic ingestion. Verify that synthetic content is returned by
-recall and search before declaring recovery complete.
+replacement budget is exhausted, inspect the scheduled retry time and underlying
+failure while the API remains live. Confirm running status, decreasing outstanding
+age and batch count, and a new successful export time after synthetic ingestion.
+Verify that synthetic content is returned by recall and search before declaring
+recovery complete.
 
 ## Upgrade maintenance
 

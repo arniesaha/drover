@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 from drover.server.runtime_observability import activity
 
@@ -23,6 +24,8 @@ log = logging.getLogger(__name__)
 CHECKPOINT_EVERY_EXPORTS = 50
 MAX_RESTARTS = 5
 RESTART_BACKOFF_SECONDS = 1
+RECOVERY_RETRY_INITIAL_SECONDS = 5 * 60
+RECOVERY_RETRY_MAX_SECONDS = 60 * 60
 FRESHNESS_POLL_SECONDS = 10
 CANCELLATION_GRACE_SECONDS = 35
 
@@ -78,6 +81,11 @@ class ExporterLifecycle:
         self._attempt_started_at = None
         self._recovery_exhausted = False
         self._recovery_escalations = 0
+        self._recovery_retry_count = 0
+        self._recovery_retry_delay_seconds = RECOVERY_RETRY_INITIAL_SECONDS
+        self._recovery_retry_next_delay_seconds = RECOVERY_RETRY_INITIAL_SECONDS
+        self._next_recovery_retry_at = None
+        self._next_recovery_retry_monotonic = None
         self._batch_deadline = (
             getattr(config.analytics, "exporter_recovery_deadline_seconds", 120)
             if hasattr(config, "analytics")
@@ -132,7 +140,7 @@ class ExporterLifecycle:
             else:
                 self._cancel_requested_at = now
         if cancellation_stuck:
-            self._stop_after_recovery_failure()
+            self._schedule_recovery_retry()
             return
         log.warning("DuckLake batch recovery deadline exceeded; cancelling owner")
         # Older libpq cancellation can block despite the supplied timeout.
@@ -155,12 +163,7 @@ class ExporterLifecycle:
     def _watch_freshness(self, shutdown):
         while not self._stop.is_set() and not shutdown.is_set():
             self._watch_attempt(shutdown)
-            if self._recovery_exhausted:
-                return
             self._watch_batch()
-            if self._cancellation_stuck:
-                self._stop_after_recovery_failure()
-                return
             try:
                 self._snapshot = read_freshness(self.config.duckdb_path)
             except Exception:
@@ -190,20 +193,26 @@ class ExporterLifecycle:
             if expired:
                 self._error = "lake_export_recovery_deadline"
         if expired:
-            log.error(
-                "DuckLake recovery attempt exceeded deadline before ownership; "
-                "stopping exporter while leaving API and relay available"
-            )
-            self._stop_after_recovery_failure()
+            self._schedule_recovery_retry()
 
     def _supervise(self, shutdown):
         while not self._stop.is_set() and not shutdown.is_set():
             self._run(shutdown)
             if not self._started or self._stop.is_set() or shutdown.is_set():
                 return
+            if self._recovery_exhausted:
+                with self._owner_lock:
+                    retry_due = self._next_recovery_retry_monotonic is None
+                if retry_due:
+                    self._schedule_recovery_retry(reschedule=True)
+                if self._wait_for_recovery_retry(shutdown):
+                    return
+                continue
             if self._restarts >= MAX_RESTARTS:
-                self._stop_after_recovery_failure()
-                return
+                self._schedule_recovery_retry()
+                if self._wait_for_recovery_retry(shutdown):
+                    return
+                continue
             self._recovering = True
             self._restarts += 1
             # Ownership has exited before a replacement acquires a new fence.
@@ -213,20 +222,69 @@ class ExporterLifecycle:
                 return
             self._recovering = False
 
-    def _stop_after_recovery_failure(self):
-        """Fail the disposable analytics exporter without stopping the hub."""
+    def _schedule_recovery_retry(self, *, reschedule=False):
+        """Degrade analytics and schedule one capped retry without stopping the hub."""
         with self._owner_lock:
-            if self._recovery_exhausted:
-                return
+            if self._recovery_exhausted and not reschedule:
+                return False
+            previously_exhausted = self._recovery_exhausted
+            delay = self._recovery_retry_next_delay_seconds
             self._recovery_exhausted = True
+            self._recovering = True
             self._recovery_escalations += 1
-        self._stop.set()
-        log.error(
-            "DuckLake recovery exhausted: error=%s restarts=%s; "
-            "exporter stopped; API and relay remain available",
-            self._error,
-            self._restarts,
-        )
+            self._recovery_retry_count += 1
+            self._recovery_retry_delay_seconds = delay
+            self._recovery_retry_next_delay_seconds = min(
+                RECOVERY_RETRY_MAX_SECONDS, delay * 2
+            )
+            self._next_recovery_retry_monotonic = time.monotonic() + delay
+            self._next_recovery_retry_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=delay)
+            ).isoformat()
+        if previously_exhausted:
+            log.warning(
+                "DuckLake recovery retry failed: error=%s; "
+                "next analytics retry scheduled in %ss; API and relay remain available",
+                self._error,
+                delay,
+            )
+        else:
+            log.warning(
+                "DuckLake recovery exhausted: error=%s restarts=%s; "
+                "analytics retry scheduled in %ss; API and relay remain available",
+                self._error,
+                self._restarts,
+                delay,
+            )
+        return True
+
+    def _wait_for_recovery_retry(self, shutdown):
+        with self._owner_lock:
+            due = self._next_recovery_retry_monotonic
+        delay = max(0.0, due - time.monotonic()) if due is not None else 0.0
+        if self._stop.wait(delay) or shutdown.is_set():
+            return True
+        with self._owner_lock:
+            self._restarts = 0
+            self._next_recovery_retry_at = None
+            self._next_recovery_retry_monotonic = None
+        return False
+
+    def _record_recovery_success(self):
+        with self._owner_lock:
+            if not self._recovery_exhausted:
+                return
+            self._recovery_exhausted = False
+            self._recovering = False
+            self._restarts = 0
+            self._cancellation_stuck = False
+            self._error = None
+            self._recovery_retry_count = 0
+            self._recovery_retry_delay_seconds = RECOVERY_RETRY_INITIAL_SECONDS
+            self._recovery_retry_next_delay_seconds = RECOVERY_RETRY_INITIAL_SECONDS
+            self._next_recovery_retry_at = None
+            self._next_recovery_retry_monotonic = None
+        log.warning("DuckLake exporter recovery succeeded; normal exports resumed")
 
     def _run(self, shutdown):
         with self._owner_lock:
@@ -292,6 +350,7 @@ class ExporterLifecycle:
                                 self.config.duckdb_path,
                                 lake_fence=getattr(exporter, "fence", None),
                             )
+                    self._record_recovery_success()
                     if result and result.get("acknowledged"):
                         self._exports_since_checkpoint += 1
                         if self._exports_since_checkpoint >= CHECKPOINT_EVERY_EXPORTS:
@@ -403,18 +462,21 @@ class ExporterLifecycle:
         health["recovery_attempt_age_seconds"] = attempt_age
         health["recovery_escalation_count"] = self._recovery_escalations
         health["recovery_exhausted"] = self._recovery_exhausted
+        health["recovery_retry_count"] = self._recovery_retry_count
+        health["recovery_retry_delay_seconds"] = self._recovery_retry_delay_seconds
+        health["recovery_next_retry_at"] = self._next_recovery_retry_at
         # Keep the former service-manager fields while callers migrate to
         # recovery_exhausted. Exporter recovery no longer restarts the hub.
         health["restart_requested"] = False
         health["recovery_crash_loop_guarded"] = False
         health["recovery_restart_requests_last_hour"] = 0
-        health["recovery_next_restart_at"] = None
+        health["recovery_next_restart_at"] = self._next_recovery_retry_at
         if self._recovery_exhausted:
             health["recovery_action"] = (
-                "Exporter stopped after recovery exhaustion; analytics is unavailable "
-                "until inspection. API and relay remain available."
+                "Analytics retry scheduled after recovery exhaustion; API and relay "
+                "remain available."
             )
-        if health["recovery_pending"]:
+        elif health["recovery_pending"]:
             health["recovery_action"] = (
                 "Supervised restart scheduled; check exporter logs and connectivity."
             )

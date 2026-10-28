@@ -39,6 +39,15 @@ def test_verdict_and_doctor(running, age, state):
     assert health["recovery_action"] in text
 
 
+def test_doctor_reports_scheduled_recovery_retry():
+    health = freshness_status({}, running=False)
+    health["recovery_next_retry_at"] = "2026-10-28T20:00:00+00:00"
+
+    assert "next recovery retry: 2026-10-28T20:00:00+00:00" in format_exporter_health(
+        health
+    )
+
+
 def test_pending_rows_are_not_silently_fresh():
     now = datetime.now(timezone.utc)
     health = freshness_status(
@@ -66,7 +75,7 @@ def test_control_freshness_idle_and_unacked(pg_control_path):
     assert health["state"] == "stalled"
 
 
-def test_supervisor_cap_and_backoff(monkeypatch):
+def test_exhausted_exporter_retries_on_backoff_and_resets_on_success(monkeypatch):
     worker = lifecycle.ExporterLifecycle(SimpleNamespace())
     worker._started = True
     waits = []
@@ -86,22 +95,30 @@ def test_supervisor_cap_and_backoff(monkeypatch):
 
     worker._stop = Stop()
     attempts = []
-
-    def die(shutdown):
-        attempts.append(1)
-        worker._running = False
-        worker._error = "lake_export_deadline"
-
-    monkeypatch.setattr(worker, "_run", die)
     shutdown = threading.Event()
+
+    monkeypatch.setattr(lifecycle, "MAX_RESTARTS", 0)
+    monkeypatch.setattr(lifecycle, "RECOVERY_RETRY_INITIAL_SECONDS", 300)
+    monkeypatch.setattr(lifecycle, "RECOVERY_RETRY_MAX_SECONDS", 3600)
+
+    def export_once(_shutdown):
+        attempts.append(1)
+        if len(attempts) < 3:
+            worker._running = False
+            worker._error = "lake_export_deadline"
+            return
+        worker._running = True
+        worker._record_recovery_success()
+        shutdown.set()
+
+    monkeypatch.setattr(worker, "_run", export_once)
     worker._supervise(shutdown)
-    assert len(attempts) == 6
-    assert waits == [1, 2, 4, 8, 16]
-    assert worker.health()["state"] == "stopped"
-    assert worker.health()["restart_count"] == 5
-    assert not shutdown.is_set()
-    assert worker.health()["recovery_exhausted"] is True
-    assert "API and relay remain available" in worker.health()["recovery_action"]
+    assert len(attempts) == 3
+    assert waits == [pytest.approx(300), pytest.approx(600)]
+    health = worker.health()
+    assert health["recovery_exhausted"] is False
+    assert health["recovery_next_retry_at"] is None
+    assert health["recovery_retry_delay_seconds"] == 300
 
 
 def test_exhausted_recovery_does_not_request_a_postgres_server_restart(
@@ -114,7 +131,7 @@ def test_exhausted_recovery_does_not_request_a_postgres_server_restart(
     worker._error = "lake_export_deadline"
     worker._restarts = lifecycle.MAX_RESTARTS
 
-    worker._stop_after_recovery_failure()
+    worker._schedule_recovery_retry()
 
     with control_plane_connection(pg_control_path) as control:
         assert (
@@ -126,10 +143,11 @@ def test_exhausted_recovery_does_not_request_a_postgres_server_restart(
     health = worker.health()
     assert health["recovery_exhausted"] is True
     assert health["state"] == "stopped"
+    assert health["recovery_next_retry_at"] is not None
     assert health["restart_requested"] is False
     assert health["recovery_crash_loop_guarded"] is False
     assert health["recovery_restart_requests_last_hour"] == 0
-    assert health["recovery_next_restart_at"] is None
+    assert health["recovery_next_restart_at"] is not None
     assert "API and relay remain available" in health["recovery_action"]
 
 
@@ -147,12 +165,24 @@ def test_exhausted_exporter_keeps_postgres_backed_readyz_listener_available(
 
     monkeypatch.setattr(ReadinessProbe, "check", lambda self: Ready())
     monkeypatch.setattr(lifecycle, "MAX_RESTARTS", 0)
+    monkeypatch.setattr(lifecycle, "RECOVERY_RETRY_INITIAL_SECONDS", 0)
     worker = lifecycle.ExporterLifecycle(SimpleNamespace(duckdb_path=pg_control_path))
     worker._started = True
+
+    class RetryWait:
+        def is_set(self):
+            return False
+
+        def set(self):
+            pass
+
+        def wait(self, _delay):
+            return True
 
     def export_fails(_shutdown):
         worker._error = "lake_export_deadline"
 
+    worker._stop = RetryWait()
     monkeypatch.setattr(worker, "_run", export_fails)
     collector = MetricsCollector(
         duckdb_path=pg_control_path,
@@ -321,7 +351,7 @@ def test_repeated_live_hangs_stop_only_the_exporter(monkeypatch, tmp_path):
     try:
         worker.start(shutdown_event=threading.Event())
         worker._thread.join(2)
-        assert not worker._thread.is_alive()
+        assert worker._thread.is_alive()
         assert len(starts) == len(exits) == 3
         assert starts[1] - exits[0] >= 0.02
         assert starts[2] - exits[1] >= 0.04
@@ -331,6 +361,7 @@ def test_repeated_live_hangs_stop_only_the_exporter(monkeypatch, tmp_path):
         assert health["last_error"] == "lake_export_recovery_deadline"
     finally:
         worker.stop()
+        worker._thread.join(2)
 
 
 def test_recovery_attempt_stuck_before_owner_stops_only_the_exporter(
@@ -376,12 +407,15 @@ def test_recovery_attempt_stuck_before_owner_stops_only_the_exporter(
         supervisor.start()
         assert entered.wait(1)
         monitor.start()
-        assert worker._stop.wait(1), worker.health()
+        deadline = time.monotonic() + 1
+        while not worker.health()["recovery_exhausted"] and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert not shutdown.is_set()
         assert worker.health()["last_error"] == "lake_export_recovery_deadline"
         assert worker.health()["recovery_escalation_count"] == 1
     finally:
         release.set()
+        worker.stop()
         supervisor.join(2)
         monitor.join(2)
 
@@ -414,9 +448,10 @@ def test_unresponsive_cancellation_stops_without_replacement(monkeypatch):
     worker._watch_batch()
     monkeypatch.setattr(lifecycle.time, "monotonic", lambda: 46)
     worker._watch_batch()
-    assert worker._stop.is_set()
+    assert not worker._stop.is_set()
     assert worker.health()["state"] == "stopped"
     assert worker.health()["last_error"] == "lake_export_cancellation_stuck"
+    assert worker.health()["recovery_exhausted"] is True
     assert worker.health()["restart_count"] == 0
 
 
@@ -608,17 +643,13 @@ def test_restart_uses_fresh_owner_and_exporter_read_lane(monkeypatch, tmp_path):
     assert worker._restarts == 1
 
 
-def test_stuck_cancellation_stops_only_the_exporter(monkeypatch):
+def test_stuck_cancellation_schedules_only_the_exporter_retry():
     shutdown = threading.Event()
     worker = lifecycle.ExporterLifecycle(SimpleNamespace())
 
-    def stuck():
-        worker._cancellation_stuck = True
-        worker._error = "lake_export_cancellation_stuck"
-        worker._stop.set()
-
-    monkeypatch.setattr(worker, "_watch_batch", stuck)
-    worker._watch_freshness(shutdown)
+    worker._cancellation_stuck = True
+    worker._error = "lake_export_cancellation_stuck"
+    worker._schedule_recovery_retry()
     assert not shutdown.is_set()
     assert worker.health()["recovery_exhausted"] is True
     assert worker._owner is None
