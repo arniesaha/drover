@@ -142,39 +142,88 @@ def test_runtime_selection_detects_harnessd_repoint(tmp_path: Path):
     assert ROLLOUT.runtime_points_to(runtime / "current", runtime / "target") is False
 
 
-def test_bootstrap_last_good_refuses_missing_running_required_env(tmp_path: Path):
+def _write_live_plist(path: Path, label: str, marker: str) -> None:
+    environment = {"HOME": "/Users/studio", "PATH": "/usr/bin:/bin"}
+    if label == "com.drover.server":
+        environment.update(
+            {
+                "DROVER_LAKE_DSN": f"postgresql://lake-{marker}",
+                "DROVER_WORK_COORDINATOR_CONTINUITY_SECRET": f"secret-{marker}",
+            }
+        )
+        arguments = ["/runtime/current/bin/drover-server", "run"]
+    else:
+        arguments = [
+            "/runtime/current/bin/drover-harnessd",
+            "--host-id",
+            marker,
+            "--central-url",
+            "https://studio.ts.net",
+            "--relay",
+        ]
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": label,
+                "EnvironmentVariables": environment,
+                "ProgramArguments": arguments,
+            }
+        )
+    )
+
+
+def _required_by_label() -> dict[str, set[str]]:
+    return {
+        "com.drover.server": {
+            "DROVER_LAKE_DSN",
+            "DROVER_WORK_COORDINATOR_CONTINUITY_SECRET",
+        },
+        "com.drover.harnessd": set(),
+    }
+
+
+def test_bootstrap_last_good_accepts_server_env_and_minimal_harnessd(tmp_path: Path):
     plists = tmp_path / "plists"
     plists.mkdir()
     for label in ROLLOUT.LABELS:
-        (plists / f"{label}.plist").write_bytes(
-            __import__("plistlib").dumps(
-                {
-                    "Label": label,
-                    "EnvironmentVariables": {"PATH": "/usr/bin"},
-                    "ProgramArguments": ["server"],
-                }
-            )
-        )
+        _write_live_plist(plists / f"{label}.plist", label, "current")
+
+    running = {
+        label: ROLLOUT.load_plist(plists / f"{label}.plist").environment
+        for label in ROLLOUT.LABELS
+    }
+    snapshot = ROLLOUT.bootstrap_last_good(
+        plists, tmp_path / "rollout", _required_by_label(), running
+    )
+
+    assert snapshot is not None
+    assert (snapshot / "com.drover.harnessd.plist").is_file()
+
+
+def test_bootstrap_last_good_refuses_server_missing_required_dsn(tmp_path: Path):
+    plists = tmp_path / "plists"
+    plists.mkdir()
+    for label in ROLLOUT.LABELS:
+        _write_live_plist(plists / f"{label}.plist", label, "current")
+    server = plists / "com.drover.server.plist"
+    payload = plistlib.loads(server.read_bytes())
+    del payload["EnvironmentVariables"]["DROVER_LAKE_DSN"]
+    server.write_bytes(plistlib.dumps(payload))
 
     with pytest.raises(ROLLOUT.RolloutError, match="required_environment_missing"):
         ROLLOUT.bootstrap_last_good(
             plists,
             tmp_path / "rollout",
-            {"DROVER_LAKE_DSN"},
-            {label: {"PATH": "/usr/bin"} for label in ROLLOUT.LABELS},
+            _required_by_label(),
+            {
+                label: ROLLOUT.load_plist(plists / f"{label}.plist").environment
+                for label in ROLLOUT.LABELS
+            },
         )
 
 
 def _write_plist(path: Path, label: str, marker: str) -> None:
-    path.write_bytes(
-        plistlib.dumps(
-            {
-                "Label": label,
-                "EnvironmentVariables": {"PATH": "/usr/bin", "MARKER": marker},
-                "ProgramArguments": ["/bin/sh", "--marker", marker],
-            }
-        )
-    )
+    _write_live_plist(path, label, marker)
 
 
 def _main_fixture(tmp_path: Path, monkeypatch, *, changed: bool = True):
@@ -218,7 +267,11 @@ def _main_fixture(tmp_path: Path, monkeypatch, *, changed: bool = True):
         return ""
 
     monkeypatch.setattr(ROLLOUT, "_run", fake_run)
-    monkeypatch.setattr(ROLLOUT, "required_environment", lambda _: set())
+    monkeypatch.setattr(
+        ROLLOUT,
+        "required_environment",
+        lambda _config, label: _required_by_label()[label],
+    )
     monkeypatch.setattr(ROLLOUT, "runtime_preflight", lambda *_: {})
     monkeypatch.setattr(ROLLOUT, "rollout_token", lambda *_args, **_kwargs: "token")
     monkeypatch.setattr(
@@ -308,8 +361,10 @@ def test_main_preserves_backup_when_rollback_raises(tmp_path, monkeypatch, capsy
     assert report["rollback"]["restored"] == "incomplete"
     assert preserved.parent == runtime.parent / "rollout" / "failed"
     assert (
-        ROLLOUT.load_plist(preserved / "com.drover.server.plist").environment["MARKER"]
-        == "old"
+        ROLLOUT.load_plist(preserved / "com.drover.server.plist").environment[
+            "DROVER_LAKE_DSN"
+        ]
+        == "postgresql://lake-old"
     )
 
 

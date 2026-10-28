@@ -149,8 +149,18 @@ def environment_diff(required: set[str], *environments: Mapping[str, str]) -> di
     return {"variables": rows, "missing_required": missing}
 
 
-def required_environment(config_path: Path) -> set[str]:
-    """Read only names, never values, from config using the checked-out code."""
+def required_environment(config_path: Path, label: str) -> set[str]:
+    """Return the required environment for one launchd service.
+
+    The hub loads control, continuity, and lake configuration from its
+    environment.  harnessd's relay CLI gets its optional credential from an
+    argument, ``DROVER_API_TOKEN``, or ``~/.drover/api_token``; it has no
+    required launchd environment variables.
+    """
+    if label == "com.drover.harnessd":
+        return set()
+    if label != "com.drover.server":
+        raise ValueError(f"unknown_launchd_label:{label}")
     from drover.config import load_config
 
     cfg = load_config(config_path)
@@ -258,7 +268,7 @@ def runtime_points_to(current: Path, target: Path) -> bool:
 def bootstrap_last_good(
     plists: Path,
     rollout_root: Path,
-    required: set[str],
+    required: Mapping[str, set[str]],
     running_environments: Mapping[str, Mapping[str, str]],
     *,
     last_good_name: str = "last-good",
@@ -268,7 +278,7 @@ def bootstrap_last_good(
     for label in LABELS:
         current = load_plist(plists / f"{label}.plist")
         diff = environment_diff(
-            required, current.environment, running_environments[label]
+            required.get(label, set()), current.environment, running_environments[label]
         )
         if diff["missing_required"]:
             raise RolloutError(f"required_environment_missing:{label}")
@@ -634,7 +644,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not config_path.is_file():
                 raise RolloutError("service_config_missing")
-            required = required_environment(config_path)
+            required = {
+                label: required_environment(config_path, label) for label in LABELS
+            }
             running = {
                 label: launchctl_environment(
                     _run(
@@ -696,7 +708,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not config_path.is_file():
             raise RolloutError("service_config_missing")
-        required = required_environment(config_path)
+        required = {label: required_environment(config_path, label) for label in LABELS}
         for label in LABELS:
             running = _run(
                 ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
@@ -704,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
                 actions=[],
             )
             report["checks"][f"{label}:environment"] = environment_diff(
-                required,
+                required[label],
                 candidate[label].environment,
                 last_good[label].environment,
                 launchctl_environment(running),
