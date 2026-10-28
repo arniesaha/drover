@@ -17,11 +17,12 @@ from pathlib import Path
 
 import pytest
 
+from drover.schema import bootstrap
 from drover.server.harness.continuity import FactoryObserverContinuity
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.metrics import MetricsCollector
-from drover.schema import bootstrap
 from drover.server.work_queue.config import WorkQueueConfig
+from drover.server.work_queue.provider import ItemRef
 from drover.server.work_queue.reconciler import QueueExecutionWorker
 from drover.server.work_queue.runtime import HarnessBridge
 from drover.server.work_queue.service import (
@@ -31,7 +32,6 @@ from drover.server.work_queue.service import (
     identity,
 )
 from drover.server.work_queue.store import WorkStore
-from drover.server.work_queue.provider import ItemRef
 
 SNAPSHOT = Path(
     os.environ.get(
