@@ -4,8 +4,6 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 
 from drover.server.runtime_observability import activity
 
@@ -24,67 +22,12 @@ log = logging.getLogger(__name__)
 # one maintenance-lane child, so this costs ~1.5 s per 50 exports.
 CHECKPOINT_EVERY_EXPORTS = 50
 MAX_RESTARTS = 5
-MAX_SERVER_RESTART_REQUESTS_PER_HOUR = 3
-SERVER_RESTART_EXIT_CODE = 75
 RESTART_BACKOFF_SECONDS = 1
 FRESHNESS_POLL_SECONDS = 10
 CANCELLATION_GRACE_SECONDS = 35
 
 # SQLSTATEs for a missing schema (3F000) or function (42883).
 _MISSING_GUARD_SQLSTATES = {"3F000", "42883"}
-
-
-@dataclass(frozen=True)
-class RestartBudget:
-    allowed: bool
-    requests_last_hour: int
-    next_restart_at: str | None = None
-
-
-def record_server_restart_request(path) -> RestartBudget:
-    """Durably reserve one launchd restart without creating a crash loop."""
-    from drover.server.db import control_plane_connection
-
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=1)
-    try:
-        with control_plane_connection(path, timeout=2) as control:
-            control.execute("BEGIN")
-            try:
-                control.execute("SET LOCAL statement_timeout = '2s'")
-                control.execute(
-                    "LOCK TABLE lake_export_restart_requests IN EXCLUSIVE MODE"
-                )
-                control.execute(
-                    "DELETE FROM lake_export_restart_requests WHERE requested_at < ?",
-                    [cutoff],
-                )
-                count = int(
-                    control.execute(
-                        "SELECT count(*) FROM lake_export_restart_requests"
-                    ).fetchone()[0]
-                )
-                if count >= MAX_SERVER_RESTART_REQUESTS_PER_HOUR:
-                    first = control.execute(
-                        "SELECT min(requested_at) FROM lake_export_restart_requests"
-                    ).fetchone()[0]
-                    control.execute("COMMIT")
-                    return RestartBudget(
-                        allowed=False,
-                        requests_last_hour=count,
-                        next_restart_at=(first + timedelta(hours=1)).isoformat(),
-                    )
-                control.execute(
-                    "INSERT INTO lake_export_restart_requests (requested_at) VALUES (?)",
-                    [now],
-                )
-                control.execute("COMMIT")
-                return RestartBudget(allowed=True, requests_last_hour=count + 1)
-            except BaseException:
-                control.execute("ROLLBACK")
-                raise
-    except Exception as exc:
-        raise LakeError("lake_export_restart_guard_unavailable") from exc
 
 
 def _guard_missing(exc: BaseException) -> bool:
@@ -133,11 +76,8 @@ class ExporterLifecycle:
         self._cancel_requested_at = None
         self._cancellation_stuck = False
         self._attempt_started_at = None
-        self._restart_requested = False
+        self._recovery_exhausted = False
         self._recovery_escalations = 0
-        self._crash_loop_guarded = False
-        self._restart_requests_last_hour = 0
-        self._next_restart_at = None
         self._batch_deadline = (
             getattr(config.analytics, "exporter_recovery_deadline_seconds", 120)
             if hasattr(config, "analytics")
@@ -170,6 +110,7 @@ class ExporterLifecycle:
 
     def _watch_batch(self):
         now = time.monotonic()
+        cancellation_stuck = False
         with self._owner_lock:
             owner = self._owner
             started = self._batch_started_at
@@ -178,14 +119,21 @@ class ExporterLifecycle:
             if self._cancel_requested_at is not None:
                 if now - self._cancel_requested_at >= CANCELLATION_GRACE_SECONDS:
                     # Python threads cannot be force-killed safely. Request a
-                    # process restart; never overlap fence owners.
+                    # exporter shutdown; never overlap fence owners.
                     self._cancellation_stuck = True
                     self._error = "lake_export_cancellation_stuck"
-                    self._stop.set()
+                    cancellation_stuck = True
+                else:
+                    return
+            if cancellation_stuck:
+                owner = None
+            elif started is None or now - started < self._batch_deadline:
                 return
-            if started is None or now - started < self._batch_deadline:
-                return
-            self._cancel_requested_at = now
+            else:
+                self._cancel_requested_at = now
+        if cancellation_stuck:
+            self._stop_after_recovery_failure()
+            return
         log.warning("DuckLake batch recovery deadline exceeded; cancelling owner")
         # Older libpq cancellation can block despite the supplied timeout.
         # Keep the watchdog responsive while the captured owner pins its borrow
@@ -207,11 +155,11 @@ class ExporterLifecycle:
     def _watch_freshness(self, shutdown):
         while not self._stop.is_set() and not shutdown.is_set():
             self._watch_attempt(shutdown)
-            if self._restart_requested:
+            if self._recovery_exhausted:
                 return
             self._watch_batch()
             if self._cancellation_stuck:
-                self._request_restart(shutdown)
+                self._stop_after_recovery_failure()
                 return
             try:
                 self._snapshot = read_freshness(self.config.duckdb_path)
@@ -241,13 +189,12 @@ class ExporterLifecycle:
             )
             if expired:
                 self._error = "lake_export_recovery_deadline"
-                self._stop.set()
         if expired:
             log.error(
                 "DuckLake recovery attempt exceeded deadline before ownership; "
-                "requesting server restart"
+                "stopping exporter while leaving API and relay available"
             )
-            self._request_restart(shutdown)
+            self._stop_after_recovery_failure()
 
     def _supervise(self, shutdown):
         while not self._stop.is_set() and not shutdown.is_set():
@@ -255,7 +202,7 @@ class ExporterLifecycle:
             if not self._started or self._stop.is_set() or shutdown.is_set():
                 return
             if self._restarts >= MAX_RESTARTS:
-                self._request_restart(shutdown)
+                self._stop_after_recovery_failure()
                 return
             self._recovering = True
             self._restarts += 1
@@ -266,38 +213,20 @@ class ExporterLifecycle:
                 return
             self._recovering = False
 
-    def _request_restart(self, shutdown):
-        path = getattr(self.config, "duckdb_path", None)
-        try:
-            budget = (
-                record_server_restart_request(path)
-                if path is not None
-                else RestartBudget(allowed=True, requests_last_hour=1)
-            )
-        except LakeError:
-            budget = RestartBudget(allowed=False, requests_last_hour=0)
-            self._error = "lake_export_restart_guard_unavailable"
+    def _stop_after_recovery_failure(self):
+        """Fail the disposable analytics exporter without stopping the hub."""
         with self._owner_lock:
-            if self._restart_requested:
+            if self._recovery_exhausted:
                 return
-            self._restart_requests_last_hour = budget.requests_last_hour
-            self._next_restart_at = budget.next_restart_at
-            if not budget.allowed:
-                self._crash_loop_guarded = True
-                return
-            self._restart_requested = True
+            self._recovery_exhausted = True
             self._recovery_escalations += 1
+        self._stop.set()
         log.error(
             "DuckLake recovery exhausted: error=%s restarts=%s; "
-            "requesting server shutdown for service-manager restart",
+            "exporter stopped; API and relay remain available",
             self._error,
             self._restarts,
         )
-        shutdown.set()
-
-    def server_exit_code(self) -> int | None:
-        """The foreground server translates an allowed escalation to failure."""
-        return SERVER_RESTART_EXIT_CODE if self._restart_requested else None
 
     def _run(self, shutdown):
         with self._owner_lock:
@@ -443,9 +372,9 @@ class ExporterLifecycle:
     def stop(self):
         self._stop.set()
         if self._thread is not None:
-            if self._restart_requested and self._thread.is_alive():
-                # The supervisor is a daemon; server shutdown must not wait
-                # behind the very wedged call that requested launchd recovery.
+            if self._recovery_exhausted and self._thread.is_alive():
+                # A wedged exporter is a daemon. A later administrative hub
+                # shutdown must not block behind it.
                 return
             self._thread.join(35)
             if self._thread.is_alive():
@@ -473,18 +402,17 @@ class ExporterLifecycle:
             )
         health["recovery_attempt_age_seconds"] = attempt_age
         health["recovery_escalation_count"] = self._recovery_escalations
-        health["restart_requested"] = self._restart_requested
-        health["recovery_crash_loop_guarded"] = self._crash_loop_guarded
-        health["recovery_restart_requests_last_hour"] = self._restart_requests_last_hour
-        health["recovery_next_restart_at"] = self._next_restart_at
-        if self._crash_loop_guarded:
+        health["recovery_exhausted"] = self._recovery_exhausted
+        # Keep the former service-manager fields while callers migrate to
+        # recovery_exhausted. Exporter recovery no longer restarts the hub.
+        health["restart_requested"] = False
+        health["recovery_crash_loop_guarded"] = False
+        health["recovery_restart_requests_last_hour"] = 0
+        health["recovery_next_restart_at"] = None
+        if self._recovery_exhausted:
             health["recovery_action"] = (
-                "Crash-loop guard active; exporter remains stopped until the "
-                "rolling restart budget resets."
-            )
-        if self._restart_requested:
-            health["recovery_action"] = (
-                "Server restart requested; the service manager will replace the exporter."
+                "Exporter stopped after recovery exhaustion; analytics is unavailable "
+                "until inspection. API and relay remain available."
             )
         if health["recovery_pending"]:
             health["recovery_action"] = (

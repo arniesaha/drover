@@ -150,7 +150,7 @@ For DuckLake hubs, `/readyz` includes `exporter`: `state`, `running`,
 `unacknowledged_batches`, `oldest_unacknowledged_age_seconds`,
 `oldest_outstanding_age_seconds`, `last_error`, `restart_count`,
 `recovery_attempt_age_seconds`, `recovery_escalation_count`,
-`restart_requested` and `recovery_action`. During backoff, `recovery_pending` is true and the action
+`recovery_exhausted` and `recovery_action`. During backoff, `recovery_pending` is true and the action
 reports the scheduled restart. The outstanding age also includes pending ingress that has
 not yet formed a batch. A running idle exporter is `ok` even if its last export
 was hours ago. Outstanding work is `lagging` at 30 seconds and `stalled` at
@@ -195,14 +195,13 @@ outbox rows or receipts to recover a backlog. Startup validation failures still
 fail closed. Shutdown interrupts backoff and prevents replacement. If an owner
 cannot unwind within the 35-second cancellation grace, the exporter reports
 `lake_export_cancellation_stuck` and stopped; no overlapping owner is started.
-The watchdog requests server shutdown to clear the unresponsive thread.
+The watchdog stops the exporter while leaving the API listener and relay running.
 If recovery blocks before it acquires an owner, the same attempt deadline
-requests server shutdown directly; this covers a stuck fence, exporter startup
+stops the exporter directly; this covers a stuck fence, exporter startup
 or serving proof that cannot be cooperatively cancelled. The health counter
 `recovery_escalation_count` records this transition. After the fifth replacement
-fails, the supervisor also requests server shutdown.
-The existing server cleanup runs and launchd's KeepAlive job restarts the process.
-An unmanaged foreground server exits and must be started by its operator.
+fails, the supervisor leaves the exporter stopped with `recovery_exhausted=true`.
+Analytics remains unavailable until inspection, while control API and relay traffic continue.
 
 Exporter catalog checks, serving checkpoints and task projection children use
 a separate file-backed admission lane from cockpit/analytics reads. Each lane

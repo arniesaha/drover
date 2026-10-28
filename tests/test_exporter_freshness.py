@@ -3,6 +3,7 @@
 import json
 import threading
 from datetime import datetime, timedelta, timezone
+from http.client import HTTPConnection
 from types import SimpleNamespace
 
 import pytest
@@ -71,8 +72,13 @@ def test_supervisor_cap_and_backoff(monkeypatch):
     waits = []
 
     class Stop:
+        stopped = False
+
         def is_set(self):
-            return False
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
 
         def wait(self, delay):
             waits.append(delay)
@@ -93,55 +99,83 @@ def test_supervisor_cap_and_backoff(monkeypatch):
     assert waits == [1, 2, 4, 8, 16]
     assert worker.health()["state"] == "stopped"
     assert worker.health()["restart_count"] == 5
-    assert shutdown.is_set()
+    assert not shutdown.is_set()
+    assert worker.health()["recovery_exhausted"] is True
+    assert "API and relay remain available" in worker.health()["recovery_action"]
 
 
-def test_exporter_restart_budget_is_durable_and_guards_the_fourth_exit(
+def test_exhausted_recovery_does_not_request_a_postgres_server_restart(
     pg_control_path,
 ):
-    """A replacement process cannot reset the service-manager crash budget."""
-    from drover.server.lake.lifecycle import record_server_restart_request
+    """Lake recovery must leave the control plane available for the API."""
+    from drover.server.db import control_plane_connection
 
-    attempts = [record_server_restart_request(pg_control_path) for _ in range(4)]
+    worker = lifecycle.ExporterLifecycle(SimpleNamespace(duckdb_path=pg_control_path))
+    worker._error = "lake_export_deadline"
+    worker._restarts = lifecycle.MAX_RESTARTS
 
-    assert [attempt.allowed for attempt in attempts] == [True, True, True, False]
-    assert [attempt.requests_last_hour for attempt in attempts] == [1, 2, 3, 3]
-    assert attempts[-1].next_restart_at is not None
+    worker._stop_after_recovery_failure()
 
-
-def test_exhausted_recovery_exits_nonzero_until_crash_loop_is_guarded(
-    monkeypatch, tmp_path
-):
-    from drover.server.lake import lifecycle
-
-    worker = lifecycle.ExporterLifecycle(SimpleNamespace(duckdb_path=tmp_path))
-    shutdown = threading.Event()
-    decisions = iter(
-        [
-            lifecycle.RestartBudget(allowed=True, requests_last_hour=1),
-            lifecycle.RestartBudget(
-                allowed=False,
-                requests_last_hour=3,
-                next_restart_at="2026-10-15T01:00:00+00:00",
-            ),
-        ]
-    )
-    monkeypatch.setattr(
-        lifecycle, "record_server_restart_request", lambda _: next(decisions)
-    )
-
-    worker._request_restart(shutdown)
-    assert shutdown.is_set()
-    assert worker.server_exit_code() == 75
-
-    shutdown.clear()
-    worker._restart_requested = False
-    worker._request_restart(shutdown)
+    with control_plane_connection(pg_control_path) as control:
+        assert (
+            control.execute(
+                "SELECT count(*) FROM lake_export_restart_requests"
+            ).fetchone()[0]
+            == 0
+        )
     health = worker.health()
-    assert not shutdown.is_set()
-    assert worker.server_exit_code() is None
-    assert health["recovery_crash_loop_guarded"] is True
-    assert health["recovery_restart_requests_last_hour"] == 3
+    assert health["recovery_exhausted"] is True
+    assert health["state"] == "stopped"
+    assert health["restart_requested"] is False
+    assert health["recovery_crash_loop_guarded"] is False
+    assert health["recovery_restart_requests_last_hour"] == 0
+    assert health["recovery_next_restart_at"] is None
+    assert "API and relay remain available" in health["recovery_action"]
+
+
+def test_exhausted_exporter_keeps_postgres_backed_readyz_listener_available(
+    monkeypatch, pg_control_path, tmp_path
+):
+    """A failed exporter cannot close the API listener that serves relays."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.readiness import ReadinessProbe
+    from drover.server.web.app import start_metrics_server
+
+    class Ready:
+        def as_response(self, **_kwargs):
+            return 200, json.dumps({"stores": []})
+
+    monkeypatch.setattr(ReadinessProbe, "check", lambda self: Ready())
+    monkeypatch.setattr(lifecycle, "MAX_RESTARTS", 0)
+    worker = lifecycle.ExporterLifecycle(SimpleNamespace(duckdb_path=pg_control_path))
+    worker._started = True
+
+    def export_fails(_shutdown):
+        worker._error = "lake_export_deadline"
+
+    monkeypatch.setattr(worker, "_run", export_fails)
+    collector = MetricsCollector(
+        duckdb_path=pg_control_path,
+        incoming_dir=tmp_path,
+        summarizer_report={},
+        exporter_health=worker.health,
+    )
+    server = start_metrics_server(host="127.0.0.1", port=0, collector=collector)
+    shutdown = threading.Event()
+    try:
+        worker._supervise(shutdown)
+        if shutdown.is_set():
+            server.shutdown()
+        host, port = server.server_address[:2]
+        connection = HTTPConnection(host, port, timeout=2)
+        connection.request("GET", "/readyz")
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["exporter"]["recovery_exhausted"] is True
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_readyz_exporter_status_is_separate(monkeypatch, tmp_path):
@@ -241,7 +275,7 @@ def test_exporter_recovery_deadline_rejects_invalid_config(deadline):
         AnalyticsConfig(exporter_recovery_deadline_seconds=deadline)
 
 
-def test_repeated_live_hangs_exhaust_shared_restart_budget(monkeypatch, tmp_path):
+def test_repeated_live_hangs_stop_only_the_exporter(monkeypatch, tmp_path):
     import time
 
     from drover.server.lake import task_projection
@@ -252,11 +286,6 @@ def test_repeated_live_hangs_exhaust_shared_restart_budget(monkeypatch, tmp_path
     monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: None)
     monkeypatch.setattr(lifecycle, "_check_export_catalog", lambda *a: None)
     monkeypatch.setattr(lifecycle, "read_freshness", lambda *a: {})
-    monkeypatch.setattr(
-        lifecycle,
-        "record_server_restart_request",
-        lambda _: lifecycle.RestartBudget(allowed=True, requests_last_hour=1),
-    )
     monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
     monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
     starts, exits = [], []
@@ -304,7 +333,7 @@ def test_repeated_live_hangs_exhaust_shared_restart_budget(monkeypatch, tmp_path
         worker.stop()
 
 
-def test_recovery_attempt_stuck_before_owner_requests_server_restart(
+def test_recovery_attempt_stuck_before_owner_stops_only_the_exporter(
     monkeypatch, tmp_path
 ):
     """A replacement that blocks before ownership cannot leave export stopped."""
@@ -316,11 +345,6 @@ def test_recovery_attempt_stuck_before_owner_requests_server_restart(
     monkeypatch.setattr(lifecycle, "lake_spec", lambda *a, **k: None)
     monkeypatch.setattr(lifecycle, "_check_export_catalog", lambda *a: None)
     monkeypatch.setattr(lifecycle, "read_freshness", lambda *a: {})
-    monkeypatch.setattr(
-        lifecycle,
-        "record_server_restart_request",
-        lambda _: lifecycle.RestartBudget(allowed=True, requests_last_hour=1),
-    )
     monkeypatch.setattr(lifecycle.ExporterLifecycle, "_checkpoint", lambda *a: None)
     monkeypatch.setattr(task_projection, "refresh_if_provisioned", lambda *a, **k: None)
     entered, release, shutdown = threading.Event(), threading.Event(), threading.Event()
@@ -352,7 +376,8 @@ def test_recovery_attempt_stuck_before_owner_requests_server_restart(
         supervisor.start()
         assert entered.wait(1)
         monitor.start()
-        assert shutdown.wait(1), worker.health()
+        assert worker._stop.wait(1), worker.health()
+        assert not shutdown.is_set()
         assert worker.health()["last_error"] == "lake_export_recovery_deadline"
         assert worker.health()["recovery_escalation_count"] == 1
     finally:
@@ -361,7 +386,7 @@ def test_recovery_attempt_stuck_before_owner_requests_server_restart(
         monitor.join(2)
 
 
-def test_restart_request_does_not_wait_for_wedged_supervisor():
+def test_exhausted_exporter_does_not_wait_for_wedged_supervisor():
     worker = lifecycle.ExporterLifecycle(SimpleNamespace())
 
     class WedgedSupervisor:
@@ -374,7 +399,7 @@ def test_restart_request_does_not_wait_for_wedged_supervisor():
             self.joined = True
 
     worker._thread = WedgedSupervisor()
-    worker._restart_requested = True
+    worker._recovery_exhausted = True
     worker.stop()
     assert not worker._thread.joined
 
@@ -583,7 +608,7 @@ def test_restart_uses_fresh_owner_and_exporter_read_lane(monkeypatch, tmp_path):
     assert worker._restarts == 1
 
 
-def test_stuck_cancellation_requests_server_shutdown(monkeypatch):
+def test_stuck_cancellation_stops_only_the_exporter(monkeypatch):
     shutdown = threading.Event()
     worker = lifecycle.ExporterLifecycle(SimpleNamespace())
 
@@ -594,5 +619,6 @@ def test_stuck_cancellation_requests_server_shutdown(monkeypatch):
 
     monkeypatch.setattr(worker, "_watch_batch", stuck)
     worker._watch_freshness(shutdown)
-    assert shutdown.is_set()
+    assert not shutdown.is_set()
+    assert worker.health()["recovery_exhausted"] is True
     assert worker._owner is None
