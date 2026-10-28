@@ -91,7 +91,17 @@ class QueueExecutionWorker:
 
     def report(self):
         report = self.reconciler.report()
-        report["execution"] = dict(self.coordinator.health)
+        execution = dict(self.coordinator.health)
+        # A rollout must wait for an already-accepted launch as well as for
+        # candidates still waiting in the reconciler.  This is intentionally
+        # derived from the same durable links that enforce the capacity cap.
+        try:
+            execution["active"] = len(
+                self.service.harness.active(self.service.store.links())
+            )
+        except Exception:  # unknown is unsafe for a rollout, not zero
+            execution["active"] = None
+        report["execution"] = execution
         return report
 
     def process_once(self):
