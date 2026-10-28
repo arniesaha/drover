@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.49] - 2026-10-28
+
+### Fixed
+
+- Keep the hub API available when lake export fails and resume exporter backoff safely (#879).
+- Harden Studio rollout environment, queue-settle, plist matching, and relay-liveness checks (#871, #873, #875, #877).
+
+### Added
+
+- Add Postgres-backed end-to-end launch coverage (#866).
+
+
 ## [0.6.48] - 2026-10-27
 
 ### Added
