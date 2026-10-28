@@ -49,35 +49,78 @@ def test_launchctl_environment_accepts_print_layout():
     """) == {"DROVER_LAKE_DSN": "postgresql://redacted", "PATH": "/usr/bin"}
 
 
-def test_load_plist_combines_static_and_non_executed_env_file(tmp_path: Path):
-    env = tmp_path / "server.env"
-    env.write_text('DROVER_LAKE_DSN="postgresql://lake"\nTOKEN="a\\$b"\n')
-    plist = tmp_path / "com.drover.server.plist"
-    import plistlib
-
-    plist.write_bytes(
+def _write_wrapped_server_plist(path: Path) -> Path:
+    env = path.parent / "server.env"
+    env.write_text(
+        'DROVER_LAKE_DSN="postgresql://lake"\n'
+        'DROVER_WORK_QUEUE_GITHUB_TOKEN="queue-token"\n'
+        'TOKEN="a\\$b"\n'
+    )
+    path.write_bytes(
         plistlib.dumps(
             {
                 "Label": "com.drover.server",
-                "EnvironmentVariables": {"PATH": "/usr/bin"},
+                "EnvironmentVariables": {
+                    "HOME": "/Users/studio",
+                    "PATH": "/usr/bin:/bin",
+                },
                 "ProgramArguments": [
                     "/bin/sh",
                     "-c",
                     'set -a; . "$1" || exit $?; shift; exec "$@"',
                     "drover-service-env",
                     str(env),
-                    "server",
+                    "/runtime/current/bin/drover-server",
+                    "--config",
+                    "/Users/studio/.drover/config.toml",
+                    "serve",
                 ],
             }
         )
     )
+    return env
+
+
+def test_load_plist_keeps_launchd_and_effective_environment_separate(tmp_path: Path):
+    plist = tmp_path / "com.drover.server.plist"
+    _write_wrapped_server_plist(plist)
 
     view = ROLLOUT.load_plist(plist)
+    assert view.launchd_environment == {
+        "HOME": "/Users/studio",
+        "PATH": "/usr/bin:/bin",
+    }
     assert view.environment == {
-        "PATH": "/usr/bin",
+        "HOME": "/Users/studio",
+        "PATH": "/usr/bin:/bin",
         "DROVER_LAKE_DSN": "postgresql://lake",
+        "DROVER_WORK_QUEUE_GITHUB_TOKEN": "queue-token",
         "TOKEN": "a$b",
     }
+
+
+def test_running_plist_matches_live_wrapper_uses_launchd_environment_only(
+    tmp_path: Path,
+):
+    plist = tmp_path / "com.drover.server.plist"
+    _write_wrapped_server_plist(plist)
+    view = ROLLOUT.load_plist(plist)
+    printed = "\n".join(
+        [
+            f"path = {plist.resolve()}",
+            "program = /bin/sh",
+            "  HOME => /Users/studio",
+            "  PATH => /usr/bin:/bin",
+        ]
+    )
+
+    assert ROLLOUT.running_plist_matches(view, printed) is True
+    assert (
+        ROLLOUT.running_plist_matches(
+            view, printed.replace("PATH => /usr/bin:/bin", "PATH => /unexpected")
+        )
+        is False
+    )
 
 
 def test_invalid_env_file_is_refused_without_shell_execution(tmp_path: Path):
@@ -393,6 +436,23 @@ def test_main_uses_kickstart_when_plists_are_unchanged(tmp_path, monkeypatch):
         f"gui/{ROLLOUT.os.getuid()}/com.drover.server",
     ] in calls
     assert not any(command[1:2] == ["bootout"] for command in calls)
+
+
+def test_dry_run_refuses_running_plist_mismatch(tmp_path, monkeypatch):
+    args, _runtime, _old, _target, _plists, calls = _main_fixture(tmp_path, monkeypatch)
+    args.append("--dry-run")
+    original_run = ROLLOUT._run
+
+    def mismatched_run(argv, *, dry_run, actions):
+        result = original_run(argv, dry_run=dry_run, actions=actions)
+        if argv[:2] == ["launchctl", "print"]:
+            return result.replace("PATH => /usr/bin:/bin", "PATH => /unexpected")
+        return result
+
+    monkeypatch.setattr(ROLLOUT, "_run", mismatched_run)
+
+    assert ROLLOUT.main(args) == 1
+    assert not any("planned-stop" in command for command in calls)
 
 
 def test_main_health_failure_rolls_back_and_clears_planned_stop(tmp_path, monkeypatch):

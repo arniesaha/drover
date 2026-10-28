@@ -39,6 +39,7 @@ class RolloutError(RuntimeError):
 class PlistView:
     label: str
     path: Path
+    launchd_environment: Mapping[str, str]
     environment: Mapping[str, str]
     arguments: tuple[str, ...]
 
@@ -97,11 +98,12 @@ def load_plist(path: Path) -> PlistView:
         raise RolloutError(f"plist_invalid:{path.name}") from exc
     if not isinstance(label, str) or not isinstance(raw_environment, dict):
         raise RolloutError(f"plist_invalid:{path.name}")
-    environment = {
+    launchd_environment = {
         str(name): str(value)
         for name, value in raw_environment.items()
         if isinstance(name, str) and isinstance(value, str)
     }
+    environment = dict(launchd_environment)
     if not isinstance(arguments, list):
         raise RolloutError(f"plist_invalid:{path.name}")
     source = _env_file(arguments)
@@ -109,7 +111,13 @@ def load_plist(path: Path) -> PlistView:
         environment.update(_read_env_file(source))
     if not all(isinstance(argument, str) for argument in arguments):
         raise RolloutError(f"plist_invalid:{path.name}")
-    return PlistView(label, path, environment, tuple(arguments))
+    return PlistView(
+        label,
+        path,
+        launchd_environment,
+        environment,
+        tuple(arguments),
+    )
 
 
 def config_from_arguments(view: PlistView, fallback: Path) -> Path:
@@ -540,8 +548,10 @@ def running_plist_matches(view: PlistView, launchctl_print: str) -> bool:
     """Compare the launchd facts that `launchctl print` exposes to a plist.
 
     launchctl does not retain the source plist as a byte-for-byte object, so
-    this deliberately compares its recorded path, executable and effective
-    environment.  It prevents overwriting a plist while launchd is actually
+    this deliberately compares its recorded path, executable, and launchd
+    environment.  Values supplied by the service's shell-sourced env file are
+    effective process environment, not launchd environment, and do not appear
+    in this output.  It prevents overwriting a plist while launchd is actually
     serving a different unit (the failure mode from the October incident).
     """
     path = re.search(r"(?m)^\s*path\s*=\s*(.*?)\s*$", launchctl_print)
@@ -558,7 +568,9 @@ def running_plist_matches(view: PlistView, launchctl_print: str) -> bool:
     ):
         return False
     running = launchctl_environment(launchctl_print)
-    return all(running.get(name) == value for name, value in view.environment.items())
+    return all(
+        running.get(name) == value for name, value in view.launchd_environment.items()
+    )
 
 
 def _stale_staging_link(runtime: Path) -> str | None:
@@ -825,6 +837,10 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=False,
                 actions=[],
             )
+            matches = running_plist_matches(deployed[label], running)
+            report["checks"][f"{label}:running_plist"] = {"ok": matches}
+            if not matches:
+                raise RolloutError(f"running_plist_mismatch:{label}")
             report["checks"][f"{label}:environment"] = environment_diff(
                 required[label],
                 candidate[label].environment,
