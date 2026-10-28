@@ -462,7 +462,11 @@ class WorkService:
         )
         if status not in {l["name"] for l in item["labels"]}:
             raise ValueError("item not ready for this run role")
-        active = self.harness.active(self.store.links())
+        active = [
+            link
+            for link in self.harness.active(self.store.links())
+            if link["run_key"] != run_key
+        ]
         if (
             len(active) >= policy.capacity.workspace_workers
             or sum(l["goal_id"] == goal_id for l in active)
@@ -472,7 +476,8 @@ class WorkService:
         # A finalised worker frees its slot but its session is still resumable,
         # so it keeps blocking a second execution of the same item.
         if any(
-            l["goal_id"] == goal_id
+            l["run_key"] != run_key
+            and l["goal_id"] == goal_id
             and l["item_number"] == number
             and not stale_sessionless_intent(
                 l, minutes=self.config.execution.orphan_intent_minutes
