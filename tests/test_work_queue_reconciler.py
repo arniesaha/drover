@@ -1,6 +1,9 @@
 import json
+import os
 import threading
 from types import SimpleNamespace
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import requests
@@ -105,7 +108,57 @@ def test_execution_report_exposes_denial_counters():
     worker = QueueExecutionWorker(SimpleNamespace(config=WorkQueueConfig()))
     worker.reconciler = SimpleNamespace(report=lambda: {"actions": []})
     worker.coordinator.health["kill_switch_denials"] = 2
-    assert worker.report()["execution"]["kill_switch_denials"] == 2
+    report = worker.report()["execution"]
+    assert report["kill_switch_denials"] == 2
+    assert report["active"] is None
+
+
+def test_execution_report_counts_durable_active_launches():
+    worker = QueueExecutionWorker(SimpleNamespace(config=WorkQueueConfig()))
+    worker.reconciler = SimpleNamespace(report=lambda: {"actions": []})
+    worker.service = SimpleNamespace(
+        store=SimpleNamespace(links=lambda: [{"id": "one"}]),
+        harness=SimpleNamespace(active=lambda links: links),
+    )
+    assert worker.report()["execution"]["active"] == 1
+
+
+def test_execution_report_reads_active_count_from_postgres_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The rollout's settle signal must exercise the real control store."""
+    dsn = os.environ.get("DROVER_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("DROVER_TEST_POSTGRES_DSN is required for PostgreSQL integration")
+    from drover.config import ControlStoreConfig
+    from drover.schema import bootstrap_control_plane_store
+    from drover.server.control_store import close_control_store, configure_control_store
+    from drover.server.work_queue.store import WorkStore
+
+    schema = f"drover_rollout_report_{uuid4().hex}"
+    selector = tmp_path / "central-selector"
+    monkeypatch.setenv("DROVER_TEST_POSTGRES_DSN", dsn)
+    configure_control_store(
+        selector,
+        ControlStoreConfig(
+            backend="postgres", dsn_env="DROVER_TEST_POSTGRES_DSN", schema=schema
+        ),
+    )
+    bootstrap_control_plane_store(selector)
+    try:
+        worker = QueueExecutionWorker(SimpleNamespace(config=WorkQueueConfig()))
+        worker.reconciler = SimpleNamespace(report=lambda: {"actions": []})
+        worker.service = SimpleNamespace(
+            store=WorkStore(selector, "workspace"),
+            harness=SimpleNamespace(active=lambda links: links),
+        )
+        assert worker.report()["execution"]["active"] == 0
+    finally:
+        close_control_store(selector)
+        import psycopg
+
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
 def test_bad_launch_candidate_is_logged_and_does_not_stop_other_candidates(caplog):
