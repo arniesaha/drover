@@ -4045,11 +4045,6 @@ def run(
         # lock against its own predecessor.
         close_control_plane_connections()
 
-    if outbox_exporter is not None:
-        exit_code = getattr(outbox_exporter, "server_exit_code", lambda: None)()
-        if exit_code is not None:
-            raise SystemExit(exit_code)
-
 
 @main.command()
 @click.option(
