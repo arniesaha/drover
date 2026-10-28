@@ -1796,9 +1796,23 @@ class MetricsCollector:
     def proxy_create_harness_session(
         self, host_id: str, payload: Mapping[str, Any], *, work_item_owner: str = "hub"
     ) -> tuple[int, str]:
+        def failed(status: int, body: str) -> tuple[int, str]:
+            # The queue persists an intent before this call and intentionally
+            # treats a non-2xx as uncertain.  Keep the remote response here:
+            # callers must not lose the only evidence of the rejecting check.
+            log.warning(
+                "harness create failed host_id=%s status=%s body=%r",
+                host_id,
+                status,
+                body,
+            )
+            return status, body
+
         host = self._harness_host(host_id)
         if host is None:
-            return _json_response(404, {"error": f"unknown harness host: {host_id}"})
+            return failed(
+                *_json_response(404, {"error": f"unknown harness host: {host_id}"})
+            )
         # A silent spoke accepts nothing. Creating anyway produced the worst
         # possible outcome for the phone: a session row that says `running`,
         # records zero events, and reports no error anywhere, because the
@@ -1808,12 +1822,14 @@ class MetricsCollector:
             if relay is None or not relay.wait_until_responsive(
                 host_id, RELAY_PROOF_TIMEOUT_S
             ):
-                return _json_response(
-                    502,
-                    {
-                        "error": f"relay host is not responding: {host_id}",
-                        "reason": _relay_silence_reason(relay, host_id),
-                    },
+                return failed(
+                    *_json_response(
+                        502,
+                        {
+                            "error": f"relay host is not responding: {host_id}",
+                            "reason": _relay_silence_reason(relay, host_id),
+                        },
+                    )
                 )
         status, body = self._harness_request(
             host,
@@ -1846,9 +1862,13 @@ class MetricsCollector:
                     log.exception(
                         "failed to terminate uninitialized coordinator worker"
                     )
-                return _json_response(
-                    503, {"error": "hub continuity initialization failed"}
+                return failed(
+                    *_json_response(
+                        503, {"error": "hub continuity initialization failed"}
+                    )
                 )
+        if not 200 <= status < 300:
+            return failed(status, body)
         return status, body
 
     def fetch_harness_provider_usage(self, host: Any) -> Mapping[str, Any]:

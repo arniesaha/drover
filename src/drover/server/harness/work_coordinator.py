@@ -104,11 +104,11 @@ def _parse_work_coordinator_continuity(
         raise FactoryObserverRequestError("work continuity run_id is invalid")
     if (
         not isinstance(owner_id, str)
-        or not owner_id.startswith("agent:")
+        or not (owner_id.startswith("agent:") or owner_id.startswith("drover:owner/"))
         or len(owner_id) > 191
     ):
         raise FactoryObserverRequestError(
-            "work continuity owner_id must be a canonical agent key"
+            "work continuity owner_id must be a canonical agent or native owner key"
         )
     if scope not in {"implementation", "integration"}:
         raise FactoryObserverRequestError("work continuity scope is invalid")
