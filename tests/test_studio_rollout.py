@@ -6,7 +6,7 @@ import importlib.util
 import json
 import plistlib
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -245,7 +245,9 @@ def _main_fixture(tmp_path: Path, monkeypatch, *, changed: bool = True):
         for label in ROLLOUT.LABELS:
             _write_plist(directory / f"{label}.plist", label, marker)
     config = home / "config.toml"
-    config.write_text("")
+    config.write_text(
+        '[control_store]\nbackend = "postgres"\ndsn_env = "DROVER_LAKE_DSN"\n'
+    )
     calls = []
 
     def fake_run(argv, *, dry_run, actions):
@@ -277,7 +279,7 @@ def _main_fixture(tmp_path: Path, monkeypatch, *, changed: bool = True):
     monkeypatch.setattr(
         ROLLOUT,
         "wait_for_work_queue",
-        lambda *_: (True, {"actions": [], "execution": {"active": 0}}),
+        lambda *_args, **_kwargs: (True, {"active": 0, "stuck_intents": []}),
     )
     monkeypatch.setattr(ROLLOUT, "api_json", lambda *_: (True, {"hosts": []}))
     monkeypatch.setattr(ROLLOUT, "service_runs_target", lambda *_: True)
@@ -424,9 +426,7 @@ def test_relay_reconnect_and_work_queue_decisions_are_explicit():
     }
     assert ROLLOUT.relay_hosts(payload) == {"nas"}
     assert ROLLOUT.relay_reconnected(payload, {"nas"}) == (True, [])
-    assert (
-        ROLLOUT.work_queue_settled({"actions": [], "execution": {"active": 0}}) is True
-    )
+    assert ROLLOUT.work_queue_settled({"actions": []}) is True
     assert (
         ROLLOUT.work_queue_settled(
             {"actions": [{"kind": "launch_candidate"}], "execution": {"active": 0}}
@@ -438,20 +438,77 @@ def test_relay_reconnect_and_work_queue_decisions_are_explicit():
     )
 
 
-def test_wait_for_work_queue_polls_until_candidates_are_gone(monkeypatch):
+def test_optional_work_queue_report_tolerates_403_and_old_hub_shape(monkeypatch):
+    monkeypatch.setattr(ROLLOUT, "api_json", lambda *_: (False, {"error": "HTTPError"}))
+    report = ROLLOUT.optional_work_queue_report("http://hub/report", "device")
+    assert report == {
+        "ok": False,
+        "report": {"error": "HTTPError"},
+    }
+    assert ROLLOUT.work_queue_settled({"actions": []}) is True
+    assert ROLLOUT.wait_for_work_queue(
+        lambda: {"active": 0, "stuck_intents": []}, 0, supplemental=lambda: report
+    ) == (True, {"active": 0, "stuck_intents": [], "http_report": report})
+
+
+def test_queue_settlement_keeps_only_fresh_sessionless_intents_active():
+    now = datetime(2026, 10, 28, tzinfo=timezone.utc)
+    links = [
+        {
+            "id": "stale",
+            "goal_id": "goal",
+            "run_key": "stale-key",
+            "session_id": None,
+            "failure_count": 0,
+            "created_at": now - timedelta(minutes=11),
+            "updated_at": now - timedelta(minutes=11),
+        },
+        {
+            "id": "systemic",
+            "goal_id": "goal",
+            "run_key": "systemic-key",
+            "session_id": None,
+            "failure_count": 3,
+            "created_at": now,
+            "updated_at": now,
+        },
+    ]
+
+    settled = ROLLOUT.queue_settlement(
+        links, orphan_intent_minutes=10, systemic_attempts={"goal": 3}, now=now
+    )
+    assert settled["active"] == 0
+    assert {row["reason"] for row in settled["stuck_intents"]} == {
+        "stale",
+        "systemic",
+    }
+    fresh = ROLLOUT.queue_settlement(
+        [
+            {
+                **links[0],
+                "id": "fresh",
+                "run_key": "fresh-key",
+                "created_at": now,
+                "updated_at": now,
+            }
+        ],
+        orphan_intent_minutes=10,
+        systemic_attempts={"goal": 3},
+        now=now,
+    )
+    assert fresh["active"] == 1
+
+
+def test_wait_for_work_queue_polls_until_local_links_are_gone(monkeypatch):
     reports = iter(
         [
-            (
-                True,
-                {"actions": [{"kind": "launch_candidate"}], "execution": {"active": 0}},
-            ),
-            (True, {"actions": [], "execution": {"active": 0}}),
+            {"active": 1, "stuck_intents": []},
+            {"active": 0, "stuck_intents": []},
         ]
     )
-    monkeypatch.setattr(ROLLOUT, "api_json", lambda *_: next(reports))
     monkeypatch.setattr(ROLLOUT.time, "monotonic", lambda: 0)
     monkeypatch.setattr(ROLLOUT.time, "sleep", lambda _: None)
-    assert ROLLOUT.wait_for_work_queue("http://hub/report", "token", 1) == (
+    assert ROLLOUT.wait_for_work_queue(lambda: next(reports), 1) == (
         True,
-        {"actions": [], "execution": {"active": 0}},
+        {"active": 0, "stuck_intents": []},
     )
