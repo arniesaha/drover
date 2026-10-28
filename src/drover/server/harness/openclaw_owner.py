@@ -44,6 +44,9 @@ class Poll(WireModel):
     operation: Literal["poll"]
     run_id: Id | None = None
     limit: Annotated[int, Field(ge=1, le=50)] = 20
+    # OpenClaw supplies these optional liveness hints on owner polls.
+    last_error: Annotated[str, Field(max_length=1000)] | None = None
+    session_activity_at: datetime | None = None
 
 
 class Initialize(WireModel):
@@ -54,7 +57,8 @@ class Lease(WireModel):
     operation: Literal["lease"]
     run_id: Id | None = None
     owner_epoch: Epoch | None = None
-    lease_seconds: Annotated[int, Field(ge=1, le=300)] = 60
+    # Zero is the bounded shutdown-path release sent by the plugin.
+    lease_seconds: Annotated[int, Field(ge=0, le=300)] = 60
 
 
 class Report(WireModel):
