@@ -2103,6 +2103,7 @@ def format_exporter_health(health: dict) -> str:
             f"  oldest outstanding age: {health.get('oldest_outstanding_age_seconds', 0):.1f}s",
             f"  last error: {health.get('last_error') or health.get('freshness_error') or 'none'}",
             f"  restarts: {health.get('restart_count', 0)}",
+            f"  next recovery retry: {health.get('recovery_next_retry_at') or 'none'}",
             f"  recovery: {health.get('recovery_action', 'Check hub and exporter logs.')}",
         ]
     )
