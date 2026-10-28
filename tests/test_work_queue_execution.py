@@ -476,6 +476,10 @@ def test_sessionless_intent_is_retried_without_duplicate_execution(service):
         launch(service)
     intent = service.store.links()[0]
     assert intent["session_id"] is None
+    # The fake harness creates before simulating a lost response. A genuinely
+    # sessionless intent has no daemon record to recover on retry.
+    service.harness.sessions.clear()
+    _age_intent(service, intent)
     service.harness.timeout = False
     retried = launch(service)
     assert retried["session_id"] == "session-2"
@@ -546,5 +550,9 @@ def test_stale_unresolved_intent_at_retry_limit_is_systemic(service):
     service.harness.sessions.clear()
     _age_intent(service, row)
     service.store.failure(row["run_key"], load_policy().retries.attempts - 1)
+    # A failure is activity: #860 deliberately refreshes the recovery clock.
+    # Age it again to exercise the retry-limit branch rather than treating it
+    # as an immediately stale, sessionless intent.
+    _age_intent(service, row)
     with pytest.raises(RuntimeError, match="systemic review required"):
         launch(service)
