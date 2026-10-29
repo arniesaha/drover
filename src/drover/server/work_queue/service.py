@@ -525,7 +525,7 @@ class WorkService:
             parent_session_id,
             goal_id,
             authority={
-                "labels": [label["name"] for label in item.get("labels", [])],
+                "labels": item.get("operator_authority_labels", []),
                 "body": item.get("body"),
             },
         )

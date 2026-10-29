@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 from test_work_queue_policy import scope
 
+from drover import github_app_token
 from drover.server.work_queue.github import GitHubProvider, ProviderUnavailable
 from drover.server.work_queue.provider import ItemRef
 
@@ -248,3 +249,103 @@ def test_missing_credentials_never_call_provider(monkeypatch):
     with pytest.raises(ProviderUnavailable, match="credential_unavailable"):
         provider.list_items()
     assert not session.calls
+
+
+def test_authority_labels_follow_the_latest_label_event(credential):
+    item = {
+        "number": 7,
+        "labels": [
+            {"name": "autonomy:through-pr"},
+            {"name": "autonomy:through-merge"},
+            {"name": "autonomy:through-rollout"},
+        ],
+    }
+    events = [
+        {
+            "event": "labeled",
+            "label": {"name": "autonomy:through-pr"},
+            "actor": {"login": "operator", "type": "User"},
+        },
+        {
+            "event": "labeled",
+            "label": {"name": "autonomy:through-pr"},
+            "actor": {"login": "drover-bot[bot]", "type": "Bot"},
+        },
+        {
+            "event": "labeled",
+            "label": {"name": "autonomy:through-merge"},
+            "actor": {"login": "operator", "type": "User"},
+        },
+        {
+            "event": "unlabeled",
+            "label": {"name": "autonomy:through-merge"},
+            "actor": {"login": "operator", "type": "User"},
+        },
+        {
+            "event": "labeled",
+            "label": {"name": "autonomy:through-rollout"},
+            "actor": {"login": "operator", "type": "User"},
+        },
+    ]
+    provider = GitHubProvider(
+        "workspace-test", scope(), session=Session(Response(item), Response(events))
+    )
+    assert provider.get_item(ref())["operator_authority_labels"] == [
+        "autonomy:through-rollout"
+    ]
+
+
+def test_write_uses_packaged_app_token_or_falls_back_when_unconfigured(
+    credential, monkeypatch
+):
+    write_scope = scope(
+        credential={
+            "token_env": "TEST_WORK_QUEUE_TOKEN",
+            "capabilities": ["issues_read", "issues_write"],
+        }
+    )
+    monkeypatch.setattr(github_app_token, "load_config", lambda: {})
+    fallback = GitHubProvider(
+        "workspace-test", write_scope, session=Session(Response({"id": 42}), Response())
+    )
+    fallback.close(ref())
+    assert fallback.session.calls[-1][2]["headers"]["Authorization"] == (
+        "Bearer synthetic-test-token"
+    )
+
+    monkeypatch.setattr(github_app_token, "load_config", lambda: {"app": "configured"})
+    monkeypatch.setattr(
+        github_app_token,
+        "mint",
+        lambda config, repo: {"token": "app-installation-token"},
+    )
+    app = GitHubProvider(
+        "workspace-test", write_scope, session=Session(Response({"id": 42}), Response())
+    )
+    app.close(ref())
+    assert app.session.calls[-1][2]["headers"]["Authorization"] == (
+        "Bearer app-installation-token"
+    )
+
+
+def test_configured_app_mint_failure_never_falls_back_to_operator_token(
+    credential, monkeypatch
+):
+    write_scope = scope(
+        credential={
+            "token_env": "TEST_WORK_QUEUE_TOKEN",
+            "capabilities": ["issues_read", "issues_write"],
+        }
+    )
+    monkeypatch.setattr(github_app_token, "load_config", lambda: {"app": "configured"})
+    monkeypatch.setattr(
+        github_app_token,
+        "mint",
+        lambda config, repo: (_ for _ in ()).throw(github_app_token.MintError("no")),
+    )
+    provider = GitHubProvider(
+        "workspace-test", write_scope, session=Session(Response({"id": 42}))
+    )
+    with pytest.raises(ProviderUnavailable, match="app_token_unavailable"):
+        provider.close(ref())
+    assert len(provider.session.calls) == 1

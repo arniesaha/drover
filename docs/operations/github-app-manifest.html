@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- Issue #786: one-click GitHub App manifest flow for drover-bot. Open in a
+     browser while signed in to GitHub as the operator. See github-app.md. -->
+<html>
+<head><meta charset="utf-8"><title>Create drover-bot</title></head>
+<body>
+<form id="f" action="https://github.com/settings/apps/new?state=drover-786" method="post">
+  <input type="hidden" name="manifest" id="manifest">
+  <button type="submit">Create the drover-bot GitHub App</button>
+</form>
+<script>
+document.getElementById("manifest").value = JSON.stringify({
+  name: "drover-bot",
+  url: "https://github.com/arniesaha/drover",
+  description: "Drover agent identity: reconciler and worker writes (comments, labels, PRs, merges).",
+  redirect_url: "https://github.com/arniesaha/drover/issues/786",
+  public: false,
+  hook_attributes: { url: "https://github.com/arniesaha/drover", active: false },
+  default_permissions: {
+    issues: "write", pull_requests: "write", contents: "write",
+    checks: "write", statuses: "read", actions: "read", metadata: "read"
+  },
+  default_events: []
+});
+</script>
+</body>
+</html>
