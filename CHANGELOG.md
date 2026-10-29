@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.51] - 2026-10-28
+
+### Fixed
+
+- Accept native `drover:owner/` continuity owners for coordinator-acted lease, consume, and acknowledgement operations (#890, #882).
+
 ## [0.6.50] - 2026-10-28
 
 ### Fixed
