@@ -5,9 +5,9 @@ from dataclasses import replace
 import pytest
 from test_work_queue_policy import scope
 
+from drover import github_app_token
 from drover.server.work_queue.github import GitHubProvider, ProviderUnavailable
 from drover.server.work_queue.provider import ItemRef
-from drover import github_app_token
 
 
 class Response:
