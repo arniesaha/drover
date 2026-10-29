@@ -15,8 +15,12 @@ way to rehearse signing and notarisation before a release.
 The Developer ID `.p12` is imported only into a temporary, unlocked keychain.
 The API-key `.p8` is decoded with mode `0600`, and both it and the keychain are
 removed in an `always()` cleanup step. The credentials are supplied by the
-protected `ios-testflight-upload` environment, matching the existing
-TestFlight API-key arrangement.
+`macos-signing` environment. This environment is intentionally separate from
+the reviewer-gated `ios-testflight-upload` environment: the former permits
+unattended harnessd signing and notarization, while the latter remains the
+approval boundary for TestFlight uploads. Configure the macOS environment with
+the Developer ID and App Store Connect secrets required by this workflow; do
+not move or relax the TestFlight environment's protections.
 
 Apple does not staple tickets to a bare Mach-O binary, and `spctl --type
 execute` assesses app bundles rather than standalone commands. Consequently the
