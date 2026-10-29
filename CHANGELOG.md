@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.54]
+
+### Fixed
+- Recognize terminal `turn_exited` status events so Drover-native continuity-owner claims complete and later wakes can proceed.
+
 ## [0.6.53] - 2026-10-29
 
 ### Fixed
