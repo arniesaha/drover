@@ -524,3 +524,27 @@ def test_completed_turn_kind_reads_postgres_payload_relation(pg_control_path):
     assert registry.completed_turn_kinds(["fixture-session"]) == {
         "fixture-session": "finished"
     }
+
+
+def test_completed_turn_kind_recognizes_turn_exited_status(registry):
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        seq=1,
+        payload={"payload": {"turn_complete": True, "awaiting": "input"}},
+    )
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        seq=2,
+        payload={"payload": {"exited": 0}},
+    )
+    assert registry.completed_turn_kinds(["sess-1"]) == {"sess-1": "finished"}
+
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        seq=3,
+        payload={"payload": {"exited": 1}},
+    )
+    assert registry.completed_turn_kinds(["sess-1"]) == {"sess-1": "failed"}

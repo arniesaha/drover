@@ -2620,13 +2620,12 @@ class HarnessRegistry:
         for session_id, event_id in rows:
             payload = json.loads(payloads.get(str(event_id)) or "{}")
             inner = payload.get("payload", payload)
-            if isinstance(inner, dict) and inner.get("turn_complete") is True:
+            if isinstance(inner, dict) and (
+                inner.get("turn_complete") is True or "exited" in inner
+            ):
                 result = inner.get("result") or {}
-                kinds[session_id] = (
-                    "failed"
-                    if isinstance(result, dict) and result.get("is_error")
-                    else "finished"
-                )
+                is_error = bool(result.get("is_error") or inner.get("exited", 0) != 0)
+                kinds[session_id] = "failed" if is_error else "finished"
         return kinds
 
     def latest_session_previews(self, session_ids: list[str]) -> dict[str, str]:
