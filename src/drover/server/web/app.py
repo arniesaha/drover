@@ -2807,7 +2807,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(status, "application/json", json.dumps(result) + "\n")
 
     def _coordinator_acts_for_bound_owner(self, store, body, principal) -> bool:
-        """A Work-coordinator run is owned by a canonical agent session key.
+        """A Work-coordinator run is owned by a canonical agent session key or native owner.
 
         No bearer principal can equal that key, so only the explicit
         coordinator/operator principal may act for exactly the owner the run
@@ -2817,7 +2817,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         owner = body.get("owner_id")
         if (
             not isinstance(owner, str)
-            or not owner.startswith("agent:")
+            or not (owner.startswith("agent:") or owner.startswith("drover:owner/"))
             or principal != self._continuity_coordinator_principal()
         ):
             return False
