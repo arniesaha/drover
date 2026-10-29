@@ -65,11 +65,39 @@ class QueueExecutionCoordinator:
                 and scope.execution_estimated_cost > scope.execution_budget
             ):
                 return self._denied("budget", goal_id, number)
+            # A terminal worker is durable evidence of a completed/aborted
+            # attempt, not an idempotency target for the next queued attempt.
+            # The stable automatic key is intentionally reused while its
+            # session is live, but a new client id is required after terminal
+            # state: harnessd correctly deduplicates client ids forever.
+            request_key = identity("automatic-launch", goal_id, number)
+            for link in reversed(
+                self.service.store.links(goal_id=goal_id, number=number)
+            ):
+                session = (
+                    self.service.harness.resolve(link["run_key"])
+                    if link["session_id"]
+                    else None
+                )
+                if (
+                    link["run_role"] == "work"
+                    and session is not None
+                    and session.status
+                    in {"completed", "failed", "errored", "terminated", "cancelled"}
+                ):
+                    request_key = identity(
+                        "automatic-relaunch",
+                        goal_id,
+                        number,
+                        link["run_key"],
+                        session.session_id,
+                    )
+                    break
             actor = WorkActor("control:queue-execution", "nix")
             row = self.service.launch(
                 goal_id,
                 number,
-                identity("automatic-launch", goal_id, number),
+                request_key,
                 scope.execution_estimated_cost,
                 actor=actor,
             )
