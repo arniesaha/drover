@@ -498,10 +498,10 @@ class GitHubProvider:
 
     def _mint_app_token(self):
         """Return an App token, or None when the App is intentionally absent."""
-        config = github_app_token.load_config()
-        if not config:
-            return None
         try:
+            config = github_app_token.load_config()
+            if not config:
+                return None
             return github_app_token.mint(config, self.scope.repo)["token"]
         except (
             github_app_token.MintError,

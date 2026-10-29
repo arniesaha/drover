@@ -43,6 +43,15 @@ def test_not_configured_exits_3(tmp_path, monkeypatch):
     assert gat.main([]) == gat.NOT_CONFIGURED
 
 
+def test_partial_configuration_is_a_mint_error(monkeypatch):
+    for k in gat.KEYS:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("DROVER_GH_APP_ID", "123")
+    with pytest.raises(gat.MintError, match="incomplete"):
+        gat.load_config()
+    assert gat.main([]) == gat.FAILED
+
+
 def test_config_env_wins_over_file(tmp_path):
     env = tmp_path / "app.env"
     env.write_text(

@@ -62,8 +62,10 @@ def load_config(environ=os.environ):
                 v = v.strip().strip("'\"")
                 if v:
                     cfg[k.strip()] = v
-    if not (cfg.get("DROVER_GH_APP_ID") and cfg.get("DROVER_GH_APP_KEY_FILE")):
+    if not cfg:
         return {}
+    if not (cfg.get("DROVER_GH_APP_ID") and cfg.get("DROVER_GH_APP_KEY_FILE")):
+        raise MintError("incomplete GitHub App configuration")
     cfg["DROVER_GH_APP_KEY_FILE"] = os.path.expanduser(cfg["DROVER_GH_APP_KEY_FILE"])
     return cfg
 
@@ -170,10 +172,10 @@ def main(argv=None):
         "--json", action="store_true", help="print {token, expires_at, installation_id}"
     )
     a = p.parse_args(argv)
-    cfg = load_config()
-    if not cfg:
-        return NOT_CONFIGURED
     try:
+        cfg = load_config()
+        if not cfg:
+            return NOT_CONFIGURED
         tok = mint(cfg, a.repo)
     except (MintError, KeyError, ValueError, subprocess.TimeoutExpired) as e:
         print(f"github_app_token: {e}", file=sys.stderr)
