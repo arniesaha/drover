@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.52] - 2026-10-29
+
+### Fixed
+
+- Wait for relay reconnection after a guarded Studio rollout restart (#892).
+- Relaunch queued work items after their latest linked harness session has terminated (#893, #882).
+
+
 ## [0.6.51] - 2026-10-28
 
 ### Fixed
