@@ -19,7 +19,11 @@ import pytest
 
 from drover.schema import bootstrap
 from drover.server.harness.continuity import FactoryObserverContinuity
+from drover.server.harness.factory_observer import FactoryObserverRequestError
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.harness.work_coordinator import (
+    parse_unverified_work_coordinator_continuity,
+)
 from drover.server.metrics import MetricsCollector
 from drover.server.work_queue.config import WorkQueueConfig
 from drover.server.work_queue.provider import ItemRef
@@ -98,6 +102,11 @@ class StubHarnessd:
                 payload = json.loads(
                     self.rfile.read(int(self.headers["Content-Length"])).decode()
                 )
+                try:
+                    parse_unverified_work_coordinator_continuity(payload)
+                except FactoryObserverRequestError as exc:
+                    self._json(400, {"error": str(exc)})
+                    return
                 session_id = "stub-session-" + str(len(stub.sessions) + 1)
                 row = {
                     "session_id": session_id,
@@ -197,7 +206,9 @@ def launch_path(pg_control_path):
                 "goal_label": "goal:launch",
                 "execution_enabled": True,
                 "execution_cwds": {host_id: "/repo/drover"},
-                "continuity_owner_id": "agent:owner:launch",
+                "brief_ref": "docs/brief.md",
+                "continuity_owner_id": "drover:owner/launch",
+                "continuity_owner_harness": "codex",
                 "credential": {
                     "token_env": "SANITIZED_TOKEN",
                     "capabilities": ["issues_read", "issues_write"],
@@ -227,7 +238,9 @@ def launch_path(pg_control_path):
         harnessd.close()
 
 
-def test_queued_issue_launches_worker_and_records_owner_continuation(launch_path):
+def test_native_owner_queued_issue_launches_worker_and_records_owner_continuation(
+    launch_path,
+):
     service, _bridge, registry, _provider, harnessd = launch_path
     worker = QueueExecutionWorker(service)
     worker.reconciler.providers["launch"] = service.providers["launch"]

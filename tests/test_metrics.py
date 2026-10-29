@@ -5804,6 +5804,28 @@ def test_successful_create_without_session_id_fails_closed(tmp_path):
     assert json.loads(body) == {"error": "hub continuity initialization failed"}
 
 
+def test_failed_create_logs_status_and_body(tmp_path, caplog):
+    collector = _collector_for_proxy(tmp_path)
+    collector._harness_request = lambda *args, **kwargs: (  # type: ignore[method-assign]
+        400,
+        '{"error":"work continuity owner_id must be a canonical agent key"}',
+    )
+    collector._harness_host = lambda host_id: type(  # type: ignore[method-assign]
+        "H",
+        (),
+        {"host_id": host_id, "connection_kind": "direct"},
+    )()
+
+    status, body = collector.proxy_create_harness_session(
+        "studio", {"harness": "codex"}
+    )
+
+    assert status == 400
+    assert "canonical agent key" in body
+    assert "host_id=studio status=400" in caplog.text
+    assert "canonical agent key" in caplog.text
+
+
 def test_a_create_that_outruns_the_hub_is_not_reported_as_unreachable(
     tmp_path, monkeypatch
 ):
