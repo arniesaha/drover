@@ -293,3 +293,37 @@ def test_restart_after_failed_submission_dead_letters_once(tmp_path):
             "SELECT action_json FROM factory_observer_inbox WHERE run_id = ?", [run_id]
         ).fetchone()
     assert json.loads(action_json)["escalation"]["state"] == "blocked:human"
+
+
+def test_finished_turn_completes_claim_and_allows_next_wake_turn(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    session_id = collector.launches[0][1]["client_session_id"]
+    owner_session = runner.registry.session_by_client_id(session_id)
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"turn_complete": True, "awaiting": "input"}},
+    )
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=3,
+        payload={"payload": {"exited": 0}},
+    )
+
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="ci-1",
+        subject="worker-1",
+        sequence=2,
+        kind="ci_green",
+        summary="ci green",
+    )
+    clock.advance(5)
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
