@@ -1438,3 +1438,65 @@ def test_http_coordinator_may_act_only_for_the_runs_bound_agent_owner(bridge, tm
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_http_coordinator_may_act_for_bound_native_owner(bridge, tmp_path):
+    """A Work-coordinator run with a native owner allows coordinator operations."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.web.app import start_metrics_server
+    from drover.server.web.auth import AuthSettings
+    from drover.server.web.credentials import CredentialStore
+
+    store, _, _ = bridge
+    bound = "drover:owner/native-canary"
+    handoff(store, bound)
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    _, device_token = credentials.issue(scope="device", label="other")
+    collector = MetricsCollector(
+        duckdb_path=store.path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        ttl_seconds=60,
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        auth=AuthSettings(
+            enabled=True,
+            api_token="operator-secret",
+            credentials=credentials,
+            legacy_token_enabled=True,
+        ),
+    )
+    base = f"http://127.0.0.1:{server.server_address[1]}/harness/factory-observer/continuity"
+
+    def request(body, token):
+        req = urllib.request.Request(
+            base,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    lease = {"operation": "lease", "run_id": RUN, "owner_id": bound}
+    try:
+        # An ordinary credential cannot claim the native owner.
+        assert request(lease, device_token)[0] == 403
+        # The coordinator/operator cannot act for a divergent native owner.
+        other = {**lease, "owner_id": "drover:owner/other-canary"}
+        assert request(other, "operator-secret")[0] == 403
+        # The coordinator/operator can act for the bound native owner.
+        status, payload = request(lease, "operator-secret")
+        assert status == 200
+        assert payload["continuity"]["owner"]["id"] == bound
+    finally:
+        server.shutdown()
+        server.server_close()
