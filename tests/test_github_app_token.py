@@ -1,18 +1,13 @@
-"""Tests for scripts/github_app_token.py (no network; openssl CLI for signing)."""
+"""Tests for the packaged GitHub App token helper (no network)."""
 
 import base64
-import importlib.util
 import json
 import shutil
 import subprocess
-from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "github_app_token.py"
-spec = importlib.util.spec_from_file_location("github_app_token", SCRIPT)
-gat = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(gat)
+from drover import github_app_token as gat
 
 needs_openssl = pytest.mark.skipif(
     not shutil.which("openssl"), reason="openssl CLI missing"

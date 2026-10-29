@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -11,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 import requests
+
+from drover import github_app_token
 
 from .config import GoalScope
 from .provider import ItemRef
@@ -53,8 +56,8 @@ class GitHubProvider:
         if capability not in self.capabilities:
             raise ProviderUnavailable("github_permission_unavailable:" + capability)
 
-    def _request(self, method, path, *, params=None, body=None):
-        token = os.environ.get(self.scope.credential.token_env, "").strip()
+    def _request(self, method, path, *, params=None, body=None, token=None):
+        token = token or os.environ.get(self.scope.credential.token_env, "").strip()
         if not token:
             raise ProviderUnavailable("github_credential_unavailable")
         digest = hashlib.sha256(token.encode()).hexdigest()
@@ -220,7 +223,60 @@ class GitHubProvider:
 
     def get_item(self, ref):
         self._require("issues_read")
-        return self._request("GET", self._ref(ref))
+        item = self._request("GET", self._ref(ref))
+        item["operator_authority_labels"] = sorted(
+            self.operator_authority_labels(ref, item)
+        )
+        return item
+
+    @staticmethod
+    def _operator_labeler(event):
+        """Return a current label grant, or a cleared grant for ``unlabeled``.
+
+        GitHub returns issue events oldest first.  The last event is therefore
+        authoritative: an App may re-apply a label after an operator removes
+        it, and that App action must never revive the operator's grant.
+        """
+        if event.get("event") not in {"labeled", "unlabeled"}:
+            return None
+        label = event.get("label") or {}
+        name = label.get("name")
+        if not isinstance(name, str) or not name.startswith("autonomy:"):
+            return None
+        if event["event"] == "unlabeled":
+            return name, None
+        actor = event.get("actor") or {}
+        login = actor.get("login")
+        # GitHub Apps use the conventional ``name[bot]`` login and type Bot.
+        # Unknown/malformed actors fail closed instead of becoming approval.
+        if (
+            not isinstance(login, str)
+            or actor.get("type") == "Bot"
+            or login.endswith("[bot]")
+        ):
+            return name, None
+        return name, login
+
+    def operator_authority_labels(self, ref, item=None):
+        """Current autonomy labels whose *latest* labeler is an operator."""
+        self._require("issues_read")
+        self._ref(ref)
+        current = {
+            label.get("name")
+            for label in (item or self.get_item(ref)).get("labels", [])
+            if isinstance(label, dict) and isinstance(label.get("name"), str)
+        }
+        latest = {}
+        for event in self._pages(self._ref(ref) + "/events"):
+            update = self._operator_labeler(event)
+            if update is not None:
+                name, labeler = update
+                latest[name] = labeler
+        return {
+            name
+            for name, labeler in latest.items()
+            if name in current and labeler is not None
+        }
 
     def list_labels(self):
         self._require("issues_read")
@@ -440,11 +496,30 @@ class GitHubProvider:
                 )
         return rows
 
+    def _mint_app_token(self):
+        """Return an App token, or None when the App is intentionally absent."""
+        config = github_app_token.load_config()
+        if not config:
+            return None
+        try:
+            return github_app_token.mint(config, self.scope.repo)["token"]
+        except (
+            github_app_token.MintError,
+            KeyError,
+            ValueError,
+            OSError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            raise ProviderUnavailable("github_app_token_unavailable") from exc
+
     def _write(self, ref, method, suffix="", body=None):
         path = self._ref(ref)
         self._require("issues_write")
         self.authenticate()
-        self._request(method, path + suffix, body=body)
+        # App configuration is optional during rollout.  If it is present,
+        # however, agent writes fail closed rather than falling back to an
+        # operator credential on mint failure.
+        self._request(method, path + suffix, body=body, token=self._mint_app_token())
 
     def set_labels(self, ref, labels):
         self._write(ref, "PUT", "/labels", {"labels": labels})
