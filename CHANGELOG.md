@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.53] - 2026-10-29
+
+### Fixed
+
+- Use the dedicated macOS signing environment for harnessd signing and notarization, independent of TestFlight upload approval (#895).
+
 ## [0.6.52] - 2026-10-29
 
 ### Fixed
