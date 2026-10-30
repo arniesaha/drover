@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fence and replace stale native continuity-owner sessions when a delivery has
+  no durable submitted turn or its owner turn terminates with an error.
+
 ## [0.6.54]
 
 ### Fixed

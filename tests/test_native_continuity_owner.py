@@ -74,7 +74,7 @@ class Collector:
             self.failed_launches -= 1
             return 503, "{}"
         session = self.registry.create_session(
-            session_id="owner-session",
+            session_id="owner-" + payload["client_session_id"][-8:],
             host_id=host_id,
             harness=payload["harness"],
             command="codex",
@@ -327,3 +327,85 @@ def test_finished_turn_completes_claim_and_allows_next_wake_turn(tmp_path):
     clock.advance(5)
     assert runner.process_once() == 1
     assert len(collector.turn_attempts) == 2
+
+
+def test_stale_owner_without_submitted_turn_is_fenced_recreated_and_acked(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    scope = runner.config.goals[0]
+    owner_id = scope.continuity_owner_id
+    stale = runner.registry.create_session(
+        session_id="stale-v0650-owner",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/project",
+        mode="structured",
+        client_session_id="v0650-owner",
+        handoff_mode="drover_native_continuity_owner",
+    )
+    link = runner._link(scope)
+    with control_plane_connection(runner.path) as con:
+        con.execute(
+            """UPDATE continuity_owner_sessions SET session_id = ?,
+            client_session_id = ?, updated_at = ? WHERE goal_id = ? AND owner_id = ?""",
+            [stale.session_id, "v0650-owner", clock(), scope.goal_id, owner_id],
+        )
+
+    runner.registry.update_session_activity(
+        stale.session_id,
+        awaiting="input",
+        last_activity=clock() - timedelta(seconds=11),
+    )
+    old_lease = store.lease(run_id, owner_id=owner_id)
+    old_epoch = old_lease["owner_epoch"]
+    old_action = store.consume(run_id, owner_id=owner_id, owner_epoch=old_epoch)
+    assert old_action is not None  # v0.6.50 delivered it without a turn claim.
+    clock.advance(5)
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        generation, session_id = con.execute(
+            """SELECT generation, session_id FROM continuity_owner_sessions
+            WHERE goal_id = ? AND owner_id = ?""",
+            [scope.goal_id, owner_id],
+        ).fetchone()
+    assert generation == link["generation"] + 1
+    assert session_id != stale.session_id
+    with pytest.raises(ContinuityConflict):
+        store.consume(run_id, owner_id=owner_id, owner_epoch=old_epoch)
+
+    status = store.status(run_id)
+    fence = {"owner_id": owner_id, "owner_epoch": status["owner"]["epoch"]}
+    action = status["next_action"]
+    receipt = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact="issue-comment:recovered",
+    )
+    assert receipt["state"] == "complete"
+    store.acknowledge(run_id, **fence, event_id=action["event_id"], checkpoint="acked")
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+
+
+def test_terminal_failed_owner_turn_is_replaced_before_redelivery(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    session_id = collector.launches[0][1]["client_session_id"]
+    owner_session = runner.registry.session_by_client_id(session_id)
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"exited": 1, "awaiting": "input"}},
+    )
+    clock.advance(5)
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == len(collector.turn_attempts) == 2
+    assert collector.launches[1][1]["client_session_id"] != session_id

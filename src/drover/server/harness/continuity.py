@@ -1061,6 +1061,23 @@ class FactoryObserverContinuity:
             "lease_until": until.isoformat(),
         }
 
+    def fence_owner(self, run_id: str, *, owner_id: str) -> int:
+        """Invalidate a lost native-owner session before its replacement runs.
+
+        This is a hub-only recovery primitive. The owner identity remains the
+        same, but every lease token held by the replaced harness session is
+        stale before the runner launches its successor.
+        """
+        with self._transaction(run_id) as (con, run):
+            self._authorized_owner(run, owner_id)
+            epoch = run["owner_epoch"] + 1
+            con.execute(
+                """UPDATE factory_observer_runs SET owner_epoch = ?, lease_until = ?,
+                updated_at = ? WHERE run_id = ?""",
+                [epoch, self.clock(), self.clock(), run_id],
+            )
+        return epoch
+
     @staticmethod
     def _authorized_owner(run, owner_id):
         authorized = run.get("authorized_owner_id")
