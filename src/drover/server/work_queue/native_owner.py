@@ -202,6 +202,46 @@ class NativeOwnerRunner:
                 [self.clock(), row[0], row[1]],
             )
 
+    def _recovery_needed(self, scope, run_id: str, session_id: str | None) -> bool:
+        """Return whether a predecessor could not safely own another wake.
+
+        A pre-native owner can leave a durable observer delivery without the
+        durable submitted-turn claim introduced for the native runner. It is
+        not a usable owner, even while its adapter reports ``awaiting=input``.
+        A terminal failed owner turn has the same recovery path: its receipt
+        rules make redelivery safe, but its session must not be reused.
+        """
+        session = self.registry.get_session(session_id) if session_id else None
+        stale_cutoff = self.clock() - timedelta(seconds=self.claim_seconds)
+        last_activity = (
+            session.last_activity.replace(tzinfo=timezone.utc)
+            if session is not None and session.last_activity is not None
+            else None
+        )
+        if last_activity is not None and last_activity <= stale_cutoff:
+            with control_plane_connection(self.path, timeout=5) as con:
+                orphan = con.execute(
+                    """SELECT 1 FROM factory_observer_inbox i
+                    WHERE i.run_id = ? AND i.state = 'delivered'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM continuity_owner_turn_claims c
+                        WHERE c.wake_id = i.event_id
+                    ) LIMIT 1""",
+                    [run_id],
+                ).fetchone()
+            if orphan is not None:
+                return True
+        return (
+            session_id is not None
+            and self.registry.completed_turn_kinds([session_id]).get(session_id)
+            == "failed"
+        )
+
+    def _recover_session(self, scope, run_id: str) -> None:
+        """Fence an old harness owner, then give the run a fresh lease epoch."""
+        self.continuity.fence_owner(run_id, owner_id=self._owner(scope))
+        self._replace_link(scope, self._link(scope))
+
     def _has_active_claim(self, scope) -> bool:
         # A passed claim deadline marks a stuck claim; it never authorizes redelivery.
         with self._transaction() as con:
@@ -299,6 +339,9 @@ class NativeOwnerRunner:
         session_id = self._session(scope, launch=False)
         if session_id:
             self._complete_finished_claim(scope, session_id)
+        if self._recovery_needed(scope, run_id, session_id):
+            self._recover_session(scope, run_id)
+            session_id = None
         if self._has_active_claim(scope):
             return False
         status = self.continuity.status(run_id)
