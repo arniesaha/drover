@@ -169,9 +169,9 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     prompt = collector.turn_attempts[0][1]["text"]
     assert f"run_id: {run_id}" in prompt
     assert "wake_id:" in prompt and "action_intent" in prompt
-    assert "DROVER_CONTINUITY_OWNER_TOKEN" in prompt
+    assert "DROVER_CONTINUITY_OWNER_BEARER" in prompt
     payload = collector.launches[0][1]
-    token = payload["continuity_owner_token"]
+    token = payload["continuity_owner_bearer"]
     assert runner.credentials.find_active(token).owner_id == "drover:owner/goal-native"
     assert store.status(run_id)["owner"]["live"]
 
@@ -393,7 +393,7 @@ def test_stale_owner_without_submitted_turn_is_fenced_recreated_and_acked(tmp_pa
 
     assert runner.process_once() == 1
     assert len(collector.launches) == len(collector.turn_attempts) == 1
-    new_token = collector.launches[0][1]["continuity_owner_token"]
+    new_token = collector.launches[0][1]["continuity_owner_bearer"]
     assert new_token != old_token
     assert runner.credentials.find_active(old_token) is None
     assert runner.credentials.find_active(new_token) is not None

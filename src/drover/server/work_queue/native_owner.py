@@ -169,7 +169,7 @@ class NativeOwnerRunner:
             "handoff_mode": "drover_native_continuity_owner",
             # This token is intentionally launch-only: it is neither kept in
             # the session registry nor recorded in the control plane.
-            "continuity_owner_token": owner_token,
+            "continuity_owner_bearer": owner_token,
         }
         if scope.continuity_owner_model:
             payload["model"] = scope.continuity_owner_model
@@ -341,7 +341,7 @@ class NativeOwnerRunner:
             f"brief_ref: {scope.brief_ref}\n\n"
             "Use the Drover lease/consume/ack contract only for this delivered action. "
             "Authenticate each continuity endpoint request with the bearer in "
-            "DROVER_CONTINUITY_OWNER_TOKEN, never DROVER_API_TOKEN. "
+            "DROVER_CONTINUITY_OWNER_BEARER, never DROVER_API_TOKEN. "
             "Before any external write, persist an action_intent keyed by this wake id "
             "and action fingerprint, carry a deterministic wake-id marker in the write, "
             "reconcile an existing marker/intent before retrying, verify its artifact, "

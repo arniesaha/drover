@@ -49,6 +49,17 @@ for event in events:
     print(json.dumps(event), flush=True)
 """
 
+OWNER_BEARER_CODEX = """
+import json, os, sys
+with open(os.environ["CODEX_ENV_LOG"], "w") as fh:
+    json.dump({
+        "bearer": os.environ.get("DROVER_CONTINUITY_OWNER_BEARER"),
+        "legacy_token": os.environ.get("DROVER_CONTINUITY_OWNER_TOKEN"),
+        "argv": sys.argv[1:],
+    }, fh)
+print(json.dumps({"type": "turn.completed", "usage": {}}), flush=True)
+"""
+
 # Fake binary that sleeps before finishing, so a second send_turn can be
 # attempted while the first is still in flight. Logs its argv (to
 # $CODEX_ARGV_LOG, if set) and pid (to $CODEX_PID_FILE, if set) so tests
@@ -672,6 +683,29 @@ def test_first_turn_argv_has_exec_not_resume(tmp_path, monkeypatch):
     assert argv1.count('model_reasoning_effort="high"') == 1
     sandbox_flag = argv1.index("--sandbox")
     assert argv1[sandbox_flag + 1] == "danger-full-access"
+    driver.close()
+
+
+def test_owner_bearer_environment_reaches_codex_turn_child(tmp_path, monkeypatch):
+    env_log = tmp_path / "owner-env.json"
+    monkeypatch.setenv("CODEX_ENV_LOG", str(env_log))
+    got: list = []
+    driver = CodexDriver(
+        [sys.executable, "-c", OWNER_BEARER_CODEX],
+        None,
+        got.append,
+        env={"DROVER_CONTINUITY_OWNER_BEARER": "test-owner-bearer"},
+    )
+    driver.start()
+    driver.send_turn("continue", turn_id="t1")
+    _wait_for(
+        got,
+        lambda g: any(m.type == "status" and m.payload.get("turn_complete") for m in g),
+    )
+    handoff = json.loads(env_log.read_text())
+    assert handoff["bearer"] == "test-owner-bearer"
+    assert handoff["legacy_token"] is None
+    assert "test-owner-bearer" not in handoff["argv"]
     driver.close()
 
 
