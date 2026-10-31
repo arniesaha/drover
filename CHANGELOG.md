@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.55] - 2026-10-31
+
 ### Fixed
+- Give the Drover-native continuity owner its own owner-scoped bearer
+  (`DROVER_CONTINUITY_OWNER_BEARER`) so continuity lease/consume/ack calls no
+  longer 403 with the generic API token (#903).
 - Fence and replace stale native continuity-owner sessions when a delivery has
   no durable submitted turn or its owner turn terminates with an error.
 
