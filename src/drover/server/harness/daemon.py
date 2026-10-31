@@ -2832,6 +2832,17 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         factory_launch = body.get("_factory_observer_launch")
         work_continuity = body.get("_work_coordinator_continuity")
         harness = str(body.get("harness") or "")
+        owner_token = body.get("continuity_owner_token")
+        if owner_token is not None and (
+            body.get("handoff_mode") != "drover_native_continuity_owner"
+            or not isinstance(owner_token, str)
+            or not owner_token
+        ):
+            self._write_json(
+                {"error": "invalid native continuity owner credential"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
         try:
             adapter = self.server.state.adapters.resolve(
                 harness, operation="structured"
@@ -3101,6 +3112,11 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 on_message=self.server.state.push_event,
                 finalize=self._finalize_structured_session,
                 native_session_id=native_session_id,
+                environment=(
+                    {"DROVER_CONTINUITY_OWNER_TOKEN": owner_token}
+                    if owner_token is not None
+                    else None
+                ),
             )
         except Exception as exc:
             if registry_created:

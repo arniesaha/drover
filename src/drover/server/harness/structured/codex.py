@@ -151,6 +151,7 @@ class CodexDriver:
         emit: EmitFn,
         *,
         native_session_id: str | None = None,
+        env: dict[str, str] | None = None,
         context_window_resolver: Callable[[str | None], int | None] | None = None,
         context_input_resolver: Callable[[str | None], int | None] | None = None,
     ) -> None:
@@ -158,6 +159,7 @@ class CodexDriver:
         self.cwd = cwd
         self.emit = emit
         self._thread_id = native_session_id
+        self.env = {**os.environ, **(env or {})}
         self._context_window_resolver = (
             context_window_resolver or resolve_effective_context_window
         )
@@ -268,6 +270,7 @@ class CodexDriver:
                     stderr=subprocess.PIPE,
                     text=True,
                     bufsize=1,
+                    env=self.env,
                 )
             except Exception:
                 self._turn_model = None

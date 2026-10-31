@@ -145,7 +145,7 @@ class ClaudeCodeAdapter(_StructuredAdapter):
             claude.resume_command(command, request.native_session_id),
             request.cwd,
             emit,
-            env=claude.child_env(),
+            env={**claude.child_env(), **(request.environment or {})},
         )
 
     def answer_permission(
@@ -222,7 +222,11 @@ class CodexAdapter(_WorktreeAdapter, _StructuredAdapter):
     def start(self, request: LaunchRequest, emit: EmitFn) -> codex.CodexDriver:
         command = list(request.command) if request.command else self.default_command()
         return codex.CodexDriver(
-            command, request.cwd, emit, native_session_id=request.native_session_id
+            command,
+            request.cwd,
+            emit,
+            native_session_id=request.native_session_id,
+            env=request.environment,
         )
 
     def native_sessions(self, *, home: Path, cwd: str | None) -> list[dict]:
@@ -288,6 +292,7 @@ class AgyAdapter(_WorktreeAdapter, _StructuredAdapter):
             request.cwd,
             emit,
             native_session_id=request.native_session_id,
+            env=request.environment,
         )
 
     def auth_adapter(self, *, shell: str | None = None) -> object | None:

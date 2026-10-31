@@ -165,6 +165,7 @@ class StructuredSessionManager:
         on_message: Callable[[str, dict[str, Any]], None],
         finalize: Callable[[str, int], None],
         native_session_id: str | None = None,
+        environment: dict[str, str] | None = None,
     ) -> None:
         try:
             adapter = self.adapters.resolve(harness, operation="structured")
@@ -357,6 +358,7 @@ class StructuredSessionManager:
             command=tuple(command or adapter.default_command()),
             cwd=cwd,
             native_session_id=native_session_id,
+            environment=environment,
         )
         entry.driver = (
             adapter.resume(request, emit)

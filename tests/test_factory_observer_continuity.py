@@ -1440,8 +1440,10 @@ def test_http_coordinator_may_act_only_for_the_runs_bound_agent_owner(bridge, tm
         server.server_close()
 
 
-def test_http_coordinator_may_act_for_bound_native_owner(bridge, tmp_path):
-    """A Work-coordinator run with a native owner allows coordinator operations."""
+def test_http_owner_credential_is_required_for_native_continuity_writes(
+    bridge, tmp_path
+):
+    """Only the native owner's provisioned bearer can mutate its delivery."""
     from drover.server.metrics import MetricsCollector
     from drover.server.web.app import start_metrics_server
     from drover.server.web.auth import AuthSettings
@@ -1450,8 +1452,12 @@ def test_http_coordinator_may_act_for_bound_native_owner(bridge, tmp_path):
     store, _, _ = bridge
     bound = "drover:owner/native-canary"
     handoff(store, bound)
+    report(store, "worker_blocked")
     credentials = CredentialStore(tmp_path / "credentials.json")
-    _, device_token = credentials.issue(scope="device", label="other")
+    _, owner_token = credentials.issue(scope="owner", label="native", owner_id=bound)
+    _, other_token = credentials.issue(
+        scope="owner", label="other", owner_id="drover:owner/other-canary"
+    )
     collector = MetricsCollector(
         duckdb_path=store.path,
         incoming_dir=tmp_path / "incoming",
@@ -1488,15 +1494,46 @@ def test_http_coordinator_may_act_for_bound_native_owner(bridge, tmp_path):
 
     lease = {"operation": "lease", "run_id": RUN, "owner_id": bound}
     try:
-        # An ordinary credential cannot claim the native owner.
-        assert request(lease, device_token)[0] == 403
-        # The coordinator/operator cannot act for a divergent native owner.
-        other = {**lease, "owner_id": "drover:owner/other-canary"}
-        assert request(other, "operator-secret")[0] == 403
-        # The coordinator/operator can act for the bound native owner.
-        status, payload = request(lease, "operator-secret")
+        # Neither the shared operator token nor another owner can claim it.
+        assert request(lease, "operator-secret")[0] == 403
+        assert request(lease, other_token)[0] == 403
+        status, payload = request(lease, owner_token)
         assert status == 200
-        assert payload["continuity"]["owner"]["id"] == bound
+        epoch = payload["continuity"]["owner"]["epoch"]
+        status, payload = request(
+            {
+                "operation": "consume",
+                "run_id": RUN,
+                "owner_id": bound,
+                "owner_epoch": epoch,
+            },
+            owner_token,
+        )
+        assert status == 200
+        action = payload["delivery"]
+        intent = {
+            "operation": "action_intent",
+            "run_id": RUN,
+            "owner_id": bound,
+            "owner_epoch": epoch,
+            "wake_id": action["event_id"],
+            "action_fingerprint": action["action_id"],
+            "artifact": "issue-comment:native-owner",
+        }
+        assert request(intent, owner_token)[0] == 200
+        status, payload = request(
+            {
+                "operation": "acknowledge",
+                "run_id": RUN,
+                "owner_id": bound,
+                "owner_epoch": epoch,
+                "event_id": action["event_id"],
+                "checkpoint": "native acknowledgement",
+            },
+            owner_token,
+        )
+        assert status == 200
+        assert payload["continuity"]["inbox_counts"] == {"acknowledged": 1}
     finally:
         server.shutdown()
         server.server_close()
