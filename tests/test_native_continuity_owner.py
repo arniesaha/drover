@@ -11,6 +11,8 @@ from drover.server.harness.continuity import (
     FactoryObserverContinuity,
 )
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.web.auth import AuthSettings, request_authorized
+from drover.server.web.credentials import CredentialStore
 from drover.server.work_queue.config import GoalScope
 from drover.server.work_queue.native_owner import NativeOwnerRunner
 
@@ -147,8 +149,13 @@ def _runner(tmp_path):
         summary="blocked",
     )
     collector = Collector(path, registry)
+    credentials = CredentialStore(tmp_path / "credentials.json")
     runner = NativeOwnerRunner(
-        collector, SimpleNamespace(goals=[_scope()]), clock=clock, claim_seconds=10
+        collector,
+        SimpleNamespace(goals=[_scope()]),
+        credential_store=credentials,
+        clock=clock,
+        claim_seconds=10,
     )
     return runner, collector, store, run_id, clock
 
@@ -162,6 +169,10 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     prompt = collector.turn_attempts[0][1]["text"]
     assert f"run_id: {run_id}" in prompt
     assert "wake_id:" in prompt and "action_intent" in prompt
+    assert "DROVER_CONTINUITY_OWNER_BEARER" in prompt
+    payload = collector.launches[0][1]
+    token = payload["continuity_owner_bearer"]
+    assert runner.credentials.find_active(token).owner_id == "drover:owner/goal-native"
     assert store.status(run_id)["owner"]["live"]
 
 
@@ -221,7 +232,11 @@ def test_expired_claim_after_restart_never_redispatches_a_mid_turn(tmp_path):
     # permission to send another turn into the same owner session.
     clock.advance(61)
     restarted = NativeOwnerRunner(
-        collector, runner.config, clock=clock, claim_seconds=10
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
     )
 
     assert restarted.process_once() == 0
@@ -264,7 +279,11 @@ def test_recorded_turn_stays_fenced_after_failed_submission_response(tmp_path):
     assert runner.process_once() == 0
     clock.advance(5)
     restarted = NativeOwnerRunner(
-        collector, runner.config, clock=clock, claim_seconds=10
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
     )
     assert restarted.process_once() == 0
     assert len(collector.turn_attempts) == 1
@@ -277,7 +296,11 @@ def test_restart_after_failed_submission_dead_letters_once(tmp_path):
     assert runner.process_once() == 0
     clock.advance(5)
     restarted = NativeOwnerRunner(
-        collector, runner.config, clock=clock, claim_seconds=10
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
     )
     for delay in (10, 20):
         assert restarted.process_once() == 0
@@ -331,6 +354,11 @@ def test_finished_turn_completes_claim_and_allows_next_wake_turn(tmp_path):
 
 def test_stale_owner_without_submitted_turn_is_fenced_recreated_and_acked(tmp_path):
     runner, collector, store, run_id, clock = _runner(tmp_path)
+    _, old_token = runner.credentials.issue(
+        scope="owner",
+        label="stale native owner",
+        owner_id="drover:owner/goal-native",
+    )
     scope = runner.config.goals[0]
     owner_id = scope.continuity_owner_id
     stale = runner.registry.create_session(
@@ -365,6 +393,16 @@ def test_stale_owner_without_submitted_turn_is_fenced_recreated_and_acked(tmp_pa
 
     assert runner.process_once() == 1
     assert len(collector.launches) == len(collector.turn_attempts) == 1
+    new_token = collector.launches[0][1]["continuity_owner_bearer"]
+    assert new_token != old_token
+    assert runner.credentials.find_active(old_token) is None
+    assert runner.credentials.find_active(new_token) is not None
+    assert not request_authorized(
+        AuthSettings(enabled=True, api_token="", credentials=runner.credentials),
+        {"Authorization": f"Bearer {old_token}"},
+        method="POST",
+        path="/harness/factory-observer/continuity",
+    )
     with control_plane_connection(runner.path) as con:
         generation, session_id = con.execute(
             """SELECT generation, session_id FROM continuity_owner_sessions

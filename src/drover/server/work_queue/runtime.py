@@ -360,7 +360,9 @@ class IdleUndeclaredWorker:
         self._stop.set()
 
 
-def start_idle_undeclared_worker(collector, config, shutdown_event):
+def start_idle_undeclared_worker(
+    collector, config, shutdown_event, *, credential_store=None
+):
     """Only goals that opted into an owner get idle-worker wakes."""
     if getattr(collector, "work_control", None) is None or not any(
         g.continuity_owner_id for g in config.goals
@@ -375,7 +377,11 @@ def start_idle_undeclared_worker(collector, config, shutdown_event):
     if native_scopes:
         from drover.server.work_queue.native_owner import NativeOwnerRunner
 
-        owner_runner = NativeOwnerRunner(collector, config)
+        if credential_store is None:
+            raise RuntimeError("native continuity owners require a credential store")
+        owner_runner = NativeOwnerRunner(
+            collector, config, credential_store=credential_store
+        )
     worker = IdleUndeclaredWorker(
         collector.duckdb_path,
         config.idle_undeclared_seconds,

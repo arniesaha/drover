@@ -27,12 +27,15 @@ def _now() -> datetime:
 class NativeOwnerRunner:
     """Deliver at most one outstanding observer action to each native owner."""
 
-    def __init__(self, collector, config, *, clock=_now, claim_seconds=3600):
+    def __init__(
+        self, collector, config, *, credential_store, clock=_now, claim_seconds=3600
+    ):
         self.collector = collector
         self.config = config
         self.path = collector.duckdb_path
         self.clock = clock
         self.claim_seconds = claim_seconds
+        self.credentials = credential_store
         self.registry = HarnessRegistry(self.path)
         self.continuity = FactoryObserverContinuity(self.path, clock=clock)
         self._ensure_schema()
@@ -151,6 +154,11 @@ class NativeOwnerRunner:
         host = self._host_for(scope)
         if host is None:
             return None
+        _, owner_token = self.credentials.issue(
+            scope="owner",
+            label="native continuity owner",
+            owner_id=link["owner_id"],
+        )
         payload = {
             "mode": "structured",
             "harness": scope.continuity_owner_harness,
@@ -159,6 +167,9 @@ class NativeOwnerRunner:
             "repo_name": scope.repo.split("/", 1)[1],
             "client_session_id": link["client_session_id"],
             "handoff_mode": "drover_native_continuity_owner",
+            # This token is intentionally launch-only: it is neither kept in
+            # the session registry nor recorded in the control plane.
+            "continuity_owner_bearer": owner_token,
         }
         if scope.continuity_owner_model:
             payload["model"] = scope.continuity_owner_model
@@ -239,7 +250,10 @@ class NativeOwnerRunner:
 
     def _recover_session(self, scope, run_id: str) -> None:
         """Fence an old harness owner, then give the run a fresh lease epoch."""
-        self.continuity.fence_owner(run_id, owner_id=self._owner(scope))
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+        self.credentials.revoke_owner(owner_id)
+        self.continuity.fence_owner(run_id, owner_id=owner_id)
         self._replace_link(scope, self._link(scope))
 
     def _has_active_claim(self, scope) -> bool:
@@ -326,6 +340,8 @@ class NativeOwnerRunner:
             f"action_fingerprint: {action['action_id']}\n"
             f"brief_ref: {scope.brief_ref}\n\n"
             "Use the Drover lease/consume/ack contract only for this delivered action. "
+            "Authenticate each continuity endpoint request with the bearer in "
+            "DROVER_CONTINUITY_OWNER_BEARER, never DROVER_API_TOKEN. "
             "Before any external write, persist an action_intent keyed by this wake id "
             "and action fingerprint, carry a deterministic wake-id marker in the write, "
             "reconcile an existing marker/intent before retrying, verify its artifact, "
@@ -346,8 +362,16 @@ class NativeOwnerRunner:
             return False
         status = self.continuity.status(run_id)
         owner = status["owner"]
-        epoch = owner["epoch"] if owner["id"] == owner_id and owner["live"] else None
+        prior_epoch = owner["epoch"] if owner["id"] == owner_id else None
+        epoch = prior_epoch if owner["live"] else None
         lease = self.continuity.lease(run_id, owner_id=owner_id, owner_epoch=epoch)
+        if prior_epoch is not None and lease["owner_epoch"] != prior_epoch:
+            # A naturally expired lease advances the epoch just as an explicit
+            # recovery fence does. The old session must not retain its bearer.
+            self.credentials.revoke_owner(owner_id)
+            if session_id is not None:
+                self._replace_link(scope, self._link(scope))
+                session_id = None
         action = self.continuity.consume(
             run_id, owner_id=owner_id, owner_epoch=lease["owner_epoch"]
         )

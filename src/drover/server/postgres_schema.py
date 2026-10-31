@@ -35,6 +35,7 @@ CONTINUITY_WAKES_MIGRATION = 35
 CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
 NATIVE_CONTINUITY_OWNER_MIGRATION = 37
 NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION = 38
+OWNER_CREDENTIAL_MIGRATION = 39
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1043,6 +1044,13 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     # Hub-native owner session links and turn fencing (#848).
     (NATIVE_CONTINUITY_OWNER_MIGRATION, NATIVE_OWNER_DDL),
     (NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION, NATIVE_OWNER_RECEIPT_DDL),
+    (
+        OWNER_CREDENTIAL_MIGRATION,
+        (
+            "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS owner_id TEXT",
+            "CREATE INDEX IF NOT EXISTS control_credentials_active_owner ON control_credentials (owner_id) WHERE scope = 'owner' AND revoked_at IS NULL",
+        ),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

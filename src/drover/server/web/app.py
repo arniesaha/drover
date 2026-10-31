@@ -77,6 +77,7 @@ from drover.server.web.auth import (
     bearer_credential,
     credential_allows_request,
     credential_matches_host,
+    credential_principal,
     request_authorized,
     session_cookie_value,
     token_matches,
@@ -2807,17 +2808,17 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         self._send(status, "application/json", json.dumps(result) + "\n")
 
     def _coordinator_acts_for_bound_owner(self, store, body, principal) -> bool:
-        """A Work-coordinator run is owned by a canonical agent session key or native owner.
+        """A Work-coordinator may act only for an agent-session owner.
 
-        No bearer principal can equal that key, so only the explicit
-        coordinator/operator principal may act for exactly the owner the run
-        was authorized for at launch; every other caller is still bound to its
-        own credential identity.
+        A native owner has its own scoped bearer and must match it exactly;
+        allowing the generic coordinator/operator bearer there would defeat
+        owner-session fencing. Agent session keys cannot have a matching
+        bearer, so they retain the narrow coordinator exception.
         """
         owner = body.get("owner_id")
         if (
             not isinstance(owner, str)
-            or not (owner.startswith("agent:") or owner.startswith("drover:owner/"))
+            or not owner.startswith("agent:")
             or principal != self._continuity_coordinator_principal()
         ):
             return False
@@ -2831,7 +2832,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         """Derive the bearer identity; observer handoffs enforce its authority."""
         credential = bearer_credential(self.auth, self.headers)
         if credential is not None:
-            return "credential:" + credential.id
+            return credential_principal(credential)
         return self._continuity_coordinator_principal()
 
     def _continuity_coordinator_principal(self) -> str | None:

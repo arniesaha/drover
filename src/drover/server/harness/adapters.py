@@ -50,6 +50,7 @@ class LaunchRequest:
     cwd: str | None = None
     command: tuple[str, ...] | None = None
     native_session_id: str | None = None
+    environment: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
