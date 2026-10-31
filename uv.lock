@@ -371,7 +371,7 @@ wheels = [
 
 [[package]]
 name = "drover"
-version = "0.6.54"
+version = "0.6.55"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
