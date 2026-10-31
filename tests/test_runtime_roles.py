@@ -835,7 +835,7 @@ def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
     monkeypatch.setattr(
         server_main,
         "load_auth",
-        lambda _cfg: SimpleNamespace(enabled=False, api_token=""),
+        lambda _cfg: SimpleNamespace(enabled=False, api_token="", credentials=None),
     )
     monkeypatch.setattr(server_main, "_configure_push", lambda *_args: None)
     monkeypatch.setattr(
