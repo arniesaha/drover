@@ -191,9 +191,20 @@ class NativeOwnerRunner:
     def _complete_finished_claim(self, scope, session_id: str) -> None:
         with control_plane_connection(self.path, timeout=5) as con:
             row = con.execute(
-                """SELECT wake_id, client_turn_id FROM continuity_owner_turn_claims
-                WHERE goal_id = ? AND owner_id = ? AND session_id = ?
-                AND state IN ('claimed', 'sent') LIMIT 1""",
+                """SELECT c.wake_id, c.client_turn_id,
+                EXISTS (
+                    SELECT 1 FROM factory_observer_inbox i
+                    WHERE i.event_id = c.wake_id AND i.run_id = c.run_id
+                    AND i.state = 'acknowledged'
+                ) AS acknowledged,
+                EXISTS (
+                    SELECT 1 FROM continuity_owner_action_intents r
+                    WHERE r.wake_id = c.wake_id AND r.run_id = c.run_id
+                    AND r.owner_id = c.owner_id AND r.state = 'complete'
+                ) AS receipted
+                FROM continuity_owner_turn_claims c
+                WHERE c.goal_id = ? AND c.owner_id = ? AND c.session_id = ?
+                AND c.state IN ('claimed', 'sent') LIMIT 1""",
                 [scope.goal_id, self._owner(scope), session_id],
             ).fetchone()
         if row is None or row[1] not in self.registry.recent_user_input_turn_ids(
@@ -203,7 +214,12 @@ class NativeOwnerRunner:
         session = self.registry.get_session(session_id)
         if session is None or session.effective_awaiting != "input":
             return
-        if session_id not in self.registry.completed_turn_kinds([session_id]):
+        completed = session_id in self.registry.completed_turn_kinds([session_id])
+        # Some native adapters return directly to awaiting=input without a
+        # turn_complete/turn-exited status.  That is safe only after the wake
+        # is durably acknowledged with its completed action-intent receipt;
+        # before then an input state alone could be stale while a turn runs.
+        if not completed and not (row[2] and row[3]):
             return
         with self._transaction() as con:
             con.execute(
