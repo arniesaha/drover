@@ -318,10 +318,30 @@ def test_restart_after_failed_submission_dead_letters_once(tmp_path):
     assert json.loads(action_json)["escalation"]["state"] == "blocked:human"
 
 
-def test_finished_turn_completes_claim_and_allows_next_wake_turn(tmp_path):
+def _acknowledge_current_wake(store, run_id, owner_id):
+    status = store.status(run_id)
+    owner = status["owner"]
+    action = status["next_action"]
+    fence = {"owner_id": owner_id, "owner_epoch": owner["epoch"]}
+    receipt = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact="issue-comment:done",
+    )
+    assert receipt["state"] == "complete"
+    store.acknowledge(run_id, **fence, event_id=action["event_id"], checkpoint="done")
+    return action["event_id"]
+
+
+def test_acknowledged_idle_owner_turn_completes_claim_and_delivers_successor(tmp_path):
     runner, collector, store, run_id, clock = _runner(tmp_path)
 
     assert runner.process_once() == 1
+    first_wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
     session_id = collector.launches[0][1]["client_session_id"]
     owner_session = runner.registry.session_by_client_id(session_id)
     runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
@@ -329,13 +349,9 @@ def test_finished_turn_completes_claim_and_allows_next_wake_turn(tmp_path):
         session_id=owner_session.session_id,
         event_type="status",
         seq=2,
-        payload={"payload": {"turn_complete": True, "awaiting": "input"}},
-    )
-    runner.registry.append_event(
-        session_id=owner_session.session_id,
-        event_type="status",
-        seq=3,
-        payload={"payload": {"exited": 0}},
+        # This is the native-owner terminal path seen in #905: it signals
+        # idle input without a turn_complete or exited marker.
+        payload={"payload": {"awaiting": "input"}},
     )
 
     store.report(
@@ -350,6 +366,40 @@ def test_finished_turn_completes_claim_and_allows_next_wake_turn(tmp_path):
     clock.advance(5)
     assert runner.process_once() == 1
     assert len(collector.turn_attempts) == 2
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
+def test_acknowledged_owner_claim_stays_sent_while_turn_is_executing(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    first_wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="ci-1",
+        subject="worker-1",
+        sequence=2,
+        kind="ci_green",
+        summary="ci green",
+    )
+
+    clock.advance(5)
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake_id],
+        ).fetchone()
+    assert state == "sent"
 
 
 def test_stale_owner_without_submitted_turn_is_fenced_recreated_and_acked(tmp_path):
