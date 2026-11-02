@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.56] - 2026-11-01
+
+### Fixed
+- Settle a native continuity owner's turn claim once the owner returns to
+  `awaiting=input` with an acknowledged wake and a completed action-intent
+  receipt, even without a `turn_complete`/`turn exited` event. Previously the
+  claim stayed `sent` and blocked the next serialized wake (#906).
+- Anchor the idle-undeclared test fixture clock to wall time; the fixed date
+  expired against the 7-day idle window on 2026-11-01.
+
 ## [0.6.55] - 2026-10-31
 
 ### Fixed
