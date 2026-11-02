@@ -11,7 +11,9 @@ from drover.server.harness.continuity import (
 )
 from drover.server.harness.registry import HarnessRegistry
 
-T0 = datetime(2026, 10, 25, 4, 0, tzinfo=timezone.utc)
+# Relative to the wall clock: HarnessBridge.active() ages sessions against real time
+# (idle_awaiting_input_minutes), so a fixed date silently expires after 7 days.
+T0 = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(second=0, microsecond=0)
 OWNER = "agent:coder:subagent:owner"
 
 
