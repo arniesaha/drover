@@ -167,9 +167,7 @@ def test_only_operator_label_events_create_autonomy_authority(credential):
     provider = GitHubProvider(
         "workspace-test", scope(), session=Session(Response([human]))
     )
-    assert provider.operator_authority_labels(ref(), item) == {
-        "autonomy:through-merge"
-    }
+    assert provider.operator_authority_labels(ref(), item) == {"autonomy:through-merge"}
     provider = GitHubProvider(
         "workspace-test", scope(), session=Session(Response([human, bot]))
     )

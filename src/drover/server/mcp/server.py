@@ -244,9 +244,13 @@ def build_mcp_server(
         return work_call(
             "delegate",
             dict(
-                goal_id=goal_id, number=number, request_key=request_key,
-                delegatee_principal=delegatee_principal, action=action,
-                stage=stage, expires_at=expires_at,
+                goal_id=goal_id,
+                number=number,
+                request_key=request_key,
+                delegatee_principal=delegatee_principal,
+                action=action,
+                stage=stage,
+                expires_at=expires_at,
             ),
         )
 
