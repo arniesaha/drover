@@ -1726,6 +1726,8 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             "/work/update",
             "/work/question",
             "/work/decide",
+            "/work/delegate",
+            "/work/revoke_delegation",
         }:
             body = self._read_json()
             if not isinstance(body, dict):

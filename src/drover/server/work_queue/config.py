@@ -271,6 +271,13 @@ class GitHubApprovalConfig(Model):
     stale_escalation_seconds: int = Field(default=14_400, ge=1800)
 
 
+class AuditedDelegationConfig(Model):
+    """Explicit server-side opt-in for one-use paired-human delegations."""
+
+    enabled: bool = False
+    max_lifetime_seconds: int = Field(default=3600, ge=60, le=86_400)
+
+
 class QueueExecutionConfig(Model):
     global_max_workers: int = Field(default=1, ge=1)
     # Awaiting-input workers remain resumable, but cannot reserve capacity forever.
@@ -289,6 +296,9 @@ class WorkQueueConfig(Model):
     github_webhook: GitHubWebhookConfig = Field(default_factory=GitHubWebhookConfig)
     rules: WorkItemRulesConfig = Field(default_factory=WorkItemRulesConfig)
     github_approvals: GitHubApprovalConfig = Field(default_factory=GitHubApprovalConfig)
+    audited_delegation: AuditedDelegationConfig = Field(
+        default_factory=AuditedDelegationConfig
+    )
     execution: QueueExecutionConfig = Field(default_factory=QueueExecutionConfig)
     # A bound worker idle at awaiting:input with output but no declared state
     # wakes its owner after this many seconds (continuity owner goals only).

@@ -31,6 +31,10 @@ class WorkActor:
     role: str
     human: bool = False
     host_id: str | None = None
+    # Only a device credential redeemed through the pairing flow has this
+    # provenance.  ``human`` alone is deliberately insufficient: it is also
+    # used by legacy/operator compatibility paths.
+    paired_human: bool = False
 
 
 def identity(*parts):
@@ -196,6 +200,11 @@ class WorkService:
         }
         if len(statuses) != 1 or not statuses <= set(policy.labels.statuses):
             raise ValueError("invalid status labels")
+        # GitHub labels are provider facts, never an authority channel.  In
+        # particular a bot (or any writer with label permission) cannot opt an
+        # issue into autonomous execution.
+        if any(label.startswith("autonomy:") for label in labels):
+            raise PermissionError("autonomy labels are not authority")
         for prefix, allowed in (
             (policy.labels.agent_prefix, policy.labels.agents),
             (policy.labels.priority_prefix, policy.labels.priorities),
@@ -225,6 +234,8 @@ class WorkService:
                 "update",
                 "question",
                 "decide",
+                "delegate",
+                "revoke_delegation",
             )
         }
         if operation not in methods:
@@ -412,10 +423,21 @@ class WorkService:
         actor,
         run_role="work",
         parent_session_id=None,
+        delegation_id=None,
     ):
         provider, policy, ref, item = self.item(goal_id, number)
-        self.coordinator(actor, policy)
         code(request_key)
+        if delegation_id is None:
+            self.coordinator(actor, policy)
+        else:
+            self.delegation_allowed(
+                delegation_id,
+                actor,
+                ref,
+                action="launch",
+                stage=run_role,
+                operation_key=request_key,
+            )
         if run_role not in {"work", "verify"}:
             raise ValueError("invalid run role")
         run_key = identity(
@@ -722,6 +744,84 @@ class WorkService:
             ),
             None,
         )
+
+    def delegation_allowed(
+        self, delegation_id, actor, ref, *, action, stage, operation_key
+    ):
+        """Consume (idempotently) a single, exact paired-human delegation."""
+        if not self.config.audited_delegation.enabled:
+            raise PermissionError("audited delegation is disabled")
+        if not isinstance(delegation_id, str) or not delegation_id:
+            raise PermissionError("delegation required")
+        if not self.store.consume_delegation(
+            delegation_id=delegation_id,
+            delegatee=actor.principal,
+            ref=ref,
+            action=action,
+            stage=stage,
+            operation_key=operation_key,
+        ):
+            raise PermissionError(
+                "delegation is invalid, expired, revoked, or replayed"
+            )
+
+    def delegate(
+        self,
+        goal_id,
+        number,
+        request_key,
+        delegatee_principal,
+        action,
+        stage,
+        expires_at,
+        *,
+        actor,
+    ):
+        """Create an auditable, one-use launch delegation from a paired device."""
+        _, _, ref, _ = self.item(goal_id, number)
+        if not self.config.audited_delegation.enabled:
+            raise PermissionError("audited delegation is disabled")
+        if not actor.paired_human:
+            raise PermissionError("authenticated paired device required")
+        code(request_key)
+        if not isinstance(delegatee_principal, str) or not delegatee_principal:
+            raise ValueError("delegatee principal required")
+        if not delegatee_principal.startswith("credential:"):
+            raise ValueError("credential delegatee required")
+        if action != "launch" or stage not in {"work", "verify"}:
+            raise ValueError("delegation action and stage not permitted")
+        if not isinstance(expires_at, str):
+            raise ValueError("delegation expiry required")
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("invalid delegation expiry") from exc
+        if expiry.tzinfo is None:
+            raise ValueError("delegation expiry timezone required")
+        now = datetime.now(timezone.utc)
+        lifetime = (expiry - now).total_seconds()
+        if not 0 < lifetime <= self.config.audited_delegation.max_lifetime_seconds:
+            raise ValueError("delegation expiry outside permitted lifetime")
+        return self.store.create_delegation(
+            actor=actor.principal,
+            ref=ref,
+            request_key=identity(
+                self.config.workspace_id, goal_id, number, request_key
+            ),
+            delegatee=delegatee_principal,
+            action=action,
+            stage=stage,
+            expires_at=expiry,
+        )
+
+    def revoke_delegation(self, delegation_id, *, actor):
+        if not actor.paired_human:
+            raise PermissionError("authenticated paired device required")
+        if not isinstance(delegation_id, str) or not delegation_id:
+            raise ValueError("delegation id required")
+        if not self.store.revoke_delegation(delegation_id, actor.principal):
+            raise PermissionError("delegation not found or not granted by actor")
+        return {"revoked": True}
 
     def question(self, goal_id, number, request_key, category, options, *, actor):
         _, policy, ref, _ = self.item(goal_id, number)
