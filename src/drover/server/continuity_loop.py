@@ -113,6 +113,18 @@ def _activity(facts: dict[str, Any]) -> datetime | None:
     stamps.append(_time(release.get("publishedAt")))
     worker = facts.get("worker") or {}
     stamps.append(_time(worker.get("last_activity")))
+    external_activity = facts.get("external_session_activity") or {}
+    for key, val in external_activity.items():
+        if (
+            key == (facts.get("markers") or {}).get("session")
+            or key == facts.get("session")
+            or key == (facts.get("markers") or {}).get("owner")
+            or key == facts.get("owner")
+            or key == facts.get("owner_id")
+            or key == facts.get("authorized_owner_id")
+            or key.startswith("agent:")
+        ):
+            stamps.append(_time(val))
     return max((stamp for stamp in stamps if stamp is not None), default=None)
 
 
@@ -250,6 +262,23 @@ def normalize_facts(facts: dict[str, Any]) -> dict[str, Any]:
         "startedAt": timestamp(release.get("startedAt"), "facts.release.startedAt"),
         "running": release.get("running", False),
     }
+
+    external_activity = facts.get("external_session_activity")
+    if external_activity is not None and not isinstance(external_activity, dict):
+        raise ValueError("facts.external_session_activity must be an object")
+    normalized_external_activity = {}
+    if external_activity:
+        if len(external_activity) > 32:
+            raise ValueError("facts.external_session_activity must be a bounded object")
+        for key, value in external_activity.items():
+            if not isinstance(key, str) or len(key) > 191 or not key:
+                raise ValueError(
+                    "facts.external_session_activity keys must be bounded non-empty strings"
+                )
+            normalized_external_activity[key] = timestamp(
+                value, f"facts.external_session_activity.{key}", required=True
+            )
+
     return {
         "number": number,
         "labels": labels,
@@ -260,6 +289,7 @@ def normalize_facts(facts: dict[str, Any]) -> dict[str, Any]:
         "bot": normalized_bot,
         "worker": normalized_worker,
         "release": normalized_release,
+        "external_session_activity": normalized_external_activity,
     }
 
 
