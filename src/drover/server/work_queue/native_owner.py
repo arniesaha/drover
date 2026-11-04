@@ -11,7 +11,7 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from drover.server.continuity_schema import NATIVE_OWNER_DDL
 from drover.server.db import control_plane_connection
@@ -38,6 +38,7 @@ class NativeOwnerRunner:
         self.credentials = credential_store
         self.registry = HarnessRegistry(self.path)
         self.continuity = FactoryObserverContinuity(self.path, clock=clock)
+        self._recovery_executor_id = str(uuid4())
         self._ensure_schema()
 
     @contextmanager
@@ -310,6 +311,24 @@ class NativeOwnerRunner:
         if recovery is None:
             return False
         recovery = dict(zip(columns, recovery))
+        # A durable executor lease serializes side effects across processes.
+        # A crashed executor is recoverable after its bounded lease expires.
+        with self._transaction() as con:
+            reserved = con.execute(
+                """UPDATE continuity_owner_recoveries SET executor_id = ?, executor_until = ?
+                WHERE wake_id = ? AND state = 'fencing'
+                  AND (executor_id IS NULL OR executor_id = ? OR executor_until <= ?)
+                RETURNING wake_id""",
+                [
+                    self._recovery_executor_id,
+                    self.clock() + timedelta(seconds=self.claim_seconds),
+                    wake_id,
+                    self._recovery_executor_id,
+                    self.clock(),
+                ],
+            ).fetchone()
+        if reserved is None:
+            return False
         # A stale runner must not touch a successor link or credential.
         if (recovery["old_generation"], recovery["old_client_session_id"]) != (
             link["generation"],

@@ -29,7 +29,7 @@ NATIVE_OWNER_DDL = (
     )""",
     "CREATE INDEX IF NOT EXISTS continuity_owner_turn_live ON continuity_owner_turn_claims (goal_id, owner_id, state, claim_until)",
     """CREATE TABLE IF NOT EXISTS continuity_owner_recoveries (
-      wake_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, owner_id TEXT NOT NULL, run_id TEXT NOT NULL, old_session_id TEXT NOT NULL, old_client_turn_id TEXT NOT NULL, old_claim_until TIMESTAMPTZ NOT NULL, old_generation INTEGER NOT NULL, old_client_session_id TEXT NOT NULL, old_owner_epoch BIGINT NOT NULL, state TEXT NOT NULL CHECK (state IN ('fencing', 'recovered')), created_at TIMESTAMPTZ NOT NULL, recovered_at TIMESTAMPTZ
+      wake_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, owner_id TEXT NOT NULL, run_id TEXT NOT NULL, old_session_id TEXT NOT NULL, old_client_turn_id TEXT NOT NULL, old_claim_until TIMESTAMPTZ NOT NULL, old_generation INTEGER NOT NULL, old_client_session_id TEXT NOT NULL, old_owner_epoch BIGINT NOT NULL, executor_id TEXT, executor_until TIMESTAMPTZ, state TEXT NOT NULL CHECK (state IN ('fencing', 'recovered')), created_at TIMESTAMPTZ NOT NULL, recovered_at TIMESTAMPTZ
     )""",
 )
 
