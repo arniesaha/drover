@@ -254,11 +254,19 @@ def test_third_failure_blocks_and_writes_systemic_review(service):
     assert max(l["failure_count"] for l in service.store.links()) == 3
 
 
-def test_bot_autonomy_label_is_never_authority(service):
+def test_unproven_autonomy_label_is_not_forwarded_as_authority(service):
     service.providers["goal"].data["labels"].append({"name": "autonomy:through-merge"})
-    with pytest.raises(PermissionError, match="autonomy labels"):
-        launch(service)
-    assert service.harness.calls == []
+    launch(service)
+    assert service.harness.calls[0][2]["labels"] == []
+
+
+def test_operator_authority_label_is_forwarded(service):
+    service.providers["goal"].data["labels"].append({"name": "autonomy:through-merge"})
+    service.providers["goal"].data["operator_authority_labels"] = [
+        "autonomy:through-merge"
+    ]
+    launch(service)
+    assert service.harness.calls[0][2]["labels"] == ["autonomy:through-merge"]
 
 
 def test_audited_paired_human_delegation_is_exact_revocable_and_idempotent(service):

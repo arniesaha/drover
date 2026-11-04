@@ -200,11 +200,6 @@ class WorkService:
         }
         if len(statuses) != 1 or not statuses <= set(policy.labels.statuses):
             raise ValueError("invalid status labels")
-        # GitHub labels are provider facts, never an authority channel.  In
-        # particular a bot (or any writer with label permission) cannot opt an
-        # issue into autonomous execution.
-        if any(label.startswith("autonomy:") for label in labels):
-            raise PermissionError("autonomy labels are not authority")
         for prefix, allowed in (
             (policy.labels.agent_prefix, policy.labels.agents),
             (policy.labels.priority_prefix, policy.labels.priorities),
