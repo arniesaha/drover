@@ -540,3 +540,41 @@ def test_terminal_failed_owner_turn_is_replaced_before_redelivery(tmp_path):
     assert runner.process_once() == 1
     assert len(collector.launches) == len(collector.turn_attempts) == 2
     assert collector.launches[1][1]["client_session_id"] != session_id
+
+
+def test_expired_sent_claim_missing_session_recovers_same_wake_once(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_token = collector.launches[0][1]["continuity_owner_bearer"]
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == 2
+    assert len(collector.turn_attempts) == 2
+    assert collector.turn_attempts[0][1]["client_turn_id"] == collector.turn_attempts[1][1]["client_turn_id"]
+    assert collector.launches[0][1]["client_session_id"] != collector.launches[1][1]["client_session_id"]
+    assert runner.credentials.find_active(old_token) is None
+    assert runner.credentials.find_active(collector.launches[1][1]["continuity_owner_bearer"]) is not None
+    with control_plane_connection(runner.path) as con:
+        assert con.execute("SELECT state FROM continuity_owner_recoveries").fetchone()[0] == "recovered"
+
+
+def test_abandoned_claim_fence_failure_leaves_blocking_claim(tmp_path, monkeypatch):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    monkeypatch.setattr(runner.continuity, "fence_owner", lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")))
+
+    with pytest.raises(ContinuityConflict, match="fence failed"):
+        runner.process_once()
+    with control_plane_connection(runner.path) as con:
+        assert con.execute("SELECT state FROM continuity_owner_turn_claims").fetchone()[0] == "sent"
+    assert len(collector.turn_attempts) == 1

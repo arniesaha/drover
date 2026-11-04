@@ -229,51 +229,37 @@ class NativeOwnerRunner:
                 [self.clock(), row[0], row[1]],
             )
 
-    def _settle_expired_claims(self, scope) -> None:
-        """Settle only expired claims whose own turn and receipt are complete.
+    def _recover_abandoned_claim(self, scope, row) -> bool:
+        """Fence one receiptless claim by exact snapshot before releasing it."""
+        wake_id, turn_id, session_id, run_id, claim_until = row
+        owner_id = self._owner(scope); assert owner_id is not None
+        link = self._link(scope); now = self.clock()
+        with self._transaction() as con:
+            inserted = con.execute("""INSERT INTO continuity_owner_recoveries (wake_id, goal_id, owner_id, run_id, old_session_id, old_client_turn_id, old_claim_until, old_generation, old_client_session_id, state, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'fencing', ? WHERE EXISTS (SELECT 1 FROM continuity_owner_turn_claims WHERE wake_id = ? AND goal_id = ? AND owner_id = ? AND run_id = ? AND session_id = ? AND client_turn_id = ? AND claim_until = ? AND state IN ('claimed', 'sent')) AND NOT EXISTS (SELECT 1 FROM continuity_owner_recoveries WHERE wake_id = ?) RETURNING wake_id""", [wake_id, scope.goal_id, owner_id, run_id, session_id, turn_id, claim_until, link['generation'], link['client_session_id'], now, wake_id, scope.goal_id, owner_id, run_id, session_id, turn_id, claim_until, wake_id]).fetchone()
+        if inserted is None: return False
+        self.credentials.revoke_owner(owner_id)
+        self.continuity.fence_owner(run_id, owner_id=owner_id)
+        generation = int(link['generation']) + 1; replacement = self._client_session_id(scope.goal_id, owner_id, generation)
+        with self._transaction() as con:
+            changed = con.execute("""DELETE FROM continuity_owner_turn_claims WHERE wake_id = ? AND goal_id = ? AND owner_id = ? AND run_id = ? AND session_id = ? AND client_turn_id = ? AND claim_until = ? AND state IN ('claimed', 'sent') RETURNING wake_id""", [wake_id, scope.goal_id, owner_id, run_id, session_id, turn_id, claim_until]).fetchone()
+            if changed is None: raise RuntimeError('abandoned owner claim changed during recovery')
+            changed_link = con.execute("""UPDATE continuity_owner_sessions SET session_id = NULL, generation = ?, client_session_id = ?, updated_at = ? WHERE goal_id = ? AND owner_id = ? AND generation = ? AND client_session_id = ? RETURNING owner_id""", [generation, replacement, self.clock(), scope.goal_id, owner_id, link['generation'], link['client_session_id']]).fetchone()
+            if changed_link is None: raise RuntimeError('owner session link changed during recovery')
+            con.execute("UPDATE continuity_owner_recoveries SET state = 'recovered', recovered_at = ? WHERE wake_id = ? AND state = 'fencing'", [self.clock(), wake_id])
+        return True
 
-        Claims from a replaced owner session otherwise fence successor wakes
-        forever. Expiry alone is never permission to redeliver: the original
-        submitted turn must be observable, terminal (or idle after a durable
-        receipt and acknowledgement), and bound to the same wake.
-        """
+    def _settle_expired_claims(self, scope) -> None:
+        """Settle terminal submitted turns; fence receiptless abandonment."""
         cutoff = self.clock()
         with control_plane_connection(self.path, timeout=5) as con:
-            rows = con.execute(
-                """SELECT c.wake_id, c.client_turn_id, c.session_id, c.run_id,
-                EXISTS (SELECT 1 FROM factory_observer_inbox i
-                       WHERE i.event_id = c.wake_id AND i.run_id = c.run_id
-                         AND i.state = 'acknowledged') AS acknowledged,
-                EXISTS (SELECT 1 FROM continuity_owner_action_intents r
-                       WHERE r.wake_id = c.wake_id AND r.run_id = c.run_id
-                         AND r.owner_id = c.owner_id AND r.state = 'complete') AS receipted
-                FROM continuity_owner_turn_claims c
-                WHERE c.goal_id = ? AND c.owner_id = ?
-                  AND c.state IN ('claimed', 'sent') AND c.claim_until <= ?""",
-                [scope.goal_id, self._owner(scope), cutoff],
-            ).fetchall()
-        for wake_id, turn_id, session_id, claim_run_id, acknowledged, receipted in rows:
-            session = self.registry.get_session(session_id)
-            submitted = session is not None and self.registry.has_user_input_turn_id(session_id, turn_id)
+            rows = con.execute("""SELECT c.wake_id, c.client_turn_id, c.session_id, c.run_id, c.claim_until, EXISTS (SELECT 1 FROM factory_observer_inbox i WHERE i.event_id = c.wake_id AND i.run_id = c.run_id AND i.state = 'acknowledged') AS acknowledged, EXISTS (SELECT 1 FROM continuity_owner_action_intents r WHERE r.wake_id = c.wake_id AND r.run_id = c.run_id AND r.owner_id = c.owner_id AND r.state = 'complete') AS receipted FROM continuity_owner_turn_claims c WHERE c.goal_id = ? AND c.owner_id = ? AND c.state IN ('claimed', 'sent') AND c.claim_until <= ?""", [scope.goal_id, self._owner(scope), cutoff]).fetchall()
+        for wake_id, turn_id, session_id, claim_run_id, claim_until, acknowledged, receipted in rows:
+            session = self.registry.get_session(session_id); submitted = session is not None and self.registry.has_user_input_turn_id(session_id, turn_id)
             if not submitted:
-                # Safe abandonment requires a prior-run fence first. The old bearer
-                # is revoked and its epoch advanced before this durable claim stops
-                # blocking a fresh owner; a fence failure leaves it untouched.
-                self.credentials.revoke_owner(self._owner(scope))
-                self.continuity.fence_owner(claim_run_id, owner_id=self._owner(scope))
-                self._replace_link(scope, self._link(scope))
-                with self._transaction() as con:
-                    con.execute("UPDATE continuity_owner_turn_claims SET state = 'abandoned', updated_at = ? WHERE wake_id = ? AND state IN ('claimed', 'sent')", [self.clock(), wake_id])
-                continue
+                self._recover_abandoned_claim(scope, (wake_id, turn_id, session_id, claim_run_id, claim_until)); continue
             completed = session_id in self.registry.completed_turn_kinds([session_id])
-            if not completed and not (session.effective_awaiting == 'input' and acknowledged and receipted):
-                continue
-            with self._transaction() as con:
-                con.execute(
-                    """UPDATE continuity_owner_turn_claims SET state = 'completed', updated_at = ?
-                    WHERE wake_id = ? AND client_turn_id = ? AND state IN ('claimed', 'sent')""",
-                    [self.clock(), wake_id, turn_id],
-                )
+            if not completed and not (session.effective_awaiting == 'input' and acknowledged and receipted): continue
+            with self._transaction() as con: con.execute("UPDATE continuity_owner_turn_claims SET state = 'completed', updated_at = ? WHERE wake_id = ? AND client_turn_id = ? AND state IN ('claimed', 'sent')", [self.clock(), wake_id, turn_id])
 
     def _recovery_needed(self, scope, run_id: str, session_id: str | None) -> bool:
         """Return whether a predecessor could not safely own another wake.
