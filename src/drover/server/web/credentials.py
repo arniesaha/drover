@@ -444,6 +444,26 @@ class CredentialStore:
                 self._write()
             return revoked
 
+    def revoke_owner_credential(self, owner_id: str, credential_id: str) -> bool:
+        """Revoke one known native-owner bearer, never a successor's bearer.
+
+        Recovery retains the credential identity that belonged to the fenced
+        session.  Treat an already-revoked matching credential as success so
+        a retry can finish after a concurrent successor issuance revoked it.
+        """
+        with self._lock:
+            credential = self._by_id.get(credential_id)
+            if (
+                credential is None
+                or credential.scope != "owner"
+                or credential.owner_id != owner_id
+            ):
+                return False
+            if credential.is_active:
+                self._index(replace(credential, revoked_at=_now_iso()))
+                self._write()
+            return True
+
     def list_all(self) -> list[Credential]:
         with self._lock:
             return sorted(self._by_id.values(), key=lambda item: item.created_at)
@@ -950,6 +970,24 @@ class PostgresCredentialStore:
                 [_now_iso(), owner_id],
             ).fetchone()
         return row is not None
+
+    def revoke_owner_credential(self, owner_id: str, credential_id: str) -> bool:
+        """Idempotently revoke exactly the recovered session's bearer."""
+        with self._connection() as con:
+            row = con.execute(
+                """SELECT revoked_at FROM control_credentials
+                   WHERE credential_id = ? AND scope = 'owner' AND owner_id = ?""",
+                [credential_id, owner_id],
+            ).fetchone()
+            if row is None:
+                return False
+            if row[0] is None:
+                con.execute(
+                    """UPDATE control_credentials SET revoked_at = ?
+                       WHERE credential_id = ? AND revoked_at IS NULL""",
+                    [_now_iso(), credential_id],
+                )
+        return True
 
     def list_all(self) -> list[Credential]:
         with self._connection() as con:

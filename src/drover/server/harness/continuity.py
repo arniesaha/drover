@@ -1061,21 +1061,61 @@ class FactoryObserverContinuity:
             "lease_until": until.isoformat(),
         }
 
-    def fence_owner(self, run_id: str, *, owner_id: str) -> int:
+    def fence_owner(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        expected_epoch: int | None = None,
+        recovery_wake_id: str | None = None,
+        recovery_executor_id: str | None = None,
+    ) -> int | None:
         """Invalidate a lost native-owner session before its replacement runs.
 
         This is a hub-only recovery primitive. The owner identity remains the
         same, but every lease token held by the replaced harness session is
         stale before the runner launches its successor.
         """
+        if (recovery_wake_id is None) != (recovery_executor_id is None):
+            raise ValueError("recovery fence requires wake and executor identity")
+        now = self.clock()
         with self._transaction(run_id) as (con, run):
             self._authorized_owner(run, owner_id)
+            if expected_epoch is not None and run["owner_epoch"] != expected_epoch:
+                return None
             epoch = run["owner_epoch"] + 1
-            con.execute(
+            clauses = ["run_id = ?", "owner_id = ?", "owner_epoch = ?"]
+            params: list[object] = [
+                epoch,
+                now,
+                now,
+                run_id,
+                owner_id,
+                run["owner_epoch"],
+            ]
+            if recovery_wake_id is not None:
+                clauses.append("""EXISTS (SELECT 1 FROM continuity_owner_recoveries r
+                    WHERE r.wake_id = ? AND r.state = 'fencing'
+                      AND r.executor_id = ? AND r.executor_until > ?)""")
+                params.extend([recovery_wake_id, recovery_executor_id, now])
+            changed = con.execute(
                 """UPDATE factory_observer_runs SET owner_epoch = ?, lease_until = ?,
-                updated_at = ? WHERE run_id = ?""",
-                [epoch, self.clock(), self.clock(), run_id],
-            )
+                updated_at = ? WHERE """
+                + " AND ".join(clauses)
+                + " RETURNING owner_epoch",
+                params,
+            ).fetchone()
+            if changed is None:
+                return None
+            if recovery_wake_id is not None:
+                marked = con.execute(
+                    """UPDATE continuity_owner_recoveries SET fenced_at = ?
+                    WHERE wake_id = ? AND state = 'fencing' AND executor_id = ?
+                      AND executor_until > ? RETURNING wake_id""",
+                    [now, recovery_wake_id, recovery_executor_id, now],
+                ).fetchone()
+                if marked is None:
+                    raise RuntimeError("recovery executor changed during owner fence")
         return epoch
 
     @staticmethod

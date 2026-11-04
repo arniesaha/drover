@@ -24,6 +24,10 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class _StaleRecovery(Exception):
+    """Abort a recovery transaction after its executor lost authority."""
+
+
 class NativeOwnerRunner:
     """Deliver at most one outstanding observer action to each native owner."""
 
@@ -97,12 +101,23 @@ class NativeOwnerRunner:
             scope.goal_id, link["owner_id"], generation
         )
         with self._transaction() as con:
-            con.execute(
+            changed = con.execute(
                 """UPDATE continuity_owner_sessions SET session_id = NULL,
-                generation = ?, client_session_id = ?, updated_at = ?
-                WHERE goal_id = ? AND owner_id = ?""",
-                [generation, client_session_id, now, scope.goal_id, link["owner_id"]],
-            )
+                credential_id = NULL, generation = ?, client_session_id = ?, updated_at = ?
+                WHERE goal_id = ? AND owner_id = ? AND generation = ?
+                AND client_session_id = ? RETURNING owner_id""",
+                [
+                    generation,
+                    client_session_id,
+                    now,
+                    scope.goal_id,
+                    link["owner_id"],
+                    link["generation"],
+                    link["client_session_id"],
+                ],
+            ).fetchone()
+        if changed is None:
+            return self._link(scope)
         return self._link(scope)
 
     def _host_for(self, scope):
@@ -182,7 +197,7 @@ class NativeOwnerRunner:
         host = self._host_for(scope)
         if host is None:
             return None
-        _, owner_token = self.credentials.issue(
+        credential, owner_token = self.credentials.issue(
             scope="owner",
             label="native continuity owner",
             owner_id=link["owner_id"],
@@ -211,8 +226,18 @@ class NativeOwnerRunner:
             return None
         with self._transaction() as con:
             con.execute(
-                "UPDATE continuity_owner_sessions SET session_id = ?, updated_at = ? WHERE goal_id = ? AND owner_id = ?",
-                [session_id, self.clock(), scope.goal_id, link["owner_id"]],
+                """UPDATE continuity_owner_sessions SET session_id = ?, credential_id = ?,
+                updated_at = ? WHERE goal_id = ? AND owner_id = ? AND generation = ?
+                AND client_session_id = ?""",
+                [
+                    session_id,
+                    credential.id,
+                    self.clock(),
+                    scope.goal_id,
+                    link["owner_id"],
+                    link["generation"],
+                    link["client_session_id"],
+                ],
             )
         return session_id
 
@@ -276,8 +301,8 @@ class NativeOwnerRunner:
                 """INSERT INTO continuity_owner_recoveries
                 (wake_id, goal_id, owner_id, run_id, old_session_id,
                  old_client_turn_id, old_claim_until, old_generation,
-                 old_client_session_id, old_owner_epoch, state, created_at)
-                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'fencing', ?
+                 old_client_session_id, old_credential_id, old_owner_epoch, state, created_at)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'fencing', ?
                 WHERE EXISTS (SELECT 1 FROM continuity_owner_turn_claims
                   WHERE wake_id = ? AND goal_id = ? AND owner_id = ? AND run_id = ?
                     AND session_id = ? AND client_turn_id = ? AND claim_until = ?
@@ -293,6 +318,7 @@ class NativeOwnerRunner:
                     claim_until,
                     link["generation"],
                     link["client_session_id"],
+                    link.get("credential_id"),
                     old_epoch,
                     now,
                     wake_id,
@@ -327,66 +353,111 @@ class NativeOwnerRunner:
                     self.clock(),
                 ],
             ).fetchone()
+            recovery = con.execute(
+                "SELECT * FROM continuity_owner_recoveries WHERE wake_id = ?", [wake_id]
+            ).fetchone()
+            columns = [column[0] for column in con.description]
         if reserved is None:
             return False
-        # A stale runner must not touch a successor link or credential.
-        if (recovery["old_generation"], recovery["old_client_session_id"]) != (
-            link["generation"],
-            link["client_session_id"],
-        ):
-            return False
-        status = self.continuity.status(run_id)["owner"]
+        assert recovery is not None
+        recovery = dict(zip(columns, recovery))
         old_epoch = recovery["old_owner_epoch"]
-        if (
-            status["id"] != owner_id
-            or status["epoch"] < old_epoch
-            or status["epoch"] > old_epoch + 1
+        old_credential_id = recovery.get("old_credential_id")
+        if old_credential_id and not self.credentials.revoke_owner_credential(
+            owner_id, old_credential_id
         ):
             return False
-        if status["epoch"] == old_epoch:
-            self.credentials.revoke_owner(owner_id)
-            self.continuity.fence_owner(run_id, owner_id=owner_id)
+        if recovery["fenced_at"] is None:
+            fenced_epoch = self.continuity.fence_owner(
+                run_id,
+                owner_id=owner_id,
+                expected_epoch=old_epoch,
+                recovery_wake_id=wake_id,
+                recovery_executor_id=self._recovery_executor_id,
+            )
+            if fenced_epoch is None:
+                return False
         generation = int(recovery["old_generation"]) + 1
         replacement = self._client_session_id(scope.goal_id, owner_id, generation)
-        with self._transaction() as con:
-            changed = con.execute(
-                """DELETE FROM continuity_owner_turn_claims WHERE wake_id = ?
-                AND goal_id = ? AND owner_id = ? AND run_id = ? AND session_id = ?
-                AND client_turn_id = ? AND claim_until = ? AND state IN ('claimed', 'sent')
-                RETURNING wake_id""",
-                [
-                    wake_id,
-                    scope.goal_id,
-                    owner_id,
-                    recovery["run_id"],
-                    recovery["old_session_id"],
-                    recovery["old_client_turn_id"],
-                    recovery["old_claim_until"],
-                ],
-            ).fetchone()
-            if changed is None:
-                raise RuntimeError("abandoned owner claim changed during recovery")
-            changed_link = con.execute(
-                """UPDATE continuity_owner_sessions SET session_id = NULL,
-                generation = ?, client_session_id = ?, updated_at = ?
-                WHERE goal_id = ? AND owner_id = ? AND generation = ?
-                AND client_session_id = ? RETURNING owner_id""",
-                [
-                    generation,
-                    replacement,
-                    self.clock(),
-                    scope.goal_id,
-                    owner_id,
-                    recovery["old_generation"],
-                    recovery["old_client_session_id"],
-                ],
-            ).fetchone()
-            if changed_link is None:
-                raise RuntimeError("owner session link changed during recovery")
-            con.execute(
-                "UPDATE continuity_owner_recoveries SET state = 'recovered', recovered_at = ? WHERE wake_id = ? AND state = 'fencing'",
-                [self.clock(), wake_id],
-            )
+        try:
+            with self._transaction() as con:
+                authoritative = con.execute(
+                    """SELECT wake_id FROM continuity_owner_recoveries
+                    WHERE wake_id = ? AND state = 'fencing' AND executor_id = ?
+                      AND executor_until > ? AND goal_id = ? AND owner_id = ?
+                      AND run_id = ? AND old_session_id = ? AND old_client_turn_id = ?
+                      AND old_claim_until = ? AND old_generation = ?
+                      AND old_client_session_id = ?
+                      AND (old_credential_id = ? OR (old_credential_id IS NULL AND ? IS NULL))
+                      AND old_owner_epoch = ? AND fenced_at IS NOT NULL
+                      AND EXISTS (SELECT 1 FROM factory_observer_runs r
+                        WHERE r.run_id = continuity_owner_recoveries.run_id
+                          AND r.owner_id = ? AND r.owner_epoch = ?)""",
+                    [
+                        wake_id,
+                        self._recovery_executor_id,
+                        self.clock(),
+                        scope.goal_id,
+                        owner_id,
+                        recovery["run_id"],
+                        recovery["old_session_id"],
+                        recovery["old_client_turn_id"],
+                        recovery["old_claim_until"],
+                        recovery["old_generation"],
+                        recovery["old_client_session_id"],
+                        old_credential_id,
+                        old_credential_id,
+                        old_epoch,
+                        owner_id,
+                        old_epoch + 1,
+                    ],
+                ).fetchone()
+                if authoritative is None:
+                    raise _StaleRecovery()
+                changed = con.execute(
+                    """DELETE FROM continuity_owner_turn_claims WHERE wake_id = ?
+                    AND goal_id = ? AND owner_id = ? AND run_id = ? AND session_id = ?
+                    AND client_turn_id = ? AND claim_until = ? AND state IN ('claimed', 'sent')
+                    RETURNING wake_id""",
+                    [
+                        wake_id,
+                        scope.goal_id,
+                        owner_id,
+                        recovery["run_id"],
+                        recovery["old_session_id"],
+                        recovery["old_client_turn_id"],
+                        recovery["old_claim_until"],
+                    ],
+                ).fetchone()
+                if changed is None:
+                    raise _StaleRecovery()
+                changed_link = con.execute(
+                    """UPDATE continuity_owner_sessions SET session_id = NULL,
+                    credential_id = NULL, generation = ?, client_session_id = ?, updated_at = ?
+                    WHERE goal_id = ? AND owner_id = ? AND generation = ?
+                    AND client_session_id = ? RETURNING owner_id""",
+                    [
+                        generation,
+                        replacement,
+                        self.clock(),
+                        scope.goal_id,
+                        owner_id,
+                        recovery["old_generation"],
+                        recovery["old_client_session_id"],
+                    ],
+                ).fetchone()
+                if changed_link is None:
+                    raise _StaleRecovery()
+                recovered = con.execute(
+                    """UPDATE continuity_owner_recoveries SET state = 'recovered', recovered_at = ?
+                    WHERE wake_id = ? AND state = 'fencing' AND executor_id = ?
+                      AND executor_until > ? RETURNING wake_id""",
+                    [self.clock(), wake_id, self._recovery_executor_id, self.clock()],
+                ).fetchone()
+                if recovered is None:
+                    raise _StaleRecovery()
+        except _StaleRecovery:
+            return False
         return True
 
     def _settle_expired_claims(self, scope) -> None:
@@ -461,13 +532,25 @@ class NativeOwnerRunner:
             == "failed"
         )
 
-    def _recover_session(self, scope, run_id: str) -> None:
+    def _recover_session(self, scope, run_id: str) -> bool:
         """Fence an old harness owner, then give the run a fresh lease epoch."""
         owner_id = self._owner(scope)
         assert owner_id is not None
-        self.credentials.revoke_owner(owner_id)
-        self.continuity.fence_owner(run_id, owner_id=owner_id)
-        self._replace_link(scope, self._link(scope))
+        link = self._link(scope)
+        if link.get("credential_id") and not self.credentials.revoke_owner_credential(
+            owner_id, link["credential_id"]
+        ):
+            return False
+        owner = self.continuity.status(run_id)["owner"]
+        if (
+            self.continuity.fence_owner(
+                run_id, owner_id=owner_id, expected_epoch=owner["epoch"]
+            )
+            is None
+        ):
+            return False
+        self._replace_link(scope, link)
+        return True
 
     def _has_active_claim(self, scope) -> bool:
         # A passed claim deadline marks a stuck claim; it never authorizes redelivery.
@@ -570,7 +653,8 @@ class NativeOwnerRunner:
             self._complete_finished_claim(scope, session_id)
         self._settle_expired_claims(scope)
         if self._recovery_needed(scope, run_id, session_id):
-            self._recover_session(scope, run_id)
+            if not self._recover_session(scope, run_id):
+                return False
             session_id = None
         if self._has_active_claim(scope):
             return False
@@ -582,9 +666,13 @@ class NativeOwnerRunner:
         if prior_epoch is not None and lease["owner_epoch"] != prior_epoch:
             # A naturally expired lease advances the epoch just as an explicit
             # recovery fence does. The old session must not retain its bearer.
-            self.credentials.revoke_owner(owner_id)
+            link = self._link(scope)
+            if link.get("credential_id"):
+                self.credentials.revoke_owner_credential(
+                    owner_id, link["credential_id"]
+                )
             if session_id is not None:
-                self._replace_link(scope, self._link(scope))
+                self._replace_link(scope, link)
                 session_id = None
         action = self.continuity.consume(
             run_id, owner_id=owner_id, owner_epoch=lease["owner_epoch"]
