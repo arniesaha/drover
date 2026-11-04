@@ -628,3 +628,46 @@ def test_fence_failure_journal_retries_without_second_epoch_fence(
     assert len(calls) == 1
     assert store.status(run_id)["owner"]["epoch"] == 3
     assert len(collector.turn_attempts) == 2
+
+
+def test_stale_recovery_snapshot_cannot_revoke_successor(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        row = con.execute(
+            "SELECT wake_id, client_turn_id, session_id, run_id, claim_until FROM continuity_owner_turn_claims"
+        ).fetchone()
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    assert runner._recover_abandoned_claim(runner.config.goals[0], row)
+    assert runner.process_once() == 1
+    successor = collector.launches[-1][1]["continuity_owner_bearer"]
+    epoch = runner.continuity.status(row[3])["owner"]["epoch"]
+
+    assert not runner._recover_abandoned_claim(runner.config.goals[0], row)
+    assert runner.credentials.find_active(successor) is not None
+    assert runner.continuity.status(row[3])["owner"]["epoch"] == epoch
+
+
+def test_terminal_session_cannot_bypass_fencing_journal(tmp_path, monkeypatch):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    runner.registry.update_session_status(session_id, "failed")
+    # This is the receiptless abandoned path: an existing terminal session
+    # must not replace the link before the missing submitted turn is fenced.
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [session_id])
+    clock.advance(11)
+    monkeypatch.setattr(
+        runner.continuity,
+        "fence_owner",
+        lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")),
+    )
+    with pytest.raises(ContinuityConflict):
+        runner.process_once()
+    link = runner._link(runner.config.goals[0])
+    assert runner._session(runner.config.goals[0], launch=False) is None
+    assert runner._link(runner.config.goals[0])["generation"] == link["generation"]

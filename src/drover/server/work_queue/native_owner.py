@@ -148,6 +148,33 @@ class NativeOwnerRunner:
                     )
             return session.session_id
         if session is not None:
+            # Normal claim completion must observe terminal sessions first.
+            # Only an expired still-live claim or an existing recovery journal
+            # blocks terminal replacement before its fencing settlement.
+            with control_plane_connection(self.path, timeout=5) as con:
+                blocked = con.execute(
+                    """SELECT 1 FROM continuity_owner_recoveries
+                    WHERE goal_id = ? AND owner_id = ?
+                      AND old_generation = ? AND old_client_session_id = ?
+                      AND state = 'fencing'
+                    UNION ALL
+                    SELECT 1 FROM continuity_owner_turn_claims
+                    WHERE goal_id = ? AND owner_id = ? AND session_id = ?
+                      AND state IN ('claimed', 'sent') AND claim_until <= ?
+                    LIMIT 1""",
+                    [
+                        scope.goal_id,
+                        link["owner_id"],
+                        link["generation"],
+                        link["client_session_id"],
+                        scope.goal_id,
+                        link["owner_id"],
+                        session.session_id,
+                        self.clock(),
+                    ],
+                ).fetchone()
+            if blocked is not None:
+                return None
             link = self._replace_link(scope, link)
         if not launch:
             return None
