@@ -230,6 +230,35 @@ def build_mcp_server(
             ),
         )
 
+    @mutation_tool(path="/work/delegate")
+    def drover_work_delegate(
+        goal_id: str,
+        number: int,
+        request_key: str,
+        delegatee_principal: str,
+        action: str,
+        stage: str,
+        expires_at: str,
+    ) -> dict:
+        """Create a one-use launch grant from an authenticated paired device."""
+        return work_call(
+            "delegate",
+            dict(
+                goal_id=goal_id,
+                number=number,
+                request_key=request_key,
+                delegatee_principal=delegatee_principal,
+                action=action,
+                stage=stage,
+                expires_at=expires_at,
+            ),
+        )
+
+    @mutation_tool(path="/work/revoke_delegation")
+    def drover_work_revoke_delegation(delegation_id: str) -> dict:
+        """Revoke one of the caller's unused audited delegation grants."""
+        return work_call("revoke_delegation", dict(delegation_id=delegation_id))
+
     @mutation_tool(path="/profile/proposals")
     def drover_profile_propose(
         layer: str,

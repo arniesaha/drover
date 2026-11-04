@@ -254,17 +254,104 @@ def test_third_failure_blocks_and_writes_systemic_review(service):
     assert max(l["failure_count"] for l in service.store.links()) == 3
 
 
-def test_launch_passes_issue_authority_to_harness(service):
+def test_unproven_autonomy_label_is_not_forwarded_as_authority(service):
     service.providers["goal"].data["labels"].append({"name": "autonomy:through-merge"})
-    service.providers["goal"].data[
-        "body"
-    ] = "Public behavioral acceptance\nHard stop: gateway restart"
     launch(service)
-    authority = service.harness.calls[0][2]
-    assert authority == {
-        "labels": ["goal:test", "status:queued", "autonomy:through-merge"],
-        "body": "Public behavioral acceptance\nHard stop: gateway restart",
+    assert service.harness.calls[0][2]["labels"] == []
+
+
+def test_operator_authority_label_is_forwarded(service):
+    service.providers["goal"].data["labels"].append({"name": "autonomy:through-merge"})
+    service.providers["goal"].data["operator_authority_labels"] = [
+        "autonomy:through-merge"
+    ]
+    launch(service)
+    assert service.harness.calls[0][2]["labels"] == ["autonomy:through-merge"]
+
+
+def test_audited_paired_human_delegation_is_exact_revocable_and_idempotent(service):
+    from datetime import datetime, timedelta, timezone
+
+    service.config = service.config.model_copy(
+        update={
+            "audited_delegation": service.config.audited_delegation.model_copy(
+                update={"enabled": True, "max_lifetime_seconds": 3600}
+            )
+        }
+    )
+    paired = WorkActor("credential:paired-device", "human", True, None, True)
+    worker = WorkActor("credential:worker", "worker")
+    expiry = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    grant_args = {
+        "goal_id": "goal",
+        "number": 1,
+        "request_key": "grant:one",
+        "delegatee_principal": worker.principal,
+        "action": "launch",
+        "stage": "work",
+        "expires_at": expiry,
     }
+    # Agent/coordinator assertions are not paired-human provenance.
+    with pytest.raises(PermissionError, match="paired device"):
+        service.call("delegate", grant_args, ACTOR)
+    grant = service.call("delegate", grant_args, paired)
+    assert service.call("delegate", grant_args, paired) == grant
+
+    launch_args = {
+        "goal_id": "goal",
+        "number": 1,
+        "request_key": "delegated:one",
+        "estimated_cost": 5,
+        "delegation_id": grant["delegation_id"],
+    }
+    assert (
+        service.call("launch", launch_args, worker)["actor_principal"]
+        == worker.principal
+    )
+    # Same idempotency key is a retry, not a second authorization/use.
+    assert service.call("launch", launch_args, worker)["run_key"]
+    with pytest.raises(PermissionError, match="replayed"):
+        service.call("launch", {**launch_args, "request_key": "delegated:two"}, worker)
+    with pytest.raises(PermissionError, match="invalid"):
+        service.call("launch", {**launch_args, "number": 2}, worker)
+    with pytest.raises(PermissionError, match="invalid"):
+        service.call("launch", {**launch_args, "run_role": "verify"}, worker)
+
+    revoked = service.call(
+        "delegate", {**grant_args, "request_key": "grant:revoked"}, paired
+    )
+    assert service.call(
+        "revoke_delegation", {"delegation_id": revoked["delegation_id"]}, paired
+    ) == {"revoked": True}
+    with pytest.raises(PermissionError, match="invalid"):
+        service.call(
+            "launch",
+            {
+                **launch_args,
+                "request_key": "revoked:one",
+                "delegation_id": revoked["delegation_id"],
+            },
+            worker,
+        )
+
+    expired = service.call(
+        "delegate", {**grant_args, "request_key": "grant:expired"}, paired
+    )
+    with service.store.connection() as con:
+        con.execute(
+            "UPDATE audited_delegations SET expires_at = now() - interval '1 second' WHERE id = ?",
+            [expired["delegation_id"]],
+        )
+    with pytest.raises(PermissionError, match="expired"):
+        service.call(
+            "launch",
+            {
+                **launch_args,
+                "request_key": "expired:one",
+                "delegation_id": expired["delegation_id"],
+            },
+            worker,
+        )
 
 
 def test_audit_metadata_only_and_append_only(service):

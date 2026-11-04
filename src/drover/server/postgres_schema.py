@@ -36,6 +36,7 @@ CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
 NATIVE_CONTINUITY_OWNER_MIGRATION = 37
 NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION = 38
 OWNER_CREDENTIAL_MIGRATION = 39
+AUDITED_DELEGATION_MIGRATION = 40
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1049,6 +1050,34 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         (
             "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS owner_id TEXT",
             "CREATE INDEX IF NOT EXISTS control_credentials_active_owner ON control_credentials (owner_id) WHERE scope = 'owner' AND revoked_at IS NULL",
+        ),
+    ),
+    # Paired-device grants are exact, short-lived and one-use. This is a
+    # local authority record, never a reflection of mutable GitHub labels.
+    (
+        AUDITED_DELEGATION_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS audited_delegations (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              grantor_principal TEXT NOT NULL,
+              delegatee_principal TEXT NOT NULL,
+              provider TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              item_number BIGINT NOT NULL CHECK (item_number > 0),
+              request_key TEXT NOT NULL CHECK (request_key ~ '^[a-f0-9]{64}$'),
+              action TEXT NOT NULL CHECK (action = 'launch'),
+              stage TEXT NOT NULL CHECK (stage IN ('work', 'verify')),
+              expires_at TIMESTAMPTZ NOT NULL,
+              revoked_at TIMESTAMPTZ,
+              used_at TIMESTAMPTZ,
+              use_key TEXT,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              UNIQUE (workspace_id, request_key)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS audited_delegations_lookup ON audited_delegations (workspace_id, id, expires_at)",
         ),
     ),
 )

@@ -405,6 +405,7 @@ def authenticated_actor(auth, headers, config):
             config.principal_roles.get(principal, "worker"),
             credential.scope == "device",
             credential.host_id,
+            credential.scope == "device",
         )
     authorization = headers.get("Authorization", "") or ""
     if (

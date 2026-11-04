@@ -166,6 +166,107 @@ class WorkStore:
                 ],
             )
 
+    def create_delegation(
+        self, *, actor, ref, request_key, delegatee, action, stage, expires_at
+    ):
+        """Persist a grant before returning it; identical requests are idempotent."""
+        delegation_id = str(uuid4())
+        with self.connection() as con:
+            con.execute(
+                """INSERT INTO audited_delegations
+                (id, workspace_id, grantor_principal, delegatee_principal, provider,
+                 repo, item_number, request_key, action, stage, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (workspace_id, request_key) DO NOTHING""",
+                [
+                    delegation_id,
+                    self.workspace_id,
+                    actor,
+                    delegatee,
+                    ref.provider,
+                    ref.repo,
+                    ref.number,
+                    request_key,
+                    action,
+                    stage,
+                    expires_at,
+                ],
+            )
+            rows = self.rows(
+                con.execute(
+                    "SELECT * FROM audited_delegations WHERE workspace_id = ? AND request_key = ?",
+                    [self.workspace_id, request_key],
+                )
+            )
+        row = rows[0]
+        if (
+            row["grantor_principal"],
+            row["delegatee_principal"],
+            row["provider"],
+            row["repo"],
+            row["item_number"],
+            row["action"],
+            row["stage"],
+            row["expires_at"],
+        ) != (
+            actor,
+            delegatee,
+            ref.provider,
+            ref.repo,
+            ref.number,
+            action,
+            stage,
+            expires_at,
+        ):
+            raise ValueError("delegation identity conflict")
+        return {
+            "delegation_id": row["id"],
+            "repo": row["repo"],
+            "number": row["item_number"],
+            "action": row["action"],
+            "stage": row["stage"],
+            "expires_at": row["expires_at"],
+        }
+
+    def consume_delegation(
+        self, *, delegation_id, delegatee, ref, action, stage, operation_key
+    ) -> bool:
+        """Atomically bind a one-use grant to one idempotency key."""
+        with self.connection() as con:
+            row = con.execute(
+                """UPDATE audited_delegations SET used_at = COALESCE(used_at, now()),
+                   use_key = COALESCE(use_key, ?)
+                   WHERE id = ? AND workspace_id = ? AND delegatee_principal = ?
+                     AND provider = ? AND repo = ? AND item_number = ?
+                     AND action = ? AND stage = ?
+                     AND (use_key = ? OR (use_key IS NULL AND revoked_at IS NULL
+                          AND expires_at > now()))
+                   RETURNING id""",
+                [
+                    operation_key,
+                    delegation_id,
+                    self.workspace_id,
+                    delegatee,
+                    ref.provider,
+                    ref.repo,
+                    ref.number,
+                    action,
+                    stage,
+                    operation_key,
+                ],
+            ).fetchone()
+        return row is not None
+
+    def revoke_delegation(self, delegation_id, actor) -> bool:
+        with self.connection() as con:
+            row = con.execute(
+                """UPDATE audited_delegations SET revoked_at = COALESCE(revoked_at, now())
+                   WHERE id = ? AND workspace_id = ? AND grantor_principal = ?
+                   RETURNING id""",
+                [delegation_id, self.workspace_id, actor],
+            ).fetchone()
+        return row is not None
+
     def failure(self, run_key, failures):
         with self.connection() as con:
             con.execute(

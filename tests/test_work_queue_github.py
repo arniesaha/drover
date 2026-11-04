@@ -152,6 +152,29 @@ def test_token_and_app_identity_repository_check(credential):
         provider.authenticate()
 
 
+def test_only_operator_label_events_create_autonomy_authority(credential):
+    item = {"labels": [{"name": "autonomy:through-merge"}]}
+    human = {
+        "event": "labeled",
+        "label": {"name": "autonomy:through-merge"},
+        "actor": {"login": "operator", "type": "User"},
+    }
+    bot = {
+        "event": "labeled",
+        "label": {"name": "autonomy:through-merge"},
+        "actor": {"login": "drover[bot]", "type": "Bot"},
+    }
+    provider = GitHubProvider(
+        "workspace-test", scope(), session=Session(Response([human]))
+    )
+    assert provider.operator_authority_labels(ref(), item) == {"autonomy:through-merge"}
+    provider = GitHubProvider(
+        "workspace-test", scope(), session=Session(Response([human, bot]))
+    )
+    # The latest event wins, so an App cannot re-apply an old human grant.
+    assert provider.operator_authority_labels(ref(), item) == set()
+
+
 def test_reads_labels_milestones_comments_pulls_checks_and_environment_gates(
     credential,
 ):
