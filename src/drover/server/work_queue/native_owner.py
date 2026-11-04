@@ -240,7 +240,7 @@ class NativeOwnerRunner:
         cutoff = self.clock()
         with control_plane_connection(self.path, timeout=5) as con:
             rows = con.execute(
-                """SELECT c.wake_id, c.client_turn_id, c.session_id,
+                """SELECT c.wake_id, c.client_turn_id, c.session_id, c.run_id,
                 EXISTS (SELECT 1 FROM factory_observer_inbox i
                        WHERE i.event_id = c.wake_id AND i.run_id = c.run_id
                          AND i.state = 'acknowledged') AS acknowledged,
@@ -252,9 +252,18 @@ class NativeOwnerRunner:
                   AND c.state IN ('claimed', 'sent') AND c.claim_until <= ?""",
                 [scope.goal_id, self._owner(scope), cutoff],
             ).fetchall()
-        for wake_id, turn_id, session_id, acknowledged, receipted in rows:
+        for wake_id, turn_id, session_id, claim_run_id, acknowledged, receipted in rows:
             session = self.registry.get_session(session_id)
-            if session is None or turn_id not in self.registry.recent_user_input_turn_ids(session_id, limit=20):
+            submitted = session is not None and turn_id in self.registry.recent_user_input_turn_ids(session_id, limit=10000)
+            if not submitted:
+                # Safe abandonment requires a prior-run fence first. The old bearer
+                # is revoked and its epoch advanced before this durable claim stops
+                # blocking a fresh owner; a fence failure leaves it untouched.
+                self.credentials.revoke_owner(self._owner(scope))
+                self.continuity.fence_owner(claim_run_id, owner_id=self._owner(scope))
+                self._replace_link(scope, self._link(scope))
+                with self._transaction() as con:
+                    con.execute("UPDATE continuity_owner_turn_claims SET state = 'abandoned', updated_at = ? WHERE wake_id = ? AND state IN ('claimed', 'sent')", [self.clock(), wake_id])
                 continue
             completed = session_id in self.registry.completed_turn_kinds([session_id])
             if not completed and not (session.effective_awaiting == 'input' and acknowledged and receipted):
