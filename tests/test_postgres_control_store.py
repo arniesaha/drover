@@ -849,6 +849,148 @@ def test_postgres_credentials_observe_cross_process_revocation(postgres_control_
     assert issuer.server_id == verifier.server_id
 
 
+def test_postgres_recovery_executor_cannot_fence_or_revoke_successor(
+    postgres_control_store,
+):
+    """A reclaimed executor can fence once without invalidating its successor."""
+    control_path, _ = postgres_control_store
+    from drover.schema import bootstrap_control_plane_store
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.continuity import (
+        ContinuityConflict,
+        FactoryObserverContinuity,
+    )
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    now = datetime(2026, 11, 4, tzinfo=timezone.utc)
+    owner_id = "drover:owner/pg-recovery"
+    run_id = "run-pg-recovery"
+    wake_id = "wake-pg-recovery"
+    credentials = PostgresCredentialStore(control_path)
+    continuity = FactoryObserverContinuity(control_path, clock=lambda: now)
+    HarnessRegistry(control_path).create_session(
+        session_id="pg-observer",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-pg-recovery@1",
+    )
+    continuity.initialize(
+        session_id="pg-observer",
+        objective="PostgreSQL native owner recovery",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    predecessor, predecessor_token = credentials.issue(
+        scope="owner", label="predecessor", owner_id=owner_id
+    )
+    lease = continuity.lease(run_id, owner_id=owner_id, lease_seconds=60)
+    continuity.report(
+        run_id,
+        source="hub",
+        source_event_id="pg-recovery-report",
+        subject="worker",
+        sequence=1,
+        kind="worker_blocked",
+        summary="blocked",
+    )
+    action = continuity.consume(
+        run_id, owner_id=owner_id, owner_epoch=lease["owner_epoch"]
+    )
+
+    with control_plane_connection(control_path) as con:
+        con.execute(
+            """INSERT INTO continuity_owner_recoveries
+            (wake_id, goal_id, owner_id, run_id, old_session_id,
+             old_client_turn_id, old_claim_until, old_generation,
+             old_client_session_id, old_credential_id, old_owner_epoch,
+             executor_id, executor_until, state, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'fencing', ?)""",
+            [
+                wake_id,
+                "goal-pg-recovery",
+                owner_id,
+                run_id,
+                "old-session",
+                "old-turn",
+                now,
+                1,
+                "old-client-session",
+                predecessor.id,
+                lease["owner_epoch"],
+                "executor-a",
+                now,
+                now,
+            ],
+        )
+        reclaimed = con.execute(
+            """UPDATE continuity_owner_recoveries
+            SET executor_id = ?, executor_until = ?
+            WHERE wake_id = ? AND state = 'fencing' AND executor_until <= ?
+            RETURNING wake_id""",
+            ["executor-b", now + timedelta(seconds=30), wake_id, now],
+        ).fetchone()
+    assert reclaimed == (wake_id,)
+
+    successor, successor_token = credentials.issue(
+        scope="owner", label="successor", owner_id=owner_id
+    )
+    assert credentials.find_active(predecessor_token) is None
+    assert credentials.find_active(successor_token).id == successor.id
+    # Replaying A's identity-specific side effect is harmless: it cannot turn
+    # into a legacy owner-wide revocation after B has issued the successor.
+    assert credentials.revoke_owner_credential(owner_id, predecessor.id)
+    assert credentials.find_active(successor_token).id == successor.id
+
+    assert (
+        continuity.fence_owner(
+            run_id,
+            owner_id=owner_id,
+            expected_epoch=lease["owner_epoch"],
+            recovery_wake_id=wake_id,
+            recovery_executor_id="executor-a",
+        )
+        is None
+    )
+    assert continuity.status(run_id)["owner"]["epoch"] == lease["owner_epoch"]
+    assert (
+        continuity.fence_owner(
+            run_id,
+            owner_id=owner_id,
+            expected_epoch=lease["owner_epoch"],
+            recovery_wake_id=wake_id,
+            recovery_executor_id="executor-b",
+        )
+        == lease["owner_epoch"] + 1
+    )
+    with pytest.raises(ContinuityConflict):
+        continuity.acknowledge(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=lease["owner_epoch"],
+            event_id=action["event_id"],
+            checkpoint="stale executor acknowledgement",
+        )
+
+    # The additive recovery columns and the populated journal survive a
+    # bootstrap rerun on the same disposable PostgreSQL schema.
+    bootstrap_control_plane_store(control_path)
+    with control_plane_connection(control_path) as con:
+        columns = {
+            row[0]
+            for row in con.execute("""SELECT column_name FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'continuity_owner_recoveries'""").fetchall()
+        }
+        assert {"old_credential_id", "fenced_at"} <= columns
+        assert con.execute(
+            "SELECT executor_id, fenced_at IS NOT NULL FROM continuity_owner_recoveries"
+        ).fetchone() == ("executor-b", True)
+
+
 def test_load_auth_uses_postgres_credentials_for_the_registered_control_path(
     postgres_control_store, tmp_path: Path
 ):
