@@ -229,6 +229,43 @@ class NativeOwnerRunner:
                 [self.clock(), row[0], row[1]],
             )
 
+    def _settle_expired_claims(self, scope) -> None:
+        """Settle only expired claims whose own turn and receipt are complete.
+
+        Claims from a replaced owner session otherwise fence successor wakes
+        forever. Expiry alone is never permission to redeliver: the original
+        submitted turn must be observable, terminal (or idle after a durable
+        receipt and acknowledgement), and bound to the same wake.
+        """
+        cutoff = self.clock()
+        with control_plane_connection(self.path, timeout=5) as con:
+            rows = con.execute(
+                """SELECT c.wake_id, c.client_turn_id, c.session_id,
+                EXISTS (SELECT 1 FROM factory_observer_inbox i
+                       WHERE i.event_id = c.wake_id AND i.run_id = c.run_id
+                         AND i.state = 'acknowledged') AS acknowledged,
+                EXISTS (SELECT 1 FROM continuity_owner_action_intents r
+                       WHERE r.wake_id = c.wake_id AND r.run_id = c.run_id
+                         AND r.owner_id = c.owner_id AND r.state = 'complete') AS receipted
+                FROM continuity_owner_turn_claims c
+                WHERE c.goal_id = ? AND c.owner_id = ?
+                  AND c.state IN ('claimed', 'sent') AND c.claim_until <= ?""",
+                [scope.goal_id, self._owner(scope), cutoff],
+            ).fetchall()
+        for wake_id, turn_id, session_id, acknowledged, receipted in rows:
+            session = self.registry.get_session(session_id)
+            if session is None or turn_id not in self.registry.recent_user_input_turn_ids(session_id, limit=20):
+                continue
+            completed = session_id in self.registry.completed_turn_kinds([session_id])
+            if not completed and not (session.effective_awaiting == 'input' and acknowledged and receipted):
+                continue
+            with self._transaction() as con:
+                con.execute(
+                    """UPDATE continuity_owner_turn_claims SET state = 'completed', updated_at = ?
+                    WHERE wake_id = ? AND client_turn_id = ? AND state IN ('claimed', 'sent')""",
+                    [self.clock(), wake_id, turn_id],
+                )
+
     def _recovery_needed(self, scope, run_id: str, session_id: str | None) -> bool:
         """Return whether a predecessor could not safely own another wake.
 
@@ -371,6 +408,7 @@ class NativeOwnerRunner:
         session_id = self._session(scope, launch=False)
         if session_id:
             self._complete_finished_claim(scope, session_id)
+        self._settle_expired_claims(scope)
         if self._recovery_needed(scope, run_id, session_id):
             self._recover_session(scope, run_id)
             session_id = None

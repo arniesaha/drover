@@ -17,6 +17,13 @@ from drover.server.work_queue.config import GoalScope
 from drover.server.work_queue.native_owner import NativeOwnerRunner
 
 
+@pytest.fixture(autouse=True)
+def _keep_test_host_launchable(monkeypatch):
+    """Registry timestamps are wall-clock based; keep this unit fixture independent of DST."""
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
+
+
 class Clock:
     now = datetime(2026, 10, 9, tzinfo=timezone.utc)
 
@@ -242,6 +249,42 @@ def test_expired_claim_after_restart_never_redispatches_a_mid_turn(tmp_path):
     assert restarted.process_once() == 0
     assert len(collector.turn_attempts) == 1
     assert collector.accepted_turns == {first_turn}
+
+
+def test_expired_sent_claim_with_completed_receipt_settles_for_successor(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    clock.advance(11)
+
+    runner._settle_expired_claims(runner.config.goals[0])
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?", [wake_id]
+        ).fetchone()
+    assert state == "completed"
+    assert not runner._has_active_claim(runner.config.goals[0])
+
+
+def test_expired_sent_claim_without_receipt_remains_fenced(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    clock.advance(11)
+
+    runner._settle_expired_claims(runner.config.goals[0])
+    assert runner._has_active_claim(runner.config.goals[0])
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 1
 
 
 def test_failed_owner_launches_exhaust_wake_once(tmp_path):
