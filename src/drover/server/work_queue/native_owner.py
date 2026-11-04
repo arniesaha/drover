@@ -254,7 +254,7 @@ class NativeOwnerRunner:
             ).fetchall()
         for wake_id, turn_id, session_id, claim_run_id, acknowledged, receipted in rows:
             session = self.registry.get_session(session_id)
-            submitted = session is not None and turn_id in self.registry.recent_user_input_turn_ids(session_id, limit=10000)
+            submitted = session is not None and self.registry.has_user_input_turn_id(session_id, turn_id)
             if not submitted:
                 # Safe abandonment requires a prior-run fence first. The old bearer
                 # is revoked and its epoch advanced before this durable claim stops

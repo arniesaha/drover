@@ -2595,6 +2595,19 @@ class HarnessRegistry:
                 turn_ids.append(turn_id)
         return turn_ids
 
+    def has_user_input_turn_id(self, session_id: str, turn_id: str) -> bool:
+        # Exact durable client-turn identity; not a bounded replay-cache window.
+        with self._connect() as con:
+            rows = _rows(con, "SELECT payload_json FROM harness_events WHERE session_id = ? AND event_type = 'user_input'", [session_id])
+        for row in rows:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("turn_id") == turn_id:
+                return True
+        return False
+
     def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
         """Classify idle turns without changing the session's resumable state.
 
