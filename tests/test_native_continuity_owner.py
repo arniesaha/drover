@@ -671,3 +671,38 @@ def test_terminal_session_cannot_bypass_fencing_journal(tmp_path, monkeypatch):
     link = runner._link(runner.config.goals[0])
     assert runner._session(runner.config.goals[0], launch=False) is None
     assert runner._link(runner.config.goals[0])["generation"] == link["generation"]
+
+
+def test_status_pause_cannot_revoke_successor_from_other_runner(tmp_path, monkeypatch):
+    runner_a, collector, _, _, clock = _runner(tmp_path)
+    assert runner_a.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    with control_plane_connection(runner_a.path) as con:
+        claim = con.execute(
+            "SELECT wake_id, client_turn_id, session_id, run_id, claim_until FROM continuity_owner_turn_claims"
+        ).fetchone()
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [session_id])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [session_id])
+    clock.advance(11)
+    runner_b = NativeOwnerRunner(
+        collector,
+        runner_a.config,
+        credential_store=runner_a.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    original_status = runner_a.continuity.status
+    paused = False
+
+    def status_then_other_runner(run_id):
+        nonlocal paused
+        if not paused:
+            paused = True
+            assert runner_b.process_once() == 1
+        return original_status(run_id)
+
+    monkeypatch.setattr(runner_a.continuity, "status", status_then_other_runner)
+    assert not runner_a._recover_abandoned_claim(runner_a.config.goals[0], claim)
+    successor = collector.launches[-1][1]["continuity_owner_bearer"]
+    assert runner_a.credentials.find_active(successor) is not None
+    assert len(collector.turn_attempts) == 2
