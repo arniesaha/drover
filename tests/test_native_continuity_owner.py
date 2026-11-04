@@ -266,7 +266,8 @@ def test_expired_sent_claim_with_completed_receipt_settles_for_successor(tmp_pat
     runner._settle_expired_claims(runner.config.goals[0])
     with control_plane_connection(runner.path) as con:
         [state] = con.execute(
-            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?", [wake_id]
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
         ).fetchone()
     assert state == "completed"
     assert not runner._has_active_claim(runner.config.goals[0])
@@ -555,12 +556,26 @@ def test_expired_sent_claim_missing_session_recovers_same_wake_once(tmp_path):
     assert runner.process_once() == 1
     assert len(collector.launches) == 2
     assert len(collector.turn_attempts) == 2
-    assert collector.turn_attempts[0][1]["client_turn_id"] == collector.turn_attempts[1][1]["client_turn_id"]
-    assert collector.launches[0][1]["client_session_id"] != collector.launches[1][1]["client_session_id"]
+    assert (
+        collector.turn_attempts[0][1]["client_turn_id"]
+        == collector.turn_attempts[1][1]["client_turn_id"]
+    )
+    assert (
+        collector.launches[0][1]["client_session_id"]
+        != collector.launches[1][1]["client_session_id"]
+    )
     assert runner.credentials.find_active(old_token) is None
-    assert runner.credentials.find_active(collector.launches[1][1]["continuity_owner_bearer"]) is not None
+    assert (
+        runner.credentials.find_active(
+            collector.launches[1][1]["continuity_owner_bearer"]
+        )
+        is not None
+    )
     with control_plane_connection(runner.path) as con:
-        assert con.execute("SELECT state FROM continuity_owner_recoveries").fetchone()[0] == "recovered"
+        assert (
+            con.execute("SELECT state FROM continuity_owner_recoveries").fetchone()[0]
+            == "recovered"
+        )
 
 
 def test_abandoned_claim_fence_failure_leaves_blocking_claim(tmp_path, monkeypatch):
@@ -571,10 +586,45 @@ def test_abandoned_claim_fence_failure_leaves_blocking_claim(tmp_path, monkeypat
         con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
         con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
     clock.advance(11)
-    monkeypatch.setattr(runner.continuity, "fence_owner", lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")))
+    monkeypatch.setattr(
+        runner.continuity,
+        "fence_owner",
+        lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")),
+    )
 
     with pytest.raises(ContinuityConflict, match="fence failed"):
         runner.process_once()
     with control_plane_connection(runner.path) as con:
-        assert con.execute("SELECT state FROM continuity_owner_turn_claims").fetchone()[0] == "sent"
+        assert (
+            con.execute("SELECT state FROM continuity_owner_turn_claims").fetchone()[0]
+            == "sent"
+        )
     assert len(collector.turn_attempts) == 1
+
+
+def test_fence_failure_journal_retries_without_second_epoch_fence(
+    tmp_path, monkeypatch
+):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    original = runner.continuity.fence_owner
+    calls = []
+
+    def fail_once(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ContinuityConflict("fence failed")
+
+    monkeypatch.setattr(runner.continuity, "fence_owner", fail_once)
+    with pytest.raises(ContinuityConflict, match="fence failed"):
+        runner.process_once()
+    monkeypatch.setattr(runner.continuity, "fence_owner", original)
+
+    assert runner.process_once() == 1
+    assert len(calls) == 1
+    assert store.status(run_id)["owner"]["epoch"] == 3
+    assert len(collector.turn_attempts) == 2
