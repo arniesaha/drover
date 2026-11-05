@@ -43,6 +43,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    40: "bb64a15b1b33c15395d2003c7bd8f20bfcee496b900a69afb5fc9f7a547c7e62",
     OWNER_CREDENTIAL_MIGRATION: "4f8a02bc72e85de23eb7f833664aff4e9fdf28d1436d2ed08910c1f4b7b24a38",
     NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION: "8808095813b5cfecc3dc9855f30abc2a2d7f8df46cbea4cb1758e654cd88aa68",
     NATIVE_CONTINUITY_OWNER_MIGRATION: "84f182dbb2eed84a5f82193f01846266fbae71ce0124ee59f1211d7deb3e919b",

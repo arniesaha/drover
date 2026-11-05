@@ -17,6 +17,13 @@ from drover.server.work_queue.config import GoalScope
 from drover.server.work_queue.native_owner import NativeOwnerRunner
 
 
+@pytest.fixture(autouse=True)
+def _keep_test_host_launchable(monkeypatch):
+    """Registry timestamps are wall-clock based; keep this unit fixture independent of DST."""
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
+
+
 class Clock:
     now = datetime(2026, 10, 9, tzinfo=timezone.utc)
 
@@ -242,6 +249,43 @@ def test_expired_claim_after_restart_never_redispatches_a_mid_turn(tmp_path):
     assert restarted.process_once() == 0
     assert len(collector.turn_attempts) == 1
     assert collector.accepted_turns == {first_turn}
+
+
+def test_expired_sent_claim_with_completed_receipt_settles_for_successor(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    clock.advance(11)
+
+    runner._settle_expired_claims(runner.config.goals[0])
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+    assert not runner._has_active_claim(runner.config.goals[0])
+
+
+def test_expired_sent_claim_without_receipt_remains_fenced(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    clock.advance(11)
+
+    runner._settle_expired_claims(runner.config.goals[0])
+    assert runner._has_active_claim(runner.config.goals[0])
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 1
 
 
 def test_failed_owner_launches_exhaust_wake_once(tmp_path):
@@ -497,3 +541,381 @@ def test_terminal_failed_owner_turn_is_replaced_before_redelivery(tmp_path):
     assert runner.process_once() == 1
     assert len(collector.launches) == len(collector.turn_attempts) == 2
     assert collector.launches[1][1]["client_session_id"] != session_id
+
+
+def test_expired_sent_claim_missing_session_recovers_same_wake_once(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_token = collector.launches[0][1]["continuity_owner_bearer"]
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == 2
+    assert len(collector.turn_attempts) == 2
+    assert (
+        collector.turn_attempts[0][1]["client_turn_id"]
+        == collector.turn_attempts[1][1]["client_turn_id"]
+    )
+    assert (
+        collector.launches[0][1]["client_session_id"]
+        != collector.launches[1][1]["client_session_id"]
+    )
+    assert runner.credentials.find_active(old_token) is None
+    assert (
+        runner.credentials.find_active(
+            collector.launches[1][1]["continuity_owner_bearer"]
+        )
+        is not None
+    )
+    with control_plane_connection(runner.path) as con:
+        assert (
+            con.execute("SELECT state FROM continuity_owner_recoveries").fetchone()[0]
+            == "recovered"
+        )
+
+
+def test_abandoned_claim_fence_failure_leaves_blocking_claim(tmp_path, monkeypatch):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    monkeypatch.setattr(
+        runner.continuity,
+        "fence_owner",
+        lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")),
+    )
+
+    with pytest.raises(ContinuityConflict, match="fence failed"):
+        runner.process_once()
+    with control_plane_connection(runner.path) as con:
+        assert (
+            con.execute("SELECT state FROM continuity_owner_turn_claims").fetchone()[0]
+            == "sent"
+        )
+    assert len(collector.turn_attempts) == 1
+
+
+def test_fence_failure_journal_retries_without_second_epoch_fence(
+    tmp_path, monkeypatch
+):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    original = runner.continuity.fence_owner
+    calls = []
+
+    def fail_once(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ContinuityConflict("fence failed")
+
+    monkeypatch.setattr(runner.continuity, "fence_owner", fail_once)
+    with pytest.raises(ContinuityConflict, match="fence failed"):
+        runner.process_once()
+    monkeypatch.setattr(runner.continuity, "fence_owner", original)
+
+    assert runner.process_once() == 1
+    assert len(calls) == 1
+    assert store.status(run_id)["owner"]["epoch"] == 3
+    assert len(collector.turn_attempts) == 2
+
+
+def test_stale_recovery_snapshot_cannot_revoke_successor(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        row = con.execute(
+            "SELECT wake_id, client_turn_id, session_id, run_id, claim_until FROM continuity_owner_turn_claims"
+        ).fetchone()
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    assert runner._recover_abandoned_claim(runner.config.goals[0], row)
+    assert runner.process_once() == 1
+    successor = collector.launches[-1][1]["continuity_owner_bearer"]
+    epoch = runner.continuity.status(row[3])["owner"]["epoch"]
+
+    assert not runner._recover_abandoned_claim(runner.config.goals[0], row)
+    assert runner.credentials.find_active(successor) is not None
+    assert runner.continuity.status(row[3])["owner"]["epoch"] == epoch
+
+
+def test_terminal_session_cannot_bypass_fencing_journal(tmp_path, monkeypatch):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    runner.registry.update_session_status(session_id, "failed")
+    # This is the receiptless abandoned path: an existing terminal session
+    # must not replace the link before the missing submitted turn is fenced.
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [session_id])
+    clock.advance(11)
+    monkeypatch.setattr(
+        runner.continuity,
+        "fence_owner",
+        lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")),
+    )
+    with pytest.raises(ContinuityConflict):
+        runner.process_once()
+    link = runner._link(runner.config.goals[0])
+    assert runner._session(runner.config.goals[0], launch=False) is None
+    assert runner._link(runner.config.goals[0])["generation"] == link["generation"]
+
+
+def test_status_pause_cannot_revoke_successor_from_other_runner(tmp_path, monkeypatch):
+    runner_a, collector, _, _, clock = _runner(tmp_path)
+    assert runner_a.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    with control_plane_connection(runner_a.path) as con:
+        claim = con.execute(
+            "SELECT wake_id, client_turn_id, session_id, run_id, claim_until FROM continuity_owner_turn_claims"
+        ).fetchone()
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [session_id])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [session_id])
+    clock.advance(11)
+    runner_b = NativeOwnerRunner(
+        collector,
+        runner_a.config,
+        credential_store=runner_a.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    original_status = runner_a.continuity.status
+    paused = False
+
+    def status_then_other_runner(run_id):
+        nonlocal paused
+        if not paused:
+            paused = True
+            assert runner_b.process_once() == 1
+        return original_status(run_id)
+
+    monkeypatch.setattr(runner_a.continuity, "status", status_then_other_runner)
+    assert not runner_a._recover_abandoned_claim(runner_a.config.goals[0], claim)
+    successor = collector.launches[-1][1]["continuity_owner_bearer"]
+    assert runner_a.credentials.find_active(successor) is not None
+    assert len(collector.turn_attempts) == 2
+
+
+def test_expired_recovery_executor_cannot_revoke_or_fence_successor(
+    tmp_path, monkeypatch
+):
+    """An executor lease fences the Python frame, not merely its reservation."""
+    runner_a, collector, store, run_id, clock = _runner(tmp_path)
+    assert runner_a.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner_a.path) as con:
+        claim = con.execute(
+            "SELECT wake_id, client_turn_id, session_id, run_id, claim_until "
+            "FROM continuity_owner_turn_claims"
+        ).fetchone()
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    runner_b = NativeOwnerRunner(
+        collector,
+        runner_a.config,
+        credential_store=runner_a.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    original_revoke = runner_a.credentials.revoke_owner_credential
+    paused = False
+    successor_epoch = None
+
+    def expire_then_reclaim(owner_id, credential_id):
+        nonlocal paused, successor_epoch
+        if not paused:
+            paused = True
+            # A has reserved the recovery.  Its executor lease now expires
+            # before the irreversible credential/epoch side effects.
+            clock.advance(11)
+            assert runner_b.process_once() == 1
+            successor_epoch = store.status(run_id)["owner"]["epoch"]
+        return original_revoke(owner_id, credential_id)
+
+    monkeypatch.setattr(
+        runner_a.credentials, "revoke_owner_credential", expire_then_reclaim
+    )
+    assert not runner_a._recover_abandoned_claim(runner_a.config.goals[0], claim)
+
+    successor = collector.launches[-1][1]["continuity_owner_bearer"]
+    assert runner_a.credentials.find_active(successor) is not None
+    assert store.status(run_id)["owner"]["epoch"] == successor_epoch
+    assert len(collector.turn_attempts) == 2
+    with control_plane_connection(runner_a.path) as con:
+        state, executor_id = con.execute(
+            "SELECT state, executor_id FROM continuity_owner_recoveries"
+        ).fetchone()
+    assert state == "recovered"
+    assert executor_id == runner_b._recovery_executor_id
+
+
+def test_recovery_revocation_failure_keeps_claim_blocked_until_retry(
+    tmp_path, monkeypatch
+):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    original_revoke = runner.credentials.revoke_owner_credential
+    monkeypatch.setattr(
+        runner.credentials, "revoke_owner_credential", lambda *_args: False
+    )
+
+    assert runner.process_once() == 0
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims"
+        ).fetchone() == ("sent",)
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("fencing",)
+
+    monkeypatch.setattr(runner.credentials, "revoke_owner_credential", original_revoke)
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+
+
+def test_crashed_post_fence_executor_reclaims_one_same_wake(tmp_path, monkeypatch):
+    runner_a, collector, _, _, clock = _runner(tmp_path)
+    assert runner_a.process_once() == 1
+    first_turn = collector.turn_attempts[0][1]["client_turn_id"]
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner_a.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    original_fence = runner_a.continuity.fence_owner
+
+    def fence_then_crash(*args, **kwargs):
+        original_fence(*args, **kwargs)
+        raise RuntimeError("simulated executor crash after fence")
+
+    monkeypatch.setattr(runner_a.continuity, "fence_owner", fence_then_crash)
+    with pytest.raises(RuntimeError, match="simulated executor crash"):
+        runner_a.process_once()
+    with control_plane_connection(runner_a.path) as con:
+        assert con.execute(
+            "SELECT state, fenced_at IS NOT NULL FROM continuity_owner_recoveries"
+        ).fetchone() == ("fencing", True)
+
+    clock.advance(11)
+    runner_b = NativeOwnerRunner(
+        collector,
+        runner_a.config,
+        credential_store=runner_a.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert runner_b.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+    assert collector.turn_attempts[-1][1]["client_turn_id"] == first_turn
+    with control_plane_connection(runner_a.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("recovered",)
+
+
+def test_populated_v0656_native_owner_upgrade_rehearsal_is_additive(
+    tmp_path, monkeypatch
+):
+    """Rehearse the v0.6.56 native tables through journal use and rollback read."""
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        # This is the exact v0.6.56 session shape, populated with a sent claim.
+        con.execute("DROP TABLE continuity_owner_recoveries")
+        con.execute("ALTER TABLE continuity_owner_sessions RENAME TO v0656_sessions")
+        con.execute("""CREATE TABLE continuity_owner_sessions (
+            goal_id TEXT NOT NULL, owner_id TEXT NOT NULL, session_id TEXT,
+            client_session_id TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (goal_id, owner_id), UNIQUE (client_session_id))""")
+        con.execute("""INSERT INTO continuity_owner_sessions
+            (goal_id, owner_id, session_id, client_session_id, generation, updated_at)
+            SELECT goal_id, owner_id, session_id, client_session_id, generation, updated_at
+            FROM v0656_sessions""")
+        con.execute("DROP TABLE v0656_sessions")
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [session_id])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [session_id])
+
+    # Upgrade, then rerun the additive DDL as a process restart would.
+    upgraded = NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    with control_plane_connection(runner.path) as con:
+        session_columns = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info('continuity_owner_sessions')"
+            ).fetchall()
+        }
+        recovery_columns = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info('continuity_owner_recoveries')"
+            ).fetchall()
+        }
+    assert "credential_id" in session_columns
+    assert "old_credential_id" in recovery_columns
+
+    clock.advance(11)
+    monkeypatch.setattr(
+        upgraded.continuity,
+        "fence_owner",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ContinuityConflict("hold")),
+    )
+    with pytest.raises(ContinuityConflict, match="hold"):
+        upgraded.process_once()
+
+    with control_plane_connection(runner.path) as con:
+        # A v0.6.56 binary never reads the additive journal. Its old claim
+        # query still sees the pending sent row during a failed new recovery.
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims"
+        ).fetchone() == ("sent",)
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("fencing",)
+
+    # The failed upgraded process has left its bounded executor lease behind.
+    clock.advance(11)
+    resumed = NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert resumed.process_once() == 1
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("recovered",)
