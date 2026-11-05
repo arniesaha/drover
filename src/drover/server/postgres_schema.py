@@ -7,8 +7,9 @@ from time import monotonic
 from typing import Any
 
 from drover.server.continuity_schema import (
-    NATIVE_OWNER_DDL,
+    NATIVE_OWNER_BASE_DDL,
     NATIVE_OWNER_RECEIPT_DDL,
+    NATIVE_OWNER_RECOVERY_DDL,
     POSTGRES_V10_CONTINUITY_DDL,
 )
 from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
@@ -36,6 +37,7 @@ CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
 NATIVE_CONTINUITY_OWNER_MIGRATION = 37
 NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION = 38
 OWNER_CREDENTIAL_MIGRATION = 39
+NATIVE_OWNER_RECOVERY_MIGRATION = 40
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1042,7 +1044,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         ("ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",),
     ),
     # Hub-native owner session links and turn fencing (#848).
-    (NATIVE_CONTINUITY_OWNER_MIGRATION, NATIVE_OWNER_DDL),
+    (NATIVE_CONTINUITY_OWNER_MIGRATION, NATIVE_OWNER_BASE_DDL),
     (NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION, NATIVE_OWNER_RECEIPT_DDL),
     (
         OWNER_CREDENTIAL_MIGRATION,
@@ -1051,6 +1053,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "CREATE INDEX IF NOT EXISTS control_credentials_active_owner ON control_credentials (owner_id) WHERE scope = 'owner' AND revoked_at IS NULL",
         ),
     ),
+    (NATIVE_OWNER_RECOVERY_MIGRATION, NATIVE_OWNER_RECOVERY_DDL),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

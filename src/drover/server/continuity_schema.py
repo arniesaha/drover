@@ -11,7 +11,7 @@ CONTINUITY_TABLES = (*CONTINUITY_BASE_TABLES, CONTINUITY_RECEIPT_TABLE)
 # state.  A turn claim is intentionally separate from the observer delivery:
 # a lost hub process may retry the same client turn id, but cannot overlap a
 # second turn on its linked owner session.
-NATIVE_OWNER_DDL = (
+NATIVE_OWNER_BASE_DDL = (
     """CREATE TABLE IF NOT EXISTS continuity_owner_sessions (
       goal_id TEXT NOT NULL, owner_id TEXT NOT NULL,
       session_id TEXT, client_session_id TEXT NOT NULL,
@@ -28,6 +28,10 @@ NATIVE_OWNER_DDL = (
       updated_at TIMESTAMPTZ NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS continuity_owner_turn_live ON continuity_owner_turn_claims (goal_id, owner_id, state, claim_until)",
+)
+
+# Recovery DDL belongs to additive PostgreSQL migration 40.
+NATIVE_OWNER_RECOVERY_DDL = (
     """CREATE TABLE IF NOT EXISTS continuity_owner_recoveries (
       wake_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, owner_id TEXT NOT NULL, run_id TEXT NOT NULL, old_session_id TEXT NOT NULL, old_client_turn_id TEXT NOT NULL, old_claim_until TIMESTAMPTZ NOT NULL, old_generation INTEGER NOT NULL, old_client_session_id TEXT NOT NULL, old_credential_id TEXT, old_owner_epoch BIGINT NOT NULL, executor_id TEXT, executor_until TIMESTAMPTZ, fenced_at TIMESTAMPTZ, state TEXT NOT NULL CHECK (state IN ('fencing', 'recovered')), created_at TIMESTAMPTZ NOT NULL, recovered_at TIMESTAMPTZ
     )""",
@@ -35,6 +39,8 @@ NATIVE_OWNER_DDL = (
     "ALTER TABLE continuity_owner_recoveries ADD COLUMN IF NOT EXISTS old_credential_id TEXT",
     "ALTER TABLE continuity_owner_recoveries ADD COLUMN IF NOT EXISTS fenced_at TIMESTAMPTZ",
 )
+
+NATIVE_OWNER_DDL = (*NATIVE_OWNER_BASE_DDL, *NATIVE_OWNER_RECOVERY_DDL)
 
 NATIVE_OWNER_RECEIPT_DDL = (
     """CREATE TABLE IF NOT EXISTS continuity_owner_action_intents (

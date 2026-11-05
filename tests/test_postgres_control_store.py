@@ -1290,3 +1290,42 @@ def test_postgres_concurrent_host_issuance_keeps_one_active(postgres_control_sto
         )
     assert sum(stores[0].find_active(token) is not None for _, token in issued) == 1
     assert sum(item.is_active for item in stores[0].list_all()) == 1
+
+
+def test_native_recovery_migration_upgrades_released_store(postgres_control_store):
+    from drover.server.control_store import postgres_control_store as pg_store
+    from drover.server.db import control_plane_connection
+    from drover.server.postgres_schema import NATIVE_OWNER_RECOVERY_MIGRATION
+
+    path, _ = postgres_control_store
+    with control_plane_connection(path) as con:
+        con.execute("DROP TABLE continuity_owner_recoveries")
+        con.execute("ALTER TABLE continuity_owner_sessions DROP COLUMN credential_id")
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [NATIVE_OWNER_RECOVERY_MIGRATION],
+        )
+        con.execute(
+            "INSERT INTO continuity_owner_sessions "
+            "(goal_id, owner_id, session_id, client_session_id, generation, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                "upgrade-goal",
+                "upgrade-owner",
+                "old-session",
+                "old-client",
+                7,
+                datetime.now(timezone.utc),
+            ],
+        )
+    pg_store(path).bootstrap()
+    pg_store(path).bootstrap()
+    with control_plane_connection(path) as con:
+        assert con.execute(
+            "SELECT session_id, generation, credential_id FROM continuity_owner_sessions "
+            "WHERE goal_id = ?",
+            ["upgrade-goal"],
+        ).fetchone() == ("old-session", 7, None)
+        assert con.execute(
+            "SELECT count(*) FROM continuity_owner_recoveries"
+        ).fetchone() == (0,)
