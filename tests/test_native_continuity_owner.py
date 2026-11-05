@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -919,3 +920,30 @@ def test_populated_v0656_native_owner_upgrade_rehearsal_is_additive(
         assert con.execute(
             "SELECT state FROM continuity_owner_recoveries"
         ).fetchone() == ("recovered",)
+
+
+@pytest.fixture(autouse=True)
+def _native_owner_connection_has_no_cursor_description(monkeypatch):
+    """Enforce PostgreSQL's result-only description contract in all recovery tests."""
+    import drover.server.work_queue.native_owner as native_owner
+
+    original = native_owner.control_plane_connection
+
+    class ConnectionOnly:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, *args, **kwargs):
+            return self.connection.execute(*args, **kwargs)
+
+        def __getattr__(self, name):
+            if name == "description":
+                raise AttributeError("description belongs to the execute result")
+            return getattr(self.connection, name)
+
+    @contextmanager
+    def connect(*args, **kwargs):
+        with original(*args, **kwargs) as connection:
+            yield ConnectionOnly(connection)
+
+    monkeypatch.setattr(native_owner, "control_plane_connection", connect)
