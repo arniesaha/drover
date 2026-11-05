@@ -1329,3 +1329,48 @@ def test_native_recovery_migration_upgrades_released_store(postgres_control_stor
         assert con.execute(
             "SELECT count(*) FROM continuity_owner_recoveries"
         ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("legacy_null_credential", [False, True])
+def test_native_owner_full_recovery_uses_typed_nullable_credential(
+    postgres_control_store, tmp_path, monkeypatch, legacy_null_credential
+):
+    # Run the actual native runner against PostgreSQL, not a cursor-shaped fake.
+    import test_native_continuity_owner as native
+
+    from drover.server.control_store import close_control_store, configure_control_store
+    from drover.server.db import control_plane_connection
+
+    _, config = postgres_control_store
+    path = tmp_path / "control.duckdb"
+    configure_control_store(path, config)
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
+    try:
+        runner, collector, store, run_id, clock = native._runner(tmp_path)
+        assert runner.process_once() == 1
+        old_session = collector.turn_attempts[0][0]
+        with control_plane_connection(path) as con:
+            con.execute(
+                "DELETE FROM harness_events WHERE session_id = ?", [old_session]
+            )
+            con.execute(
+                "DELETE FROM harness_sessions WHERE session_id = ?", [old_session]
+            )
+            if legacy_null_credential:
+                con.execute("UPDATE continuity_owner_sessions SET credential_id = NULL")
+        clock.advance(11)
+        assert runner.process_once() == 1
+        assert len(collector.launches) == 2
+        assert (
+            collector.turn_attempts[0][1]["client_turn_id"]
+            == collector.turn_attempts[1][1]["client_turn_id"]
+        )
+        with control_plane_connection(path) as con:
+            state, fenced = con.execute(
+                "SELECT state, fenced_at IS NOT NULL FROM continuity_owner_recoveries"
+            ).fetchone()
+        assert (state, fenced) == ("recovered", True)
+        assert store.status(run_id)["owner"]["epoch"] >= 2
+    finally:
+        close_control_store(path)

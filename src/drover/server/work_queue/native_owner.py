@@ -390,7 +390,7 @@ class NativeOwnerRunner:
                       AND run_id = ? AND old_session_id = ? AND old_client_turn_id = ?
                       AND old_claim_until = ? AND old_generation = ?
                       AND old_client_session_id = ?
-                      AND (old_credential_id = ? OR (old_credential_id IS NULL AND ? IS NULL))
+                      AND old_credential_id IS NOT DISTINCT FROM ?
                       AND old_owner_epoch = ? AND fenced_at IS NOT NULL
                       AND EXISTS (SELECT 1 FROM factory_observer_runs r
                         WHERE r.run_id = continuity_owner_recoveries.run_id
@@ -407,7 +407,6 @@ class NativeOwnerRunner:
                         recovery["old_claim_until"],
                         recovery["old_generation"],
                         recovery["old_client_session_id"],
-                        old_credential_id,
                         old_credential_id,
                         old_epoch,
                         owner_id,
