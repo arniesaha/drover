@@ -330,10 +330,11 @@ class NativeOwnerRunner:
                     claim_until,
                 ],
             )
-            recovery = con.execute(
+            result = con.execute(
                 "SELECT * FROM continuity_owner_recoveries WHERE wake_id = ?", [wake_id]
-            ).fetchone()
-            columns = [column[0] for column in con.description]
+            )
+            columns = [column[0] for column in result.description]
+            recovery = result.fetchone()
         if recovery is None:
             return False
         recovery = dict(zip(columns, recovery))
@@ -353,10 +354,11 @@ class NativeOwnerRunner:
                     self.clock(),
                 ],
             ).fetchone()
-            recovery = con.execute(
+            result = con.execute(
                 "SELECT * FROM continuity_owner_recoveries WHERE wake_id = ?", [wake_id]
-            ).fetchone()
-            columns = [column[0] for column in con.description]
+            )
+            columns = [column[0] for column in result.description]
+            recovery = result.fetchone()
         if reserved is None:
             return False
         assert recovery is not None
