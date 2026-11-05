@@ -1374,3 +1374,54 @@ def test_native_owner_full_recovery_uses_typed_nullable_credential(
         assert store.status(run_id)["owner"]["epoch"] >= 2
     finally:
         close_control_store(path)
+
+
+def test_postgres_final_acknowledged_owner_turn_settles_without_successor(
+    postgres_control_store, tmp_path, monkeypatch
+):
+    # Exercise the real PostgreSQL control store: no fake cursor or DB layer.
+    import test_native_continuity_owner as native
+
+    from drover.server.control_store import close_control_store, configure_control_store
+    from drover.server.db import control_plane_connection
+
+    _, config = postgres_control_store
+    path = tmp_path / "control.duckdb"
+    configure_control_store(path, config)
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
+    try:
+        runner, collector, store, run_id, _ = native._runner(tmp_path)
+        assert runner.process_once() == 1
+        wake_id = native._acknowledge_current_wake(
+            store, run_id, runner.config.goals[0].continuity_owner_id
+        )
+        owner_session = runner.registry.session_by_client_id(
+            collector.launches[0][1]["client_session_id"]
+        )
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            seq=2,
+            payload={"payload": {"turn_complete": True, "awaiting": "input"}},
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            seq=3,
+            payload={"payload": {"exited": 0}},
+        )
+
+        assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+        assert runner.process_once() == 0
+        with control_plane_connection(path) as con:
+            [state] = con.execute(
+                "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+                [wake_id],
+            ).fetchone()
+        assert state == "completed"
+    finally:
+        close_control_store(path)
