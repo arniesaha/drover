@@ -282,6 +282,25 @@ class NativeOwnerRunner:
                 [self.clock(), row[0], row[1]],
             )
 
+    def _complete_finished_claims(self, scope) -> None:
+        """Settle terminal owner turns even when their run has no next action.
+
+        owner_runs intentionally lists only action-bearing runs. An owner can
+        acknowledge its final wake before its turn reaches its terminal
+        harness event, leaving no run for _process_run to revisit. Scan only
+        already-claimed session identities; settlement keeps its receipt,
+        acknowledgement, and awaiting-input fences.
+        """
+        with control_plane_connection(self.path, timeout=5) as con:
+            rows = con.execute(
+                """SELECT DISTINCT session_id FROM continuity_owner_turn_claims
+                WHERE goal_id = ? AND owner_id = ?
+                AND state IN ('claimed', 'sent')""",
+                [scope.goal_id, self._owner(scope)],
+            ).fetchall()
+        for (session_id,) in rows:
+            self._complete_finished_claim(scope, session_id)
+
     def _recover_abandoned_claim(self, scope, row) -> bool:
         """Resume one fenced abandonment by its immutable journal snapshot.
 
@@ -713,6 +732,7 @@ class NativeOwnerRunner:
             owner_id = self._owner(scope)
             if owner_id is None:
                 continue
+            self._complete_finished_claims(scope)
             for run_id in self.continuity.owner_runs(owner_id):
                 dispatched += int(self._process_run(scope, run_id))
         return dispatched

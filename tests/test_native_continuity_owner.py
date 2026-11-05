@@ -419,6 +419,41 @@ def test_acknowledged_idle_owner_turn_completes_claim_and_delivers_successor(tmp
     assert state == "completed"
 
 
+def test_final_acknowledged_owner_turn_completes_claim_without_successor(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"turn_complete": True, "awaiting": "input"}},
+    )
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=3,
+        payload={"payload": {"exited": 0}},
+    )
+
+    # The final acknowledged wake leaves owner_runs empty.
+    assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+    assert runner.process_once() == 0
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
 def test_acknowledged_owner_claim_stays_sent_while_turn_is_executing(tmp_path):
     runner, collector, store, run_id, clock = _runner(tmp_path)
 
