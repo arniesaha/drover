@@ -1399,13 +1399,19 @@ def test_postgres_final_acknowledged_owner_turn_settles_without_successor(
         owner_session = runner.registry.session_by_client_id(
             collector.launches[0][1]["client_session_id"]
         )
-        runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
         runner.registry.append_event(
-            session_id=owner_session.session_id, event_type="status", seq=2,
+            session_id=owner_session.session_id,
+            event_type="status",
+            seq=2,
             payload={"payload": {"turn_complete": True, "awaiting": "input"}},
         )
         runner.registry.append_event(
-            session_id=owner_session.session_id, event_type="status", seq=3,
+            session_id=owner_session.session_id,
+            event_type="status",
+            seq=3,
             payload={"payload": {"exited": 0}},
         )
 
