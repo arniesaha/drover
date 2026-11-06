@@ -2,8 +2,9 @@
 
 import duckdb
 import pytest
+
 from drover.server.lake.export_worker import _merge_events, _stage
-from drover.server.lake.rebuild_worker import POLICY_SCHEMA, LINEAGE
+from drover.server.lake.rebuild_worker import LINEAGE, POLICY_SCHEMA
 
 SCHEMA = POLICY_SCHEMA | LINEAGE
 
