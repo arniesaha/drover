@@ -257,8 +257,8 @@ def test_profile_startup_is_one_bounded_general_call(pg_control_path):
     assert result["oldest_item_age_seconds"] >= 0
 
 def test_lake_read_avoids_redundant_precheck_but_canonical_read_fails_closed(monkeypatch, tmp_path):
-    from drover.server.lake.runtime import LakeError
     from drover.server.lake import serving
+    from drover.server.lake.runtime import LakeError
     from drover.server.mcp import tools
 
     class Selected:

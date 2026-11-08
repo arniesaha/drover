@@ -3,6 +3,7 @@ import pytest
 from drover.server.lake.rebuild import PROVIDER_SCHEMA
 from drover.server.lake.runtime import create_table
 
+
 class Capture:
     def __init__(self): self.sql = []
     def execute(self, sql): self.sql.append(sql)
