@@ -255,3 +255,30 @@ def test_profile_startup_is_one_bounded_general_call(pg_control_path):
     assert result["token_upper_bound"] == len(result["bundle"].encode()) <= 1500
     assert result["data_watermark"]["basis"] == "rendered_profile_source_at"
     assert result["oldest_item_age_seconds"] >= 0
+
+def test_lake_read_avoids_redundant_precheck_but_canonical_read_fails_closed(monkeypatch, tmp_path):
+    from drover.server.lake.runtime import LakeError
+    from drover.server.lake import serving
+    from drover.server.mcp import tools
+
+    class Selected:
+        backend = "ducklake"
+        epoch = "test-epoch"
+
+    monkeypatch.setattr(serving, "selected_config", lambda path: Selected())
+    calls = []
+
+    def blocked(path):
+        calls.append(path)
+        raise LakeError("analytics_deadline_exceeded")
+
+    monkeypatch.setattr(serving, "check_selected", blocked)
+    assert tools._lake_read(lambda **_: {"status": "ok"})(duckdb_path=tmp_path) == {"status": "ok"}
+    assert calls == []
+    assert tools._canonical_read(lambda **_: {"status": "ok"})(duckdb_path=tmp_path) == {
+        "status": "unavailable",
+        "analytics_backend": "ducklake",
+        "analytics_epoch": "test-epoch",
+        "reason": "analytics_deadline_exceeded",
+    }
+    assert calls == [tmp_path]
