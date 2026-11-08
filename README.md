@@ -176,8 +176,8 @@ device signing, and server configuration.
 ## Status and limitations
 
 Drover is source-distributed software for technical users operating a trusted
-personal fleet. The latest release is **v0.6.26**; see the
-[changelog](CHANGELOG.md) for upgrade notes and changes. The Python server and
+personal fleet. The latest public release is **v0.6.56**; see the
+[changelog](CHANGELOG.md) and [GitHub releases](https://github.com/arniesaha/drover/releases) for upgrade notes and checksums. Verify a pinned public release with `install.sh --verify-release`; private validation artifacts are not public releases. The Python server and
 native iOS client are
 functional. The iOS app is built from source or distributed to testers through
 the TestFlight production lane; it is not on the public App Store. Push notifications work when the
