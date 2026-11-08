@@ -214,7 +214,15 @@ def create_table(
     """Create a stable table once; never replace or implicitly evolve a schema."""
     import re
 
-    allowed = {"VARCHAR", "VARCHAR[]", "BIGINT", "INTEGER", "DOUBLE", "BOOLEAN", "TIMESTAMPTZ"}
+    allowed = {
+        "VARCHAR",
+        "VARCHAR[]",
+        "BIGINT",
+        "INTEGER",
+        "DOUBLE",
+        "BOOLEAN",
+        "TIMESTAMPTZ",
+    }
     if not re.fullmatch(r"[a-z_][a-z_0-9]*", name):
         raise ValueError("invalid table name")
     if not columns or any(
