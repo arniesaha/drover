@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.57] - 2026-11-08
+
+### Fixed
+- Preserve provider harness lists during lake rebuilds and reject unexpected source columns before import.
+- Route MCP replay, summary, and search reads through the selected lake worker, avoiding redundant prechecks while preserving fail-closed responses.
+
+### Known limitations
+- The Studio Claude CLI recap and handoff integration requires an existing authenticated login and was not exercised for this release candidate.
+- Release recovery remains limited to the documented, rollback-capable operator procedures; this release does not broaden recovery authority.
+
 ## [0.6.56] - 2026-11-01
 
 ### Fixed

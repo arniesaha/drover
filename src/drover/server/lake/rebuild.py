@@ -83,7 +83,7 @@ PROVIDER_SCHEMA = (
         ],
         "DOUBLE",
     )
-    | {"window_minutes": "BIGINT"}
+    | {"window_minutes": "BIGINT", "harnesses": "VARCHAR[]"}
 )
 OUTBOX_SCHEMA = dict.fromkeys(
     [

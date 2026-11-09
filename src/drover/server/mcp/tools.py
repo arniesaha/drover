@@ -582,7 +582,7 @@ def drover_handoff(
 # --- drover_session_replay ----------------------------------------------------
 
 
-@_canonical_read
+@_lake_read
 def drover_session_replay(
     *,
     duckdb_path: Path,
@@ -623,7 +623,7 @@ def drover_session_replay(
 # --- drover_session_summary ---------------------------------------------------
 
 
-@_canonical_read
+@_lake_read
 def drover_session_summary(
     *,
     duckdb_path: Path,
@@ -691,7 +691,7 @@ def _utc_partition_date(since: str) -> str | None:
     return instant.astimezone(timezone.utc).date().isoformat()
 
 
-@_canonical_read
+@_lake_read
 def drover_search(
     *,
     duckdb_path: Path,
