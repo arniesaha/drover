@@ -482,6 +482,178 @@ def test_acknowledged_owner_claim_stays_sent_while_turn_is_executing(tmp_path):
     assert state == "sent"
 
 
+def _ingest_owner_events(runner, collector, events):
+    """Exercise the HTTP ingest handler without opening a listening service."""
+    from drover.server.web.app import _MetricsHandler
+
+    responses = []
+    handler = SimpleNamespace(
+        headers={},
+        auth=SimpleNamespace(enabled=False),
+        collector=collector,
+        _read_json=lambda: {"events": events},
+        _harness_registry=lambda: runner.registry,
+        _send=lambda status, content_type, body: responses.append(
+            (status, json.loads(body))
+        ),
+    )
+    _MetricsHandler._ingest_harness_events(handler)
+    return responses
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_completion_predicate_keeps_turn_boundary_and_durable_evidence(
+    tmp_path, nested
+):
+    runner, collector, _, _, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    session_id, turn = collector.turn_attempts[0]
+    registry = runner.registry
+    assert not registry.has_completed_turn(session_id, turn["client_turn_id"])
+    assert not registry.has_completed_turn(session_id, "unsubmitted-turn")
+    completion = {"turn_complete": True}
+    registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        payload={"payload": completion} if nested else completion,
+    )
+    registry.append_event(
+        session_id=session_id, event_type="status", payload={"awaiting": "input"}
+    )
+    assert registry.has_completed_turn(session_id, turn["client_turn_id"])
+    registry.append_event(
+        session_id=session_id, event_type="user_input", payload={"turn_id": "next-turn"}
+    )
+    assert not registry.has_completed_turn(session_id, "next-turn")
+    # A successor's completion cannot be borrowed by a submitted turn that
+    # never completed before the next input arrived.
+    registry.append_event(
+        session_id=session_id,
+        event_type="user_input",
+        payload={"turn_id": "third-turn"},
+    )
+    registry.append_event(
+        session_id=session_id, event_type="status", payload=completion
+    )
+    assert not registry.has_completed_turn(session_id, "next-turn")
+    assert registry.has_completed_turn(session_id, "third-turn")
+
+
+def test_post_ingest_completion_settles_claim_and_delivers_successor_once(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    collector.idle_undeclared_worker = SimpleNamespace(owner_runner=runner)
+    assert runner.process_once() == 1
+    first_wake = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    session_id = collector.turn_attempts[0][0]
+    events = [
+        {
+            "event_id": "owner-completed-924",
+            "session_id": session_id,
+            "seq": 2,
+            "type": "status",
+            "payload": {"turn_complete": True},
+        },
+        {
+            "event_id": "owner-exited-924",
+            "session_id": session_id,
+            "seq": 3,
+            "type": "status",
+            "payload": {"exited": 0},
+        },
+        {
+            "event_id": "worker-completed-924",
+            "session_id": "observer-session",
+            "seq": 4,
+            "type": "status",
+            "payload": {"turn_complete": True},
+        },
+    ]
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 3})]
+    assert runner.registry.get_session(session_id).effective_awaiting is None
+    assert len(collector.turn_attempts) == 2
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake],
+        ).fetchone() == ("completed",)
+        assert con.execute(
+            "SELECT state FROM continuity_owner_action_intents WHERE wake_id = ?",
+            [first_wake],
+        ).fetchone() == ("complete",)
+    status = store.status(run_id)
+    assert status["completion_receipts"]["counts"] == {"projected": 1}
+    assert status["inbox_counts"] == {"acknowledged": 1, "delivered": 1}
+
+    # Replayed source events cannot duplicate a wake or settle the new claim
+    # using its predecessor's completion, even when the claim expires.
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 0})]
+    runner.clock.advance(11)
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 2
+    assert runner._has_active_claim(runner.config.goals[0])
+
+
+def test_post_ingest_kick_failure_keeps_commit_and_replay_retries(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    events = [
+        {
+            "event_id": "final-completion-924",
+            "session_id": collector.turn_attempts[0][0],
+            "seq": 2,
+            "type": "status",
+            "payload": {"turn_complete": True},
+        }
+    ]
+
+    def fail():
+        # The kick must see the committed source event on another connection.
+        assert runner.registry.get_event("final-completion-924") is not None
+        raise RuntimeError("injected owner kick failure")
+
+    collector.idle_undeclared_worker = SimpleNamespace(
+        owner_runner=SimpleNamespace(process_once=fail)
+    )
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 1})]
+    assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+    assert runner._has_active_claim(runner.config.goals[0])
+
+    collector.idle_undeclared_worker.owner_runner = runner
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 0})]
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone() == ("completed",)
+    assert len(collector.turn_attempts) == 1
+
+
+@pytest.mark.parametrize("flag", [False, "true", 1, None])
+def test_nonliteral_completion_does_not_settle_owner_claim(tmp_path, flag):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    collector.idle_undeclared_worker = SimpleNamespace(owner_runner=runner)
+    assert runner.process_once() == 1
+    events = [
+        {
+            "event_id": "not-completed-924",
+            "session_id": collector.turn_attempts[0][0],
+            "seq": 2,
+            "type": "status",
+            "payload": {"turn_complete": flag},
+        }
+    ]
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 1})]
+    clock.advance(11)
+    runner._settle_expired_claims(runner.config.goals[0])
+    assert runner._has_active_claim(runner.config.goals[0])
+    assert len(collector.turn_attempts) == 1
+
+
 def test_stale_owner_without_submitted_turn_is_fenced_recreated_and_acked(tmp_path):
     runner, collector, store, run_id, clock = _runner(tmp_path)
     _, old_token = runner.credentials.issue(

@@ -260,19 +260,19 @@ class NativeOwnerRunner:
                 AND c.state IN ('claimed', 'sent') LIMIT 1""",
                 [scope.goal_id, self._owner(scope), session_id],
             ).fetchone()
-        if row is None or row[1] not in self.registry.recent_user_input_turn_ids(
-            session_id, limit=20
-        ):
+        if row is None or not self.registry.has_user_input_turn_id(session_id, row[1]):
             return
         session = self.registry.get_session(session_id)
-        if session is None or session.effective_awaiting != "input":
+        if session is None:
             return
-        completed = session_id in self.registry.completed_turn_kinds([session_id])
+        completed = self.registry.has_completed_turn(session_id, row[1])
         # Some native adapters return directly to awaiting=input without a
         # turn_complete/turn-exited status.  That is safe only after the wake
         # is durably acknowledged with its completed action-intent receipt;
         # before then an input state alone could be stale while a turn runs.
-        if not completed and not (row[2] and row[3]):
+        if not completed and not (
+            session.effective_awaiting == "input" and row[2] and row[3]
+        ):
             return
         with self._transaction() as con:
             con.execute(
@@ -506,7 +506,7 @@ class NativeOwnerRunner:
                     scope, (wake_id, turn_id, session_id, claim_run_id, claim_until)
                 )
                 continue
-            completed = session_id in self.registry.completed_turn_kinds([session_id])
+            completed = self.registry.has_completed_turn(session_id, turn_id)
             if not completed and not (
                 session.effective_awaiting == "input" and acknowledged and receipted
             ):
