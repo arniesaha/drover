@@ -360,6 +360,7 @@ def record_observer_worker_completion(
             continuity_event_id=None,
             recorded_at=received_at,
         )
+    # Only the literal completion flag authorizes a completed-worker fact.
     if completion.get("turn_complete") is not True:
         return _record_completion_receipt(
             con,

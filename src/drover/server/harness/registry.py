@@ -2598,18 +2598,54 @@ class HarnessRegistry:
     def has_user_input_turn_id(self, session_id: str, turn_id: str) -> bool:
         # Exact durable client-turn identity; not a bounded replay-cache window.
         with self._connect() as con:
-            rows = _rows(
-                con,
-                "SELECT payload_json FROM harness_events WHERE session_id = ? AND event_type = 'user_input'",
+            rows = con.execute(
+                "SELECT event_id FROM harness_events WHERE session_id = ? AND event_type = 'user_input'",
                 [session_id],
-            )
-        for row in rows:
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        for payload_json in payloads.values():
             try:
-                payload = json.loads(row.get("payload_json") or "{}")
+                payload = json.loads(payload_json or "{}")
             except (TypeError, ValueError):
                 continue
             if isinstance(payload, dict) and payload.get("turn_id") == turn_id:
                 return True
+        return False
+
+    def has_completed_turn(self, session_id: str, turn_id: str) -> bool:
+        """Retain completion evidence for one durably submitted turn.
+
+        Later status/awaiting projections cannot erase completion. A different
+        user input closes the turn's event window, so an older completion can
+        never settle a successor claim. Read payloads through the control-store
+        abstraction, including PostgreSQL's separate payload relation.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT event_id, event_type FROM harness_events
+                WHERE session_id = ? AND event_type IN ('user_input', 'status')
+                ORDER BY created_at, COALESCE(seq, 0), event_id""",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        submitted = False
+        for event_id, event_type in rows:
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if event_type == "user_input":
+                if submitted and payload.get("turn_id") != turn_id:
+                    return False
+                submitted = payload.get("turn_id") == turn_id
+            elif submitted:
+                inner = payload.get("payload", payload)
+                if _is_turn_completion_payload(payload) or (
+                    isinstance(inner, dict) and "exited" in inner
+                ):
+                    return True
         return False
 
     def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
