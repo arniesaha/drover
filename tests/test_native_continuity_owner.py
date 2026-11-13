@@ -454,6 +454,107 @@ def test_final_acknowledged_owner_turn_completes_claim_without_successor(tmp_pat
     assert state == "completed"
 
 
+def _terminalize_owner_turn(runner, collector):
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_status(owner_session.session_id, "terminated")
+    return owner_session
+
+
+def test_terminal_acknowledged_owner_turn_settles_without_owner_run(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    _terminalize_owner_turn(runner, collector)
+    assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+    assert runner.process_once() == 0
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
+@pytest.mark.parametrize("acknowledge, receipt", [(False, True), (True, False)])
+def test_terminal_owner_turn_requires_acknowledgement_and_completed_receipt(
+    tmp_path, acknowledge, receipt
+):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    owner_id = runner.config.goals[0].continuity_owner_id
+    action = status["next_action"]
+    fence = {"owner_id": owner_id, "owner_epoch": status["owner"]["epoch"]}
+    if receipt:
+        assert (
+            store.action_intent(
+                run_id,
+                **fence,
+                wake_id=action["event_id"],
+                action_fingerprint=action["action_id"],
+                artifact="issue-comment:done",
+            )["state"]
+            == "complete"
+        )
+    if acknowledge and not receipt:
+        with pytest.raises(
+            ContinuityConflict, match="completed action intent receipt is required"
+        ):
+            store.acknowledge(
+                run_id, **fence, event_id=action["event_id"], checkpoint="done"
+            )
+    elif acknowledge:
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="done"
+        )
+    _terminalize_owner_turn(runner, collector)
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [action["event_id"]],
+        ).fetchone()
+    assert state == "sent"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("wake_id", "wrong-wake"),
+        ("session_id", "wrong-session"),
+        ("client_turn_id", "wrong-turn"),
+    ],
+)
+def test_terminal_owner_settlement_keeps_wake_session_and_turn_fences(
+    tmp_path, field, value
+):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    _terminalize_owner_turn(runner, collector)
+    with control_plane_connection(runner.path) as con:
+        con.execute(
+            f"UPDATE continuity_owner_turn_claims SET {field} = ? WHERE wake_id = ?",
+            [value, wake_id],
+        )
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE state = 'sent'"
+        ).fetchone()
+    assert state == "sent"
+
+
 def test_acknowledged_owner_claim_stays_sent_while_turn_is_executing(tmp_path):
     runner, collector, store, run_id, clock = _runner(tmp_path)
 
