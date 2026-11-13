@@ -265,14 +265,21 @@ class NativeOwnerRunner:
         ):
             return
         session = self.registry.get_session(session_id)
-        if session is None or session.effective_awaiting != "input":
+        if session is None:
+            return
+        acknowledged_and_receipted = bool(row[2] and row[3])
+        terminal_settlement = (
+            session.status in TERMINAL_SESSION_STATUSES and acknowledged_and_receipted
+        )
+        if session.effective_awaiting != "input" and not terminal_settlement:
             return
         completed = session_id in self.registry.completed_turn_kinds([session_id])
         # Some native adapters return directly to awaiting=input without a
-        # turn_complete/turn-exited status.  That is safe only after the wake
-        # is durably acknowledged with its completed action-intent receipt;
-        # before then an input state alone could be stale while a turn runs.
-        if not completed and not (row[2] and row[3]):
+        # turn_complete/turn-exited status. A terminal owner session can also
+        # settle, but only when this exact wake has both its durable
+        # acknowledgement and completed action-intent receipt. Before then an
+        # input state alone could be stale while a turn runs.
+        if not completed and not acknowledged_and_receipted:
             return
         with self._transaction() as con:
             con.execute(
