@@ -1098,13 +1098,21 @@ def test_isolated_same_claim_delivery_ack_settlement_receipt(tmp_path, capsys):
             "SELECT wake_id, client_turn_id, state FROM continuity_owner_turn_claims"
         ).fetchone()
     assert claim_state == "sent"
-    assert collector.turn_attempts == [(owner_session.session_id, collector.turn_attempts[0][1])]
+    assert collector.turn_attempts == [
+        (owner_session.session_id, collector.turn_attempts[0][1])
+    ]
     assert collector.turn_attempts[0][1]["client_turn_id"] == claim_turn_id
 
     action = store.status(run_id)["next_action"]
-    fence = {"owner_id": owner_id, "owner_epoch": store.status(run_id)["owner"]["epoch"]}
+    fence = {
+        "owner_id": owner_id,
+        "owner_epoch": store.status(run_id)["owner"]["epoch"],
+    }
     receipt = store.action_intent(
-        run_id, **fence, wake_id=wake_id, action_fingerprint=action["action_id"],
+        run_id,
+        **fence,
+        wake_id=wake_id,
+        action_fingerprint=action["action_id"],
         artifact="no-op:isolated-claim-e2e",
     )
     store.acknowledge(run_id, **fence, event_id=wake_id, checkpoint="no-op complete")
@@ -1114,11 +1122,20 @@ def test_isolated_same_claim_delivery_ack_settlement_receipt(tmp_path, capsys):
 
     runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
     runner.registry.append_event(
-        session_id=owner_session.session_id, event_type="status", seq=2,
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
         payload={"payload": {"awaiting": "input"}},
     )
-    store.report(run_id, source="hub", source_event_id="successor-1", subject="worker-1",
-                 sequence=2, kind="ci_green", summary="successor")
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="successor-1",
+        subject="worker-1",
+        sequence=2,
+        kind="ci_green",
+        summary="successor",
+    )
     clock.advance(5)
     assert runner.process_once() == 1
 
@@ -1128,15 +1145,22 @@ def test_isolated_same_claim_delivery_ack_settlement_receipt(tmp_path, capsys):
                FROM continuity_owner_turn_claims c
                JOIN factory_observer_inbox i ON i.event_id = c.wake_id AND i.run_id = c.run_id
                JOIN continuity_owner_action_intents r ON r.wake_id = c.wake_id AND r.run_id = c.run_id
-               WHERE c.wake_id = ?""", [wake_id]
+               WHERE c.wake_id = ?""",
+            [wake_id],
         ).fetchone()
         [linked_sessions] = con.execute(
             "SELECT count(*) FROM continuity_owner_sessions WHERE goal_id = ? AND owner_id = ?",
             [runner.config.goals[0].goal_id, owner_id],
         ).fetchone()
-    assert (state, ack_state, receipt_state) == ("completed", "acknowledged", "complete")
+    assert (state, ack_state, receipt_state) == (
+        "completed",
+        "acknowledged",
+        "complete",
+    )
     assert linked_sessions == 1
     assert len(collector.launches) == 1
     assert len(collector.turn_attempts) == 2
     assert len({turn[1]["client_turn_id"] for turn in collector.turn_attempts}) == 2
-    print(f"claim_id={wake_id} turn_id={claim_turn_id} receipt_id={receipt['action_fingerprint']} ack_id={wake_id} state={state} sessions={linked_sessions} turns={len(collector.turn_attempts)}")
+    print(
+        f"claim_id={wake_id} turn_id={claim_turn_id} receipt_id={receipt['action_fingerprint']} ack_id={wake_id} state={state} sessions={linked_sessions} turns={len(collector.turn_attempts)}"
+    )
