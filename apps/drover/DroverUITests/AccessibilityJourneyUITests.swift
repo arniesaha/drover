@@ -225,8 +225,17 @@ final class AccessibilityJourneyUITests: XCTestCase {
         XCTAssertTrue(inline.exists)
         let jump = app.buttons["chat-scroll-to-bottom"]
         if jump.exists { jump.tap() }
+        // Frame predicates do not reliably refresh a previously-resolved
+        // XCUIElement while SwiftUI is settling a large transcript. Re-query
+        // both semantic controls on every predicate evaluation, preserving
+        // the same geometric assertion and five-second budget.
         let cleared = XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in inline.frame.maxY <= chip.frame.minY }, object: inline)
+            predicate: NSPredicate { _, _ in
+                let currentInline = app.buttons["artifact-pane-toggle"]
+                let currentChip = app.buttons["chat-floating-artifacts"]
+                return currentInline.exists && currentChip.exists
+                    && currentInline.frame.maxY <= currentChip.frame.minY
+            }, object: app)
         XCTAssertEqual(XCTWaiter.wait(for: [cleared], timeout: timeout), .completed)
         chip.tap()
         XCTAssertTrue(app.buttons["Open Pull request"].waitForExistence(timeout: timeout))
