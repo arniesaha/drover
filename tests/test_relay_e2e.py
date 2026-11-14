@@ -32,21 +32,27 @@ import pytest
 from drover.config import AdvisoryContentConfig
 from drover.schema import bootstrap
 from drover.server.advisory.service import InsightsService
+from drover.server.harness.adapters import (
+    AdapterHealth,
+    HarnessAdapter,
+    HarnessAdapterRegistry,
+    HarnessCapabilities,
+    LaunchRequest,
+)
 from drover.server.harness.content_consent import DurableContentConsent
-from drover.server.harness.adapters import AdapterHealth, HarnessAdapter, HarnessAdapterRegistry, HarnessCapabilities, LaunchRequest
-from drover.server.harness.structured.driver import StructuredMessage
-from drover.server.harness.structured.manager import StructuredSessionManager
-from drover.server.harness.daemon import wire_event_pusher
 from drover.server.harness.daemon import (
     HarnessDaemonState,
     HarnessPreset,
+    _heartbeat_once,
     create_harness_server,
     register_daemon_host,
-    _heartbeat_once,
+    wire_event_pusher,
 )
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.relay_client import RelayClient
+from drover.server.harness.structured.driver import StructuredMessage
+from drover.server.harness.structured.manager import StructuredSessionManager
 from drover.server.harness.websocket import (
     WebSocketClosed,
     client_handshake,
@@ -64,37 +70,65 @@ HOST_ID = "laptop"
 
 class _InertStructuredDriver:
     """Fixture-only driver: deterministic structured completion, no provider CLI."""
+
     def __init__(self, emit, user_input_delivered):
         self.emit = emit
         self.user_input_delivered = user_input_delivered
         self.live = False
+
     def start(self):
         self.live = True
+
     def is_alive(self):
         return self.live
+
     def close(self):
         self.live = False
+
     def interrupt(self):
         return None
+
     def send_turn(self, text, turn_id, **_kwargs):
         def complete_after_input():
-            assert self.user_input_delivered.wait(timeout=10), "user input was not delivered"
-            self.emit(StructuredMessage(type="status", role="system", text="inert turn complete", turn_id=turn_id, payload={"turn_complete": True, "awaiting": "input"}))
+            assert self.user_input_delivered.wait(
+                timeout=10
+            ), "user input was not delivered"
+            self.emit(
+                StructuredMessage(
+                    type="status",
+                    role="system",
+                    text="inert turn complete",
+                    turn_id=turn_id,
+                    payload={"turn_complete": True, "awaiting": "input"},
+                )
+            )
 
         threading.Thread(target=complete_after_input, daemon=True).start()
 
 
 class _InertStructuredAdapter(HarnessAdapter):
     id = "inert"
+
     def __init__(self, user_input_delivered):
         self.user_input_delivered = user_input_delivered
+
     display_name = "Fixture inert structured adapter"
     capabilities = HarnessCapabilities(launch_modes=frozenset({"structured"}))
-    def default_command(self): return ["/bin/cat"]
-    def start(self, request: LaunchRequest, emit): return _InertStructuredDriver(emit, self.user_input_delivered)
-    def send_turn(self, driver, text, turn_id, **kwargs): driver.send_turn(text, turn_id, **kwargs)
-    def close(self, driver): driver.close()
-    def health(self): return AdapterHealth(available=True)
+
+    def default_command(self):
+        return ["/bin/cat"]
+
+    def start(self, request: LaunchRequest, emit):
+        return _InertStructuredDriver(emit, self.user_input_delivered)
+
+    def send_turn(self, driver, text, turn_id, **kwargs):
+        driver.send_turn(text, turn_id, **kwargs)
+
+    def close(self, driver):
+        driver.close()
+
+    def health(self):
+        return AdapterHealth(available=True)
 
 
 def _get(port: int, path: str) -> dict[str, Any]:
@@ -226,7 +260,9 @@ def relay_env(tmp_path, monkeypatch):
     adapters = HarnessAdapterRegistry([_InertStructuredAdapter(user_input_delivered)])
     presets = {
         "inert": HarnessPreset(
-            name="inert", command=("/bin/cat",), enabled=True,
+            name="inert",
+            command=("/bin/cat",),
+            enabled=True,
             description="fixture-only structured inert driver",
         ),
         "shell": HarnessPreset(
@@ -282,7 +318,9 @@ def relay_env(tmp_path, monkeypatch):
     def _track_delivery(batch):
         pending = post_pending(batch)
         if pending == []:
-            pusher_delivery_types.update(str(event.get("type") or "") for event in batch)
+            pusher_delivery_types.update(
+                str(event.get("type") or "") for event in batch
+            )
             if any(event.get("type") == "user_input" for event in batch):
                 user_input_delivered.set()
             if {"user_input", "status"} <= pusher_delivery_types:
@@ -337,7 +375,9 @@ def relay_env(tmp_path, monkeypatch):
     host = hosts[HOST_ID]
     assert host["status"] == "online"
     assert host["connection_kind"] == "relay"
-    inert = next(row for row in host["capabilities"]["harnesses"] if row["name"] == "inert")
+    inert = next(
+        row for row in host["capabilities"]["harnesses"] if row["name"] == "inert"
+    )
     assert inert["enabled"] is True
     assert inert["capabilities"]["launch_modes"] == ["structured"]
 
@@ -569,29 +609,50 @@ def test_host_registration_rejects_duplicate_json_keys_and_identity_mismatch(rel
         expected = 403 if raw == b'{"host_id":"other"}' else 400
         assert error.value.code == expected
 
+
 def test_inert_structured_turn_reaches_authenticated_hub(relay_env, tmp_path):
     """Fixture driver emits through manager -> real EventPusher -> hub ingest."""
     env = relay_env
     cwd = tmp_path / "inert-cwd"
     cwd.mkdir()
     status, created = _hub_post(
-        env, f"/harness/hosts/{HOST_ID}/sessions",
-        {"harness": "inert", "mode": "structured", "cwd": str(cwd), "client_session_id": "fixture-inert-session"},
+        env,
+        f"/harness/hosts/{HOST_ID}/sessions",
+        {
+            "harness": "inert",
+            "mode": "structured",
+            "cwd": str(cwd),
+            "client_session_id": "fixture-inert-session",
+        },
     )
     assert status == 201, created
     turn_id = "6a704730-49c0-4c0e-a863-0e94209c9f50"
     env.pusher_delivery_types.clear()
     env.pusher_delivery.clear()
     env.user_input_delivered.clear()
-    status, _ = _hub_post(env, f"/harness/sessions/{created['session_id']}/turns", {"text": "fixture turn", "client_turn_id": turn_id})
+    status, _ = _hub_post(
+        env,
+        f"/harness/sessions/{created['session_id']}/turns",
+        {"text": "fixture turn", "client_turn_id": turn_id},
+    )
     assert status == 202
     assert env.pusher_delivery.wait(timeout=10), "EventPusher did not deliver the turn"
     observed = HarnessRegistry(env.hub_duckdb_path).list_events(created["session_id"])
-    assert any(event.event_type == "user_input" and (event.payload or {}).get("turn_id") == turn_id for event in observed)
-    assert any(event.event_type == "status" and (event.payload or {}).get("payload", {}).get("turn_complete") for event in observed)
+    assert any(
+        event.event_type == "user_input"
+        and (event.payload or {}).get("turn_id") == turn_id
+        for event in observed
+    )
+    assert any(
+        event.event_type == "status"
+        and (event.payload or {}).get("payload", {}).get("turn_complete")
+        for event in observed
+    )
+
 
 # Fixture-only native-owner acceptance dependencies.
 from types import SimpleNamespace
+
 from drover.schema import bootstrap_control_plane_store
 from drover.server.db import control_plane_connection
 from drover.server.harness.continuity import FactoryObserverContinuity
@@ -604,34 +665,100 @@ def test_native_owner_claim_settles_via_real_structured_relay(relay_env, tmp_pat
     env = relay_env
     bootstrap_control_plane_store(env.hub_duckdb_path)
     registry = HarnessRegistry(env.hub_duckdb_path)
-    registry.create_session(session_id="observer", host_id=HOST_ID, harness="inert", command="inert", status="running", handoff_mode="factory_observer", source_session_id="factory/run-fixture@1")
+    registry.create_session(
+        session_id="observer",
+        host_id=HOST_ID,
+        harness="inert",
+        command="inert",
+        status="running",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-fixture@1",
+    )
     continuity = FactoryObserverContinuity(env.hub_duckdb_path)
     owner_id = "drover:owner/fixture-relay"
-    run_id = continuity.initialize(session_id="observer", objective="fixture", checkpoint="started", authorized_owner_id=owner_id)
-    continuity.report(run_id, source="hub", source_event_id="wake-1", subject="fixture", sequence=1, kind="worker_blocked", summary="fixture wake")
-    scope = GoalScope.model_validate({"goal_id":"fixture-relay", "repo":"fixture/repo", "goal_label":"goal:fixture-relay", "execution_enabled":True, "execution_cwds":{HOST_ID:str(tmp_path)}, "brief_ref":"fixture", "continuity_owner_id":owner_id, "continuity_owner_harness":"inert", "credential":{"token_env":"TOKEN", "capabilities":["issues_read"]}})
-    runner = NativeOwnerRunner(env.hub_collector, SimpleNamespace(goals=[scope]), credential_store=CredentialStore(tmp_path / "owner-credentials.json"))
+    run_id = continuity.initialize(
+        session_id="observer",
+        objective="fixture",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    continuity.report(
+        run_id,
+        source="hub",
+        source_event_id="wake-1",
+        subject="fixture",
+        sequence=1,
+        kind="worker_blocked",
+        summary="fixture wake",
+    )
+    scope = GoalScope.model_validate(
+        {
+            "goal_id": "fixture-relay",
+            "repo": "fixture/repo",
+            "goal_label": "goal:fixture-relay",
+            "execution_enabled": True,
+            "execution_cwds": {HOST_ID: str(tmp_path)},
+            "brief_ref": "fixture",
+            "continuity_owner_id": owner_id,
+            "continuity_owner_harness": "inert",
+            "credential": {"token_env": "TOKEN", "capabilities": ["issues_read"]},
+        }
+    )
+    runner = NativeOwnerRunner(
+        env.hub_collector,
+        SimpleNamespace(goals=[scope]),
+        credential_store=CredentialStore(tmp_path / "owner-credentials.json"),
+    )
     env.pusher_delivery_types.clear()
     env.pusher_delivery.clear()
     env.user_input_delivered.clear()
     assert runner.process_once() == 1
     with control_plane_connection(env.hub_duckdb_path) as con:
-        wake_id, turn_id = con.execute("SELECT wake_id, client_turn_id FROM continuity_owner_turn_claims").fetchone()
-        session_id = con.execute("SELECT session_id FROM continuity_owner_sessions").fetchone()[0]
-    assert env.pusher_delivery.wait(timeout=10), "EventPusher did not deliver the owner turn"
+        wake_id, turn_id = con.execute(
+            "SELECT wake_id, client_turn_id FROM continuity_owner_turn_claims"
+        ).fetchone()
+        session_id = con.execute(
+            "SELECT session_id FROM continuity_owner_sessions"
+        ).fetchone()[0]
+    assert env.pusher_delivery.wait(
+        timeout=10
+    ), "EventPusher did not deliver the owner turn"
     events = registry.list_events(session_id)
-    assert any(e.event_type == "user_input" and (e.payload or {}).get("turn_id") == turn_id for e in events)
-    assert any(e.event_type == "status" and (e.payload or {}).get("payload", {}).get("turn_complete") for e in events)
+    assert any(
+        e.event_type == "user_input" and (e.payload or {}).get("turn_id") == turn_id
+        for e in events
+    )
+    assert any(
+        e.event_type == "status"
+        and (e.payload or {}).get("payload", {}).get("turn_complete")
+        for e in events
+    )
     status = continuity.status(run_id)
     fence = {"owner_id": owner_id, "owner_epoch": status["owner"]["epoch"]}
     action = status["next_action"]
-    continuity.action_intent(run_id, **fence, wake_id=wake_id, action_fingerprint=action["action_id"], artifact="fixture no-op")
-    continuity.acknowledge(run_id, **fence, event_id=wake_id, checkpoint="fixture complete")
+    continuity.action_intent(
+        run_id,
+        **fence,
+        wake_id=wake_id,
+        action_fingerprint=action["action_id"],
+        artifact="fixture no-op",
+    )
+    continuity.acknowledge(
+        run_id, **fence, event_id=wake_id, checkpoint="fixture complete"
+    )
     assert runner.process_once() == 0
     with control_plane_connection(env.hub_duckdb_path) as con:
-        claim = con.execute("SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?", [wake_id]).fetchone()
-        receipts = con.execute("SELECT state FROM continuity_owner_action_intents WHERE wake_id = ?", [wake_id]).fetchall()
-        inbox = con.execute("SELECT state FROM factory_observer_inbox WHERE event_id = ?", [wake_id]).fetchall()
+        claim = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+        receipts = con.execute(
+            "SELECT state FROM continuity_owner_action_intents WHERE wake_id = ?",
+            [wake_id],
+        ).fetchall()
+        inbox = con.execute(
+            "SELECT state FROM factory_observer_inbox WHERE event_id = ?", [wake_id]
+        ).fetchall()
     assert claim == ("completed",), (claim, receipts, inbox)
     assert registry.get_session(session_id).effective_awaiting == "input"
     assert registry.completed_turn_kinds([session_id]) == {session_id: "finished"}
@@ -639,7 +766,15 @@ def test_native_owner_claim_settles_via_real_structured_relay(relay_env, tmp_pat
     # A settled turn must not be sent again, and the next wake must reuse the
     # sole owner session rather than creating a duplicate initial turn.
     assert runner.process_once() == 0
-    continuity.report(run_id, source="hub", source_event_id="wake-2", subject="fixture", sequence=2, kind="worker_blocked", summary="fixture successor")
+    continuity.report(
+        run_id,
+        source="hub",
+        source_event_id="wake-2",
+        subject="fixture",
+        sequence=2,
+        kind="worker_blocked",
+        summary="fixture successor",
+    )
     env.pusher_delivery_types.clear()
     env.pusher_delivery.clear()
     env.user_input_delivered.clear()
@@ -651,20 +786,47 @@ def test_native_owner_claim_settles_via_real_structured_relay(relay_env, tmp_pat
     assert successor_session == session_id
     assert env.pusher_delivery.wait(timeout=10), "EventPusher did not deliver successor"
     successor_events = registry.list_events(session_id)
-    assert sum(
-        event.event_type == "user_input" and (event.payload or {}).get("turn_id") == turn_id
-        for event in successor_events
-    ) == 1
-    assert sum(
-        event.event_type == "user_input" and (event.payload or {}).get("turn_id") == successor_turn
-        for event in successor_events
-    ) == 1
+    assert (
+        sum(
+            event.event_type == "user_input"
+            and (event.payload or {}).get("turn_id") == turn_id
+            for event in successor_events
+        )
+        == 1
+    )
+    assert (
+        sum(
+            event.event_type == "user_input"
+            and (event.payload or {}).get("turn_id") == successor_turn
+            for event in successor_events
+        )
+        == 1
+    )
     successor_status = continuity.status(run_id)
-    successor_fence = {"owner_id": owner_id, "owner_epoch": successor_status["owner"]["epoch"]}
+    successor_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": successor_status["owner"]["epoch"],
+    }
     successor_action = successor_status["next_action"]
-    continuity.action_intent(run_id, **successor_fence, wake_id=successor_wake, action_fingerprint=successor_action["action_id"], artifact="fixture successor no-op")
-    continuity.acknowledge(run_id, **successor_fence, event_id=successor_wake, checkpoint="fixture successor complete")
+    continuity.action_intent(
+        run_id,
+        **successor_fence,
+        wake_id=successor_wake,
+        action_fingerprint=successor_action["action_id"],
+        artifact="fixture successor no-op",
+    )
+    continuity.acknowledge(
+        run_id,
+        **successor_fence,
+        event_id=successor_wake,
+        checkpoint="fixture successor complete",
+    )
     assert runner.process_once() == 0
     with control_plane_connection(env.hub_duckdb_path) as con:
-        assert con.execute("SELECT count(*) FROM continuity_owner_sessions").fetchone() == (1,)
-        assert con.execute("SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?", [successor_wake]).fetchone() == ("completed",)
+        assert con.execute(
+            "SELECT count(*) FROM continuity_owner_sessions"
+        ).fetchone() == (1,)
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [successor_wake],
+        ).fetchone() == ("completed",)
