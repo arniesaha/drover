@@ -178,6 +178,13 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     assert f"run_id: {run_id}" in prompt
     assert "wake_id:" in prompt and "action_intent" in prompt
     assert "DROVER_CONTINUITY_OWNER_BEARER" in prompt
+    assert (
+        "authorized brief referenced by brief_ref is the deliverable contract" in prompt
+    )
+    assert "read-only summary or other non-code evidence" in prompt
+    assert "rather than requiring or accepting a code SHA" in prompt
+    assert "code-SHA verification for briefs that require implementation" in prompt
+    assert "without explicit human approval" in prompt
     payload = collector.launches[0][1]
     token = payload["continuity_owner_bearer"]
     assert runner.credentials.find_active(token).owner_id == "drover:owner/goal-native"
