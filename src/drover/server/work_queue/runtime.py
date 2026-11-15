@@ -164,14 +164,39 @@ class HarnessBridge:
             self.registry.get_session(parent_session_id) if parent_session_id else None
         )
         hosts = {parent.host_id} if parent and parent.cwd else set(scope.execution_cwds)
+        # Native-owner goals bind their durable lifecycle to one configured
+        # harness. Their work turn must use that same worktree-capable harness:
+        # never let quota preference select a shared-CWD adapter.
+        native_owner = isinstance(scope.continuity_owner_id, str) and (
+            scope.continuity_owner_id.startswith("drover:owner/")
+        )
+        required_harness = scope.continuity_owner_harness if native_owner else None
+        if native_owner and not isinstance(required_harness, str):
+            return set()
+        if native_owner and not required_harness.strip():
+            return set()
+
+        def eligible_row(row):
+            if not isinstance(row, dict) or not row.get("enabled"):
+                return False
+            capabilities = row.get("capabilities")
+            if not isinstance(capabilities, dict):
+                return False
+            if "structured" not in capabilities.get("launch_modes", []):
+                return False
+            if required_harness is None:
+                return True
+            return (
+                row.get("name") == required_harness
+                and capabilities.get("worktree") is True
+            )
+
         return {
             (host.host_id, row["name"])
             for host in self.registry.list_hosts()
             if host.liveness().usable and host.host_id in hosts
             for row in host.capabilities.get("harnesses", [])
-            if isinstance(row, dict)
-            and row.get("enabled")
-            and "structured" in row.get("capabilities", {}).get("launch_modes", [])
+            if eligible_row(row)
         }
 
     def quota(self):
