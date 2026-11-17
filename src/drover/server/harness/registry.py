@@ -175,7 +175,13 @@ def _as_db_timestamp(value: Any) -> datetime | None:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    # The control-plane schema uses DuckDB ``TIMESTAMP`` columns.  Bind a
+    # process-local wall time so DuckDB does not apply its own session
+    # timezone while dropping an aware UTC offset.  Readers deliberately
+    # interpret naive values from those columns as process-local; keeping the
+    # two sides on that contract makes a fresh relay heartbeat fresh even when
+    # the database session and process timezone settings differ.
+    return datetime.now()
 
 
 #: Awaiting values that mean the agent is blocked on the user, and therefore

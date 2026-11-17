@@ -30,6 +30,7 @@ from typing import Any
 import pytest
 
 from drover.config import AdvisoryContentConfig
+from drover.server import relay_manager
 from drover.schema import bootstrap
 from drover.server.advisory.service import InsightsService
 from drover.server.harness.adapters import (
@@ -54,6 +55,7 @@ from drover.server.harness.relay_client import RelayClient
 from drover.server.harness.structured.driver import StructuredMessage
 from drover.server.harness.structured.manager import StructuredSessionManager
 from drover.server.harness.websocket import (
+    OPCODE_PONG,
     WebSocketClosed,
     client_handshake,
     client_recv_json,
@@ -226,6 +228,19 @@ class _RelayEnv:
 
 @pytest.fixture
 def relay_env(tmp_path, monkeypatch):
+    # Observe the hub reader receiving the real control frame.  The wrapper
+    # delegates unchanged; it makes the authenticated relay proof explicit
+    # without manufacturing a heartbeat or a PONG.
+    hub_pong = threading.Event()
+    recv_hub_frame = relay_manager.recv_frame
+
+    def _track_hub_frames(*args, **kwargs):
+        frame = recv_hub_frame(*args, **kwargs)
+        if frame.opcode == OPCODE_PONG:
+            hub_pong.set()
+        return frame
+
+    monkeypatch.setattr(relay_manager, "recv_frame", _track_hub_frames)
     store = CredentialStore(tmp_path / "credentials.json")
     _, token = store.issue(scope="host", label=HOST_ID, host_id=HOST_ID)
     monkeypatch.setitem(globals(), "TOKEN", token)
@@ -370,6 +385,8 @@ def relay_env(tmp_path, monkeypatch):
     # native-owner routing sees capabilities obtained through the production
     # registration path rather than a fixture-crafted hub row.
     assert relay_connected.wait(timeout=10), "relay client did not connect"
+    assert hub_pong.wait(timeout=10), "hub did not receive the relay pong"
+    assert hub_collector.relay_manager.is_responsive(HOST_ID)
     assert _heartbeat_once(harnessd_state) is not None
     hosts = {h["host_id"]: h for h in _get(hub_port, "/harness/hosts")["hosts"]}
     host = hosts[HOST_ID]
