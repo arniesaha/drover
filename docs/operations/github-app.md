@@ -110,3 +110,39 @@ The operator login is `arniesaha` (`DROVER_OPERATOR_LOGIN`).
 
 Without an App configured every write is still the operator's login, so rules
 1-3 accept everything exactly as before; rule 4 applies regardless.
+
+## 5. Artifact-only native-owner closeout
+
+An artifact-only brief can be complete without a commit, CI run, release, or
+generic worker `Drover-State: done` declaration. Its native owner records a
+fenced action-intent receipt for the exact wake and then acknowledges that
+delivery. This proves only that delivery settled; it is not task acceptance,
+Factory release, behavioural verification, or authorization to close an issue.
+
+An external reconciler that owns issue lifecycle must use the typed continuity
+projection, not summary prose or a synthetic `Drover-Done` marker. For the
+tracked `run_id`, read:
+
+```text
+GET /harness/factory-observer/continuity?run_id=<run_id>
+```
+
+It may remove that native owner from its *idle/nudge queue* only when all of
+these are true:
+
+- `owner_handoff.state` is `acknowledged`;
+- `next_action` is `null` and `owner_wake` is `false`; and
+- `inbox_counts` has no `pending` or `delivered` entries.
+
+`terminal_release` remains `false` by contract. A rejected receipt, a pending
+delivery, a new action, or any non-empty pending/delivered count remains
+actionable and must not be suppressed.
+
+The caller must retain the provisioned artifact contract (for example, the
+expected immutable artifact reference and digest) and verify it through the
+native owner's authorized evidence path before it records its own
+`artifact-only` issue-closeout decision. It must not infer this decision from
+free-form summaries, receipt acknowledgement, or the absence of a
+SHA-and-Actions `Drover-Done` line. Closing the GitHub issue is a separate
+caller lifecycle action after that contract-specific acceptance; it must not
+set a Factory release or generic behavioural-verification state.
