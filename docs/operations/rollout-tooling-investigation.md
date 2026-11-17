@@ -1,5 +1,10 @@
 # Rollout tooling investigation, Oct 12
 
+> **Historical archive, not the current ordinary-update path.** Its findings
+> explain safeguards retained for [advanced point-release
+> maintenance](point-release-rollout.md). Compatible private server-only
+> changes use [Normal private server update](private-server-update.md).
+
 Scope: approved Oct 11 rollout tooling fixes. Commit only. Studio evidence was
 read without changing the service, updater configuration, runtime or backups.
 

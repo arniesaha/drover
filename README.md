@@ -55,7 +55,8 @@ Analytics expands provider-reported quota windows and usage distributions.
 
 See [Architecture](docs/architecture.md) for the component boundaries and
 [Context Store](docs/context-store.md) for the data model. Operators should
-read [PostgreSQL control store](docs/postgresql-control-store.md) and the
+read [Normal private server update](docs/operations/private-server-update.md),
+[PostgreSQL control store](docs/postgresql-control-store.md), and the
 [lake operations runbooks](docs/operations/lake-serving.md).
 
 ## Quickstart
@@ -166,6 +167,7 @@ device signing, and server configuration.
 - [iOS app](apps/drover/README.md) and [TestFlight runbook](apps/drover/docs/internal-testflight-runbook.md)
 - [Context Store](docs/context-store.md)
 - [PostgreSQL Control Store](docs/postgresql-control-store.md)
+- [Normal private server update](docs/operations/private-server-update.md)
 - [Integrations](docs/integrations.md)
 - [Multi-Host](docs/multi-host.md)
 - [Security](docs/security.md)
