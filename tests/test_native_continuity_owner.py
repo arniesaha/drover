@@ -461,6 +461,44 @@ def test_final_acknowledged_owner_turn_completes_claim_without_successor(tmp_pat
     assert state == "completed"
 
 
+def test_artifact_only_delivery_settlement_is_not_task_acceptance_or_release(tmp_path):
+    """A completed native-owner receipt releases its claim, not the issue itself."""
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        # Native owners may become input-idle without a generic done marker.
+        payload={"payload": {"awaiting": "input"}},
+    )
+
+    projection = store.status(run_id)
+    assert projection["owner_handoff"]["state"] == "acknowledged"
+    assert projection["next_action"] is None
+    assert not projection["owner_wake"]
+    assert projection["terminal_release"] is False
+
+    # The native runner may settle this exact acknowledged receipt, but neither
+    # the receipt nor the settled claim is task acceptance or a release.
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
 def _terminalize_owner_turn(runner, collector):
     owner_session = runner.registry.session_by_client_id(
         collector.launches[0][1]["client_session_id"]
