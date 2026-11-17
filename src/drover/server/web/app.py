@@ -3221,6 +3221,16 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 }
             )
         ingested = registry.ingest_structured_events(prepared)
+        # Source events and inbox projections are committed before delivery.
+        # Replay also retries a failed kick; existing claims fence duplicates.
+        if prepared:
+            try:
+                worker = getattr(self.collector, "idle_undeclared_worker", None)
+                runner = getattr(worker, "owner_runner", None)
+                if runner is not None:
+                    runner.process_once()
+            except Exception:  # noqa: BLE001 - polling retries committed work
+                log.exception("post-ingest native continuity owner kick failed")
         result = {"ingested": ingested}
         if pending_sessions:
             result["pending"] = pending_sessions
