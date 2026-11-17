@@ -265,13 +265,21 @@ class NativeOwnerRunner:
         session = self.registry.get_session(session_id)
         if session is None:
             return
+        acknowledged_and_receipted = bool(row[2] and row[3])
+        terminal_settlement = (
+            session.status in TERMINAL_SESSION_STATUSES and acknowledged_and_receipted
+        )
+        # A durable completion is evidence about this exact submitted turn;
+        # it remains sufficient after a later mutable session projection.
         completed = self.registry.has_completed_turn(session_id, row[1])
         # Some native adapters return directly to awaiting=input without a
-        # turn_complete/turn-exited status.  That is safe only after the wake
-        # is durably acknowledged with its completed action-intent receipt;
-        # before then an input state alone could be stale while a turn runs.
+        # turn_complete/turn-exited status. A terminal owner session can also
+        # settle, but only when this exact wake has both its durable
+        # acknowledgement and completed action-intent receipt. Before then an
+        # input state alone could be stale while a turn runs.
         if not completed and not (
-            session.effective_awaiting == "input" and row[2] and row[3]
+            acknowledged_and_receipted
+            and (session.effective_awaiting == "input" or terminal_settlement)
         ):
             return
         with self._transaction() as con:
@@ -658,6 +666,11 @@ class NativeOwnerRunner:
             "Use the Drover lease/consume/ack contract only for this delivered action. "
             "Authenticate each continuity endpoint request with the bearer in "
             "DROVER_CONTINUITY_OWNER_BEARER, never DROVER_API_TOKEN. "
+            "The authorized brief referenced by brief_ref is the deliverable contract: "
+            "when it explicitly requires a read-only summary or other non-code "
+            "evidence, verify and record that artifact rather than requiring or "
+            "accepting a code SHA. Keep code-SHA verification for briefs that require "
+            "implementation. "
             "Before any external write, persist an action_intent keyed by this wake id "
             "and action fingerprint, carry a deterministic wake-id marker in the write, "
             "reconcile an existing marker/intent before retrying, verify its artifact, "

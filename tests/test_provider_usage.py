@@ -1285,6 +1285,116 @@ def test_optional_quota_refresh_preserves_prior_state(
     con.close()
 
 
+def test_optional_quota_refresh_persists_healthy_provider_despite_other_failure(
+    provider_service, provider_host
+):
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.mcp.tools import drover_provider_quota
+
+    now = datetime.fromisoformat(GOOD_PAYLOAD["observed_at"])
+    provider_service.clock = lambda: now
+    old_openai = {**GOOD_PAYLOAD["accounts"][0], "account_label": "old-codex"}
+    old_claude = {
+        **GOOD_PAYLOAD["accounts"][0],
+        "snapshot_id": "old-claude",
+        "dedup_key": "old-claude",
+        "provider": "anthropic",
+        "account_label": "claude-person",
+    }
+    provider_service.refresh_host(
+        provider_host, fetch=lambda _: {"accounts": [old_openai, old_claude]}
+    )
+    HarnessRegistry(provider_service.duckdb_path).register_host(
+        host_id=provider_host.host_id, display_name="Synthetic host", kind="mac"
+    )
+    before = {
+        account.provider: account for account in provider_service.latest_accounts()
+    }
+    con = duckdb.connect(str(provider_service.duckdb_path))
+    claude_connection = con.execute(
+        "SELECT * FROM provider_connections WHERE provider = 'anthropic'"
+    ).fetchall()
+    con.close()
+
+    now += timedelta(minutes=1)
+    fresh_openai = {
+        **GOOD_PAYLOAD["accounts"][0],
+        "snapshot_id": "fresh-codex",
+        "dedup_key": "fresh-codex",
+        "observed_at": now.isoformat(),
+        "windows": [{**GOOD_PAYLOAD["accounts"][0]["windows"][0], "used_percent": 23}],
+    }
+    failed_claude = {
+        **CODEX_ERROR_PAYLOAD["accounts"][0],
+        "provider": "anthropic",
+        "account_label": "Claude Code",
+        "error_category": "login_refresh_needed",
+    }
+    result = drover_provider_quota(
+        duckdb_path=provider_service.duckdb_path,
+        service=provider_service,
+        fresh=True,
+        fetch=lambda _: {"accounts": [fresh_openai, failed_claude]},
+        now=now,
+        timeout_s=20,
+    )
+
+    assert result["refresh_errors"] == [
+        {"host_id": provider_host.host_id, "error_category": "provider_error"}
+    ]
+    assert "codex: 23%" in result["routing_hint"]
+    after = {
+        account.provider: account for account in provider_service.latest_accounts()
+    }
+    assert after["openai"].snapshot_id == "fresh-codex"
+    assert after["openai"].status == "ok"
+    assert after["anthropic"].snapshot_id == before["anthropic"].snapshot_id
+    assert after["anthropic"].observed_at == before["anthropic"].observed_at
+    assert after["anthropic"].windows == before["anthropic"].windows
+    con = duckdb.connect(str(provider_service.duckdb_path))
+    assert (
+        con.execute(
+            "SELECT * FROM provider_connections WHERE provider = 'anthropic'"
+        ).fetchall()
+        == claude_connection
+    )
+    assert con.execute(
+        "SELECT enabled FROM provider_connections WHERE account_label = 'old-codex'"
+    ).fetchone() == (False,)
+    assert con.execute(
+        "SELECT COUNT(*) FROM provider_usage_snapshots WHERE status = 'error'"
+    ).fetchone() == (0,)
+    con.close()
+
+
+def test_optional_partial_account_failure_does_not_retire_last_good_identity(
+    provider_service, provider_host
+):
+    now = datetime.fromisoformat(GOOD_PAYLOAD["observed_at"])
+    provider_service.clock = lambda: now
+    provider_service.refresh_host(provider_host, fetch=lambda _: GOOD_PAYLOAD)
+    another_account = {
+        **GOOD_PAYLOAD["accounts"][0],
+        "snapshot_id": "second-subscription",
+        "dedup_key": "second-subscription",
+        "account_label": "second-person",
+    }
+    with pytest.raises(RuntimeError, match="^provider_error$"):
+        provider_service.refresh_host(
+            provider_host,
+            fetch=lambda _: {
+                "accounts": [another_account, *CODEX_ERROR_PAYLOAD["accounts"]]
+            },
+            record_failures=False,
+        )
+    assert {
+        account.account_label for account in provider_service.latest_accounts()
+    } == {
+        "person@example.com",
+        "second-person",
+    }
+
+
 def test_optional_quota_refresh_background_failure_preserves_prior_state(
     provider_service, provider_host
 ):

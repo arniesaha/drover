@@ -178,6 +178,13 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     assert f"run_id: {run_id}" in prompt
     assert "wake_id:" in prompt and "action_intent" in prompt
     assert "DROVER_CONTINUITY_OWNER_BEARER" in prompt
+    assert (
+        "authorized brief referenced by brief_ref is the deliverable contract" in prompt
+    )
+    assert "read-only summary or other non-code evidence" in prompt
+    assert "rather than requiring or accepting a code SHA" in prompt
+    assert "code-SHA verification for briefs that require implementation" in prompt
+    assert "without explicit human approval" in prompt
     payload = collector.launches[0][1]
     token = payload["continuity_owner_bearer"]
     assert runner.credentials.find_active(token).owner_id == "drover:owner/goal-native"
@@ -452,6 +459,145 @@ def test_final_acknowledged_owner_turn_completes_claim_without_successor(tmp_pat
             [wake_id],
         ).fetchone()
     assert state == "completed"
+
+
+def test_artifact_only_delivery_settlement_is_not_task_acceptance_or_release(tmp_path):
+    """A completed native-owner receipt releases its claim, not the issue itself."""
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        # Native owners may become input-idle without a generic done marker.
+        payload={"payload": {"awaiting": "input"}},
+    )
+
+    projection = store.status(run_id)
+    assert projection["owner_handoff"]["state"] == "acknowledged"
+    assert projection["next_action"] is None
+    assert not projection["owner_wake"]
+    assert projection["terminal_release"] is False
+
+    # The native runner may settle this exact acknowledged receipt, but neither
+    # the receipt nor the settled claim is task acceptance or a release.
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
+def _terminalize_owner_turn(runner, collector):
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_status(owner_session.session_id, "terminated")
+    return owner_session
+
+
+def test_terminal_acknowledged_owner_turn_settles_without_owner_run(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    _terminalize_owner_turn(runner, collector)
+    assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+    assert runner.process_once() == 0
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
+@pytest.mark.parametrize("acknowledge, receipt", [(False, True), (True, False)])
+def test_terminal_owner_turn_requires_acknowledgement_and_completed_receipt(
+    tmp_path, acknowledge, receipt
+):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    owner_id = runner.config.goals[0].continuity_owner_id
+    action = status["next_action"]
+    fence = {"owner_id": owner_id, "owner_epoch": status["owner"]["epoch"]}
+    if receipt:
+        assert (
+            store.action_intent(
+                run_id,
+                **fence,
+                wake_id=action["event_id"],
+                action_fingerprint=action["action_id"],
+                artifact="issue-comment:done",
+            )["state"]
+            == "complete"
+        )
+    if acknowledge and not receipt:
+        with pytest.raises(
+            ContinuityConflict, match="completed action intent receipt is required"
+        ):
+            store.acknowledge(
+                run_id, **fence, event_id=action["event_id"], checkpoint="done"
+            )
+    elif acknowledge:
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="done"
+        )
+    _terminalize_owner_turn(runner, collector)
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [action["event_id"]],
+        ).fetchone()
+    assert state == "sent"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("wake_id", "wrong-wake"),
+        ("session_id", "wrong-session"),
+        ("client_turn_id", "wrong-turn"),
+    ],
+)
+def test_terminal_owner_settlement_keeps_wake_session_and_turn_fences(
+    tmp_path, field, value
+):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    _terminalize_owner_turn(runner, collector)
+    with control_plane_connection(runner.path) as con:
+        con.execute(
+            f"UPDATE continuity_owner_turn_claims SET {field} = ? WHERE wake_id = ?",
+            [value, wake_id],
+        )
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE state = 'sent'"
+        ).fetchone()
+    assert state == "sent"
 
 
 def test_acknowledged_owner_claim_stays_sent_while_turn_is_executing(tmp_path):

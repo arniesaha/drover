@@ -14,7 +14,8 @@
             "capabilities": {
               "schema_version": 1,
               "harness_id": "codex",
-              "launch_modes": ["structured"]
+              "launch_modes": ["structured"],
+              "worktree": true
             }
           }
         ]
