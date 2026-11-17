@@ -96,6 +96,13 @@ def _free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def _reserve_loopback_port() -> socket.socket:
+    """Keep a worker boundary port unavailable until this test owns it."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    return listener
+
+
 def _request_json(
     port: int,
     method: str,
@@ -484,11 +491,12 @@ def test_split_roles_use_real_postgres_auth_when_lake_is_absent_and_worker_chang
     from drover.server.harness.registry import HarnessRegistry
 
     schema = f"drover_runtime_{uuid4().hex}"
-    api_port, worker_port, worker_metrics_port = (
-        _free_loopback_port(),
+    api_port, worker_metrics_port = (
         _free_loopback_port(),
         _free_loopback_port(),
     )
+    worker_reservation = _reserve_loopback_port()
+    worker_port = int(worker_reservation.getsockname()[1])
     lake_guard = tmp_path / "lake-guard"
     lake_guard.write_text("API must never open this analytical path", encoding="utf-8")
     api_lake = lake_guard / "analytics.duckdb"
@@ -621,6 +629,7 @@ def test_split_roles_use_real_postgres_auth_when_lake_is_absent_and_worker_chang
         assert status == 503
         assert _request_json(api_port, "GET", "/harness", token=device_token)[0] == 200
 
+        worker_reservation.close()
         slow_server = _SlowDripServer(drip_stage="body", port=worker_port)
         slow_thread = threading.Thread(target=slow_server.serve_forever, daemon=True)
         slow_thread.start()
@@ -699,6 +708,7 @@ finally:
         assert revoked.returncode == 0, revoked.stderr
         assert _request_json(api_port, "GET", "/harness", token=device_token)[0] == 401
     finally:
+        worker_reservation.close()
         if slow_server is not None:
             slow_server.shutdown()
             slow_server.server_close()
