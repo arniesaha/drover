@@ -696,9 +696,7 @@ def test_register_host_keeps_duckdb_heartbeats_in_non_utc_local_time(
 @pytest.mark.skipif(
     not hasattr(time, "tzset"), reason="requires process timezone control"
 )
-def test_register_host_binds_aware_utc_timestamps_for_postgres(
-    tmp_path, monkeypatch
-):
+def test_register_host_binds_aware_utc_timestamps_for_postgres(tmp_path, monkeypatch):
     """A UTC PostgreSQL session must not reinterpret local wall time as UTC."""
     previous_tz = os.environ.get("TZ")
     monkeypatch.setenv("TZ", "America/Los_Angeles")

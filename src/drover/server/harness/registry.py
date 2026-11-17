@@ -182,11 +182,7 @@ def _now(con: object) -> datetime:
     aware UTC values. Requiring the live connection keeps the dialect choice
     at every write boundary explicit.
     """
-    return (
-        datetime.now(timezone.utc)
-        if is_postgres_connection(con)
-        else datetime.now()
-    )
+    return datetime.now(timezone.utc) if is_postgres_connection(con) else datetime.now()
 
 
 #: Awaiting values that mean the agent is blocked on the user, and therefore

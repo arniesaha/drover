@@ -30,8 +30,8 @@ from typing import Any
 import pytest
 
 from drover.config import AdvisoryContentConfig
-from drover.server import relay_manager
 from drover.schema import bootstrap
+from drover.server import relay_manager
 from drover.server.advisory.service import InsightsService
 from drover.server.harness.adapters import (
     AdapterHealth,
