@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import duckdb
@@ -12,6 +16,7 @@ import pytest
 import drover.server.harness.registry as registry_module
 from drover.schema import bootstrap
 from drover.server.db import control_plane_connection, control_plane_path
+from drover.server.harness.liveness import heartbeat_age_seconds
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.schema import (
     audit_duplicate_harness_events,
@@ -658,6 +663,85 @@ def test_register_host_upserts_capabilities_and_heartbeat(tmp_path):
     assert second.tailscale_url == "http://100.64.0.10:7081"
     assert second.capabilities == {"harnesses": ["shell", "codex"]}
     assert second.last_seen_at is not None
+
+
+@pytest.mark.skipif(
+    not hasattr(time, "tzset"), reason="requires process timezone control"
+)
+def test_register_host_keeps_duckdb_heartbeats_in_non_utc_local_time(
+    tmp_path, monkeypatch
+):
+    """A DuckDB TIMESTAMP stays comparable to the process-local liveness clock."""
+    previous_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        registry, _ = _registry(tmp_path)
+        registry.register_host(host_id="local", display_name="Local", kind="mac")
+        with registry._connect() as con:
+            stored = con.execute(
+                "SELECT last_seen_at FROM harness_hosts WHERE host_id = ?", ["local"]
+            ).fetchone()[0]
+
+        assert stored.tzinfo is None
+        assert heartbeat_age_seconds(stored, now=datetime.now()) < 2
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
+
+
+@pytest.mark.skipif(
+    not hasattr(time, "tzset"), reason="requires process timezone control"
+)
+def test_register_host_binds_aware_utc_timestamps_for_postgres(
+    tmp_path, monkeypatch
+):
+    """A UTC PostgreSQL session must not reinterpret local wall time as UTC."""
+    previous_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        registry = HarnessRegistry(tmp_path / "central.duckdb")
+        executed: list[tuple[str, list[object]]] = []
+
+        class _PostgresConnection:
+            dialect = "postgres"
+
+            def execute(self, sql, params):
+                executed.append((sql, list(params)))
+                return self
+
+        connection = _PostgresConnection()
+
+        @contextmanager
+        def _postgres_connection():
+            yield connection
+
+        monkeypatch.setattr(registry, "_connect", _postgres_connection)
+        monkeypatch.setattr(
+            registry,
+            "get_host",
+            lambda _host_id: SimpleNamespace(retired_at=None),
+        )
+
+        registry.register_host(host_id="pg", display_name="Postgres", kind="linux")
+        timestamps = executed[0][1][10:13]
+
+        assert all(
+            isinstance(stamp, datetime)
+            and stamp.tzinfo is not None
+            and stamp.utcoffset() == timedelta(0)
+            for stamp in timestamps
+        )
+    finally:
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
 
 
 def test_register_host_persists_connection_kind(tmp_path):

@@ -117,13 +117,12 @@ def _as_utc_datetime(value: Any) -> datetime | None:
 
 
 def _db_timestamp_to_utc(value: Any) -> datetime | None:
-    """Restore UTC timezone from a DuckDB TIMESTAMP column value.
+    """Restore UTC timezone from a DuckDB ``TIMESTAMP`` column value.
 
-    Every timestamp column in ``schema.py`` is ``TIMESTAMP``, never
-    ``TIMESTAMPTZ``. Binding an aware datetime converts it to *process-local*
-    wall time and discards the offset; binding a naive datetime stores it
-    verbatim. So a naive datetime read back out of one of those columns means
-    process-local, not UTC::
+    DuckDB control-plane timestamps are ``TIMESTAMP`` values. Binding an
+    aware datetime converts it to *process-local* wall time and discards the
+    offset; binding a naive datetime stores it verbatim. So a naive datetime
+    read back out of one of those columns means process-local, not UTC::
 
         aware 20:00+00:00  ->  stored as 13:00   (in PDT)
         naive 20:00        ->  stored as 20:00
@@ -174,14 +173,20 @@ def _as_db_timestamp(value: Any) -> datetime | None:
     return None
 
 
-def _now() -> datetime:
-    # The control-plane schema uses DuckDB ``TIMESTAMP`` columns.  Bind a
-    # process-local wall time so DuckDB does not apply its own session
-    # timezone while dropping an aware UTC offset.  Readers deliberately
-    # interpret naive values from those columns as process-local; keeping the
-    # two sides on that contract makes a fresh relay heartbeat fresh even when
-    # the database session and process timezone settings differ.
-    return datetime.now()
+def _now(con: object) -> datetime:
+    """Return the timestamp representation required by this control store.
+
+    DuckDB's control tables are ``TIMESTAMP`` columns whose naive values mean
+    process-local wall time. PostgreSQL's central control tables are
+    ``TIMESTAMPTZ`` and pooled sessions use UTC, so their bindings must remain
+    aware UTC values. Requiring the live connection keeps the dialect choice
+    at every write boundary explicit.
+    """
+    return (
+        datetime.now(timezone.utc)
+        if is_postgres_connection(con)
+        else datetime.now()
+    )
 
 
 #: Awaiting values that mean the agent is blocked on the user, and therefore
@@ -497,8 +502,8 @@ class HarnessRegistry:
         update: dict[str, Any] | None = None,
     ) -> HarnessHost:
         capabilities = validate_capabilities(capabilities, host_id)
-        now = _now()
         with self._connect() as con:
+            now = _now(con)
             con.execute(
                 """
                 INSERT INTO harness_hosts (
@@ -593,16 +598,17 @@ class HarnessRegistry:
                     raise HostBusyError(
                         "host has running/awaiting sessions; use --force to retire"
                     )
+                now = _now(con)
                 con.execute(
                     "UPDATE harness_hosts SET retired_at = COALESCE(retired_at, ?), "
                     "retired_reason = ?, updated_at = ? WHERE host_id = ?",
-                    [_now(), reason.strip(), _now(), host_id],
+                    [now, reason.strip(), now, host_id],
                 )
                 if is_postgres_connection(con):
                     con.execute(
                         "UPDATE control_credentials SET revoked_at = ? "
                         "WHERE scope = 'host' AND host_id = ? AND revoked_at IS NULL",
-                        [_now(), host_id],
+                        [now, host_id],
                     )
                 con.execute("COMMIT")
             except Exception:
@@ -621,7 +627,7 @@ class HarnessRegistry:
                 "UPDATE harness_hosts SET retired_at = NULL, retired_reason = NULL, "
                 "status = CASE WHEN retired_at IS NOT NULL THEN 'offline' ELSE status END, "
                 "updated_at = ? WHERE host_id = ?",
-                [_now(), host_id],
+                [_now(con), host_id],
             )
         return self.get_host(host_id)
 
@@ -676,7 +682,7 @@ class HarnessRegistry:
             con.execute(
                 "UPDATE harness_hosts SET model_catalogs_json = ?, updated_at = ? "
                 "WHERE host_id = ?",
-                [serialized, _now(), host_id],
+                [serialized, _now(con), host_id],
             )
 
     def latest_model_catalog(self, host_id: str, harness: str) -> dict[str, Any] | None:
@@ -733,10 +739,10 @@ class HarnessRegistry:
             existing = self.session_by_client_id(client_session_id)
             if existing is not None:
                 return existing
-        now = _now()
-        started_at = _as_utc_datetime(started_at) or now
         session_id = session_id or f"harness-{uuid4()}"
         with self._connect() as con:
+            now = _now(con)
+            started_at = _as_utc_datetime(started_at) or now
             con.execute("BEGIN TRANSACTION")
             try:
                 lock = " FOR UPDATE" if is_postgres_connection(con) else ""
@@ -1068,9 +1074,9 @@ class HarnessRegistry:
         ended_at: datetime | None = None,
         summary_session_id: str | None = None,
     ) -> HarnessSession:
-        now = _now()
         ended_at = _as_utc_datetime(ended_at)
         with self._connect() as con:
+            now = _now(con)
             previous = con.execute(
                 "SELECT status FROM harness_sessions WHERE session_id = ?", [session_id]
             ).fetchone()
@@ -1105,8 +1111,8 @@ class HarnessRegistry:
     def mark_session_recovered(
         self, session_id: str, native_session_id: str
     ) -> HarnessSession:
-        now = _now()
         with self._connect() as con:
+            now = _now(con)
             con.execute(
                 """
                 UPDATE harness_sessions
@@ -1134,8 +1140,9 @@ class HarnessRegistry:
         awaiting: str | None,
         last_activity: datetime | None = None,
     ) -> None:
-        stamp = _as_utc_datetime(last_activity) or _now()
+        stamp = _as_utc_datetime(last_activity)
         with self._connect() as con:
+            stamp = stamp or _now(con)
             # Read the prior value inside the same window as the write: this
             # is the one chokepoint both the local emit() path and the remote
             # /harness/events ingest path funnel through, so a transition seen
@@ -1463,7 +1470,7 @@ class HarnessRegistry:
                 "UPDATE harness_sessions "
                 "SET native_session_id = ?, updated_at = ? "
                 "WHERE session_id = ?",
-                [native_session_id, _now(), session_id],
+                [native_session_id, _now(con), session_id],
             )
 
     def update_session_preferences(
@@ -1475,16 +1482,16 @@ class HarnessRegistry:
     ) -> None:
         if model is None and thinking_effort is None:
             return
-        assignments = ["updated_at = ?"]
-        params: list[Any] = [_now()]
-        if model is not None:
-            assignments.append("model = ?")
-            params.append(model)
-        if thinking_effort is not None:
-            assignments.append("thinking_effort = ?")
-            params.append(thinking_effort)
-        params.append(session_id)
         with self._connect() as con:
+            assignments = ["updated_at = ?"]
+            params: list[Any] = [_now(con)]
+            if model is not None:
+                assignments.append("model = ?")
+                params.append(model)
+            if thinking_effort is not None:
+                assignments.append("thinking_effort = ?")
+                params.append(thinking_effort)
+            params.append(session_id)
             con.execute(
                 f"UPDATE harness_sessions SET {', '.join(assignments)} WHERE session_id = ?",
                 params,
@@ -1508,7 +1515,7 @@ class HarnessRegistry:
         # after the last sequenced event at or before their creation timestamp.
         # Never reserve a number owned by a remote structured manager.
         event_id = event_id or f"harness-event-{uuid4()}"
-        created_at = _as_utc_datetime(created_at) or _now()
+        created_at = _as_utc_datetime(created_at)
         normalized = normalize_harness_event(
             event_type=event_type,
             payload=payload,
@@ -1519,6 +1526,7 @@ class HarnessRegistry:
         )
         payload_json = canonical_payload(payload)
         with self._connect() as con:
+            created_at = created_at or _now(con)
             dedup_key = event_ingest_identity(
                 con,
                 session_id=session_id,
@@ -1698,7 +1706,7 @@ class HarnessRegistry:
                 seq = record.get("seq")
                 if not isinstance(seq, int) or isinstance(seq, bool):
                     seq = None
-                created_at = _as_utc_datetime(record.get("created_at")) or _now()
+                created_at = _as_utc_datetime(record.get("created_at")) or _now(con)
                 payload_json = canonical_payload(record.get("payload"))
                 params.append(
                     [
@@ -1943,7 +1951,7 @@ class HarnessRegistry:
                     seq = record.get("seq")
                     if not isinstance(seq, int) or isinstance(seq, bool):
                         seq = None
-                    created_at = _as_utc_datetime(record.get("created_at")) or _now()
+                    created_at = _as_utc_datetime(record.get("created_at")) or _now(con)
                     payload_json = canonical_payload(payload)
                     normalized = normalize_harness_event(
                         event_type=event_type,
@@ -2124,7 +2132,7 @@ class HarnessRegistry:
                             inserted_events,
                             key=lambda event: (
                                 event.get("seq") or 0,
-                                _as_utc_datetime(event.get("created_at")) or _now(),
+                                _as_utc_datetime(event.get("created_at")) or _now(con),
                                 event["event_id"],
                             ),
                         )
@@ -3068,9 +3076,9 @@ class HarnessRegistry:
         the hub stays durable indefinitely.  Per-session rank keeps the 500
         newest acknowledgements even when they are younger than seven days.
         """
-        cutoff = _as_utc_datetime(now) or _now()
-        cutoff -= timedelta(days=7)
+        cutoff = _as_utc_datetime(now)
         with self._connect() as con:
+            cutoff = (cutoff or _now(con)) - timedelta(days=7)
             rows = con.execute(
                 """
                 WITH ranked AS MATERIALIZED (
