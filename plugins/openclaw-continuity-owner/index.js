@@ -19,6 +19,7 @@ const validateConfig = ajv.compile(manifest.configSchema);
 const scopes = { implementation: "commit_only", integration: "publish_review", deployment: "explicit_approval_required" };
 const actionFields = ["action_id", "event_id", "type", "authority_scope", "authorized"];
 const WAKE_SERVICE_ID = "drover-continuity-owner-wake";
+let latestActivityAt = null;
 
 function requireValue(condition, message) {
   if (!condition) throw new Error(message);
@@ -33,7 +34,7 @@ function configuration(raw) {
   requireValue(validateConfig(raw), "Invalid trusted Drover plugin configuration");
   const config = {
     mode: "poll_only", timeoutMs: 5000, wakePollIntervalMs: 15000,
-    wakeRetryIntervalMs: 60000, ownerLeaseSeconds: 60, ...raw,
+    wakeRetryIntervalMs: 60000, ownerLeaseSeconds: 60, maxDrainMs: 55000, ...raw,
   };
   if (config.enabled !== true) return Object.freeze(config);
   requireValue(!config.canarySessionKey || config.canarySessionKey !== config.ownerSessionKey, "Canary and owner session bindings must be distinct");
@@ -158,6 +159,8 @@ function committedServiceConfiguration(ctx) {
 function registerWakeService(api) {
   let controller;
   let running;
+  let lastError = null;
+  const heldLeases = new Map();
   const wakes = new Map();
   api.registerService({
     id: WAKE_SERVICE_ID,
@@ -175,12 +178,19 @@ function registerWakeService(api) {
             const listed = await wakeRunIds(config, signal, assertCurrent, ctx.logger);
             const present = new Set(listed);
             for (const known of wakes.keys()) if (!present.has(known)) wakes.delete(known);
+            for (const known of heldLeases.keys()) if (!present.has(known)) heldLeases.delete(known);
             for (const runId of listed) {
               try {
                 const scoped = scopedTo(config, runId);
-                const polled = reply(await request(scoped, "GET", { run_id: runId, limit: 1 }, signal, assertCurrent), scoped);
+                const query = { run_id: runId, limit: 1 };
+                if (latestActivityAt) query.session_activity_at = latestActivityAt;
+                if (lastError) query.last_error = lastError;
+                const polled = reply(await request(scoped, "GET", query, signal, assertCurrent), scoped);
                 const status = await maintainOwnerLease(scoped, polled.continuity, signal, assertCurrent);
                 assertCurrent();
+                if (status.owner?.epoch) {
+                  heldLeases.set(runId, { epoch: status.owner.epoch, config: scoped });
+                }
                 const fingerprint = status.owner_wake ? wakeFingerprint(status) : null;
                 if (fingerprint) pending.push({ runId, fingerprint });
                 else wakes.delete(runId);
@@ -208,19 +218,53 @@ function registerWakeService(api) {
               requestOwnerWake(api, config.ownerSessionKey, ctx.logger);
             }
             ctx.serviceHealth?.clearFailure();
+            lastError = null;
           } catch (error) {
             if (!signal.aborted) {
+              lastError = error instanceof Error ? error.message : "unknown error";
               ctx.serviceHealth?.reportFailure(error);
-              ctx.logger.warn(`continuity wake poll failed: ${error instanceof Error ? error.message : "unknown error"}`);
+              ctx.logger.warn(`continuity wake poll failed: ${lastError}`);
             }
           }
           await waitFor(signal, config.wakePollIntervalMs);
         }
       })();
     },
-    async stop() {
+    async stop(ctx) {
+      const config = ctx ? committedServiceConfiguration(ctx) : null;
+      const drainMs = config?.maxDrainMs ?? 55000;
       controller?.abort();
-      await running;
+      let timeoutId;
+      let timedOut = false;
+      const drainTimer = new Promise((resolve) => {
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, drainMs);
+        if (typeof timeoutId.unref === "function") timeoutId.unref();
+      });
+      try {
+        await Promise.race([running, drainTimer]);
+      } finally {
+        clearTimeout(timeoutId);
+      }
+      if (timedOut && heldLeases.size > 0) {
+        for (const [runId, leaseInfo] of heldLeases.entries()) {
+          try {
+            await invoke(leaseInfo.config, false, {
+              version: 1,
+              request: {
+                operation: "lease",
+                owner_epoch: leaseInfo.epoch,
+                lease_seconds: 0,
+              },
+            }, AbortSignal.timeout(config?.timeoutMs ?? 5000), () => {});
+          } catch {
+            // best-effort lease release during drain timeout
+          }
+        }
+        heldLeases.clear();
+      }
     },
   });
 }
@@ -303,7 +347,12 @@ async function invoke(base, readOnly, payload, signal, assertCurrent) {
   requireValue(runId !== undefined, "run_id is required when no fixed runId is bound");
   const config = scopedTo(base, runId);
   requireValue(!readOnly || args.operation === "poll", "Read-only canary permits poll only");
-  const get = (limit) => request(config, "GET", { run_id: config.runId, limit }, signal, assertCurrent);
+  const get = (limit) => {
+    const query = { run_id: config.runId, limit };
+    if (args.session_activity_at) query.session_activity_at = args.session_activity_at;
+    if (args.last_error) query.last_error = args.last_error;
+    return request(config, "GET", query, signal, assertCurrent);
+  };
   let raw;
   let ownerId = config.ownerPrincipal;
   if (args.operation === "poll") raw = await get(args.limit ?? 20);
@@ -328,7 +377,9 @@ async function invoke(base, readOnly, payload, signal, assertCurrent) {
     requireValue(result.delivery === null || (status.next_action && actionFields.every((key) => result.delivery[key] === status.next_action[key])), "Delivery differs from the durable action");
   } else requireValue(!Object.hasOwn(raw, "delivery"), "Only consume may deliver an owner action");
   if (["lease", "consume", "acknowledge"].includes(args.operation)) {
-    requireValue(status.owner.id === ownerIdFor(config, status) && status.owner.live, "Reply no longer carries the trusted live owner");
+    if (args.operation !== "lease" || args.lease_seconds !== 0) {
+      requireValue(status.owner.id === ownerIdFor(config, status) && status.owner.live, "Reply no longer carries the trusted live owner");
+    }
     if (args.operation !== "lease") requireValue(status.owner.epoch === args.owner_epoch, "Reply no longer carries the requested owner epoch");
   }
   if (args.operation === "report") requireValue(result.event_id !== null, "Report must return its durable identity");
@@ -369,6 +420,7 @@ export function register(api) {
         : "Explicit Drover continuity calls for the bound owner. Advisory actions only; no executor, merge, deployment or messaging. Ack only after idempotent reconciliation.",
       parameters: structuredClone(requestSchema),
       async execute(_toolCallId, payload, signal) {
+        latestActivityAt = new Date().toISOString();
         const details = await invoke(config, readOnly, payload, signal, assertCurrent);
         return { content: [{ type: "text", text: JSON.stringify(details) }], details };
       },
