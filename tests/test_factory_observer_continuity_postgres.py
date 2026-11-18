@@ -376,8 +376,10 @@ def test_duplicate_source_retries_race_before_and_after_ack(pg_bridge):
     assert store.consume(RUN, **fence) is None
 
 
-def test_postgres_integration_reservation_serializes_and_fences_redelivery(pg_bridge):
-    """A released keyed delivery may advance; a live or stale one cannot."""
+def test_postgres_integration_reservation_fences_paused_stale_effect_and_redelivery(
+    pg_bridge,
+):
+    """A paused owner cannot materialize or acknowledge after its successor."""
     store, clock = pg_bridge
     registry = HarnessRegistry(store.path)
     first_run = "work-integration-first"
@@ -467,15 +469,34 @@ def test_postgres_integration_reservation_serializes_and_fences_redelivery(pg_br
     )
     fence = {"owner_id": owner, "owner_epoch": first["owner_epoch"]}
     action = store.consume(first_run, **fence)
-    store.action_intent(
-        first_run,
-        **fence,
-        wake_id=event_id,
-        action_fingerprint=action["action_id"],
-        artifact="local:serialized-effect",
-    )
+    # Pause A after the authorized delivery but before it records an effect.
     clock.advance(5)
     successor = store.lease(first_run, owner_id=owner, owner_epoch=first["owner_epoch"])
+    with pytest.raises(ContinuityConflict):
+        store.action_intent(
+            first_run,
+            **fence,
+            wake_id=event_id,
+            action_fingerprint=action["action_id"],
+            artifact="local:stale-effect",
+        )
+    assert (
+        store.fence_owner(
+            first_run, owner_id=owner, expected_epoch=first["owner_epoch"]
+        )
+        is None
+    )
+    successor_fence = {"owner_id": owner, "owner_epoch": successor["owner_epoch"]}
+    successor_action = store.consume(first_run, **successor_fence)
+    assert successor_action["action_id"] == action["action_id"]
+    receipt = store.action_intent(
+        first_run,
+        **successor_fence,
+        wake_id=event_id,
+        action_fingerprint=successor_action["action_id"],
+        artifact="local:serialized-effect",
+    )
+    assert receipt["state"] == "complete"
     with pytest.raises(ContinuityConflict):
         store.acknowledge(
             first_run,
@@ -485,19 +506,23 @@ def test_postgres_integration_reservation_serializes_and_fences_redelivery(pg_br
         )
     store.acknowledge(
         first_run,
-        owner_id=owner,
-        owner_epoch=successor["owner_epoch"],
+        **successor_fence,
         event_id=event_id,
         checkpoint="Serialized action acknowledged",
     )
     # The durable acknowledgement may be replayed after it releases the key.
     store.acknowledge(
         first_run,
-        owner_id=owner,
-        owner_epoch=successor["owner_epoch"],
+        **successor_fence,
         event_id=event_id,
         checkpoint="stale replay must not overwrite",
     )
+    with control_plane_connection(store.path) as con:
+        assert con.execute(
+            "SELECT count(*) FROM continuity_owner_action_intents "
+            "WHERE wake_id = ? AND state = 'complete'",
+            [event_id],
+        ).fetchone() == (1,)
     store.initialize(
         session_id="pg-integration-second",
         objective="Serialized implementation",
