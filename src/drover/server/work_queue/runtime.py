@@ -230,6 +230,17 @@ class HarnessBridge:
             if parent_session and parent_session.host_id == host
             else scope.execution_cwds.get(host)
         )
+        authority = authority or {}
+        local_number = authority.get("local_candidate_number")
+        local_cwd = authority.get("local_candidate_cwd")
+        if local_cwd is not None:
+            if (
+                scope.candidate_source != "local_file"
+                or not isinstance(local_number, int)
+                or scope.local_candidate_worktrees.get(str(local_number)) != local_cwd
+            ):
+                raise WorkDenied("local candidate worktree binding is invalid")
+            cwd = local_cwd
         if not cwd:
             raise ValueError("configured execution checkout required")
         brief = (
@@ -237,7 +248,6 @@ class HarnessBridge:
             f"ref {scope.brief_ref or scope.goal_id} and versioned policy. Report "
             "behavioral evidence through the work tools."
         )
-        authority = authority or {}
         payload = {
             "cwd": cwd,
             "harness": harness,

@@ -531,6 +531,8 @@ class WorkService:
             authority={
                 "labels": item.get("operator_authority_labels", []),
                 "body": item.get("body"),
+                "local_candidate_number": number,
+                "local_candidate_cwd": scope.local_candidate_worktrees.get(str(number)),
             },
         )
         linked = self.store.associate(row["run_key"], session_id)

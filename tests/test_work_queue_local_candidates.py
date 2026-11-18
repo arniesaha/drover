@@ -109,6 +109,21 @@ def test_local_candidate_config_fails_closed_without_absolute_manifest(tmp_path)
         _scope(tmp_path / "relative").model_copy(
             update={"local_candidates_path": "relative.json"}
         ).valid()
+    with pytest.raises(ValueError, match="positive item keys"):
+        _scope(tmp_path / "candidates.json", local_candidate_worktrees={"x": "/tmp"})
+    with pytest.raises(ValueError, match="cannot configure local"):
+        GoalScope.model_validate(
+            {
+                "goal_id": "github-goal",
+                "repo": "example/project",
+                "goal_label": "goal:github",
+                "local_candidate_worktrees": {"1": "/tmp"},
+                "credential": {
+                    "token_env": "UNUSED_LOCAL_CANDIDATE_TOKEN",
+                    "capabilities": ["issues_read"],
+                },
+            }
+        )
 
 
 def test_local_candidate_reconciler_and_work_service_share_the_same_provider(tmp_path):
@@ -146,6 +161,7 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
         brief_ref="docs/local-canary.md",
         continuity_owner_id="drover:owner/goal-local",
         continuity_owner_harness="codex",
+        local_candidate_worktrees={"1": str(tmp_path / "worktree-1")},
     )
     config = WorkQueueConfig(
         enabled=True,
@@ -210,6 +226,9 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
     assert link["session_id"] == "local-session-1"
     assert harness.launches[0][2] == _ref()
     assert harness.launches[0][4] == scope.goal_id
+    assert harness.launches[0][5]["authority"]["local_candidate_cwd"] == str(
+        tmp_path / "worktree-1"
+    )
     assert provider.get_item(_ref())["labels"] == [
         {"name": "goal:local"},
         {"name": "agent:nix"},

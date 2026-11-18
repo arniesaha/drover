@@ -192,6 +192,9 @@ class GoalScope(Model):
     # canary source and never inherits a remote provider credential.
     candidate_source: Literal["github", "local_file"] = "github"
     local_candidates_path: str | None = None
+    # Per-item worktrees are local-file-only and must be declared in the
+    # server configuration; manifest content cannot choose an arbitrary path.
+    local_candidate_worktrees: dict[str, str] = Field(default_factory=dict)
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -235,9 +238,18 @@ class GoalScope(Model):
                 or not Path(self.local_candidates_path).is_absolute()
             ):
                 raise ValueError("local candidate source requires an absolute manifest")
-        elif self.local_candidates_path is not None:
+            for number, path in self.local_candidate_worktrees.items():
+                if (
+                    not number.isdigit()
+                    or int(number) <= 0
+                    or not Path(path).is_absolute()
+                ):
+                    raise ValueError(
+                        "local candidate worktrees require positive item keys and absolute paths"
+                    )
+        elif self.local_candidates_path is not None or self.local_candidate_worktrees:
             raise ValueError(
-                "GitHub candidate source cannot configure a local manifest"
+                "GitHub candidate source cannot configure local candidate paths"
             )
         return self
 
