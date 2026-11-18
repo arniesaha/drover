@@ -207,6 +207,7 @@ def launch_path(pg_control_path):
                 "execution_enabled": True,
                 "execution_cwds": {host_id: "/repo/drover"},
                 "brief_ref": "docs/brief.md",
+                "integration_serialization_key": "main-write",
                 "continuity_owner_id": "drover:owner/launch",
                 "continuity_owner_harness": "codex",
                 "credential": {
@@ -250,6 +251,11 @@ def test_native_owner_queued_issue_launches_worker_and_records_owner_continuatio
     link = service.store.links()[0]
     assert link["session_id"] == "stub-session-1"
     assert harnessd.requests[0]["client_session_id"] == link["run_key"]
+    binding = harnessd.requests[0]["work_coordinator_continuity"]
+    assert binding["authority_scope"] == "implementation"
+    assert binding["delivery_role"] == "integration_serialized"
+    assert binding["repository"] == "arniesaha/drover"
+    assert binding["serialization_key"] == "main-write"
     session = registry.get_session(link["session_id"])
     assert session and session.handoff_mode == "work_coordinator"
 

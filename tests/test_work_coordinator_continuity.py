@@ -184,6 +184,60 @@ def test_work_coordinator_binding_rejects_noncanonical_owner():
         raise AssertionError("noncanonical owner accepted")
 
 
+def test_integration_serialization_binding_is_signed_and_retains_commit_only_scope():
+    """A serialization class is metadata, never the integration authority."""
+    unsigned = {
+        "run_id": "work-integration-abc",
+        "owner_id": "drover:owner/goal",
+        "authority_scope": "implementation",
+        "objective": "Serialized implementation work",
+        "delivery_role": "integration_serialized",
+        "repository": "example/project",
+        "serialization_key": "main-write",
+    }
+
+    binding, _ = parse_work_coordinator_continuity(
+        {
+            "work_coordinator_continuity": {
+                **unsigned,
+                "binding_signature": sign_work_coordinator_continuity(unsigned, "hub"),
+            }
+        },
+        hub_secret="hub",
+    )
+
+    assert binding is not None
+    assert binding.authority_scope == "implementation"
+    assert binding.delivery_role == "integration_serialized"
+    assert binding.repository == "example/project"
+    assert binding.serialization_key == "main-write"
+
+
+def test_integration_serialization_binding_rejects_authority_escalation():
+    unsigned = {
+        "run_id": "work-integration-abc",
+        "owner_id": "drover:owner/goal",
+        "authority_scope": "integration",
+        "objective": "Serialized implementation work",
+        "delivery_role": "integration_serialized",
+        "repository": "example/project",
+        "serialization_key": "main-write",
+    }
+
+    with pytest.raises(ValueError, match="implementation"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **unsigned,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        unsigned, "hub"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )
+
+
 def test_work_coordinator_binding_rejects_forged_hub_signature():
     unsigned = {
         "run_id": "work-abc123",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -22,6 +23,9 @@ class WorkCoordinatorContinuity:
     owner_id: str
     authority_scope: str
     objective: str
+    delivery_role: str = "standard"
+    repository: str | None = None
+    serialization_key: str | None = None
 
     @property
     def source_session_id(self) -> str:
@@ -82,13 +86,18 @@ def _parse_work_coordinator_continuity(
     if raw is None:
         return None, normalized, {}, None
     normalized.pop("work_coordinator_continuity")
-    if not isinstance(raw, Mapping) or set(raw) != {
+    base_fields = {
         "run_id",
         "owner_id",
         "authority_scope",
         "objective",
         "binding_signature",
-    }:
+    }
+    serialization_fields = {"delivery_role", "repository", "serialization_key"}
+    if not isinstance(raw, Mapping) or set(raw) not in (
+        base_fields,
+        base_fields | serialization_fields,
+    ):
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
     signature = raw["binding_signature"]
     unsigned = {key: value for key, value in raw.items() if key != "binding_signature"}
@@ -114,8 +123,40 @@ def _parse_work_coordinator_continuity(
         raise FactoryObserverRequestError("work continuity scope is invalid")
     if not isinstance(objective, str) or not objective.strip() or len(objective) > 4000:
         raise FactoryObserverRequestError("work continuity objective is invalid")
+    delivery_role = raw.get("delivery_role", "standard")
+    repository = raw.get("repository")
+    serialization_key = raw.get("serialization_key")
+    if delivery_role == "standard":
+        if repository is not None or serialization_key is not None:
+            raise FactoryObserverRequestError(
+                "standard work continuity cannot serialize"
+            )
+    elif delivery_role == "integration_serialized":
+        if scope != "implementation":
+            raise FactoryObserverRequestError(
+                "integration serialization requires implementation authority"
+            )
+        if (
+            not isinstance(repository, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+            or not isinstance(serialization_key, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}", serialization_key)
+        ):
+            raise FactoryObserverRequestError(
+                "integration serialization binding is invalid"
+            )
+    else:
+        raise FactoryObserverRequestError("work continuity delivery role is invalid")
     return (
-        WorkCoordinatorContinuity(run_id, owner_id, scope, objective.strip()),
+        WorkCoordinatorContinuity(
+            run_id,
+            owner_id,
+            scope,
+            objective.strip(),
+            delivery_role,
+            repository,
+            serialization_key,
+        ),
         normalized,
         unsigned,
         signature,

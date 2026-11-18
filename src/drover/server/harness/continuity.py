@@ -133,6 +133,32 @@ def _row(con, sql, params):
     return dict(zip((col[0] for col in result.description), row)) if row else None
 
 
+def _serialization_binding(
+    delivery_role: str, repository: str | None, serialization_key: str | None
+) -> tuple[str, str | None, str | None]:
+    """Validate the signed logical serialization extension.
+
+    It fences a conflicting delivery under implementation authority; it is not
+    the broader integration/publish authority scope.
+    """
+    if delivery_role == "standard":
+        if repository is not None or serialization_key is not None:
+            raise ValueError("standard delivery cannot carry serialization metadata")
+        return delivery_role, None, None
+    if delivery_role != "integration_serialized":
+        raise ValueError("unknown delivery role")
+    import re
+
+    if (
+        not isinstance(repository, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+        or not isinstance(serialization_key, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}", serialization_key)
+    ):
+        raise ValueError("invalid integration serialization binding")
+    return delivery_role, repository, serialization_key
+
+
 def _intent_wire(row: dict) -> dict:
     return {
         "wake_id": row["wake_id"],
@@ -841,6 +867,110 @@ class FactoryObserverContinuity:
                 con, now=self.clock(), deadline_seconds=deadline_seconds
             )
 
+    @staticmethod
+    def _reserve_integration(con, run: dict, now: datetime) -> None:
+        """Acquire one repository/key reservation or reject the live holder."""
+        if run["delivery_role"] != "integration_serialized":
+            return
+        repository = run["serialization_repository"]
+        key = run["serialization_key"]
+        owner_id = run["authorized_owner_id"]
+        if not repository or not key or not owner_id:
+            raise ContinuityConflict("integration serialization binding is incomplete")
+        con.execute(
+            """INSERT INTO continuity_integration_reservations
+            (repository, serialization_key, owner_id, run_id, generation,
+             owner_epoch, state, acquired_at)
+            VALUES (?, ?, ?, ?, 1, 0, 'reserved', ?)
+            ON CONFLICT (repository, serialization_key) DO NOTHING""",
+            [repository, key, owner_id, run["run_id"], now],
+        )
+        lock = " FOR UPDATE" if is_postgres_connection(con) else ""
+        reservation = _row(
+            con,
+            """SELECT * FROM continuity_integration_reservations
+            WHERE repository = ? AND serialization_key = ?""" + lock,
+            [repository, key],
+        )
+        if reservation is None:
+            raise ContinuityConflict("integration reservation is unavailable")
+        if reservation["state"] == "reserved":
+            if (
+                reservation["run_id"] != run["run_id"]
+                or reservation["owner_id"] != owner_id
+            ):
+                raise ContinuityConflict("integration reservation is held")
+        elif reservation["state"] == "released":
+            reservation = _row(
+                con,
+                """UPDATE continuity_integration_reservations SET
+                owner_id = ?, run_id = ?, generation = generation + 1,
+                owner_epoch = 0, state = 'reserved', acquired_at = ?, released_at = NULL
+                WHERE repository = ? AND serialization_key = ? AND state = 'released'
+                RETURNING *""",
+                [owner_id, run["run_id"], now, repository, key],
+            )
+            if reservation is None:
+                raise ContinuityConflict("integration reservation changed")
+        elif reservation["run_id"] != run["run_id"]:
+            raise ContinuityConflict("integration reservation is unavailable")
+        generation = reservation["generation"]
+        if run.get("serialization_generation") not in {None, generation}:
+            raise ContinuityConflict("integration reservation generation changed")
+        con.execute(
+            """UPDATE factory_observer_runs SET serialization_generation = ?
+            WHERE run_id = ? AND serialization_generation IS NULL""",
+            [generation, run["run_id"]],
+        )
+        run["serialization_generation"] = generation
+
+    @staticmethod
+    def _fence_integration(con, run: dict, owner_id: str, owner_epoch: int) -> None:
+        if run["delivery_role"] != "integration_serialized":
+            return
+        changed = con.execute(
+            """UPDATE continuity_integration_reservations SET owner_epoch = ?
+            WHERE repository = ? AND serialization_key = ? AND run_id = ?
+              AND owner_id = ? AND generation = ? AND state = 'reserved'
+              AND owner_epoch <= ? RETURNING generation""",
+            [
+                owner_epoch,
+                run["serialization_repository"],
+                run["serialization_key"],
+                run["run_id"],
+                owner_id,
+                run["serialization_generation"],
+                owner_epoch,
+            ],
+        ).fetchone()
+        if changed is None:
+            raise ContinuityConflict("integration reservation fence changed")
+
+    @staticmethod
+    def _release_integration(
+        con, run: dict, owner_id: str, owner_epoch: int, now: datetime
+    ) -> None:
+        if run["delivery_role"] != "integration_serialized":
+            return
+        changed = con.execute(
+            """UPDATE continuity_integration_reservations
+            SET state = 'released', released_at = ?
+            WHERE repository = ? AND serialization_key = ? AND run_id = ?
+              AND owner_id = ? AND generation = ? AND owner_epoch = ?
+              AND state = 'reserved' RETURNING generation""",
+            [
+                now,
+                run["serialization_repository"],
+                run["serialization_key"],
+                run["run_id"],
+                owner_id,
+                run["serialization_generation"],
+                owner_epoch,
+            ],
+        ).fetchone()
+        if changed is None:
+            raise ContinuityConflict("integration reservation fence changed")
+
     def initialize(
         self,
         *,
@@ -850,6 +980,9 @@ class FactoryObserverContinuity:
         authority_scope: str = "implementation",
         authorized_owner_id: str | None = None,
         handoff_token: str | None = None,
+        delivery_role: str = "standard",
+        repository: str | None = None,
+        serialization_key: str | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
@@ -863,6 +996,21 @@ class FactoryObserverContinuity:
                 raise PermissionError("handoff redemption requires an owner identity")
         if authority_scope not in SCOPES:
             raise ValueError("unsupported authority_scope")
+        delivery_role, repository, serialization_key = _serialization_binding(
+            delivery_role, repository, serialization_key
+        )
+        if (
+            delivery_role == "integration_serialized"
+            and authority_scope != "implementation"
+        ):
+            raise ValueError(
+                "integration serialization requires implementation authority"
+            )
+        if delivery_role == "integration_serialized" and not (
+            isinstance(authorized_owner_id, str)
+            and authorized_owner_id.startswith("drover:owner/")
+        ):
+            raise ValueError("integration serialization requires a native owner")
         session = HarnessRegistry(self.path).get_session(session_id)
         projection = factory_observer_projection(session)
         if projection is None:
@@ -873,8 +1021,9 @@ class FactoryObserverContinuity:
             con.execute(
                 """INSERT INTO factory_observer_runs
                 (run_id, session_id, expected_revision, objective, checkpoint,
-                 authority_scope, authorized_owner_id, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 authority_scope, authorized_owner_id, delivery_role,
+                 serialization_repository, serialization_key, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (run_id) DO NOTHING""",
                 [
                     run_id,
@@ -884,6 +1033,9 @@ class FactoryObserverContinuity:
                     checkpoint,
                     authority_scope,
                     authorized_owner_id,
+                    delivery_role,
+                    repository,
+                    serialization_key,
                     self.clock(),
                 ],
             )
@@ -899,6 +1051,9 @@ class FactoryObserverContinuity:
                 "objective": objective,
                 "authority_scope": authority_scope,
                 "expected_revision": projection["expected_revision"],
+                "delivery_role": delivery_role,
+                "serialization_repository": repository,
+                "serialization_key": serialization_key,
             }.items():
                 if existing[name] != value:
                     raise ContinuityConflict(f"run {name} is immutable")
@@ -938,6 +1093,7 @@ class FactoryObserverContinuity:
                 existing_owner is not None or authorized_owner_id is not None
             ):
                 raise ContinuityConflict("run authorized owner is immutable")
+            self._reserve_integration(con, existing, self.clock())
             if authorized_owner_id is not None:
                 _recover_pending_completions(con, session_id=session_id)
         return run_id
@@ -1056,6 +1212,7 @@ class FactoryObserverContinuity:
                 owner_epoch = ?, lease_until = ?, updated_at = ? WHERE run_id = ?""",
                 [owner_id, epoch, until, now, run_id],
             )
+            self._fence_integration(con, run, owner_id, epoch)
         return {
             "owner_id": owner_id,
             "owner_epoch": epoch,
@@ -1117,6 +1274,7 @@ class FactoryObserverContinuity:
                 ).fetchone()
                 if marked is None:
                     raise RuntimeError("recovery executor changed during owner fence")
+            self._fence_integration(con, run, owner_id, epoch)
         return epoch
 
     @staticmethod
@@ -1174,6 +1332,7 @@ class FactoryObserverContinuity:
             now = self.clock()
             self._authorized_owner(run, owner_id)
             self._fence(run, owner_id, owner_epoch, now)
+            self._fence_integration(con, run, owner_id, owner_epoch)
             action = (
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
             )
@@ -1279,6 +1438,7 @@ class FactoryObserverContinuity:
             now = self.clock()
             self._authorized_owner(run, owner_id)
             self._fence(run, owner_id, owner_epoch, now)
+            self._fence_integration(con, run, owner_id, owner_epoch)
             event = _row(
                 con,
                 """SELECT state, action_json FROM factory_observer_inbox
@@ -1362,6 +1522,7 @@ class FactoryObserverContinuity:
                 raise KeyError(event_id)
             if event["state"] == "acknowledged":
                 return  # A replay must never clobber a newer checkpoint/action.
+            self._fence_integration(con, run, owner_id, owner_epoch)
             if not event["action_json"]:
                 raise ContinuityConflict("consume the report before acknowledging")
             action = json.loads(event["action_json"])
@@ -1390,6 +1551,7 @@ class FactoryObserverContinuity:
                 next_action_json = NULL, updated_at = ? WHERE run_id = ?""",
                 [checkpoint, now, run_id],
             )
+            self._release_integration(con, run, owner_id, owner_epoch, now)
 
     def owner_runs(
         self,
@@ -1462,6 +1624,25 @@ class FactoryObserverContinuity:
                 if receipt is not None:
                     action["action_intent"] = _intent_wire(receipt)
             blocked = run["authority_scope"] == "deployment"
+            integration_serialization = None
+            if run.get("delivery_role") == "integration_serialized":
+                reservation = _row(
+                    con,
+                    """SELECT owner_id, run_id, generation, owner_epoch, state
+                    FROM continuity_integration_reservations
+                    WHERE repository = ? AND serialization_key = ?""",
+                    [run["serialization_repository"], run["serialization_key"]],
+                )
+                if reservation is None:
+                    raise ContinuityConflict("integration reservation is missing")
+                integration_serialization = {
+                    "repository": run["serialization_repository"],
+                    "key": run["serialization_key"],
+                    "generation": reservation["generation"],
+                    "owner_epoch": reservation["owner_epoch"],
+                    "state": reservation["state"],
+                    "held_by_run": reservation["run_id"] == run_id,
+                }
             receipt_counts = dict(
                 con.execute(
                     "SELECT state, count(*) FROM factory_observer_completion_receipts "
@@ -1514,6 +1695,8 @@ class FactoryObserverContinuity:
                 "checkpoint": run["checkpoint"],
                 "authority_scope": run["authority_scope"],
                 "scope_limit": SCOPES[run["authority_scope"]],
+                "delivery_role": run.get("delivery_role", "standard"),
+                "integration_serialization": integration_serialization,
                 "owner_handoff": {
                     "authorized_owner_id": run.get("authorized_owner_id"),
                     "state": handoff_state,
