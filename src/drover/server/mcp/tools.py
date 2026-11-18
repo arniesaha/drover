@@ -1822,7 +1822,7 @@ def _build_routing_hint(accounts: list[dict[str, Any]], now: datetime) -> str:
                     )
                     candidate = (label, None, recovery)
                 elif all(
-                    w.get("status") == "ok"
+                    w.get("status") in {None, "ok"}
                     and isinstance(w.get("used_percent"), (int, float))
                     and not isinstance(w["used_percent"], bool)
                     and math.isfinite(w["used_percent"])

@@ -36,6 +36,14 @@ def test_best_account_uses_its_own_binding_window():
     assert _build_routing_hint(list(reversed(accounts)), NOW) == "codex: 2%"
 
 
+def test_ok_account_without_legacy_window_status_remains_routable():
+    # ProviderUsageWindow has no per-window status.  Its daemon JSON is
+    # therefore governed by the account-level successful observation.
+    ready = window(used=13)
+    ready.pop("status")
+    assert _build_routing_hint([account(ready)], NOW) == "codex: 13%"
+
+
 def test_single_exhausted_constraint_blocks_account():
     assert (
         _build_routing_hint(
