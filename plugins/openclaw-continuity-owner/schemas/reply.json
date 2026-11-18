@@ -142,6 +142,14 @@
         "completion_receipts": {
           "$ref": "#/$defs/CompletionReceipts"
         },
+        "delivery_role": {
+          "enum": [
+            "standard",
+            "integration_serialized"
+          ],
+          "title": "Delivery Role",
+          "type": "string"
+        },
         "events": {
           "items": {
             "$ref": "#/$defs/InboxEntry"
@@ -174,6 +182,16 @@
           },
           "title": "Inbox Counts",
           "type": "object"
+        },
+        "integration_serialization": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IntegrationSerialization"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "next_action": {
           "anyOf": [
@@ -270,6 +288,8 @@
         "checkpoint",
         "authority_scope",
         "scope_limit",
+        "delivery_role",
+        "integration_serialization",
         "owner_handoff",
         "owner",
         "worker_state",
@@ -394,6 +414,58 @@
         "summary"
       ],
       "title": "InboxReport",
+      "type": "object"
+    },
+    "IntegrationSerialization": {
+      "additionalProperties": false,
+      "description": "Read-only reservation state for a serialized integration delivery.",
+      "properties": {
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "held_by_run": {
+          "title": "Held By Run",
+          "type": "boolean"
+        },
+        "key": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Key",
+          "type": "string"
+        },
+        "owner_epoch": {
+          "minimum": 0,
+          "title": "Owner Epoch",
+          "type": "integer"
+        },
+        "repository": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Repository",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "reserved",
+            "released"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "key",
+        "generation",
+        "owner_epoch",
+        "state",
+        "held_by_run"
+      ],
+      "title": "IntegrationSerialization",
       "type": "object"
     },
     "OwnerAction": {

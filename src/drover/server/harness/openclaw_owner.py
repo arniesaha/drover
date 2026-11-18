@@ -193,6 +193,17 @@ class InboxEntry(WireModel):
     report: InboxReport
 
 
+class IntegrationSerialization(WireModel):
+    """Read-only reservation state for a serialized integration delivery."""
+
+    repository: Id
+    key: Id
+    generation: Annotated[int, Field(ge=1)]
+    owner_epoch: Annotated[int, Field(ge=0)]
+    state: Literal["reserved", "released"]
+    held_by_run: bool
+
+
 class ContinuityProjection(WireModel):
     version: Literal[1]
     run_id: Id
@@ -203,6 +214,8 @@ class ContinuityProjection(WireModel):
     checkpoint: Checkpoint
     authority_scope: Scope
     scope_limit: Literal["commit_only", "publish_review", "explicit_approval_required"]
+    delivery_role: Literal["standard", "integration_serialized"]
+    integration_serialization: IntegrationSerialization | None
     owner_handoff: OwnerHandoff
     owner: OwnerLease
     worker_state: Literal[

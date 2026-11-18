@@ -948,6 +948,8 @@ def test_python_adapter_first_handoff_preserves_scope_on_postgres(
         handoff_token=handoff["handoff_token"],
     ).invoke({"version": 1, "request": {"operation": "initialize"}})
     assert reply.continuity.authority_scope == scope
+    assert reply.continuity.delivery_role == "standard"
+    assert reply.continuity.integration_serialization is None
     assert reply.continuity.owner_handoff.authorized_owner_id == "credential:pg-owner"
 
 
