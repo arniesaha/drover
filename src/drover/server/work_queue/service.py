@@ -162,10 +162,14 @@ class WorkService:
             raise ValueError("positive issue number required")
         return ItemRef(
             self.config.workspace_id,
-            "github",
+            scope.candidate_source,
             scope.repo,
             number,
-            f"https://github.com/{scope.repo}/issues/{number}",
+            (
+                f"local://{scope.goal_id}/{number}"
+                if scope.candidate_source == "local_file"
+                else f"https://github.com/{scope.repo}/issues/{number}"
+            ),
         )
 
     def item(self, goal_id, number):

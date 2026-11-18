@@ -188,6 +188,10 @@ class GoalScope(Model):
     # provider/model default from an unrelated worker.
     continuity_owner_harness: str | None = None
     continuity_owner_model: str | None = None
+    # GitHub is the normal ingress.  ``local_file`` is an explicit isolated
+    # canary source and never inherits a remote provider credential.
+    candidate_source: Literal["github", "local_file"] = "github"
+    local_candidates_path: str | None = None
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -224,6 +228,16 @@ class GoalScope(Model):
         if self.integration_serialization_key is not None and owner != native_owner:
             raise ValueError(
                 "integration serialization requires this goal's native owner"
+            )
+        if self.candidate_source == "local_file":
+            if (
+                not self.local_candidates_path
+                or not Path(self.local_candidates_path).is_absolute()
+            ):
+                raise ValueError("local candidate source requires an absolute manifest")
+        elif self.local_candidates_path is not None:
+            raise ValueError(
+                "GitHub candidate source cannot configure a local manifest"
             )
         return self
 

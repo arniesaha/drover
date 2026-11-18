@@ -12,7 +12,8 @@ from drover.server.harness.worker_state import worker_brief
 from drover.server.mcp.contract import ReadCaps, bound_response
 from drover.server.web.auth import bearer_credential
 
-from .github import GitHubProvider, ProviderUnavailable
+from .github import ProviderUnavailable
+from .providers import provider_for_scope
 from .service import SYSTEMIC_COMMENT, WorkActor, WorkDenied, WorkService
 from .store import WorkStore
 
@@ -278,7 +279,7 @@ def start_work_service(collector, config):
             return None
         raise ValueError("live work control requires Postgres")
     providers = {
-        g.goal_id: GitHubProvider(
+        g.goal_id: provider_for_scope(
             config.workspace_id,
             g,
             public_text_validator=lambda text: text == SYSTEMIC_COMMENT,
