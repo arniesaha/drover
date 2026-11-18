@@ -283,6 +283,55 @@ def _is_turn_completion_payload(payload: dict[str, Any]) -> bool:
     return isinstance(inner, dict) and inner.get("turn_complete") is True
 
 
+def _structured_terminal_result(
+    *, event_id: str, event_type: str, created_at: Any, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return only the allowlisted terminal facts for one structured event.
+
+    Session listings must explain whether a turn ended normally, was cancelled,
+    or failed at the adapter boundary without exposing event text, command
+    arguments, tool output, or provider transcript content.
+    """
+    inner = payload.get("payload")
+    if not isinstance(inner, dict):
+        inner = payload
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str):
+        turn_id = (
+            inner.get("turn_id") if isinstance(inner.get("turn_id"), str) else None
+        )
+    returncode = inner.get("exited")
+    if not isinstance(returncode, int) or isinstance(returncode, bool):
+        returncode = None
+    if (
+        event_type == "session.terminated"
+        or inner.get("session_status") == "terminated"
+    ):
+        category = "cancelled"
+    elif event_type == "session.exited" or "exited" in inner:
+        category = "completed" if returncode == 0 else "adapter_failure"
+    elif event_type == "error":
+        category = "adapter_failure"
+    elif inner.get("turn_complete") is True:
+        result = inner.get("result")
+        category = (
+            "adapter_failure"
+            if isinstance(result, dict) and result.get("is_error") is True
+            else "completed"
+        )
+    else:
+        return None
+    return {
+        "category": category,
+        "event_id": event_id,
+        "returncode": returncode,
+        "turn_id": turn_id,
+        # Preserve the store's own timestamp frame: DuckDB rows are local-naive
+        # while PostgreSQL TIMESTAMPTZ rows are UTC-aware.
+        "at": created_at.isoformat() if isinstance(created_at, datetime) else None,
+    }
+
+
 def _project_work_item_lifecycle(
     con: Any,
     *,
@@ -2706,6 +2755,57 @@ class HarnessRegistry:
                 is_error = bool(result.get("is_error") or inner.get("exited", 0) != 0)
                 kinds[session_id] = "failed" if is_error else "finished"
         return kinds
+
+    def structured_terminal_results(
+        self, session_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Project latest terminal structured-event facts without a transcript read.
+
+        The bounded candidate query carries identifiers and timestamps only;
+        payloads are fetched solely to classify the allowlisted completion,
+        cancellation, and adapter-failure fields. This works with PostgreSQL's
+        side payload relation as well as DuckDB's inline payload column.
+        """
+        session_ids = [session_id for session_id in session_ids if session_id]
+        if not session_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in session_ids)
+        with self._connect() as con:
+            rows = con.execute(
+                f"""SELECT session_id, event_id, event_type, created_at FROM (
+                    SELECT session_id, event_id, event_type, created_at, seq,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY session_id
+                               ORDER BY created_at DESC, COALESCE(seq, 0) DESC, event_id DESC
+                           ) AS rank
+                    FROM harness_events
+                    WHERE session_id IN ({placeholders})
+                      AND event_type IN ('status', 'error', 'session.exited', 'session.terminated')
+                ) candidates WHERE rank <= 16
+                ORDER BY session_id, created_at DESC, COALESCE(seq, 0) DESC, event_id DESC""",
+                session_ids,
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[1]) for row in rows])
+        results: dict[str, dict[str, Any]] = {}
+        for session_id, event_id, event_type, created_at in rows:
+            session_key = str(session_id)
+            if session_key in results:
+                continue
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            terminal = _structured_terminal_result(
+                event_id=str(event_id),
+                event_type=str(event_type),
+                created_at=created_at,
+                payload=payload,
+            )
+            if terminal is not None:
+                results[session_key] = terminal
+        return results
 
     def latest_session_previews(self, session_ids: list[str]) -> dict[str, str]:
         """The preview line for each session, cheapest source first.

@@ -3132,8 +3132,74 @@ def _expected_structured_json(row) -> dict:
         "awaiting": row.awaiting,
         "model": row.model,
         "thinking_effort": row.thinking_effort,
+        "terminal_result": None,
         "last_activity": (row.last_activity.isoformat() if row.last_activity else None),
     }
+
+
+def test_harnessd_structured_readback_projects_sanitized_terminal_category(tmp_path):
+    """A client can distinguish a terminal turn without reading its transcript."""
+    server, state, base_url = _start_test_server(tmp_path)
+    try:
+        session = state.registry.create_session(
+            session_id="structured-terminal-result",
+            host_id="test-host",
+            harness="codex",
+            command="codex",
+            status="running",
+            cwd=str(tmp_path),
+            mode="structured",
+        )
+        completed = state.registry.append_event(
+            session_id=session.session_id,
+            event_type="status",
+            seq=1,
+            payload={"turn_complete": True, "turn_id": "turn-completed"},
+        )
+
+        status, payload = _json_request(f"{base_url}/sessions/{session.session_id}")
+
+        assert status == 200
+        assert payload["terminal_result"] == {
+            "category": "completed",
+            "event_id": completed.event_id,
+            "returncode": None,
+            "turn_id": "turn-completed",
+            "at": completed.created_at.isoformat(),
+        }
+
+        cancelled = state.registry.append_event(
+            session_id=session.session_id,
+            event_type="session.terminated",
+            seq=2,
+        )
+        _, payload = _json_request(f"{base_url}/sessions/{session.session_id}")
+        assert payload["terminal_result"] == {
+            "category": "cancelled",
+            "event_id": cancelled.event_id,
+            "returncode": None,
+            "turn_id": None,
+            "at": cancelled.created_at.isoformat(),
+        }
+
+        failed = state.registry.append_event(
+            session_id=session.session_id,
+            event_type="error",
+            seq=3,
+            payload={"returncode": 17},
+        )
+        _, payload = _json_request(f"{base_url}/sessions/{session.session_id}")
+        assert payload["terminal_result"] == {
+            "category": "adapter_failure",
+            "event_id": failed.event_id,
+            "returncode": None,
+            "turn_id": None,
+            "at": failed.created_at.isoformat(),
+        }
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
 
 
 def test_harnessd_listing_merges_pty_registry_and_manager_only_sessions(tmp_path):

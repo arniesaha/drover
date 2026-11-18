@@ -3558,7 +3558,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         registry_session = self._safe_get_session(session_id)
         if registry_session is None:
             return None
-        return _structured_session_row_json(registry_session)
+        try:
+            terminal_result = self.server.state.registry.structured_terminal_results(
+                [session_id]
+            ).get(session_id)
+        except Exception:
+            terminal_result = None
+        return _structured_session_row_json(registry_session, terminal_result)
 
     def _list_sessions(self, query: str = "") -> None:
         """Every live session, then one bounded page of finished ones.
@@ -3636,12 +3642,20 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         structured_ids += sorted(
             set(self.server.state.structured.session_ids()) - set(structured_ids)
         )
+        try:
+            terminal_results = self.server.state.registry.structured_terminal_results(
+                structured_ids
+            )
+        except Exception:
+            terminal_results = {}
         for session_id in structured_ids:
             if session_id in pty_ids:
                 continue
             row = registry_rows.get(session_id)
             if row is not None:
-                sessions.append(_structured_session_row_json(row))
+                sessions.append(
+                    _structured_session_row_json(row, terminal_results.get(session_id))
+                )
                 continue
             # Manager-only ids: a live structured session whose row the
             # host-scoped listing did not return (or an empty map because the
@@ -5125,7 +5139,9 @@ def _session_listing_rank(session: Mapping[str, Any]) -> int:
     return 0 if session.get("awaiting") else 1
 
 
-def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
+def _structured_session_row_json(
+    registry_session: Any, terminal_result: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """The single definition of a structured session's listing shape.
 
     Both the per-id lookup and the batched listing format rows through here so
@@ -5144,6 +5160,7 @@ def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
         "awaiting": registry_session.effective_awaiting,
         "model": registry_session.model,
         "thinking_effort": registry_session.thinking_effort,
+        "terminal_result": terminal_result,
         "last_activity": (
             registry_session.last_activity.isoformat()
             if registry_session.last_activity

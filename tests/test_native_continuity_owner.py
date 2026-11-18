@@ -897,6 +897,31 @@ def test_terminal_failed_owner_turn_is_replaced_before_redelivery(tmp_path):
     assert collector.launches[1][1]["client_session_id"] != session_id
 
 
+def test_cancelled_owner_turn_is_replaced_before_redelivery(tmp_path):
+    """A durable cancellation fences the prior native owner before reuse."""
+    runner, collector, _, _, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    client_session_id = collector.launches[0][1]["client_session_id"]
+    owner_session = runner.registry.session_by_client_id(client_session_id)
+    assert owner_session is not None
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="session.terminated",
+        seq=2,
+    )
+    runner.registry.update_session_status(
+        owner_session.session_id,
+        "terminated",
+        ended_at=clock(),
+    )
+    clock.advance(5)
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == len(collector.turn_attempts) == 2
+    assert collector.launches[1][1]["client_session_id"] != client_session_id
+
+
 def test_expired_sent_claim_missing_session_recovers_same_wake_once(tmp_path):
     runner, collector, _, _, clock = _runner(tmp_path)
     assert runner.process_once() == 1

@@ -167,6 +167,25 @@ class NativeOwnerRunner:
             # Normal claim completion must observe terminal sessions first.
             # Only an expired still-live claim or an existing recovery journal
             # blocks terminal replacement before its fencing settlement.
+            terminal = self.registry.structured_terminal_results(
+                [session.session_id]
+            ).get(session.session_id)
+            if terminal is not None and terminal["category"] in {
+                "cancelled",
+                "adapter_failure",
+            }:
+                with control_plane_connection(self.path, timeout=5) as con:
+                    active_claim = con.execute(
+                        """SELECT 1 FROM continuity_owner_turn_claims
+                        WHERE goal_id = ? AND owner_id = ? AND session_id = ?
+                          AND state IN ('claimed', 'sent') LIMIT 1""",
+                        [scope.goal_id, link["owner_id"], session.session_id],
+                    ).fetchone()
+                if active_claim is not None:
+                    # Keep the immutable link available to _recover_session;
+                    # replacing it here would strand the live claim before its
+                    # recovery journal can fence the stale owner.
+                    return session.session_id
             with control_plane_connection(self.path, timeout=5) as con:
                 blocked = con.execute(
                     """SELECT 1 FROM continuity_owner_recoveries
@@ -554,6 +573,16 @@ class NativeOwnerRunner:
                 ).fetchone()
             if orphan is not None:
                 return True
+        terminal = (
+            self.registry.structured_terminal_results([session_id]).get(session_id)
+            if session_id is not None
+            else None
+        )
+        if terminal is not None and terminal["category"] in {
+            "cancelled",
+            "adapter_failure",
+        }:
+            return True
         return (
             session_id is not None
             and self.registry.completed_turn_kinds([session_id]).get(session_id)
@@ -565,6 +594,30 @@ class NativeOwnerRunner:
         owner_id = self._owner(scope)
         assert owner_id is not None
         link = self._link(scope)
+        session_id = link.get("session_id")
+        terminal = (
+            self.registry.structured_terminal_results([session_id]).get(session_id)
+            if isinstance(session_id, str) and session_id
+            else None
+        )
+        if terminal is not None and terminal["category"] in {
+            "cancelled",
+            "adapter_failure",
+        }:
+            with self._transaction() as con:
+                claim = con.execute(
+                    """SELECT wake_id, client_turn_id, session_id, run_id, claim_until
+                    FROM continuity_owner_turn_claims
+                    WHERE goal_id = ? AND owner_id = ? AND run_id = ? AND session_id = ?
+                    AND state IN ('claimed', 'sent') LIMIT 1""",
+                    [scope.goal_id, owner_id, run_id, session_id],
+                ).fetchone()
+            if claim is not None:
+                # A terminal turn has no in-flight side effect to wait for. Reuse
+                # the immutable recovery journal so the claim, credential, epoch,
+                # and successor link change under the same stale-owner fences as
+                # expiry recovery rather than leaving a sent claim to block retry.
+                return self._recover_abandoned_claim(scope, claim)
         if link.get("credential_id") and not self.credentials.revoke_owner_credential(
             owner_id, link["credential_id"]
         ):
