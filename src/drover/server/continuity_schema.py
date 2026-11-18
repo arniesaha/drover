@@ -5,7 +5,12 @@
 # rather than treating a valid continuity checkpoint as corrupt.
 CONTINUITY_BASE_TABLES = ("factory_observer_runs", "factory_observer_inbox")
 CONTINUITY_RECEIPT_TABLE = "factory_observer_completion_receipts"
-CONTINUITY_TABLES = (*CONTINUITY_BASE_TABLES, CONTINUITY_RECEIPT_TABLE)
+CONTINUITY_RESERVATION_TABLE = "continuity_integration_reservations"
+CONTINUITY_TABLES = (
+    *CONTINUITY_BASE_TABLES,
+    CONTINUITY_RECEIPT_TABLE,
+    CONTINUITY_RESERVATION_TABLE,
+)
 
 # A logical integration serialization role is still served by the configured
 # native owner.  The reservation only fences conflicting deliveries; it never
