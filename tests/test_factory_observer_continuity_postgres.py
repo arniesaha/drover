@@ -376,6 +376,142 @@ def test_duplicate_source_retries_race_before_and_after_ack(pg_bridge):
     assert store.consume(RUN, **fence) is None
 
 
+def test_postgres_integration_reservation_serializes_and_fences_redelivery(pg_bridge):
+    """A released keyed delivery may advance; a live or stale one cannot."""
+    store, clock = pg_bridge
+    registry = HarnessRegistry(store.path)
+    first_run = "work-integration-first"
+    second_run = "work-integration-second"
+    repository = "example/project"
+    key = "main-write"
+    owner = "drover:owner/integration-goal"
+
+    # Ordinary ready work has no serialization key. Its leases can coexist;
+    # only the explicitly tagged integration delivery is fenced.
+    for session_id, run_id, independent_owner in (
+        ("pg-independent-a", "work-independent-a", "drover:owner/independent-a"),
+        ("pg-independent-b", "work-independent-b", "drover:owner/independent-b"),
+    ):
+        registry.create_session(
+            session_id=session_id,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            status="running",
+            handoff_mode="work_coordinator",
+            source_session_id=f"work/{run_id}@0",
+        )
+        store.initialize(
+            session_id=session_id,
+            objective="Independent implementation",
+            checkpoint="Pending",
+            authorized_owner_id=independent_owner,
+        )
+        assert store.lease(run_id, owner_id=independent_owner)["owner_epoch"] == 1
+
+    for session_id, run_id in (
+        ("pg-integration-first", first_run),
+        ("pg-integration-second", second_run),
+    ):
+        registry.create_session(
+            session_id=session_id,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            status="running",
+            handoff_mode="work_coordinator",
+            source_session_id=f"work/{run_id}@0",
+        )
+
+    store.initialize(
+        session_id="pg-integration-first",
+        objective="Serialized implementation",
+        checkpoint="Pending",
+        authorized_owner_id=owner,
+        delivery_role="integration_serialized",
+        repository=repository,
+        serialization_key=key,
+    )
+    first = store.lease(first_run, owner_id=owner, lease_seconds=5)
+    with pytest.raises(ContinuityConflict, match="reservation"):
+        store.initialize(
+            session_id="pg-integration-second",
+            objective="Serialized implementation",
+            checkpoint="Pending",
+            authorized_owner_id=owner,
+            delivery_role="integration_serialized",
+            repository=repository,
+            serialization_key=key,
+        )
+
+    event_id = store.report(
+        first_run,
+        source="coordinator",
+        source_event_id="serialized-complete-1",
+        subject="pg-integration-first",
+        sequence=1,
+        kind="worker_brief_completed",
+        summary="Implementation ready",
+    )
+    assert (
+        store.report(
+            first_run,
+            source="coordinator",
+            source_event_id="serialized-complete-1",
+            subject="pg-integration-first",
+            sequence=1,
+            kind="worker_brief_completed",
+            summary="Implementation ready",
+        )
+        == event_id
+    )
+    fence = {"owner_id": owner, "owner_epoch": first["owner_epoch"]}
+    action = store.consume(first_run, **fence)
+    store.action_intent(
+        first_run,
+        **fence,
+        wake_id=event_id,
+        action_fingerprint=action["action_id"],
+        artifact="local:serialized-effect",
+    )
+    clock.advance(5)
+    successor = store.lease(first_run, owner_id=owner, owner_epoch=first["owner_epoch"])
+    with pytest.raises(ContinuityConflict):
+        store.acknowledge(
+            first_run,
+            **fence,
+            event_id=event_id,
+            checkpoint="stale",
+        )
+    store.acknowledge(
+        first_run,
+        owner_id=owner,
+        owner_epoch=successor["owner_epoch"],
+        event_id=event_id,
+        checkpoint="Serialized action acknowledged",
+    )
+    # The durable acknowledgement may be replayed after it releases the key.
+    store.acknowledge(
+        first_run,
+        owner_id=owner,
+        owner_epoch=successor["owner_epoch"],
+        event_id=event_id,
+        checkpoint="stale replay must not overwrite",
+    )
+    store.initialize(
+        session_id="pg-integration-second",
+        objective="Serialized implementation",
+        checkpoint="Pending",
+        authorized_owner_id=owner,
+        delivery_role="integration_serialized",
+        repository=repository,
+        serialization_key=key,
+    )
+    reservation = store.status(second_run)["integration_serialization"]
+    assert reservation["generation"] == 2
+    assert reservation["owner_epoch"] == 0
+
+
 def test_sequenced_drover_completion_reaches_leased_owner_on_postgres(pg_bridge):
     store, _ = pg_bridge
     registry = HarnessRegistry(store.path)

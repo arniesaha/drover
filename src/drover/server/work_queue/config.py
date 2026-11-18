@@ -174,6 +174,12 @@ class GoalScope(Model):
     execution_budget: float | None = Field(default=None, gt=0)
     execution_estimated_cost: float = Field(default=5.0, gt=0)
     execution_max_workers: int | None = Field(default=None, gt=0)
+    # An explicitly configured conflicting-write class.  This is a logical
+    # delivery role only: it reuses this goal's native owner and normal
+    # implementation authority.
+    integration_serialization_key: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$"
+    )
     # Explicit opt-in: the one OpenClaw session allowed to receive durable
     # work-completion wakes for this goal.  No default owner exists.
     continuity_owner_id: str | None = None
@@ -215,6 +221,10 @@ class GoalScope(Model):
                 raise ValueError(
                     "native continuity owner requires an enabled harness profile"
                 )
+        if self.integration_serialization_key is not None and owner != native_owner:
+            raise ValueError(
+                "integration serialization requires this goal's native owner"
+            )
         return self
 
 
@@ -300,4 +310,11 @@ class WorkQueueConfig(Model):
             raise ValueError("enabled work queue requires workspace and goals")
         if len({g.goal_id for g in self.goals}) != len(self.goals):
             raise ValueError("duplicate goal ID")
+        keys = [
+            (goal.repo, goal.integration_serialization_key)
+            for goal in self.goals
+            if goal.integration_serialization_key is not None
+        ]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate integration serialization repository/key")
         return self

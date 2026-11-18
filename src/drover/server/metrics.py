@@ -3144,6 +3144,9 @@ class MetricsCollector:
                     checkpoint="Work coordinator launch recorded",
                     authority_scope=work_continuity.authority_scope,
                     authorized_owner_id=work_continuity.owner_id,
+                    delivery_role=work_continuity.delivery_role,
+                    repository=work_continuity.repository,
+                    serialization_key=work_continuity.serialization_key,
                 )
                 continuity.report(
                     run_id,

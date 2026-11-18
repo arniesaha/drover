@@ -7,6 +7,21 @@ CONTINUITY_BASE_TABLES = ("factory_observer_runs", "factory_observer_inbox")
 CONTINUITY_RECEIPT_TABLE = "factory_observer_completion_receipts"
 CONTINUITY_TABLES = (*CONTINUITY_BASE_TABLES, CONTINUITY_RECEIPT_TABLE)
 
+# A logical integration serialization role is still served by the configured
+# native owner.  The reservation only fences conflicting deliveries; it never
+# grants the broader integration/publish authority scope.
+INTEGRATION_SERIALIZATION_DDL = (
+    """CREATE TABLE IF NOT EXISTS continuity_integration_reservations (
+      repository TEXT NOT NULL, serialization_key TEXT NOT NULL,
+      owner_id TEXT NOT NULL, run_id TEXT NOT NULL,
+      generation BIGINT NOT NULL CHECK (generation > 0),
+      owner_epoch BIGINT NOT NULL DEFAULT 0 CHECK (owner_epoch >= 0),
+      state TEXT NOT NULL CHECK (state IN ('reserved', 'released')),
+      acquired_at TIMESTAMPTZ NOT NULL, released_at TIMESTAMPTZ,
+      PRIMARY KEY (repository, serialization_key)
+    )""",
+)
+
 # Native owner execution records are control-plane state, not harness-local
 # state.  A turn claim is intentionally separate from the observer delivery:
 # a lost hub process may retry the same client turn id, but cannot overlap a
@@ -66,7 +81,10 @@ CONTINUITY_DDL = (
       handoff_redeemed_at TIMESTAMPTZ,
       owner_id TEXT, owner_epoch BIGINT NOT NULL DEFAULT 0,
       lease_until TIMESTAMPTZ, worker_state TEXT NOT NULL DEFAULT 'unknown',
-      next_action_json TEXT, updated_at TIMESTAMPTZ NOT NULL
+      next_action_json TEXT, updated_at TIMESTAMPTZ NOT NULL,
+      delivery_role TEXT NOT NULL DEFAULT 'standard',
+      serialization_repository TEXT, serialization_key TEXT,
+      serialization_generation BIGINT
     )
     """,
     """
@@ -96,6 +114,7 @@ CONTINUITY_DDL = (
     """,
     "CREATE INDEX IF NOT EXISTS factory_observer_completion_receipts_run "
     "ON factory_observer_completion_receipts (run_id, state, recorded_at, harness_event_id)",
+    *INTEGRATION_SERIALIZATION_DDL,
 )
 
 # PostgreSQL migration 10 was released with this exact tuple. New continuity

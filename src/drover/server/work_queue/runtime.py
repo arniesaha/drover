@@ -113,6 +113,13 @@ class HarnessBridge:
             "authority_scope": "implementation",
             "objective": f"Work coordinator {role} for {item_url}",
         }
+        serialization_key = getattr(scope, "integration_serialization_key", None)
+        if role == "work" and serialization_key is not None:
+            binding.update(
+                delivery_role="integration_serialized",
+                repository=scope.repo,
+                serialization_key=serialization_key,
+            )
         binding["binding_signature"] = sign_work_coordinator_continuity(
             binding, self.collector.work_coordinator_continuity_secret
         )
