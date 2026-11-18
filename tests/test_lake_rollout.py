@@ -326,9 +326,12 @@ def test_control_migration_refuses_unsafe_inline_checks(statement):
     }
 
 
-def test_control_migrations_28_through_40_classify_from_v0628_baseline():
+def test_control_migrations_28_through_41_classify_from_v0628_baseline():
     from drover.server.lake.rollout import classify_release_kind
-    from drover.server.postgres_schema import _MIGRATIONS
+    from drover.server.postgres_schema import (
+        _MIGRATIONS,
+        INTEGRATION_SERIALIZATION_MIGRATION,
+    )
 
     current = [
         [version, list(statements)]
@@ -336,14 +339,15 @@ def test_control_migrations_28_through_40_classify_from_v0628_baseline():
         if version <= 27
     ]
     target = [[version, list(statements)] for version, statements in _MIGRATIONS]
-    assert [version for version, _ in target if version > 27] == list(range(28, 41))
+    expected_migrations = list(range(28, INTEGRATION_SERIALIZATION_MIGRATION + 1))
+    assert [version for version, _ in target if version > 27] == expected_migrations
 
     allowed, evidence = classify_release_kind(
         _release_metadata(current), _release_metadata(target)
     )
 
     assert allowed
-    assert evidence["new_migration_ids"] == list(range(28, 41))
+    assert evidence["new_migration_ids"] == expected_migrations
     assert [
         verdict
         for verdict in evidence["migration_verdicts"]
@@ -360,6 +364,33 @@ def test_control_migrations_28_through_40_classify_from_v0628_baseline():
             "statement_index": 2,
             "allowed": True,
             "verdict": "create_index",
+        },
+    ]
+    assert [
+        verdict
+        for verdict in evidence["migration_verdicts"]
+        if verdict["migration_id"] == INTEGRATION_SERIALIZATION_MIGRATION
+    ] == [
+        {
+            "migration_id": INTEGRATION_SERIALIZATION_MIGRATION,
+            "statement_index": 1,
+            "allowed": True,
+            "verdict": "alter_table_add_column_constant_default",
+        },
+        *[
+            {
+                "migration_id": INTEGRATION_SERIALIZATION_MIGRATION,
+                "statement_index": statement_index,
+                "allowed": True,
+                "verdict": "alter_table_add_nullable_column",
+            }
+            for statement_index in (2, 3, 4)
+        ],
+        {
+            "migration_id": INTEGRATION_SERIALIZATION_MIGRATION,
+            "statement_index": 5,
+            "allowed": True,
+            "verdict": "create_table",
         },
     ]
 
