@@ -303,8 +303,13 @@ def test_fenced_import_preserves_integration_reservation(
     from drover.server.control_migration import import_legacy_snapshot
     from drover.server.db import control_plane_connection, control_plane_path
 
-    acquired_at = datetime(2026, 9, 20, 12, 0, 0)
-    source = _legacy_snapshot(tmp_path, created_at=acquired_at)
+    legacy_wall_time = datetime(2026, 9, 20, 12, 0, 0)
+    # Reservations are written by the continuity clock as an instant.  Keep
+    # that value aware here: DuckDB's TIMESTAMPTZ binder otherwise interprets
+    # a naïve test value in the host session timezone, making this import
+    # regression depend on where the test happens to run.
+    acquired_at = legacy_wall_time.replace(tzinfo=timezone.utc)
+    source = _legacy_snapshot(tmp_path, created_at=legacy_wall_time)
     with duckdb.connect(str(control_plane_path(source))) as con:
         con.execute(
             """INSERT INTO continuity_integration_reservations
@@ -334,7 +339,7 @@ def test_fenced_import_preserves_integration_reservation(
                 3,
                 4,
                 "reserved",
-                datetime(2026, 9, 20, 19, 0, tzinfo=timezone.utc),
+                acquired_at,
                 None,
             )
         )
