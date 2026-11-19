@@ -149,7 +149,7 @@ def test_candidate_specific_expected_effect_is_durable_and_fences_generic_marker
     bridge,
 ):
     """A native acknowledgement cannot use a wake marker for another candidate."""
-    store, _, registry = bridge
+    store, clock, registry = bridge
     owner_id = "drover:owner/candidate-effect"
     expected = "local-file:worktrees/work-b/.drover-native-canary/source-task-9.json"
     session_id = "observer-candidate-effect"
@@ -211,6 +211,50 @@ def test_candidate_specific_expected_effect_is_durable_and_fences_generic_marker
         "artifact": expected,
     }
     store.acknowledge(run_id, **fence, event_id=event_id, checkpoint="verified")
+    audit = store.status(run_id)
+    [acknowledged] = audit["acknowledged_events"]
+    assert acknowledged | {"acknowledged_at": None} == {
+        "event_id": event_id,
+        "state": "acknowledged",
+        "attempts": 1,
+        "acknowledged_at": None,
+        "report": {
+            "source": "drover-work-coordinator",
+            "source_event_id": "candidate-effect:done",
+            "subject": session_id,
+            "sequence": 1,
+            "kind": "worker_done",
+        },
+        "action": {
+            "event_id": event_id,
+            "action_id": action["action_id"],
+            "type": "review_worker_result",
+            "expected_effect_artifact": expected,
+        },
+    }
+    assert (
+        datetime.fromisoformat(acknowledged["acknowledged_at"]).astimezone(timezone.utc)
+        == clock.now
+    )
+    [intent] = audit["owner_action_intents"]
+    assert intent | {"created_at": None, "completed_at": None} == {
+        "wake_id": event_id,
+        "action_fingerprint": action["action_id"],
+        "owner_id": owner_id,
+        "owner_epoch": 1,
+        "state": "complete",
+        "artifact": expected,
+        "created_at": None,
+        "completed_at": None,
+    }
+    assert (
+        datetime.fromisoformat(intent["created_at"]).astimezone(timezone.utc)
+        == clock.now
+    )
+    assert (
+        datetime.fromisoformat(intent["completed_at"]).astimezone(timezone.utc)
+        == clock.now
+    )
 
 
 def test_integration_reservation_stays_fenced_until_worker_done_is_acknowledged(

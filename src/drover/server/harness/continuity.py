@@ -1716,6 +1716,78 @@ class FactoryObserverContinuity:
                 }
                 for eid, state, attempts, due, payload in result.fetchall()
             ]
+            acknowledged_rows = con.execute(
+                """SELECT event_id, attempts, acknowledged_at, payload_json, action_json
+                FROM factory_observer_inbox
+                WHERE run_id = ? AND state = 'acknowledged'
+                ORDER BY acknowledged_at DESC, event_id DESC LIMIT ?""",
+                [run_id, limit],
+            ).fetchall()
+            acknowledged_events = []
+            for (
+                event_id,
+                attempts,
+                acknowledged_at,
+                payload,
+                action_json,
+            ) in acknowledged_rows:
+                report = json.loads(payload)
+                action_payload = json.loads(action_json) if action_json else {}
+                acknowledged_events.append(
+                    {
+                        "event_id": event_id,
+                        "state": "acknowledged",
+                        "attempts": attempts,
+                        "acknowledged_at": acknowledged_at.isoformat(),
+                        "report": {
+                            key: report.get(key)
+                            for key in (
+                                "source",
+                                "source_event_id",
+                                "subject",
+                                "sequence",
+                                "kind",
+                            )
+                        },
+                        "action": {
+                            key: action_payload.get(key)
+                            for key in (
+                                "event_id",
+                                "action_id",
+                                "type",
+                                "expected_effect_artifact",
+                            )
+                        },
+                    }
+                )
+            action_intents = [
+                {
+                    "wake_id": wake_id,
+                    "action_fingerprint": fingerprint,
+                    "owner_id": owner_id,
+                    "owner_epoch": owner_epoch,
+                    "state": state,
+                    "artifact": artifact,
+                    "created_at": created_at.isoformat(),
+                    "completed_at": completed_at.isoformat() if completed_at else None,
+                }
+                for (
+                    wake_id,
+                    fingerprint,
+                    owner_id,
+                    owner_epoch,
+                    state,
+                    artifact,
+                    created_at,
+                    completed_at,
+                ) in con.execute(
+                    """SELECT wake_id, action_fingerprint, owner_id, owner_epoch,
+                    state, artifact, created_at, completed_at
+                    FROM continuity_owner_action_intents WHERE run_id = ?
+                    ORDER BY created_at DESC, wake_id DESC LIMIT ?""",
+                    [run_id, limit],
+                ).fetchall()
+            ]
             action = (
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
             )
@@ -1832,6 +1904,8 @@ class FactoryObserverContinuity:
                     "errors": receipt_errors,
                 },
                 "events": events,
+                "acknowledged_events": acknowledged_events,
+                "owner_action_intents": action_intents,
                 "has_more": sum(
                     n for state, n in counts.items() if state != "acknowledged"
                 )
