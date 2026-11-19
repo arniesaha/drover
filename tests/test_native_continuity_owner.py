@@ -130,7 +130,7 @@ class Collector:
         return 202, "{}"
 
 
-def _runner(tmp_path, *, expected_effect=None):
+def _runner(tmp_path, *, expected_effect=None, event_kind="worker_blocked"):
     path = tmp_path / "control.duckdb"
     bootstrap_control_plane_store(path)
     registry = HarnessRegistry(path)
@@ -166,8 +166,8 @@ def _runner(tmp_path, *, expected_effect=None):
         source_event_id="blocked-1",
         subject="worker-1",
         sequence=1,
-        kind="worker_blocked",
-        summary="blocked",
+        kind=event_kind,
+        summary=event_kind,
     )
     collector = Collector(path, registry)
     credentials = CredentialStore(tmp_path / "credentials.json")
@@ -374,6 +374,71 @@ def test_failed_owner_launches_exhaust_wake_once(tmp_path):
     assert len(collector.launches) == 3
     assert store.status(run_id)["worker_state"] == "blocked:human"
     assert store.owner_runs("drover:owner/goal-native") == []
+
+
+def test_terminal_failed_owner_turn_rearms_one_completed_worker_wake_once(tmp_path):
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_done"
+    )
+
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+        assert owner_session is not None
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            payload={"payload": {"exited": 1, "awaiting": "input"}},
+        )
+        clock.advance(delay)
+
+    # The ordinary bounded deliveries exhaust first.  A later runner pass sees
+    # the durable submitted failed turn and fences it before one rearm.
+    assert runner.process_once() == 0
+    assert store.status(run_id)["inbox_counts"] == {"exhausted": 1}
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"delivered": 1}
+    assert status["events"][0]["attempts"] == 1
+    assert status["events"][0]["report"]["kind"] == "worker_done"
+    assert status["owner"]["epoch"] > 0
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("recovered",)
+    # The durable recovery journal is the one-time gate; an already
+    # recovered wake is never eligible for another infrastructure rearm.
+    assert (
+        runner._rearm_exhausted_terminal_delivery(runner.config.goals[0], run_id)
+        is False
+    )
+
+
+def test_terminal_failed_owner_turn_never_rearms_worker_human_block(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+        assert owner_session is not None
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            payload={"payload": {"exited": 1, "awaiting": "input"}},
+        )
+        clock.advance(delay)
+
+    assert runner.process_once() == 0
+    assert runner.process_once() == 0
+    assert store.status(run_id)["inbox_counts"] == {"exhausted": 1}
+    assert store.status(run_id)["worker_state"] == "blocked:human"
+    assert len(collector.turn_attempts) == 3
 
 
 def test_failed_turn_submission_retries_the_same_owner_turn(tmp_path):

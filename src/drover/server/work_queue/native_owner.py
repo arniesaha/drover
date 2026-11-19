@@ -15,7 +15,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from drover.server.continuity_schema import NATIVE_OWNER_DDL
 from drover.server.db import control_plane_connection
-from drover.server.harness.continuity import FactoryObserverContinuity
+from drover.server.harness.continuity import MAX_DELIVERIES, FactoryObserverContinuity
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
 
@@ -521,6 +521,259 @@ class NativeOwnerRunner:
             return False
         return True
 
+    def _rearm_exhausted_terminal_delivery(self, scope, run_id: str) -> bool:
+        """Rearm one exhausted wake after a fenced native-owner infrastructure failure.
+
+        This is deliberately narrower than a delivery retry: the durable claim
+        must name a submitted owner turn whose registry terminal kind is
+        ``failed``; the source event must be a completed worker result; and no
+        action-intent or acknowledgement may exist.  The existing recovery
+        journal admits exactly one such rearm for a wake.  Human gates, launch
+        failures, completed effects, and ordinary exhausted deliveries remain
+        fail-closed.
+        """
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+        link = self._link(scope)
+        with control_plane_connection(self.path, timeout=5) as con:
+            result = con.execute(
+                """SELECT i.event_id, i.attempts, i.action_json, i.payload_json,
+                          c.session_id, c.client_turn_id, c.claim_until,
+                          c.state, r.owner_epoch, r.owner_id,
+                          x.state, x.old_session_id, x.old_client_turn_id,
+                          x.old_claim_until, x.old_generation,
+                          x.old_client_session_id, x.old_credential_id,
+                          x.old_owner_epoch
+                   FROM factory_observer_inbox i
+                   JOIN factory_observer_runs r ON r.run_id = i.run_id
+                   JOIN continuity_owner_turn_claims c
+                     ON c.wake_id = i.event_id AND c.run_id = i.run_id
+                   LEFT JOIN continuity_owner_recoveries x ON x.wake_id = i.event_id
+                  WHERE i.run_id = ? AND i.state = 'exhausted'
+                    AND i.attempts >= ? AND r.authorized_owner_id = ?
+                    AND c.goal_id = ? AND c.owner_id = ? AND c.state = 'completed'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM continuity_owner_action_intents q
+                         WHERE q.wake_id = i.event_id AND q.run_id = i.run_id
+                    )
+                  LIMIT 1""",
+                [run_id, MAX_DELIVERIES, owner_id, scope.goal_id, owner_id],
+            )
+            columns = [column[0] for column in result.description]
+            row = result.fetchone()
+        if row is None:
+            return False
+        row = dict(zip(columns, row))
+        try:
+            action = json.loads(row["action_json"] or "null")
+            report = json.loads(row["payload_json"] or "null")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        # A worker-declared human block must never be reclassified as a native
+        # infrastructure failure.  Only a completed source worker result has
+        # this bounded recovery path.
+        if (
+            not isinstance(action, dict)
+            or action.get("type") != "review_worker_result"
+            or not isinstance(report, dict)
+            or report.get("kind") not in {"worker_done", "worker_brief_completed"}
+        ):
+            return False
+        recovery_state = row["state"]
+        if recovery_state == "recovered":
+            return False
+        if recovery_state is None:
+            # The completed claim is durable evidence that this exact owner
+            # turn was submitted.  The registry's normalized terminal kind is
+            # the only accepted infrastructure classification; model text is
+            # neither retained nor interpreted here.
+            if (
+                self.registry.completed_turn_kinds([row["session_id"]]).get(
+                    row["session_id"]
+                )
+                != "failed"
+            ):
+                return False
+            # A prior terminal settlement may already have rotated the link
+            # to an unlaunched generation.  A different live successor is
+            # never displaced by this bounded recovery.
+            if link.get("session_id") not in {None, row["session_id"]}:
+                return False
+            old_credential_id = link.get("credential_id")
+            if old_credential_id and not self.credentials.revoke_owner_credential(
+                owner_id, old_credential_id
+            ):
+                return False
+            with self._transaction() as con:
+                reserved = con.execute(
+                    """INSERT INTO continuity_owner_recoveries
+                    (wake_id, goal_id, owner_id, run_id, old_session_id,
+                     old_client_turn_id, old_claim_until, old_generation,
+                     old_client_session_id, old_credential_id, old_owner_epoch,
+                     executor_id, executor_until, state, created_at)
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'fencing', ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM continuity_owner_recoveries WHERE wake_id = ?
+                    )
+                    RETURNING wake_id""",
+                    [
+                        row["event_id"],
+                        scope.goal_id,
+                        owner_id,
+                        run_id,
+                        row["session_id"],
+                        row["client_turn_id"],
+                        row["claim_until"],
+                        link["generation"],
+                        link["client_session_id"],
+                        old_credential_id,
+                        row["owner_epoch"],
+                        self._recovery_executor_id,
+                        self.clock() + timedelta(seconds=self.claim_seconds),
+                        self.clock(),
+                        row["event_id"],
+                    ],
+                ).fetchone()
+            if reserved is None:
+                return False
+            row.update(
+                state="fencing",
+                old_session_id=row["session_id"],
+                old_client_turn_id=row["client_turn_id"],
+                old_claim_until=row["claim_until"],
+                old_generation=link["generation"],
+                old_client_session_id=link["client_session_id"],
+                old_credential_id=old_credential_id,
+                old_owner_epoch=row["owner_epoch"],
+            )
+        elif recovery_state != "fencing":
+            return False
+
+        with self._transaction() as con:
+            reserved = con.execute(
+                """UPDATE continuity_owner_recoveries
+                   SET executor_id = ?, executor_until = ?
+                 WHERE wake_id = ? AND state = 'fencing'
+                   AND (executor_id IS NULL OR executor_id = ? OR executor_until <= ?)
+                 RETURNING wake_id""",
+                [
+                    self._recovery_executor_id,
+                    self.clock() + timedelta(seconds=self.claim_seconds),
+                    row["event_id"],
+                    self._recovery_executor_id,
+                    self.clock(),
+                ],
+            ).fetchone()
+        if reserved is None:
+            return False
+        old_epoch = row["old_owner_epoch"]
+        fenced_epoch = self.continuity.fence_owner(
+            run_id,
+            owner_id=owner_id,
+            expected_epoch=old_epoch,
+            recovery_wake_id=row["event_id"],
+            recovery_executor_id=self._recovery_executor_id,
+        )
+        if fenced_epoch is None:
+            return False
+        action.pop("escalation", None)
+        action["recovery"] = {
+            "kind": "terminal_native_owner_failure",
+            "prior_attempts": row["attempts"],
+            "fenced_owner_epoch": old_epoch,
+        }
+        now = self.clock()
+        with self._transaction() as con:
+            authoritative = con.execute(
+                """SELECT 1 FROM continuity_owner_recoveries x
+                   JOIN factory_observer_runs r ON r.run_id = x.run_id
+                  WHERE x.wake_id = ? AND x.state = 'fencing'
+                    AND x.executor_id = ? AND x.executor_until > ?
+                    AND x.old_session_id = ? AND x.old_client_turn_id = ?
+                    AND x.old_claim_until = ? AND x.old_owner_epoch = ?
+                    AND r.owner_id = ? AND r.owner_epoch = ?
+                    AND EXISTS (
+                        SELECT 1 FROM factory_observer_inbox i
+                         WHERE i.event_id = x.wake_id AND i.run_id = x.run_id
+                           AND i.state = 'exhausted' AND i.attempts >= ?
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM continuity_owner_action_intents q
+                         WHERE q.wake_id = x.wake_id AND q.run_id = x.run_id
+                    )""",
+                [
+                    row["event_id"],
+                    self._recovery_executor_id,
+                    now,
+                    row["old_session_id"],
+                    row["old_client_turn_id"],
+                    row["old_claim_until"],
+                    old_epoch,
+                    owner_id,
+                    fenced_epoch,
+                    MAX_DELIVERIES,
+                ],
+            ).fetchone()
+            if authoritative is None:
+                return False
+            rearmed = con.execute(
+                """UPDATE factory_observer_inbox SET state = 'pending', attempts = 0,
+                    next_delivery_at = ?, action_json = ?
+                    WHERE event_id = ? AND state = 'exhausted'
+                    RETURNING event_id""",
+                [
+                    now,
+                    json.dumps(action, sort_keys=True, separators=(",", ":")),
+                    row["event_id"],
+                ],
+            ).fetchone()
+            if rearmed is None:
+                return False
+            con.execute(
+                """UPDATE factory_observer_runs SET next_action_json = ?,
+                    worker_state = 'done', updated_at = ? WHERE run_id = ?""",
+                [
+                    json.dumps(action, sort_keys=True, separators=(",", ":")),
+                    now,
+                    run_id,
+                ],
+            )
+            recovered = con.execute(
+                """UPDATE continuity_owner_recoveries SET state = 'recovered',
+                    recovered_at = ? WHERE wake_id = ? AND state = 'fencing'
+                    AND executor_id = ? AND executor_until > ? RETURNING wake_id""",
+                [now, row["event_id"], self._recovery_executor_id, now],
+            ).fetchone()
+            if recovered is None:
+                raise _StaleRecovery()
+        return True
+
+    def _exhausted_terminal_runs(self, scope) -> list[str]:
+        """Return only wakes that may have the bounded native-owner rearm path."""
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+        with control_plane_connection(self.path, timeout=5) as con:
+            rows = con.execute(
+                """SELECT DISTINCT r.run_id
+                   FROM factory_observer_runs r
+                   JOIN factory_observer_inbox i ON i.run_id = r.run_id
+                   JOIN continuity_owner_turn_claims c
+                     ON c.wake_id = i.event_id AND c.run_id = i.run_id
+                  WHERE r.authorized_owner_id = ? AND i.state = 'exhausted'
+                    AND c.goal_id = ? AND c.owner_id = ? AND c.state = 'completed'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM continuity_owner_action_intents q
+                         WHERE q.wake_id = i.event_id AND q.run_id = i.run_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM continuity_owner_recoveries x
+                         WHERE x.wake_id = i.event_id AND x.state = 'recovered'
+                    )
+                   ORDER BY r.updated_at, r.run_id""",
+                [owner_id, scope.goal_id, owner_id],
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
     def _settle_expired_claims(self, scope) -> None:
         """Settle terminal submitted turns; fence receiptless abandonment."""
         cutoff = self.clock()
@@ -714,6 +967,7 @@ class NativeOwnerRunner:
     def _process_run(self, scope, run_id: str) -> bool:
         owner_id = self._owner(scope)
         assert owner_id is not None
+        self._rearm_exhausted_terminal_delivery(scope, run_id)
         session_id = self._session(scope, launch=False)
         if session_id:
             self._complete_finished_claim(scope, session_id)
@@ -788,7 +1042,11 @@ class NativeOwnerRunner:
             if owner_id is None:
                 continue
             self._complete_finished_claims(scope)
-            for run_id in self.continuity.owner_runs(owner_id):
+            run_ids = self.continuity.owner_runs(owner_id)
+            for run_id in self._exhausted_terminal_runs(scope):
+                if run_id not in run_ids:
+                    run_ids.append(run_id)
+            for run_id in run_ids:
                 run = {"goal_id": scope.goal_id, "run_id": run_id}
                 report["runs"].append(run)
                 try:
