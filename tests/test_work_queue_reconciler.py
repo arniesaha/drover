@@ -211,6 +211,48 @@ def test_execution_report_projects_sanitized_candidate_failure():
     ]
 
 
+def test_execution_report_retains_first_contained_failure_for_candidate():
+    worker = QueueExecutionWorker(SimpleNamespace(config=WorkQueueConfig()))
+    worker.reconciler = SimpleNamespace(
+        poll=lambda: {
+            "actions": [{"kind": "launch_candidate", "goal_id": "goal-1", "number": 10}]
+        },
+        report=lambda: {"actions": []},
+    )
+    failures = iter(
+        [
+            WorkDenied("harness inspection unavailable"),
+            WorkDenied("launch intent uncertain; inspection required"),
+        ]
+    )
+    worker.coordinator = SimpleNamespace(
+        health={},
+        launch_candidate=lambda _goal_id, _number: (_ for _ in ()).throw(
+            next(failures)
+        ),
+    )
+    worker.service = SimpleNamespace(
+        store=SimpleNamespace(links=lambda: []),
+        harness=SimpleNamespace(active=lambda links: links),
+    )
+
+    worker.process_once()
+    worker.process_once()
+
+    assert worker.report()["execution"]["recent_launch_failures"] == [
+        {
+            "goal_id": "goal-1",
+            "item_number": 10,
+            "category": "harness_inspection_unavailable",
+        },
+        {
+            "goal_id": "goal-1",
+            "item_number": 10,
+            "category": "launch_intent_uncertain",
+        },
+    ]
+
+
 @pytest.mark.parametrize(
     "labels,reason",
     [
