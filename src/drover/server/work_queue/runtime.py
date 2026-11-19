@@ -293,6 +293,16 @@ class HarnessBridge:
             f"ref {scope.brief_ref or scope.goal_id} and versioned policy. Report "
             "behavioral evidence through the work tools."
         )
+        candidate_body = authority.get("body")
+        if scope.candidate_source == "local_file":
+            if not isinstance(candidate_body, str) or not candidate_body.strip():
+                raise WorkDenied("local candidate instruction is unavailable")
+            # A local-file reference is a durable identity, not a path the
+            # harness can dereference.  Render its validated manifest body
+            # into the worker prompt so the source task remains actionable.
+            brief += (
+                "\n\nAuthorized local candidate instruction:\n" + candidate_body.strip()
+            )
         payload = {
             "cwd": cwd,
             "harness": harness,
@@ -304,7 +314,7 @@ class HarnessBridge:
             "prompt": worker_brief(
                 brief,
                 list(authority.get("labels") or []),
-                authority.get("body"),
+                candidate_body,
             ),
         }
         if scope.continuity_owner_id:

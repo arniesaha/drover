@@ -294,6 +294,71 @@ def test_native_owner_explicit_integration_label_claims_configured_reservation(
     assert binding["serialization_key"] == "main-write"
 
 
+def test_local_candidate_body_is_rendered_as_the_worker_instruction(launch_path):
+    _service, bridge, registry, _provider, harnessd = launch_path
+    scope = bridge.config.goals[0].model_copy(
+        update={
+            "candidate_source": "local_file",
+            "local_candidates_path": "/isolated/candidates.json",
+        }
+    )
+    bridge.config = bridge.config.model_copy(update={"goals": [scope]})
+    local_ref = ItemRef(
+        "sanitized-launch-workspace",
+        "local_file",
+        "arniesaha/drover",
+        867,
+        "local://launch/867",
+    )
+
+    bridge.launch(
+        registry.list_hosts()[0].host_id,
+        "codex",
+        "local-candidate-run",
+        local_ref,
+        "work",
+        None,
+        "launch",
+        authority={
+            "labels": ["goal:launch"],
+            "body": "Create only the declared harmless local marker.",
+        },
+    )
+
+    prompt = harnessd.requests[-1]["prompt"]
+    assert "Create only the declared harmless local marker." in prompt
+    assert "local://launch/867" in prompt
+
+
+def test_local_candidate_launch_fails_closed_without_an_instruction(launch_path):
+    _service, bridge, registry, _provider, _harnessd = launch_path
+    scope = bridge.config.goals[0].model_copy(
+        update={
+            "candidate_source": "local_file",
+            "local_candidates_path": "/isolated/candidates.json",
+        }
+    )
+    bridge.config = bridge.config.model_copy(update={"goals": [scope]})
+
+    with pytest.raises(WorkDenied, match="local candidate instruction is unavailable"):
+        bridge.launch(
+            registry.list_hosts()[0].host_id,
+            "codex",
+            "local-candidate-missing-body",
+            ItemRef(
+                "sanitized-launch-workspace",
+                "local_file",
+                "arniesaha/drover",
+                868,
+                "local://launch/868",
+            ),
+            "work",
+            None,
+            "launch",
+            authority={"labels": ["goal:launch"], "body": "   "},
+        )
+
+
 def test_failed_intent_refreshes_age_before_relaunch(launch_path):
     service, _bridge, _registry, _provider, harnessd = launch_path
     request_key = "failed-intent"
