@@ -15,10 +15,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from drover.server.continuity_schema import NATIVE_OWNER_DDL
 from drover.server.db import control_plane_connection
-from drover.server.harness.continuity import (
-    ContinuityConflict,
-    FactoryObserverContinuity,
-)
+from drover.server.harness.continuity import FactoryObserverContinuity
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
 
@@ -29,16 +26,6 @@ def _now() -> datetime:
 
 class _StaleRecovery(Exception):
     """Abort a recovery transaction after its executor lost authority."""
-
-
-class _StaleOwnerEpoch(Exception):
-    """A lease compare-and-swap lost to a newer owner epoch.
-
-    This is the only per-run conflict which is safe for ``process_once`` to
-    contain: ``lease`` detects it before consuming a delivery or changing a
-    claim. Recovery, fencing, journal, and acknowledgement failures retain
-    their normal propagation so their durable state is visible to callers.
-    """
 
 
 class NativeOwnerRunner:
@@ -775,17 +762,7 @@ class NativeOwnerRunner:
         owner = status["owner"]
         prior_epoch = owner["epoch"] if owner["id"] == owner_id else None
         epoch = prior_epoch if owner["live"] else None
-        try:
-            lease = self.continuity.lease(run_id, owner_id=owner_id, owner_epoch=epoch)
-        except ContinuityConflict as exc:
-            # ``lease`` uses this fixed error for its owner-epoch
-            # compare-and-swap. It occurs before consume/claim, so a later
-            # independent run may proceed. Do not contain any other fence
-            # failure: those preserve the caller-visible recovery/journal
-            # failure contract.
-            if str(exc) != "owner epoch changed; read recovery status":
-                raise
-            raise _StaleOwnerEpoch() from exc
+        lease = self.continuity.lease(run_id, owner_id=owner_id, owner_epoch=epoch)
         if prior_epoch is not None and lease["owner_epoch"] != prior_epoch:
             # A naturally expired lease advances the epoch just as an explicit
             # recovery fence does. The old session must not retain its bearer.
@@ -848,11 +825,12 @@ class NativeOwnerRunner:
                 report["runs"].append(run)
                 try:
                     delivered = self._process_run(scope, run_id)
-                except _StaleOwnerEpoch:
-                    # The lease CAS lost before this runner consumed a wake.
-                    # Report only the fixed category; exception text can
-                    # contain remote details and must not enter observability.
-                    run["state"] = "stale_owner_epoch"
+                except Exception as exc:
+                    # A durable fenced failure is retained for retry. It must
+                    # not prevent later independent ready work from running.
+                    # Keep only the exception class: response text can carry
+                    # provider or remote-service details.
+                    run.update(state="failed", error_type=type(exc).__name__)
                     report["state"] = "partial_failure"
                     continue
                 run["state"] = "dispatched" if delivered else "not_dispatched"
