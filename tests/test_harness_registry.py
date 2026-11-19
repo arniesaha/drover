@@ -58,6 +58,39 @@ def test_bootstrap_creates_harness_tables(tmp_path):
     }.issubset(tables)
 
 
+def test_coordinator_failure_category_requires_the_latest_typed_turn(tmp_path):
+    registry, _ = _registry(tmp_path)
+    registry.create_session(
+        session_id="coordinator", host_id="host", harness="codex", command="test"
+    )
+    registry.append_event(
+        session_id="coordinator",
+        event_id="input-1",
+        event_type="user_input",
+        payload={"turn_id": "turn-1"},
+    )
+    registry.append_event(
+        session_id="coordinator",
+        event_id="tool-auth",
+        event_type="tool_result",
+        payload={"failure_category": "authentication_required"},
+    )
+    assert (
+        registry.coordinator_turn_failure_category("coordinator")
+        == "authentication_required"
+    )
+
+    # A later turn makes the prior infrastructure failure ineligible. This
+    # prevents recovery from rearming a session that has since received work.
+    registry.append_event(
+        session_id="coordinator",
+        event_id="input-2",
+        event_type="user_input",
+        payload={"turn_id": "turn-2"},
+    )
+    assert registry.coordinator_turn_failure_category("coordinator") is None
+
+
 def test_quarantine_protects_previously_acknowledged_events_from_retention(tmp_path):
     registry, _ = _registry(tmp_path)
     registry.create_session(

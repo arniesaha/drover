@@ -3178,6 +3178,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
         prompt = body.get("prompt")
         prompt_text = prompt.strip() if isinstance(prompt, str) else ""
+        if work_continuity is not None and session_cwd is not None:
+            # The daemon may replace the requested checkout with a fresh
+            # isolated worktree.  Tell the coordinator worker the resolved
+            # path that is already bound to its signed session, rather than
+            # making it infer an assignment from a local-candidate map.  This
+            # is path metadata only; no credential or expected-effect value is
+            # exposed in the prompt.
+            prompt_text = (
+                f"{prompt_text}\n\n"
+                f"Assigned isolated worktree: {session_cwd}\n"
+                "Perform local work only in that assigned worktree."
+            ).strip()
         images = body.get("images") or []
         if prompt_text or images:
             try:

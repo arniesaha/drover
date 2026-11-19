@@ -8,7 +8,7 @@ from drover.server.work_queue.github import ProviderUnavailable
 from drover.server.work_queue.local_candidates import LocalCandidateProvider
 from drover.server.work_queue.provider import ItemRef
 from drover.server.work_queue.reconciler import QueueExecutionWorker, ShadowReconciler
-from drover.server.work_queue.service import WorkService
+from drover.server.work_queue.service import WorkService, identity
 from drover.server.work_queue.store import WorkStore
 
 
@@ -278,3 +278,128 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
         {"name": "agent:nix"},
         {"name": "status:running"},
     ]
+
+
+def _terminal_local_worker_service(
+    tmp_path, pg_control_path, *, category, materialized
+):
+    path = tmp_path / "candidates.json"
+    expected = "local-file:.drover-native-canary/source-task-1.json"
+    _manifest(path, expected_effect=expected)
+    manifest = json.loads(path.read_text())
+    manifest["items"][0]["labels"] = [
+        "goal:local",
+        "status:running",
+        "agent:nix",
+    ]
+    path.write_text(json.dumps(manifest))
+    scope = _scope(
+        path,
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path)},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+        local_candidate_worktrees={"1": str(tmp_path / "worktree-1")},
+    )
+    config = WorkQueueConfig(
+        enabled=True,
+        shadow_mode=False,
+        workspace_id="local-workspace",
+        goals=[scope],
+    )
+
+    class Harness:
+        def __init__(self):
+            self.session = SimpleNamespace(
+                session_id="terminal-worker",
+                status="completed",
+                handoff_mode="work_coordinator",
+            )
+
+        def resolve(self, run_key):
+            assert run_key == "terminal-run"
+            return self.session
+
+        def active(self, links, *, release_finalised=True):
+            return []
+
+        def coordinator_failure_category(self, run_key):
+            assert run_key == "terminal-run"
+            return category
+
+        def expected_effect_materialized(self, run_key, artifact):
+            assert run_key == "terminal-run"
+            assert artifact == expected
+            return materialized
+
+    provider = LocalCandidateProvider(config.workspace_id, scope)
+    store = WorkStore(pg_control_path, config.workspace_id)
+    harness = Harness()
+    service = WorkService(config, store, {scope.goal_id: provider}, harness)
+    store.intent(
+        "control:queue-execution",
+        _ref(),
+        scope.goal_id,
+        "terminal-run",
+        "work",
+        0,
+        scope.goal_label,
+    )
+    store.associate("terminal-run", "terminal-worker")
+    return path, scope, service, store
+
+
+def test_queue_worker_rearms_only_typed_pre_effect_worker_auth_failure(
+    tmp_path, pg_control_path
+):
+    path, scope, service, store = _terminal_local_worker_service(
+        tmp_path,
+        pg_control_path,
+        category="authentication_required",
+        materialized=False,
+    )
+    worker = QueueExecutionWorker(service)
+
+    worker.process_once()
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:queued"]
+    recovery_events = store.events(
+        identity("automatic-work-coordinator-auth-recovery", "terminal-run")
+    )
+    assert [(event["event_kind"], event["outcome"]) for event in recovery_events] == [
+        ("intent", None),
+        ("outcome", "queued"),
+    ]
+
+    # The immutable intent/outcome pair prevents a terminal source session
+    # from being rearmed repeatedly if a future poll sees it again.
+    worker.process_once()
+    assert len(store.events(recovery_events[0]["request_key"])) == 2
+
+
+@pytest.mark.parametrize(
+    ("category", "materialized"),
+    [(None, False), ("authentication_required", True)],
+    ids=["human-or-prose-block", "materialized-candidate-effect"],
+)
+def test_queue_worker_never_rearms_human_or_materialized_candidate_work(
+    tmp_path, pg_control_path, category, materialized
+):
+    path, scope, service, store = _terminal_local_worker_service(
+        tmp_path, pg_control_path, category=category, materialized=materialized
+    )
+
+    QueueExecutionWorker(service).process_once()
+
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:running"]
+    assert not store.events(
+        identity("automatic-work-coordinator-auth-recovery", "terminal-run")
+    )

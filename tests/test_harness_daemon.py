@@ -200,6 +200,41 @@ def test_work_coordinator_session_gets_paired_mcp_bearer_only(tmp_path, monkeypa
         server.server_close()
 
 
+def test_work_coordinator_prompt_names_the_resolved_isolated_worktree(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _FakeStructuredManager(harness="codex")
+    binding = {
+        "run_id": "work-" + "b" * 32,
+        "owner_id": "drover:owner/goal-native",
+        "authority_scope": "implementation",
+        "objective": "write the bound local effect",
+        "binding_signature": "opaque-hub-signature",
+    }
+    try:
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "cwd": str(tmp_path),
+                "prompt": "Read the bound local candidate.",
+                "work_coordinator_continuity": binding,
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 201
+    assert len(state.structured.turns) == 1
+    assert f"Assigned isolated worktree: {tmp_path}" in state.structured.turns[0][1]
+    assert (
+        "Perform local work only in that assigned worktree."
+        in state.structured.turns[0][1]
+    )
+
+
 def test_harnessd_attests_only_a_work_coordinator_session_effect(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     worktree = tmp_path / "worktrees" / "work-a"

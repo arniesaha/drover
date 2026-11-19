@@ -2761,6 +2761,20 @@ class HarnessRegistry:
                 return "authentication_required"
         return None
 
+    def coordinator_turn_failure_category(self, session_id: str) -> str | None:
+        """Return a typed failure for the most recent coordinator turn.
+
+        A work-coordinator session has one initial submitted turn per launch.
+        Recovery may only use the same persisted tool-result category as a
+        native-owner turn; assistant text is never an infrastructure signal.
+        Selecting the last durable user-input id also prevents an earlier
+        failed turn from rearming a session after it has received new work.
+        """
+        turn_ids = self.recent_user_input_turn_ids(session_id, limit=1)
+        if not turn_ids:
+            return None
+        return self.owner_turn_failure_category(session_id, turn_ids[-1])
+
     def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
         """Classify idle turns without changing the session's resumable state.
 
