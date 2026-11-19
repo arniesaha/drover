@@ -89,7 +89,8 @@ CONTINUITY_DDL = (
       next_action_json TEXT, updated_at TIMESTAMPTZ NOT NULL,
       delivery_role TEXT NOT NULL DEFAULT 'standard',
       serialization_repository TEXT, serialization_key TEXT,
-      serialization_generation BIGINT
+      serialization_generation BIGINT,
+      expected_effect_artifact TEXT
     )
     """,
     """

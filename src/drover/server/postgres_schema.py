@@ -40,6 +40,7 @@ NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION = 38
 OWNER_CREDENTIAL_MIGRATION = 39
 NATIVE_OWNER_RECOVERY_MIGRATION = 40
 INTEGRATION_SERIALIZATION_MIGRATION = 41
+EXPECTED_EFFECT_ARTIFACT_MIGRATION = 42
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1064,6 +1065,12 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS serialization_key TEXT",
             "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS serialization_generation BIGINT",
             *INTEGRATION_SERIALIZATION_DDL,
+        ),
+    ),
+    (
+        EXPECTED_EFFECT_ARTIFACT_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS expected_effect_artifact TEXT",
         ),
     ),
 )

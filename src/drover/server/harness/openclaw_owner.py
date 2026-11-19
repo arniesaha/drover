@@ -215,6 +215,9 @@ class ContinuityProjection(WireModel):
     authority_scope: Scope
     scope_limit: Literal["commit_only", "publish_review", "explicit_approval_required"]
     delivery_role: Literal["standard", "integration_serialized"]
+    # Older hubs do not project this field.  Keep that reply compatible while
+    # accepting the optional candidate-bound attestation from newer hubs.
+    expected_effect_artifact: Checkpoint | None = None
     integration_serialization: IntegrationSerialization | None
     owner_handoff: OwnerHandoff
     owner: OwnerLease

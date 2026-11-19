@@ -983,6 +983,7 @@ class FactoryObserverContinuity:
         delivery_role: str = "standard",
         repository: str | None = None,
         serialization_key: str | None = None,
+        expected_effect_artifact: str | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
@@ -999,6 +1000,8 @@ class FactoryObserverContinuity:
         delivery_role, repository, serialization_key = _serialization_binding(
             delivery_role, repository, serialization_key
         )
+        if expected_effect_artifact is not None:
+            _text(expected_effect_artifact, "expected_effect_artifact", 2000)
         if (
             delivery_role == "integration_serialized"
             and authority_scope != "implementation"
@@ -1022,8 +1025,9 @@ class FactoryObserverContinuity:
                 """INSERT INTO factory_observer_runs
                 (run_id, session_id, expected_revision, objective, checkpoint,
                  authority_scope, authorized_owner_id, delivery_role,
-                 serialization_repository, serialization_key, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 serialization_repository, serialization_key, expected_effect_artifact,
+                 updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (run_id) DO NOTHING""",
                 [
                     run_id,
@@ -1036,6 +1040,7 @@ class FactoryObserverContinuity:
                     delivery_role,
                     repository,
                     serialization_key,
+                    expected_effect_artifact,
                     self.clock(),
                 ],
             )
@@ -1054,6 +1059,7 @@ class FactoryObserverContinuity:
                 "delivery_role": delivery_role,
                 "serialization_repository": repository,
                 "serialization_key": serialization_key,
+                "expected_effect_artifact": expected_effect_artifact,
             }.items():
                 if existing[name] != value:
                     raise ContinuityConflict(f"run {name} is immutable")
@@ -1388,6 +1394,8 @@ class FactoryObserverContinuity:
                 }
                 if scope == "deployment":
                     action["type"] = "request_explicit_approval"
+                if run.get("expected_effect_artifact") is not None:
+                    action["expected_effect_artifact"] = run["expected_effect_artifact"]
                 if not late and report["kind"].startswith("worker_"):
                     con.execute(
                         "UPDATE factory_observer_runs SET worker_state = ? WHERE run_id = ?",
@@ -1455,6 +1463,14 @@ class FactoryObserverContinuity:
             ):
                 raise ContinuityConflict(
                     "action intent must match the consumed delivery"
+                )
+            expected_effect_artifact = action.get("expected_effect_artifact")
+            if (
+                expected_effect_artifact is not None
+                and artifact != expected_effect_artifact
+            ):
+                raise ContinuityConflict(
+                    "action intent artifact must match the expected effect"
                 )
             existing = _row(
                 con,
@@ -1696,6 +1712,7 @@ class FactoryObserverContinuity:
                 "authority_scope": run["authority_scope"],
                 "scope_limit": SCOPES[run["authority_scope"]],
                 "delivery_role": run.get("delivery_role", "standard"),
+                "expected_effect_artifact": run.get("expected_effect_artifact"),
                 "integration_serialization": integration_serialization,
                 "owner_handoff": {
                     "authorized_owner_id": run.get("authorized_owner_id"),

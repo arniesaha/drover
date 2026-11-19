@@ -362,6 +362,7 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "serialization_repository": "VARCHAR",
             "serialization_key": "VARCHAR",
             "serialization_generation": "BIGINT",
+            "expected_effect_artifact": "VARCHAR",
         },
     )
     con.execute(_HARNESS_HOSTS_DDL)
