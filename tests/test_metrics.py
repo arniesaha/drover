@@ -4806,6 +4806,24 @@ def test_sync_created_harness_session_preserves_mode(tmp_path):
     assert session.mode == "structured"
 
 
+def test_sync_created_harness_session_does_not_resurrect_terminal_projection(tmp_path):
+    collector = _make_collector(tmp_path)
+    payload = {
+        "session_id": "harness-terminal-race",
+        "mode": "structured",
+        "harness": "codex",
+        "status": "running",
+    }
+    collector._sync_created_harness_session("mac-mini", {}, json.dumps(payload))
+    registry = HarnessRegistry(collector.duckdb_path)
+    registry.update_session_status("harness-terminal-race", "terminated")
+
+    # A delayed create response must not bring back a source session whose
+    # durable terminal projection was already committed at the hub.
+    collector._sync_created_harness_session("mac-mini", {}, json.dumps(payload))
+    assert registry.get_session("harness-terminal-race").status == "terminated"
+
+
 @pytest.mark.parametrize("extra", [{}, {"factory_observer": None}])
 def test_sync_created_app_session_preserves_project_and_cwd(tmp_path, extra):
     collector = _make_collector(tmp_path)

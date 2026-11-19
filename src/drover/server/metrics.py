@@ -3132,7 +3132,16 @@ class MetricsCollector:
                     ),
                     on_created=register_work_item,
                 )
-            else:
+            elif existing.status not in {
+                "completed",
+                "terminated",
+                "errored",
+                "failed",
+            }:
+                # Event delivery can race the original create response.  Once
+                # a terminal source fact has been projected, a delayed host
+                # reply still saying "running" must not resurrect capacity or
+                # let a stale worker re-enter the coordinator path.
                 registry.update_session_status(session_id, status)
             if work_continuity is not None:
                 from drover.server.harness.continuity import FactoryObserverContinuity
