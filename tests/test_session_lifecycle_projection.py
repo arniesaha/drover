@@ -59,6 +59,51 @@ def test_unsequenced_exit_and_restart_preserve_status_first_projection(tmp_path)
     )
 
 
+def test_ingested_unsequenced_termination_projects_terminal_session_status(tmp_path):
+    """A remote daemon termination must release the hub's active-session view."""
+    from drover.schema import bootstrap
+    from drover.server.harness.registry import HarnessRegistry
+
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=tmp_path / "control.duckdb")
+    registry = HarnessRegistry(tmp_path / "control.duckdb")
+    session = registry.create_session(host_id="h", harness="codex", command="codex")
+    registry.update_session_activity(session.session_id, awaiting="input")
+
+    assert (
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": "remote-terminated",
+                    "session_id": session.session_id,
+                    "event_type": "session.terminated",
+                    "payload": {},
+                }
+            ]
+        )
+        == 1
+    )
+    projected = registry.get_session(session.session_id)
+    assert projected is not None
+    assert projected.status == "terminated"
+    assert projected.effective_awaiting is None
+
+    # The same durable terminal identity is replay-safe and cannot reopen it.
+    assert (
+        registry.ingest_structured_events(
+            [
+                {
+                    "event_id": "remote-terminated",
+                    "session_id": session.session_id,
+                    "event_type": "session.terminated",
+                    "payload": {},
+                }
+            ]
+        )
+        == 0
+    )
+    assert registry.get_session(session.session_id).status == "terminated"
+
+
 @pytest.mark.parametrize(
     "status", ["running", "completed", "terminated", "errored", "failed"]
 )

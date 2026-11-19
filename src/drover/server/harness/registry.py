@@ -2225,7 +2225,14 @@ class HarnessRegistry:
                             payload=inner_payload,
                             current=awaiting,
                         )
-                        if event["event_type"] == "session.exited":
+                        if event["event_type"] == "session.terminated":
+                            # Daemon-side /terminate is an unsequenced
+                            # lifecycle record. Once it reaches the hub it
+                            # must release the central active-session view;
+                            # otherwise capacity and fenced recovery both keep
+                            # treating this source as live.
+                            terminal_status = "terminated"
+                        elif event["event_type"] == "session.exited":
                             terminal_status = (
                                 "failed"
                                 if inner_payload.get("exited", 0) != 0
