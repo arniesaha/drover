@@ -208,6 +208,7 @@ def launch_path(pg_control_path):
                 "execution_cwds": {host_id: "/repo/drover"},
                 "brief_ref": "docs/brief.md",
                 "integration_serialization_key": "main-write",
+                "integration_serialization_label": "delivery:integration",
                 "continuity_owner_id": "drover:owner/launch",
                 "continuity_owner_harness": "codex",
                 "credential": {
@@ -239,7 +240,7 @@ def launch_path(pg_control_path):
         harnessd.close()
 
 
-def test_native_owner_queued_issue_launches_worker_and_records_owner_continuation(
+def test_native_owner_standard_queued_issue_does_not_claim_integration_reservation(
     launch_path,
 ):
     service, _bridge, registry, _provider, harnessd = launch_path
@@ -253,9 +254,9 @@ def test_native_owner_queued_issue_launches_worker_and_records_owner_continuatio
     assert harnessd.requests[0]["client_session_id"] == link["run_key"]
     binding = harnessd.requests[0]["work_coordinator_continuity"]
     assert binding["authority_scope"] == "implementation"
-    assert binding["delivery_role"] == "integration_serialized"
-    assert binding["repository"] == "arniesaha/drover"
-    assert binding["serialization_key"] == "main-write"
+    assert binding.get("delivery_role", "standard") == "standard"
+    assert "repository" not in binding
+    assert "serialization_key" not in binding
     session = registry.get_session(link["session_id"])
     assert session and session.handoff_mode == "work_coordinator"
 
@@ -275,6 +276,22 @@ def test_native_owner_queued_issue_launches_worker_and_records_owner_continuatio
         "worker_started",
         "worker_done",
     ]
+
+
+def test_native_owner_explicit_integration_label_claims_configured_reservation(
+    launch_path,
+):
+    service, _bridge, _registry, provider, harnessd = launch_path
+    provider.item["operator_authority_labels"] = ["delivery:integration"]
+    worker = QueueExecutionWorker(service)
+    worker.reconciler.providers["launch"] = service.providers["launch"]
+
+    worker.process_once()
+
+    binding = harnessd.requests[0]["work_coordinator_continuity"]
+    assert binding["delivery_role"] == "integration_serialized"
+    assert binding["repository"] == "arniesaha/drover"
+    assert binding["serialization_key"] == "main-write"
 
 
 def test_failed_intent_refreshes_age_before_relaunch(launch_path):

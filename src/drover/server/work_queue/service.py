@@ -162,10 +162,14 @@ class WorkService:
             raise ValueError("positive issue number required")
         return ItemRef(
             self.config.workspace_id,
-            "github",
+            scope.candidate_source,
             scope.repo,
             number,
-            f"https://github.com/{scope.repo}/issues/{number}",
+            (
+                f"local://{scope.goal_id}/{number}"
+                if scope.candidate_source == "local_file"
+                else f"https://github.com/{scope.repo}/issues/{number}"
+            ),
         )
 
     def item(self, goal_id, number):
@@ -527,6 +531,9 @@ class WorkService:
             authority={
                 "labels": item.get("operator_authority_labels", []),
                 "body": item.get("body"),
+                "local_candidate_number": number,
+                "local_candidate_cwd": scope.local_candidate_worktrees.get(str(number)),
+                "expected_effect_artifact": item.get("expected_effect_artifact"),
             },
         )
         linked = self.store.associate(row["run_key"], session_id)
