@@ -28,6 +28,39 @@ class HarnessBridge:
     def resolve(self, run_key):
         session = self.registry.session_by_client_id(run_key)
         if session is not None:
+            # The hub registry can lag a terminal daemon transition across a
+            # relay restart. Confirm a known nonterminal work session with
+            # its own live host before letting it suppress a terminal relaunch.
+            # An unavailable host remains fail-closed as the registry value.
+            host_id = getattr(session, "host_id", None)
+            if host_id and session.status not in TERMINAL_SESSION_STATUSES:
+                for host in self.registry.list_hosts():
+                    if host.host_id != host_id or not host.liveness().usable:
+                        continue
+                    status, body = self.collector._harness_request(
+                        host,
+                        "/sessions?client_session_id=" + run_key,
+                        method="GET",
+                        timeout_s=10,
+                    )
+                    if status != 200:
+                        log.warning(
+                            "harness inspection unavailable host_id=%s status=%s",
+                            host.host_id,
+                            status,
+                        )
+                        break
+                    for row in json.loads(body).get("sessions", []):
+                        if (
+                            row.get("client_session_id") == run_key
+                            and row.get("status") in TERMINAL_SESSION_STATUSES
+                        ):
+                            payload = self._recovery_payload(run_key, row)
+                            self.collector._sync_created_harness_session(
+                                host.host_id, payload, json.dumps(row)
+                            )
+                            return self.registry.session_by_client_id(run_key)
+                    break
             return session
         # A response may have been lost before the control registry was synced.
         # Read each reachable daemon, never replay POST to discover the outcome.
