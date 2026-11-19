@@ -844,6 +844,11 @@ class NativeOwnerRunner:
                     [self.clock(), action["event_id"]],
                 )
             return True
+        # Keep the supported operational boundary inspectable without
+        # retaining a remote response body, which can contain provider or
+        # harness details.  The durable wake remains retryable under its
+        # existing claim/epoch fences.
+        self._last_not_dispatched_reason = f"owner_turn_http_{response}"
         self._release_failed_claim(session_id, action["event_id"], turn_id)
         return False
 

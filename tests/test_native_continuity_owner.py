@@ -420,6 +420,14 @@ def test_failed_turn_submission_retries_the_same_owner_turn(tmp_path):
 
     assert runner.process_once() == 0
     failed_turn = collector.turn_attempts[0][1]["client_turn_id"]
+    assert runner.observability()["runs"] == [
+        {
+            "goal_id": "goal-native",
+            "run_id": "run-native",
+            "state": "not_dispatched",
+            "reason": "owner_turn_http_503",
+        }
+    ]
     clock.advance(5)
     assert runner.process_once() == 1
     assert [attempt[1]["client_turn_id"] for attempt in collector.turn_attempts] == [
