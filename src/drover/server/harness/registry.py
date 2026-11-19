@@ -283,6 +283,26 @@ def _is_turn_completion_payload(payload: dict[str, Any]) -> bool:
     return isinstance(inner, dict) and inner.get("turn_complete") is True
 
 
+def _completion_turn_id(payload: dict[str, Any]) -> str | None:
+    """Return a structured completion's exact submitted-turn correlation.
+
+    A relay can deliver a terminal status before the hub has persisted the
+    matching ``user_input`` event.  Only the outer StructuredMessage turn id
+    (or its compatibility ``client_turn_id`` spelling) is trustworthy for
+    bridging that ordering race; an uncorrelated terminal status remains
+    bounded by the ordinary event-order window.
+    """
+    inner = payload.get("payload")
+    for candidate in (payload, inner):
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("turn_id", "client_turn_id"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
 def _project_work_item_lifecycle(
     con: Any,
     *,
@@ -2655,6 +2675,7 @@ class HarnessRegistry:
             ).fetchall()
             payloads = self._event_payloads(con, [str(row[0]) for row in rows])
         submitted = False
+        pending_exact_completion = False
         for event_id, event_type in rows:
             try:
                 payload = json.loads(payloads.get(str(event_id)) or "{}")
@@ -2663,16 +2684,82 @@ class HarnessRegistry:
             if not isinstance(payload, dict):
                 continue
             if event_type == "user_input":
-                if submitted and payload.get("turn_id") != turn_id:
+                submitted_turn_id = payload.get("turn_id")
+                if submitted and submitted_turn_id != turn_id:
                     return False
-                submitted = payload.get("turn_id") == turn_id
-            elif submitted:
-                inner = payload.get("payload", payload)
-                if _is_turn_completion_payload(payload) or (
-                    isinstance(inner, dict) and "exited" in inner
-                ):
+                submitted = submitted_turn_id == turn_id
+                if submitted and pending_exact_completion:
                     return True
+                continue
+
+            inner = payload.get("payload", payload)
+            is_completion = _is_turn_completion_payload(payload) or (
+                isinstance(inner, dict) and "exited" in inner
+            )
+            if not is_completion:
+                continue
+            completed_turn_id = _completion_turn_id(payload)
+            if completed_turn_id is not None:
+                # A terminal status for another submitted turn can never
+                # settle this claim.  For our exact turn, retain the
+                # correlation until the durable user_input arrives: remote
+                # relay delivery may legitimately win that local write race.
+                if completed_turn_id != turn_id:
+                    continue
+                if submitted:
+                    return True
+                pending_exact_completion = True
+            elif submitted:
+                # Preserve legacy drivers that do not emit a terminal turn
+                # identifier, but only within the ordinary submission window.
+                return True
         return False
+
+    def owner_turn_failure_category(self, session_id: str, turn_id: str) -> str | None:
+        """Return a bounded structured infrastructure category for one turn.
+
+        Only a persisted tool-result category qualifies.  Legacy events may
+        use the exact daemon JSON response as a compatibility shape; prose,
+        assistant output, and arbitrary tool output are never interpreted.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT event_id, event_type, content_preview
+                     FROM harness_events
+                    WHERE session_id = ?
+                      AND event_type IN ('user_input', 'tool_result')
+                 ORDER BY created_at, COALESCE(seq, 0), event_id""",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        submitted = False
+        for event_id, event_type, preview in rows:
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if event_type == "user_input":
+                if submitted and (
+                    not isinstance(payload, dict) or payload.get("turn_id") != turn_id
+                ):
+                    return None
+                submitted = (
+                    isinstance(payload, dict) and payload.get("turn_id") == turn_id
+                )
+                continue
+            if not submitted or not isinstance(payload, dict):
+                continue
+            if payload.get("failure_category") == "authentication_required":
+                return "authentication_required"
+            # Compatibility for already-persisted structured Codex events:
+            # parse only the exact JSON daemon response, never free text.
+            try:
+                legacy = json.loads(str(preview or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if legacy == {"error": "authentication required"}:
+                return "authentication_required"
+        return None
 
     def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
         """Classify idle turns without changing the session's resumable state.

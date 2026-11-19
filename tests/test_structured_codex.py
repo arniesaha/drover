@@ -508,6 +508,41 @@ def test_parse_turn_completed_marks_awaiting_input():
     assert message.payload["usage"]["output_tokens"] == 67
 
 
+def test_command_result_projects_exact_daemon_auth_category():
+    messages = _driver([]).parse_line(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-auth",
+                    "type": "command_execution",
+                    "aggregated_output": '{"error":"authentication required"}',
+                    "exit_code": 22,
+                    "status": "failed",
+                },
+            }
+        )
+    )
+    assert messages[0].type == "tool_result"
+    assert messages[0].payload["failure_category"] == "authentication_required"
+
+
+def test_command_result_does_not_classify_prose_as_daemon_auth():
+    messages = _driver([]).parse_line(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-prose",
+                    "type": "command_execution",
+                    "aggregated_output": "authentication required",
+                },
+            }
+        )
+    )
+    assert "failure_category" not in messages[0].payload
+
+
 def test_parse_command_execution_started_and_completed():
     begin = json.dumps(
         {

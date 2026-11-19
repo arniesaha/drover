@@ -130,7 +130,7 @@ class Collector:
         return 202, "{}"
 
 
-def _runner(tmp_path, *, expected_effect=None):
+def _runner(tmp_path, *, expected_effect=None, event_kind="worker_blocked"):
     path = tmp_path / "control.duckdb"
     bootstrap_control_plane_store(path)
     registry = HarnessRegistry(path)
@@ -166,8 +166,8 @@ def _runner(tmp_path, *, expected_effect=None):
         source_event_id="blocked-1",
         subject="worker-1",
         sequence=1,
-        kind="worker_blocked",
-        summary="blocked",
+        kind=event_kind,
+        summary=event_kind,
     )
     collector = Collector(path, registry)
     credentials = CredentialStore(tmp_path / "credentials.json")
@@ -374,6 +374,130 @@ def test_failed_owner_launches_exhaust_wake_once(tmp_path):
     assert len(collector.launches) == 3
     assert store.status(run_id)["worker_state"] == "blocked:human"
     assert store.owner_runs("drover:owner/goal-native") == []
+
+
+def _mark_owner_auth_failure(runner, collector):
+    owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+    assert owner_session is not None
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="tool_result",
+        content_preview='{"error":"authentication required"}',
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        payload={"payload": {"exited": 0, "awaiting": "input"}},
+    )
+    return owner_session.session_id
+
+
+def test_structured_auth_failure_rearms_only_completed_worker_wake_once(tmp_path):
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+    clock.advance(1)
+    done_wake = store.report(
+        run_id,
+        source="hub",
+        source_event_id="done-1",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="done",
+    )
+
+    # Exhaust the earlier worker_started event. It must not shadow the later
+    # worker_done wake that is eligible for the structured auth recovery.
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        _mark_owner_auth_failure(runner, collector)
+        clock.advance(delay)
+    assert runner.process_once() == 0
+
+    # The normal queue advances to worker_done without manually selecting it.
+    assert runner.process_once() == 1
+    for delay in (5, 10, 20):
+        owner_session_id = _mark_owner_auth_failure(runner, collector)
+        assert runner.registry.completed_turn_kinds([owner_session_id]) == {
+            owner_session_id: "finished"
+        }
+        assert (
+            runner.registry.owner_turn_failure_category(
+                owner_session_id, collector.turn_attempts[-1][1]["client_turn_id"]
+            )
+            == "authentication_required"
+        )
+        clock.advance(delay)
+        assert runner.process_once() == (1 if delay != 20 else 0)
+
+    # The post-exhaustion pass reserves and fences the eligible done wake,
+    # restoring it to pending; the next normal runner pass creates its fresh
+    # owner turn. The earlier started wake remains exhausted.
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"exhausted": 2}
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"exhausted": 1, "delivered": 1}
+    done_event = next(
+        event for event in status["events"] if event["event_id"] == done_wake
+    )
+    with control_plane_connection(runner.path) as con:
+        recovery = con.execute(
+            "SELECT wake_id, state FROM continuity_owner_recoveries"
+        ).fetchone()
+    assert recovery == (done_wake, "recovered")
+    assert done_event["attempts"] == 1
+
+
+def test_finished_owner_turn_without_structured_auth_stays_exhausted(tmp_path):
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_done"
+    )
+
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+        assert owner_session is not None
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            payload={"payload": {"exited": 0, "awaiting": "input"}},
+        )
+        clock.advance(delay)
+
+    assert runner.process_once() == 0
+    assert runner.process_once() == 0
+    assert store.status(run_id)["inbox_counts"] == {"exhausted": 1}
+    assert len(collector.turn_attempts) == 3
+
+
+def test_terminal_failed_owner_turn_never_rearms_worker_human_block(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+        assert owner_session is not None
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            payload={"payload": {"exited": 1, "awaiting": "input"}},
+        )
+        clock.advance(delay)
+
+    assert runner.process_once() == 0
+    assert runner.process_once() == 0
+    assert store.status(run_id)["inbox_counts"] == {"exhausted": 1}
+    assert store.status(run_id)["worker_state"] == "blocked:human"
+    assert len(collector.turn_attempts) == 3
 
 
 def test_failed_turn_submission_retries_the_same_owner_turn(tmp_path):
@@ -723,6 +847,17 @@ def test_completion_predicate_keeps_turn_boundary_and_durable_evidence(
     registry = runner.registry
     assert not registry.has_completed_turn(session_id, turn["client_turn_id"])
     assert not registry.has_completed_turn(session_id, "unsubmitted-turn")
+    # An explicit completion for another turn must not settle this submitted
+    # claim merely because it shares the owner session.
+    registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        payload={
+            "turn_id": "stale-turn",
+            "payload": {"turn_complete": True},
+        },
+    )
+    assert not registry.has_completed_turn(session_id, turn["client_turn_id"])
     completion = {"turn_complete": True}
     registry.append_event(
         session_id=session_id,
@@ -759,12 +894,14 @@ def test_post_ingest_completion_settles_claim_and_delivers_successor_once(tmp_pa
         store, run_id, runner.config.goals[0].continuity_owner_id
     )
     session_id = collector.turn_attempts[0][0]
+    turn_id = collector.turn_attempts[0][1]["client_turn_id"]
     events = [
         {
             "event_id": "owner-completed-924",
             "session_id": session_id,
             "seq": 2,
             "type": "status",
+            "turn_id": turn_id,
             "payload": {"turn_complete": True},
         },
         {
@@ -772,6 +909,7 @@ def test_post_ingest_completion_settles_claim_and_delivers_successor_once(tmp_pa
             "session_id": session_id,
             "seq": 3,
             "type": "status",
+            "turn_id": turn_id,
             "payload": {"exited": 0},
         },
         {
@@ -784,6 +922,7 @@ def test_post_ingest_completion_settles_claim_and_delivers_successor_once(tmp_pa
     ]
     assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 3})]
     assert runner.registry.get_session(session_id).effective_awaiting is None
+    assert runner.registry.has_completed_turn(session_id, turn_id)
     assert len(collector.turn_attempts) == 2
     with control_plane_connection(runner.path) as con:
         assert con.execute(
@@ -813,12 +952,15 @@ def test_post_ingest_kick_failure_keeps_commit_and_replay_retries(tmp_path):
     wake_id = _acknowledge_current_wake(
         store, run_id, runner.config.goals[0].continuity_owner_id
     )
+    session_id = collector.turn_attempts[0][0]
+    turn_id = collector.turn_attempts[0][1]["client_turn_id"]
     events = [
         {
             "event_id": "final-completion-924",
-            "session_id": collector.turn_attempts[0][0],
+            "session_id": session_id,
             "seq": 2,
             "type": "status",
+            "turn_id": turn_id,
             "payload": {"turn_complete": True},
         }
     ]
@@ -837,6 +979,7 @@ def test_post_ingest_kick_failure_keeps_commit_and_replay_retries(tmp_path):
 
     collector.idle_undeclared_worker.owner_runner = runner
     assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 0})]
+    assert runner.registry.has_completed_turn(session_id, turn_id)
     with control_plane_connection(runner.path) as con:
         assert con.execute(
             "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
