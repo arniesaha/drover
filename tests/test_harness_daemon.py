@@ -93,6 +93,92 @@ def test_expected_effect_attestation_is_confined_to_the_structured_worktree(tmp_
     )
 
 
+def test_work_coordinator_session_gets_paired_mcp_bearer_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("DROVER_MCP_TOKEN", "ambient-worker-token")
+    server, state, base_url = _start_test_server(tmp_path)
+    state.host_token = "test-paired-host-bearer"
+    probe = (
+        "import json, os\n"
+        "from pathlib import Path\n"
+        'Path(os.environ["CODEX_ENV_LOG"]).write_text(json.dumps({'
+        '"mcp": os.environ.get("DROVER_MCP_TOKEN"), '
+        '"owner": os.environ.get("DROVER_CONTINUITY_OWNER_BEARER")}))\n'
+        'print(json.dumps({"type": "turn.completed", "usage": {}}), flush=True)\n'
+    )
+    coordinator_log = tmp_path / "coordinator-env.json"
+    ordinary_log = tmp_path / "ordinary-env.json"
+    binding = {
+        "run_id": "work-" + "a" * 32,
+        "owner_id": "drover:owner/goal-native",
+        "authority_scope": "implementation",
+        "objective": "read the bound work item",
+        "binding_signature": "opaque-hub-signature",
+    }
+    try:
+        monkeypatch.setenv("CODEX_ENV_LOG", str(coordinator_log))
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": [sys.executable, "-c", probe],
+                "cwd": str(tmp_path),
+                "prompt": "read work",
+                "work_coordinator_continuity": binding,
+            },
+        )
+        assert status == 201
+        _wait_until(coordinator_log.exists, what="coordinator child environment")
+        assert json.loads(coordinator_log.read_text()) == {
+            "mcp": "test-paired-host-bearer",
+            "owner": None,
+        }
+
+        monkeypatch.setenv("CODEX_ENV_LOG", str(ordinary_log))
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": [sys.executable, "-c", probe],
+                "cwd": str(tmp_path),
+                "prompt": "ordinary work",
+            },
+        )
+        assert status == 201
+        _wait_until(ordinary_log.exists, what="ordinary child environment")
+        assert json.loads(ordinary_log.read_text()) == {
+            "mcp": "ambient-worker-token",
+            "owner": None,
+        }
+
+        # Missing paired-host state must not mint or substitute a bearer.
+        state.host_token = None
+        unpaired_log = tmp_path / "unpaired-coordinator-env.json"
+        monkeypatch.setenv("CODEX_ENV_LOG", str(unpaired_log))
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": [sys.executable, "-c", probe],
+                "cwd": str(tmp_path),
+                "prompt": "read work without pairing",
+                "work_coordinator_continuity": binding,
+            },
+        )
+        assert status == 201
+        _wait_until(unpaired_log.exists, what="unpaired coordinator child environment")
+        assert json.loads(unpaired_log.read_text()) == {
+            "mcp": "ambient-worker-token",
+            "owner": None,
+        }
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
 def test_harnessd_attests_only_a_work_coordinator_session_effect(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     worktree = tmp_path / "worktrees" / "work-a"
