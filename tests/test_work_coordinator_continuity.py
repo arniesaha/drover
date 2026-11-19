@@ -506,3 +506,104 @@ def test_hub_sync_rejects_success_response_without_session_id(tmp_path):
         collector._sync_created_harness_session("studio", {}, '{"status": "running"}')
     with pytest.raises(ValueError, match="valid JSON"):
         collector._sync_created_harness_session("studio", {}, "not-json")
+
+
+def test_work_coordinator_projects_structured_terminal_result_once(tmp_path):
+    """A normal structured completion wakes the bound owner without text state."""
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    registry = HarnessRegistry(path)
+    session = registry.create_session(
+        session_id="harness-terminal",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="work_coordinator",
+        source_session_id="work/work-terminal@0",
+    )
+    store = FactoryObserverContinuity(path)
+    run_id = store.initialize(
+        session_id=session.session_id,
+        objective="terminal projection",
+        checkpoint="launched",
+        authorized_owner_id="drover:owner/native-canary",
+    )
+    now = datetime.now(timezone.utc)
+    with store._transaction(run_id) as (con, _):
+        completion = {"payload": {"turn_complete": True, "awaiting": "input"}}
+        projected = record_work_coordinator_state(
+            con,
+            event_id="terminal-status-1",
+            session_id=session.session_id,
+            event_type="status",
+            sequence=1,
+            payload=completion,
+            received_at=now,
+        )
+        assert projected is not None
+        assert (
+            record_work_coordinator_state(
+                con,
+                event_id="terminal-status-1",
+                session_id=session.session_id,
+                event_type="status",
+                sequence=1,
+                payload=completion,
+                received_at=now,
+            )
+            == projected
+        )
+        assert (
+            record_work_coordinator_state(
+                con,
+                event_id="terminal-error-1",
+                session_id=session.session_id,
+                event_type="error",
+                sequence=2,
+                payload={"payload": {"reason": "adapter"}},
+                received_at=now,
+            )
+            is not None
+        )
+    reports = [event["report"] for event in store.status(run_id)["events"]]
+    assert {report["kind"] for report in reports} == {
+        "worker_brief_completed",
+        "worker_blocked",
+    }
+    assert {report["summary"] for report in reports} == {
+        "Structured worker reported a completed turn.",
+        "Structured worker reported an adapter failure.",
+    }
+
+
+def test_registry_append_projects_coordinator_completion_at_real_entrypoint(tmp_path):
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    registry = HarnessRegistry(path)
+    session = registry.create_session(
+        session_id="harness-real-entrypoint",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="work_coordinator",
+        source_session_id="work/work-real-entrypoint@0",
+    )
+    store = FactoryObserverContinuity(path)
+    run_id = store.initialize(
+        session_id=session.session_id,
+        objective="real completion projection",
+        checkpoint="launched",
+        authorized_owner_id="drover:owner/native-canary",
+    )
+    registry.append_event(
+        session_id=session.session_id,
+        event_type="status",
+        payload={"turn_complete": True, "awaiting": "input"},
+        seq=1,
+    )
+    reports = [event["report"] for event in store.status(run_id)["events"]]
+    assert len(reports) == 1
+    assert reports[0]["kind"] == "worker_brief_completed"
+    assert reports[0]["source"] == "drover-work-coordinator"

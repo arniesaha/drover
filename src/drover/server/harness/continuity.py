@@ -474,13 +474,17 @@ def record_work_coordinator_state(
     payload: dict | None,
     received_at: datetime,
 ) -> str | None:
-    """Project explicit coordinator worker states into the same durable inbox.
+    """Project coordinator terminal facts and declared states durably.
 
-    Factory sessions retain their TaskFlow completion contract. Coordinator
-    sessions opt in only through their committed launch binding, and all state
-    reports use the immutable harness event identity for replay safety.
+    A structured worker normally ends a turn with a ``status`` event carrying
+    ``turn_complete``; it does not have to emit a textual ``Drover-State`` line.
+    Project that allowlisted completion into the same inbox that wakes the
+    native owner.  Explicit state declarations remain authoritative for their
+    turn, so a completion status following ``Drover-State`` cannot create a
+    second wake.  Adapter failures and cancellations are projected as blocked,
+    never as a successful worker result.
     """
-    if event_type != "assistant_output" or type(sequence) is not int or sequence < 0:
+    if type(sequence) is not int or sequence < 0:
         return None
     session = _lock_observer_session(con, session_id)
     if session is None or session["handoff_mode"] != "work_coordinator":
@@ -491,6 +495,48 @@ def record_work_coordinator_state(
         [session_id],
     )
     if run is None:
+        return None
+
+    completion = _completion_payload(payload)
+    terminal_kind = None
+    terminal_summary = None
+    if event_type == "status" and completion is not None:
+        if completion.get("turn_complete") is not True:
+            return None
+        result = completion.get("result")
+        if isinstance(result, dict) and result.get("is_error") is True:
+            terminal_kind = "worker_blocked"
+            terminal_summary = "Structured worker reported an adapter failure."
+        else:
+            # The final explicit declaration in this turn was already
+            # projected from assistant output.  Do not add a completion wake
+            # for the same logical worker result.
+            final = _final_turn_output(con, session_id)
+            if final is not None and final[3] is not None:
+                return None
+            terminal_kind = "worker_brief_completed"
+            terminal_summary = "Structured worker reported a completed turn."
+    elif event_type == "error":
+        terminal_kind = "worker_blocked"
+        terminal_summary = "Structured worker reported an adapter failure."
+    elif event_type == "session.terminated":
+        terminal_kind = "worker_blocked"
+        terminal_summary = "Structured worker reported cancellation."
+
+    if terminal_kind is not None:
+        return _record_report(
+            con,
+            run_id=run["run_id"],
+            source="drover-work-coordinator",
+            source_event_id=event_id,
+            subject=session_id,
+            sequence=sequence,
+            kind=terminal_kind,
+            summary=terminal_summary,
+            received_at=received_at,
+        )
+
+    if event_type != "assistant_output":
         return None
     from drover.server.harness.events import is_text_stream_delta
     from drover.server.harness.worker_state import _message_text, parse_state_line
