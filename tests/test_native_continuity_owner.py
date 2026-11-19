@@ -199,6 +199,53 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     assert len(collector.turn_attempts) == 1
 
 
+def test_process_observability_reports_the_eligible_run_and_dispatch(tmp_path):
+    runner, _, _, run_id, _ = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+
+    assert runner.observability() == {
+        "state": "complete",
+        "at": "2026-10-09T00:00:00+00:00",
+        "dispatched": 1,
+        "runs": [
+            {
+                "goal_id": "goal-native",
+                "run_id": run_id,
+                "state": "dispatched",
+            }
+        ],
+    }
+
+
+def test_process_observability_records_a_sanitized_per_run_failure(
+    tmp_path, monkeypatch
+):
+    runner, _, _, run_id, _ = _runner(tmp_path)
+
+    def fail(*_args):
+        raise RuntimeError("remote response must not be retained")
+
+    monkeypatch.setattr(runner, "_process_run", fail)
+
+    with pytest.raises(RuntimeError, match="remote response"):
+        runner.process_once()
+
+    assert runner.observability() == {
+        "state": "failed",
+        "at": "2026-10-09T00:00:00+00:00",
+        "dispatched": 0,
+        "runs": [
+            {
+                "goal_id": "goal-native",
+                "run_id": run_id,
+                "state": "failed",
+                "error_type": "RuntimeError",
+            }
+        ],
+    }
+
+
 def test_native_ack_requires_completed_intent_across_redelivery(tmp_path):
     runner, _, store, run_id, clock = _runner(tmp_path)
 

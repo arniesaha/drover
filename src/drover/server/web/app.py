@@ -2762,6 +2762,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
             if self._continuity_coordinator_principal() is None:
                 raise PermissionError("bound bearer credential required")
             result = ContinuityHub(self.collector.duckdb_path).observability_status()
+            worker = getattr(self.collector, "idle_undeclared_worker", None)
+            runner = getattr(worker, "owner_runner", None)
+            result["native_owner_runner"] = (
+                runner.observability()
+                if runner is not None
+                else {"state": "not_configured", "runs": []}
+            )
             status = 200
         except PermissionError as exc:
             status, result = 403, {"error": str(exc)}
