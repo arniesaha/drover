@@ -130,6 +130,8 @@ class QueueExecutionWorker:
         if isinstance(exc, WorkDenied):
             if str(exc) == "harness inspection unavailable":
                 return "harness_inspection_unavailable"
+            if str(exc) == "harness launch uncertain; inspect persisted intent":
+                return "harness_launch_uncertain"
             if str(exc) == "launch intent uncertain; inspection required":
                 return "launch_intent_uncertain"
             return "work_denied"
@@ -163,13 +165,13 @@ class QueueExecutionWorker:
                     )
                 except Exception as exc:
                     # A malformed candidate or failed launch must not stop the daemon.
-                    self._recent_launch_failures.append(
-                        {
-                            "goal_id": candidate.get("goal_id"),
-                            "item_number": candidate.get("number"),
-                            "category": self._failure_category(exc),
-                        }
-                    )
+                    failure = {
+                        "goal_id": candidate.get("goal_id"),
+                        "item_number": candidate.get("number"),
+                        "category": self._failure_category(exc),
+                    }
+                    if failure not in self._recent_launch_failures:
+                        self._recent_launch_failures.append(failure)
                     # Keep the automatic loop observable without making an
                     # unbounded in-memory error log or retaining raw details.
                     del self._recent_launch_failures[:-16]

@@ -222,6 +222,8 @@ def test_execution_report_retains_first_contained_failure_for_candidate():
     failures = iter(
         [
             WorkDenied("harness inspection unavailable"),
+            WorkDenied("harness launch uncertain; inspect persisted intent"),
+            WorkDenied("launch intent uncertain; inspection required"),
             WorkDenied("launch intent uncertain; inspection required"),
         ]
     )
@@ -238,12 +240,19 @@ def test_execution_report_retains_first_contained_failure_for_candidate():
 
     worker.process_once()
     worker.process_once()
+    worker.process_once()
+    worker.process_once()
 
     assert worker.report()["execution"]["recent_launch_failures"] == [
         {
             "goal_id": "goal-1",
             "item_number": 10,
             "category": "harness_inspection_unavailable",
+        },
+        {
+            "goal_id": "goal-1",
+            "item_number": 10,
+            "category": "harness_launch_uncertain",
         },
         {
             "goal_id": "goal-1",
