@@ -77,6 +77,29 @@ class Collector:
         self.failed_launches = 0
         self.failed_turns = 0
         self.recorded_failed_turns = 0
+        self.daemon_session_statuses = {}
+
+    def _harness_request(self, _host, path, *, method, timeout_s):
+        assert method == "GET" and timeout_s == 10
+        if not path.startswith("/sessions?client_session_id="):
+            return 404, "{}"
+        client_session_id = path.split("=", 1)[1]
+        status = self.daemon_session_statuses.get(client_session_id)
+        if status is None:
+            return 503, "{}"
+        session = self.registry.session_by_client_id(client_session_id)
+        assert session is not None
+        return 200, json.dumps(
+            {
+                "sessions": [
+                    {
+                        "session_id": session.session_id,
+                        "client_session_id": client_session_id,
+                        "status": status,
+                    }
+                ]
+            }
+        )
 
     def proxy_create_harness_session(self, host_id, payload):
         self.launches.append((host_id, payload))
@@ -204,6 +227,36 @@ def test_owner_observability_names_unavailable_owner_session(tmp_path):
             "reason": "owner_session_unavailable",
         }
     ]
+
+
+def test_daemon_terminal_owner_session_replaces_stale_hub_projection(tmp_path):
+    runner, collector, _, _, _ = _runner(tmp_path)
+    scope = runner.config.goals[0]
+    link = runner._link(scope)
+    session = runner.registry.create_session(
+        session_id="stale-owner-daemon-terminal",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/project",
+        mode="structured",
+        client_session_id=link["client_session_id"],
+        handoff_mode="drover_native_continuity_owner",
+    )
+    with control_plane_connection(runner.path) as con:
+        con.execute(
+            """UPDATE continuity_owner_sessions SET session_id = ?
+            WHERE goal_id = ? AND owner_id = ?""",
+            [session.session_id, scope.goal_id, link["owner_id"]],
+        )
+    collector.daemon_session_statuses[link["client_session_id"]] = "errored"
+
+    assert runner._session(scope, launch=False) is None
+    assert runner.registry.get_session(session.session_id).status == "errored"
+    replacement = runner._link(scope)
+    assert replacement["generation"] == link["generation"] + 1
+    assert replacement["session_id"] is None
 
 
 def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):

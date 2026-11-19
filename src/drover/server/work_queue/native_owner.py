@@ -150,6 +150,43 @@ class NativeOwnerRunner:
                     return host
         return None
 
+    def _refresh_terminal_owner_session(self, session, host):
+        """Project a daemon-terminal owner session before it can be reused.
+
+        The hub registry can lag a daemon restart or terminal adapter error.
+        Reuse the bounded daemon metadata inspection used by the work bridge;
+        never inspect transcript content and fail closed if that inspection is
+        unavailable.  A terminal projection then takes the existing fenced
+        owner-link replacement path below.
+        """
+        if session.status in TERMINAL_SESSION_STATUSES or host is None:
+            return session
+        request = getattr(self.collector, "_harness_request", None)
+        if not callable(request):
+            return session
+        try:
+            status, body = request(
+                host,
+                "/sessions?client_session_id=" + session.client_session_id,
+                method="GET",
+                timeout_s=10,
+            )
+            if status != 200:
+                return session
+            rows = json.loads(body).get("sessions", [])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return session
+        for row in rows:
+            if (
+                isinstance(row, dict)
+                and row.get("session_id") == session.session_id
+                and row.get("status") in TERMINAL_SESSION_STATUSES
+            ):
+                return self.registry.update_session_status(
+                    session.session_id, row["status"]
+                )
+        return session
+
     def _session(self, scope, *, launch=True) -> str | None:
         link = self._link(scope)
         session = (
@@ -160,6 +197,8 @@ class NativeOwnerRunner:
         if session is None:
             session = self.registry.session_by_client_id(link["client_session_id"])
         host = self.registry.get_host(session.host_id) if session is not None else None
+        if session is not None and host is not None and host.liveness().usable:
+            session = self._refresh_terminal_owner_session(session, host)
         if (
             session is not None
             and session.status not in TERMINAL_SESSION_STATUSES
