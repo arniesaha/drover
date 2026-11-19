@@ -3580,8 +3580,24 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if "client_session_id" in params:
             key = params["client_session_id"][0]
             row = self.server.state.registry.session_by_client_id(key)
+            try:
+                terminal_result = (
+                    self.server.state.registry.structured_terminal_results(
+                        [row.session_id]
+                    ).get(row.session_id)
+                    if row is not None and row.mode == "structured"
+                    else None
+                )
+            except Exception:
+                terminal_result = None
             self._write_json(
-                {"sessions": [_structured_session_row_json(row)] if row else []}
+                {
+                    "sessions": (
+                        [_structured_session_row_json(row, terminal_result)]
+                        if row
+                        else []
+                    )
+                }
             )
             return
         archived_limit = _session_list_archived_limit(params)

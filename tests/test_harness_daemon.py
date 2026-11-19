@@ -3149,6 +3149,7 @@ def test_harnessd_structured_readback_projects_sanitized_terminal_category(tmp_p
             status="running",
             cwd=str(tmp_path),
             mode="structured",
+            client_session_id="structured-terminal-result",
         )
         completed = state.registry.append_event(
             session_id=session.session_id,
@@ -3181,6 +3182,13 @@ def test_harnessd_structured_readback_projects_sanitized_terminal_category(tmp_p
             "turn_id": None,
             "at": cancelled.created_at.isoformat(),
         }
+
+        # The normal work coordinator locates its source session by run key,
+        # so its filtered supported readback must not bypass this projection.
+        _, filtered = _json_request(
+            f"{base_url}/sessions?client_session_id=structured-terminal-result"
+        )
+        assert filtered["sessions"] == [payload]
 
         failed = state.registry.append_event(
             session_id=session.session_id,
