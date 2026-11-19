@@ -3137,6 +3137,16 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             seq=0,
         )
 
+        child_environment: dict[str, str] = {}
+        if owner_bearer is not None:
+            child_environment["DROVER_CONTINUITY_OWNER_BEARER"] = owner_bearer
+        if work_continuity is not None and self.server.state.host_token:
+            # A coordinator worker may use the already-paired host identity
+            # through the configured MCP server to read its work item.  This
+            # is launch-only: the bearer is not persisted in the registry,
+            # continuity ledger, prompt, or hub request payload.  Ordinary
+            # and native-owner sessions never receive it here.
+            child_environment["DROVER_MCP_TOKEN"] = self.server.state.host_token
         try:
             self.server.state.structured.start(
                 session_id,
@@ -3147,11 +3157,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 on_message=self.server.state.push_event,
                 finalize=self._finalize_structured_session,
                 native_session_id=native_session_id,
-                environment=(
-                    {"DROVER_CONTINUITY_OWNER_BEARER": owner_bearer}
-                    if owner_bearer is not None
-                    else None
-                ),
+                environment=child_environment or None,
             )
         except Exception as exc:
             if registry_created:
