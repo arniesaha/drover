@@ -11,7 +11,8 @@ import time
 from datetime import datetime, timezone
 
 from .config import WorkQueueConfig, load_policy
-from .github import GitHubProvider, ProviderUnavailable
+from .github import ProviderUnavailable
+from .providers import provider_for_scope
 from .service import WorkActor, identity
 
 log = logging.getLogger(__name__)
@@ -112,7 +113,9 @@ class QueueExecutionWorker:
         self.service = service
         self.coordinator = QueueExecutionCoordinator(service)
         self.reconciler = ShadowReconciler(
-            service.config, service_principal="control:queue-execution"
+            service.config,
+            service_principal="control:queue-execution",
+            providers=getattr(service, "providers", None),
         )
         self._stop = threading.Event()
         self._thread = None
@@ -174,7 +177,8 @@ class ShadowReconciler:
         config: WorkQueueConfig,
         *,
         service_principal: str,
-        provider_factory=GitHubProvider,
+        provider_factory=provider_for_scope,
+        providers=None,
         clock=time.time,
     ):
         if not service_principal.strip():
@@ -182,9 +186,14 @@ class ShadowReconciler:
         self.service_principal = service_principal
         self.config = config
         self.clock = clock
-        self.providers = {
-            g.goal_id: provider_factory(config.workspace_id, g) for g in config.goals
-        }
+        if providers is None:
+            providers = {
+                g.goal_id: provider_factory(config.workspace_id, g)
+                for g in config.goals
+            }
+        if set(providers) != {goal.goal_id for goal in config.goals}:
+            raise ValueError("candidate providers must match configured goals")
+        self.providers = providers
         self._lock = threading.Lock()
         self._poll_lock = threading.Lock()
         self._reports = {}

@@ -12,7 +12,8 @@ from drover.server.harness.worker_state import worker_brief
 from drover.server.mcp.contract import ReadCaps, bound_response
 from drover.server.web.auth import bearer_credential
 
-from .github import GitHubProvider, ProviderUnavailable
+from .github import ProviderUnavailable
+from .providers import provider_for_scope
 from .service import SYSTEMIC_COMMENT, WorkActor, WorkDenied, WorkService
 from .store import WorkStore
 
@@ -85,17 +86,39 @@ class HarnessBridge:
         if len(links) != 1:
             raise WorkDenied("cannot recover unique work launch intent")
         link = links[0]
+        scope = next(
+            (
+                scope
+                for scope in self.config.goals
+                if scope.goal_id == link.get("goal_id")
+            ),
+            None,
+        )
+        if scope is None:
+            raise WorkDenied("cannot recover work continuity goal")
+        expected_effect_artifact = None
+        if getattr(scope, "candidate_source", None) == "local_file":
+            _, _, _, item = service.item(link.get("goal_id"), link.get("item_number"))
+            from .service import candidate_effect_reference
+
+            expected_effect_artifact = candidate_effect_reference(
+                item.get("expected_effect_artifact"),
+                scope.local_candidate_worktrees.get(str(link.get("item_number"))),
+            )
         binding = self._work_coordinator_binding(
             run_key,
             link.get("run_role"),
             link.get("item_url"),
             link.get("goal_id"),
+            expected_effect_artifact=expected_effect_artifact,
         )
         if binding is not None:
             payload["work_coordinator_continuity"] = binding
         return payload
 
-    def _work_coordinator_binding(self, run_key, role, item_url, goal_id):
+    def _work_coordinator_binding(
+        self, run_key, role, item_url, goal_id, *, expected_effect_artifact=None
+    ):
         scope = next(
             (scope for scope in self.config.goals if scope.goal_id == goal_id), None
         )
@@ -113,6 +136,14 @@ class HarnessBridge:
             "authority_scope": "implementation",
             "objective": f"Work coordinator {role} for {item_url}",
         }
+        if expected_effect_artifact is not None:
+            if (
+                not isinstance(expected_effect_artifact, str)
+                or not expected_effect_artifact.strip()
+                or len(expected_effect_artifact) > 2000
+            ):
+                raise WorkDenied("local candidate expected effect is invalid")
+            binding["expected_effect_artifact"] = expected_effect_artifact
         serialization_key = getattr(scope, "integration_serialization_key", None)
         if role == "work" and serialization_key is not None:
             binding.update(
@@ -229,6 +260,17 @@ class HarnessBridge:
             if parent_session and parent_session.host_id == host
             else scope.execution_cwds.get(host)
         )
+        authority = authority or {}
+        local_number = authority.get("local_candidate_number")
+        local_cwd = authority.get("local_candidate_cwd")
+        if local_cwd is not None:
+            if (
+                scope.candidate_source != "local_file"
+                or not isinstance(local_number, int)
+                or scope.local_candidate_worktrees.get(str(local_number)) != local_cwd
+            ):
+                raise WorkDenied("local candidate worktree binding is invalid")
+            cwd = local_cwd
         if not cwd:
             raise ValueError("configured execution checkout required")
         brief = (
@@ -236,7 +278,6 @@ class HarnessBridge:
             f"ref {scope.brief_ref or scope.goal_id} and versioned policy. Report "
             "behavioral evidence through the work tools."
         )
-        authority = authority or {}
         payload = {
             "cwd": cwd,
             "harness": harness,
@@ -260,7 +301,11 @@ class HarnessBridge:
             # was signed by the hub's continuity secret. The host receives the
             # binding but never the HMAC secret or the hub bearer token.
             payload["work_coordinator_continuity"] = self._work_coordinator_binding(
-                run_key, role, ref.url, goal_id
+                run_key,
+                role,
+                ref.url,
+                goal_id,
+                expected_effect_artifact=authority.get("expected_effect_artifact"),
             )
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:
@@ -278,7 +323,7 @@ def start_work_service(collector, config):
             return None
         raise ValueError("live work control requires Postgres")
     providers = {
-        g.goal_id: GitHubProvider(
+        g.goal_id: provider_for_scope(
             config.workspace_id,
             g,
             public_text_validator=lambda text: text == SYSTEMIC_COMMENT,

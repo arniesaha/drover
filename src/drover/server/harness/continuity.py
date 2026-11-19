@@ -868,7 +868,9 @@ class FactoryObserverContinuity:
             )
 
     @staticmethod
-    def _reserve_integration(con, run: dict, now: datetime) -> None:
+    def _reserve_integration(
+        con, run: dict, now: datetime, *, allow_reacquire: bool = False
+    ) -> None:
         """Acquire one repository/key reservation or reject the live holder."""
         if run["delivery_role"] != "integration_serialized":
             return
@@ -915,13 +917,24 @@ class FactoryObserverContinuity:
         elif reservation["run_id"] != run["run_id"]:
             raise ContinuityConflict("integration reservation is unavailable")
         generation = reservation["generation"]
-        if run.get("serialization_generation") not in {None, generation}:
-            raise ContinuityConflict("integration reservation generation changed")
-        con.execute(
-            """UPDATE factory_observer_runs SET serialization_generation = ?
-            WHERE run_id = ? AND serialization_generation IS NULL""",
-            [generation, run["run_id"]],
-        )
+        prior_generation = run.get("serialization_generation")
+        if prior_generation not in {None, generation}:
+            if not allow_reacquire:
+                raise ContinuityConflict("integration reservation generation changed")
+            changed = con.execute(
+                """UPDATE factory_observer_runs SET serialization_generation = ?
+                WHERE run_id = ? AND serialization_generation = ?
+                RETURNING serialization_generation""",
+                [generation, run["run_id"], prior_generation],
+            ).fetchone()
+            if changed is None:
+                raise ContinuityConflict("integration reservation generation changed")
+        else:
+            con.execute(
+                """UPDATE factory_observer_runs SET serialization_generation = ?
+                WHERE run_id = ? AND serialization_generation IS NULL""",
+                [generation, run["run_id"]],
+            )
         run["serialization_generation"] = generation
 
     @staticmethod
@@ -971,6 +984,30 @@ class FactoryObserverContinuity:
         if changed is None:
             raise ContinuityConflict("integration reservation fence changed")
 
+    @staticmethod
+    def _integration_release_ready(con, run: dict) -> bool:
+        """Release a serialized key only after its terminal worker result settles.
+
+        Work-coordinator sessions emit a durable ``worker_started`` report
+        before their terminal ``worker_done`` report.  Releasing the key when
+        the first observation is acknowledged lets another serialized run
+        advance the generation, then fences the original run's final result.
+        Keep the key through every non-terminal report; the final result may
+        release it only once no pending/delivered work remains for this run.
+        """
+        if run["delivery_role"] != "integration_serialized":
+            return False
+        if run["worker_state"] != "done":
+            return False
+        return (
+            con.execute(
+                """SELECT 1 FROM factory_observer_inbox
+                WHERE run_id = ? AND state IN ('pending', 'delivered') LIMIT 1""",
+                [run["run_id"]],
+            ).fetchone()
+            is None
+        )
+
     def initialize(
         self,
         *,
@@ -983,6 +1020,7 @@ class FactoryObserverContinuity:
         delivery_role: str = "standard",
         repository: str | None = None,
         serialization_key: str | None = None,
+        expected_effect_artifact: str | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
@@ -999,6 +1037,8 @@ class FactoryObserverContinuity:
         delivery_role, repository, serialization_key = _serialization_binding(
             delivery_role, repository, serialization_key
         )
+        if expected_effect_artifact is not None:
+            _text(expected_effect_artifact, "expected_effect_artifact", 2000)
         if (
             delivery_role == "integration_serialized"
             and authority_scope != "implementation"
@@ -1022,8 +1062,9 @@ class FactoryObserverContinuity:
                 """INSERT INTO factory_observer_runs
                 (run_id, session_id, expected_revision, objective, checkpoint,
                  authority_scope, authorized_owner_id, delivery_role,
-                 serialization_repository, serialization_key, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 serialization_repository, serialization_key, expected_effect_artifact,
+                 updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (run_id) DO NOTHING""",
                 [
                     run_id,
@@ -1036,6 +1077,7 @@ class FactoryObserverContinuity:
                     delivery_role,
                     repository,
                     serialization_key,
+                    expected_effect_artifact,
                     self.clock(),
                 ],
             )
@@ -1054,6 +1096,7 @@ class FactoryObserverContinuity:
                 "delivery_role": delivery_role,
                 "serialization_repository": repository,
                 "serialization_key": serialization_key,
+                "expected_effect_artifact": expected_effect_artifact,
             }.items():
                 if existing[name] != value:
                     raise ContinuityConflict(f"run {name} is immutable")
@@ -1206,6 +1249,12 @@ class FactoryObserverContinuity:
                 epoch = run["owner_epoch"]
             else:
                 epoch = run["owner_epoch"] + 1
+                # A previous, fully acknowledged delivery may have released
+                # this run's serialization key before a delayed durable
+                # source report arrives.  Only an expired owner may reclaim a
+                # *released* reservation; a live holder still fails closed in
+                # _reserve_integration.
+                self._reserve_integration(con, run, now, allow_reacquire=True)
             until = now + timedelta(seconds=lease_seconds)
             con.execute(
                 """UPDATE factory_observer_runs SET owner_id = ?,
@@ -1388,6 +1437,8 @@ class FactoryObserverContinuity:
                 }
                 if scope == "deployment":
                     action["type"] = "request_explicit_approval"
+                if run.get("expected_effect_artifact") is not None:
+                    action["expected_effect_artifact"] = run["expected_effect_artifact"]
                 if not late and report["kind"].startswith("worker_"):
                     con.execute(
                         "UPDATE factory_observer_runs SET worker_state = ? WHERE run_id = ?",
@@ -1455,6 +1506,14 @@ class FactoryObserverContinuity:
             ):
                 raise ContinuityConflict(
                     "action intent must match the consumed delivery"
+                )
+            expected_effect_artifact = action.get("expected_effect_artifact")
+            if (
+                expected_effect_artifact is not None
+                and artifact != expected_effect_artifact
+            ):
+                raise ContinuityConflict(
+                    "action intent artifact must match the expected effect"
                 )
             existing = _row(
                 con,
@@ -1551,7 +1610,8 @@ class FactoryObserverContinuity:
                 next_action_json = NULL, updated_at = ? WHERE run_id = ?""",
                 [checkpoint, now, run_id],
             )
-            self._release_integration(con, run, owner_id, owner_epoch, now)
+            if self._integration_release_ready(con, run):
+                self._release_integration(con, run, owner_id, owner_epoch, now)
 
     def owner_runs(
         self,
@@ -1696,6 +1756,7 @@ class FactoryObserverContinuity:
                 "authority_scope": run["authority_scope"],
                 "scope_limit": SCOPES[run["authority_scope"]],
                 "delivery_role": run.get("delivery_role", "standard"),
+                "expected_effect_artifact": run.get("expected_effect_artifact"),
                 "integration_serialization": integration_serialization,
                 "owner_handoff": {
                     "authorized_owner_id": run.get("authorized_owner_id"),

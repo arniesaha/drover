@@ -26,6 +26,10 @@ class WorkCoordinatorContinuity:
     delivery_role: str = "standard"
     repository: str | None = None
     serialization_key: str | None = None
+    # An opaque, signed reference to the one local effect that can settle a
+    # canary delivery.  It is not an authority grant or a filesystem path the
+    # hub resolves; the owner verifies it in its isolated worktree.
+    expected_effect_artifact: str | None = None
 
     @property
     def source_session_id(self) -> str:
@@ -94,9 +98,11 @@ def _parse_work_coordinator_continuity(
         "binding_signature",
     }
     serialization_fields = {"delivery_role", "repository", "serialization_key"}
-    if not isinstance(raw, Mapping) or set(raw) not in (
-        base_fields,
-        base_fields | serialization_fields,
+    expected_effect_fields = {"expected_effect_artifact"}
+    if not isinstance(raw, Mapping) or not (
+        base_fields
+        <= set(raw)
+        <= base_fields | serialization_fields | expected_effect_fields
     ):
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
     signature = raw["binding_signature"]
@@ -126,6 +132,13 @@ def _parse_work_coordinator_continuity(
     delivery_role = raw.get("delivery_role", "standard")
     repository = raw.get("repository")
     serialization_key = raw.get("serialization_key")
+    expected_effect_artifact = raw.get("expected_effect_artifact")
+    if expected_effect_artifact is not None and (
+        not isinstance(expected_effect_artifact, str)
+        or not expected_effect_artifact.strip()
+        or len(expected_effect_artifact) > 2000
+    ):
+        raise FactoryObserverRequestError("work continuity expected effect is invalid")
     if delivery_role == "standard":
         if repository is not None or serialization_key is not None:
             raise FactoryObserverRequestError(
@@ -156,6 +169,7 @@ def _parse_work_coordinator_continuity(
             delivery_role,
             repository,
             serialization_key,
+            expected_effect_artifact,
         ),
         normalized,
         unsigned,
