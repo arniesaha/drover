@@ -78,6 +78,8 @@ class Collector:
         self.failed_turns = 0
         self.recorded_failed_turns = 0
         self.daemon_session_statuses = {}
+        self.expected_effect_attestations = {}
+        self.effect_attestation_attempts = []
 
     def _harness_request(self, _host, path, *, method, timeout_s):
         assert method == "GET" and timeout_s == 10
@@ -120,6 +122,15 @@ class Collector:
         return 202, json.dumps({"session_id": session.session_id})
 
     def proxy_harness_session_action(self, session_id, action, payload):
+        if action == "expected-effect":
+            self.effect_attestation_attempts.append((session_id, payload))
+            materialized = self.expected_effect_attestations.get(session_id, False)
+            return 200, json.dumps(
+                {
+                    "artifact": payload["artifact"],
+                    "materialized": materialized,
+                }
+            )
         assert action == "turns"
         self.turn_attempts.append((session_id, payload))
         if self.failed_turns:
@@ -142,7 +153,7 @@ class Collector:
         return 202, "{}"
 
 
-def _runner(tmp_path):
+def _runner(tmp_path, *, expected_effect=None):
     path = tmp_path / "control.duckdb"
     bootstrap_control_plane_store(path)
     registry = HarnessRegistry(path)
@@ -158,6 +169,7 @@ def _runner(tmp_path):
         harness="codex",
         command="codex",
         status="running",
+        cwd="/workspace/worktrees/project",
         handoff_mode="factory_observer",
         source_session_id="factory/run-native@1",
     )
@@ -169,6 +181,7 @@ def _runner(tmp_path):
         objective="Native continuity",
         checkpoint="started",
         authorized_owner_id=owner_id,
+        expected_effect_artifact=expected_effect,
     )
     store.report(
         run_id,
@@ -212,6 +225,32 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     token = payload["continuity_owner_bearer"]
     assert runner.credentials.find_active(token).owner_id == "drover:owner/goal-native"
     assert store.status(run_id)["owner"]["live"]
+
+
+def test_owner_turn_waits_for_materialized_candidate_effect_attestation(tmp_path):
+    expected = "local-file:worktrees/project/.drover-native-canary/source-task-13.json"
+    runner, collector, _, run_id, _ = _runner(tmp_path, expected_effect=expected)
+
+    assert runner.process_once() == 0
+    assert collector.launches == []
+    assert collector.turn_attempts == []
+    assert collector.effect_attestation_attempts == [
+        ("observer-session", {"artifact": expected})
+    ]
+    assert runner.observability()["runs"] == [
+        {
+            "goal_id": "goal-native",
+            "run_id": run_id,
+            "state": "not_dispatched",
+            "reason": "expected_effect_unverified",
+        }
+    ]
+
+    collector.expected_effect_attestations["observer-session"] = True
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == 1
+    assert len(collector.turn_attempts) == 1
 
 
 def test_owner_observability_names_unavailable_owner_session(tmp_path):

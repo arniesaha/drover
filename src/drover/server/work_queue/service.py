@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 
 from .config import load_policy
 from .provider import ItemRef
@@ -43,6 +44,39 @@ def code(value):
     ):
         raise ValueError("opaque metadata code required")
     return value
+
+
+def candidate_effect_reference(value, worktree_cwd):
+    """Canonicalize a local-candidate marker for its eventual session worktree.
+
+    A manifest may name its assigned logical worktree as
+    ``worktrees/<name>/.drover-native-canary/...``.  Structured harnesses run
+    in a fresh child worktree, so bind the durable effect reference to the
+    marker's safe relative location there rather than to the launch checkout.
+    """
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or not isinstance(worktree_cwd, str)
+        or not worktree_cwd
+    ):
+        raise WorkDenied("local candidate expected effect is invalid")
+    raw = value.removeprefix("local-file:")
+    if raw == value and value.startswith("local-file:"):
+        raise WorkDenied("local candidate expected effect is invalid")
+    if not raw or "\\" in raw:
+        raise WorkDenied("local candidate expected effect is invalid")
+    path = PurePosixPath(raw)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise WorkDenied("local candidate expected effect is invalid")
+    parts = path.parts
+    if len(parts) >= 3 and parts[:2] == ("worktrees", Path(worktree_cwd).name):
+        parts = parts[2:]
+    if len(parts) < 2 or parts[0] != ".drover-native-canary":
+        raise WorkDenied("local candidate expected effect is outside its worktree")
+    return "local-file:" + "/".join(parts)
 
 
 def route(accounts, policy, estimate, eligible):
@@ -515,6 +549,13 @@ class WorkService:
         ):
             raise PermissionError("parent session outside workspace")
         scope = next(g for g in self.config.goals if g.goal_id == goal_id)
+        local_candidate_cwd = None
+        expected_effect_artifact = None
+        if scope.candidate_source == "local_file":
+            local_candidate_cwd = scope.local_candidate_worktrees.get(str(number))
+            expected_effect_artifact = candidate_effect_reference(
+                item.get("expected_effect_artifact"), local_candidate_cwd
+            )
         goal_ref = scope.goal_label or f"milestone:{scope.milestone}"
         row = self.store.intent(
             actor.principal, ref, goal_id, run_key, run_role, failures, goal_ref
@@ -530,8 +571,8 @@ class WorkService:
         if scope.candidate_source == "local_file":
             authority.update(
                 local_candidate_number=number,
-                local_candidate_cwd=scope.local_candidate_worktrees.get(str(number)),
-                expected_effect_artifact=item.get("expected_effect_artifact"),
+                local_candidate_cwd=local_candidate_cwd,
+                expected_effect_artifact=expected_effect_artifact,
             )
         session_id = self.harness.launch(
             host,

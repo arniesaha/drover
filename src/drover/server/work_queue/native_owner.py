@@ -382,6 +382,32 @@ class NativeOwnerRunner:
         for (session_id,) in rows:
             self._complete_finished_claim(scope, session_id)
 
+    def _expected_effect_materialized(self, status: dict) -> bool:
+        """Ask the source host to attest the signed candidate effect in its cwd.
+
+        The hub does not dereference opaque ``local-file`` references itself.
+        It asks the paired daemon that owns the recorded worker session, which
+        confines the check to that session's structured worktree.  A missing
+        or malformed attestation fails closed before a native owner turn can
+        write an action-intent receipt or acknowledgement.
+        """
+        artifact = status.get("expected_effect_artifact")
+        if artifact is None:
+            return True
+        session_id = status.get("session_id")
+        if not isinstance(artifact, str) or not isinstance(session_id, str):
+            return False
+        response, body = self.collector.proxy_harness_session_action(
+            session_id, "expected-effect", {"artifact": artifact}
+        )
+        if not 200 <= response < 300:
+            return False
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return payload.get("materialized") is True
+
     def _recover_abandoned_claim(self, scope, row) -> bool:
         """Resume one fenced abandonment by its immutable journal snapshot.
 
@@ -809,6 +835,9 @@ class NativeOwnerRunner:
         if self._has_active_claim(scope):
             return False
         status = self.continuity.status(run_id)
+        if not self._expected_effect_materialized(status):
+            self._last_not_dispatched_reason = "expected_effect_unverified"
+            return False
         owner = status["owner"]
         prior_epoch = owner["epoch"] if owner["id"] == owner_id else None
         epoch = prior_epoch if owner["live"] else None

@@ -1985,6 +1985,16 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             self._interrupt_session(session_id)
             return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith(
+            "/expected-effect"
+        ):
+            session_id = (
+                parsed.path.removeprefix("/sessions/")
+                .removesuffix("/expected-effect")
+                .strip("/")
+            )
+            self._verify_expected_effect(session_id)
+            return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
 
     def _fs_list(self, query: str) -> None:
@@ -2043,6 +2053,37 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
     def _fs_exists(self) -> None:
         body = self._read_json() or {}
         self._write_json({"exists": _directories_exist(body.get("paths"))})
+
+    def _verify_expected_effect(self, session_id: str) -> None:
+        """Attest one local candidate effect relative to its worker session.
+
+        This is deliberately separate from the generic filesystem helpers:
+        callers cannot choose an arbitrary host path.  The paired hub supplies
+        the immutable local-file reference from its signed continuity binding;
+        harnessd limits that reference to this structured work session's cwd.
+        """
+        session = self._safe_get_session(session_id)
+        if (
+            session is None
+            or session.mode != "structured"
+            or session.handoff_mode != "work_coordinator"
+        ):
+            self._write_json(
+                {"error": "unknown work-coordinator session"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+        body = self._read_json() or {}
+        artifact = body.get("artifact")
+        if not isinstance(artifact, str):
+            self._write_json(
+                {"error": "expected effect artifact is required"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        self._write_json(
+            {"materialized": _materialized_expected_effect(session.cwd, artifact)}
+        )
 
     def _auth_status(self, harness: str) -> None:
         try:
@@ -4534,6 +4575,41 @@ def _directories_exist(paths: Any) -> dict[str, bool]:
         except Exception:  # noqa: BLE001 - a bad path is False, never a 500
             result[candidate] = False
     return result
+
+
+def _materialized_expected_effect(cwd: str | None, artifact: Any) -> bool:
+    """Return whether an expected local-file effect is a regular file in cwd.
+
+    ``local-file:.drover-native-canary/...`` is an immutable, hub-issued
+    session-relative reference. The daemon must not turn it into arbitrary
+    filesystem access: reject traversal or links escaping the source session's
+    recorded cwd.
+    """
+    if not isinstance(cwd, str) or not cwd or not isinstance(artifact, str):
+        return False
+    prefix = "local-file:"
+    if not artifact.startswith(prefix):
+        return False
+    reference = artifact.removeprefix(prefix)
+    if not reference or "\\" in reference:
+        return False
+    path = Path(reference)
+    if path.is_absolute() or len(path.parts) < 2:
+        return False
+    if any(part in {"", ".", ".."} for part in path.parts):
+        return False
+    try:
+        root = Path(cwd).resolve(strict=True)
+    except OSError:
+        return False
+    if path.parts[0] != ".drover-native-canary":
+        return False
+    try:
+        target = root.joinpath(*path.parts).resolve(strict=True)
+        target.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return target.is_file()
 
 
 def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:

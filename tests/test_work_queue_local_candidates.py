@@ -8,7 +8,11 @@ from drover.server.work_queue.github import ProviderUnavailable
 from drover.server.work_queue.local_candidates import LocalCandidateProvider
 from drover.server.work_queue.provider import ItemRef
 from drover.server.work_queue.reconciler import QueueExecutionWorker, ShadowReconciler
-from drover.server.work_queue.service import WorkService
+from drover.server.work_queue.service import (
+    WorkDenied,
+    WorkService,
+    candidate_effect_reference,
+)
 from drover.server.work_queue.store import WorkStore
 
 
@@ -97,6 +101,21 @@ def test_local_candidate_effect_reference_is_explicit_and_bounded(tmp_path):
     _manifest(path, expected_effect=" ")
     with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
         provider.authenticate()
+
+
+def test_local_candidate_effect_reference_becomes_session_relative(tmp_path):
+    worktree = tmp_path / "worktree-1"
+    assert (
+        candidate_effect_reference(
+            "worktrees/worktree-1/.drover-native-canary/source-task-1.json",
+            str(worktree),
+        )
+        == "local-file:.drover-native-canary/source-task-1.json"
+    )
+    with pytest.raises(WorkDenied, match="outside"):
+        candidate_effect_reference(
+            "worktrees/other/.drover-native-canary/source-task-1.json", str(worktree)
+        )
 
 
 def test_local_candidate_manifest_rejects_cross_scope_and_malformed_content(tmp_path):
@@ -250,7 +269,9 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
     assert harness.launches[0][5]["authority"]["local_candidate_cwd"] == str(
         tmp_path / "worktree-1"
     )
-    assert harness.launches[0][5]["authority"]["expected_effect_artifact"] == expected
+    assert harness.launches[0][5]["authority"]["expected_effect_artifact"] == (
+        "local-file:.drover-native-canary/source-task-1.json"
+    )
     assert provider.get_item(_ref())["labels"] == [
         {"name": "goal:local"},
         {"name": "agent:nix"},

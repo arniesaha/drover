@@ -25,11 +25,15 @@ or act after a lost lease epoch.
 
 For a candidate whose harmless effect is acceptance evidence, its local-file
 manifest must carry `expected_effect_artifact`. The WorkService signs that
-opaque candidate reference into the coordinator binding, and the hub stores it
-on the run before owner delivery. A completed action intent must use the exact
-reference; a generic wake marker is not evidence for the candidate effect and
-cannot be acknowledged. The reference identifies a verified artifact in the
-isolated worktree; it is not a host path for the hub to dereference.
+logical candidate reference into a session-relative
+`local-file:.drover-native-canary/...` coordinator binding, and the hub stores
+that immutable reference on the run before owner delivery. Before it sends an
+owner turn, the hub asks the paired daemon to attest that the exact reference
+names a regular file under the recorded source session's isolated worktree. A
+completed action intent must use the exact reference; a generic wake marker is
+not evidence for the candidate effect and cannot be acknowledged. The reference
+is not a host path for the hub to dereference, and a missing or
+out-of-worktree artifact leaves the wake pending without an owner turn.
 
 The only allowed action is this local marker. A missing, malformed, or
 out-of-scope instruction is a fail-closed condition: retain the durable wake
