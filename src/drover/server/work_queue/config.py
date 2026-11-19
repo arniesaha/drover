@@ -180,6 +180,12 @@ class GoalScope(Model):
     integration_serialization_key: str | None = Field(
         default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$"
     )
+    # When present, only an operator-authorized candidate carrying this label
+    # enters the configured conflicting-write class.  Omitting the selector
+    # preserves the historical all-work serialization behavior.
+    integration_serialization_label: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$"
+    )
     # Explicit opt-in: the one OpenClaw session allowed to receive durable
     # work-completion wakes for this goal.  No default owner exists.
     continuity_owner_id: str | None = None
@@ -188,6 +194,13 @@ class GoalScope(Model):
     # provider/model default from an unrelated worker.
     continuity_owner_harness: str | None = None
     continuity_owner_model: str | None = None
+    # GitHub is the normal ingress.  ``local_file`` is an explicit isolated
+    # canary source and never inherits a remote provider credential.
+    candidate_source: Literal["github", "local_file"] = "github"
+    local_candidates_path: str | None = None
+    # Per-item worktrees are local-file-only and must be declared in the
+    # server configuration; manifest content cannot choose an arbitrary path.
+    local_candidate_worktrees: dict[str, str] = Field(default_factory=dict)
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -224,6 +237,32 @@ class GoalScope(Model):
         if self.integration_serialization_key is not None and owner != native_owner:
             raise ValueError(
                 "integration serialization requires this goal's native owner"
+            )
+        if (
+            self.integration_serialization_label is not None
+            and self.integration_serialization_key is None
+        ):
+            raise ValueError(
+                "integration serialization label requires a serialization key"
+            )
+        if self.candidate_source == "local_file":
+            if (
+                not self.local_candidates_path
+                or not Path(self.local_candidates_path).is_absolute()
+            ):
+                raise ValueError("local candidate source requires an absolute manifest")
+            for number, path in self.local_candidate_worktrees.items():
+                if (
+                    not number.isdigit()
+                    or int(number) <= 0
+                    or not Path(path).is_absolute()
+                ):
+                    raise ValueError(
+                        "local candidate worktrees require positive item keys and absolute paths"
+                    )
+        elif self.local_candidates_path is not None or self.local_candidate_worktrees:
+            raise ValueError(
+                "GitHub candidate source cannot configure local candidate paths"
             )
         return self
 
