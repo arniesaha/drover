@@ -89,14 +89,20 @@ def test_local_candidate_manifest_is_bound_and_status_writes_are_atomic(tmp_path
 
 def test_local_candidate_effect_reference_is_explicit_and_bounded(tmp_path):
     path = tmp_path / "candidates.json"
-    expected = "local-file:worktrees/work-b/.drover-native-canary/source-task-9.json"
+    expected = "local-file:.drover-native-canary/source-task-9.json"
     _manifest(path, expected_effect=expected)
     provider = LocalCandidateProvider("local-workspace", _scope(path))
     assert provider.get_item(_ref())["expected_effect_artifact"] == expected
 
-    _manifest(path, expected_effect=" ")
-    with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
-        provider.authenticate()
+    for invalid in (
+        " ",
+        "worktrees/work-b/.drover-native-canary/source-task-9.json",
+        "local-file:worktrees/work-b/.drover-native-canary/source-task-9.json",
+        "local-file:.drover-native-canary/../generic.json",
+    ):
+        _manifest(path, expected_effect=invalid)
+        with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
+            provider.authenticate()
 
 
 def test_local_candidate_manifest_rejects_cross_scope_and_malformed_content(tmp_path):
@@ -189,9 +195,7 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
     tmp_path, pg_control_path
 ):
     path = tmp_path / "candidates.json"
-    expected = (
-        "local-file:worktrees/worktree-1/.drover-native-canary/source-task-1.json"
-    )
+    expected = "local-file:.drover-native-canary/source-task-1.json"
     _manifest(path, expected_effect=expected)
     scope = _scope(
         path,

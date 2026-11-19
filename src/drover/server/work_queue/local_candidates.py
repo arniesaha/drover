@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .github import ProviderUnavailable
@@ -61,7 +61,23 @@ class LocalCandidateProvider:
             raise ProviderUnavailable("local_candidate_manifest_invalid") from None
 
     @staticmethod
-    def _item(item: Any) -> None:
+    def _valid_expected_effect_artifact(value: Any) -> bool:
+        """Require the daemon's session-CWD-confined local-file reference."""
+        if not isinstance(value, str) or not value.startswith("local-file:"):
+            return False
+        reference = value.removeprefix("local-file:")
+        if not reference or "\\" in reference:
+            return False
+        path = PurePosixPath(reference)
+        return (
+            not path.is_absolute()
+            and len(path.parts) >= 2
+            and path.parts[0] == ".drover-native-canary"
+            and not any(part in {"", ".", ".."} for part in path.parts)
+        )
+
+    @classmethod
+    def _item(cls, item: Any) -> None:
         required = {
             "number",
             "state",
@@ -90,8 +106,9 @@ class LocalCandidateProvider:
             or (
                 "expected_effect_artifact" in item
                 and (
-                    not isinstance(item["expected_effect_artifact"], str)
-                    or not item["expected_effect_artifact"].strip()
+                    not cls._valid_expected_effect_artifact(
+                        item["expected_effect_artifact"]
+                    )
                     or len(item["expected_effect_artifact"]) > 2000
                 )
             )
