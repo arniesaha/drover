@@ -520,6 +520,18 @@ class WorkService:
             actor.principal, ref, goal_id, run_key, run_role, failures, goal_ref
         )
         # The intent is committed before this call. Any exception leaves it inspectable.
+        authority = {
+            "labels": item.get(
+                "operator_authority_labels",
+                [label["name"] for label in item.get("labels", [])],
+            ),
+            "body": item.get("body"),
+        }
+        if scope.candidate_source == "local_file":
+            authority.update(
+                local_candidate_number=number,
+                local_candidate_cwd=scope.local_candidate_worktrees.get(str(number)),
+            )
         session_id = self.harness.launch(
             host,
             harness,
@@ -528,12 +540,7 @@ class WorkService:
             run_role,
             parent_session_id,
             goal_id,
-            authority={
-                "labels": item.get("operator_authority_labels", []),
-                "body": item.get("body"),
-                "local_candidate_number": number,
-                "local_candidate_cwd": scope.local_candidate_worktrees.get(str(number)),
-            },
+            authority=authority,
         )
         linked = self.store.associate(row["run_key"], session_id)
         if run_role == "work":

@@ -292,3 +292,54 @@ def test_restart_bridge_resolves_lost_daemon_response_without_post(service):
     assert bridge.resolve(intent["run_key"]).session_id == "remote-session"
     assert bridge.resolve(intent["run_key"]).session_id == "remote-session"
     assert calls == [("GET", "/sessions?client_session_id=" + intent["run_key"])]
+
+
+def test_bridge_refreshes_known_running_session_from_live_terminal_daemon():
+    """A stale hub projection must not suppress a terminal relaunch."""
+    from drover.server.work_queue.runtime import HarnessBridge
+
+    key = "known-running-key"
+    sessions = {
+        key: SimpleNamespace(
+            session_id="hub-session",
+            client_session_id=key,
+            status="running",
+            host_id="host",
+        )
+    }
+    remote = {
+        "session_id": "hub-session",
+        "client_session_id": key,
+        "harness": "codex",
+        "status": "terminated",
+    }
+    calls = []
+    registry = SimpleNamespace(
+        session_by_client_id=lambda value: sessions.get(value),
+        list_hosts=lambda: [
+            SimpleNamespace(
+                host_id="host", liveness=lambda: SimpleNamespace(usable=True)
+            )
+        ],
+    )
+
+    def request(host, path, *, method, timeout_s):
+        calls.append((host.host_id, method, path))
+        return 200, json.dumps({"sessions": [remote]})
+
+    def sync(host_id, payload, body):
+        assert host_id == "host"
+        row = json.loads(body)
+        sessions[payload["client_session_id"]] = SimpleNamespace(**row)
+
+    bridge = object.__new__(HarnessBridge)
+    bridge.registry = registry
+    bridge.collector = SimpleNamespace(
+        _harness_request=request, _sync_created_harness_session=sync
+    )
+    bridge._recovery_payload = lambda _key, _row: {"client_session_id": _key}
+
+    session = bridge.resolve(key)
+
+    assert session.status == "terminated"
+    assert calls == [("host", "GET", "/sessions?client_session_id=" + key)]
