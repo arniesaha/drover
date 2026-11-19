@@ -72,7 +72,11 @@ from drover.server.harness.model_catalog import (
 )
 from drover.server.harness.models import HarnessEvent
 from drover.server.harness.pty import PtySessionManager
-from drover.server.harness.registry import ARCHIVED_SESSION_STATUSES, HarnessRegistry
+from drover.server.harness.registry import (
+    ARCHIVED_SESSION_STATUSES,
+    HarnessRegistry,
+    _db_timestamp_to_utc,
+)
 from drover.server.harness.relay_client import RelayClient
 from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 from drover.server.harness.structured.manager import StructuredSessionManager
@@ -4129,6 +4133,25 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 content_preview=content_preview,
                 seq=seq,
             )
+            # Lifecycle records produced by daemon request handlers do not
+            # pass through StructuredSessionManager.emit().  Offer the exact
+            # durable record to the same pusher path so a split hub ingests
+            # terminal facts and can wake its fenced recovery owner.  Keep
+            # the local ledger as the source of truth: reconciliation safely
+            # re-offers this event if the immediate delivery is interrupted.
+            try:
+                event_payload = event.wire_payload()
+            except ValueError:
+                event_payload = {
+                    "event_id": event.event_id,
+                    "session_id": event.session_id,
+                }
+            event_payload.setdefault("type", event.event_type)
+            if "ts" not in event_payload and event.created_at is not None:
+                event_timestamp = _db_timestamp_to_utc(event.created_at)
+                if event_timestamp is not None:
+                    event_payload["ts"] = event_timestamp.isoformat()
+            self.server.state.push_event(session_id, event_payload)
             return event
         except Exception:
             return None

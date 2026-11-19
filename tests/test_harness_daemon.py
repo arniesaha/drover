@@ -4805,6 +4805,11 @@ def test_structured_terminate_closes_driver_and_marks_terminated(tmp_path):
             event.get("payload", {}).get("session_status") == "terminated"
             for event in pushed
         )
+        # /terminate writes its own durable lifecycle record after closing the
+        # driver. That record must take the same pusher path as driver events;
+        # otherwise a split hub never ingests the terminal fact to wake the
+        # fenced owner/recovery path.
+        assert any(event.get("type") == "session.terminated" for event in pushed)
         assert not state.structured.has(sid)
 
         session = state.registry.get_session(sid)
