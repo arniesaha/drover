@@ -79,6 +79,13 @@ acknowledgement. `cancelled` and `adapter_failure` require the fenced native
 owner recovery path; `completed` still requires the durable turn and receipt
 checks above.
 
+Daemon lifecycle records such as `session.terminated` use the same durable
+event-pusher path as structured driver messages. The hub projects that
+immutable terminal record before accepting any delayed create response; a
+later `running` response cannot reopen capacity. Seeing the terminal event in
+`/harness/sessions/<id>` proves only source-to-hub delivery. It is not an
+owner wake, claim, receipt, acknowledgement, or effect.
+
 Join inbox `event_id` with claim and action-intent `wake_id`. The completed
 receipt key is `(wake_id, action_fingerprint)`. Join completion projections by
 their continuity event ID. The `_receipts` query in the fixture test is the
