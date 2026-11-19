@@ -70,6 +70,15 @@ Interpret a local receipt through these sources:
    [runtime.py](../../src/drover/server/work_queue/runtime.py): existing worker
    admission and active-slot calculation.
 
+For a structured source session located by its durable client/run key, use the
+authenticated daemon's `/sessions?client_session_id=...` readback. Its
+`terminal_result` is deliberately limited to `category`, event and turn
+identifiers, return code, and timestamp; it contains no transcript, command,
+or tool output. A missing result is not success and must not trigger an owner
+acknowledgement. `cancelled` and `adapter_failure` require the fenced native
+owner recovery path; `completed` still requires the durable turn and receipt
+checks above.
+
 Join inbox `event_id` with claim and action-intent `wake_id`. The completed
 receipt key is `(wake_id, action_fingerprint)`. Join completion projections by
 their continuity event ID. The `_receipts` query in the fixture test is the
