@@ -376,7 +376,82 @@ def test_failed_owner_launches_exhaust_wake_once(tmp_path):
     assert store.owner_runs("drover:owner/goal-native") == []
 
 
-def test_terminal_failed_owner_turn_rearms_one_completed_worker_wake_once(tmp_path):
+def _mark_owner_auth_failure(runner, collector):
+    owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+    assert owner_session is not None
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="tool_result",
+        content_preview='{"error":"authentication required"}',
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        payload={"payload": {"exited": 0, "awaiting": "input"}},
+    )
+    return owner_session.session_id
+
+
+def test_structured_auth_failure_rearms_only_completed_worker_wake_once(tmp_path):
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+    clock.advance(1)
+    done_wake = store.report(
+        run_id,
+        source="hub",
+        source_event_id="done-1",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="done",
+    )
+
+    # Exhaust the earlier worker_started event. It must not shadow the later
+    # worker_done wake that is eligible for the structured auth recovery.
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        _mark_owner_auth_failure(runner, collector)
+        clock.advance(delay)
+    assert runner.process_once() == 0
+
+    # The normal queue advances to worker_done without manually selecting it.
+    assert runner.process_once() == 1
+    for delay in (5, 10, 20):
+        owner_session_id = _mark_owner_auth_failure(runner, collector)
+        assert runner.registry.completed_turn_kinds([owner_session_id]) == {
+            owner_session_id: "finished"
+        }
+        assert (
+            runner.registry.owner_turn_failure_category(
+                owner_session_id, collector.turn_attempts[-1][1]["client_turn_id"]
+            )
+            == "authentication_required"
+        )
+        clock.advance(delay)
+        assert runner.process_once() == (1 if delay != 20 else 0)
+
+    # The post-exhaustion pass reserves and fences the eligible done wake,
+    # restoring it to pending; the next normal runner pass creates its fresh
+    # owner turn. The earlier started wake remains exhausted.
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"exhausted": 2}
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"exhausted": 1, "delivered": 1}
+    done_event = next(
+        event for event in status["events"] if event["event_id"] == done_wake
+    )
+    with control_plane_connection(runner.path) as con:
+        recovery = con.execute(
+            "SELECT wake_id, state FROM continuity_owner_recoveries"
+        ).fetchone()
+    assert recovery == (done_wake, "recovered")
+    assert done_event["attempts"] == 1
+
+
+def test_finished_owner_turn_without_structured_auth_stays_exhausted(tmp_path):
     runner, collector, store, run_id, clock = _runner(
         tmp_path, event_kind="worker_done"
     )
@@ -391,30 +466,14 @@ def test_terminal_failed_owner_turn_rearms_one_completed_worker_wake_once(tmp_pa
         runner.registry.append_event(
             session_id=owner_session.session_id,
             event_type="status",
-            payload={"payload": {"exited": 1, "awaiting": "input"}},
+            payload={"payload": {"exited": 0, "awaiting": "input"}},
         )
         clock.advance(delay)
 
-    # The ordinary bounded deliveries exhaust first.  A later runner pass sees
-    # the durable submitted failed turn and fences it before one rearm.
+    assert runner.process_once() == 0
     assert runner.process_once() == 0
     assert store.status(run_id)["inbox_counts"] == {"exhausted": 1}
-    assert runner.process_once() == 1
-    status = store.status(run_id)
-    assert status["inbox_counts"] == {"delivered": 1}
-    assert status["events"][0]["attempts"] == 1
-    assert status["events"][0]["report"]["kind"] == "worker_done"
-    assert status["owner"]["epoch"] > 0
-    with control_plane_connection(runner.path) as con:
-        assert con.execute(
-            "SELECT state FROM continuity_owner_recoveries"
-        ).fetchone() == ("recovered",)
-    # The durable recovery journal is the one-time gate; an already
-    # recovered wake is never eligible for another infrastructure rearm.
-    assert (
-        runner._rearm_exhausted_terminal_delivery(runner.config.goals[0], run_id)
-        is False
-    )
+    assert len(collector.turn_attempts) == 3
 
 
 def test_terminal_failed_owner_turn_never_rearms_worker_human_block(tmp_path):

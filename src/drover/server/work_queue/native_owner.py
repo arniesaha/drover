@@ -525,9 +525,10 @@ class NativeOwnerRunner:
         """Rearm one exhausted wake after a fenced native-owner infrastructure failure.
 
         This is deliberately narrower than a delivery retry: the durable claim
-        must name a submitted owner turn whose registry terminal kind is
-        ``failed``; the source event must be a completed worker result; and no
-        action-intent or acknowledgement may exist.  The existing recovery
+        must name a submitted owner turn with a failed terminal result, or the
+        exact persisted structured authentication category; the source event
+        must be a completed worker result; and no action-intent or
+        acknowledgement may exist.  The existing recovery
         journal admits exactly one such rearm for a wake.  Human gates, launch
         failures, completed effects, and ordinary exhausted deliveries remain
         fail-closed.
@@ -539,8 +540,8 @@ class NativeOwnerRunner:
             result = con.execute(
                 """SELECT i.event_id, i.attempts, i.action_json, i.payload_json,
                           c.session_id, c.client_turn_id, c.claim_until,
-                          c.state, r.owner_epoch, r.owner_id,
-                          x.state, x.old_session_id, x.old_client_turn_id,
+                          c.state AS claim_state, r.owner_epoch, r.owner_id,
+                          x.state AS recovery_state, x.old_session_id, x.old_client_turn_id,
                           x.old_claim_until, x.old_generation,
                           x.old_client_session_id, x.old_credential_id,
                           x.old_owner_epoch
@@ -556,42 +557,54 @@ class NativeOwnerRunner:
                         SELECT 1 FROM continuity_owner_action_intents q
                          WHERE q.wake_id = i.event_id AND q.run_id = i.run_id
                     )
-                  LIMIT 1""",
+                  ORDER BY i.received_at, i.event_id""",
                 [run_id, MAX_DELIVERIES, owner_id, scope.goal_id, owner_id],
             )
             columns = [column[0] for column in result.description]
-            row = result.fetchone()
-        if row is None:
+            rows = result.fetchall()
+        row = None
+        action = None
+        for candidate in rows:
+            candidate = dict(zip(columns, candidate))
+            try:
+                candidate_action = json.loads(candidate["action_json"] or "null")
+                report = json.loads(candidate["payload_json"] or "null")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            # A worker-declared human block must never be reclassified as a
+            # native infrastructure failure.  Keep scanning so an earlier
+            # worker_started wake cannot starve the completed worker result.
+            if (
+                not isinstance(candidate_action, dict)
+                or candidate_action.get("type") != "review_worker_result"
+                or not isinstance(report, dict)
+                or report.get("kind") not in {"worker_done", "worker_brief_completed"}
+            ):
+                continue
+            row = candidate
+            action = candidate_action
+            break
+        if row is None or action is None:
             return False
-        row = dict(zip(columns, row))
-        try:
-            action = json.loads(row["action_json"] or "null")
-            report = json.loads(row["payload_json"] or "null")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return False
-        # A worker-declared human block must never be reclassified as a native
-        # infrastructure failure.  Only a completed source worker result has
-        # this bounded recovery path.
-        if (
-            not isinstance(action, dict)
-            or action.get("type") != "review_worker_result"
-            or not isinstance(report, dict)
-            or report.get("kind") not in {"worker_done", "worker_brief_completed"}
-        ):
-            return False
-        recovery_state = row["state"]
+        recovery_state = row["recovery_state"]
+        failure_category = None
         if recovery_state == "recovered":
             return False
         if recovery_state is None:
             # The completed claim is durable evidence that this exact owner
-            # turn was submitted.  The registry's normalized terminal kind is
-            # the only accepted infrastructure classification; model text is
-            # neither retained nor interpreted here.
+            # turn was submitted.  A nonzero terminal result is already a
+            # normalized infrastructure failure.  A clean process exit may
+            # also carry the exact structured daemon auth response; that
+            # category is persisted without retaining or interpreting prose.
+            terminal_kind = self.registry.completed_turn_kinds([row["session_id"]]).get(
+                row["session_id"]
+            )
+            failure_category = self.registry.owner_turn_failure_category(
+                row["session_id"], row["client_turn_id"]
+            )
             if (
-                self.registry.completed_turn_kinds([row["session_id"]]).get(
-                    row["session_id"]
-                )
-                != "failed"
+                terminal_kind != "failed"
+                and failure_category != "authentication_required"
             ):
                 return False
             # A prior terminal settlement may already have rotated the link
@@ -678,7 +691,11 @@ class NativeOwnerRunner:
             return False
         action.pop("escalation", None)
         action["recovery"] = {
-            "kind": "terminal_native_owner_failure",
+            "kind": (
+                "native_owner_authentication_failure"
+                if failure_category == "authentication_required"
+                else "terminal_native_owner_failure"
+            ),
             "prior_attempts": row["attempts"],
             "fenced_owner_epoch": old_epoch,
         }

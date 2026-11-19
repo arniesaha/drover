@@ -503,6 +503,24 @@ class CodexDriver:
             ]
         return []  # e.g. agent_message item.started, if it ever occurs
 
+    @staticmethod
+    def _tool_result_failure_category(output: object) -> str | None:
+        """Classify only a structured daemon authentication response.
+
+        Tool output stays in the transcript.  This metadata is deliberately
+        narrower than text matching: it accepts exactly the daemon's JSON
+        authorization response and nothing an assistant merely says.
+        """
+        if not isinstance(output, str):
+            return None
+        try:
+            payload = json.loads(output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if payload == {"error": "authentication required"}:
+            return "authentication_required"
+        return None
+
     def _on_item_completed(self, obj: dict[str, Any]) -> list[StructuredMessage]:
         item = obj.get("item") or {}
         item_type = item.get("type")
@@ -538,6 +556,12 @@ class CodexDriver:
                         "tool_use_id": item.get("id"),
                         "exit_code": item.get("exit_code"),
                         "status": item.get("status"),
+                        **(
+                            {"failure_category": category}
+                            if (category := self._tool_result_failure_category(output))
+                            is not None
+                            else {}
+                        ),
                         # Everything else codex reported, minus the output
                         # itself: `text` above already carries it, and shell
                         # output is the largest thing a session produces. Sent

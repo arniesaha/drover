@@ -2674,6 +2674,52 @@ class HarnessRegistry:
                     return True
         return False
 
+    def owner_turn_failure_category(self, session_id: str, turn_id: str) -> str | None:
+        """Return a bounded structured infrastructure category for one turn.
+
+        Only a persisted tool-result category qualifies.  Legacy events may
+        use the exact daemon JSON response as a compatibility shape; prose,
+        assistant output, and arbitrary tool output are never interpreted.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT event_id, event_type, content_preview
+                     FROM harness_events
+                    WHERE session_id = ?
+                      AND event_type IN ('user_input', 'tool_result')
+                 ORDER BY created_at, COALESCE(seq, 0), event_id""",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        submitted = False
+        for event_id, event_type, preview in rows:
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if event_type == "user_input":
+                if submitted and (
+                    not isinstance(payload, dict) or payload.get("turn_id") != turn_id
+                ):
+                    return None
+                submitted = (
+                    isinstance(payload, dict) and payload.get("turn_id") == turn_id
+                )
+                continue
+            if not submitted or not isinstance(payload, dict):
+                continue
+            if payload.get("failure_category") == "authentication_required":
+                return "authentication_required"
+            # Compatibility for already-persisted structured Codex events:
+            # parse only the exact JSON daemon response, never free text.
+            try:
+                legacy = json.loads(str(preview or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if legacy == {"error": "authentication required"}:
+                return "authentication_required"
+        return None
+
     def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
         """Classify idle turns without changing the session's resumable state.
 
