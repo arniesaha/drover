@@ -40,6 +40,7 @@ from drover.server.harness.daemon import (
     HarnessDaemonState,
     HarnessPreset,
     ProviderUsageRefreshCache,
+    _materialized_expected_effect,
     create_harness_server,
     discover_native_history_metadata,
     discover_native_resume_sessions,
@@ -73,6 +74,55 @@ class _FailingRegistry:
 
     def append_event(self, **kwargs):
         raise RuntimeError("locked")
+
+
+def test_expected_effect_attestation_is_confined_to_the_structured_worktree(tmp_path):
+    worktree = tmp_path / "worktrees" / "work-a"
+    effect = worktree / ".drover-native-canary" / "source-task-13.json"
+    effect.parent.mkdir(parents=True)
+    effect.write_text("{}", encoding="utf-8")
+    artifact = "local-file:.drover-native-canary/source-task-13.json"
+
+    assert _materialized_expected_effect(str(worktree), artifact)
+    assert not _materialized_expected_effect(
+        str(worktree), "local-file:.drover-native-canary/../../outside.json"
+    )
+    assert not _materialized_expected_effect(
+        str(worktree),
+        "local-file:worktrees/work-b/.drover-native-canary/source-task-13.json",
+    )
+
+
+def test_harnessd_attests_only_a_work_coordinator_session_effect(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    worktree = tmp_path / "worktrees" / "work-a"
+    effect = worktree / ".drover-native-canary" / "source-task-13.json"
+    effect.parent.mkdir(parents=True)
+    effect.write_text("{}", encoding="utf-8")
+    artifact = "local-file:.drover-native-canary/source-task-13.json"
+    session = state.registry.create_session(
+        host_id="test-host",
+        harness="codex",
+        command="codex",
+        cwd=str(worktree),
+        mode="structured",
+        handoff_mode="work_coordinator",
+    )
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session.session_id}/expected-effect",
+            payload={"artifact": artifact},
+        )
+        assert status == 200 and payload == {"materialized": True}
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session.session_id}/expected-effect",
+            payload={"artifact": "local-file:.drover-native-canary/../../outside.json"},
+        )
+        assert status == 200 and payload == {"materialized": False}
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
 
 
 def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):

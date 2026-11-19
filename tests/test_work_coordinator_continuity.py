@@ -6,6 +6,7 @@ import pytest
 
 from drover.schema import bootstrap_control_plane_store
 from drover.server.harness.continuity import (
+    ContinuityConflict,
     FactoryObserverContinuity,
     record_work_coordinator_state,
 )
@@ -157,6 +158,64 @@ def test_work_coordinator_binding_is_exact_and_projects_start_done_blocked_and_a
         "worker_done",
     ]
     assert store.status(run)["owner_handoff"]["authorized_owner_id"] == binding.owner_id
+
+
+def test_signed_candidate_effect_binding_is_persisted_and_rejects_generic_receipts(
+    tmp_path,
+):
+    """The hub persists the signed local effect before any owner delivery."""
+    from drover.server.metrics import MetricsCollector
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    expected = "local-file:.drover-native-canary/source-task-9.json"
+    unsigned = {
+        "run_id": "work-expected-effect",
+        "owner_id": "drover:owner/native-canary",
+        "authority_scope": "implementation",
+        "objective": "Bounded candidate effect",
+        "expected_effect_artifact": expected,
+    }
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        api_token="hub-secret",
+        work_coordinator_continuity_secret="hub-continuity-secret",
+    )
+    MetricsCollector._sync_created_harness_session(
+        collector,
+        "studio",
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": {
+                **unsigned,
+                "binding_signature": sign_work_coordinator_continuity(
+                    unsigned, "hub-continuity-secret"
+                ),
+            },
+        },
+        json.dumps({"session_id": "harness-expected-effect", "status": "running"}),
+    )
+    store = FactoryObserverContinuity(path)
+    status = store.status("work-expected-effect")
+    assert status["expected_effect_artifact"] == expected
+    lease = store.lease("work-expected-effect", owner_id=unsigned["owner_id"])
+    action = store.consume(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+    )
+    assert action["expected_effect_artifact"] == expected
+    with pytest.raises(ContinuityConflict, match="expected effect"):
+        store.action_intent(
+            "work-expected-effect",
+            owner_id=unsigned["owner_id"],
+            owner_epoch=lease["owner_epoch"],
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact="local-file:.drover-native-canary/actions/generic-wake.json",
+        )
 
 
 def test_work_coordinator_binding_rejects_noncanonical_owner():

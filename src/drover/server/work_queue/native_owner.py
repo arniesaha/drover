@@ -300,6 +300,29 @@ class NativeOwnerRunner:
                 [self.clock(), row[0], row[1]],
             )
 
+    def _expected_effect_materialized(self, status: dict) -> bool:
+        """Verify a candidate effect through its paired source daemon.
+
+        Non-candidate actions have no expected artifact and retain generic
+        settlement. Candidate actions fail closed before owner dispatch.
+        """
+        artifact = status.get("expected_effect_artifact")
+        if artifact is None:
+            return True
+        session_id = status.get("session_id")
+        if not isinstance(artifact, str) or not isinstance(session_id, str):
+            return False
+        response, body = self.collector.proxy_harness_session_action(
+            session_id, "expected-effect", {"artifact": artifact}
+        )
+        if not 200 <= response < 300:
+            return False
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return payload.get("materialized") is True
+
     def _complete_finished_claims(self, scope) -> None:
         """Settle terminal owner turns even when their run has no next action.
 
@@ -702,6 +725,8 @@ class NativeOwnerRunner:
         if self._has_active_claim(scope):
             return False
         status = self.continuity.status(run_id)
+        if not self._expected_effect_materialized(status):
+            return False
         owner = status["owner"]
         prior_epoch = owner["epoch"] if owner["id"] == owner_id else None
         epoch = prior_epoch if owner["live"] else None
