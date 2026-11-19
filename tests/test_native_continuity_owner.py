@@ -229,6 +229,22 @@ def test_owner_observability_names_unavailable_owner_session(tmp_path):
     ]
 
 
+def test_owner_observability_names_unavailable_recovery(tmp_path, monkeypatch):
+    runner, _, _, run_id, _ = _runner(tmp_path)
+    monkeypatch.setattr(runner, "_recovery_needed", lambda *_args: True)
+    monkeypatch.setattr(runner, "_recover_session", lambda *_args: False)
+
+    assert runner.process_once() == 0
+    assert runner.observability()["runs"] == [
+        {
+            "goal_id": "goal-native",
+            "run_id": run_id,
+            "state": "not_dispatched",
+            "reason": "owner_recovery_unavailable",
+        }
+    ]
+
+
 def test_daemon_terminal_owner_session_replaces_stale_hub_projection(tmp_path):
     runner, collector, _, _, _ = _runner(tmp_path)
     scope = runner.config.goals[0]

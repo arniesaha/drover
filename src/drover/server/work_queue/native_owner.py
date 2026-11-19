@@ -794,6 +794,7 @@ class NativeOwnerRunner:
         self._settle_expired_claims(scope)
         if self._recovery_needed(scope, run_id, session_id):
             if not self._recover_session(scope, run_id):
+                self._last_not_dispatched_reason = "owner_recovery_unavailable"
                 return False
             session_id = None
         if self._has_active_claim(scope):
