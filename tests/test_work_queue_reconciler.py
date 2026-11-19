@@ -19,6 +19,7 @@ from drover.server.work_queue.reconciler import (
     ShadowReconciler,
     start_shadow_reconciler,
 )
+from drover.server.work_queue.service import WorkDenied
 
 
 def issue(number=7, *labels, state="open", body="public acceptance"):
@@ -178,6 +179,37 @@ def test_bad_launch_candidate_is_logged_and_does_not_stop_other_candidates(caplo
     worker.process_once()
     assert launched == [("goal-1", 2)]
     assert "work queue launch candidate failed" in caplog.text
+
+
+def test_execution_report_projects_sanitized_contained_launch_denial():
+    """A contained automatic denial remains observable without raw exception text."""
+    worker = QueueExecutionWorker(SimpleNamespace(config=WorkQueueConfig()))
+    worker.reconciler = SimpleNamespace(
+        poll=lambda: {
+            "actions": [{"kind": "launch_candidate", "goal_id": "goal-1", "number": 14}]
+        },
+        report=lambda: {"actions": []},
+    )
+    worker.coordinator = SimpleNamespace(
+        health={},
+        launch_candidate=lambda _goal_id, _number: (_ for _ in ()).throw(
+            WorkDenied("quota or capability unavailable")
+        ),
+    )
+    worker.service = SimpleNamespace(
+        store=SimpleNamespace(links=lambda: []),
+        harness=SimpleNamespace(active=lambda links: links),
+    )
+
+    worker.process_once()
+
+    assert worker.report()["execution"]["recent_launch_failures"] == [
+        {
+            "goal_id": "goal-1",
+            "item_number": 14,
+            "category": "quota_or_capability_unavailable",
+        }
+    ]
 
 
 @pytest.mark.parametrize(

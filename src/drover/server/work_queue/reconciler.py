@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from .config import WorkQueueConfig, load_policy
 from .github import ProviderUnavailable
 from .providers import provider_for_scope
-from .service import WorkActor, identity
+from .service import WorkActor, WorkDenied, identity
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +119,20 @@ class QueueExecutionWorker:
         )
         self._stop = threading.Event()
         self._thread = None
+        # Automatic launch failures are deliberately contained so one bad
+        # candidate cannot stop the queue.  Retain only a bounded, sanitized
+        # per-candidate category for the device-authenticated status report.
+        self._last_launch_failures = {}
+
+    @staticmethod
+    def _failure_category(exc):
+        if isinstance(exc, WorkDenied):
+            if str(exc) == "quota or capability unavailable":
+                return "quota_or_capability_unavailable"
+            if str(exc) == "launch intent uncertain; inspection required":
+                return "launch_intent_uncertain"
+            return "work_denied"
+        return "launch_error"
 
     def report(self):
         report = self.reconciler.report()
@@ -132,6 +146,16 @@ class QueueExecutionWorker:
             )
         except Exception:  # unknown is unsafe for a rollout, not zero
             execution["active"] = None
+        execution["recent_launch_failures"] = [
+            dict(failure)
+            for failure in sorted(
+                self._last_launch_failures.values(),
+                key=lambda failure: (
+                    str(failure["goal_id"] or ""),
+                    failure["item_number"] or -1,
+                ),
+            )
+        ]
         report["execution"] = execution
         return report
 
@@ -143,8 +167,14 @@ class QueueExecutionWorker:
                     self.coordinator.launch_candidate(
                         candidate["goal_id"], candidate["number"]
                     )
-                except Exception:
+                except Exception as exc:
                     # A malformed candidate or failed launch must not stop the daemon.
+                    key = (candidate.get("goal_id"), candidate.get("number"))
+                    self._last_launch_failures[key] = {
+                        "goal_id": candidate.get("goal_id"),
+                        "item_number": candidate.get("number"),
+                        "category": self._failure_category(exc),
+                    }
                     log.exception("work queue launch candidate failed")
 
     def start(self, shutdown_event=None):
