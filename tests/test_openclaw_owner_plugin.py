@@ -161,6 +161,28 @@ def test_generated_plugin_schema_matches_existing_strict_python_contract():
         )
 
 
+def test_owner_reply_accepts_optional_expected_effect_attestation(canary):
+    store, _, _ = canary
+    projection = {
+        **store.status(RUN),
+        "expected_effect_artifact": "local-file:.drover-native-canary/result.json",
+    }
+
+    reply = OwnerToolReply.model_validate({"version": 1, "continuity": projection})
+
+    assert (
+        reply.continuity.expected_effect_artifact
+        == "local-file:.drover-native-canary/result.json"
+    )
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        OwnerToolReply.model_validate(
+            {
+                "version": 1,
+                "continuity": {**projection, "unrelated_extra": "rejected"},
+            }
+        )
+
+
 def test_canary_parent_owner_poll_receipts_do_not_consume_or_ack(node, canary):
     store, event_id, config = canary
     before = store.status(RUN)

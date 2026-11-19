@@ -158,6 +158,21 @@
           "title": "Events",
           "type": "array"
         },
+        "expected_effect_artifact": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Effect Artifact"
+        },
         "expected_revision": {
           "minimum": 0,
           "title": "Expected Revision",
