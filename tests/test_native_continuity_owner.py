@@ -199,6 +199,42 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     assert len(collector.turn_attempts) == 1
 
 
+def test_failed_fenced_run_does_not_starve_later_ready_run(tmp_path, monkeypatch):
+    runner, _, _, run_id, _ = _runner(tmp_path)
+    monkeypatch.setattr(
+        runner.continuity,
+        "owner_runs",
+        lambda _owner_id: ["fenced-run", run_id],
+    )
+
+    def process(_scope, candidate_run_id):
+        if candidate_run_id == "fenced-run":
+            raise ContinuityConflict("stale epoch")
+        return True
+
+    monkeypatch.setattr(runner, "_process_run", process)
+
+    assert runner.process_once() == 1
+    assert runner.observability() == {
+        "state": "partial_failure",
+        "at": "2026-10-09T00:00:00+00:00",
+        "dispatched": 1,
+        "runs": [
+            {
+                "goal_id": "goal-native",
+                "run_id": "fenced-run",
+                "state": "failed",
+                "error_type": "ContinuityConflict",
+            },
+            {
+                "goal_id": "goal-native",
+                "run_id": run_id,
+                "state": "dispatched",
+            },
+        ],
+    }
+
+
 def test_native_ack_requires_completed_intent_across_redelivery(tmp_path):
     runner, _, store, run_id, clock = _runner(tmp_path)
 
@@ -932,6 +968,18 @@ def test_expired_sent_claim_missing_session_recovers_same_wake_once(tmp_path):
         )
 
 
+def _assert_public_run_failure(runner, run_id, error_type):
+    """The runner contains per-run failures but preserves their safe outcome."""
+    report = runner.observability()
+    assert report["state"] == "partial_failure"
+    assert report["dispatched"] == 0
+    assert {
+        "run_id": run_id,
+        "state": "failed",
+        "error_type": error_type,
+    }.items() <= report["runs"][0].items()
+
+
 def test_abandoned_claim_fence_failure_leaves_blocking_claim(tmp_path, monkeypatch):
     runner, collector, _, _, clock = _runner(tmp_path)
     assert runner.process_once() == 1
@@ -946,8 +994,12 @@ def test_abandoned_claim_fence_failure_leaves_blocking_claim(tmp_path, monkeypat
         lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")),
     )
 
-    with pytest.raises(ContinuityConflict, match="fence failed"):
-        runner.process_once()
+    assert runner.process_once() == 0
+    _assert_public_run_failure(
+        runner,
+        runner.continuity.owner_runs(runner.config.goals[0].continuity_owner_id)[0],
+        "ContinuityConflict",
+    )
     with control_plane_connection(runner.path) as con:
         assert (
             con.execute("SELECT state FROM continuity_owner_turn_claims").fetchone()[0]
@@ -974,8 +1026,8 @@ def test_fence_failure_journal_retries_without_second_epoch_fence(
         raise ContinuityConflict("fence failed")
 
     monkeypatch.setattr(runner.continuity, "fence_owner", fail_once)
-    with pytest.raises(ContinuityConflict, match="fence failed"):
-        runner.process_once()
+    assert runner.process_once() == 0
+    _assert_public_run_failure(runner, run_id, "ContinuityConflict")
     monkeypatch.setattr(runner.continuity, "fence_owner", original)
 
     assert runner.process_once() == 1
@@ -1020,8 +1072,12 @@ def test_terminal_session_cannot_bypass_fencing_journal(tmp_path, monkeypatch):
         "fence_owner",
         lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")),
     )
-    with pytest.raises(ContinuityConflict):
-        runner.process_once()
+    assert runner.process_once() == 0
+    _assert_public_run_failure(
+        runner,
+        runner.continuity.owner_runs(runner.config.goals[0].continuity_owner_id)[0],
+        "ContinuityConflict",
+    )
     link = runner._link(runner.config.goals[0])
     assert runner._session(runner.config.goals[0], launch=False) is None
     assert runner._link(runner.config.goals[0])["generation"] == link["generation"]
@@ -1161,8 +1217,12 @@ def test_crashed_post_fence_executor_reclaims_one_same_wake(tmp_path, monkeypatc
         raise RuntimeError("simulated executor crash after fence")
 
     monkeypatch.setattr(runner_a.continuity, "fence_owner", fence_then_crash)
-    with pytest.raises(RuntimeError, match="simulated executor crash"):
-        runner_a.process_once()
+    assert runner_a.process_once() == 0
+    _assert_public_run_failure(
+        runner_a,
+        runner_a.continuity.owner_runs(runner_a.config.goals[0].continuity_owner_id)[0],
+        "RuntimeError",
+    )
     with control_plane_connection(runner_a.path) as con:
         assert con.execute(
             "SELECT state, fenced_at IS NOT NULL FROM continuity_owner_recoveries"
@@ -1246,8 +1306,12 @@ def test_populated_v0656_native_owner_upgrade_rehearsal_is_additive(
         "fence_owner",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ContinuityConflict("hold")),
     )
-    with pytest.raises(ContinuityConflict, match="hold"):
-        upgraded.process_once()
+    assert upgraded.process_once() == 0
+    _assert_public_run_failure(
+        upgraded,
+        upgraded.continuity.owner_runs(upgraded.config.goals[0].continuity_owner_id)[0],
+        "ContinuityConflict",
+    )
 
     with control_plane_connection(runner.path) as con:
         # A v0.6.56 binary never reads the additive journal. Its old claim
