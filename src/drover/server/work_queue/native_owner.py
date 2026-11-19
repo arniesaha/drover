@@ -48,6 +48,7 @@ class NativeOwnerRunner:
         # an operator which eligible run the runner last considered and whether
         # an exception prevented it from reaching later runs.
         self._last_process: dict = {"state": "not_run", "runs": []}
+        self._last_not_dispatched_reason: str | None = None
         self._ensure_schema()
 
     def observability(self) -> dict:
@@ -782,6 +783,7 @@ class NativeOwnerRunner:
         if session_id is None:
             session_id = self._session(scope)
             if session_id is None:
+                self._last_not_dispatched_reason = "owner_session_unavailable"
                 return False
         turn_id = self._claim(scope, run_id, session_id, action["event_id"])
         if turn_id is None:
@@ -823,6 +825,7 @@ class NativeOwnerRunner:
             for run_id in self.continuity.owner_runs(owner_id):
                 run = {"goal_id": scope.goal_id, "run_id": run_id}
                 report["runs"].append(run)
+                self._last_not_dispatched_reason = None
                 try:
                     delivered = self._process_run(scope, run_id)
                 except Exception as exc:
@@ -834,6 +837,8 @@ class NativeOwnerRunner:
                     report["state"] = "partial_failure"
                     continue
                 run["state"] = "dispatched" if delivered else "not_dispatched"
+                if not delivered and self._last_not_dispatched_reason is not None:
+                    run["reason"] = self._last_not_dispatched_reason
                 dispatched += int(delivered)
         if report["state"] == "running":
             report["state"] = "complete"

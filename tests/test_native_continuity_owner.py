@@ -191,6 +191,21 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     assert store.status(run_id)["owner"]["live"]
 
 
+def test_owner_observability_names_unavailable_owner_session(tmp_path):
+    runner, collector, _, run_id, _ = _runner(tmp_path)
+    collector.failed_launches = 1
+
+    assert runner.process_once() == 0
+    assert runner.observability()["runs"] == [
+        {
+            "goal_id": "goal-native",
+            "run_id": run_id,
+            "state": "not_dispatched",
+            "reason": "owner_session_unavailable",
+        }
+    ]
+
+
 def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     runner, collector, _, _, _ = _runner(tmp_path)
 
