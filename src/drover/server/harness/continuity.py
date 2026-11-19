@@ -868,7 +868,9 @@ class FactoryObserverContinuity:
             )
 
     @staticmethod
-    def _reserve_integration(con, run: dict, now: datetime) -> None:
+    def _reserve_integration(
+        con, run: dict, now: datetime, *, allow_reacquire: bool = False
+    ) -> None:
         """Acquire one repository/key reservation or reject the live holder."""
         if run["delivery_role"] != "integration_serialized":
             return
@@ -915,13 +917,24 @@ class FactoryObserverContinuity:
         elif reservation["run_id"] != run["run_id"]:
             raise ContinuityConflict("integration reservation is unavailable")
         generation = reservation["generation"]
-        if run.get("serialization_generation") not in {None, generation}:
-            raise ContinuityConflict("integration reservation generation changed")
-        con.execute(
-            """UPDATE factory_observer_runs SET serialization_generation = ?
-            WHERE run_id = ? AND serialization_generation IS NULL""",
-            [generation, run["run_id"]],
-        )
+        prior_generation = run.get("serialization_generation")
+        if prior_generation not in {None, generation}:
+            if not allow_reacquire:
+                raise ContinuityConflict("integration reservation generation changed")
+            changed = con.execute(
+                """UPDATE factory_observer_runs SET serialization_generation = ?
+                WHERE run_id = ? AND serialization_generation = ?
+                RETURNING serialization_generation""",
+                [generation, run["run_id"], prior_generation],
+            ).fetchone()
+            if changed is None:
+                raise ContinuityConflict("integration reservation generation changed")
+        else:
+            con.execute(
+                """UPDATE factory_observer_runs SET serialization_generation = ?
+                WHERE run_id = ? AND serialization_generation IS NULL""",
+                [generation, run["run_id"]],
+            )
         run["serialization_generation"] = generation
 
     @staticmethod
@@ -970,6 +983,30 @@ class FactoryObserverContinuity:
         ).fetchone()
         if changed is None:
             raise ContinuityConflict("integration reservation fence changed")
+
+    @staticmethod
+    def _integration_release_ready(con, run: dict) -> bool:
+        """Release a serialized key only after its terminal worker result settles.
+
+        Work-coordinator sessions emit a durable ``worker_started`` report
+        before their terminal ``worker_done`` report.  Releasing the key when
+        the first observation is acknowledged lets another serialized run
+        advance the generation, then fences the original run's final result.
+        Keep the key through every non-terminal report; the final result may
+        release it only once no pending/delivered work remains for this run.
+        """
+        if run["delivery_role"] != "integration_serialized":
+            return False
+        if run["worker_state"] != "done":
+            return False
+        return (
+            con.execute(
+                """SELECT 1 FROM factory_observer_inbox
+                WHERE run_id = ? AND state IN ('pending', 'delivered') LIMIT 1""",
+                [run["run_id"]],
+            ).fetchone()
+            is None
+        )
 
     def initialize(
         self,
@@ -1206,6 +1243,12 @@ class FactoryObserverContinuity:
                 epoch = run["owner_epoch"]
             else:
                 epoch = run["owner_epoch"] + 1
+                # A previous, fully acknowledged delivery may have released
+                # this run's serialization key before a delayed durable
+                # source report arrives.  Only an expired owner may reclaim a
+                # *released* reservation; a live holder still fails closed in
+                # _reserve_integration.
+                self._reserve_integration(con, run, now, allow_reacquire=True)
             until = now + timedelta(seconds=lease_seconds)
             con.execute(
                 """UPDATE factory_observer_runs SET owner_id = ?,
@@ -1551,7 +1594,8 @@ class FactoryObserverContinuity:
                 next_action_json = NULL, updated_at = ? WHERE run_id = ?""",
                 [checkpoint, now, run_id],
             )
-            self._release_integration(con, run, owner_id, owner_epoch, now)
+            if self._integration_release_ready(con, run):
+                self._release_integration(con, run, owner_id, owner_epoch, now)
 
     def owner_runs(
         self,

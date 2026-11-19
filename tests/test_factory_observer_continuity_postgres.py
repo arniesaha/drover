@@ -452,7 +452,7 @@ def test_postgres_integration_reservation_fences_paused_stale_effect_and_redeliv
         source_event_id="serialized-complete-1",
         subject="pg-integration-first",
         sequence=1,
-        kind="worker_brief_completed",
+        kind="worker_done",
         summary="Implementation ready",
     )
     assert (
@@ -462,7 +462,7 @@ def test_postgres_integration_reservation_fences_paused_stale_effect_and_redeliv
             source_event_id="serialized-complete-1",
             subject="pg-integration-first",
             sequence=1,
-            kind="worker_brief_completed",
+            kind="worker_done",
             summary="Implementation ready",
         )
         == event_id

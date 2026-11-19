@@ -145,6 +145,119 @@ def test_duplicate_report_dedupe_and_divergent_identity_rejection(bridge):
     assert store.consume(RUN, **fence) is None
 
 
+def test_integration_reservation_stays_fenced_until_worker_done_is_acknowledged(
+    bridge,
+):
+    """A start observation must not release its run's serialized write key."""
+    store, clock, registry = bridge
+    run_id = "run_integration_lifecycle"
+    session_id = "observer-integration-lifecycle"
+    owner_id = "drover:owner/integration-lifecycle"
+    registry.create_session(
+        session_id=session_id,
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{run_id}@0",
+    )
+    assert (
+        store.initialize(
+            session_id=session_id,
+            objective="Serialized implementation",
+            checkpoint="Pending",
+            authorized_owner_id=owner_id,
+            delivery_role="integration_serialized",
+            repository="example/repository",
+            serialization_key="main-write",
+        )
+        == run_id
+    )
+    fence = store.lease(run_id, owner_id=owner_id)
+    owner = {"owner_id": owner_id, "owner_epoch": fence["owner_epoch"]}
+
+    started = store.report(
+        run_id,
+        source="coordinator",
+        source_event_id="integration-started",
+        subject=session_id,
+        sequence=1,
+        kind="worker_started",
+        summary="worker started",
+    )
+    started_action = store.consume(run_id, **owner)
+    store.action_intent(
+        run_id,
+        **owner,
+        wake_id=started,
+        action_fingerprint=started_action["action_id"],
+        artifact="local:started",
+    )
+    store.acknowledge(run_id, **owner, event_id=started, checkpoint="Observed start")
+    assert store.status(run_id)["integration_serialization"]["state"] == "reserved"
+    registry.create_session(
+        session_id="observer-competing-integration",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run_competing_integration@0",
+    )
+    with pytest.raises(ContinuityConflict, match="reservation"):
+        store.initialize(
+            session_id="observer-competing-integration",
+            objective="Competing serialized implementation",
+            checkpoint="Pending",
+            authorized_owner_id=owner_id,
+            delivery_role="integration_serialized",
+            repository="example/repository",
+            serialization_key="main-write",
+        )
+
+    done = store.report(
+        run_id,
+        source="coordinator",
+        source_event_id="integration-done",
+        subject=session_id,
+        sequence=2,
+        kind="worker_done",
+        summary="worker done",
+    )
+    done_action = store.consume(run_id, **owner)
+    store.action_intent(
+        run_id,
+        **owner,
+        wake_id=done,
+        action_fingerprint=done_action["action_id"],
+        artifact="local:done",
+    )
+    store.acknowledge(run_id, **owner, event_id=done, checkpoint="Reviewed done")
+    assert store.status(run_id)["integration_serialization"]["state"] == "released"
+
+    # A delayed terminal projection after an earlier acknowledgement must
+    # reclaim only a released key with a fresh generation.  It cannot fence a
+    # live conflicting integration run.
+    delayed = store.report(
+        run_id,
+        source="coordinator",
+        source_event_id="integration-delayed-terminal",
+        subject=session_id,
+        sequence=3,
+        kind="worker_done",
+        summary="delayed terminal projection",
+    )
+    clock.advance(61)
+    successor = store.lease(run_id, owner_id=owner_id)
+    successor_owner = {"owner_id": owner_id, "owner_epoch": successor["owner_epoch"]}
+    serialization = store.status(run_id)["integration_serialization"]
+    assert serialization["state"] == "reserved"
+    assert serialization["generation"] == 2
+    assert serialization["held_by_run"]
+    assert store.consume(run_id, **successor_owner)["event_id"] == delayed
+
+
 def test_competing_owner_claims_have_one_winner(bridge):
     store, _, _ = bridge
 
