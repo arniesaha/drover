@@ -827,12 +827,15 @@ class NativeOwnerRunner:
                     delivered = self._process_run(scope, run_id)
                 except Exception as exc:
                     # Do not retain exception text: it can include a remote
-                    # response. Re-raise so the existing retry/fencing path
-                    # keeps its behavior unchanged.
+                    # response. Leave this run's durable state untouched and
+                    # continue: an old fenced run must not starve independent
+                    # ready work owned by the same native owner.
                     run.update(state="failed", error_type=type(exc).__name__)
-                    report["state"] = "failed"
-                    raise
+                    report["state"] = "partial_failure"
+                    continue
                 run["state"] = "dispatched" if delivered else "not_dispatched"
                 dispatched += int(delivered)
-        report.update(state="complete", dispatched=dispatched)
+        if report["state"] == "running":
+            report["state"] = "complete"
+        report["dispatched"] = dispatched
         return dispatched

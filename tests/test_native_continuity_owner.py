@@ -218,30 +218,42 @@ def test_process_observability_reports_the_eligible_run_and_dispatch(tmp_path):
     }
 
 
-def test_process_observability_records_a_sanitized_per_run_failure(
+def test_process_observability_continues_after_a_sanitized_per_run_failure(
     tmp_path, monkeypatch
 ):
     runner, _, _, run_id, _ = _runner(tmp_path)
 
-    def fail(*_args):
-        raise RuntimeError("remote response must not be retained")
+    monkeypatch.setattr(
+        runner.continuity,
+        "owner_runs",
+        lambda _owner_id: ["failed-run", run_id],
+    )
 
-    monkeypatch.setattr(runner, "_process_run", fail)
+    def process(_scope, candidate_run_id):
+        if candidate_run_id == "failed-run":
+            raise RuntimeError("remote response must not be retained")
+        return True
 
-    with pytest.raises(RuntimeError, match="remote response"):
-        runner.process_once()
+    monkeypatch.setattr(runner, "_process_run", process)
+
+    assert runner.process_once() == 1
 
     assert runner.observability() == {
-        "state": "failed",
+        "state": "partial_failure",
         "at": "2026-10-09T00:00:00+00:00",
-        "dispatched": 0,
+        "dispatched": 1,
         "runs": [
             {
                 "goal_id": "goal-native",
-                "run_id": run_id,
+                "run_id": "failed-run",
                 "state": "failed",
                 "error_type": "RuntimeError",
-            }
+            },
+            {
+                "goal_id": "goal-native",
+                "run_id": run_id,
+                "state": "dispatched",
+            },
         ],
     }
 
