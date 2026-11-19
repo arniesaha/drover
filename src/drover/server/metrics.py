@@ -3268,6 +3268,28 @@ class MetricsCollector:
         endpoint.
         """
         if self.relay_manager is not None and self.relay_manager.is_live(host.host_id):
+            # A recovery inspection decides whether a persisted launch intent
+            # may be retried.  Treat it like creation: an attached relay
+            # socket that has not completed a round trip is not evidence that
+            # the daemon can answer this request.  Sending anyway can yield a
+            # 502 after the intent is durable, leaving it fail-closed with no
+            # safe next launch.  This also protects all other hub-to-relay
+            # requests from accepting an unproven reconnect.
+            if (
+                getattr(host, "connection_kind", "direct") == "relay"
+                or self._host_requires_relay(host)
+            ) and not self.relay_manager.wait_until_responsive(
+                host.host_id, RELAY_PROOF_TIMEOUT_S
+            ):
+                return _json_response(
+                    502,
+                    {
+                        "error": f"relay host is not responding: {host.host_id}",
+                        "reason": _relay_silence_reason(
+                            self.relay_manager, host.host_id
+                        ),
+                    },
+                )
             if max_response_bytes is not None:
                 return self.relay_manager.request(
                     host.host_id,

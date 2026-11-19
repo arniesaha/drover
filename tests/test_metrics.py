@@ -2265,6 +2265,10 @@ class _FakeRelay:
         # is not a working host (#231).
         return host_id == "laptop"
 
+    def wait_until_responsive(self, host_id: str, timeout_s: float) -> bool:
+        assert timeout_s == metrics.RELAY_PROOF_TIMEOUT_S
+        return self.is_live(host_id)
+
     def silent_for(self, host_id: str) -> float | None:
         return 0.0 if host_id == "laptop" else None
 
@@ -2606,6 +2610,35 @@ def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
     status, body = collector._harness_request(host, "/sessions", method="GET")
     assert status == 200
     assert fake.calls == [("laptop", "GET", "/sessions", {})]
+
+
+def test_harness_request_refuses_unresponsive_live_relay(collector_with_hosts) -> None:
+    """Inspection must not send a recovery read onto an unproven relay.
+
+    A stale work intent uses this read to decide whether it is safe to launch
+    again.  An attached socket alone is insufficient: it can return a 502
+    after the work has been durably recorded, leaving that intent permanently
+    fail-closed.  Creation already waits for this proof; recovery inspection
+    must use the same boundary.
+    """
+
+    collector = collector_with_hosts
+
+    class _UnresponsiveRelay(_FakeRelay):
+        def wait_until_responsive(self, host_id: str, timeout_s: float) -> bool:
+            assert host_id == "laptop"
+            assert timeout_s == metrics.RELAY_PROOF_TIMEOUT_S
+            return False
+
+    relay = _UnresponsiveRelay()
+    collector.relay_manager = relay
+    host = collector._harness_host("laptop")
+
+    status, body = collector._harness_request(host, "/sessions", method="GET")
+
+    assert status == 502
+    assert "relay host is not responding" in body
+    assert relay.calls == []
 
 
 def test_bound_host_uses_relay_without_a_legacy_hub_token(
