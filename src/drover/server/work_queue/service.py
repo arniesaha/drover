@@ -531,6 +531,7 @@ class WorkService:
             authority.update(
                 local_candidate_number=number,
                 local_candidate_cwd=scope.local_candidate_worktrees.get(str(number)),
+                expected_effect_artifact=item.get("expected_effect_artifact"),
             )
         session_id = self.harness.launch(
             host,

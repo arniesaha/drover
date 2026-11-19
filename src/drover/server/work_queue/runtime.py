@@ -130,22 +130,35 @@ class HarnessBridge:
         if scope is None:
             raise WorkDenied("cannot recover work continuity goal")
         authority_labels = ()
-        if getattr(scope, "integration_serialization_label", None) is not None:
+        expected_effect_artifact = None
+        if (
+            getattr(scope, "integration_serialization_label", None) is not None
+            or getattr(scope, "candidate_source", None) == "local_file"
+        ):
             _, _, _, item = service.item(link.get("goal_id"), link.get("item_number"))
             authority_labels = item.get("operator_authority_labels", [])
+            expected_effect_artifact = item.get("expected_effect_artifact")
         binding = self._work_coordinator_binding(
             run_key,
             link.get("run_role"),
             link.get("item_url"),
             link.get("goal_id"),
             authority_labels=authority_labels,
+            expected_effect_artifact=expected_effect_artifact,
         )
         if binding is not None:
             payload["work_coordinator_continuity"] = binding
         return payload
 
     def _work_coordinator_binding(
-        self, run_key, role, item_url, goal_id, *, authority_labels=()
+        self,
+        run_key,
+        role,
+        item_url,
+        goal_id,
+        *,
+        authority_labels=(),
+        expected_effect_artifact=None,
     ):
         scope = next(
             (scope for scope in self.config.goals if scope.goal_id == goal_id), None
@@ -164,6 +177,14 @@ class HarnessBridge:
             "authority_scope": "implementation",
             "objective": f"Work coordinator {role} for {item_url}",
         }
+        if expected_effect_artifact is not None:
+            if (
+                not isinstance(expected_effect_artifact, str)
+                or not expected_effect_artifact.strip()
+                or len(expected_effect_artifact) > 2000
+            ):
+                raise WorkDenied("local candidate expected effect is invalid")
+            binding["expected_effect_artifact"] = expected_effect_artifact
         serialization_key = getattr(scope, "integration_serialization_key", None)
         serialization_label = getattr(scope, "integration_serialization_label", None)
         if (
@@ -364,6 +385,7 @@ class HarnessBridge:
                 ref.url,
                 goal_id,
                 authority_labels=authority.get("labels", []),
+                expected_effect_artifact=authority.get("expected_effect_artifact"),
             )
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:

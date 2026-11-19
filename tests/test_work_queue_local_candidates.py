@@ -12,26 +12,29 @@ from drover.server.work_queue.service import WorkService
 from drover.server.work_queue.store import WorkStore
 
 
-def _manifest(path, *, workspace="local-workspace", goal="goal-local"):
+def _manifest(
+    path, *, workspace="local-workspace", goal="goal-local", expected_effect=None
+):
+    item = {
+        "number": 1,
+        "state": "open",
+        "body": "Perform only a harmless local canary effect.",
+        "created_at": "2026-11-18T00:00:00Z",
+        "labels": [
+            "goal:local",
+            "status:queued",
+            "agent:nix",
+        ],
+    }
+    if expected_effect is not None:
+        item["expected_effect_artifact"] = expected_effect
     path.write_text(
         json.dumps(
             {
                 "version": 1,
                 "workspace_id": workspace,
                 "goal_id": goal,
-                "items": [
-                    {
-                        "number": 1,
-                        "state": "open",
-                        "body": "Perform only a harmless local canary effect.",
-                        "created_at": "2026-11-18T00:00:00Z",
-                        "labels": [
-                            "goal:local",
-                            "status:queued",
-                            "agent:nix",
-                        ],
-                    }
-                ],
+                "items": [item],
             }
         )
     )
@@ -84,6 +87,18 @@ def test_local_candidate_manifest_is_bound_and_status_writes_are_atomic(tmp_path
     assert not path.with_name(path.name + ".tmp").exists()
 
 
+def test_local_candidate_effect_reference_is_explicit_and_bounded(tmp_path):
+    path = tmp_path / "candidates.json"
+    expected = "local-file:worktrees/work-b/.drover-native-canary/source-task-9.json"
+    _manifest(path, expected_effect=expected)
+    provider = LocalCandidateProvider("local-workspace", _scope(path))
+    assert provider.get_item(_ref())["expected_effect_artifact"] == expected
+
+    _manifest(path, expected_effect=" ")
+    with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
+        provider.authenticate()
+
+
 def test_local_candidate_manifest_rejects_cross_scope_and_malformed_content(tmp_path):
     path = tmp_path / "candidates.json"
     _manifest(path, workspace="other-workspace")
@@ -91,7 +106,10 @@ def test_local_candidate_manifest_rejects_cross_scope_and_malformed_content(tmp_
     with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
         provider.authenticate()
 
-    _manifest(path)
+    expected = (
+        "local-file:worktrees/worktree-1/.drover-native-canary/source-task-1.json"
+    )
+    _manifest(path, expected_effect=expected)
     with pytest.raises(PermissionError, match="cross-workspace"):
         provider.get_item(
             ItemRef(
@@ -153,7 +171,10 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
     tmp_path, pg_control_path
 ):
     path = tmp_path / "candidates.json"
-    _manifest(path)
+    expected = (
+        "local-file:worktrees/worktree-1/.drover-native-canary/source-task-1.json"
+    )
+    _manifest(path, expected_effect=expected)
     scope = _scope(
         path,
         execution_enabled=True,
@@ -229,6 +250,7 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
     assert harness.launches[0][5]["authority"]["local_candidate_cwd"] == str(
         tmp_path / "worktree-1"
     )
+    assert harness.launches[0][5]["authority"]["expected_effect_artifact"] == expected
     assert provider.get_item(_ref())["labels"] == [
         {"name": "goal:local"},
         {"name": "agent:nix"},

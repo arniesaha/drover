@@ -145,6 +145,74 @@ def test_duplicate_report_dedupe_and_divergent_identity_rejection(bridge):
     assert store.consume(RUN, **fence) is None
 
 
+def test_candidate_specific_expected_effect_is_durable_and_fences_generic_marker(
+    bridge,
+):
+    """A native acknowledgement cannot use a wake marker for another candidate."""
+    store, _, registry = bridge
+    owner_id = "drover:owner/candidate-effect"
+    expected = "local-file:worktrees/work-b/.drover-native-canary/source-task-9.json"
+    session_id = "observer-candidate-effect"
+    run_id = "run_candidate_effect"
+    registry.create_session(
+        session_id=session_id,
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{run_id}@4",
+    )
+    store.initialize(
+        session_id=session_id,
+        objective="Candidate effect",
+        checkpoint="Implementation pending",
+        authorized_owner_id=owner_id,
+        expected_effect_artifact=expected,
+    )
+    lease = store.lease(run_id, owner_id=owner_id)
+    fence = {"owner_id": owner_id, "owner_epoch": lease["owner_epoch"]}
+    event_id = store.report(
+        run_id,
+        source="drover-work-coordinator",
+        source_event_id="candidate-effect:done",
+        subject=session_id,
+        sequence=1,
+        kind="worker_done",
+        summary="Bounded candidate effect completed.",
+    )
+    action = store.consume(run_id, **fence)
+
+    assert action["expected_effect_artifact"] == expected
+    assert store.status(run_id)["expected_effect_artifact"] == expected
+    with pytest.raises(ContinuityConflict, match="expected effect"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=event_id,
+            action_fingerprint=action["action_id"],
+            artifact="local-file:.drover-native-canary/actions/generic-wake.json",
+        )
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=event_id, checkpoint="generic marker rejected"
+        )
+    receipt = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=event_id,
+        action_fingerprint=action["action_id"],
+        artifact=expected,
+    )
+    assert receipt == {
+        "wake_id": event_id,
+        "action_fingerprint": action["action_id"],
+        "state": "complete",
+        "artifact": expected,
+    }
+    store.acknowledge(run_id, **fence, event_id=event_id, checkpoint="verified")
+
+
 def test_integration_reservation_stays_fenced_until_worker_done_is_acknowledged(
     bridge,
 ):

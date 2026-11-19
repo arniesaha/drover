@@ -62,13 +62,17 @@ class LocalCandidateProvider:
 
     @staticmethod
     def _item(item: Any) -> None:
-        if not isinstance(item, dict) or set(item) != {
+        required = {
             "number",
             "state",
             "body",
             "created_at",
             "labels",
-        }:
+        }
+        optional = {"expected_effect_artifact"}
+        if not isinstance(item, dict) or not (
+            required <= set(item) <= required | optional
+        ):
             raise ValueError
         if (
             isinstance(item["number"], bool)
@@ -82,6 +86,14 @@ class LocalCandidateProvider:
             or not all(
                 isinstance(label, str) and label and len(label) <= 191
                 for label in item["labels"]
+            )
+            or (
+                "expected_effect_artifact" in item
+                and (
+                    not isinstance(item["expected_effect_artifact"], str)
+                    or not item["expected_effect_artifact"].strip()
+                    or len(item["expected_effect_artifact"]) > 2000
+                )
             )
         ):
             raise ValueError
@@ -100,7 +112,7 @@ class LocalCandidateProvider:
 
     @staticmethod
     def _public(item: dict[str, Any]) -> dict[str, Any]:
-        return {
+        public = {
             "number": item["number"],
             "state": item["state"],
             "body": item["body"],
@@ -108,6 +120,9 @@ class LocalCandidateProvider:
             "labels": [{"name": label} for label in item["labels"]],
             "operator_authority_labels": list(item["labels"]),
         }
+        if "expected_effect_artifact" in item:
+            public["expected_effect_artifact"] = item["expected_effect_artifact"]
+        return public
 
     def list_items(self) -> list[dict[str, Any]]:
         return [self._public(item) for item in self._load()["items"]]

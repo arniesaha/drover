@@ -23,6 +23,14 @@ instead of writing a second effect. Verify the marker, record the completed
 receipt, and acknowledge the same delivery. Do not acknowledge a different wake
 or act after a lost lease epoch.
 
+For a candidate whose harmless effect is acceptance evidence, its local-file
+manifest must carry `expected_effect_artifact`. The WorkService signs that
+opaque candidate reference into the coordinator binding, and the hub stores it
+on the run before owner delivery. A completed action intent must use the exact
+reference; a generic wake marker is not evidence for the candidate effect and
+cannot be acknowledged. The reference identifies a verified artifact in the
+isolated worktree; it is not a host path for the hub to dereference.
+
 The only allowed action is this local marker. A missing, malformed, or
 out-of-scope instruction is a fail-closed condition: retain the durable wake
 without an acknowledgement and request no external workaround.

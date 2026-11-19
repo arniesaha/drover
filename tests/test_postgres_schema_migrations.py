@@ -28,6 +28,7 @@ from drover.server.postgres_schema import (
     CONTINUITY_WAKES_MIGRATION,
     DAILY_DIGEST_LEASE_MIGRATION,
     DAILY_DIGEST_MIGRATION,
+    EXPECTED_EFFECT_ARTIFACT_MIGRATION,
     EXPORTER_FRESHNESS_MIGRATION,
     EXPORTER_RESTART_GUARD_MIGRATION,
     GITHUB_ENVIRONMENT_APPROVALS_MIGRATION,
@@ -44,6 +45,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    EXPECTED_EFFECT_ARTIFACT_MIGRATION: "745ad20c33fa21000cb8d8879127dbb2768b7d5ff40a5d3bddf7f8d749d50a48",
     INTEGRATION_SERIALIZATION_MIGRATION: "aabc4c9680acd4920282106fb2c38919d896ca27e8a35ef3b2d67364b07ed190",
     40: "bb64a15b1b33c15395d2003c7bd8f20bfcee496b900a69afb5fc9f7a547c7e62",
     OWNER_CREDENTIAL_MIGRATION: "4f8a02bc72e85de23eb7f833664aff4e9fdf28d1436d2ed08910c1f4b7b24a38",
@@ -140,6 +142,35 @@ def test_migration_versions_are_unique_and_ascending():
     assert versions == sorted(set(versions))
     assert VECTOR_MIGRATION not in versions
     assert sorted([*versions, VECTOR_MIGRATION]) == list(range(1, max(versions) + 1))
+
+
+def test_expected_effect_artifact_migration_42_is_additive(pg_control_path):
+    """Existing PostgreSQL control stores gain the immutable effect reference."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute(
+            "ALTER TABLE factory_observer_runs DROP COLUMN expected_effect_artifact"
+        )
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [EXPECTED_EFFECT_ARTIFACT_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        assert (
+            con.execute(
+                "SELECT expected_effect_artifact FROM factory_observer_runs LIMIT 0"
+            ).description[0][0]
+            == "expected_effect_artifact"
+        )
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [EXPECTED_EFFECT_ARTIFACT_MIGRATION],
+        ).fetchone() == (1,)
 
 
 def test_lake_export_batches_backfill_matches_migration_2():
