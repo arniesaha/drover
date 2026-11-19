@@ -218,20 +218,20 @@ def test_process_observability_reports_the_eligible_run_and_dispatch(tmp_path):
     }
 
 
-def test_process_observability_continues_after_a_sanitized_per_run_failure(
-    tmp_path, monkeypatch
-):
+def test_stale_owner_epoch_does_not_starve_later_ready_run(tmp_path, monkeypatch):
+    from drover.server.work_queue.native_owner import _StaleOwnerEpoch
+
     runner, _, _, run_id, _ = _runner(tmp_path)
 
     monkeypatch.setattr(
         runner.continuity,
         "owner_runs",
-        lambda _owner_id: ["failed-run", run_id],
+        lambda _owner_id: ["fenced-run", run_id],
     )
 
     def process(_scope, candidate_run_id):
-        if candidate_run_id == "failed-run":
-            raise RuntimeError("remote response must not be retained")
+        if candidate_run_id == "fenced-run":
+            raise _StaleOwnerEpoch()
         return True
 
     monkeypatch.setattr(runner, "_process_run", process)
@@ -245,9 +245,8 @@ def test_process_observability_continues_after_a_sanitized_per_run_failure(
         "runs": [
             {
                 "goal_id": "goal-native",
-                "run_id": "failed-run",
-                "state": "failed",
-                "error_type": "RuntimeError",
+                "run_id": "fenced-run",
+                "state": "stale_owner_epoch",
             },
             {
                 "goal_id": "goal-native",
@@ -256,6 +255,35 @@ def test_process_observability_continues_after_a_sanitized_per_run_failure(
             },
         ],
     }
+
+
+def test_lease_epoch_cas_conflict_is_the_only_contained_owner_conflict(
+    tmp_path, monkeypatch
+):
+    from drover.server.work_queue.native_owner import _StaleOwnerEpoch
+
+    runner, _, _, run_id, _ = _runner(tmp_path)
+    scope = runner.config.goals[0]
+    monkeypatch.setattr(
+        runner.continuity,
+        "lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ContinuityConflict("owner epoch changed; read recovery status")
+        ),
+    )
+
+    with pytest.raises(_StaleOwnerEpoch):
+        runner._process_run(scope, run_id)
+
+    monkeypatch.setattr(
+        runner.continuity,
+        "lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ContinuityConflict("current owner lease and epoch are required")
+        ),
+    )
+    with pytest.raises(ContinuityConflict, match="current owner lease"):
+        runner._process_run(scope, run_id)
 
 
 def test_native_ack_requires_completed_intent_across_redelivery(tmp_path):
