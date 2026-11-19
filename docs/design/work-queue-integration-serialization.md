@@ -37,6 +37,7 @@ serialization key only when all of these inputs are present:
 | Base owner | `GoalScope.continuity_owner_id` | Reuse the configured native owner; do not mint an owner or provider identity. |
 | Worker profile and cap | `execution_enabled`, `execution_cwds`, worker coordinator | Admit independent source work through the existing cap calculation. |
 | Serialization class and key | `GoalScope.integration_serialization_key` | Bind the conflicting action to one repository/key reservation before dispatch. |
+| Optional delivery selector | `GoalScope.integration_serialization_label` | When configured, only a candidate carrying this operator-authority label enters the conflicting-write class; unlabelled work retains the standard delivery role. |
 | Authority scope | Existing signed work-coordinator binding | Keep `implementation`; reject `integration` for this role. |
 
 The hub-signed work-coordinator binding adds only immutable,
