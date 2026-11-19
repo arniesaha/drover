@@ -152,6 +152,27 @@ def test_work_coordinator_session_gets_paired_mcp_bearer_only(tmp_path, monkeypa
             "owner": None,
         }
 
+        owner_log = tmp_path / "native-owner-env.json"
+        monkeypatch.setenv("CODEX_ENV_LOG", str(owner_log))
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": [sys.executable, "-c", probe],
+                "cwd": str(tmp_path),
+                "prompt": "read the fenced native owner wake",
+                "handoff_mode": "drover_native_continuity_owner",
+                "continuity_owner_bearer": "test-native-owner-bearer",
+            },
+        )
+        assert status == 201
+        _wait_until(owner_log.exists, what="native owner child environment")
+        assert json.loads(owner_log.read_text()) == {
+            "mcp": "test-native-owner-bearer",
+            "owner": "test-native-owner-bearer",
+        }
+
         # Missing paired-host state must not mint or substitute a bearer.
         state.host_token = None
         unpaired_log = tmp_path / "unpaired-coordinator-env.json"

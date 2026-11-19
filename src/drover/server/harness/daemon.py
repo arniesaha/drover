@@ -3139,13 +3139,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
         child_environment: dict[str, str] = {}
         if owner_bearer is not None:
+            # Native owner tools use the normal MCP client, which reads
+            # DROVER_MCP_TOKEN.  Keep the explicit owner name for the prompt,
+            # and give that client the same launch-only, route-limited bearer.
+            # It is never persisted and cannot authorize work-item routes.
             child_environment["DROVER_CONTINUITY_OWNER_BEARER"] = owner_bearer
-        if work_continuity is not None and self.server.state.host_token:
+            child_environment["DROVER_MCP_TOKEN"] = owner_bearer
+        elif work_continuity is not None and self.server.state.host_token:
             # A coordinator worker may use the already-paired host identity
             # through the configured MCP server to read its work item.  This
             # is launch-only: the bearer is not persisted in the registry,
             # continuity ledger, prompt, or hub request payload.  Ordinary
-            # and native-owner sessions never receive it here.
+            # sessions never receive it here.
             child_environment["DROVER_MCP_TOKEN"] = self.server.state.host_token
         try:
             self.server.state.structured.start(
