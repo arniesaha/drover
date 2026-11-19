@@ -150,6 +150,26 @@ class HarnessBridge:
                 active.append(link)
         live = [l["session_id"] for l in active if l["session_id"]]
         if release_finalised and live:
+            # The daemon persists terminal cancellation/failure facts before
+            # the hub's mutable session projection may be updated.  Capacity
+            # must not stay occupied across that upgrade/replay window, but a
+            # normal per-turn completion remains resumable and still holds its
+            # slot.  If the bounded lookup fails, retain every live link.
+            try:
+                terminal = self.registry.structured_terminal_results(live)
+                released_terminal = {
+                    session_id
+                    for session_id, result in terminal.items()
+                    if result.get("category") in {"cancelled", "adapter_failure"}
+                }
+            except Exception:  # noqa: BLE001 - never free a slot on a failed read
+                log.exception("terminal worker lookup failed; holding all slots")
+                released_terminal = set()
+            active = [
+                link for link in active if link["session_id"] not in released_terminal
+            ]
+            live = [link["session_id"] for link in active if link["session_id"]]
+        if release_finalised and live:
             from drover.server.harness.continuity import finalised_session_ids
 
             try:

@@ -275,6 +275,30 @@ def test_bridge_active_excludes_finalised_workers(run):
     assert bridge.active(links) == []
 
 
+def test_bridge_active_releases_durable_cancelled_terminal_even_if_status_is_stale(run):
+    from drover.server.work_queue.runtime import HarnessBridge
+
+    bridge = object.__new__(HarnessBridge)
+    bridge.collector = SimpleNamespace(duckdb_path=run.path)
+    bridge.config = SimpleNamespace(
+        execution=SimpleNamespace(
+            idle_awaiting_input_minutes=10_080, orphan_intent_minutes=10
+        )
+    )
+    bridge.registry = HarnessRegistry(run.path)
+    bridge.registry.append_event(
+        session_id="harness-w",
+        event_type="session.terminated",
+        normalized_source="structured",
+    )
+
+    # A hub upgraded after it persisted the immutable terminal event can still
+    # have a stale mutable status. Capacity must honor the durable cancellation
+    # without treating a normal completed turn as a closed session.
+    assert bridge.registry.get_session("harness-w").status == "running"
+    assert bridge.active([{"session_id": "harness-w"}]) == []
+
+
 def test_sessionless_intents_never_hold_capacity_but_still_block_duplicates(run):
     from drover.server.harness.registry import HarnessRegistry
     from drover.server.work_queue.runtime import HarnessBridge
