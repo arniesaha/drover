@@ -199,6 +199,42 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     assert len(collector.turn_attempts) == 1
 
 
+def test_failed_fenced_run_does_not_starve_later_ready_run(tmp_path, monkeypatch):
+    runner, _, _, run_id, _ = _runner(tmp_path)
+    monkeypatch.setattr(
+        runner.continuity,
+        "owner_runs",
+        lambda _owner_id: ["fenced-run", run_id],
+    )
+
+    def process(_scope, candidate_run_id):
+        if candidate_run_id == "fenced-run":
+            raise ContinuityConflict("stale epoch")
+        return True
+
+    monkeypatch.setattr(runner, "_process_run", process)
+
+    assert runner.process_once() == 1
+    assert runner.observability() == {
+        "state": "partial_failure",
+        "at": "2026-10-09T00:00:00+00:00",
+        "dispatched": 1,
+        "runs": [
+            {
+                "goal_id": "goal-native",
+                "run_id": "fenced-run",
+                "state": "failed",
+                "error_type": "ContinuityConflict",
+            },
+            {
+                "goal_id": "goal-native",
+                "run_id": run_id,
+                "state": "dispatched",
+            },
+        ],
+    }
+
+
 def test_native_ack_requires_completed_intent_across_redelivery(tmp_path):
     runner, _, store, run_id, clock = _runner(tmp_path)
 

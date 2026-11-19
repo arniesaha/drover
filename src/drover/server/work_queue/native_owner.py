@@ -43,7 +43,17 @@ class NativeOwnerRunner:
         self.registry = HarnessRegistry(self.path)
         self.continuity = FactoryObserverContinuity(self.path, clock=clock)
         self._recovery_executor_id = str(uuid4())
+        self._last_process: dict = {"state": "not_run", "runs": []}
         self._ensure_schema()
+
+    def observability(self) -> dict:
+        """Return a sanitized snapshot of the most recent dispatch pass."""
+        return {
+            "state": self._last_process["state"],
+            "at": self._last_process.get("at"),
+            "dispatched": self._last_process.get("dispatched", 0),
+            "runs": [dict(run) for run in self._last_process["runs"]],
+        }
 
     @contextmanager
     def _transaction(self):
@@ -741,11 +751,34 @@ class NativeOwnerRunner:
 
     def process_once(self) -> int:
         dispatched = 0
+        report = {
+            "state": "running",
+            "at": self.clock().isoformat(),
+            "dispatched": 0,
+            "runs": [],
+        }
+        self._last_process = report
         for scope in self.config.goals:
             owner_id = self._owner(scope)
             if owner_id is None:
                 continue
             self._complete_finished_claims(scope)
             for run_id in self.continuity.owner_runs(owner_id):
-                dispatched += int(self._process_run(scope, run_id))
+                run = {"goal_id": scope.goal_id, "run_id": run_id}
+                report["runs"].append(run)
+                try:
+                    delivered = self._process_run(scope, run_id)
+                except Exception as exc:
+                    # A durable fenced failure is retained for retry. It must
+                    # not prevent later independent ready work from running.
+                    # Keep only the exception class: response text can carry
+                    # provider or remote-service details.
+                    run.update(state="failed", error_type=type(exc).__name__)
+                    report["state"] = "partial_failure"
+                    continue
+                run["state"] = "dispatched" if delivered else "not_dispatched"
+                dispatched += int(delivered)
+        if report["state"] == "running":
+            report["state"] = "complete"
+        report["dispatched"] = dispatched
         return dispatched
