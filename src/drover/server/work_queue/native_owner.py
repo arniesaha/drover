@@ -771,7 +771,7 @@ class NativeOwnerRunner:
         assert owner_id is not None
         with control_plane_connection(self.path, timeout=5) as con:
             rows = con.execute(
-                """SELECT DISTINCT r.run_id
+                """SELECT r.run_id
                    FROM factory_observer_runs r
                    JOIN factory_observer_inbox i ON i.run_id = r.run_id
                    JOIN continuity_owner_turn_claims c
@@ -786,7 +786,8 @@ class NativeOwnerRunner:
                         SELECT 1 FROM continuity_owner_recoveries x
                          WHERE x.wake_id = i.event_id AND x.state = 'recovered'
                     )
-                   ORDER BY r.updated_at, r.run_id""",
+                  GROUP BY r.run_id
+                  ORDER BY MIN(r.updated_at), r.run_id""",
                 [owner_id, scope.goal_id, owner_id],
             ).fetchall()
         return [str(row[0]) for row in rows]
