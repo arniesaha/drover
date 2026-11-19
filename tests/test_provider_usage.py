@@ -147,7 +147,15 @@ for line in sys.stdin:
         }
     elif request["method"] == "account/rateLimits/read":
         result = {
-            "rateLimits": {
+            ("rateLimitsByLimitId" if mode == "limit_id" else "rateLimits"): ({
+                "codex": {
+                    "primary": {
+                        "usedPercent": 21,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1795592148,
+                    }
+                }
+            } if mode == "limit_id" else {
                 "primary": {
                     "usedPercent": 25,
                     "windowDurationMins": 15,
@@ -158,7 +166,7 @@ for line in sys.stdin:
                     "windowDurationMins": 10080,
                     "resetsAt": 1731552000,
                 },
-            }
+            })
         }
     elif request["method"] == "model/list":
         result = {
@@ -185,6 +193,7 @@ for line in sys.stdin:
             str(script),
             "stdout_multibyte_flood",
         ),
+        limit_id_command=(sys.executable, "-u", str(script), "limit_id"),
     )
 
 
@@ -361,6 +370,19 @@ def test_codex_probe_reads_plan_and_multiple_windows(fake_codex_app_server):
     ]
     assert snapshot.windows[0].resets_at == datetime(
         2024, 11, 7, 2, 40, tzinfo=timezone.utc
+    )
+
+
+def test_codex_probe_reads_codex_limit_id_namespace(fake_codex_app_server):
+    snapshot = CodexUsageProbe(command=fake_codex_app_server.limit_id_command).read()
+
+    assert snapshot.status == "ok"
+    assert [(window.kind, window.used_percent) for window in snapshot.windows] == [
+        ("primary", 21.0)
+    ]
+    assert snapshot.windows[0].window_minutes == 10080
+    assert snapshot.windows[0].resets_at == datetime(
+        2026, 11, 25, 7, 35, 48, tzinfo=timezone.utc
     )
 
 
