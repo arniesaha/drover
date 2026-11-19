@@ -278,6 +278,24 @@ def test_native_owner_standard_queued_issue_does_not_claim_integration_reservati
     ]
 
 
+def test_active_refreshes_a_daemon_terminal_before_capacity_accounting(launch_path):
+    """A terminal daemon session must not consume a stale hub capacity slot."""
+
+    service, bridge, registry, _provider, harnessd = launch_path
+    worker = QueueExecutionWorker(service)
+    worker.reconciler.providers["launch"] = service.providers["launch"]
+    worker.process_once()
+
+    link = service.store.links()[0]
+    harnessd.sessions[link["session_id"]]["status"] = "terminated"
+
+    # Before the bridge reads the supported daemon metadata, the hub still
+    # carries its create-time running projection.
+    assert registry.get_session(link["session_id"]).status == "running"
+    assert bridge.active([link]) == []
+    assert registry.get_session(link["session_id"]).status == "terminated"
+
+
 def test_native_owner_explicit_integration_label_claims_configured_reservation(
     launch_path,
 ):

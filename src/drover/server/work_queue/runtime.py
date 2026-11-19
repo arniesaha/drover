@@ -225,6 +225,19 @@ class HarnessBridge:
                 if link["session_id"]
                 else None
             )
+            if session is not None and session.status not in TERMINAL_SESSION_STATUSES:
+                # ``resolve`` is the supported, relay-aware daemon metadata
+                # refresh.  Without it, an exit that reached the daemon but
+                # not the hub's mutable session projection holds capacity
+                # forever: the reconciler sees only a stale ``running`` row
+                # and never reaches the per-run recovery path.  An unavailable
+                # inspection remains fail-closed and retains the slot.
+                try:
+                    refreshed = self.resolve(link["run_key"])
+                except WorkDenied:
+                    refreshed = None
+                if refreshed is not None:
+                    session = refreshed
             if session is None or session.status not in TERMINAL_SESSION_STATUSES:
                 active.append(link)
         live = [l["session_id"] for l in active if l["session_id"]]
