@@ -847,6 +847,17 @@ def test_completion_predicate_keeps_turn_boundary_and_durable_evidence(
     registry = runner.registry
     assert not registry.has_completed_turn(session_id, turn["client_turn_id"])
     assert not registry.has_completed_turn(session_id, "unsubmitted-turn")
+    # An explicit completion for another turn must not settle this submitted
+    # claim merely because it shares the owner session.
+    registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        payload={
+            "turn_id": "stale-turn",
+            "payload": {"turn_complete": True},
+        },
+    )
+    assert not registry.has_completed_turn(session_id, turn["client_turn_id"])
     completion = {"turn_complete": True}
     registry.append_event(
         session_id=session_id,
@@ -883,12 +894,14 @@ def test_post_ingest_completion_settles_claim_and_delivers_successor_once(tmp_pa
         store, run_id, runner.config.goals[0].continuity_owner_id
     )
     session_id = collector.turn_attempts[0][0]
+    turn_id = collector.turn_attempts[0][1]["client_turn_id"]
     events = [
         {
             "event_id": "owner-completed-924",
             "session_id": session_id,
             "seq": 2,
             "type": "status",
+            "turn_id": turn_id,
             "payload": {"turn_complete": True},
         },
         {
@@ -896,6 +909,7 @@ def test_post_ingest_completion_settles_claim_and_delivers_successor_once(tmp_pa
             "session_id": session_id,
             "seq": 3,
             "type": "status",
+            "turn_id": turn_id,
             "payload": {"exited": 0},
         },
         {
@@ -908,6 +922,7 @@ def test_post_ingest_completion_settles_claim_and_delivers_successor_once(tmp_pa
     ]
     assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 3})]
     assert runner.registry.get_session(session_id).effective_awaiting is None
+    assert runner.registry.has_completed_turn(session_id, turn_id)
     assert len(collector.turn_attempts) == 2
     with control_plane_connection(runner.path) as con:
         assert con.execute(
@@ -937,12 +952,15 @@ def test_post_ingest_kick_failure_keeps_commit_and_replay_retries(tmp_path):
     wake_id = _acknowledge_current_wake(
         store, run_id, runner.config.goals[0].continuity_owner_id
     )
+    session_id = collector.turn_attempts[0][0]
+    turn_id = collector.turn_attempts[0][1]["client_turn_id"]
     events = [
         {
             "event_id": "final-completion-924",
-            "session_id": collector.turn_attempts[0][0],
+            "session_id": session_id,
             "seq": 2,
             "type": "status",
+            "turn_id": turn_id,
             "payload": {"turn_complete": True},
         }
     ]
@@ -961,6 +979,7 @@ def test_post_ingest_kick_failure_keeps_commit_and_replay_retries(tmp_path):
 
     collector.idle_undeclared_worker.owner_runner = runner
     assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 0})]
+    assert runner.registry.has_completed_turn(session_id, turn_id)
     with control_plane_connection(runner.path) as con:
         assert con.execute(
             "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
