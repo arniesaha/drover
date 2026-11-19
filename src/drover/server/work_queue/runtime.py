@@ -86,17 +86,34 @@ class HarnessBridge:
         if len(links) != 1:
             raise WorkDenied("cannot recover unique work launch intent")
         link = links[0]
+        scope = next(
+            (
+                scope
+                for scope in self.config.goals
+                if scope.goal_id == link.get("goal_id")
+            ),
+            None,
+        )
+        if scope is None:
+            raise WorkDenied("cannot recover work continuity goal")
+        authority_labels = ()
+        if getattr(scope, "integration_serialization_label", None) is not None:
+            _, _, _, item = service.item(link.get("goal_id"), link.get("item_number"))
+            authority_labels = item.get("operator_authority_labels", [])
         binding = self._work_coordinator_binding(
             run_key,
             link.get("run_role"),
             link.get("item_url"),
             link.get("goal_id"),
+            authority_labels=authority_labels,
         )
         if binding is not None:
             payload["work_coordinator_continuity"] = binding
         return payload
 
-    def _work_coordinator_binding(self, run_key, role, item_url, goal_id):
+    def _work_coordinator_binding(
+        self, run_key, role, item_url, goal_id, *, authority_labels=()
+    ):
         scope = next(
             (scope for scope in self.config.goals if scope.goal_id == goal_id), None
         )
@@ -115,7 +132,15 @@ class HarnessBridge:
             "objective": f"Work coordinator {role} for {item_url}",
         }
         serialization_key = getattr(scope, "integration_serialization_key", None)
-        if role == "work" and serialization_key is not None:
+        serialization_label = getattr(scope, "integration_serialization_label", None)
+        if (
+            role == "work"
+            and serialization_key is not None
+            and (
+                serialization_label is None
+                or serialization_label in set(authority_labels or ())
+            )
+        ):
             binding.update(
                 delivery_role="integration_serialized",
                 repository=scope.repo,
@@ -291,7 +316,11 @@ class HarnessBridge:
             # was signed by the hub's continuity secret. The host receives the
             # binding but never the HMAC secret or the hub bearer token.
             payload["work_coordinator_continuity"] = self._work_coordinator_binding(
-                run_key, role, ref.url, goal_id
+                run_key,
+                role,
+                ref.url,
+                goal_id,
+                authority_labels=authority.get("labels", []),
             )
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:

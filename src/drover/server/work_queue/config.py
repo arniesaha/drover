@@ -180,6 +180,12 @@ class GoalScope(Model):
     integration_serialization_key: str | None = Field(
         default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$"
     )
+    # When present, only an operator-authorized candidate carrying this label
+    # enters the configured conflicting-write class.  Omitting the selector
+    # preserves the historical all-work serialization behavior.
+    integration_serialization_label: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$"
+    )
     # Explicit opt-in: the one OpenClaw session allowed to receive durable
     # work-completion wakes for this goal.  No default owner exists.
     continuity_owner_id: str | None = None
@@ -231,6 +237,13 @@ class GoalScope(Model):
         if self.integration_serialization_key is not None and owner != native_owner:
             raise ValueError(
                 "integration serialization requires this goal's native owner"
+            )
+        if (
+            self.integration_serialization_label is not None
+            and self.integration_serialization_key is None
+        ):
+            raise ValueError(
+                "integration serialization label requires a serialization key"
             )
         if self.candidate_source == "local_file":
             if (
