@@ -65,6 +65,7 @@ class HarnessBridge:
                             )
                             return self.registry.session_by_client_id(run_key)
                     break
+            self._require_bound_work_continuity(session, run_key)
             return session
         # A response may have been lost before the control registry was synced.
         # Read each reachable daemon, never replay POST to discover the outcome.
@@ -103,6 +104,34 @@ class HarnessBridge:
         if inspection_unavailable:
             raise WorkDenied("harness inspection unavailable")
         return None
+
+    def _require_bound_work_continuity(self, session, run_key):
+        """Reject a coordinator session that lacks its immutable ledger.
+
+        A coordinator create is only usable after the hub has persisted the
+        signed continuity run.  A daemon can still be live when its create
+        response reached the hub but initialization then failed (for example,
+        because a serialized integration reservation was already held).  The
+        registry row alone cannot reconstruct a local-candidate authority or
+        expected effect, so it must never turn that orphan into a reusable
+        launch result.
+        """
+        if getattr(session, "handoff_mode", None) != "work_coordinator":
+            return
+        from drover.server.harness.continuity import FactoryObserverContinuity
+
+        try:
+            status = FactoryObserverContinuity(self.collector.duckdb_path).status(
+                "work-" + run_key
+            )
+        except Exception as exc:  # unknown ledger is never safe to recover
+            raise WorkDenied(
+                "bound work continuity is unavailable; inspection required"
+            ) from exc
+        if status.get("session_id") != session.session_id:
+            raise WorkDenied(
+                "bound work continuity is unavailable; inspection required"
+            )
 
     def _recovery_payload(self, run_key, row):
         payload = {
