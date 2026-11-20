@@ -798,6 +798,7 @@ def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
         ("native-canary-m2-candidates-26-27.json", [26, 27]),
         ("native-canary-m3-candidates-28-32.json", [28, 29, 30, 31, 32, 33]),
         ("native-canary-m3-candidate-44-verification.json", [44]),
+        ("native-canary-m3-candidate-45-stdlib-verification.json", [45]),
     ],
 )
 def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
@@ -845,6 +846,11 @@ def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
         body = items[0]["body"]
         assert "git add -f" in body
         assert "Run role is verify" in body
+        assert "untracked-only evidence is a verification failure" in body
+    if fixture_name == "native-canary-m3-candidate-45-stdlib-verification.json":
+        body = items[0]["body"]
+        assert "python3 tests/test_native_canary_m3_45.py" in body
+        assert "without optional `evidence_key` or `estimated_cost`" in body
         assert "untracked-only evidence is a verification failure" in body
 
 
@@ -1088,6 +1094,31 @@ def _deferred_completion_service(
     worker.process_once()
     work = service.store.links(goal_id=scope.goal_id, number=1)[0]
     return scope, provider, harness, service, worker, work
+
+
+def test_completed_local_candidate_uses_goal_estimate_not_worker_metadata(
+    tmp_path, pg_control_path, monkeypatch
+):
+    scope, _provider, harness, service, _worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path
+    )
+    harness.sessions[work["run_key"]].status = "completed"
+    captured = {}
+
+    def launch_verification(*args, **kwargs):
+        captured["estimated_cost"] = kwargs["estimated_cost"]
+        return {"run_role": "verify"}
+
+    monkeypatch.setattr(service, "_launch_verification", launch_verification)
+    assert service.update(
+        scope.goal_id,
+        1,
+        work["run_key"],
+        "complete",
+        actor=WorkActor("credential:coordinator", "nix"),
+        estimated_cost=0.01,
+    ) == {"run_role": "verify"}
+    assert captured["estimated_cost"] == scope.execution_estimated_cost
 
 
 def test_queue_worker_defers_bound_completion_until_terminal_then_launches_verify(

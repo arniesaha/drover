@@ -66,6 +66,49 @@ def test_bound_stdio_tools_use_existing_authenticated_hub_transport(
     assert kwargs["estimated_cost"] is None
 
 
+def test_bound_completion_drops_nonsemantic_metadata_but_progress_keeps_it(
+    monkeypatch,
+):
+    bound = BoundWorkControl("http://127.0.0.1:28180", "private", "a" * 32, "goal", 1)
+    calls = []
+
+    def call(_self, operation, args):
+        calls.append((operation, args))
+        return {"outcome": "ok"}
+
+    monkeypatch.setattr(BoundWorkControl, "_call", call)
+    assert bound.update(
+        "complete", evidence_key="sha=" + "a" * 64, estimated_cost=0.01
+    ) == {"outcome": "ok"}
+    assert bound.update("progress", evidence_key="progress:1", estimated_cost=0.01) == {
+        "outcome": "ok"
+    }
+    assert calls == [
+        (
+            "update",
+            {
+                "goal_id": "goal",
+                "number": 1,
+                "run_key": "a" * 32,
+                "action": "complete",
+                "evidence_key": None,
+                "estimated_cost": None,
+            },
+        ),
+        (
+            "update",
+            {
+                "goal_id": "goal",
+                "number": 1,
+                "run_key": "a" * 32,
+                "action": "progress",
+                "evidence_key": "progress:1",
+                "estimated_cost": 0.01,
+            },
+        ),
+    ]
+
+
 def test_bound_stdio_worker_rejects_missing_or_cross_scope_configuration():
     with pytest.raises(BoundWorkError):
         BoundWorkControl.from_environment({})
@@ -175,7 +218,12 @@ def test_bound_stdio_child_lists_tools_and_defers_through_existing_hub(
                 "method": "tools/call",
                 "params": {
                     "name": "drover_work_update",
-                    "arguments": {"action": "complete"},
+                    "arguments": {
+                        "action": "complete",
+                        # Natural model prose often supplies this as a label.
+                        # It is not part of a bound completion's authority.
+                        "evidence_key": "sha=" + "a" * 64,
+                    },
                 },
             },
         )
@@ -193,6 +241,9 @@ def test_bound_stdio_child_lists_tools_and_defers_through_existing_hub(
     # after the original worker reaches its terminal boundary.
     assert len(service.store.events(identity(work["run_key"], "complete", None))) == 1
     harness.sessions[work["run_key"]].status = "completed"
+    # A terminal daemon status alone is insufficient: the deferred path also
+    # requires the exact signed worker turn to have finished.
+    harness.sessions[work["run_key"]].turn_finished = True
     worker.process_once()
     assert [
         link["run_role"]
