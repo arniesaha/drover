@@ -10,6 +10,7 @@ from drover.server.harness.continuity import (
     FactoryObserverContinuity,
     record_work_coordinator_state,
 )
+from drover.server.harness.factory_observer import FactoryObserverRequestError
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.work_coordinator import (
     parse_unverified_work_coordinator_continuity,
@@ -570,3 +571,32 @@ def test_hub_sync_rejects_success_response_without_session_id(tmp_path):
         collector._sync_created_harness_session("studio", {}, '{"status": "running"}')
     with pytest.raises(ValueError, match="valid JSON"):
         collector._sync_created_harness_session("studio", {}, "not-json")
+
+
+def test_work_continuity_item_binding_is_signed_and_requires_the_complete_pair():
+    unsigned = {
+        "run_id": "work-" + "d" * 32,
+        "owner_id": "drover:owner/native",
+        "authority_scope": "implementation",
+        "objective": "bound worker update",
+        "goal_id": "native-canary-924-848",
+        "item_number": 41,
+    }
+    binding, _ = parse_work_coordinator_continuity(
+        {
+            "work_coordinator_continuity": {
+                **unsigned,
+                "binding_signature": sign_work_coordinator_continuity(unsigned, "hub"),
+            }
+        },
+        hub_secret="hub",
+    )
+    assert binding is not None
+    assert (binding.goal_id, binding.item_number) == ("native-canary-924-848", 41)
+
+    partial = dict(unsigned)
+    partial.pop("item_number")
+    with pytest.raises(FactoryObserverRequestError, match="item binding"):
+        parse_unverified_work_coordinator_continuity(
+            {"work_coordinator_continuity": {**partial, "binding_signature": "x"}}
+        )

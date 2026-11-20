@@ -29,6 +29,10 @@ class WorkCoordinatorContinuity:
     # Opaque, signed reference to the single candidate effect the source daemon
     # must attest before a native owner can settle its wake.
     expected_effect_artifact: str | None = None
+    # The hub signs the exact WorkService item that a coordinator worker may read
+    # or update through its per-session stdio MCP bridge.
+    goal_id: str | None = None
+    item_number: int | None = None
 
     @property
     def source_session_id(self) -> str:
@@ -98,10 +102,14 @@ def _parse_work_coordinator_continuity(
     }
     serialization_fields = {"delivery_role", "repository", "serialization_key"}
     expected_effect_fields = {"expected_effect_artifact"}
+    work_item_fields = {"goal_id", "item_number"}
     if not isinstance(raw, Mapping) or not (
         base_fields
         <= set(raw)
-        <= base_fields | serialization_fields | expected_effect_fields
+        <= base_fields
+        | serialization_fields
+        | expected_effect_fields
+        | work_item_fields
     ):
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
     signature = raw["binding_signature"]
@@ -132,6 +140,18 @@ def _parse_work_coordinator_continuity(
     repository = raw.get("repository")
     serialization_key = raw.get("serialization_key")
     expected_effect_artifact = raw.get("expected_effect_artifact")
+    goal_id = raw.get("goal_id")
+    item_number = raw.get("item_number")
+    if (goal_id is None) != (item_number is None):
+        raise FactoryObserverRequestError("work continuity item binding is invalid")
+    if goal_id is not None and (
+        not isinstance(goal_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}", goal_id)
+        or isinstance(item_number, bool)
+        or not isinstance(item_number, int)
+        or item_number <= 0
+    ):
+        raise FactoryObserverRequestError("work continuity item binding is invalid")
     if expected_effect_artifact is not None and (
         not isinstance(expected_effect_artifact, str)
         or not expected_effect_artifact.strip()
@@ -169,6 +189,8 @@ def _parse_work_coordinator_continuity(
             repository,
             serialization_key,
             expected_effect_artifact,
+            goal_id,
+            item_number,
         ),
         normalized,
         unsigned,

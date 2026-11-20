@@ -3154,11 +3154,25 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             child_environment["DROVER_MCP_TOKEN"] = owner_bearer
         elif work_continuity is not None and self.server.state.host_token:
             # A coordinator worker may use the already-paired host identity
-            # through the configured MCP server to read its work item.  This
+            # through a bound stdio MCP bridge. This
             # is launch-only: the bearer is not persisted in the registry,
-            # continuity ledger, prompt, or hub request payload.  Ordinary
+            # continuity ledger, prompt, or hub request payload. Ordinary
             # sessions never receive it here.
             child_environment["DROVER_MCP_TOKEN"] = self.server.state.host_token
+            # This is a signed hub binding. The child receives only its own
+            # run/item identity and speaks to the existing central control API
+            # through a stdio MCP bridge; no additional MCP listener exists.
+            if (
+                self.server.state.central_url
+                and work_continuity.goal_id is not None
+                and work_continuity.item_number is not None
+            ):
+                child_environment.update(
+                    DROVER_WORK_CONTROL_URL=self.server.state.central_url,
+                    DROVER_WORK_RUN_KEY=work_continuity.run_id.removeprefix("work-"),
+                    DROVER_WORK_GOAL_ID=work_continuity.goal_id,
+                    DROVER_WORK_ITEM_NUMBER=str(work_continuity.item_number),
+                )
         try:
             self.server.state.structured.start(
                 session_id,
