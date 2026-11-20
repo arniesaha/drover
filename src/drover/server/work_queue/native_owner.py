@@ -1131,6 +1131,48 @@ class NativeOwnerRunner:
                 [wake_id, turn_id],
             )
 
+    def _recovery_owner_bearer_factory(self, scope, session_id: str):
+        """Build a one-use callback for the exact missing owner session.
+
+        Metrics invokes this only after harnessd returns the exact missing
+        session response. Issuing earlier would revoke a bearer held by a live
+        owner. The bearer is intentionally returned only to the proxied
+        recovery request; the durable link retains its credential id solely
+        for later fencing/revocation.
+        """
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+
+        def issue() -> dict[str, str] | None:
+            link = self._link(scope)
+            if link.get("session_id") != session_id:
+                return None
+            credential, token = self.credentials.issue(
+                scope="owner",
+                label="recovered native continuity owner",
+                owner_id=owner_id,
+            )
+            with self._transaction() as con:
+                updated = con.execute(
+                    """UPDATE continuity_owner_sessions SET credential_id = ?, updated_at = ?
+                    WHERE goal_id = ? AND owner_id = ? AND session_id = ?
+                    AND generation = ? RETURNING owner_id""",
+                    [
+                        credential.id,
+                        self.clock(),
+                        scope.goal_id,
+                        owner_id,
+                        session_id,
+                        link["generation"],
+                    ],
+                ).fetchone()
+            if updated is None:
+                self.credentials.revoke_owner_credential(owner_id, credential.id)
+                return None
+            return {"continuity_owner_bearer": token}
+
+        return issue
+
     def _claim(
         self, scope, run_id: str, session_id: str, wake_id: str, owner_epoch: int
     ) -> str | None:
@@ -1280,6 +1322,9 @@ class NativeOwnerRunner:
                 ),
                 "client_turn_id": turn_id,
             },
+            recovery_payload_factory=self._recovery_owner_bearer_factory(
+                scope, session_id
+            ),
         )
         if 200 <= response < 300:
             with self._transaction() as con:

@@ -117,8 +117,15 @@ def test_bridge_terminal_work_done_requires_bound_done_projection(monkeypatch):
     from drover.server.harness.continuity import FactoryObserverContinuity
 
     bridge = object.__new__(HarnessBridge)
-    bridge.resolve = lambda run_key: SimpleNamespace(
-        session_id="worker-session", status="completed", handoff_mode="work_coordinator"
+    session = SimpleNamespace(
+        session_id="worker-session",
+        status="completed",
+        handoff_mode="work_coordinator",
+        effective_awaiting=None,
+    )
+    bridge.resolve = lambda run_key: session
+    bridge.registry = SimpleNamespace(
+        completed_turn_kinds=lambda session_ids: {session_ids[0]: "finished"}
     )
     bridge.collector = SimpleNamespace(duckdb_path="ignored")
     observed = []
@@ -141,6 +148,40 @@ def test_bridge_terminal_work_done_requires_bound_done_projection(monkeypatch):
         FactoryObserverContinuity,
         "status",
         lambda *_: {"session_id": "other-session", "worker_state": "done"},
+    )
+    assert bridge.terminal_work_done("bound-run") is False
+
+
+def test_bridge_terminal_work_done_accepts_only_finished_idle_reusable_turn(
+    monkeypatch,
+):
+    from drover.server.harness.continuity import FactoryObserverContinuity
+
+    bridge = object.__new__(HarnessBridge)
+    session = SimpleNamespace(
+        session_id="worker-session",
+        status="running",
+        handoff_mode="work_coordinator",
+        effective_awaiting="input",
+    )
+    bridge.resolve = lambda run_key: session
+    bridge.collector = SimpleNamespace(duckdb_path="ignored")
+    bridge.registry = SimpleNamespace(
+        completed_turn_kinds=lambda session_ids: {session_ids[0]: "finished"}
+    )
+    monkeypatch.setattr(
+        FactoryObserverContinuity,
+        "status",
+        lambda *_: {"session_id": "worker-session", "worker_state": "done"},
+    )
+
+    assert bridge.terminal_work_done("bound-run") is True
+
+    session.effective_awaiting = None
+    assert bridge.terminal_work_done("bound-run") is False
+    session.effective_awaiting = "input"
+    bridge.registry = SimpleNamespace(
+        completed_turn_kinds=lambda _session_ids: {"worker-session": "failed"}
     )
     assert bridge.terminal_work_done("bound-run") is False
 
@@ -457,6 +498,7 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
                 status="running",
                 host_id=host,
                 parent_session_id=parent,
+                turn_finished=False,
             )
             return "local-session-1"
 
@@ -979,7 +1021,7 @@ def _deferred_completion_service(
             return {("host", "codex")}
 
         def terminal_work_done(self, run_key):
-            return terminal_done
+            return terminal_done and self.sessions[run_key].turn_finished
 
         def expected_effect_materialized(self, run_key, artifact):
             assert artifact == expected
@@ -995,6 +1037,7 @@ def _deferred_completion_service(
                 status="running",
                 host_id=host,
                 parent_session_id=parent,
+                turn_finished=False,
             )
             return self.sessions[run_key].session_id
 
@@ -1047,7 +1090,42 @@ def test_queue_worker_defers_bound_completion_until_terminal_then_launches_verif
         if label["name"].startswith("status:")
     ] == ["status:running"]
 
-    harness.sessions[work["run_key"]].status = "completed"
+    # The ordinary launch surface cannot evade same-item exclusion merely by
+    # naming the reusable worker as a parent. Only the internal terminal-proof
+    # path below can release that exact parent link.
+    service.status(
+        provider,
+        service.item(scope.goal_id, 1)[1],
+        _ref(),
+        provider.get_item(_ref()),
+        "review",
+    )
+    request, _ = service._verification_request(
+        scope.goal_id, 1, work, provider.get_item(_ref())
+    )
+    with pytest.raises(WorkDenied, match="existing execution requires inspection"):
+        service.launch(
+            scope.goal_id,
+            1,
+            request,
+            scope.execution_estimated_cost,
+            actor=WorkActor("control:queue-execution", "nix"),
+            run_role="verify",
+            parent_session_id=work["session_id"],
+        )
+    service.status(
+        provider,
+        service.item(scope.goal_id, 1)[1],
+        _ref(),
+        provider.get_item(_ref()),
+        "running",
+    )
+
+    # Codex keeps its structured session reusable after a finished turn. The
+    # bound terminal proof, not whole-session termination, releases exactly
+    # this deferred verification successor.
+    harness.sessions[work["run_key"]].status = "running"
+    harness.sessions[work["run_key"]].turn_finished = True
     worker.process_once()
     links = service.store.links(goal_id=scope.goal_id, number=1)
     assert [link["run_role"] for link in links] == ["work", "verify"]

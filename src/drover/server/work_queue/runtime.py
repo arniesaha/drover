@@ -349,13 +349,31 @@ class HarnessBridge:
         return self.registry.coordinator_turn_failure_category(session.session_id)
 
     def terminal_work_done(self, run_key):
-        """Return true only for the bound worker's declared successful terminal state."""
+        """Return true only after the bound worker's exact turn is safely idle.
+
+        Codex is a reusable structured session: a successful turn emits an
+        ``exited`` status with its turn id while the session remains running
+        and awaits its next input. Requiring the whole session to terminate
+        stranded a deferred verification intent forever. A live session is
+        therefore acceptable only when its most recent turn is durably
+        finished and it is awaiting input; active, failed, and unknown turns
+        remain ineligible.
+        """
         session = self.resolve(run_key)
-        if (
-            session is None
-            or session.status != "completed"
-            or session.handoff_mode != "work_coordinator"
-        ):
+        if session is None or session.handoff_mode != "work_coordinator":
+            return False
+        if session.status == "completed":
+            turn_finished = True
+        elif session.status == "running" and session.effective_awaiting == "input":
+            turn_finished = (
+                self.registry.completed_turn_kinds([session.session_id]).get(
+                    session.session_id
+                )
+                == "finished"
+            )
+        else:
+            turn_finished = False
+        if not turn_finished:
             return False
         from drover.server.harness.continuity import FactoryObserverContinuity
 

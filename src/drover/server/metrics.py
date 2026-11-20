@@ -2195,21 +2195,33 @@ class MetricsCollector:
         session_id: str,
         action: str,
         payload: Mapping[str, Any],
+        *,
+        recovery_payload_factory: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> tuple[int, str]:
-        """Proxy a structured-session action (turns/permission/interrupt) to
-        the owning host's harnessd, forwarding the JSON body verbatim."""
+        """Proxy an action, optionally supplying launch-only recovery context.
+
+        The factory is evaluated only after harnessd has authoritatively
+        reported this exact structured session missing.  Its result is sent to
+        ``/recover`` only; it is never included in the original or replayed
+        turn payload, persisted by this collector, or logged here.
+        """
         # A turn can spend seconds preparing or recovering. Stop must reach
         # harnessd while that request is still in flight.
         if action == "interrupt":
-            return self._proxy_harness_session_action(session_id, action, payload)
+            return self._proxy_harness_session_action(
+                session_id, action, payload, recovery_payload_factory
+            )
         with self._session_lock_for(session_id):
-            return self._proxy_harness_session_action(session_id, action, payload)
+            return self._proxy_harness_session_action(
+                session_id, action, payload, recovery_payload_factory
+            )
 
     def _proxy_harness_session_action(
         self,
         session_id: str,
         action: str,
         payload: Mapping[str, Any],
+        recovery_payload_factory: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> tuple[int, str]:
         session = self._harness_session(session_id)
         if session is None:
@@ -2240,11 +2252,25 @@ class MetricsCollector:
             # (native_resume + recover_after_restart); it answers 409 if not.
             if native_session_id is None:
                 return _json_response(409, {"error": _RECOVERY_UNAVAILABLE})
+            recovery_payload: dict[str, Any] = {"native_session_id": native_session_id}
+            if recovery_payload_factory is not None:
+                try:
+                    extra = recovery_payload_factory()
+                except Exception:  # noqa: BLE001 - no credential diagnostic here
+                    return _json_response(409, {"error": _RECOVERY_UNAVAILABLE})
+                if not isinstance(extra, Mapping):
+                    return _json_response(409, {"error": _RECOVERY_UNAVAILABLE})
+                owner_bearer = extra.get("continuity_owner_bearer")
+                if not isinstance(owner_bearer, str) or not owner_bearer:
+                    return _json_response(409, {"error": _RECOVERY_UNAVAILABLE})
+                # The recovery contract intentionally admits no arbitrary
+                # caller keys. The bearer exists only on this request.
+                recovery_payload["continuity_owner_bearer"] = owner_bearer
             recovery_status, _recovery_body = self._harness_request(
                 host,
                 f"/sessions/{session_id}/recover",
                 method="POST",
-                payload={"native_session_id": native_session_id},
+                payload=recovery_payload,
                 timeout_s=15.0,
             )
             if recovery_status == 409:

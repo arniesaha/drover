@@ -3388,6 +3388,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         native_session_id = _optional_text(
             body.get("native_session_id") if body is not None else None
         )
+        owner_bearer = body.get("continuity_owner_bearer") if body is not None else None
+        if owner_bearer is not None and (
+            not isinstance(owner_bearer, str) or not owner_bearer
+        ):
+            self._write_json(
+                {"error": "invalid native continuity owner credential"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
         with self.server.state.recovery_lock_for(session_id):
             if self.server.state.structured.is_alive(session_id):
                 session = self.server.state.registry.get_session(session_id)
@@ -3416,6 +3425,28 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 )
             except (KeyError, UnsupportedHarnessOperation):
                 adapter = None
+            is_native_owner = (
+                session is not None
+                and session.handoff_mode == "drover_native_continuity_owner"
+            )
+            if owner_bearer is not None and not is_native_owner:
+                self._write_json(
+                    {
+                        "error": "native continuity owner credential is not valid for this session"
+                    },
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if is_native_owner and owner_bearer is None:
+                # A recovered owner without the launch-only bearer can only
+                # consume delivery attempts and fail closed later. Refuse
+                # before restarting it; the hub must rotate a scoped bearer
+                # during the same authenticated recovery request.
+                self._write_json(
+                    {"error": "native continuity owner recovery requires credential"},
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
             if (
                 session is None
                 or session.mode != "structured"
@@ -3452,6 +3483,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             if session.handoff_mode == "factory_observer":
                 command = factory_observer_command(session.harness, command)
+            child_environment: dict[str, str] = {}
+            if owner_bearer is not None:
+                # Keep the fresh route-limited bearer launch-only, matching
+                # initial native-owner creation. It is not written to the
+                # registry, event ledger, or resumed turn payload.
+                child_environment["DROVER_CONTINUITY_OWNER_BEARER"] = owner_bearer
+                child_environment["DROVER_MCP_TOKEN"] = owner_bearer
             try:
                 self.server.state.structured.start(
                     session_id,
@@ -3462,6 +3500,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     on_message=self.server.state.push_event,
                     finalize=self._finalize_structured_session,
                     native_session_id=native_session_id,
+                    environment=child_environment or None,
                 )
                 if not self.server.state.structured.is_alive(session_id):
                     raise RuntimeError("recovered driver exited during startup")

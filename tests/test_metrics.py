@@ -5057,6 +5057,71 @@ def test_turn_recovery_retries_original_payload_once(monkeypatch, tmp_path):
     ]
 
 
+def test_turn_recovery_uses_launch_only_owner_context(monkeypatch, tmp_path):
+    collector = _recovery_collector(tmp_path)
+    responses = iter(
+        [
+            (404, '{"error":"unknown structured session: harness-recover"}\n'),
+            (
+                200,
+                '{"session_id":"harness-recover","status":"running",'
+                '"recovered":true,"native_session_id":"provider-thread-1"}\n',
+            ),
+            (202, '{"turn_id":"turn-recovered"}\n'),
+        ]
+    )
+    calls: list[tuple[str, str, dict]] = []
+    issued = []
+
+    def request(_host, path, *, method, payload, **_kwargs):
+        calls.append((method, path, dict(payload)))
+        return next(responses)
+
+    monkeypatch.setattr(collector, "_harness_request", request)
+    turn = {"text": "continue safely", "client_turn_id": "turn-1"}
+
+    status, _body = collector.proxy_harness_session_action(
+        "harness-recover",
+        "turns",
+        turn,
+        recovery_payload_factory=lambda: issued.append("called")
+        or {"continuity_owner_bearer": "test-recovery-owner-bearer"},
+    )
+
+    assert status == 202
+    assert issued == ["called"]
+    assert calls == [
+        ("POST", "/sessions/harness-recover/turns", turn),
+        (
+            "POST",
+            "/sessions/harness-recover/recover",
+            {
+                "native_session_id": "provider-thread-1",
+                "continuity_owner_bearer": "test-recovery-owner-bearer",
+            },
+        ),
+        ("POST", "/sessions/harness-recover/turns", turn),
+    ]
+
+
+def test_turn_recovery_does_not_evaluate_context_without_missing_session(
+    monkeypatch, tmp_path
+):
+    collector = _recovery_collector(tmp_path)
+    monkeypatch.setattr(
+        collector, "_harness_request", lambda *_args, **_kwargs: (202, "{}")
+    )
+    called = []
+
+    assert collector.proxy_harness_session_action(
+        "harness-recover",
+        "turns",
+        {"text": "continue"},
+        recovery_payload_factory=lambda: called.append(True),
+    ) == (202, "{}")
+    assert called == []
+
+
 def test_central_terminate_waits_for_recovery_retry(monkeypatch, tmp_path):
     collector = _recovery_collector(tmp_path)
     recovery_reached = threading.Event()
