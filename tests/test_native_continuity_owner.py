@@ -207,6 +207,31 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     assert store.status(run_id)["owner"]["live"]
 
 
+def test_owner_prompt_binds_hub_preconsumed_terminal_delivery(tmp_path):
+    """The runner consumes once; the owner must reconcile that exact wake."""
+    expected = "local-file:.drover-native-canary/source-task-37.json"
+    runner, collector, store, run_id, _ = _runner(
+        tmp_path, expected_effect=expected, event_kind="worker_done"
+    )
+    collector.expected_effect_attestations["observer-session"] = True
+
+    assert runner.process_once() == 1
+    action = store.status(run_id)["next_action"]
+    owner = store.status(run_id)["owner"]
+    prompt = collector.turn_attempts[0][1]["text"]
+
+    # ``process_once`` has already consumed this wake to create the owner
+    # turn, so a second consume cannot be the owner-side way to rediscover it.
+    assert (
+        store.consume(run_id, owner_id=owner["id"], owner_epoch=owner["epoch"]) is None
+    )
+    assert "already consumed and fenced the exact wake" in prompt
+    assert "Do not call consume to fetch a replacement delivery" in prompt
+    assert f"expected_effect_artifact: {expected}" in prompt
+    assert f"wake_id: {action['event_id']}" in prompt
+    assert f"action_fingerprint: {action['action_id']}" in prompt
+
+
 def test_owner_turn_waits_for_materialized_candidate_effect_attestation(tmp_path):
     expected = "local-file:.drover-native-canary/source-task-13.json"
     runner, collector, _, _, _ = _runner(tmp_path, expected_effect=expected)
@@ -235,6 +260,7 @@ def test_worker_started_observation_does_not_wait_for_candidate_effect(tmp_path)
     start = store.status(run_id)["next_action"]
     assert start["type"] == "observe_worker_start"
     assert "expected_effect_artifact" not in start
+    assert "expected_effect_artifact:" not in collector.turn_attempts[0][1]["text"]
 
     _acknowledge_current_wake(store, run_id, runner.config.goals[0].continuity_owner_id)
     owner_session = runner.registry.session_by_client_id(
