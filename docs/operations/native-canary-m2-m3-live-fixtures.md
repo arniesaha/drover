@@ -126,8 +126,11 @@ The policy default is false; the reviewed goal selector names candidate 48 and
 the hub signs `committed_provenance` into its work binding. The body cannot
 select this permission, verifier bindings never carry it, and the M3 brief only
 allows a local session-branch commit of the named source/test/evidence files.
-This is an owner-reviewable configuration delta, not an instruction to change
-the live disposable configuration.
+The fixture contains `<approved-canary-runtime>` as a documentation template:
+the integration owner resolves it to the existing disposable runtime root during
+a reviewed alignment, because the configuration parser does not expand it. This
+is an owner-reviewable configuration delta, not an instruction to change the
+live disposable configuration.
 
 This uses the existing `create_session_worktree` provenance rule; it does not
 add a shared path, cross-worktree read capability, or new authority. The exact

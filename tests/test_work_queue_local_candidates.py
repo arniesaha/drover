@@ -859,6 +859,30 @@ def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
         assert "If the signed binding does not permit it" in body
 
 
+def test_reviewed_committed_provenance_binding_delta_is_portable_template():
+    fixture = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "operations"
+        / "fixtures"
+        / "native-canary-m3-committed-provenance-binding.json"
+    )
+    binding = json.loads(fixture.read_text(encoding="utf-8"))
+
+    assert binding["policy_authority_delta"] == {
+        "local_candidate_committed_provenance_enabled": True
+    }
+    assert binding["goal_scope_delta_template"] == {
+        "brief_ref": (
+            "<approved-canary-runtime>/source/docs/operations/"
+            "native-local-candidate-canary-m3-committed-provenance.md"
+        ),
+        "local_candidate_committed_provenance": {"48": "m3"},
+    }
+    assert "<approved-canary-runtime>" in binding["owner_resolution"]
+    assert "/Users/" not in fixture.read_text(encoding="utf-8")
+
+
 def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_path):
     """A local manifest cannot fabricate the deployment human-gate binding."""
     path = tmp_path / "candidates.json"
