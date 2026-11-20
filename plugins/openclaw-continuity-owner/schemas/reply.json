@@ -320,11 +320,75 @@
       "title": "ContinuityProjection",
       "type": "object"
     },
+    "DeliveryEscalation": {
+      "additionalProperties": false,
+      "description": "Sanitized durable health signal for an unacknowledged observation.",
+      "properties": {
+        "attempts": {
+          "anyOf": [
+            {
+              "minimum": 3,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempts"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "const": "authentication_required",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "state": {
+          "enum": [
+            "delivery_stalled",
+            "delivery_blocked",
+            "superseded_by_terminal"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "successor_wake_id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Successor Wake Id"
+        },
+        "wake_id": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Wake Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "wake_id"
+      ],
+      "title": "DeliveryEscalation",
+      "type": "object"
+    },
     "InboxEntry": {
       "additionalProperties": false,
       "properties": {
         "attempts": {
-          "maximum": 3,
           "minimum": 0,
           "title": "Attempts",
           "type": "integer"
@@ -357,6 +421,19 @@
           ],
           "title": "State",
           "type": "string"
+        },
+        "superseded_by_terminal": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Superseded By Terminal"
         }
       },
       "required": [
@@ -513,6 +590,17 @@
         "authorized": {
           "title": "Authorized",
           "type": "boolean"
+        },
+        "escalation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeliveryEscalation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "event_id": {
           "pattern": "^[a-f0-9]{64}$",

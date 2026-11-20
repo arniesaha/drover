@@ -34,7 +34,7 @@ The existing fixture-only coverage remains in
 `test_human_gate_blocks_only_its_branch`. Those tests prove source behavior, not
 these live fixtures.
 
-## M2 — one mid-flight hub interruption and same-wake recovery
+## M2: one mid-flight hub interruption and same-wake recovery
 
 The integration owner performs these steps only in the approved disposable
 allocation, after recording a positive supported allowance readback. This worker
@@ -74,7 +74,7 @@ claims and epochs, and must stop for human, authority, cancellation, budget, or
 permanent-auth gates. The separate durable-transient-retry recommendation is
 unchanged; this fixture does not raise a retry limit.
 
-## M3 — ordinary multistage, overlap, integration fence, and human gate
+## M3: ordinary multistage, overlap, integration fence, and human gate
 
 Run each item through the same ordinary local-file ingress. An operator may
 prepare the disposable manifest/config only after review; this document does
@@ -162,11 +162,13 @@ snippet. It reuses the approved paired helper in process memory, prints no
 credential value, task body, transcript, or request headers, and does not use a
 control-store module.
 
-    PYTHONPATH=src /path/to/canary-python - <<'PY'
-    import contextlib, io, json, runpy
+    PYTHONPATH=src DROVER_CANARY_RUNTIME=/path/to/approved-canary-runtime \
+      /path/to/canary-python - <<'PY'
+    import contextlib, io, json, os, runpy
+    from pathlib import Path
     helper_path = (
-        "/Users/arnab/scratch/drover-native-canary-setup-20261118/"
-        "runtime/env/root-read-candidate-15.py"
+        Path(os.environ["DROVER_CANARY_RUNTIME"])
+        / "env/root-read-candidate-15.py"
     )
     with contextlib.redirect_stdout(io.StringIO()):
         helper = runpy.run_path(helper_path)
