@@ -8,6 +8,7 @@ OpenClaw/plugin endpoint and never performs the authorized action itself.
 from __future__ import annotations
 
 import json
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -50,6 +51,10 @@ class NativeOwnerRunner:
         self.registry = HarnessRegistry(self.path)
         self.continuity = FactoryObserverContinuity(self.path, clock=clock)
         self._recovery_executor_id = str(uuid4())
+        # Event ingestion kicks this runner synchronously while the idle sweep
+        # also polls it. Serialize those two hub-local entry points so only a
+        # claimed wake consumes one owner delivery slot.
+        self._process_lock = threading.Lock()
         self._last_process: dict = {"state": "not_run", "runs": []}
         self._ensure_schema()
 
@@ -1278,6 +1283,13 @@ class NativeOwnerRunner:
         return False
 
     def process_once(self) -> int:
+        # The durable claim protects restart/cross-hub recovery. This local
+        # gate closes the in-process consume-then-claim race between a relay
+        # post-ingest kick and the idle worker sweep.
+        with self._process_lock:
+            return self._process_once()
+
+    def _process_once(self) -> int:
         dispatched = 0
         report = {
             "state": "running",
