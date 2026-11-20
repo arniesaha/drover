@@ -3174,6 +3174,7 @@ class MetricsCollector:
                     repository=work_continuity.repository,
                     serialization_key=work_continuity.serialization_key,
                     expected_effect_artifact=work_continuity.expected_effect_artifact,
+                    committed_provenance=work_continuity.committed_provenance,
                 )
                 continuity.report(
                     run_id,

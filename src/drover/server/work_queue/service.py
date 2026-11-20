@@ -585,6 +585,17 @@ class WorkService:
         ]
         provider.set_labels(ref, labels + [policy.labels.status_prefix + status])
 
+    def _signed_committed_provenance(self, run_key):
+        """Read the immutable worker-mode bit; unknown never schedules review."""
+        reader = getattr(self.harness, "work_coordinator_committed_provenance", None)
+        if not callable(reader):
+            return None
+        try:
+            value = reader(run_key)
+        except Exception:
+            return None
+        return value if isinstance(value, bool) else None
+
     def _verification_request(self, goal_id, number, row, item):
         request = identity(row["run_key"], "verify", item.get("body"))
         return request, identity(
@@ -655,6 +666,11 @@ class WorkService:
                 return None
             session = self.harness.resolve(row["run_key"])
             if session is None:
+                return None
+            # Only the immutable hub-signed provenance mode may create a
+            # separate verifier. Marker-only runs settle through their bound
+            # daemon-attested effect and native owner, never this queue path.
+            if self._signed_committed_provenance(row["run_key"]) is not True:
                 return None
             artifact = item.get("expected_effect_artifact")
             terminal_done = getattr(self.harness, "terminal_work_done", None)
@@ -750,6 +766,13 @@ class WorkService:
                 scope for scope in self.config.goals if scope.goal_id == goal_id
             )
             if scope.candidate_source == "local_file":
+                # The immutable signed binding, not mutable goal config or a
+                # worker body, decides whether this worker can create a verifier.
+                provenance = self._signed_committed_provenance(run_key)
+                if provenance is False:
+                    return {"outcome": "marker_only"}
+                if provenance is not True:
+                    raise WorkDenied("signed local candidate provenance unavailable")
                 # The bound worker cannot select a verification route or quota
                 # estimate.  Use the reviewed goal value both for a normal
                 # terminal successor and for the active-turn deferred path.

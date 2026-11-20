@@ -427,6 +427,15 @@ class HarnessBridge:
             and status.get("worker_state") == "done"
         )
 
+    def work_coordinator_committed_provenance(self, run_key):
+        """Return the immutable provenance mode from the bound hub run."""
+        session = self.resolve(run_key)
+        if session is None or session.handoff_mode != "work_coordinator":
+            return None
+        return self.registry.work_coordinator_committed_provenance(
+            session.session_id, "work-" + run_key
+        )
+
     def expected_effect_materialized(self, run_key, artifact):
         """Ask the bound daemon whether its exact candidate effect exists.
 
@@ -527,9 +536,12 @@ class HarnessBridge:
                     "requests the bound local-file effect, create that regular file "
                     "only in the assigned worktree. The daemon attests this exact "
                     "session-relative file directly; it does not need to be Git "
-                    "tracked, committed, or passed to a verifier. Do not interpret "
-                    "committed-provenance verification requirements from the brief "
-                    "as applying to this unsigned-for-provenance run."
+                    "tracked, committed, or passed to a verifier. Do not request "
+                    "`drover_work_update(action=complete)`: that operation is reserved "
+                    "for a signed committed-provenance verifier handoff. Finish the "
+                    "structured worker turn after creating the bound file. Do not "
+                    "interpret committed-provenance verification requirements from the "
+                    "brief as applying to this unsigned-for-provenance run."
                 )
             else:
                 brief += (

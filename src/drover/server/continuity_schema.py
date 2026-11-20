@@ -96,7 +96,8 @@ CONTINUITY_DDL = (
       delivery_role TEXT NOT NULL DEFAULT 'standard',
       serialization_repository TEXT, serialization_key TEXT,
       serialization_generation BIGINT,
-      expected_effect_artifact TEXT
+      expected_effect_artifact TEXT,
+      committed_provenance BOOLEAN
     )
     """,
     """

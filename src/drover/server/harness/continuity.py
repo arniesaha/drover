@@ -1009,6 +1009,7 @@ class FactoryObserverContinuity:
         repository: str | None = None,
         serialization_key: str | None = None,
         expected_effect_artifact: str | None = None,
+        committed_provenance: bool | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
@@ -1027,6 +1028,12 @@ class FactoryObserverContinuity:
         )
         if expected_effect_artifact is not None:
             _text(expected_effect_artifact, "expected_effect_artifact", 2000)
+        if committed_provenance is not None and not isinstance(
+            committed_provenance, bool
+        ):
+            raise ValueError("committed_provenance must be boolean or null")
+        if committed_provenance is True and expected_effect_artifact is None:
+            raise ValueError("committed provenance requires expected effect")
         if (
             delivery_role == "integration_serialized"
             and authority_scope != "implementation"
@@ -1051,8 +1058,8 @@ class FactoryObserverContinuity:
                 (run_id, session_id, expected_revision, objective, checkpoint,
                  authority_scope, authorized_owner_id, delivery_role,
                  serialization_repository, serialization_key, expected_effect_artifact,
-                 updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 committed_provenance, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (run_id) DO NOTHING""",
                 [
                     run_id,
@@ -1066,6 +1073,7 @@ class FactoryObserverContinuity:
                     repository,
                     serialization_key,
                     expected_effect_artifact,
+                    committed_provenance,
                     self.clock(),
                 ],
             )
@@ -1085,6 +1093,7 @@ class FactoryObserverContinuity:
                 "serialization_repository": repository,
                 "serialization_key": serialization_key,
                 "expected_effect_artifact": expected_effect_artifact,
+                "committed_provenance": committed_provenance,
             }.items():
                 if existing[name] != value:
                     raise ContinuityConflict(f"run {name} is immutable")
@@ -1874,6 +1883,13 @@ class FactoryObserverContinuity:
                 "scope_limit": SCOPES[run["authority_scope"]],
                 "delivery_role": run.get("delivery_role", "standard"),
                 "expected_effect_artifact": run.get("expected_effect_artifact"),
+                # A migration-44 legacy row has no immutable signed mode.
+                # Do not collapse that unknown into marker-only authority.
+                "committed_provenance": (
+                    run.get("committed_provenance")
+                    if isinstance(run.get("committed_provenance"), bool)
+                    else None
+                ),
                 "integration_serialization": integration_serialization,
                 "owner_handoff": {
                     "authorized_owner_id": run.get("authorized_owner_id"),

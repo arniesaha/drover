@@ -1252,9 +1252,11 @@ def test_http_initialize_requires_host_issued_handoff_and_cannot_be_raced(
                 )
             )
         assert sorted(outcomes) == [200, 403]
-        assert store.status(race_run)["owner_handoff"]["authorized_owner_id"] == (
-            owner_principal
-        )
+        race_status = store.status(race_run)
+        assert race_status["owner_handoff"]["authorized_owner_id"] == owner_principal
+        # The host-issued handoff did not carry a signed local-candidate mode.
+        # Initial redemption must preserve that unknown rather than downgrading it.
+        assert race_status["committed_provenance"] is None
     finally:
         server.shutdown()
         server.server_close()

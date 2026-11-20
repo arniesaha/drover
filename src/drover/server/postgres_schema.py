@@ -42,6 +42,7 @@ NATIVE_OWNER_RECOVERY_MIGRATION = 40
 INTEGRATION_SERIALIZATION_MIGRATION = 41
 EXPECTED_EFFECT_ARTIFACT_MIGRATION = 42
 OWNER_CLAIM_EPOCH_MIGRATION = 43
+COMMITTED_PROVENANCE_MIGRATION = 44
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1079,6 +1080,12 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         OWNER_CLAIM_EPOCH_MIGRATION,
         (
             "ALTER TABLE continuity_owner_turn_claims ADD COLUMN IF NOT EXISTS owner_epoch BIGINT",
+        ),
+    ),
+    (
+        COMMITTED_PROVENANCE_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS committed_provenance BOOLEAN",
         ),
     ),
 )
