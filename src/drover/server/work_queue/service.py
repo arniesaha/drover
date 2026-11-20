@@ -574,6 +574,109 @@ class WorkService:
         ]
         provider.set_labels(ref, labels + [policy.labels.status_prefix + status])
 
+    def _verification_request(self, goal_id, number, row, item):
+        request = identity(row["run_key"], "verify", item.get("body"))
+        return request, identity(
+            self.config.workspace_id, goal_id, number, request, "verify"
+        )
+
+    def _launch_verification(
+        self, provider, policy, ref, item, row, *, goal_id, number, estimated_cost
+    ):
+        request, verification_key = self._verification_request(
+            goal_id, number, row, item
+        )
+        existing = self.store.links(run_key=verification_key)
+        if existing:
+            return existing[0]
+        if (
+            max(
+                link["failure_count"]
+                for link in self.store.links(goal_id=goal_id, number=number)
+            )
+            >= policy.retries.attempts
+        ):
+            raise WorkDenied("systemic review required before verification")
+        self.status(provider, policy, ref, item, "review")
+        return self.launch(
+            goal_id,
+            number,
+            request,
+            estimated_cost,
+            actor=WorkActor("control:queue-execution", policy.authority.coordinator),
+            run_role="verify",
+            parent_session_id=row["session_id"],
+        )
+
+    def advance_deferred_completion(self, goal_id, number):
+        """Launch one verification run after a bound worker has terminated.
+
+        This is internal queue reconciliation, never a caller-selectable update
+        action. A worker can request completion while its own turn is running;
+        only this path observes its terminal boundary and verifies its signed
+        candidate effect before it creates the separate verification session.
+        """
+        with self.lock:
+            scope, provider, policy, ref = self.scope(goal_id, number)
+            if scope.candidate_source != "local_file":
+                return None
+            item = self.checked(scope, policy, provider.get_item(ref))
+            work_links = [
+                link
+                for link in self.store.links(goal_id=goal_id, number=number)
+                if link["run_role"] == "work"
+            ]
+            if not work_links:
+                return None
+            row = work_links[-1]
+            key = identity(row["run_key"], "complete", None)
+            events = self.store.events(key)
+            if (
+                not events
+                or any(event["event_kind"] == "outcome" for event in events)
+                or any(
+                    event["event_kind"] != "intent"
+                    or event["action_category"] != "complete"
+                    for event in events
+                )
+            ):
+                return None
+            session = self.harness.resolve(row["run_key"])
+            if session is None or session.status != "completed":
+                return None
+            artifact = item.get("expected_effect_artifact")
+            terminal_done = getattr(self.harness, "terminal_work_done", None)
+            materialized = getattr(self.harness, "expected_effect_materialized", None)
+            if (
+                not isinstance(artifact, str)
+                or not artifact
+                or not callable(terminal_done)
+                or terminal_done(row["run_key"]) is not True
+                or not callable(materialized)
+                or materialized(row["run_key"], artifact) is not True
+            ):
+                return None
+            verification = self._launch_verification(
+                provider,
+                policy,
+                ref,
+                item,
+                row,
+                goal_id=goal_id,
+                number=number,
+                estimated_cost=scope.execution_estimated_cost,
+            )
+            self.store.event(
+                "control:queue-execution",
+                ref,
+                key,
+                "outcome",
+                "complete",
+                outcome="verification_scheduled",
+                link_id=row["id"],
+            )
+            return verification
+
     def update(
         self,
         goal_id,
@@ -612,6 +715,15 @@ class WorkService:
         if any(e["event_kind"] == "outcome" for e in events):
             return {"outcome": events[-1]["outcome"]}
         if events:
+            if action == "complete" and all(
+                event["event_kind"] == "intent"
+                and event["action_category"] == "complete"
+                for event in events
+            ):
+                # The worker already asked for a terminal-only verification
+                # successor. Repeating that request must not create a second
+                # intent or launch while its turn is still active.
+                return {"outcome": "deferred"}
             raise WorkDenied("provider operation uncertain; inspection required")
         if item["state"] != "open":
             raise ValueError("item already closed")
@@ -619,31 +731,40 @@ class WorkService:
             self.coordinator(actor, policy)
             if row["run_role"] != "work":
                 raise ValueError("verification needs behavioral result")
-            request = identity(run_key, "verify", item.get("body"))
-            verification_key = identity(
-                self.config.workspace_id, goal_id, number, request, "verify"
-            )
-            if not self.store.links(run_key=verification_key):
+            session = self.harness.resolve(run_key)
+            if session is None:
+                raise ValueError("work session must complete before verification")
+            if session.status != "completed":
+                scope = next(
+                    scope for scope in self.config.goals if scope.goal_id == goal_id
+                )
+                # Only a task-bound local candidate may defer its request. The
+                # terminal queue path will re-check this immutable candidate
+                # effect before it creates the separate verifier.
                 if (
-                    max(
-                        l["failure_count"]
-                        for l in self.store.links(goal_id=goal_id, number=number)
-                    )
-                    >= policy.retries.attempts
+                    scope.candidate_source != "local_file"
+                    or not isinstance(item.get("expected_effect_artifact"), str)
+                    or not item["expected_effect_artifact"]
                 ):
-                    raise WorkDenied("systemic review required before verification")
-                session = self.harness.resolve(run_key)
-                if session is None or session.status != "completed":
                     raise ValueError("work session must complete before verification")
-                self.status(provider, policy, ref, item, "review")
-            return self.launch(
-                goal_id,
-                number,
-                request,
-                estimated_cost,
-                actor=actor,
-                run_role="verify",
-                parent_session_id=row["session_id"],
+                self.store.event(
+                    actor.principal,
+                    ref,
+                    key,
+                    "intent",
+                    "complete",
+                    link_id=row["id"],
+                )
+                return {"outcome": "deferred"}
+            return self._launch_verification(
+                provider,
+                policy,
+                ref,
+                item,
+                row,
+                goal_id=goal_id,
+                number=number,
+                estimated_cost=estimated_cost,
             )
         if action not in {"verified", "failed", "progress"}:
             raise ValueError("unsupported update action")

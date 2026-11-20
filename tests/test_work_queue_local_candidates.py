@@ -11,7 +11,12 @@ from drover.server.work_queue.local_candidates import LocalCandidateProvider
 from drover.server.work_queue.provider import ItemRef
 from drover.server.work_queue.reconciler import QueueExecutionWorker, ShadowReconciler
 from drover.server.work_queue.runtime import HarnessBridge
-from drover.server.work_queue.service import WorkDenied, WorkService, identity
+from drover.server.work_queue.service import (
+    WorkActor,
+    WorkDenied,
+    WorkService,
+    identity,
+)
 from drover.server.work_queue.store import WorkStore
 
 
@@ -106,6 +111,38 @@ def test_local_candidate_effect_reference_is_explicit_and_bounded(tmp_path):
         _manifest(path, expected_effect=invalid)
         with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
             provider.authenticate()
+
+
+def test_bridge_terminal_work_done_requires_bound_done_projection(monkeypatch):
+    from drover.server.harness.continuity import FactoryObserverContinuity
+
+    bridge = object.__new__(HarnessBridge)
+    bridge.resolve = lambda run_key: SimpleNamespace(
+        session_id="worker-session", status="completed", handoff_mode="work_coordinator"
+    )
+    bridge.collector = SimpleNamespace(duckdb_path="ignored")
+    observed = []
+
+    def status(_self, run_id):
+        observed.append(run_id)
+        return {"session_id": "worker-session", "worker_state": "done"}
+
+    monkeypatch.setattr(FactoryObserverContinuity, "status", status)
+    assert bridge.terminal_work_done("bound-run") is True
+    assert observed == ["work-bound-run"]
+
+    monkeypatch.setattr(
+        FactoryObserverContinuity,
+        "status",
+        lambda *_: {"session_id": "worker-session", "worker_state": "blocked"},
+    )
+    assert bridge.terminal_work_done("bound-run") is False
+    monkeypatch.setattr(
+        FactoryObserverContinuity,
+        "status",
+        lambda *_: {"session_id": "other-session", "worker_state": "done"},
+    )
+    assert bridge.terminal_work_done("bound-run") is False
 
 
 @pytest.mark.parametrize(
@@ -888,3 +925,198 @@ def test_deployment_selector_refuses_recovery_without_existing_signed_session(tm
     bridge.config = SimpleNamespace(goals=[downgraded])
     with pytest.raises(WorkDenied, match="existing signed session"):
         bridge._recovery_payload("a" * 32, {"harness": "codex"})
+
+
+def _deferred_completion_service(
+    tmp_path, pg_control_path, *, materialized=True, terminal_done=True
+):
+    path = tmp_path / "candidates.json"
+    expected = "local-file:.drover-native-canary/source-task-28.json"
+    _manifest(path, expected_effect=expected)
+    scope = _scope(
+        path,
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path / "checkout")},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+    )
+    config = WorkQueueConfig(
+        enabled=True,
+        shadow_mode=False,
+        workspace_id="local-workspace",
+        execution={"global_max_workers": 2},
+        goals=[scope],
+    )
+
+    class Harness:
+        def __init__(self):
+            self.sessions = {}
+            self.launches = []
+
+        def active(self, links, *, release_finalised=True):
+            return [
+                link
+                for link in links
+                if not link["session_id"]
+                or self.sessions[link["run_key"]].status == "running"
+            ]
+
+        def resolve(self, run_key):
+            return self.sessions.get(run_key)
+
+        def quota(self):
+            return [
+                {
+                    "provider": "openai",
+                    "status": "ok",
+                    "hosts": [{"host_id": "host"}],
+                    "windows": [{"kind": "primary", "status": "ok", "used_percent": 1}],
+                }
+            ]
+
+        def eligible(self, goal_id=None, parent_session_id=None):
+            return {("host", "codex")}
+
+        def terminal_work_done(self, run_key):
+            return terminal_done
+
+        def expected_effect_materialized(self, run_key, artifact):
+            assert artifact == expected
+            return materialized
+
+        def coordinator_failure_category(self, run_key):
+            return None
+
+        def launch(self, host, harness, run_key, ref, role, parent, goal_id, **kwargs):
+            self.launches.append((run_key, role, parent, kwargs))
+            self.sessions[run_key] = SimpleNamespace(
+                session_id=f"session-{len(self.launches)}",
+                status="running",
+                host_id=host,
+                parent_session_id=parent,
+            )
+            return self.sessions[run_key].session_id
+
+    provider = LocalCandidateProvider(config.workspace_id, scope)
+    harness = Harness()
+    service = WorkService(
+        config,
+        WorkStore(pg_control_path, config.workspace_id),
+        {scope.goal_id: provider},
+        harness,
+    )
+    worker = QueueExecutionWorker(service)
+    worker.process_once()
+    work = service.store.links(goal_id=scope.goal_id, number=1)[0]
+    return scope, provider, harness, service, worker, work
+
+
+def test_queue_worker_defers_bound_completion_until_terminal_then_launches_verify(
+    tmp_path, pg_control_path
+):
+    scope, provider, harness, service, worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path
+    )
+    actor = WorkActor("credential:coordinator", "nix")
+
+    # The worker records a completion request while its structured turn is
+    # still active. Verification cannot launch until that exact work session
+    # reaches its terminal boundary.
+    assert service.update(
+        scope.goal_id,
+        1,
+        work["run_key"],
+        "complete",
+        actor=actor,
+        estimated_cost=1,
+    ) == {"outcome": "deferred"}
+    assert len(harness.launches) == 1
+    assert service.update(
+        scope.goal_id,
+        1,
+        work["run_key"],
+        "complete",
+        actor=actor,
+        estimated_cost=1,
+    ) == {"outcome": "deferred"}
+    assert len(service.store.events(identity(work["run_key"], "complete", None))) == 1
+    assert [
+        label["name"]
+        for label in provider.get_item(_ref())["labels"]
+        if label["name"].startswith("status:")
+    ] == ["status:running"]
+
+    harness.sessions[work["run_key"]].status = "completed"
+    worker.process_once()
+    links = service.store.links(goal_id=scope.goal_id, number=1)
+    assert [link["run_role"] for link in links] == ["work", "verify"]
+    assert harness.launches[-1][1:3] == ("verify", work["session_id"])
+    assert [
+        label["name"]
+        for label in provider.get_item(_ref())["labels"]
+        if label["name"].startswith("status:")
+    ] == ["status:review"]
+
+    # The durable deferred-completion intent yields one verification successor.
+    worker.process_once()
+    assert len(service.store.links(goal_id=scope.goal_id, number=1)) == 2
+
+
+def test_queue_worker_does_not_infer_completion_without_worker_request(
+    tmp_path, pg_control_path
+):
+    """An old terminal worker, such as candidate 28, is never auto-rescued."""
+    scope, provider, harness, service, worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path
+    )
+    harness.sessions[work["run_key"]].status = "completed"
+
+    worker.process_once()
+
+    assert [
+        link["run_role"]
+        for link in service.store.links(goal_id=scope.goal_id, number=1)
+    ] == ["work"]
+    assert not service.store.events(identity(work["run_key"], "complete", None))
+    assert [
+        label["name"]
+        for label in provider.get_item(_ref())["labels"]
+        if label["name"].startswith("status:")
+    ] == ["status:running"]
+
+
+@pytest.mark.parametrize(
+    ("terminal", "materialized", "terminal_done"),
+    [("errored", True, True), ("completed", False, True), ("completed", True, False)],
+    ids=["terminal-error", "missing-bound-effect", "human-or-blocked-terminal"],
+)
+def test_queue_worker_never_advances_deferred_completion_without_terminal_bound_effect(
+    tmp_path, pg_control_path, terminal, materialized, terminal_done
+):
+    scope, provider, harness, service, worker, work = _deferred_completion_service(
+        tmp_path,
+        pg_control_path,
+        materialized=materialized,
+        terminal_done=terminal_done,
+    )
+    assert service.update(
+        scope.goal_id,
+        1,
+        work["run_key"],
+        "complete",
+        actor=WorkActor("credential:coordinator", "nix"),
+        estimated_cost=1,
+    ) == {"outcome": "deferred"}
+    harness.sessions[work["run_key"]].status = terminal
+
+    worker.process_once()
+    assert [
+        link["run_role"]
+        for link in service.store.links(goal_id=scope.goal_id, number=1)
+    ] == ["work"]
+    assert [
+        label["name"]
+        for label in provider.get_item(_ref())["labels"]
+        if label["name"].startswith("status:")
+    ] == ["status:running"]
