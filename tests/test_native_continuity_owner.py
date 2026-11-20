@@ -1,4 +1,5 @@
 import json
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -266,6 +267,85 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
 
     assert runner.process_once() == 1
     assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 1
+
+
+def test_concurrent_owner_kicks_do_not_spend_final_wake_before_claim(
+    tmp_path, monkeypatch
+):
+    """One shared owner slot serializes concurrent terminal deliveries first."""
+    runner, collector, store, first_run, _ = _runner(tmp_path, event_kind="worker_done")
+    scope = runner.config.goals[0]
+    assert runner._session(scope) is not None
+
+    runner.registry.create_session(
+        session_id="observer-session-two",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/project-two",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-second@1",
+    )
+    second_run = store.initialize(
+        session_id="observer-session-two",
+        objective="Native continuity two",
+        checkpoint="started",
+        authorized_owner_id=scope.continuity_owner_id,
+    )
+    store.report(
+        second_run,
+        source="hub",
+        source_event_id="done-2",
+        subject="worker-2",
+        sequence=1,
+        kind="worker_done",
+        summary="done",
+    )
+
+    runs = {"first-owner-kick": first_run, "second-owner-kick": second_run}
+    monkeypatch.setattr(
+        runner.continuity,
+        "owner_runs",
+        lambda _owner: [runs[threading.current_thread().name]],
+    )
+    start_gate = threading.Barrier(2)
+    active_check_gate = threading.Barrier(2, timeout=0.2)
+    original_active_claim = runner._has_active_claim
+
+    def synchronize_active_check(candidate_scope):
+        try:
+            active_check_gate.wait()
+        except threading.BrokenBarrierError:
+            # A serialized runner has exactly one active check at a time.
+            pass
+        return original_active_claim(candidate_scope)
+
+    monkeypatch.setattr(runner, "_has_active_claim", synchronize_active_check)
+    failures = []
+
+    def kick():
+        try:
+            start_gate.wait()
+            runner.process_once()
+        except Exception as exc:  # pragma: no cover - assertion below retains it
+            failures.append(exc)
+
+    first = threading.Thread(target=kick, name="first-owner-kick")
+    second = threading.Thread(target=kick, name="second-owner-kick")
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not failures
+    assert not first.is_alive() and not second.is_alive()
+    attempts = [
+        store.status(run_id)["events"][0]["attempts"]
+        for run_id in (first_run, second_run)
+    ]
+    assert sum(attempts) == 1
     assert len(collector.turn_attempts) == 1
 
 
