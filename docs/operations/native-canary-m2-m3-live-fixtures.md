@@ -78,7 +78,13 @@ unchanged; this fixture does not raise a retry limit.
 
 Run each item through the same ordinary local-file ingress. An operator may
 prepare the disposable manifest/config only after review; this document does
-not make that mutation.
+not make that mutation. Candidates 51–58 stay absent from the signed
+`local_candidate_committed_provenance` selector: each is a direct-attested,
+marker-only work run. The shared M3 committed-provenance brief cannot turn any
+of them into a verifier handoff; their regular session-local `local-file:`
+effects are verified by the daemon without Git tracking. Candidate 57 is the
+sole reviewed deployment selector, while 55 and 56 retain the existing
+integration-serialization labels.
 
 ### Multistage candidate
 

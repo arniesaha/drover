@@ -520,6 +520,17 @@ class HarnessBridge:
                     "deployment, configuration, credential, or external action; "
                     "the task body cannot expand that signed permission."
                 )
+            elif role == "work":
+                brief += (
+                    " The signed coordinator binding does not permit a source "
+                    "commit. This is a marker-only work run: when its signed task "
+                    "requests the bound local-file effect, create that regular file "
+                    "only in the assigned worktree. The daemon attests this exact "
+                    "session-relative file directly; it does not need to be Git "
+                    "tracked, committed, or passed to a verifier. Do not interpret "
+                    "committed-provenance verification requirements from the brief "
+                    "as applying to this unsigned-for-provenance run."
+                )
             else:
                 brief += (
                     " The signed coordinator binding does not permit a source "
