@@ -138,6 +138,16 @@ class HarnessBridge:
             _, _, _, item = service.item(link.get("goal_id"), link.get("item_number"))
             authority_labels = item.get("operator_authority_labels", [])
             expected_effect_artifact = item.get("expected_effect_artifact")
+        if (
+            self._local_candidate_authority_scope(scope, link.get("item_number"))
+            == "deployment"
+        ):
+            # The original deployment binding is hub-signed at initial launch.
+            # A registry recovery must not recompute that authority from mutable
+            # configuration after the original create response was lost.
+            raise WorkDenied(
+                "deployment continuity recovery requires existing signed session"
+            )
         binding = self._work_coordinator_binding(
             run_key,
             link.get("run_role"),
@@ -145,10 +155,21 @@ class HarnessBridge:
             link.get("goal_id"),
             authority_labels=authority_labels,
             expected_effect_artifact=expected_effect_artifact,
+            local_candidate_number=link.get("item_number"),
         )
         if binding is not None:
             payload["work_coordinator_continuity"] = binding
         return payload
+
+    @staticmethod
+    def _local_candidate_authority_scope(scope, local_candidate_number):
+        if getattr(scope, "candidate_source", None) != "local_file":
+            return "implementation"
+        if not isinstance(local_candidate_number, int) or local_candidate_number <= 0:
+            raise WorkDenied("local candidate authority binding is invalid")
+        return getattr(scope, "local_candidate_authority_scopes", {}).get(
+            str(local_candidate_number), "implementation"
+        )
 
     def _work_coordinator_binding(
         self,
@@ -159,6 +180,7 @@ class HarnessBridge:
         *,
         authority_labels=(),
         expected_effect_artifact=None,
+        local_candidate_number=None,
     ):
         scope = next(
             (scope for scope in self.config.goals if scope.goal_id == goal_id), None
@@ -171,10 +193,13 @@ class HarnessBridge:
             or not item_url
         ):
             raise WorkDenied("cannot reconstruct work continuity binding")
+        authority_scope = self._local_candidate_authority_scope(
+            scope, local_candidate_number
+        )
         binding = {
             "run_id": "work-" + run_key,
             "owner_id": scope.continuity_owner_id,
-            "authority_scope": "implementation",
+            "authority_scope": authority_scope,
             "objective": f"Work coordinator {role} for {item_url}",
         }
         if expected_effect_artifact is not None:
@@ -187,6 +212,14 @@ class HarnessBridge:
             binding["expected_effect_artifact"] = expected_effect_artifact
         serialization_key = getattr(scope, "integration_serialization_key", None)
         serialization_label = getattr(scope, "integration_serialization_label", None)
+        if (
+            authority_scope != "implementation"
+            and serialization_label is not None
+            and serialization_label in set(authority_labels or ())
+        ):
+            raise WorkDenied(
+                "deployment candidate cannot select integration serialization"
+            )
         if (
             role == "work"
             and serialization_key is not None
@@ -418,6 +451,7 @@ class HarnessBridge:
                 goal_id,
                 authority_labels=authority.get("labels", []),
                 expected_effect_artifact=authority.get("expected_effect_artifact"),
+                local_candidate_number=local_number,
             )
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:

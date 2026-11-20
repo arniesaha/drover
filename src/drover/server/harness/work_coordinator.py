@@ -124,7 +124,7 @@ def _parse_work_coordinator_continuity(
         raise FactoryObserverRequestError(
             "work continuity owner_id must be a canonical agent or native owner key"
         )
-    if scope not in {"implementation", "integration"}:
+    if scope not in {"implementation", "integration", "deployment"}:
         raise FactoryObserverRequestError("work continuity scope is invalid")
     if not isinstance(objective, str) or not objective.strip() or len(objective) > 4000:
         raise FactoryObserverRequestError("work continuity objective is invalid")

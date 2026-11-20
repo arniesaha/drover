@@ -64,6 +64,18 @@
         "delivery:integration"
       ],
       "expected_effect_artifact": "local-file:.drover-native-canary/source-task-32.json"
+    },
+    {
+      "number": 33,
+      "state": "open",
+      "body": "M3 genuine human-gate branch. In only the daemon-assigned disposable worktree, create exactly .drover-native-canary/source-task-33.json as a regular JSON file containing a JSON object identifying candidate 33 and phase m3-await-human-approval. Do not modify tracked source, configuration, credentials, network resources, or external services. Do not request, infer, or fabricate approval; finish with one Drover-State: done sha=<current 40-character git HEAD> line. The signed deployment authority is selected only by the reviewed hub goal configuration, never by this body or its labels.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-33.json"
     }
   ]
 }

@@ -255,19 +255,33 @@ contains exact normal ingress records for:
 - candidates 31 and 32, each carrying `delivery:integration`, so the existing
   goal's serialization label/key select a normal signed
   `delivery_role=integration_serialized` binding. Actual reservation generation,
-  epoch, fence and release-after-ACK evidence remains required.
+  epoch, fence and release-after-ACK evidence remains required; and
+- candidate 33, the genuine human-gated branch. Its manifest has no authority
+  label or scope field. The reviewed policy and goal-scope delta alone select
+  deployment authority for this exact candidate number.
 
 [`fixtures/native-canary-m3-signed-binding-input.json`](fixtures/native-canary-m3-signed-binding-input.json)
-is an offline equality check for the existing selected goal values. It is not a
-TOML patch and has no HMAC: only `HarnessBridge` can sign a launch binding with
-the canary secret.
+contains the offline, review-only policy opt-in
+`local_candidate_deployment_scope_enabled: true` and the goal selector
+`local_candidate_authority_scopes: {"33": "deployment"}`. It is not a TOML
+patch and has no HMAC: only `HarnessBridge` can sign the normal launch binding
+with the canary secret.
 
-A genuine deployment human gate is **not** currently runnable from local-file
-ingress. `HarnessBridge._work_coordinator_binding` hard-codes
-`authority_scope="implementation"`, and `LocalCandidateProvider._item` rejects
-a manifest `authority_scope` field. The focused
-`test_local_candidate_manifest_rejects_caller_selected_deployment_scope` test
-keeps that boundary fail-closed. There is no safe offline configuration delta
-that can claim a signed deployment binding today. A separate minimal feature
-must add a policy-bound, hub-signed selector before M3 deployment can run; a
-label, marker, or injected ACK cannot substitute.
+The selector is deliberately narrow. `GoalScope` accepts it only for an exact
+positive local candidate number, its own `drover:owner/<goal>` native owner, and
+a policy that explicitly enables deployment selection. The local manifest
+schema still rejects `authority_scope`, the worker body cannot choose scope, and
+a deployment-selected candidate cannot select integration serialization.
+`HarnessBridge` signs the resulting deployment scope. If the original create
+response is lost, registry recovery fails closed rather than recomputing that
+authority from changed configuration.
+
+For candidate 33, a terminal worker report must yield the signed deployment
+continuity run and `request_explicit_approval`, with no executor wake, owner
+effect, or ACK. Its paired human decision remains unanswered. In the same
+observation window an independent implementation candidate, such as 29 or 30,
+must advance normally. Approval is not part of this fixture. The focused tests
+`test_policy_opted_local_deployment_selector_is_hub_signed`,
+`test_local_candidate_manifest_rejects_caller_selected_deployment_scope`, and
+the existing continuity deployment-gate tests cover the selector, hub HMAC,
+manifest rejection, and fail-closed human gate.

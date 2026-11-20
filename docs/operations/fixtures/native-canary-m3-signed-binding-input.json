@@ -19,7 +19,22 @@
     "delivery:integration"
   ],
   "deployment_gate": {
-    "runnable": false,
-    "reason": "Current HarnessBridge._work_coordinator_binding hard-codes authority_scope=implementation and LocalCandidateProvider rejects an authority_scope item field. A manifest/config delta cannot safely produce a deployment-authority binding on this source."
+    "runnable_after_reviewed_alignment": true,
+    "candidate": 33,
+    "scope": "deployment",
+    "expected_behavior": "the hub-signed binding causes a request_explicit_approval action; the wake has no owner executor action or ACK until a separate paired human approval exists",
+    "recovery_constraint": "if the initial signed session cannot be recovered, hub recovery fails closed instead of recomputing deployment authority from configuration"
+  },
+  "policy_delta": {
+    "authority": {
+      "local_candidate_deployment_scope_enabled": true
+    },
+    "purpose": "reviewed isolated-canary policy opt-in; false remains the default on ordinary goals"
+  },
+  "goal_scope_delta": {
+    "local_candidate_authority_scopes": {
+      "33": "deployment"
+    },
+    "purpose": "hub configuration selects only candidate 33; manifest labels and body cannot select a scope"
   }
 }

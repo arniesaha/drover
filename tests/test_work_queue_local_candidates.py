@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from drover.server.harness.work_coordinator import parse_work_coordinator_continuity
 from drover.server.work_queue.config import GoalScope, WorkQueueConfig
 from drover.server.work_queue.github import ProviderUnavailable
 from drover.server.work_queue.local_candidates import LocalCandidateProvider
@@ -687,7 +688,7 @@ def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
     ("fixture_name", "numbers"),
     [
         ("native-canary-m2-candidates-26-27.json", [26, 27]),
-        ("native-canary-m3-candidates-28-32.json", [28, 29, 30, 31, 32]),
+        ("native-canary-m3-candidates-28-32.json", [28, 29, 30, 31, 32, 33]),
     ],
 )
 def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
@@ -729,6 +730,8 @@ def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
             "delivery:integration" in item["operator_authority_labels"]
             for item in integration
         )
+        deployment = next(item for item in items if item["number"] == 33)
+        assert "delivery:integration" not in deployment["operator_authority_labels"]
 
 
 def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_path):
@@ -742,3 +745,137 @@ def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_p
     provider = LocalCandidateProvider("local-workspace", _scope(path))
     with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
         provider.authenticate()
+
+
+def test_policy_opted_local_deployment_selector_is_hub_signed(tmp_path):
+    """Only policy/config can select a deployment gate; manifest labels cannot."""
+    path = tmp_path / "candidates.json"
+    _manifest(path)
+    policy_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "drover"
+        / "server"
+        / "work_queue"
+        / "policy-v1.json"
+    )
+    policy = json.loads(policy_source.read_text(encoding="utf-8"))
+    policy["authority"]["local_candidate_deployment_scope_enabled"] = True
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    scope = _scope(
+        path,
+        policy_path=str(policy_path),
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path / "checkout")},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+        local_candidate_authority_scopes={"33": "deployment"},
+        integration_serialization_key="canary-write",
+        integration_serialization_label="delivery:integration",
+    )
+    config = WorkQueueConfig(
+        enabled=True, shadow_mode=False, workspace_id="local-workspace", goals=[scope]
+    )
+    bridge = object.__new__(HarnessBridge)
+    bridge.config = config
+    bridge.collector = SimpleNamespace(work_coordinator_continuity_secret="hub-secret")
+
+    binding = bridge._work_coordinator_binding(
+        "a" * 32,
+        "work",
+        "local://goal-local/33",
+        scope.goal_id,
+        local_candidate_number=33,
+    )
+    parsed, _ = parse_work_coordinator_continuity(
+        {"harness": "codex", "work_coordinator_continuity": binding},
+        hub_secret="hub-secret",
+    )
+
+    assert parsed.authority_scope == "deployment"
+    implementation_binding = bridge._work_coordinator_binding(
+        "c" * 32,
+        "work",
+        "local://goal-local/34",
+        scope.goal_id,
+        local_candidate_number=34,
+    )
+    implementation, _ = parse_work_coordinator_continuity(
+        {"harness": "codex", "work_coordinator_continuity": implementation_binding},
+        hub_secret="hub-secret",
+    )
+    assert implementation.authority_scope == "implementation"
+    with pytest.raises(WorkDenied, match="cannot select integration"):
+        bridge._work_coordinator_binding(
+            "b" * 32,
+            "work",
+            "local://goal-local/33",
+            scope.goal_id,
+            authority_labels=["delivery:integration"],
+            local_candidate_number=33,
+        )
+
+    policy["authority"]["local_candidate_deployment_scope_enabled"] = False
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    with pytest.raises(ValueError, match="policy opt-in"):
+        _scope(
+            path,
+            policy_path=str(policy_path),
+            execution_enabled=True,
+            execution_cwds={"host": str(tmp_path / "checkout")},
+            brief_ref="docs/local-canary.md",
+            continuity_owner_id="drover:owner/goal-local",
+            continuity_owner_harness="codex",
+            local_candidate_authority_scopes={"33": "deployment"},
+        )
+
+
+def test_deployment_selector_refuses_recovery_without_existing_signed_session(tmp_path):
+    """A lost create response cannot recompute deployment authority from config."""
+    path = tmp_path / "candidates.json"
+    _manifest(path)
+    policy_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "drover"
+        / "server"
+        / "work_queue"
+        / "policy-v1.json"
+    )
+    policy = json.loads(policy_source.read_text(encoding="utf-8"))
+    policy["authority"]["local_candidate_deployment_scope_enabled"] = True
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    scope = _scope(
+        path,
+        policy_path=str(policy_path),
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path / "checkout")},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+        local_candidate_authority_scopes={"33": "deployment"},
+    )
+    bridge = object.__new__(HarnessBridge)
+    bridge.config = SimpleNamespace(goals=[scope])
+    bridge.collector = SimpleNamespace(
+        work_control=SimpleNamespace(
+            store=SimpleNamespace(
+                links=lambda *, run_key: [
+                    {
+                        "run_key": run_key,
+                        "goal_id": "goal-local",
+                        "run_role": "work",
+                        "item_number": 33,
+                        "item_url": "local://goal-local/33",
+                    }
+                ]
+            ),
+            item=lambda *_: (None, None, None, {"operator_authority_labels": []}),
+        )
+    )
+
+    with pytest.raises(WorkDenied, match="existing signed session"):
+        bridge._recovery_payload("a" * 32, {"harness": "codex"})
