@@ -81,8 +81,13 @@ def acceptance(tmp_path, monkeypatch):
     effects.mkdir()
     state = SimpleNamespace(interrupt=False, gate_denials=[])
 
-    def execute(session_id, action, payload):
-        response = original(session_id, action, payload)
+    def execute(session_id, action, payload, *, recovery_payload_factory=None):
+        response = original(
+            session_id,
+            action,
+            payload,
+            recovery_payload_factory=recovery_payload_factory,
+        )
         fields = dict(
             line.split(": ", 1) for line in payload["text"].splitlines() if ": " in line
         )
