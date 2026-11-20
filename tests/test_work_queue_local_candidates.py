@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -680,3 +681,64 @@ def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
 
     worker.process_once()
     assert len(store.events(recovery_key)) == 1
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "numbers"),
+    [
+        ("native-canary-m2-candidates-26-27.json", [26, 27]),
+        ("native-canary-m3-candidates-28-32.json", [28, 29, 30, 31, 32]),
+    ],
+)
+def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
+    tmp_path, fixture_name, numbers
+):
+    """Offline review fixtures remain valid ordinary local-file ingress records."""
+    fixture = (
+        Path(__file__).parents[1] / "docs" / "operations" / "fixtures" / fixture_name
+    )
+    path = tmp_path / "candidates.json"
+    path.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    scope = GoalScope.model_validate(
+        {
+            "goal_id": "native-canary-924-848",
+            "repo": "arniesaha/drover",
+            "goal_label": "goal:native-canary-924-848",
+            "candidate_source": "local_file",
+            "local_candidates_path": str(path),
+            "credential": {
+                "token_env": "UNUSED_LOCAL_CANDIDATE_TOKEN",
+                "capabilities": ["issues_read"],
+            },
+        }
+    )
+    provider = LocalCandidateProvider("native-canary-924-848", scope)
+
+    provider.authenticate()
+    items = provider.list_items()
+
+    assert [item["number"] for item in items] == numbers
+    assert all("status:queued" in item["operator_authority_labels"] for item in items)
+    assert all(
+        item["expected_effect_artifact"].startswith("local-file:.drover-native-canary/")
+        for item in items
+    )
+    if fixture_name.startswith("native-canary-m3"):
+        integration = [item for item in items if item["number"] in {31, 32}]
+        assert all(
+            "delivery:integration" in item["operator_authority_labels"]
+            for item in integration
+        )
+
+
+def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_path):
+    """A local manifest cannot fabricate the deployment human-gate binding."""
+    path = tmp_path / "candidates.json"
+    _manifest(path)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["items"][0]["authority_scope"] = "deployment"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    provider = LocalCandidateProvider("local-workspace", _scope(path))
+    with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
+        provider.authenticate()

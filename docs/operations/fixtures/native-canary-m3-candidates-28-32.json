@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "workspace_id": "native-canary-924-848",
+  "goal_id": "native-canary-924-848",
+  "items": [
+    {
+      "number": 28,
+      "state": "open",
+      "body": "M3 work stage. In only the daemon-assigned disposable worktree, create .drover-native-canary/m3-28-analysis.json, .drover-native-canary/m3-28-implementation.json, and .drover-native-canary/m3-28-focused-tests.json, then create .drover-native-canary/source-task-28.json containing a JSON object identifying candidate 28 and phase m3-work-complete. Each file must be a regular JSON file. Do not modify tracked source, configuration, credentials, network resources, or external services. After these real artifacts and the focused test result exist, use the available normal drover_work_update tool with action=complete for this run so WorkService can create the separate verification run. Do not claim that this one worker turn is the verification stage. Finish with one Drover-State: done sha=<current 40-character git HEAD> line.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-28.json"
+    },
+    {
+      "number": 29,
+      "state": "open",
+      "body": "M3 independent overlap A. In only the daemon-assigned disposable worktree, create exactly `.drover-native-canary/source-task-29.json` containing `{\"candidate\":29,\"phase\":\"m3-independent-a\"}`. Do not modify tracked source, configuration, credentials, network resources, or external services. Finish with one `Drover-State: done sha=<current 40-character git HEAD>` line.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-29.json"
+    },
+    {
+      "number": 30,
+      "state": "open",
+      "body": "M3 independent overlap B. In only the daemon-assigned disposable worktree, create exactly `.drover-native-canary/source-task-30.json` containing `{\"candidate\":30,\"phase\":\"m3-independent-b\"}`. Do not modify tracked source, configuration, credentials, network resources, or external services. Finish with one `Drover-State: done sha=<current 40-character git HEAD>` line.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-30.json"
+    },
+    {
+      "number": 31,
+      "state": "open",
+      "body": "M3 serialized integration A. In only the daemon-assigned disposable worktree, create exactly `.drover-native-canary/source-task-31.json` containing `{\"candidate\":31,\"phase\":\"m3-integration-a\"}`. Do not modify tracked source, configuration, credentials, network resources, or external services. Finish with one `Drover-State: done sha=<current 40-character git HEAD>` line.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued",
+        "delivery:integration"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-31.json"
+    },
+    {
+      "number": 32,
+      "state": "open",
+      "body": "M3 serialized integration B. In only the daemon-assigned disposable worktree, create exactly `.drover-native-canary/source-task-32.json` containing `{\"candidate\":32,\"phase\":\"m3-integration-b\"}`. Do not modify tracked source, configuration, credentials, network resources, or external services. Finish with one `Drover-State: done sha=<current 40-character git HEAD>` line.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued",
+        "delivery:integration"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-32.json"
+    }
+  ]
+}

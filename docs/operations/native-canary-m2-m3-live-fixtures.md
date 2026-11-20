@@ -131,3 +131,143 @@ or an injected acknowledgement.
 
 The final run report must distinguish these live artifacts from fixture tests.
 Nothing here proves #924 or #848 until the corresponding direct records exist.
+
+## Reviewed offline records
+
+The next M2 input is the complete, schema-validated manifest at
+[`fixtures/native-canary-m2-candidates-26-27.json`](fixtures/native-canary-m2-candidates-26-27.json).
+It is an offline review record only; the integration owner may copy its two
+items into the existing disposable manifest after independent review.
+
+Both records use the current ordinary ingress shape:
+
+- `version: 1`, `workspace_id`, and `goal_id` are `native-canary-924-848`.
+- Candidate 26 is `state: open`, labelled `goal:native-canary-924-848`,
+  `agent:nix`, `status:queued`, and binds
+  `local-file:.drover-native-canary/source-task-26.json`.
+- Candidate 27 uses the same normal queued labels and binds
+  `local-file:.drover-native-canary/source-task-27.json`.
+- Each task says that the harness-assigned disposable worktree is authoritative;
+  a missing entry in the old static map is not another worker authorization gate.
+
+`status:queued` is required: `ShadowReconciler` projects it as
+`launch_candidate`, then `QueueExecutionWorker.process_once` is the sole
+automatic path to `WorkService.launch_candidate`. Neither this document nor an
+owner may call that method directly.
+
+### Paired, sanitized observation command
+
+After a reviewed record is staged, the owner can use this read-only observation
+snippet. It reuses the approved paired helper in process memory, prints no
+credential value, task body, transcript, or request headers, and does not use a
+control-store module.
+
+    PYTHONPATH=src /path/to/canary-python - <<'PY'
+    import contextlib, io, json, runpy
+    helper_path = (
+        "/Users/arnab/scratch/drover-native-canary-setup-20261118/"
+        "runtime/env/root-read-candidate-15.py"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        helper = runpy.run_path(helper_path)
+    request = helper["request"]
+    token = helper["redeemed"]["token"]  # memory only: never print or persist
+    for number in (26, 27):
+        status, work = request(
+            f"/work/get?goal_id=native-canary-924-848&number={number}",
+            token=token,
+        )
+        links = work.get("links") if isinstance(work, dict) else []
+        for link in links if isinstance(links, list) else []:
+            if not isinstance(link, dict):
+                continue
+            safe_link = {key: link.get(key) for key in (
+                "id", "run_key", "run_role", "session_id", "failure_count",
+                "created_at", "updated_at", "last_progress_at",
+            )}
+            print(json.dumps({"candidate": number, "work_status": status,
+                              "link": safe_link}, sort_keys=True))
+            run_key = safe_link.get("run_key")
+            if isinstance(run_key, str) and run_key:
+                c_status, result = request(
+                    "/harness/factory-observer/continuity?run_id=work-" + run_key,
+                    token=token,
+                )
+                continuity = result.get("continuity", {}) if isinstance(result, dict) else {}
+                print(json.dumps({
+                    "candidate": number, "continuity_status": c_status,
+                    "run_id": "work-" + run_key,
+                    "owner": continuity.get("owner"),
+                    "owner_handoff": continuity.get("owner_handoff"),
+                    "next_action": continuity.get("next_action"),
+                    "events": continuity.get("events"),
+                }, sort_keys=True))
+    PY
+
+The paired run readback identifies the worker link, source events, wake state,
+owner epoch/lease, and final action intent. It intentionally does **not** reveal
+an owner session or `client_turn_id` to the device principal. The owner must
+locate those identifiers through the existing authenticated, sanitized
+owner/coordinator readback, recording only wake ID, session ID, turn ID, epoch,
+lease, action fingerprint and action-intent state. A database query or
+transcript endpoint is not an alternative.
+
+### Precise M2 interruption boundary
+
+Restart the disposable hub only after the candidate-26 final `worker_done` wake
+has all of these machine-readable facts:
+
+1. its source worker is terminal and the bound daemon endpoint reports the
+   exact expected artifact `materialized`;
+2. continuity names a final wake with a nonempty action intent for that same
+   artifact and a durable owner epoch/lease or turn claim;
+3. the durable action receipt/intent is complete, but that exact wake is not
+   `acknowledged`; and
+4. there is exactly one regular owner-marker hash and no second effect hash.
+
+This is after a materialized **owner** effect and before its ACK, not merely
+after the worker-side artifact. If an ACK has already settled, retain ordinary
+success and stop rather than manufacturing a race. After the permitted hub
+restart, exact-once evidence requires the same wake ID, a recovery checkpoint,
+a successor epoch that fences the predecessor, an unchanged marker hash, and a
+receipt/ACK for the same expected artifact. A new candidate, changed artifact,
+or second marker fails the fixture.
+
+Candidate 27 is a real ready witness only while `work/get` has no link and the
+queue report projects `launch_candidate`. With the current cap of two it may
+automatically launch before the restart; that proves preservation and progress,
+but not that it remained ready. The stronger no-lost-ready observation requires
+that same queued state while two ordinary worker links consume the cap, without
+a manual hold, sleep, or barrier. Otherwise report the actual state honestly.
+
+## M3 offline inputs and explicit source limits
+
+[`fixtures/native-canary-m3-candidates-28-32.json`](fixtures/native-canary-m3-candidates-28-32.json)
+contains exact normal ingress records for:
+
+- candidate 28, whose worker writes analysis, implementation and focused-test
+  artifacts, then uses the existing `drover_work_update` tool with
+  `action=complete`. This is the supported transition: `WorkService.update`
+  changes the item to `status:review` and launches a separate `verify` run with
+  the parent worker session. One prose completion is not several native stages;
+- candidates 29 and 30, independent harmless effects whose real intervals must
+  overlap under cap two without a barrier or sleep; and
+- candidates 31 and 32, each carrying `delivery:integration`, so the existing
+  goal's serialization label/key select a normal signed
+  `delivery_role=integration_serialized` binding. Actual reservation generation,
+  epoch, fence and release-after-ACK evidence remains required.
+
+[`fixtures/native-canary-m3-signed-binding-input.json`](fixtures/native-canary-m3-signed-binding-input.json)
+is an offline equality check for the existing selected goal values. It is not a
+TOML patch and has no HMAC: only `HarnessBridge` can sign a launch binding with
+the canary secret.
+
+A genuine deployment human gate is **not** currently runnable from local-file
+ingress. `HarnessBridge._work_coordinator_binding` hard-codes
+`authority_scope="implementation"`, and `LocalCandidateProvider._item` rejects
+a manifest `authority_scope` field. The focused
+`test_local_candidate_manifest_rejects_caller_selected_deployment_scope` test
+keeps that boundary fail-closed. There is no safe offline configuration delta
+that can claim a signed deployment binding today. A separate minimal feature
+must add a policy-bound, hub-signed selector before M3 deployment can run; a
+label, marker, or injected ACK cannot substitute.

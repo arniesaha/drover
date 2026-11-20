@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "purpose": "offline review input; not an executable runtime configuration",
+  "goal_id": "native-canary-924-848",
+  "requires_existing_goal_scope_values": {
+    "candidate_source": "local_file",
+    "execution_enabled": true,
+    "execution_max_workers": 2,
+    "continuity_owner_id": "drover:owner/native-canary-924-848",
+    "continuity_owner_harness": "codex",
+    "integration_serialization_key": "canary-integration-924-848",
+    "integration_serialization_label": "delivery:integration"
+  },
+  "signing_boundary": "HarnessBridge signs these selected values into each ordinary work-coordinator binding at launch; this offline file carries no signature or secret.",
+  "candidate_labels_requiring_serialization": [
+    "goal:native-canary-924-848",
+    "agent:nix",
+    "status:queued",
+    "delivery:integration"
+  ],
+  "deployment_gate": {
+    "runnable": false,
+    "reason": "Current HarnessBridge._work_coordinator_binding hard-codes authority_scope=implementation and LocalCandidateProvider rejects an authority_scope item field. A manifest/config delta cannot safely produce a deployment-authority binding on this source."
+  }
+}
