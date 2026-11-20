@@ -43,6 +43,7 @@ import threading
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from drover.server.harness.structured.driver import EmitFn, StructuredMessage
 from drover.server.harness.structured.git_changes import capture_head, changed_paths
@@ -141,6 +142,29 @@ def resolve_last_context_input_tokens(
         return None
 
 
+def _work_mcp_url(value: object) -> str | None:
+    """Accept only a credential-free loopback streamable-MCP endpoint."""
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/mcp"
+    ):
+        return None
+    try:
+        if parsed.port is None or not 1 <= parsed.port <= 65535:
+            return None
+    except ValueError:
+        return None
+    return value
+
+
 class CodexDriver:
     """Owns one `codex exec` subprocess per turn; no persistent process."""
 
@@ -183,6 +207,7 @@ class CodexDriver:
         self._closed = False
         self._git_base: str | None = None
         self._git_turn_id: str | None = None
+        self._work_mcp_url = _work_mcp_url(self.env.get("DROVER_WORK_MCP_URL"))
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -293,6 +318,20 @@ class CodexDriver:
         thinking_effort: str | None = None,
     ) -> list[str]:
         command = list(self.command)
+        if self._work_mcp_url is not None:
+            # Coordinator workers receive the paired host bearer only at
+            # launch.  Register the bounded loopback MCP endpoint for this
+            # one Codex process without editing the caller's CODEX_HOME.
+            # The URL contains no credential; Codex reads the bearer from the
+            # already-scoped DROVER_MCP_TOKEN environment variable.
+            command.extend(
+                [
+                    "-c",
+                    f"mcp_servers.drover.url={json.dumps(self._work_mcp_url)}",
+                    "-c",
+                    'mcp_servers.drover.bearer_token_env_var="DROVER_MCP_TOKEN"',
+                ]
+            )
         if model:
             command.extend(["--model", model])
         if thinking_effort:

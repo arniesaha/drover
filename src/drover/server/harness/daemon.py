@@ -1374,6 +1374,7 @@ class HarnessDaemonState:
     tailscale_url: str | None = None
     central_url: str | None = None
     host_token: str | None = None
+    work_mcp_url: str | None = None
     api_token: str = ""
     # True when this daemon dials the hub instead of waiting to be dialled;
     # visible here so the registration payload can advertise which it is.
@@ -3154,11 +3155,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             child_environment["DROVER_MCP_TOKEN"] = owner_bearer
         elif work_continuity is not None and self.server.state.host_token:
             # A coordinator worker may use the already-paired host identity
-            # through the configured MCP server to read its work item.  This
+            # through its explicitly configured loopback MCP endpoint. This
             # is launch-only: the bearer is not persisted in the registry,
-            # continuity ledger, prompt, or hub request payload.  Ordinary
+            # continuity ledger, prompt, or hub request payload. Ordinary
             # sessions never receive it here.
             child_environment["DROVER_MCP_TOKEN"] = self.server.state.host_token
+            if self.server.state.work_mcp_url:
+                child_environment["DROVER_WORK_MCP_URL"] = (
+                    self.server.state.work_mcp_url
+                )
         try:
             self.server.state.structured.start(
                 session_id,
@@ -4970,6 +4975,7 @@ def run_harnessd(
     tailscale_url: str | None = None,
     central_url: str | None = None,
     host_token: str | None = None,
+    work_mcp_url: str | None = None,
     relay: bool = False,
     advisory_content: "AdvisoryContentConfig | None" = None,
     content_consent_path: Path | None = None,
@@ -4997,6 +5003,7 @@ def run_harnessd(
         tailscale_url=tailscale_url,
         central_url=central_url,
         host_token=host_token,
+        work_mcp_url=work_mcp_url,
         relay=relay,
         advisory_content=advisory_content,
         content_consent=content_consent,

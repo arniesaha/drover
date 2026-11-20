@@ -410,6 +410,43 @@ def test_initial_turn_argv_is_otherwise_unchanged_for_an_ordinary_prompt():
     ]
 
 
+def test_work_coordinator_mcp_is_advertised_only_for_a_valid_loopback_endpoint():
+    driver = CodexDriver(
+        ["codex"],
+        None,
+        lambda _message: None,
+        env={"DROVER_WORK_MCP_URL": "http://127.0.0.1:28182/mcp"},
+    )
+
+    argv = driver._argv_for("complete the bound work")
+
+    assert argv[:5] == [
+        "codex",
+        "-c",
+        'mcp_servers.drover.url="http://127.0.0.1:28182/mcp"',
+        "-c",
+        'mcp_servers.drover.bearer_token_env_var="DROVER_MCP_TOKEN"',
+    ]
+    assert argv[-2:] == ["--", "complete the bound work"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.invalid/mcp",
+        "http://127.0.0.1:28182/not-mcp",
+        "http://user@127.0.0.1:28182/mcp",
+        "http://127.0.0.1:28182/mcp?token=forbidden",
+    ],
+)
+def test_work_coordinator_mcp_rejects_non_loopback_or_credentialed_urls(url):
+    driver = CodexDriver(
+        ["codex"], None, lambda _message: None, env={"DROVER_WORK_MCP_URL": url}
+    )
+
+    assert "mcp_servers.drover.url" not in " ".join(driver._argv_for("work"))
+
+
 def test_resume_turn_argv_is_otherwise_unchanged_for_an_ordinary_prompt():
     driver = CodexDriver(
         ["codex"], None, lambda _message: None, native_session_id="thread-1"
