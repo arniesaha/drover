@@ -1009,7 +1009,7 @@ class FactoryObserverContinuity:
         repository: str | None = None,
         serialization_key: str | None = None,
         expected_effect_artifact: str | None = None,
-        committed_provenance: bool = False,
+        committed_provenance: bool | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
@@ -1028,9 +1028,11 @@ class FactoryObserverContinuity:
         )
         if expected_effect_artifact is not None:
             _text(expected_effect_artifact, "expected_effect_artifact", 2000)
-        if not isinstance(committed_provenance, bool):
-            raise ValueError("committed_provenance must be boolean")
-        if committed_provenance and expected_effect_artifact is None:
+        if committed_provenance is not None and not isinstance(
+            committed_provenance, bool
+        ):
+            raise ValueError("committed_provenance must be boolean or null")
+        if committed_provenance is True and expected_effect_artifact is None:
             raise ValueError("committed provenance requires expected effect")
         if (
             delivery_role == "integration_serialized"

@@ -139,6 +139,18 @@
           "title": "Checkpoint",
           "type": "string"
         },
+        "committed_provenance": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Committed Provenance"
+        },
         "completion_receipts": {
           "$ref": "#/$defs/CompletionReceipts"
         },
