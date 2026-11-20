@@ -429,7 +429,7 @@ def test_control_migrations_28_through_44_classify_from_v0628_baseline():
             "migration_id": COMMITTED_PROVENANCE_MIGRATION,
             "statement_index": 1,
             "allowed": True,
-            "verdict": "alter_table_add_column_constant_default",
+            "verdict": "alter_table_add_nullable_column",
         }
     ]
 

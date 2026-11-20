@@ -1085,7 +1085,7 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         COMMITTED_PROVENANCE_MIGRATION,
         (
-            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS committed_provenance BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS committed_provenance BOOLEAN",
         ),
     ),
 )

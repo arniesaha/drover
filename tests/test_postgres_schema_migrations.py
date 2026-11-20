@@ -47,7 +47,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
-    COMMITTED_PROVENANCE_MIGRATION: "6d2caeee83220f2cb0565a40daf58fd57055eb7f2e97bce8ae172a485c484880",
+    COMMITTED_PROVENANCE_MIGRATION: "3eb6eb9caf7990e23375a2c62e93bacd846978689629ccbb80aa523bcba58092",
     OWNER_CLAIM_EPOCH_MIGRATION: "81e448da38f14ff3ce08aa90ab01eafbb7256e21985c31d1a5022c93185e168d",
     EXPECTED_EFFECT_ARTIFACT_MIGRATION: "745ad20c33fa21000cb8d8879127dbb2768b7d5ff40a5d3bddf7f8d749d50a48",
     INTEGRATION_SERIALIZATION_MIGRATION: "aabc4c9680acd4920282106fb2c38919d896ca27e8a35ef3b2d67364b07ed190",
@@ -204,11 +204,31 @@ def test_owner_claim_epoch_migration_43_is_additive(pg_control_path):
         ).fetchone() == (1,)
 
 
-def test_committed_provenance_migration_44_is_additive(pg_control_path):
-    """Existing PostgreSQL stores retain a durable signed provenance mode."""
+def test_committed_provenance_migration_44_preserves_preupgrade_runs_as_unknown(
+    pg_control_path,
+):
+    """A pre-44 run may not be silently downgraded to marker-only authority."""
     from drover.server.control_store import postgres_control_store
+    from drover.server.harness.continuity import FactoryObserverContinuity
+    from drover.server.harness.registry import HarnessRegistry
     from drover.server.postgres_schema import bootstrap_postgres_control_store
 
+    registry = HarnessRegistry(pg_control_path)
+    session = registry.create_session(
+        session_id="harness-pre44-provenance",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="work_coordinator",
+        source_session_id="work/work-pre44-provenance@0",
+    )
+    run_id = FactoryObserverContinuity(pg_control_path).initialize(
+        session_id=session.session_id,
+        objective="Pre-upgrade candidate",
+        checkpoint="launched",
+        expected_effect_artifact="local-file:.drover-native-canary/source-task-48.json",
+    )
     store = postgres_control_store(pg_control_path)
     with store.connection() as con:
         con.execute(
@@ -220,13 +240,20 @@ def test_committed_provenance_migration_44_is_additive(pg_control_path):
         )
     bootstrap_postgres_control_store(store)
     bootstrap_postgres_control_store(store)
-    with store.connection() as con:
-        assert (
-            con.execute(
-                "SELECT committed_provenance FROM factory_observer_runs LIMIT 0"
-            ).description[0][0]
-            == "committed_provenance"
+
+    status = FactoryObserverContinuity(pg_control_path).status(run_id)
+    assert status["committed_provenance"] is None
+    assert (
+        HarnessRegistry(pg_control_path).work_coordinator_committed_provenance(
+            session.session_id, run_id
         )
+        is None
+    )
+    with store.connection() as con:
+        assert con.execute(
+            "SELECT committed_provenance FROM factory_observer_runs WHERE run_id = ?",
+            [run_id],
+        ).fetchone() == (None,)
         assert con.execute(
             "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
             [COMMITTED_PROVENANCE_MIGRATION],

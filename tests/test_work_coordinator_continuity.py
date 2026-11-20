@@ -559,6 +559,59 @@ def test_hub_sync_is_the_only_ledger_initializer(tmp_path):
     assert [event["report"]["kind"] for event in status["events"]] == ["worker_started"]
 
 
+def test_registry_preserves_signed_committed_provenance_tristate(tmp_path):
+    """Only an initialized binding can distinguish false from legacy unknown."""
+    from drover.server.db import control_plane_connection
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    registry = HarnessRegistry(path)
+    store = FactoryObserverContinuity(path)
+    runs = {}
+    for name, provenance in (("true", True), ("false", False), ("legacy", False)):
+        session = registry.create_session(
+            session_id=f"harness-provenance-{name}",
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            status="running",
+            handoff_mode="work_coordinator",
+            source_session_id=f"work/work-provenance-{name}@0",
+        )
+        runs[name] = store.initialize(
+            session_id=session.session_id,
+            objective=f"Provenance {name}",
+            checkpoint="launched",
+            expected_effect_artifact="local-file:.drover-native-canary/effect.json",
+            committed_provenance=provenance,
+        )
+    with control_plane_connection(path) as con:
+        con.execute(
+            "UPDATE factory_observer_runs SET committed_provenance = NULL WHERE run_id = ?",
+            [runs["legacy"]],
+        )
+
+    assert (
+        registry.work_coordinator_committed_provenance(
+            "harness-provenance-true", runs["true"]
+        )
+        is True
+    )
+    assert (
+        registry.work_coordinator_committed_provenance(
+            "harness-provenance-false", runs["false"]
+        )
+        is False
+    )
+    assert (
+        registry.work_coordinator_committed_provenance(
+            "harness-provenance-legacy", runs["legacy"]
+        )
+        is None
+    )
+    assert store.status(runs["legacy"])["committed_provenance"] is None
+
+
 def test_hub_sync_persists_immutable_committed_provenance_mode(tmp_path):
     """Only the hub-signed binding may select a verifier-capable work run."""
     import json

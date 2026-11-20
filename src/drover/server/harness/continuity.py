@@ -1881,7 +1881,13 @@ class FactoryObserverContinuity:
                 "scope_limit": SCOPES[run["authority_scope"]],
                 "delivery_role": run.get("delivery_role", "standard"),
                 "expected_effect_artifact": run.get("expected_effect_artifact"),
-                "committed_provenance": bool(run.get("committed_provenance")),
+                # A migration-44 legacy row has no immutable signed mode.
+                # Do not collapse that unknown into marker-only authority.
+                "committed_provenance": (
+                    run.get("committed_provenance")
+                    if isinstance(run.get("committed_provenance"), bool)
+                    else None
+                ),
                 "integration_serialization": integration_serialization,
                 "owner_handoff": {
                     "authorized_owner_id": run.get("authorized_owner_id"),
