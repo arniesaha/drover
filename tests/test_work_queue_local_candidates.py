@@ -879,3 +879,12 @@ def test_deployment_selector_refuses_recovery_without_existing_signed_session(tm
 
     with pytest.raises(WorkDenied, match="existing signed session"):
         bridge._recovery_payload("a" * 32, {"harness": "codex"})
+
+    # Removing the reviewed selector later cannot downgrade a deployment
+    # candidate into implementation authority while reconstructing a lost
+    # create response. Local candidate recovery needs an existing signed
+    # session regardless of the mutable selector's current value.
+    downgraded = scope.model_copy(update={"local_candidate_authority_scopes": {}})
+    bridge.config = SimpleNamespace(goals=[downgraded])
+    with pytest.raises(WorkDenied, match="existing signed session"):
+        bridge._recovery_payload("a" * 32, {"harness": "codex"})

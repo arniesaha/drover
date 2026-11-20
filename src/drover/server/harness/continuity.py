@@ -1425,11 +1425,20 @@ class FactoryObserverContinuity:
                     # attempts.  Keep its immutable wake/action identity and
                     # surface a durable stalled-delivery record instead.
                     if action.get("type") == "observe_worker_start":
-                        action["escalation"] = {
-                            "state": "delivery_stalled",
-                            "wake_id": event["event_id"],
-                            "attempts": event["attempts"],
-                        }
+                        prior_escalation = action.get("escalation")
+                        if not (
+                            isinstance(prior_escalation, dict)
+                            and prior_escalation.get("state") == "delivery_stalled"
+                            and prior_escalation.get("wake_id") == event["event_id"]
+                        ):
+                            # Persist one stable health signal for this wake.
+                            # Later retries update delivery state, never create
+                            # another alert identity or another owner action.
+                            action["escalation"] = {
+                                "state": "delivery_stalled",
+                                "wake_id": event["event_id"],
+                                "attempts": event["attempts"],
+                            }
                         con.execute(
                             """UPDATE factory_observer_runs SET next_action_json = ?,
                             updated_at = ? WHERE run_id = ?""",
@@ -1709,6 +1718,35 @@ class FactoryObserverContinuity:
                     [run_id],
                 ).fetchall()
             )
+            # Counts drive health and recovery decisions, so they must not
+            # depend on the bounded event page returned to this caller. A
+            # superseded start remains auditable in ``events`` but is not an
+            # exhausted final action and must not make a later terminal wake
+            # appear lost.
+            superseded = 0
+            for (action_payload,) in con.execute(
+                """SELECT action_json FROM factory_observer_inbox
+                WHERE run_id = ? AND state = 'exhausted'""",
+                [run_id],
+            ).fetchall():
+                try:
+                    escalation = json.loads(action_payload or "null").get("escalation")
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    escalation = None
+                if (
+                    isinstance(escalation, dict)
+                    and escalation.get("state") == "superseded_by_terminal"
+                    and isinstance(escalation.get("successor_wake_id"), str)
+                ):
+                    superseded += 1
+            if superseded:
+                counts["exhausted"] = max(0, counts.get("exhausted", 0) - superseded)
+                if not counts["exhausted"]:
+                    counts.pop("exhausted")
+            visible_total = con.execute(
+                "SELECT count(*) FROM factory_observer_inbox WHERE run_id = ? AND state <> 'acknowledged'",
+                [run_id],
+            ).fetchone()[0]
             result = con.execute(
                 """SELECT event_id, state, attempts, next_delivery_at,
                 payload_json, action_json FROM factory_observer_inbox
@@ -1717,7 +1755,6 @@ class FactoryObserverContinuity:
                 [run_id, limit],
             )
             events = []
-            superseded = 0
             for eid, state, attempts, due, payload, action_payload in result.fetchall():
                 try:
                     event_action = json.loads(action_payload or "null")
@@ -1734,8 +1771,6 @@ class FactoryObserverContinuity:
                     and escalation.get("state") == "superseded_by_terminal"
                     else None
                 )
-                if state == "exhausted" and successor is not None:
-                    superseded += 1
                 events.append(
                     {
                         "event_id": eid,
@@ -1750,10 +1785,6 @@ class FactoryObserverContinuity:
                         ),
                     }
                 )
-            if superseded:
-                counts["exhausted"] = max(0, counts.get("exhausted", 0) - superseded)
-                if not counts["exhausted"]:
-                    counts.pop("exhausted")
             action = (
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
             )
@@ -1872,8 +1903,7 @@ class FactoryObserverContinuity:
                     "errors": receipt_errors,
                 },
                 "events": events,
-                "has_more": sum(
-                    n for state, n in counts.items() if state != "acknowledged"
-                )
-                > len(events),
+                # ``inbox_counts`` intentionally coalesces superseded start
+                # observations; pagination still exposes each durable event.
+                "has_more": visible_total > len(events),
             }

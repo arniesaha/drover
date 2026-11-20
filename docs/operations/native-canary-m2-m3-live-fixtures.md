@@ -240,6 +240,18 @@ but not that it remained ready. The stronger no-lost-ready observation requires
 that same queued state while two ordinary worker links consume the cap, without
 a manual hold, sleep, or barrier. Otherwise report the actual state honestly.
 
+### Marker scope
+
+The candidate-bound expected effect is verified only against the daemon-assigned
+worker session CWD and its signed `local-file:` reference. An owner action may
+write its own reconciliation marker in a separately assigned owner worktree,
+but that marker is an action receipt aid, not the candidate's materialized
+effect. The retained candidate-26 marker under the historical
+`runtime/worktrees/work-a/.drover-native-canary/actions/` directory therefore
+must not be reused as a worker effect or copied into later M2/M3 fixtures. New
+fixtures must bind their marker to the worker's assigned session worktree and
+prove that exact signed reference through the daemon readback.
+
 ## M3 offline inputs and explicit source limits
 
 [`fixtures/native-canary-m3-candidates-28-32.json`](fixtures/native-canary-m3-candidates-28-32.json)

@@ -13,7 +13,10 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from drover.server.continuity_schema import NATIVE_OWNER_DDL
+from drover.server.continuity_schema import (
+    NATIVE_OWNER_CLAIM_EPOCH_DDL,
+    NATIVE_OWNER_DDL,
+)
 from drover.server.db import control_plane_connection
 from drover.server.harness.continuity import (
     MAX_DELIVERIES,
@@ -73,7 +76,7 @@ class NativeOwnerRunner:
     def _ensure_schema(self) -> None:
         # Safe for an older DuckDB control store during a rolling hub upgrade.
         with control_plane_connection(self.path, timeout=5) as con:
-            for statement in NATIVE_OWNER_DDL:
+            for statement in (*NATIVE_OWNER_DDL, *NATIVE_OWNER_CLAIM_EPOCH_DDL):
                 con.execute(statement)
 
     @staticmethod
@@ -911,37 +914,183 @@ class NativeOwnerRunner:
         self._replace_link(scope, link)
         return True
 
-    def _renew_active_claim_lease(self, scope) -> bool:
-        """Keep a submitted, unfinished native turn inside its exact lease epoch.
+    def _block_permanent_start_delivery(self, scope, run_id: str) -> bool:
+        """Circuit-break a typed permanent failure for one start observation.
 
-        The durable turn claim already prevents a successor from dispatching.
-        Renewal merely prevents the much shorter observer lease from fencing a
-        normal structured turn before it can persist its intent or ACK.  A
-        missing, completed, terminal, or already-expired claim is never
-        renewed and stays on the existing recovery path.
+        Start observations may retry a missing launch or a transient relay gap,
+        but a completed owner turn with the persisted authentication failure
+        category is not a delivery outage.  Keep that exact event delivered and
+        auditable; do not make another provider turn, reclassify it as a human
+        gate, or silently reset its attempt history.
         """
         owner_id = self._owner(scope)
         assert owner_id is not None
+        with control_plane_connection(self.path, timeout=5) as con:
+            rows = con.execute(
+                """SELECT c.wake_id, c.session_id, c.client_turn_id, i.action_json,
+                          i.source, i.subject, i.sequence
+                FROM continuity_owner_turn_claims c
+                JOIN factory_observer_inbox i
+                  ON i.event_id = c.wake_id AND i.run_id = c.run_id
+                WHERE c.goal_id = ? AND c.owner_id = ? AND c.run_id = ?
+                  AND c.state = 'completed' AND i.state = 'delivered'
+                ORDER BY c.updated_at, c.wake_id""",
+                [scope.goal_id, owner_id, run_id],
+            ).fetchall()
+        for (
+            wake_id,
+            session_id,
+            turn_id,
+            action_json,
+            source,
+            subject,
+            sequence,
+        ) in rows:
+            try:
+                action = json.loads(action_json or "null")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(action, dict)
+                or action.get("type") != "observe_worker_start"
+            ):
+                continue
+            escalation = action.get("escalation")
+            already_blocked = (
+                isinstance(escalation, dict)
+                and escalation.get("state") == "delivery_blocked"
+                and escalation.get("wake_id") == wake_id
+            )
+            if (
+                not already_blocked
+                and self.registry.owner_turn_failure_category(session_id, turn_id)
+                != "authentication_required"
+            ):
+                continue
+            # A later terminal worker report is the authoritative successor
+            # for a start observation.  Let normal consume coalesce the old
+            # observation instead of pinning the run behind its failed start.
+            with control_plane_connection(self.path, timeout=5) as con:
+                candidates = con.execute(
+                    """SELECT payload_json FROM factory_observer_inbox
+                    WHERE run_id = ? AND state = 'pending' AND source = ?
+                      AND subject = ? AND sequence > ?
+                    ORDER BY sequence, received_at, event_id""",
+                    [run_id, source, subject, sequence],
+                ).fetchall()
+            terminal_successor = False
+            for (payload_json,) in candidates:
+                try:
+                    report = json.loads(payload_json)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(report, dict) and report.get("kind") in {
+                    "worker_done",
+                    "worker_brief_completed",
+                    "worker_blocked",
+                    "worker_needs_approval",
+                }:
+                    terminal_successor = True
+                    break
+            if terminal_successor:
+                continue
+            if already_blocked:
+                return True
+            action["escalation"] = {
+                "state": "delivery_blocked",
+                "wake_id": wake_id,
+                "reason": "authentication_required",
+            }
+            encoded = json.dumps(action, sort_keys=True, separators=(",", ":"))
+            with self._transaction() as con:
+                # Do not overwrite a successor that consumed the run between
+                # the read above and this health projection.
+                current = con.execute(
+                    "SELECT next_action_json FROM factory_observer_runs WHERE run_id = ?",
+                    [run_id],
+                ).fetchone()
+                if current is None or current[0] != action_json:
+                    continue
+                changed = con.execute(
+                    """UPDATE factory_observer_inbox SET action_json = ?
+                    WHERE event_id = ? AND run_id = ? AND state = 'delivered'
+                      AND action_json = ? RETURNING event_id""",
+                    [encoded, wake_id, run_id, action_json],
+                ).fetchone()
+                if changed is None:
+                    continue
+                replaced = con.execute(
+                    """UPDATE factory_observer_runs SET next_action_json = ?,
+                    updated_at = ? WHERE run_id = ? AND next_action_json = ?
+                    RETURNING run_id""",
+                    [encoded, self.clock(), run_id, action_json],
+                ).fetchone()
+                if replaced is None:
+                    raise _StaleRecovery()
+            return True
+        return False
+
+    def _renew_active_claim_lease(self, scope) -> bool:
+        """Renew only a live, current, nonterminal submitted-turn claim.
+
+        A short observer lease must not fence a healthy structured turn before
+        it can persist an intent or ACK.  The renewal is never an acquisition:
+        terminal sessions, expired claims, stale wakes, and successor epochs
+        all remain on their fenced recovery path.
+        """
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+        now = self.clock()
         with self._transaction() as con:
             row = con.execute(
-                """SELECT run_id, session_id, client_turn_id FROM continuity_owner_turn_claims
-                WHERE goal_id = ? AND owner_id = ? AND state IN ('claimed', 'sent')
-                ORDER BY updated_at, wake_id LIMIT 1""",
-                [scope.goal_id, owner_id],
+                """SELECT c.wake_id, c.run_id, c.session_id, c.client_turn_id,
+                          c.owner_epoch, c.claim_until, i.state, i.action_json
+                FROM continuity_owner_turn_claims c
+                JOIN factory_observer_inbox i
+                  ON i.event_id = c.wake_id AND i.run_id = c.run_id
+                WHERE c.goal_id = ? AND c.owner_id = ?
+                  AND c.state IN ('claimed', 'sent') AND c.claim_until > ?
+                ORDER BY c.updated_at, c.wake_id LIMIT 1""",
+                [scope.goal_id, owner_id, now],
             ).fetchone()
         if row is None:
             return False
-        run_id, session_id, turn_id = map(str, row)
+        (
+            wake_id,
+            run_id,
+            session_id,
+            turn_id,
+            claim_epoch,
+            _,
+            event_state,
+            action_json,
+        ) = row
+        if event_state != "delivered":
+            return False
+        try:
+            action = json.loads(action_json or "null")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(action, dict) or action.get("event_id") != wake_id:
+            return False
         session = self.registry.get_session(session_id)
         if (
             session is None
+            or session.status in TERMINAL_SESSION_STATUSES
             or not self.registry.has_user_input_turn_id(session_id, turn_id)
             or self.registry.has_completed_turn(session_id, turn_id)
         ):
             return False
         owner = self.continuity.status(run_id)["owner"]
-        if owner["id"] != owner_id or not owner["live"]:
+        if (
+            owner["id"] != owner_id
+            or not owner["live"]
+            or claim_epoch is None
+            or int(claim_epoch) != owner["epoch"]
+        ):
             return False
+        # ``lease`` compares the epoch in the same transaction; an owner that
+        # changed after the status read cannot be renewed by this old claim.
         self.continuity.lease(
             run_id,
             owner_id=owner_id,
@@ -977,7 +1126,9 @@ class NativeOwnerRunner:
                 [wake_id, turn_id],
             )
 
-    def _claim(self, scope, run_id: str, session_id: str, wake_id: str) -> str | None:
+    def _claim(
+        self, scope, run_id: str, session_id: str, wake_id: str, owner_epoch: int
+    ) -> str | None:
         now = self.clock()
         until = now + timedelta(seconds=self.claim_seconds)
         owner_id = self._owner(scope)
@@ -1000,16 +1151,16 @@ class NativeOwnerRunner:
             if row:
                 con.execute(
                     """UPDATE continuity_owner_turn_claims SET run_id = ?, session_id = ?,
-                    client_turn_id = ?, state = 'claimed', claim_until = ?, updated_at = ?
+                    client_turn_id = ?, owner_epoch = ?, state = 'claimed', claim_until = ?, updated_at = ?
                     WHERE wake_id = ?""",
-                    [run_id, session_id, turn_id, until, now, wake_id],
+                    [run_id, session_id, turn_id, owner_epoch, until, now, wake_id],
                 )
             else:
                 con.execute(
                     """INSERT INTO continuity_owner_turn_claims
                     (wake_id, goal_id, owner_id, run_id, session_id, client_turn_id,
-                     state, claim_until, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
+                     owner_epoch, state, claim_until, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
                     [
                         wake_id,
                         scope.goal_id,
@@ -1017,6 +1168,7 @@ class NativeOwnerRunner:
                         run_id,
                         session_id,
                         turn_id,
+                        owner_epoch,
                         until,
                         now,
                         now,
@@ -1056,6 +1208,8 @@ class NativeOwnerRunner:
         if session_id:
             self._complete_finished_claim(scope, session_id)
         self._settle_expired_claims(scope)
+        if self._block_permanent_start_delivery(scope, run_id):
+            return False
         # Recovery is session-scoped while the submitted owner turn is wake-
         # scoped.  An older failed turn on a reused session must never fence
         # the current claimed wake before its exact acknowledgement settles.
@@ -1098,7 +1252,9 @@ class NativeOwnerRunner:
             session_id = self._session(scope)
             if session_id is None:
                 return False
-        turn_id = self._claim(scope, run_id, session_id, action["event_id"])
+        turn_id = self._claim(
+            scope, run_id, session_id, action["event_id"], lease["owner_epoch"]
+        )
         if turn_id is None:
             return False
         response, _ = self.collector.proxy_harness_session_action(

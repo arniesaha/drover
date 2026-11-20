@@ -101,15 +101,20 @@ class OwnerToolCall(WireModel):
 class DeliveryEscalation(WireModel):
     """Sanitized durable health signal for an unacknowledged observation."""
 
-    state: Literal["delivery_stalled", "superseded_by_terminal"]
+    state: Literal["delivery_stalled", "delivery_blocked", "superseded_by_terminal"]
     wake_id: EventId
     attempts: Annotated[int, Field(ge=3)] | None = None
+    reason: Literal["authentication_required"] | None = None
     successor_wake_id: EventId | None = None
 
     @model_validator(mode="after")
     def check_shape(self):
         if self.state == "delivery_stalled" and self.attempts is None:
             raise ValueError("stalled delivery needs attempts")
+        if self.state == "delivery_blocked" and self.reason is None:
+            raise ValueError("blocked delivery needs a typed reason")
+        if self.state != "delivery_blocked" and self.reason is not None:
+            raise ValueError("only blocked delivery carries a failure reason")
         if self.state == "superseded_by_terminal" and self.successor_wake_id is None:
             raise ValueError("superseded delivery needs terminal successor")
         return self

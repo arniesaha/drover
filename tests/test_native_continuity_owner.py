@@ -8,8 +8,10 @@ import pytest
 from drover.schema import bootstrap_control_plane_store
 from drover.server.db import control_plane_connection
 from drover.server.harness.continuity import (
+    MAX_LEASE_SECONDS,
     ContinuityConflict,
     FactoryObserverContinuity,
+    _observation_retry_delay,
 )
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.web.auth import AuthSettings, request_authorized
@@ -515,13 +517,20 @@ def test_structured_auth_failure_rearms_only_completed_worker_wake_once(tmp_path
         tmp_path, event_kind="worker_started"
     )
 
-    # The start wake can stall without an artificial human block.  Once the
-    # worker has a terminal result, that exact later report supersedes the
-    # observation rather than being starved by it.
-    for delay in (5, 10, 20):
-        assert runner.process_once() == 1
-        _mark_owner_auth_failure(runner, collector)
-        clock.advance(delay)
+    # A typed owner-auth failure is a permanent breaker for this start wake,
+    # not a reason to spend provider turns forever. A later terminal worker
+    # report remains the authoritative successor and can progress normally.
+    assert runner.process_once() == 1
+    _mark_owner_auth_failure(runner, collector)
+    clock.advance(5)
+    assert runner.process_once() == 0
+    start = store.status(run_id)["next_action"]
+    assert start["escalation"] == {
+        "state": "delivery_blocked",
+        "wake_id": start["event_id"],
+        "reason": "authentication_required",
+    }
+    assert len(collector.turn_attempts) == 1
     done_wake = store.report(
         run_id,
         source="hub",
@@ -1837,17 +1846,123 @@ def test_worker_start_delivery_stalls_without_fixed_attempt_cutoff(tmp_path):
     runner, collector, store, run_id, clock = _runner(
         tmp_path, event_kind="worker_started"
     )
-    collector.failed_launches = 4
+    collector.failed_launches = 5
 
-    for attempt in range(4):
+    for attempt in range(5):
         assert runner.process_once() == 0
         status = store.status(run_id)
         event = status["events"][0]
         assert event["state"] == "delivered"
         assert event["attempts"] == attempt + 1
-        if attempt == 3:
+        if attempt >= 3:
             assert status["worker_state"] == "started"
-            assert status["next_action"]["escalation"]["state"] == "delivery_stalled"
-            break
+            assert status["next_action"]["escalation"] == {
+                "state": "delivery_stalled",
+                "wake_id": event["event_id"],
+                "attempts": 3,
+            }
+            if attempt == 4:
+                # The same durable wake/action remains the one stall signal;
+                # each failed launch retains that identity rather than creating
+                # another durable warning or another wake.
+                assert len(collector.launches) == 5
+                assert len(status["events"]) == 1
+                break
         due = datetime.fromisoformat(event["next_delivery_at"])
         clock.advance((due - clock()).total_seconds())
+
+
+def test_terminal_or_expired_claim_never_renews_owner_lease(tmp_path):
+    """A stale claim cannot keep an ended owner or successor epoch alive."""
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+    runner.claim_seconds = 3600
+    assert runner.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    before = store.status(run_id)["owner"]
+
+    runner.registry.update_session_status(session_id, "terminated")
+    clock.advance(61)
+    assert not runner._renew_active_claim_lease(runner.config.goals[0])
+    terminal = store.status(run_id)["owner"]
+    assert terminal["epoch"] == before["epoch"]
+    assert terminal["lease_until"] == before["lease_until"]
+
+    # An unfinished submitted turn is deliberately retained for fenced
+    # recovery after its claim expires; it must not be silently renewed.
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path / "expired", event_kind="worker_started"
+    )
+    assert runner.process_once() == 1
+    before = store.status(run_id)["owner"]
+    clock.advance(runner.claim_seconds + 1)
+    assert not runner._renew_active_claim_lease(runner.config.goals[0])
+    expired = store.status(run_id)["owner"]
+    assert expired["epoch"] == before["epoch"]
+    assert expired["lease_until"] == before["lease_until"]
+    assert runner._has_active_claim(runner.config.goals[0])
+
+
+def test_stale_claim_epoch_cannot_renew_successor_lease(tmp_path):
+    """A claim records the epoch that submitted its owner turn."""
+    runner, _, store, run_id, _ = _runner(tmp_path, event_kind="worker_started")
+    owner_id = runner.config.goals[0].continuity_owner_id
+    assert runner.process_once() == 1
+    assert store.status(run_id)["owner"]["epoch"] == 1
+
+    assert store.fence_owner(run_id, owner_id=owner_id, expected_epoch=1) == 2
+    successor = store.lease(run_id, owner_id=owner_id, owner_epoch=2)
+    assert successor["owner_epoch"] == 3
+    assert not runner._renew_active_claim_lease(runner.config.goals[0])
+    assert store.status(run_id)["owner"]["epoch"] == 3
+
+
+def test_superseded_start_health_count_is_page_independent(tmp_path):
+    """A bounded status page cannot hide a durable superseded start wake."""
+    runner, _, store, run_id, _ = _runner(tmp_path, event_kind="worker_started")
+    start = store.status(run_id)["events"][0]
+    done = store.report(
+        run_id,
+        source="hub",
+        source_event_id="done-after-start",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="done",
+    )
+    action = {
+        "action_id": "observer-action-" + start["event_id"],
+        "event_id": start["event_id"],
+        "type": "observe_worker_start",
+        "authority_scope": "implementation",
+        "authorized": True,
+        "escalation": {
+            "state": "superseded_by_terminal",
+            "wake_id": start["event_id"],
+            "successor_wake_id": done,
+        },
+    }
+    with control_plane_connection(runner.path) as con:
+        con.execute(
+            "UPDATE factory_observer_inbox SET state = 'exhausted', action_json = ? WHERE event_id = ?",
+            [json.dumps(action, sort_keys=True), start["event_id"]],
+        )
+
+    first_page = store.status(run_id, limit=1)
+    full_page = store.status(run_id, limit=20)
+    assert first_page["inbox_counts"] == full_page["inbox_counts"] == {"pending": 1}
+    assert first_page["events"][0]["superseded_by_terminal"] == done
+    assert first_page["has_more"]
+    assert not full_page["has_more"]
+
+
+def test_start_retry_delay_is_capped_and_deterministic_for_large_attempts():
+    """No-progress delivery retries never grow arithmetic or synchronize wakes."""
+    for attempts in (4, 8, 10_000_000):
+        delay = _observation_retry_delay("a" * 64, attempts)
+        assert 1 <= delay <= MAX_LEASE_SECONDS
+        assert delay == _observation_retry_delay("a" * 64, attempts)
+    assert _observation_retry_delay("a" * 64, 10_000_000) != _observation_retry_delay(
+        "b" * 64, 10_000_000
+    )

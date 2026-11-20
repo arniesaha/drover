@@ -138,15 +138,14 @@ class HarnessBridge:
             _, _, _, item = service.item(link.get("goal_id"), link.get("item_number"))
             authority_labels = item.get("operator_authority_labels", [])
             expected_effect_artifact = item.get("expected_effect_artifact")
-        if (
-            self._local_candidate_authority_scope(scope, link.get("item_number"))
-            == "deployment"
-        ):
-            # The original deployment binding is hub-signed at initial launch.
-            # A registry recovery must not recompute that authority from mutable
-            # configuration after the original create response was lost.
+        if getattr(scope, "candidate_source", None) == "local_file":
+            # The original local-candidate authority and expected effect are
+            # hub-signed at launch.  A missing create response has no durable
+            # signed binding to recover, so mutable goal config must never
+            # reconstruct either an implementation binding or a downgraded
+            # former deployment binding.
             raise WorkDenied(
-                "deployment continuity recovery requires existing signed session"
+                "local candidate continuity recovery requires existing signed session"
             )
         binding = self._work_coordinator_binding(
             run_key,

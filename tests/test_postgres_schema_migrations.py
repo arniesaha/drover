@@ -37,6 +37,7 @@ from drover.server.postgres_schema import (
     INTEGRATION_SERIALIZATION_MIGRATION,
     NATIVE_CONTINUITY_OWNER_MIGRATION,
     NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION,
+    OWNER_CLAIM_EPOCH_MIGRATION,
     OWNER_CREDENTIAL_MIGRATION,
     PROFILE_MIGRATION,
     WORK_ITEM_EVENTS_MIGRATION,
@@ -45,6 +46,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    OWNER_CLAIM_EPOCH_MIGRATION: "81e448da38f14ff3ce08aa90ab01eafbb7256e21985c31d1a5022c93185e168d",
     EXPECTED_EFFECT_ARTIFACT_MIGRATION: "745ad20c33fa21000cb8d8879127dbb2768b7d5ff40a5d3bddf7f8d749d50a48",
     INTEGRATION_SERIALIZATION_MIGRATION: "aabc4c9680acd4920282106fb2c38919d896ca27e8a35ef3b2d67364b07ed190",
     40: "bb64a15b1b33c15395d2003c7bd8f20bfcee496b900a69afb5fc9f7a547c7e62",
@@ -170,6 +172,33 @@ def test_expected_effect_artifact_migration_42_is_additive(pg_control_path):
         assert con.execute(
             "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
             [EXPECTED_EFFECT_ARTIFACT_MIGRATION],
+        ).fetchone() == (1,)
+
+
+def test_owner_claim_epoch_migration_43_is_additive(pg_control_path):
+    """Existing PostgreSQL stores gain the epoch fence without rewriting claims."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute("ALTER TABLE continuity_owner_turn_claims DROP COLUMN owner_epoch")
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [OWNER_CLAIM_EPOCH_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        assert (
+            con.execute(
+                "SELECT owner_epoch FROM continuity_owner_turn_claims LIMIT 0"
+            ).description[0][0]
+            == "owner_epoch"
+        )
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [OWNER_CLAIM_EPOCH_MIGRATION],
         ).fetchone() == (1,)
 
 

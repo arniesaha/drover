@@ -60,6 +60,12 @@ NATIVE_OWNER_RECOVERY_DDL = (
     "ALTER TABLE continuity_owner_recoveries ADD COLUMN IF NOT EXISTS fenced_at TIMESTAMPTZ",
 )
 
+# Additive runner bootstrap for control stores that predate PostgreSQL migration
+# 43. A NULL legacy epoch fails closed in renewal until that claim settles.
+NATIVE_OWNER_CLAIM_EPOCH_DDL = (
+    "ALTER TABLE continuity_owner_turn_claims ADD COLUMN IF NOT EXISTS owner_epoch BIGINT",
+)
+
 NATIVE_OWNER_DDL = (*NATIVE_OWNER_BASE_DDL, *NATIVE_OWNER_RECOVERY_DDL)
 
 NATIVE_OWNER_RECEIPT_DDL = (
