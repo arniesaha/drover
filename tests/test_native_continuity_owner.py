@@ -229,6 +229,85 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     assert len(collector.turn_attempts) == 1
 
 
+def test_active_claim_ignores_prior_failed_session_turn_until_exact_ack(tmp_path):
+    """A stale session result must not fence the current submitted owner wake."""
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    owner = status["owner"]
+    action = status["next_action"]
+    session_id, turn_payload = collector.turn_attempts[-1]
+    turn_id = turn_payload["client_turn_id"]
+
+    # The session is reusable. Its latest status can belong to an earlier,
+    # explicitly correlated failed turn while this wake remains active.
+    runner.registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        seq=1,
+        payload={"payload": {"turn_id": "older-turn", "exited": 1}},
+    )
+    assert runner.registry.completed_turn_kinds([session_id]) == {session_id: "failed"}
+    assert not runner.registry.has_completed_turn(session_id, turn_id)
+
+    assert (
+        store.action_intent(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"],
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact="issue-comment:done",
+        )["state"]
+        == "complete"
+    )
+
+    # A session-wide failure must not advance this live wake's epoch or send a
+    # duplicate owner turn before the exact wake gets its fenced acknowledgement.
+    assert runner.process_once() == 0
+    assert store.status(run_id)["owner"]["epoch"] == owner["epoch"]
+    assert len(collector.turn_attempts) == 1
+
+    store.acknowledge(
+        run_id,
+        owner_id=owner_id,
+        owner_epoch=owner["epoch"],
+        event_id=action["event_id"],
+        checkpoint="exact-current-wake",
+    )
+    with pytest.raises(ContinuityConflict, match="owner lease and epoch"):
+        store.acknowledge(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"] - 1,
+            event_id=action["event_id"],
+            checkpoint="stale-owner",
+        )
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+
+    # The following ready report remains deliverable after the exact claim has
+    # settled; the stale prior status did not consume or lose later work.
+    runner.registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"turn_id": turn_id, "exited": 0}},
+    )
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="next-ready",
+        subject="worker-1",
+        sequence=2,
+        kind="ci_green",
+        summary="next ready work",
+    )
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+
+
 def test_failed_fenced_run_does_not_starve_later_ready_run(tmp_path, monkeypatch):
     runner, _, _, run_id, _ = _runner(tmp_path)
     monkeypatch.setattr(
@@ -575,6 +654,50 @@ def _acknowledge_current_wake(store, run_id, owner_id):
     assert receipt["state"] == "complete"
     store.acknowledge(run_id, **fence, event_id=action["event_id"], checkpoint="done")
     return action["event_id"]
+
+
+def test_exhausted_worker_wake_is_not_hidden_by_an_earlier_acknowledgement(tmp_path):
+    runner, _, store, run_id, clock = _runner(tmp_path, event_kind="worker_started")
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    assert runner.process_once() == 1
+    acknowledged_wake = _acknowledge_current_wake(store, run_id, owner_id)
+    exhausted_wake = store.report(
+        run_id,
+        source="hub",
+        source_event_id="done-after-ack",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="done",
+    )
+
+    def consume_current_wake():
+        owner = store.status(run_id)["owner"]
+        lease = store.lease(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"] if owner["live"] else None,
+        )
+        return store.consume(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=lease["owner_epoch"],
+        )
+
+    for delay in (5, 10, 20):
+        action = consume_current_wake()
+        assert action and action["event_id"] == exhausted_wake
+        clock.advance(delay)
+    assert consume_current_wake() is None
+
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"acknowledged": 1, "exhausted": 1}
+    assert status["owner_handoff"]["state"] == "delivery_exhausted"
+    assert status["recovery"] == "manual_attention"
+    assert status["next_action"] is None
+    assert not status["owner_wake"]
+    assert acknowledged_wake != exhausted_wake
 
 
 def test_acknowledged_idle_owner_turn_completes_claim_and_delivers_successor(tmp_path):

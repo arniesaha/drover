@@ -990,12 +990,16 @@ class NativeOwnerRunner:
         if session_id:
             self._complete_finished_claim(scope, session_id)
         self._settle_expired_claims(scope)
+        # Recovery is session-scoped while the submitted owner turn is wake-
+        # scoped.  An older failed turn on a reused session must never fence
+        # the current claimed wake before its exact acknowledgement settles.
+        # Expired claims have already taken their bounded settlement path above.
+        if self._has_active_claim(scope):
+            return False
         if self._recovery_needed(scope, run_id, session_id):
             if not self._recover_session(scope, run_id):
                 return False
             session_id = None
-        if self._has_active_claim(scope):
-            return False
         status = self.continuity.status(run_id)
         if not self._expected_effect_materialized(status):
             return False
