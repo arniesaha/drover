@@ -559,6 +559,67 @@ def test_hub_sync_is_the_only_ledger_initializer(tmp_path):
     assert [event["report"]["kind"] for event in status["events"]] == ["worker_started"]
 
 
+def test_hub_sync_persists_immutable_committed_provenance_mode(tmp_path):
+    """Only the hub-signed binding may select a verifier-capable work run."""
+    import json
+
+    from drover.server.metrics import MetricsCollector
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        api_token="hub-secret",
+        work_coordinator_continuity_secret="hub-continuity-secret",
+    )
+    unsigned = {
+        "run_id": "work-hub-committed",
+        "owner_id": "agent:main:telegram:owner",
+        "authority_scope": "implementation",
+        "objective": "Bound committed provenance",
+        "goal_id": "goal",
+        "item_number": 48,
+        "expected_effect_artifact": "local-file:.drover-native-canary/source-task-48.json",
+        "committed_provenance": True,
+    }
+    payload = {
+        "harness": "codex",
+        "mode": "structured",
+        "work_coordinator_continuity": {
+            **unsigned,
+            "binding_signature": sign_work_coordinator_continuity(
+                unsigned, "hub-continuity-secret"
+            ),
+        },
+    }
+    response = json.dumps({"session_id": "harness-hub-committed", "status": "running"})
+    MetricsCollector._sync_created_harness_session(
+        collector, "studio", payload, response
+    )
+    status = FactoryObserverContinuity(path).status("work-hub-committed")
+    assert status["committed_provenance"] is True
+
+    unsigned["committed_provenance"] = False
+    payload["work_coordinator_continuity"] = {
+        **unsigned,
+        "binding_signature": sign_work_coordinator_continuity(
+            unsigned, "hub-continuity-secret"
+        ),
+    }
+    with pytest.raises(RuntimeError, match="hub continuity initialization failed"):
+        MetricsCollector._sync_created_harness_session(
+            collector, "studio", payload, response
+        )
+    assert (
+        FactoryObserverContinuity(path).status("work-hub-committed")[
+            "committed_provenance"
+        ]
+        is True
+    )
+
+
 def test_hub_sync_fails_closed_when_binding_cannot_initialize(tmp_path):
     import json
 

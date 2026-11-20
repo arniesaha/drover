@@ -1186,6 +1186,10 @@ def test_policy_opted_committed_provenance_is_hub_signed_and_body_cannot_select_
     assert "does not need to be Git tracked, committed, or passed to a verifier" in (
         legacy_payload["prompt"]
     )
+    assert (
+        "Do not request `drover_work_update(action=complete)`"
+        in legacy_payload["prompt"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1296,6 +1300,7 @@ def test_followon_marker_only_bindings_cannot_inherit_committed_provenance(
     assert "does not need to be Git tracked, committed, or passed to a verifier" in (
         payload["prompt"]
     )
+    assert "Do not request `drover_work_update(action=complete)`" in payload["prompt"]
 
 
 def test_deployment_selector_refuses_recovery_without_existing_signed_session(tmp_path):
@@ -1357,7 +1362,12 @@ def test_deployment_selector_refuses_recovery_without_existing_signed_session(tm
 
 
 def _deferred_completion_service(
-    tmp_path, pg_control_path, *, materialized=True, terminal_done=True
+    tmp_path,
+    pg_control_path,
+    *,
+    materialized=True,
+    terminal_done=True,
+    committed_provenance=True,
 ):
     path = tmp_path / "candidates.json"
     expected = "local-file:.drover-native-canary/source-task-28.json"
@@ -1414,6 +1424,9 @@ def _deferred_completion_service(
             assert artifact == expected
             return materialized
 
+        def work_coordinator_committed_provenance(self, run_key):
+            return committed_provenance
+
         def coordinator_failure_category(self, run_key):
             return None
 
@@ -1440,6 +1453,48 @@ def _deferred_completion_service(
     worker.process_once()
     work = service.store.links(goal_id=scope.goal_id, number=1)[0]
     return scope, provider, harness, service, worker, work
+
+
+def test_marker_only_completion_never_creates_a_verifier_successor(
+    tmp_path, pg_control_path
+):
+    """An ordinary marker must remain daemon-attested, not review-worktree evidence."""
+    scope, _provider, harness, service, worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path, committed_provenance=False
+    )
+    actor = WorkActor("credential:coordinator", "nix")
+
+    assert service.update(
+        scope.goal_id, 1, work["run_key"], "complete", actor=actor
+    ) == {"outcome": "marker_only"}
+    assert not service.store.events(identity(work["run_key"], "complete", None))
+
+    harness.sessions[work["run_key"]].status = "completed"
+    harness.sessions[work["run_key"]].turn_finished = True
+    worker.process_once()
+    assert [
+        link["run_role"]
+        for link in service.store.links(goal_id=scope.goal_id, number=1)
+    ] == ["work"]
+
+
+def test_unknown_local_candidate_provenance_fails_closed_before_verification(
+    tmp_path, pg_control_path
+):
+    scope, _provider, _harness, service, _worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path, committed_provenance=None
+    )
+    with pytest.raises(
+        WorkDenied, match="signed local candidate provenance unavailable"
+    ):
+        service.update(
+            scope.goal_id,
+            1,
+            work["run_key"],
+            "complete",
+            actor=WorkActor("credential:coordinator", "nix"),
+        )
+    assert not service.store.events(identity(work["run_key"], "complete", None))
 
 
 def test_completed_local_candidate_uses_goal_estimate_not_worker_metadata(

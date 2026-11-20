@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 
 from drover.server.postgres_schema import (
+    COMMITTED_PROVENANCE_MIGRATION,
     CONTINUITY_LEASES_MIGRATION,
     CONTINUITY_OWNER_HANDOFF_MIGRATION,
     CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION,
@@ -46,6 +47,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    COMMITTED_PROVENANCE_MIGRATION: "6d2caeee83220f2cb0565a40daf58fd57055eb7f2e97bce8ae172a485c484880",
     OWNER_CLAIM_EPOCH_MIGRATION: "81e448da38f14ff3ce08aa90ab01eafbb7256e21985c31d1a5022c93185e168d",
     EXPECTED_EFFECT_ARTIFACT_MIGRATION: "745ad20c33fa21000cb8d8879127dbb2768b7d5ff40a5d3bddf7f8d749d50a48",
     INTEGRATION_SERIALIZATION_MIGRATION: "aabc4c9680acd4920282106fb2c38919d896ca27e8a35ef3b2d67364b07ed190",
@@ -199,6 +201,35 @@ def test_owner_claim_epoch_migration_43_is_additive(pg_control_path):
         assert con.execute(
             "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
             [OWNER_CLAIM_EPOCH_MIGRATION],
+        ).fetchone() == (1,)
+
+
+def test_committed_provenance_migration_44_is_additive(pg_control_path):
+    """Existing PostgreSQL stores retain a durable signed provenance mode."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute(
+            "ALTER TABLE factory_observer_runs DROP COLUMN committed_provenance"
+        )
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [COMMITTED_PROVENANCE_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        assert (
+            con.execute(
+                "SELECT committed_provenance FROM factory_observer_runs LIMIT 0"
+            ).description[0][0]
+            == "committed_provenance"
+        )
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [COMMITTED_PROVENANCE_MIGRATION],
         ).fetchone() == (1,)
 
 
