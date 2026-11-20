@@ -362,6 +362,55 @@ def test_integration_serialization_binding_rejects_authority_escalation():
         )
 
 
+def test_work_coordinator_committed_provenance_requires_signed_item_binding():
+    unsigned = {
+        "run_id": "work-committed-provenance",
+        "owner_id": "drover:owner/goal",
+        "authority_scope": "implementation",
+        "objective": "Committed local provenance",
+        "committed_provenance": True,
+    }
+    with pytest.raises(ValueError, match="requires item binding"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **unsigned,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        unsigned, "hub"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )
+
+    signed = {**unsigned, "goal_id": "goal", "item_number": 48}
+    with pytest.raises(ValueError, match="requires expected effect"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **signed,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        signed, "hub"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )
+    signed["expected_effect_artifact"] = (
+        "local-file:.drover-native-canary/source-task-48.json"
+    )
+    binding, _ = parse_work_coordinator_continuity(
+        {
+            "work_coordinator_continuity": {
+                **signed,
+                "binding_signature": sign_work_coordinator_continuity(signed, "hub"),
+            }
+        },
+        hub_secret="hub",
+    )
+    assert binding is not None and binding.committed_provenance is True
+
+
 def test_work_coordinator_binding_rejects_forged_hub_signature():
     unsigned = {
         "run_id": "work-abc123",
