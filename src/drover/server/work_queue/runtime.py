@@ -7,7 +7,10 @@ import threading
 
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.work_coordinator import sign_work_coordinator_continuity
+from drover.server.harness.work_coordinator import (
+    sign_work_coordinator_continuity,
+    work_coordinator_turn_id,
+)
 from drover.server.harness.worker_state import worker_brief
 from drover.server.mcp.contract import ReadCaps, bound_response
 from drover.server.web.auth import bearer_credential
@@ -362,14 +365,14 @@ class HarnessBridge:
         session = self.resolve(run_key)
         if session is None or session.handoff_mode != "work_coordinator":
             return False
+        expected_turn_id = work_coordinator_turn_id("work-" + run_key)
         if session.status == "completed":
-            turn_finished = True
+            turn_finished = self.registry.has_successfully_completed_turn(
+                session.session_id, expected_turn_id
+            )
         elif session.status == "running" and session.effective_awaiting == "input":
-            turn_finished = (
-                self.registry.completed_turn_kinds([session.session_id]).get(
-                    session.session_id
-                )
-                == "finished"
+            turn_finished = self.registry.has_successfully_completed_turn(
+                session.session_id, expected_turn_id
             )
         else:
             turn_finished = False

@@ -12,9 +12,17 @@ import hmac
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
+from uuid import NAMESPACE_URL, uuid5
 
 from drover.server.control_outbox import canonical_payload
 from drover.server.harness.factory_observer import _RUN_ID, FactoryObserverRequestError
+
+
+def work_coordinator_turn_id(run_id: str) -> str:
+    """Return the immutable initial-turn id for one signed worker run."""
+    if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+        raise ValueError("work continuity run_id is invalid")
+    return str(uuid5(NAMESPACE_URL, "drover-work-coordinator-turn:" + run_id))
 
 
 @dataclass(frozen=True)

@@ -95,6 +95,7 @@ from drover.server.harness.websocket import (
 )
 from drover.server.harness.work_coordinator import (
     parse_unverified_work_coordinator_continuity,
+    work_coordinator_turn_id,
 )
 from drover.server.harness.worktree import (
     SessionWorktree,
@@ -3218,13 +3219,22 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     self.server.state.attachments_dir, session_id, images
                 )
                 text = append_attachment_lines(prompt_text, saved)
-                self.server.state.structured.send_turn(
-                    session_id,
-                    text,
-                    images=saved or None,
-                    model=model,
-                    thinking_effort=thinking_effort,
-                )
+                if work_continuity is None:
+                    self.server.state.structured.send_turn(
+                        session_id,
+                        text,
+                        images=saved or None,
+                        model=model,
+                        thinking_effort=thinking_effort,
+                    )
+                else:
+                    self.server.state.structured.submit_turn(
+                        session_id,
+                        prepare=lambda: (text, saved or None),
+                        model=model,
+                        thinking_effort=thinking_effort,
+                        client_turn_id=work_coordinator_turn_id(work_continuity.run_id),
+                    )
             except ValueError as exc:
                 self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return

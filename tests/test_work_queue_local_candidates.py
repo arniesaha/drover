@@ -125,7 +125,7 @@ def test_bridge_terminal_work_done_requires_bound_done_projection(monkeypatch):
     )
     bridge.resolve = lambda run_key: session
     bridge.registry = SimpleNamespace(
-        completed_turn_kinds=lambda session_ids: {session_ids[0]: "finished"}
+        has_successfully_completed_turn=lambda _session_id, _turn_id: True
     )
     bridge.collector = SimpleNamespace(duckdb_path="ignored")
     observed = []
@@ -167,7 +167,7 @@ def test_bridge_terminal_work_done_accepts_only_finished_idle_reusable_turn(
     bridge.resolve = lambda run_key: session
     bridge.collector = SimpleNamespace(duckdb_path="ignored")
     bridge.registry = SimpleNamespace(
-        completed_turn_kinds=lambda session_ids: {session_ids[0]: "finished"}
+        has_successfully_completed_turn=lambda _session_id, _turn_id: True
     )
     monkeypatch.setattr(
         FactoryObserverContinuity,
@@ -181,7 +181,7 @@ def test_bridge_terminal_work_done_accepts_only_finished_idle_reusable_turn(
     assert bridge.terminal_work_done("bound-run") is False
     session.effective_awaiting = "input"
     bridge.registry = SimpleNamespace(
-        completed_turn_kinds=lambda _session_ids: {"worker-session": "failed"}
+        has_successfully_completed_turn=lambda _session_id, _turn_id: False
     )
     assert bridge.terminal_work_done("bound-run") is False
 

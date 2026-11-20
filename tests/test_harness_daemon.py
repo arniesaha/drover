@@ -59,6 +59,7 @@ from drover.server.harness.model_catalog import (
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import client_handshake
+from drover.server.harness.work_coordinator import work_coordinator_turn_id
 from drover.server.providers.claude import ClaudeUsageProbe
 from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 
@@ -347,6 +348,9 @@ def test_work_coordinator_prompt_preserves_candidate_task_and_worktree_authority
     assert task in delivered
     assert f"Assigned isolated worktree: {tmp_path}" in delivered
     assert "authoritative worktree for this task" in delivered
+    assert state.structured.turns[0][2]["client_turn_id"] == work_coordinator_turn_id(
+        binding["run_id"]
+    )
 
 
 def test_harnessd_attests_only_a_work_coordinator_session_effect(tmp_path):

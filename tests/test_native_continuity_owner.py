@@ -232,6 +232,43 @@ def test_recovery_owner_bearer_rotates_only_for_the_missing_link(tmp_path):
     assert refreshed_link["generation"] == original_link["generation"]
 
 
+def test_recovery_owner_bearer_factory_rotates_one_bound_credential_once(tmp_path):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    recovery = runner._recovery_owner_bearer_factory(
+        scope, collector.turn_attempts[0][0]
+    )
+
+    first = recovery()
+    assert first is not None
+    assert recovery() is None
+    assert runner.credentials.find_active(first["continuity_owner_bearer"]) is not None
+
+
+def test_recovery_owner_bearer_fences_generation_before_credential_rotation(
+    tmp_path,
+):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    session_id = collector.turn_attempts[0][0]
+    original_token = collector.launches[0][1]["continuity_owner_bearer"]
+    recovery = runner._recovery_owner_bearer_factory(scope, session_id)
+
+    # The callback was constructed for generation 1. A successor generation
+    # wins before the relay requests its recovery payload.
+    with runner._transaction() as con:
+        con.execute(
+            """UPDATE continuity_owner_sessions SET generation = generation + 1,
+            session_id = ?, credential_id = NULL
+            WHERE goal_id = ? AND owner_id = ?""",
+            ["successor-session", scope.goal_id, scope.continuity_owner_id],
+        )
+    assert recovery() is None
+    assert runner.credentials.find_active(original_token) is not None
+
+
 def test_recovery_owner_bearer_refuses_a_replaced_session_link(tmp_path):
     runner, collector, _store, _run_id, _clock = _runner(tmp_path)
     assert runner.process_once() == 1

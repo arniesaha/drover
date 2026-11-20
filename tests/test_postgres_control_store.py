@@ -1292,6 +1292,114 @@ def test_postgres_concurrent_host_issuance_keeps_one_active(postgres_control_sto
     assert sum(item.is_active for item in stores[0].list_all()) == 1
 
 
+def test_postgres_owner_credential_fence_serializes_generation_replacement(
+    postgres_control_store, tmp_path, monkeypatch
+):
+    """A stale recovery cannot revoke the successor it waits behind."""
+    import test_native_continuity_owner as native
+
+    from drover.server.control_store import close_control_store, configure_control_store
+    from drover.server.db import control_plane_connection
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    _, config = postgres_control_store
+    path = tmp_path / "control.duckdb"
+    configure_control_store(path, config)
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
+    try:
+        runner, collector, _store, _run_id, _clock = native._runner(tmp_path)
+        credentials = PostgresCredentialStore(path)
+        runner.credentials = credentials
+        assert runner.process_once() == 1
+        scope = runner.config.goals[0]
+        link = runner._link(scope)
+        stale_ready = threading.Event()
+        release_stale = threading.Event()
+        successor_attempted = threading.Event()
+        successor_done = threading.Event()
+        result = {}
+
+        def apply_for(session_id, generation, credential, con, *, block=False):
+            row = con.execute(
+                """SELECT generation FROM continuity_owner_sessions
+                WHERE goal_id = ? AND owner_id = ? AND session_id = ? FOR UPDATE""",
+                [scope.goal_id, scope.continuity_owner_id, session_id],
+            ).fetchone()
+            if row is None or int(row[0]) != generation:
+                return False
+            if block:
+                stale_ready.set()
+                assert release_stale.wait(timeout=5)
+            changed = con.execute(
+                """UPDATE continuity_owner_sessions SET credential_id = ?
+                WHERE goal_id = ? AND owner_id = ? AND session_id = ?
+                AND generation = ? RETURNING owner_id""",
+                [
+                    credential.id,
+                    scope.goal_id,
+                    scope.continuity_owner_id,
+                    session_id,
+                    generation,
+                ],
+            ).fetchone()
+            return changed is not None
+
+        def stale():
+            result["stale"] = credentials.issue_owner_if_current(
+                label="stale recovery",
+                owner_id=scope.continuity_owner_id,
+                apply=lambda credential, con: apply_for(
+                    link["session_id"], link["generation"], credential, con, block=True
+                ),
+            )
+
+        def successor():
+            assert stale_ready.wait(timeout=5)
+            successor_attempted.set()
+            with control_plane_connection(path) as con:
+                con.execute(
+                    """UPDATE continuity_owner_sessions SET session_id = ?,
+                    generation = generation + 1, credential_id = NULL
+                    WHERE goal_id = ? AND owner_id = ? AND generation = ?""",
+                    [
+                        "successor-owner-session",
+                        scope.goal_id,
+                        scope.continuity_owner_id,
+                        link["generation"],
+                    ],
+                )
+            successor_link = runner._link(scope)
+            result["successor"] = credentials.issue_owner_if_current(
+                label="successor recovery",
+                owner_id=scope.continuity_owner_id,
+                apply=lambda credential, con: apply_for(
+                    successor_link["session_id"],
+                    successor_link["generation"],
+                    credential,
+                    con,
+                ),
+            )
+            successor_done.set()
+
+        stale_thread = threading.Thread(target=stale)
+        successor_thread = threading.Thread(target=successor)
+        stale_thread.start()
+        assert stale_ready.wait(timeout=5)
+        successor_thread.start()
+        assert successor_attempted.wait(timeout=5)
+        assert not successor_done.wait(timeout=0.1)
+        release_stale.set()
+        stale_thread.join(timeout=5)
+        successor_thread.join(timeout=5)
+        assert not stale_thread.is_alive() and not successor_thread.is_alive()
+        assert result["stale"] is not None and result["successor"] is not None
+        assert credentials.find_active(result["stale"][1]) is None
+        assert credentials.find_active(result["successor"][1]) is not None
+    finally:
+        close_control_store(path)
+
+
 def test_native_recovery_migration_upgrades_released_store(postgres_control_store):
     from drover.server.control_store import postgres_control_store as pg_store
     from drover.server.db import control_plane_connection
