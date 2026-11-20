@@ -207,29 +207,172 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     assert store.status(run_id)["owner"]["live"]
 
 
-def test_owner_prompt_binds_hub_preconsumed_terminal_delivery(tmp_path):
-    """The runner consumes once; the owner must reconcile that exact wake."""
+def _advance_final_delivery_to_third_deadline(store, run_id, clock):
+    """Model the 5/10/20-second delivery schedule without replaying a turn."""
+    status = store.status(run_id)
+    action = status["next_action"]
+    owner = status["owner"]
+    fence = {"owner_id": owner["id"], "owner_epoch": owner["epoch"]}
+
+    clock.advance(5)
+    assert store.consume(run_id, **fence)["event_id"] == action["event_id"]
+    clock.advance(10)
+    assert store.consume(run_id, **fence)["event_id"] == action["event_id"]
+    third = next(
+        event
+        for event in store.status(run_id)["events"]
+        if event["event_id"] == action["event_id"]
+    )
+    assert third["state"] == "delivered"
+    assert third["attempts"] == 3
+    # The third delivery is due at t+35; candidate 37's owner double-consumed
+    # after that deadline.
+    clock.advance(21)
+    return action, fence
+
+
+def test_terminal_double_consume_after_third_deadline_exhausts_without_intent(tmp_path):
+    """Reproduce the candidate-37 handoff failure before correcting its prompt."""
     expected = "local-file:.drover-native-canary/source-task-37.json"
-    runner, collector, store, run_id, _ = _runner(
+    runner, collector, store, run_id, clock = _runner(
         tmp_path, expected_effect=expected, event_kind="worker_done"
     )
     collector.expected_effect_attestations["observer-session"] = True
 
     assert runner.process_once() == 1
-    action = store.status(run_id)["next_action"]
-    owner = store.status(run_id)["owner"]
+    action, fence = _advance_final_delivery_to_third_deadline(store, run_id, clock)
+
+    # A second owner-side consume at t+36 hits the final-event cutoff. It does
+    # not rediscover the hub-delivered wake and there is no completed receipt.
+    assert store.consume(run_id, **fence) is None
+    status = store.status(run_id)
+    event = next(
+        event for event in status["events"] if event["event_id"] == action["event_id"]
+    )
+    assert event["state"] == "exhausted"
+    assert event["attempts"] == 3
+    assert status["next_action"] is None
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="old-contract"
+        )
+    with control_plane_connection(runner.collector.duckdb_path) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_action_intents WHERE wake_id = ?",
+                [action["event_id"]],
+            ).fetchone()[0]
+            == 0
+        )
+    assert len(collector.turn_attempts) == 1
+
+
+def test_preconsumed_terminal_delivery_can_intent_and_ack_after_third_deadline(
+    tmp_path,
+):
+    """The exact delivered wake remains safely reconcilable after its deadline."""
+    expected = "local-file:.drover-native-canary/source-task-37.json"
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, expected_effect=expected, event_kind="worker_done"
+    )
+    collector.expected_effect_attestations["observer-session"] = True
+
+    assert runner.process_once() == 1
+    action, fence = _advance_final_delivery_to_third_deadline(store, run_id, clock)
     prompt = collector.turn_attempts[0][1]["text"]
 
-    # ``process_once`` has already consumed this wake to create the owner
-    # turn, so a second consume cannot be the owner-side way to rediscover it.
-    assert (
-        store.consume(run_id, owner_id=owner["id"], owner_epoch=owner["epoch"]) is None
-    )
     assert "already consumed and fenced the exact wake" in prompt
     assert "Do not call consume to fetch a replacement delivery" in prompt
     assert f"expected_effect_artifact: {expected}" in prompt
     assert f"wake_id: {action['event_id']}" in prompt
     assert f"action_fingerprint: {action['action_id']}" in prompt
+    with pytest.raises(KeyError):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id="not-the-delivered-wake",
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict, match="match the consumed delivery"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint="wrong-fingerprint",
+        )
+    with pytest.raises(ContinuityConflict, match="current owner lease and epoch"):
+        store.action_intent(
+            run_id,
+            owner_id=fence["owner_id"],
+            owner_epoch=fence["owner_epoch"] + 1,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict, match="artifact must match"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact="local-file:.drover-native-canary/generic-marker.json",
+        )
+
+    # The terminal binding requires a verified artifact before it writes any
+    # receipt, so an unverified delivery cannot be acknowledged.
+    with pytest.raises(ContinuityConflict, match="artifact must match"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="unverified"
+        )
+
+    # Reconcile the same immutable wake/fingerprint/artifact. This completes
+    # one durable effect receipt without another provider turn or consume.
+    complete = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact=expected,
+    )
+    assert complete == {
+        "wake_id": action["event_id"],
+        "action_fingerprint": action["action_id"],
+        "state": "complete",
+        "artifact": expected,
+    }
+    assert (
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact=expected,
+        )
+        == complete
+    )
+    store.acknowledge(
+        run_id, **fence, event_id=action["event_id"], checkpoint="reconciled"
+    )
+    store.acknowledge(run_id, **fence, event_id=action["event_id"], checkpoint="replay")
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+    with control_plane_connection(runner.collector.duckdb_path) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_action_intents "
+                "WHERE wake_id = ? AND action_fingerprint = ?",
+                [action["event_id"], action["action_id"]],
+            ).fetchone()[0]
+            == 1
+        )
+    # The runner submitted only the original owner turn; reconciliation did
+    # not invoke another provider turn or consume a second delivery.
+    assert len(collector.turn_attempts) == 1
 
 
 def test_owner_turn_waits_for_materialized_candidate_effect_attestation(tmp_path):
