@@ -339,11 +339,13 @@ a deployment-selected candidate cannot select integration serialization.
 response is lost, registry recovery fails closed rather than recomputing that
 authority from changed configuration.
 
-For candidate 33, a terminal worker report must yield the signed deployment
-continuity run and `request_explicit_approval`, with no executor wake, owner
-effect, or ACK. Its paired human decision remains unanswered. In the same
-observation window an independent implementation candidate, such as 29 or 30,
-must advance normally. Approval is not part of this fixture. The focused tests
+For candidate 33, the signed deployment continuity run must yield one durable
+`request_explicit_approval` delivery from its first pending source observation,
+with no executor session, owner turn claim, action intent, owner effect, or ACK.
+Its paired human decision remains unanswered and later source reports do not create
+another gate delivery. In the same observation window an independent implementation
+candidate, such as 29 or 30, must advance normally. Approval is not part of this
+fixture. The focused tests
 `test_policy_opted_local_deployment_selector_is_hub_signed`,
 `test_local_candidate_manifest_rejects_caller_selected_deployment_scope`, and
 the existing continuity deployment-gate tests cover the selector, hub HMAC,

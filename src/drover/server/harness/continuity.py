@@ -1686,6 +1686,34 @@ class FactoryObserverContinuity:
             )
             self._release_integration(con, run, owner_id, owner_epoch, now)
 
+    def pending_deployment_gate_runs(
+        self, owner_id: str, *, limit: int = 20
+    ) -> list[str]:
+        """Return signed deployment runs that need one non-executor gate delivery.
+
+        Deployment authority is deliberately excluded from :meth:`owner_runs`:
+        a native owner must never turn an unanswered human approval into a
+        provider turn.  The runner can still lease and consume one durable
+        ``request_explicit_approval`` action so status exposes the gate.  Once
+        that action is stored, ``next_action_json`` prevents a second source
+        event from being consumed until an authorized human decision exists.
+        """
+        _text(owner_id, "owner_id", 191)
+        _integer(limit, "limit", 1, 50)
+        with self._transaction() as (con, _):
+            rows = con.execute(
+                """SELECT r.run_id FROM factory_observer_runs r
+                WHERE r.authorized_owner_id = ? AND r.authority_scope = 'deployment'
+                  AND r.next_action_json IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM factory_observer_inbox i
+                    WHERE i.run_id = r.run_id AND i.state = 'pending'
+                  )
+                ORDER BY r.updated_at, r.run_id LIMIT ?""",
+                [owner_id, limit],
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def owner_runs(
         self,
         owner_id: str,

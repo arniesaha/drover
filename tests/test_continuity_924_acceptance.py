@@ -327,17 +327,23 @@ def test_human_gate_blocks_only_its_branch(acceptance, tmp_path):
     assert f.ingest(gate_event, f.event("fixture-924-unrelated-ready")) == [
         (200, {"ingested": 2})
     ]
-    assert f.store.status(gated)["inbox_counts"] == {"pending": 1}
+    gate_status = f.store.status(gated)
+    delivery = gate_status["next_action"]
+    assert gate_status["inbox_counts"] == {"delivered": 1}
+    assert gate_status["recovery"] == "approval_required"
+    assert gate_status["owner_wake"] is False
+    assert delivery["type"] == "request_explicit_approval"
+    assert delivery["authorized"] is False
+    # The automatic path surfaces one durable approval delivery but never
+    # creates an executor turn, action intent, effect, or acknowledgement.
     assert f.store.owner_runs(scope.continuity_owner_id) == []
-    # A separate negative boundary probe confirms that even a direct consumed
-    # delivery cannot acknowledge deployment without human approval. The
-    # automatic runner above never dispatched this excluded branch.
-    lease = f.store.lease(gated, owner_id=scope.continuity_owner_id)
-    fence = {"owner_id": scope.continuity_owner_id, "owner_epoch": lease["owner_epoch"]}
-    delivery = f.store.consume(gated, **fence)
     with pytest.raises(ContinuityConflict, match="explicit deployment approval") as exc:
         f.store.acknowledge(
-            gated, **fence, event_id=delivery["event_id"], checkpoint="forbidden"
+            gated,
+            owner_id=scope.continuity_owner_id,
+            owner_epoch=gate_status["owner"]["epoch"],
+            event_id=delivery["event_id"],
+            checkpoint="forbidden",
         )
     f.state.gate_denials.append(str(exc.value))
     f.clock.advance(1)
@@ -373,7 +379,8 @@ def test_human_gate_blocks_only_its_branch(acceptance, tmp_path):
         {
             "clock": "synthetic UTC",
             "automatic_gate_dispatches": 0,
-            "negative_probe": "explicit lease/consume/ack refused; automatic gate remained pending before probe",
+            "automatic_gate_delivery": "one signed request_explicit_approval; no executor turn or ACK",
+            "negative_probe": "automatic gate acknowledgement refused without explicit human approval",
             "gate_denials": f.state.gate_denials,
             "receipts": rows,
             "effects": [json.loads(p.read_text()) for p in f.effects.iterdir()],
