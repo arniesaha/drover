@@ -232,16 +232,18 @@ def test_work_coordinator_session_gets_paired_mcp_bearer_only(tmp_path, monkeypa
         server.server_close()
 
 
-def test_work_coordinator_session_scopes_the_explicit_mcp_endpoint(tmp_path):
+def test_work_coordinator_session_scopes_bound_stdio_work_control(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     state.structured = _FakeStructuredManager(harness="codex")
     state.host_token = "test-paired-host-bearer"
-    state.work_mcp_url = "http://127.0.0.1:28182/mcp"
+    state.central_url = base_url
     binding = {
         "run_id": "work-" + "d" * 32,
         "owner_id": "drover:owner/goal-native",
         "authority_scope": "implementation",
         "objective": "complete the bound work",
+        "goal_id": "native-canary-924-848",
+        "item_number": 41,
         "binding_signature": "opaque-hub-signature",
     }
     try:
@@ -264,7 +266,10 @@ def test_work_coordinator_session_scopes_the_explicit_mcp_endpoint(tmp_path):
     environment = state.structured.starts[0][1]["environment"]
     assert environment == {
         "DROVER_MCP_TOKEN": "test-paired-host-bearer",
-        "DROVER_WORK_MCP_URL": "http://127.0.0.1:28182/mcp",
+        "DROVER_WORK_CONTROL_URL": base_url,
+        "DROVER_WORK_RUN_KEY": "d" * 32,
+        "DROVER_WORK_GOAL_ID": "native-canary-924-848",
+        "DROVER_WORK_ITEM_NUMBER": "41",
     }
 
 

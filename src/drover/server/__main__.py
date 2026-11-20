@@ -1391,11 +1391,6 @@ def setup_check(
         "then ~/.drover/api_token)"
     ),
 )
-@click.option(
-    "--work-mcp-url",
-    default=None,
-    help="Credential-free loopback /mcp endpoint for coordinator workers",
-)
 @click.pass_context
 def harnessd_cmd(
     ctx: click.Context,
@@ -1407,7 +1402,6 @@ def harnessd_cmd(
     tailscale_url: Optional[str],
     central_url: Optional[str],
     host_token: Optional[str],
-    work_mcp_url: Optional[str],
 ) -> None:
     """Run the Drover host daemon."""
     from drover.server.harness.cli import run_harnessd_from_options
@@ -1422,7 +1416,6 @@ def harnessd_cmd(
         tailscale_url=tailscale_url,
         central_url=central_url,
         host_token=host_token,
-        work_mcp_url=work_mcp_url,
     )
 
 

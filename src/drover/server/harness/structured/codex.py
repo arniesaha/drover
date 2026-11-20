@@ -39,6 +39,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from collections import deque
 from pathlib import Path
@@ -142,11 +143,25 @@ def resolve_last_context_input_tokens(
         return None
 
 
-def _work_mcp_url(value: object) -> str | None:
-    """Accept only a credential-free loopback streamable-MCP endpoint."""
-    if not isinstance(value, str) or not value:
-        return None
-    parsed = urlparse(value)
+def _bound_work_mcp_overrides(env: dict[str, str]) -> list[str]:
+    """Return ephemeral stdio-MCP config for one signed coordinator worker.
+
+    The bridge talks to the existing authenticated hub control route.  It does
+    not create an HTTP MCP listener or edit the shared CODEX_HOME.
+    """
+    required = (
+        "DROVER_WORK_CONTROL_URL",
+        "DROVER_WORK_RUN_KEY",
+        "DROVER_WORK_GOAL_ID",
+        "DROVER_WORK_ITEM_NUMBER",
+        "DROVER_MCP_TOKEN",
+    )
+    if not all(isinstance(env.get(key), str) and env[key] for key in required):
+        return []
+    try:
+        parsed = urlparse(env["DROVER_WORK_CONTROL_URL"])
+    except ValueError:
+        return []
     if (
         parsed.scheme != "http"
         or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
@@ -154,15 +169,21 @@ def _work_mcp_url(value: object) -> str | None:
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
-        or parsed.path != "/mcp"
+        or parsed.path not in {"", "/"}
     ):
-        return None
+        return []
     try:
         if parsed.port is None or not 1 <= parsed.port <= 65535:
-            return None
+            return []
+        if int(env["DROVER_WORK_ITEM_NUMBER"]) <= 0:
+            return []
     except ValueError:
-        return None
-    return value
+        return []
+    return [
+        f"mcp_servers.drover.command={json.dumps(sys.executable)}",
+        "mcp_servers.drover.args="
+        + json.dumps(["-m", "drover.server.work_queue.worker_mcp"]),
+    ]
 
 
 class CodexDriver:
@@ -207,7 +228,7 @@ class CodexDriver:
         self._closed = False
         self._git_base: str | None = None
         self._git_turn_id: str | None = None
-        self._work_mcp_url = _work_mcp_url(self.env.get("DROVER_WORK_MCP_URL"))
+        self._bound_work_mcp_overrides = _bound_work_mcp_overrides(self.env)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -318,20 +339,8 @@ class CodexDriver:
         thinking_effort: str | None = None,
     ) -> list[str]:
         command = list(self.command)
-        if self._work_mcp_url is not None:
-            # Coordinator workers receive the paired host bearer only at
-            # launch.  Register the bounded loopback MCP endpoint for this
-            # one Codex process without editing the caller's CODEX_HOME.
-            # The URL contains no credential; Codex reads the bearer from the
-            # already-scoped DROVER_MCP_TOKEN environment variable.
-            command.extend(
-                [
-                    "-c",
-                    f"mcp_servers.drover.url={json.dumps(self._work_mcp_url)}",
-                    "-c",
-                    'mcp_servers.drover.bearer_token_env_var="DROVER_MCP_TOKEN"',
-                ]
-            )
+        for override in self._bound_work_mcp_overrides:
+            command.extend(["-c", override])
         if model:
             command.extend(["--model", model])
         if thinking_effort:

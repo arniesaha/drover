@@ -201,6 +201,14 @@ class HarnessBridge:
             "authority_scope": authority_scope,
             "objective": f"Work coordinator {role} for {item_url}",
         }
+        if (
+            isinstance(goal_id, str)
+            and goal_id
+            and not isinstance(local_candidate_number, bool)
+            and isinstance(local_candidate_number, int)
+            and local_candidate_number > 0
+        ):
+            binding.update(goal_id=goal_id, item_number=local_candidate_number)
         if expected_effect_artifact is not None:
             if (
                 not isinstance(expected_effect_artifact, str)

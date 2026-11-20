@@ -1374,7 +1374,6 @@ class HarnessDaemonState:
     tailscale_url: str | None = None
     central_url: str | None = None
     host_token: str | None = None
-    work_mcp_url: str | None = None
     api_token: str = ""
     # True when this daemon dials the hub instead of waiting to be dialled;
     # visible here so the registration payload can advertise which it is.
@@ -3155,14 +3154,24 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             child_environment["DROVER_MCP_TOKEN"] = owner_bearer
         elif work_continuity is not None and self.server.state.host_token:
             # A coordinator worker may use the already-paired host identity
-            # through its explicitly configured loopback MCP endpoint. This
+            # through a bound stdio MCP bridge. This
             # is launch-only: the bearer is not persisted in the registry,
             # continuity ledger, prompt, or hub request payload. Ordinary
             # sessions never receive it here.
             child_environment["DROVER_MCP_TOKEN"] = self.server.state.host_token
-            if self.server.state.work_mcp_url:
-                child_environment["DROVER_WORK_MCP_URL"] = (
-                    self.server.state.work_mcp_url
+            # This is a signed hub binding. The child receives only its own
+            # run/item identity and speaks to the existing central control API
+            # through a stdio MCP bridge; no additional MCP listener exists.
+            if (
+                self.server.state.central_url
+                and work_continuity.goal_id is not None
+                and work_continuity.item_number is not None
+            ):
+                child_environment.update(
+                    DROVER_WORK_CONTROL_URL=self.server.state.central_url,
+                    DROVER_WORK_RUN_KEY=work_continuity.run_id.removeprefix("work-"),
+                    DROVER_WORK_GOAL_ID=work_continuity.goal_id,
+                    DROVER_WORK_ITEM_NUMBER=str(work_continuity.item_number),
                 )
         try:
             self.server.state.structured.start(
@@ -4975,7 +4984,6 @@ def run_harnessd(
     tailscale_url: str | None = None,
     central_url: str | None = None,
     host_token: str | None = None,
-    work_mcp_url: str | None = None,
     relay: bool = False,
     advisory_content: "AdvisoryContentConfig | None" = None,
     content_consent_path: Path | None = None,
@@ -5003,7 +5011,6 @@ def run_harnessd(
         tailscale_url=tailscale_url,
         central_url=central_url,
         host_token=host_token,
-        work_mcp_url=work_mcp_url,
         relay=relay,
         advisory_content=advisory_content,
         content_consent=content_consent,

@@ -93,7 +93,6 @@ def run_harnessd_from_options(
     tailscale_url: str | None,
     central_url: str | None,
     host_token: str | None,
-    work_mcp_url: str | None = None,
     relay: bool = False,
 ) -> None:
     cfg = resolve_config(config_path)
@@ -111,7 +110,6 @@ def run_harnessd_from_options(
         tailscale_url=tailscale_url,
         central_url=central_url,
         host_token=host_token,
-        work_mcp_url=work_mcp_url,
         relay=relay,
         advisory_content=cfg.advisory_content,
         content_consent_path=resolved_config_path.with_name(
@@ -225,11 +223,6 @@ def store_check(cfg: DroverConfig) -> dict[str, Any]:
     ),
 )
 @click.option(
-    "--work-mcp-url",
-    default=None,
-    help="Credential-free loopback /mcp endpoint for coordinator workers",
-)
-@click.option(
     "--relay",
     is_flag=True,
     default=False,
@@ -248,7 +241,6 @@ def main(
     tailscale_url: str | None,
     central_url: str | None,
     host_token: str | None,
-    work_mcp_url: str | None,
     relay: bool,
 ) -> None:
     """Run the Drover host daemon without loading full drover-server."""
@@ -273,7 +265,6 @@ def main(
         tailscale_url=tailscale_url,
         central_url=central_url,
         host_token=host_token,
-        work_mcp_url=work_mcp_url,
         relay=relay,
     )
 
