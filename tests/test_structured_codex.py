@@ -422,12 +422,14 @@ def test_work_coordinator_mcp_uses_bound_stdio_bridge_without_listener():
 
     argv = driver._argv_for("complete the bound work")
 
-    assert argv[:5] == [
+    assert argv[:7] == [
         "codex",
         "-c",
         f"mcp_servers.drover.command={json.dumps(sys.executable)}",
         "-c",
         'mcp_servers.drover.args=["-m", "drover.server.work_queue.worker_mcp"]',
+        "-c",
+        'mcp_servers.drover.env_vars=["DROVER_WORK_CONTROL_URL", "DROVER_MCP_TOKEN", "DROVER_WORK_RUN_KEY", "DROVER_WORK_GOAL_ID", "DROVER_WORK_ITEM_NUMBER", "PYTHONPATH"]',
     ]
     assert "launch-only-bearer" not in " ".join(argv)
     assert argv[-2:] == ["--", "complete the bound work"]

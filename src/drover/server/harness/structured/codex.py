@@ -183,6 +183,17 @@ def _bound_work_mcp_overrides(env: dict[str, str]) -> list[str]:
         f"mcp_servers.drover.command={json.dumps(sys.executable)}",
         "mcp_servers.drover.args="
         + json.dumps(["-m", "drover.server.work_queue.worker_mcp"]),
+        "mcp_servers.drover.env_vars="
+        + json.dumps(
+            [
+                "DROVER_WORK_CONTROL_URL",
+                "DROVER_MCP_TOKEN",
+                "DROVER_WORK_RUN_KEY",
+                "DROVER_WORK_GOAL_ID",
+                "DROVER_WORK_ITEM_NUMBER",
+                "PYTHONPATH",
+            ]
+        ),
     ]
 
 
