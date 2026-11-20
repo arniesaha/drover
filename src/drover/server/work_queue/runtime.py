@@ -318,6 +318,14 @@ class HarnessBridge:
         session = self.resolve(run_key)
         if session is None or session.handoff_mode != "work_coordinator":
             return None
+        # The provider manifest can change after launch. Recovery must compare
+        # its current value with the original hub-verified binding rather than
+        # reconstructing authority from that mutable provider data.
+        bound_artifact = self.registry.work_coordinator_expected_effect_artifact(
+            session.session_id, "work-" + run_key
+        )
+        if bound_artifact != artifact:
+            return None
         status, body = self.collector.proxy_harness_session_action(
             session.session_id, "expected-effect", {"artifact": artifact}
         )

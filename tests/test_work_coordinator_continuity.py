@@ -200,6 +200,18 @@ def test_signed_candidate_effect_binding_is_persisted_and_rejects_generic_receip
     store = FactoryObserverContinuity(path)
     status = store.status("work-expected-effect")
     assert status["expected_effect_artifact"] == expected
+    assert (
+        HarnessRegistry(path).work_coordinator_expected_effect_artifact(
+            "harness-expected-effect", "work-expected-effect"
+        )
+        == expected
+    )
+    assert (
+        HarnessRegistry(path).work_coordinator_expected_effect_artifact(
+            "harness-expected-effect", "work-other"
+        )
+        is None
+    )
     lease = store.lease("work-expected-effect", owner_id=unsigned["owner_id"])
     action = store.consume(
         "work-expected-effect",

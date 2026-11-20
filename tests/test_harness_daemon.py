@@ -99,9 +99,27 @@ def test_expected_effect_attestation_is_confined_to_the_structured_worktree(tmp_
         )
         == "absent"
     )
+    empty_worktree = tmp_path / "empty-worktree"
+    empty_worktree.mkdir()
+    assert _expected_effect_verification(str(empty_worktree), artifact) == "absent"
     assert (
         _expected_effect_verification(
             str(worktree), "local-file:.drover-native-canary/../../outside.json"
+        )
+        == "unknown"
+    )
+    dangling = worktree / ".drover-native-canary" / "dangling.json"
+    dangling.symlink_to("missing.json")
+    assert (
+        _expected_effect_verification(
+            str(worktree), "local-file:.drover-native-canary/dangling.json"
+        )
+        == "unknown"
+    )
+    (worktree / ".drover-native-canary" / "directory").mkdir()
+    assert (
+        _expected_effect_verification(
+            str(worktree), "local-file:.drover-native-canary/directory"
         )
         == "unknown"
     )

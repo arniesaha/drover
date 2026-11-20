@@ -2775,6 +2775,21 @@ class HarnessRegistry:
             return None
         return self.owner_turn_failure_category(session_id, turn_ids[-1])
 
+    def work_coordinator_expected_effect_artifact(
+        self, session_id: str, run_id: str
+    ) -> str | None:
+        """Read the hub-signed immutable effect binding for one worker run."""
+        if not session_id or not run_id:
+            return None
+        with self._connect() as con:
+            row = con.execute(
+                """SELECT expected_effect_artifact FROM factory_observer_runs
+                     WHERE session_id = ? AND run_id = ?""",
+                [session_id, run_id],
+            ).fetchone()
+        artifact = row[0] if row else None
+        return artifact if isinstance(artifact, str) and artifact else None
+
     def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
         """Classify idle turns without changing the session's resumable state.
 

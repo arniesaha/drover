@@ -120,6 +120,11 @@ def test_bridge_requires_explicit_absent_effect_verification(payload, expected):
     bridge.resolve = lambda run_key: SimpleNamespace(
         session_id="coordinator", handoff_mode="work_coordinator"
     )
+    bridge.registry = SimpleNamespace(
+        work_coordinator_expected_effect_artifact=lambda session_id, run_id: (
+            "local-file:.drover-native-canary/source-task-1.json"
+        )
+    )
     bridge.collector = SimpleNamespace(
         proxy_harness_session_action=lambda session_id, action, body: (
             200,
@@ -132,6 +137,30 @@ def test_bridge_requires_explicit_absent_effect_verification(payload, expected):
         )
         is expected
     )
+
+
+def test_bridge_refuses_current_manifest_artifact_that_differs_from_signed_binding():
+    bridge = object.__new__(HarnessBridge)
+    bridge.resolve = lambda run_key: SimpleNamespace(
+        session_id="coordinator", handoff_mode="work_coordinator"
+    )
+    bridge.registry = SimpleNamespace(
+        work_coordinator_expected_effect_artifact=lambda session_id, run_id: (
+            "local-file:.drover-native-canary/source-task-original.json"
+        )
+    )
+    called = []
+    bridge.collector = SimpleNamespace(
+        proxy_harness_session_action=lambda *args: called.append(args)
+    )
+
+    assert (
+        bridge.expected_effect_materialized(
+            "run", "local-file:.drover-native-canary/source-task-changed.json"
+        )
+        is None
+    )
+    assert called == []
 
 
 def test_local_candidate_manifest_rejects_cross_scope_and_malformed_content(tmp_path):
@@ -310,11 +339,17 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
 
 
 def _terminal_local_worker_service(
-    tmp_path, pg_control_path, *, category, materialized
+    tmp_path,
+    pg_control_path,
+    *,
+    category,
+    materialized,
+    provider_artifact=None,
+    bound_artifact=None,
 ):
     path = tmp_path / "candidates.json"
     expected = "local-file:.drover-native-canary/source-task-1.json"
-    _manifest(path, expected_effect=expected)
+    _manifest(path, expected_effect=provider_artifact or expected)
     manifest = json.loads(path.read_text())
     manifest["items"][0]["labels"] = [
         "goal:local",
@@ -340,6 +375,7 @@ def _terminal_local_worker_service(
 
     class Harness:
         def __init__(self):
+            self.bound_artifact = bound_artifact or expected
             self.sessions = {
                 "terminal-run": SimpleNamespace(
                     session_id="terminal-worker",
@@ -361,7 +397,8 @@ def _terminal_local_worker_service(
 
         def expected_effect_materialized(self, run_key, artifact):
             assert run_key in self.sessions
-            assert artifact == expected
+            if artifact != self.bound_artifact:
+                return None
             return materialized
 
         def quota(self):
@@ -470,6 +507,30 @@ def test_queue_worker_never_rearms_human_or_materialized_candidate_work(
 ):
     path, scope, service, store = _terminal_local_worker_service(
         tmp_path, pg_control_path, category=category, materialized=materialized
+    )
+
+    QueueExecutionWorker(service).process_once()
+
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:running"]
+    assert not store.events(
+        identity("automatic-work-coordinator-auth-recovery", scope.goal_id, "1")
+    )
+
+
+def test_queue_worker_refuses_changed_manifest_artifact_after_original_effect(
+    tmp_path, pg_control_path
+):
+    path, scope, service, store = _terminal_local_worker_service(
+        tmp_path,
+        pg_control_path,
+        category="authentication_required",
+        materialized=True,
+        provider_artifact="local-file:.drover-native-canary/source-task-changed.json",
+        bound_artifact="local-file:.drover-native-canary/source-task-1.json",
     )
 
     QueueExecutionWorker(service).process_once()

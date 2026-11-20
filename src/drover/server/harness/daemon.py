@@ -4576,20 +4576,32 @@ def _expected_effect_verification(cwd: str | None, artifact: Any) -> str:
         root = Path(cwd).resolve(strict=True)
         if not root.is_dir():
             return "unknown"
-        target = root.joinpath(*path.parts).resolve(strict=False)
-        target.relative_to(root)
     except (OSError, ValueError, RuntimeError):
         return "unknown"
-    try:
-        target.lstat()
-    except FileNotFoundError:
-        return "absent"
-    except OSError:
-        return "unknown"
-    try:
-        return "materialized" if target.is_file() else "unknown"
-    except OSError:
-        return "unknown"
+    # Do not resolve the target first: a dangling symlink resolves to a
+    # missing path and would otherwise look like a safe absence. Every
+    # supplied component must be a directly readable non-symlink directory,
+    # until the final regular file (or genuinely missing child).
+    target = root
+    for index, part in enumerate(path.parts):
+        target = target / part
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "unknown"
+        if target.is_symlink():
+            return "unknown"
+        if index < len(path.parts) - 1:
+            if not target.is_dir():
+                return "unknown"
+            continue
+        try:
+            return "materialized" if target.is_file() else "unknown"
+        except OSError:
+            return "unknown"
+    return "unknown"
 
 
 def _materialized_expected_effect(cwd: str | None, artifact: Any) -> bool:
