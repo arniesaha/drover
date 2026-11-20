@@ -1,0 +1,16 @@
+{
+  "policy_authority_delta": {
+    "local_candidate_committed_provenance_enabled": true,
+    "local_candidate_deployment_scope_enabled": true
+  },
+  "goal_scope_delta_template": {
+    "brief_ref": "<approved-canary-runtime>/source/docs/operations/native-local-candidate-canary-m3-committed-provenance.md",
+    "local_candidate_committed_provenance": {"48": "m3", "49": "m3", "50": "m3"},
+    "local_candidate_authority_scopes": {"57": "deployment"}
+  },
+  "fixture_sequence": [
+    "docs/operations/fixtures/native-canary-m3-candidates-49-50-committed-provenance.json",
+    "docs/operations/fixtures/native-canary-followon-m2-m3-candidates-51-58.json"
+  ],
+  "owner_resolution": "Offline review template only. Resolve <approved-canary-runtime> to the existing disposable runtime root during approved alignment; the configuration parser does not expand it. Existing integration serialization key/label is reused for 55 and 56; do not add committed provenance to those items."
+}

@@ -800,6 +800,8 @@ def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
         ("native-canary-m3-candidate-44-verification.json", [44]),
         ("native-canary-m3-candidate-45-stdlib-verification.json", [45]),
         ("native-canary-m3-candidate-48-committed-provenance.json", [48]),
+        ("native-canary-m3-candidates-49-50-committed-provenance.json", [49, 50]),
+        ("native-canary-followon-m2-m3-candidates-51-58.json", list(range(51, 59))),
     ],
 )
 def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
@@ -857,6 +859,25 @@ def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
         body = items[0]["body"]
         assert "signed coordinator binding explicitly permits" in body
         assert "If the signed binding does not permit it" in body
+    if fixture_name == "native-canary-m3-candidates-49-50-committed-provenance.json":
+        assert all("committed provenance" in item["body"] for item in items)
+        assert all(
+            "python3 tests/test_native_canary_m3_" in item["body"] for item in items
+        )
+        assert all(
+            "delivery:integration" not in item["operator_authority_labels"]
+            for item in items
+        )
+    if fixture_name == "native-canary-followon-m2-m3-candidates-51-58.json":
+        assert all("Do not commit" in item["body"] for item in items)
+        integration = [item for item in items if item["number"] in {55, 56}]
+        assert all(
+            "delivery:integration" in item["operator_authority_labels"]
+            for item in integration
+        )
+        human = next(item for item in items if item["number"] == 57)
+        assert "delivery:integration" not in human["operator_authority_labels"]
+        assert "Do not request, infer, or fabricate approval" in human["body"]
 
 
 def test_reviewed_committed_provenance_binding_delta_is_portable_template():
@@ -880,6 +901,31 @@ def test_reviewed_committed_provenance_binding_delta_is_portable_template():
         "local_candidate_committed_provenance": {"48": "m3"},
     }
     assert "<approved-canary-runtime>" in binding["owner_resolution"]
+    assert "/Users/" not in fixture.read_text(encoding="utf-8")
+
+
+def test_reviewed_followon_binding_delta_keeps_selectors_narrow_and_portable():
+    fixture = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "operations"
+        / "fixtures"
+        / "native-canary-followon-binding-input.json"
+    )
+    binding = json.loads(fixture.read_text(encoding="utf-8"))
+
+    assert binding["policy_authority_delta"] == {
+        "local_candidate_committed_provenance_enabled": True,
+        "local_candidate_deployment_scope_enabled": True,
+    }
+    delta = binding["goal_scope_delta_template"]
+    assert delta["local_candidate_committed_provenance"] == {
+        "48": "m3",
+        "49": "m3",
+        "50": "m3",
+    }
+    assert delta["local_candidate_authority_scopes"] == {"57": "deployment"}
+    assert "<approved-canary-runtime>" in delta["brief_ref"]
     assert "/Users/" not in fixture.read_text(encoding="utf-8")
 
 

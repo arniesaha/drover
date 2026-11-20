@@ -342,3 +342,46 @@ must advance normally. Approval is not part of this fixture. The focused tests
 `test_local_candidate_manifest_rejects_caller_selected_deployment_scope`, and
 the existing continuity deployment-gate tests cover the selector, hub HMAC,
 manifest rejection, and fail-closed human gate.
+
+## Fresh follow-on inputs after candidate 48
+
+[`fixtures/native-canary-m3-candidates-49-50-committed-provenance.json`](fixtures/native-canary-m3-candidates-49-50-committed-provenance.json)
+contains the next two independent, harmless committed-provenance records. They
+use different standard-library-focused tasks and exact candidate-bound effects;
+they are not copies of candidate 48's source assertion. The integration owner
+stages **49 only** after an independent verdict for 48. It stages **50 only**
+after an independent verdict for 49. A valid worker, separate verifier, signed
+artifact attestation, owner action intent, and both terminal ACKs are required
+for each. Three consecutive successes are a live evidence requirement; this
+fixture does not establish it.
+
+[`fixtures/native-canary-followon-binding-input.json`](fixtures/native-canary-followon-binding-input.json)
+is the sole offline selector extension. It retains the exact reviewed
+committed-provenance selectors for 48, 49, and 50, selects no deployment or
+integration item for provenance, and separately selects deployment authority
+only for candidate 57. The `<approved-canary-runtime>` value is resolved by the
+integration owner during a reviewed disposable alignment; it is not a parser
+substitution or a body-controlled value.
+
+[`fixtures/native-canary-followon-m2-m3-candidates-51-58.json`](fixtures/native-canary-followon-m2-m3-candidates-51-58.json)
+uses marker-only tasks and existing mechanisms for the remaining live stages:
+
+- 51 is the M2 source effect and 52 is the ordinary ready-work witness. Stage
+  them only according to the M2 pre-ACK interruption boundary above. A restart
+  is permitted only after 51 has a materialized **owner** effect and the same
+  final wake remains unacknowledged. If that boundary settles first, retain the
+  ordinary outcome and do not retry to manufacture a race.
+- 53 and 54 are distinct, ordinary implementation tasks for a real cap-two
+  overlap. Stage both once, without a barrier or sleep; retain their genuine
+  intervals whether or not they overlap.
+- 55 and 56 carry the existing integration label. The already configured
+  serialization key/label must create the signed fenced role; no committed
+  provenance exception applies to either item.
+- 57 is the genuine deployment-selected human gate. Leave its approval
+  unanswered. Stage 58 as the unrelated ordinary implementation branch and
+  require it to advance while 57 has no owner effect or ACK.
+
+All records retain the ordinary `local_file -> WorkService ->
+QueueExecutionWorker -> HarnessBridge` path. None authorizes direct dispatch,
+a manual lease/consume/action/ACK, a copied artifact, or a second source turn.
+These are review inputs only and do not prove M2 or M3.
