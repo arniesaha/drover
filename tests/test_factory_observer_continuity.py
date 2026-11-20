@@ -707,6 +707,48 @@ def test_scope_is_immutable_and_deployment_approval_is_blocked(
         assert store.status(run)["checkpoint"] == "Waiting"
 
 
+def test_candidate_worker_started_cannot_bypass_deployment_effect_or_gate(bridge):
+    store, _, registry = bridge
+    registry.create_session(
+        session_id="deployment-candidate",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        source_session_id="factory/run_DEPLOYMENT497@4",
+        handoff_mode="factory_observer",
+    )
+    expected = "local-file:.drover-native-canary/source-task-deployment.json"
+    run_id = store.initialize(
+        session_id="deployment-candidate",
+        objective="Deploy candidate",
+        checkpoint="Waiting for approval",
+        authority_scope="deployment",
+        authorized_owner_id="owner",
+        expected_effect_artifact=expected,
+    )
+    lease = store.lease(run_id, owner_id="owner")
+    fence = {"owner_id": "owner", "owner_epoch": lease["owner_epoch"]}
+    event_id = store.report(
+        run_id,
+        source="openclaw",
+        source_event_id="worker-started",
+        subject="worker-deployment",
+        sequence=1,
+        kind="worker_started",
+        summary="Worker started",
+    )
+
+    action = store.consume(run_id, **fence)
+    assert action["type"] == "request_explicit_approval"
+    assert action["authorized"] is False
+    assert action["expected_effect_artifact"] == expected
+    assert not store.status(run_id)["owner_wake"]
+    with pytest.raises(ContinuityConflict, match="approval"):
+        store.acknowledge(
+            run_id, **fence, event_id=event_id, checkpoint="unauthorized deployment"
+        )
+
+
 def test_delivery_backoff_and_retry_budget_survive_owner_recovery(bridge):
     store, clock, _ = bridge
     fence = owner(store, lease_seconds=1)
