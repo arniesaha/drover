@@ -1394,7 +1394,14 @@ class FactoryObserverContinuity:
                 }
                 if scope == "deployment":
                     action["type"] = "request_explicit_approval"
-                if run.get("expected_effect_artifact") is not None:
+                # A worker-start observation is not settlement of the
+                # candidate's final effect.  It may use ordinary owner
+                # evidence, while the terminal worker result remains bound to
+                # the signed candidate artifact below.
+                if (
+                    run.get("expected_effect_artifact") is not None
+                    and action["type"] != "observe_worker_start"
+                ):
                     action["expected_effect_artifact"] = run["expected_effect_artifact"]
                 if not late and report["kind"].startswith("worker_"):
                     con.execute(
