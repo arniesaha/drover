@@ -371,6 +371,24 @@ class HarnessBridge:
             f"ref {scope.brief_ref or scope.goal_id} and versioned policy. Report "
             "behavioral evidence through the work tools."
         )
+        if scope.candidate_source == "local_file":
+            body = authority.get("body")
+            if (
+                not isinstance(local_number, int)
+                or local_number <= 0
+                or not isinstance(body, str)
+                or not body.strip()
+            ):
+                raise WorkDenied("local candidate task authority is invalid")
+            brief += (
+                f"\n\nLocal candidate task #{local_number}:\n{body.strip()}\n\n"
+                "The `Assigned isolated worktree` appended by harnessd is the "
+                "authoritative worktree for this task and its bound local effect. "
+                "An optional local_candidate_worktrees entry only selected a "
+                "base checkout before launch; a missing entry is not a worker "
+                "authorization gate. Do not use another worktree or substitute "
+                "the requested effect."
+            )
         payload = {
             "cwd": cwd,
             "harness": harness,
