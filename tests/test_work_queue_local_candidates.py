@@ -9,7 +9,7 @@ from drover.server.work_queue.local_candidates import LocalCandidateProvider
 from drover.server.work_queue.provider import ItemRef
 from drover.server.work_queue.reconciler import QueueExecutionWorker, ShadowReconciler
 from drover.server.work_queue.runtime import HarnessBridge
-from drover.server.work_queue.service import WorkService, identity
+from drover.server.work_queue.service import WorkDenied, WorkService, identity
 from drover.server.work_queue.store import WorkStore
 
 
@@ -247,6 +247,114 @@ def test_local_candidate_reconciler_and_work_service_share_the_same_provider(tmp
     assert worker.reconciler.providers is service.providers
     work = WorkService(config, None, service.providers, None)
     assert work.ref(scope, 1) == _ref()
+
+
+def test_bridge_delivers_unmapped_local_candidate_task_to_assigned_worktree(tmp_path):
+    """The daemon-assigned worktree, not an optional static map, authorizes work."""
+    manifest = tmp_path / "candidates.json"
+    _manifest(manifest)
+    expected = "local-file:.drover-native-canary/source-task-19.json"
+    task = (
+        "Write .drover-native-canary/source-task-19.json in the assigned "
+        "disposable worktree."
+    )
+    scope = _scope(
+        manifest,
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path / "configured-checkout")},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+        # Candidate 19 is deliberately absent: this optional map picks a
+        # launch checkout, not whether the daemon may assign a worktree.
+        local_candidate_worktrees={"1": str(tmp_path / "worktree-1")},
+    )
+    config = WorkQueueConfig(
+        enabled=True,
+        shadow_mode=False,
+        workspace_id="local-workspace",
+        goals=[scope],
+    )
+    payloads = []
+    bridge = object.__new__(HarnessBridge)
+    bridge.config = config
+    bridge.collector = SimpleNamespace(
+        work_coordinator_continuity_secret="test-continuity-secret",
+        proxy_create_harness_session=lambda host, payload: (
+            payloads.append((host, payload)) or (201, '{"session_id":"worker-19"}')
+        ),
+    )
+    bridge.registry = SimpleNamespace()
+
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "a" * 32,
+            ItemRef(
+                "local-workspace",
+                "local_file",
+                "example/project",
+                19,
+                "local://goal-local/19",
+            ),
+            "work",
+            None,
+            scope.goal_id,
+            authority={
+                "labels": ["goal:local", "status:queued"],
+                "body": task,
+                "local_candidate_number": 19,
+                "local_candidate_cwd": None,
+                "expected_effect_artifact": expected,
+            },
+        )
+        == "worker-19"
+    )
+    _host, payload = payloads[0]
+    assert payload["cwd"] == str(tmp_path / "configured-checkout")
+    assert task in payload["prompt"]
+    assert "Assigned isolated worktree" in payload["prompt"]
+    assert "missing entry is not a worker authorization gate" in payload["prompt"]
+    assert (
+        payload["work_coordinator_continuity"]["expected_effect_artifact"] == expected
+    )
+
+
+def test_bridge_refuses_local_candidate_without_task_authority(tmp_path):
+    manifest = tmp_path / "candidates.json"
+    _manifest(manifest)
+    scope = _scope(
+        manifest,
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path)},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+    )
+    bridge = object.__new__(HarnessBridge)
+    bridge.config = WorkQueueConfig(
+        enabled=True,
+        shadow_mode=False,
+        workspace_id="local-workspace",
+        goals=[scope],
+    )
+    bridge.registry = SimpleNamespace()
+    bridge.collector = SimpleNamespace(
+        proxy_create_harness_session=lambda *_: pytest.fail("invalid task launched")
+    )
+
+    with pytest.raises(WorkDenied, match="local candidate task authority is invalid"):
+        bridge.launch(
+            "host",
+            "codex",
+            "a" * 32,
+            _ref(),
+            "work",
+            None,
+            scope.goal_id,
+            authority={"local_candidate_number": 1, "body": " "},
+        )
 
 
 def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(

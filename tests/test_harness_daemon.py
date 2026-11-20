@@ -267,6 +267,47 @@ def test_work_coordinator_prompt_names_the_resolved_isolated_worktree(tmp_path):
     )
 
 
+def test_work_coordinator_prompt_preserves_candidate_task_and_worktree_authority(
+    tmp_path,
+):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _FakeStructuredManager(harness="codex")
+    task = "Write .drover-native-canary/source-task-19.json in the assigned worktree."
+    binding = {
+        "run_id": "work-" + "c" * 32,
+        "owner_id": "drover:owner/goal-native",
+        "authority_scope": "implementation",
+        "objective": "write the bound local effect",
+        "binding_signature": "opaque-hub-signature",
+    }
+    prompt = (
+        f"Local candidate task #19:\n{task}\n\n"
+        "The `Assigned isolated worktree` appended by harnessd is the "
+        "authoritative worktree for this task and its bound local effect."
+    )
+    try:
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "cwd": str(tmp_path),
+                "prompt": prompt,
+                "work_coordinator_continuity": binding,
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 201
+    delivered = state.structured.turns[0][1]
+    assert task in delivered
+    assert f"Assigned isolated worktree: {tmp_path}" in delivered
+    assert "authoritative worktree for this task" in delivered
+
+
 def test_harnessd_attests_only_a_work_coordinator_session_effect(tmp_path):
     server, state, base_url = _start_test_server(tmp_path)
     worktree = tmp_path / "worktrees" / "work-a"
