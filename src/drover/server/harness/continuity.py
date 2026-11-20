@@ -1684,21 +1684,23 @@ class FactoryObserverContinuity:
                 handoff_state = "acknowledgement_required"
             elif counts.get("pending") or counts.get("delivered"):
                 handoff_state = "owner_lease_required"
+            elif counts.get("exhausted"):
+                # An acknowledgement for an earlier wake cannot settle a
+                # different exhausted delivery.  Keep this distinct from a
+                # successful handoff so an owner never treats aggregate
+                # counts as proof that its exact wake was acknowledged.
+                handoff_state = "delivery_exhausted"
             elif counts.get("acknowledged"):
                 handoff_state = "acknowledged"
             else:
                 handoff_state = "awaiting_completion"
             recovery = (
-                ("claim_owner" if not run["owner_id"] else "reclaim_expired_owner")
-                if not live
+                "manual_attention"
+                if counts.get("exhausted")
                 else (
-                    "approval_required"
-                    if blocked
-                    else (
-                        "manual_attention"
-                        if counts.get("exhausted")
-                        else "continue_owner"
-                    )
+                    ("claim_owner" if not run["owner_id"] else "reclaim_expired_owner")
+                    if not live
+                    else ("approval_required" if blocked else "continue_owner")
                 )
             )
             return {

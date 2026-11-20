@@ -577,6 +577,50 @@ def _acknowledge_current_wake(store, run_id, owner_id):
     return action["event_id"]
 
 
+def test_exhausted_worker_wake_is_not_hidden_by_an_earlier_acknowledgement(tmp_path):
+    runner, _, store, run_id, clock = _runner(tmp_path, event_kind="worker_started")
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    assert runner.process_once() == 1
+    acknowledged_wake = _acknowledge_current_wake(store, run_id, owner_id)
+    exhausted_wake = store.report(
+        run_id,
+        source="hub",
+        source_event_id="done-after-ack",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="done",
+    )
+
+    def consume_current_wake():
+        owner = store.status(run_id)["owner"]
+        lease = store.lease(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"] if owner["live"] else None,
+        )
+        return store.consume(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=lease["owner_epoch"],
+        )
+
+    for delay in (5, 10, 20):
+        action = consume_current_wake()
+        assert action and action["event_id"] == exhausted_wake
+        clock.advance(delay)
+    assert consume_current_wake() is None
+
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"acknowledged": 1, "exhausted": 1}
+    assert status["owner_handoff"]["state"] == "delivery_exhausted"
+    assert status["recovery"] == "manual_attention"
+    assert status["next_action"] is None
+    assert not status["owner_wake"]
+    assert acknowledged_wake != exhausted_wake
+
+
 def test_acknowledged_idle_owner_turn_completes_claim_and_delivers_successor(tmp_path):
     runner, collector, store, run_id, clock = _runner(tmp_path)
 
