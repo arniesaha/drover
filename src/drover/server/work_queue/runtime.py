@@ -340,6 +340,28 @@ class HarnessBridge:
             return None
         return self.registry.coordinator_turn_failure_category(session.session_id)
 
+    def terminal_work_done(self, run_key):
+        """Return true only for the bound worker's declared successful terminal state."""
+        session = self.resolve(run_key)
+        if (
+            session is None
+            or session.status != "completed"
+            or session.handoff_mode != "work_coordinator"
+        ):
+            return False
+        from drover.server.harness.continuity import FactoryObserverContinuity
+
+        try:
+            status = FactoryObserverContinuity(self.collector.duckdb_path).status(
+                "work-" + run_key
+            )
+        except Exception:  # unknown terminal projection must not schedule a verifier
+            return False
+        return (
+            status.get("session_id") == session.session_id
+            and status.get("worker_state") == "done"
+        )
+
     def expected_effect_materialized(self, run_key, artifact):
         """Ask the bound daemon whether its exact candidate effect exists.
 

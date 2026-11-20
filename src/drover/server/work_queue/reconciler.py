@@ -271,6 +271,9 @@ class QueueExecutionWorker:
                     log.exception("work queue launch candidate failed")
             elif candidate["kind"] == "inspect_execution":
                 try:
+                    self.service.advance_deferred_completion(
+                        candidate["goal_id"], candidate["number"]
+                    )
                     self._recover_typed_worker_auth_failure(candidate)
                 except Exception:
                     # Recovery is intentionally best-effort and fenced by a
