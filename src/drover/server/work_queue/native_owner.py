@@ -1189,9 +1189,18 @@ class NativeOwnerRunner:
             f"goal_id: {scope.goal_id}\nrun_id: {run_id}\nwake_id: {action['event_id']}\n"
             f"owner_id: {owner_id}\nowner_epoch: {epoch}\naction: {action['type']}\n"
             f"action_fingerprint: {action['action_id']}\n"
-            f"brief_ref: {scope.brief_ref}\n\n"
-            "Use the Drover lease/consume/ack contract only for this delivered action. "
-            "Authenticate each continuity endpoint request with the bearer in "
+            + (
+                f"expected_effect_artifact: {action['expected_effect_artifact']}\n"
+                if action.get("expected_effect_artifact") is not None
+                else ""
+            )
+            + f"brief_ref: {scope.brief_ref}\n\n"
+            "The hub already consumed and fenced the exact wake printed above before "
+            "submitting this turn. Do not call consume to fetch a replacement delivery: "
+            "it returns no delivery until a scheduled redelivery and never authorizes "
+            "a different wake. Reconcile only this wake and action fingerprint with "
+            "action_intent, verify the bound artifact when present, then acknowledge "
+            "that exact delivery. Authenticate each continuity endpoint request with the bearer in "
             "DROVER_CONTINUITY_OWNER_BEARER, never DROVER_API_TOKEN. "
             "The authorized brief referenced by brief_ref is the deliverable contract: "
             "when it explicitly requires a read-only summary or other non-code "
