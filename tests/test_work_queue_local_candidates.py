@@ -1182,7 +1182,120 @@ def test_policy_opted_committed_provenance_is_hub_signed_and_body_cannot_select_
         hub_secret="hub-secret",
     )
     assert parsed_legacy.committed_provenance is False
-    assert "does not permit a source commit" in legacy_payload["prompt"]
+    assert "marker-only work run" in legacy_payload["prompt"]
+    assert "does not need to be Git tracked, committed, or passed to a verifier" in (
+        legacy_payload["prompt"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("number", "labels", "authority_scope", "delivery_role"),
+    [
+        (51, ["goal:local", "status:queued"], "implementation", "standard"),
+        (52, ["goal:local", "status:queued"], "implementation", "standard"),
+        (53, ["goal:local", "status:queued"], "implementation", "standard"),
+        (54, ["goal:local", "status:queued"], "implementation", "standard"),
+        (
+            55,
+            ["goal:local", "status:queued", "delivery:integration"],
+            "implementation",
+            "integration_serialized",
+        ),
+        (
+            56,
+            ["goal:local", "status:queued", "delivery:integration"],
+            "implementation",
+            "integration_serialized",
+        ),
+        (57, ["goal:local", "status:queued"], "deployment", "standard"),
+        (58, ["goal:local", "status:queued"], "implementation", "standard"),
+    ],
+)
+def test_followon_marker_only_bindings_cannot_inherit_committed_provenance(
+    tmp_path, number, labels, authority_scope, delivery_role
+):
+    """The shared brief cannot turn pending M2/M3 work into a verifier handoff."""
+    path = tmp_path / "candidates.json"
+    _manifest(path)
+    policy_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "drover"
+        / "server"
+        / "work_queue"
+        / "policy-v1.json"
+    )
+    policy = json.loads(policy_source.read_text(encoding="utf-8"))
+    policy["authority"]["local_candidate_committed_provenance_enabled"] = True
+    policy["authority"]["local_candidate_deployment_scope_enabled"] = True
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    scope = _scope(
+        path,
+        policy_path=str(policy_path),
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path / "checkout")},
+        brief_ref="docs/native-canary-m3-committed-provenance.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+        local_candidate_committed_provenance={"48": "m3", "49": "m3", "50": "m3"},
+        local_candidate_authority_scopes={"57": "deployment"},
+        integration_serialization_key="canary-integration",
+        integration_serialization_label="delivery:integration",
+    )
+    bridge = object.__new__(HarnessBridge)
+    payloads = []
+    bridge.config = SimpleNamespace(goals=[scope])
+    bridge.collector = SimpleNamespace(
+        work_coordinator_continuity_secret="hub-secret",
+        proxy_create_harness_session=lambda host, payload: (
+            payloads.append(payload) or (201, '{"session_id":"worker-followon"}')
+        ),
+    )
+    bridge.registry = SimpleNamespace()
+    expected = f"local-file:.drover-native-canary/source-task-{number}.json"
+    ref = ItemRef(
+        "local-workspace",
+        "local_file",
+        "example/project",
+        number,
+        f"local://goal-local/{number}",
+    )
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "e" * 32,
+            ref,
+            "work",
+            None,
+            scope.goal_id,
+            authority={
+                "labels": labels,
+                "body": "Create only the signed harmless marker.",
+                "local_candidate_number": number,
+                "local_candidate_cwd": None,
+                "expected_effect_artifact": expected,
+            },
+        )
+        == "worker-followon"
+    )
+    payload = payloads[-1]
+    parsed, _ = parse_work_coordinator_continuity(
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": payload["work_coordinator_continuity"],
+        },
+        hub_secret="hub-secret",
+    )
+    assert parsed.committed_provenance is False
+    assert parsed.expected_effect_artifact == expected
+    assert parsed.authority_scope == authority_scope
+    assert parsed.delivery_role == delivery_role
+    assert "marker-only work run" in payload["prompt"]
+    assert "does not need to be Git tracked, committed, or passed to a verifier" in (
+        payload["prompt"]
+    )
 
 
 def test_deployment_selector_refuses_recovery_without_existing_signed_session(tmp_path):

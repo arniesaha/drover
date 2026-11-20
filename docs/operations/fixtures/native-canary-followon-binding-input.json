@@ -12,5 +12,5 @@
     "docs/operations/fixtures/native-canary-m3-candidates-49-50-committed-provenance.json",
     "docs/operations/fixtures/native-canary-followon-m2-m3-candidates-51-58.json"
   ],
-  "owner_resolution": "Offline review template only. Resolve <approved-canary-runtime> to the existing disposable runtime root during approved alignment; the configuration parser does not expand it. Existing integration serialization key/label is reused for 55 and 56; do not add committed provenance to those items."
+  "owner_resolution": "Offline review template only. Resolve <approved-canary-runtime> to the existing disposable runtime root during approved alignment; the configuration parser does not expand it. Candidates 51, 52, 53, 54, 55, 56, 57, and 58 are intentionally absent from local_candidate_committed_provenance: each remains a direct-attested marker-only work run. Existing integration serialization key/label is reused for 55 and 56; only 57 receives the reviewed deployment authority selector. Do not add committed provenance to any of those items."
 }

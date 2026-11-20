@@ -5,6 +5,12 @@ provides a **hub-signed** `committed_provenance` work binding for the exact
 candidate. It does not change the marker-only default. A candidate body, label,
 or expected-effect reference cannot enable this exception.
 
+A work binding without `committed_provenance` remains marker-only even when this
+brief is the goal's shared `brief_ref`: its signed `local-file:` expected effect
+is a regular untracked file in that worker's assigned worktree and is attested
+directly by the daemon. It does not require a commit or create a verifier run.
+The verifier-only untracked-evidence rule below never applies to that binding.
+
 ## Permitted worker action
 
 For that exact `work` run only, use the daemon-assigned isolated worktree to
