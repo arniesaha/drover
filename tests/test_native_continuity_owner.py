@@ -514,7 +514,14 @@ def test_structured_auth_failure_rearms_only_completed_worker_wake_once(tmp_path
     runner, collector, store, run_id, clock = _runner(
         tmp_path, event_kind="worker_started"
     )
-    clock.advance(1)
+
+    # The start wake can stall without an artificial human block.  Once the
+    # worker has a terminal result, that exact later report supersedes the
+    # observation rather than being starved by it.
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        _mark_owner_auth_failure(runner, collector)
+        clock.advance(delay)
     done_wake = store.report(
         run_id,
         source="hub",
@@ -524,17 +531,20 @@ def test_structured_auth_failure_rearms_only_completed_worker_wake_once(tmp_path
         kind="worker_done",
         summary="done",
     )
-
-    # Exhaust the earlier worker_started event. It must not shadow the later
-    # worker_done wake that is eligible for the structured auth recovery.
-    for delay in (5, 10, 20):
-        assert runner.process_once() == 1
-        _mark_owner_auth_failure(runner, collector)
-        clock.advance(delay)
-    assert runner.process_once() == 0
-
-    # The normal queue advances to worker_done without manually selecting it.
     assert runner.process_once() == 1
+    status = store.status(run_id)
+    start_event = next(
+        event for event in status["events"] if event["event_id"] != done_wake
+    )
+    done_event = next(
+        event for event in status["events"] if event["event_id"] == done_wake
+    )
+    assert start_event["state"] == "exhausted"
+    assert start_event["superseded_by_terminal"] == done_wake
+    assert done_event["state"] == "delivered"
+    assert done_event["attempts"] == 1
+
+    # Only the terminal wake may take the bounded structured-auth recovery.
     for delay in (5, 10, 20):
         owner_session_id = _mark_owner_auth_failure(runner, collector)
         assert runner.registry.completed_turn_kinds([owner_session_id]) == {
@@ -553,10 +563,10 @@ def test_structured_auth_failure_rearms_only_completed_worker_wake_once(tmp_path
     # restoring it to pending; the next normal runner pass creates its fresh
     # owner turn. The earlier started wake remains exhausted.
     status = store.status(run_id)
-    assert status["inbox_counts"] == {"exhausted": 2}
+    assert status["inbox_counts"] == {"exhausted": 1}
     assert runner.process_once() == 1
     status = store.status(run_id)
-    assert status["inbox_counts"] == {"exhausted": 1, "delivered": 1}
+    assert status["inbox_counts"] == {"delivered": 1}
     done_event = next(
         event for event in status["events"] if event["event_id"] == done_wake
     )
@@ -1779,3 +1789,65 @@ def test_isolated_same_claim_delivery_ack_settlement_receipt(tmp_path, capsys):
     print(
         f"claim_id={wake_id} turn_id={claim_turn_id} receipt_id={receipt['action_fingerprint']} ack_id={wake_id} state={state} sessions={linked_sessions} turns={len(collector.turn_attempts)}"
     )
+
+
+def test_active_start_claim_renews_lease_before_owner_action(tmp_path):
+    """A live native start turn keeps its exact epoch while it is still active."""
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+    runner.claim_seconds = 3600
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    action = status["next_action"]
+    owner = status["owner"]
+    assert owner["epoch"] == 1
+
+    # The former 60-second owner lease expired before a normal structured
+    # observation turn could persist its action intent.
+    clock.advance(61)
+    assert runner.process_once() == 0
+    renewed = store.status(run_id)["owner"]
+    assert renewed["epoch"] == owner["epoch"]
+    assert renewed["live"]
+
+    receipt = store.action_intent(
+        run_id,
+        owner_id=owner_id,
+        owner_epoch=renewed["epoch"],
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact="issue-comment:start-observed",
+    )
+    assert receipt["state"] == "complete"
+    store.acknowledge(
+        run_id,
+        owner_id=owner_id,
+        owner_epoch=renewed["epoch"],
+        event_id=action["event_id"],
+        checkpoint="start observed",
+    )
+    assert len(collector.turn_attempts) == 1
+
+
+def test_worker_start_delivery_stalls_without_fixed_attempt_cutoff(tmp_path):
+    """A start observation retries durably without pretending a human blocked it."""
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+    collector.failed_launches = 4
+
+    for attempt in range(4):
+        assert runner.process_once() == 0
+        status = store.status(run_id)
+        event = status["events"][0]
+        assert event["state"] == "delivered"
+        assert event["attempts"] == attempt + 1
+        if attempt == 3:
+            assert status["worker_state"] == "started"
+            assert status["next_action"]["escalation"]["state"] == "delivery_stalled"
+            break
+        due = datetime.fromisoformat(event["next_delivery_at"])
+        clock.advance((due - clock()).total_seconds())

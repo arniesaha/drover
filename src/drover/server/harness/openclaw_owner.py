@@ -98,6 +98,23 @@ class OwnerToolCall(WireModel):
     ]
 
 
+class DeliveryEscalation(WireModel):
+    """Sanitized durable health signal for an unacknowledged observation."""
+
+    state: Literal["delivery_stalled", "superseded_by_terminal"]
+    wake_id: EventId
+    attempts: Annotated[int, Field(ge=3)] | None = None
+    successor_wake_id: EventId | None = None
+
+    @model_validator(mode="after")
+    def check_shape(self):
+        if self.state == "delivery_stalled" and self.attempts is None:
+            raise ValueError("stalled delivery needs attempts")
+        if self.state == "superseded_by_terminal" and self.successor_wake_id is None:
+            raise ValueError("superseded delivery needs terminal successor")
+        return self
+
+
 class OwnerAction(WireModel):
     action_id: str
     event_id: EventId
@@ -115,6 +132,7 @@ class OwnerAction(WireModel):
     authority_scope: Scope
     authorized: bool
     action_intent: ActionIntentReceipt | None = None
+    escalation: DeliveryEscalation | None = None
 
     @model_validator(mode="after")
     def check_authority(self):
@@ -133,6 +151,8 @@ class OwnerAction(WireModel):
         value = handler(self)
         if value.get("action_intent") is None:
             value.pop("action_intent")
+        if value.get("escalation") is None:
+            value.pop("escalation")
         return value
 
 
@@ -188,9 +208,12 @@ class InboxReport(WireModel):
 class InboxEntry(WireModel):
     event_id: EventId
     state: Literal["pending", "delivered", "exhausted"]
-    attempts: Annotated[int, Field(ge=0, le=3)]
+    # Native start observations can retry after transient owner outages;
+    # their persisted identity and backoff remain bounded by the hub contract.
+    attempts: Annotated[int, Field(ge=0)]
     next_delivery_at: datetime | None
     report: InboxReport
+    superseded_by_terminal: EventId | None = None
 
 
 class IntegrationSerialization(WireModel):

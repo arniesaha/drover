@@ -29,6 +29,31 @@ from drover.server.harness.registry import HarnessRegistry
 MAX_DELIVERIES = 3
 MAX_LEASE_SECONDS = 300
 MAX_COMPLETION_PROJECTION_BATCH = 100
+
+
+def _observation_retry_delay(event_id: str, attempts: int) -> int:
+    """Return a capped deterministic retry delay for a start observation.
+
+    A start observation never performs the worker's effect.  It can therefore
+    retain its durable identity and retry after a transient owner failure.  The
+    first three delays preserve the historical 5/10/20-second cadence; later
+    retries add deterministic jitter inside the capped exponential window so
+    recovering owners do not synchronize on the same wake.
+    """
+    # Bound the exponent before calculating it: this path intentionally has
+    # no fixed attempt cutoff, so a pathological durable counter must never
+    # turn retry scheduling into unbounded arithmetic.
+    base = 5 * 2 ** min(attempts - 1, 6)
+    base = min(base, MAX_LEASE_SECONDS)
+    if attempts <= MAX_DELIVERIES:
+        return base
+    spread = max(1, min(base // 5, 30))
+    seed = int.from_bytes(
+        hashlib.sha256(f"{event_id}:{attempts}".encode()).digest()[:2], "big"
+    )
+    return base - spread + seed % (spread + 1)
+
+
 SCOPES = {
     "implementation": "commit_only",
     "integration": "publish_review",
@@ -1350,22 +1375,82 @@ class FactoryObserverContinuity:
                 )
                 if event["state"] == "exhausted" or event["next_delivery_at"] > now:
                     return None
-                if event["attempts"] >= MAX_DELIVERIES:
-                    action["escalation"] = {
-                        "state": "blocked:human",
-                        "wake_id": event["event_id"],
-                    }
-                    con.execute(
-                        "UPDATE factory_observer_inbox SET state = 'exhausted', action_json = ? WHERE event_id = ?",
-                        [canonical_payload(action), event["event_id"]],
-                    )
-                    con.execute(
-                        """UPDATE factory_observer_runs SET next_action_json = NULL,
-                        worker_state = 'blocked:human', updated_at = ? WHERE run_id = ?""",
-                        [now, run_id],
-                    )
-                    return None
-            else:
+                # A later terminal report for this exact worker supersedes a
+                # stalled start observation. Preserve the original delivery as
+                # a durable non-acknowledged record, then allow the terminal,
+                # effect-bound result to progress.
+                if action.get("type") == "observe_worker_start":
+                    successor = None
+                    rows = con.execute(
+                        """SELECT event_id, sequence, payload_json FROM factory_observer_inbox
+                        WHERE run_id = ? AND state = 'pending' AND source = ? AND subject = ?
+                          AND sequence > ? ORDER BY sequence, received_at, event_id""",
+                        [run_id, event["source"], event["subject"], event["sequence"]],
+                    ).fetchall()
+                    for successor_id, _, successor_payload in rows:
+                        try:
+                            successor_report = json.loads(successor_payload)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        if successor_report.get("kind") in {
+                            "worker_done",
+                            "worker_brief_completed",
+                            "worker_blocked",
+                            "worker_needs_approval",
+                        }:
+                            successor = successor_id
+                            break
+                    if successor is not None:
+                        action["escalation"] = {
+                            "state": "superseded_by_terminal",
+                            "wake_id": event["event_id"],
+                            "successor_wake_id": successor,
+                        }
+                        con.execute(
+                            """UPDATE factory_observer_inbox SET state = 'exhausted',
+                            action_json = ? WHERE event_id = ? AND state = 'delivered'""",
+                            [canonical_payload(action), event["event_id"]],
+                        )
+                        con.execute(
+                            """UPDATE factory_observer_runs SET next_action_json = NULL,
+                            updated_at = ? WHERE run_id = ?""",
+                            [now, run_id],
+                        )
+                        action = None
+                if action is not None and event["attempts"] >= MAX_DELIVERIES:
+                    # A native ``worker_started`` delivery is a durable
+                    # observation, never the worker's final effect.  A
+                    # transient owner/lease outage must not fabricate a human
+                    # block or discard that exact source event after three
+                    # attempts.  Keep its immutable wake/action identity and
+                    # surface a durable stalled-delivery record instead.
+                    if action.get("type") == "observe_worker_start":
+                        action["escalation"] = {
+                            "state": "delivery_stalled",
+                            "wake_id": event["event_id"],
+                            "attempts": event["attempts"],
+                        }
+                        con.execute(
+                            """UPDATE factory_observer_runs SET next_action_json = ?,
+                            updated_at = ? WHERE run_id = ?""",
+                            [canonical_payload(action), now, run_id],
+                        )
+                    else:
+                        action["escalation"] = {
+                            "state": "blocked:human",
+                            "wake_id": event["event_id"],
+                        }
+                        con.execute(
+                            "UPDATE factory_observer_inbox SET state = 'exhausted', action_json = ? WHERE event_id = ?",
+                            [canonical_payload(action), event["event_id"]],
+                        )
+                        con.execute(
+                            """UPDATE factory_observer_runs SET next_action_json = NULL,
+                            worker_state = 'blocked:human', updated_at = ? WHERE run_id = ?""",
+                            [now, run_id],
+                        )
+                        return None
+            if action is None:
                 event = _row(
                     con,
                     """SELECT * FROM factory_observer_inbox
@@ -1419,7 +1504,14 @@ class FactoryObserverContinuity:
                 [
                     canonical_payload(action),
                     attempts,
-                    now + timedelta(seconds=5 * 2 ** (attempts - 1)),
+                    now
+                    + timedelta(
+                        seconds=(
+                            _observation_retry_delay(event["event_id"], attempts)
+                            if action.get("type") == "observe_worker_start"
+                            else 5 * 2 ** (attempts - 1)
+                        )
+                    ),
                     event["event_id"],
                 ],
             )
@@ -1619,20 +1711,49 @@ class FactoryObserverContinuity:
             )
             result = con.execute(
                 """SELECT event_id, state, attempts, next_delivery_at,
-                payload_json FROM factory_observer_inbox WHERE run_id = ? AND state <> 'acknowledged'
+                payload_json, action_json FROM factory_observer_inbox
+                WHERE run_id = ? AND state <> 'acknowledged'
                 ORDER BY received_at, event_id LIMIT ?""",
                 [run_id, limit],
             )
-            events = [
-                {
-                    "event_id": eid,
-                    "state": state,
-                    "attempts": attempts,
-                    "next_delivery_at": due.isoformat() if due else None,
-                    "report": json.loads(payload),
-                }
-                for eid, state, attempts, due, payload in result.fetchall()
-            ]
+            events = []
+            superseded = 0
+            for eid, state, attempts, due, payload, action_payload in result.fetchall():
+                try:
+                    event_action = json.loads(action_payload or "null")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    event_action = None
+                escalation = (
+                    event_action.get("escalation")
+                    if isinstance(event_action, dict)
+                    else None
+                )
+                successor = (
+                    escalation.get("successor_wake_id")
+                    if isinstance(escalation, dict)
+                    and escalation.get("state") == "superseded_by_terminal"
+                    else None
+                )
+                if state == "exhausted" and successor is not None:
+                    superseded += 1
+                events.append(
+                    {
+                        "event_id": eid,
+                        "state": state,
+                        "attempts": attempts,
+                        "next_delivery_at": due.isoformat() if due else None,
+                        "report": json.loads(payload),
+                        **(
+                            {"superseded_by_terminal": successor}
+                            if successor is not None
+                            else {}
+                        ),
+                    }
+                )
+            if superseded:
+                counts["exhausted"] = max(0, counts.get("exhausted", 0) - superseded)
+                if not counts["exhausted"]:
+                    counts.pop("exhausted")
             action = (
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
             )

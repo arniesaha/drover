@@ -15,7 +15,11 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from drover.server.continuity_schema import NATIVE_OWNER_DDL
 from drover.server.db import control_plane_connection
-from drover.server.harness.continuity import MAX_DELIVERIES, FactoryObserverContinuity
+from drover.server.harness.continuity import (
+    MAX_DELIVERIES,
+    MAX_LEASE_SECONDS,
+    FactoryObserverContinuity,
+)
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
 
@@ -306,8 +310,10 @@ class NativeOwnerRunner:
         if status.get("expected_effect_artifact") is None:
             return False
         action = status.get("next_action")
-        if isinstance(action, dict):
-            return action.get("type") != "observe_worker_start"
+        if isinstance(action, dict) and action.get("type") != "observe_worker_start":
+            return True
+        # A terminal successor must verify the candidate-bound final artifact
+        # before it can supersede a stalled start observation.
         # Pending reports have not been consumed into an action yet.  The
         # oldest one is the next delivery selected by FactoryObserverContinuity.
         for event in status.get("events", []):
@@ -905,6 +911,45 @@ class NativeOwnerRunner:
         self._replace_link(scope, link)
         return True
 
+    def _renew_active_claim_lease(self, scope) -> bool:
+        """Keep a submitted, unfinished native turn inside its exact lease epoch.
+
+        The durable turn claim already prevents a successor from dispatching.
+        Renewal merely prevents the much shorter observer lease from fencing a
+        normal structured turn before it can persist its intent or ACK.  A
+        missing, completed, terminal, or already-expired claim is never
+        renewed and stays on the existing recovery path.
+        """
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+        with self._transaction() as con:
+            row = con.execute(
+                """SELECT run_id, session_id, client_turn_id FROM continuity_owner_turn_claims
+                WHERE goal_id = ? AND owner_id = ? AND state IN ('claimed', 'sent')
+                ORDER BY updated_at, wake_id LIMIT 1""",
+                [scope.goal_id, owner_id],
+            ).fetchone()
+        if row is None:
+            return False
+        run_id, session_id, turn_id = map(str, row)
+        session = self.registry.get_session(session_id)
+        if (
+            session is None
+            or not self.registry.has_user_input_turn_id(session_id, turn_id)
+            or self.registry.has_completed_turn(session_id, turn_id)
+        ):
+            return False
+        owner = self.continuity.status(run_id)["owner"]
+        if owner["id"] != owner_id or not owner["live"]:
+            return False
+        self.continuity.lease(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"],
+            lease_seconds=MAX_LEASE_SECONDS,
+        )
+        return True
+
     def _has_active_claim(self, scope) -> bool:
         # A passed claim deadline marks a stuck claim; it never authorizes redelivery.
         with self._transaction() as con:
@@ -1015,7 +1060,7 @@ class NativeOwnerRunner:
         # scoped.  An older failed turn on a reused session must never fence
         # the current claimed wake before its exact acknowledgement settles.
         # Expired claims have already taken their bounded settlement path above.
-        if self._has_active_claim(scope):
+        if self._renew_active_claim_lease(scope) or self._has_active_claim(scope):
             return False
         if self._recovery_needed(scope, run_id, session_id):
             if not self._recover_session(scope, run_id):
@@ -1027,7 +1072,12 @@ class NativeOwnerRunner:
         owner = status["owner"]
         prior_epoch = owner["epoch"] if owner["id"] == owner_id else None
         epoch = prior_epoch if owner["live"] else None
-        lease = self.continuity.lease(run_id, owner_id=owner_id, owner_epoch=epoch)
+        lease = self.continuity.lease(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=epoch,
+            lease_seconds=MAX_LEASE_SECONDS,
+        )
         if prior_epoch is not None and lease["owner_epoch"] != prior_epoch:
             # A naturally expired lease advances the epoch just as an explicit
             # recovery fence does. The old session must not retain its bearer.
