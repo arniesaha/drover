@@ -400,6 +400,35 @@ def test_bridge_delivers_unmapped_local_candidate_task_to_assigned_worktree(tmp_
         payload["work_coordinator_continuity"]["expected_effect_artifact"] == expected
     )
 
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "b" * 32,
+            ItemRef(
+                "local-workspace",
+                "local_file",
+                "example/project",
+                19,
+                "local://goal-local/19",
+            ),
+            "verify",
+            None,
+            scope.goal_id,
+            authority={
+                "labels": ["goal:local", "status:review"],
+                "body": task,
+                "local_candidate_number": 19,
+                "local_candidate_cwd": None,
+                "expected_effect_artifact": expected,
+            },
+        )
+        == "worker-19"
+    )
+    assert "separate verification run" in payloads[1][1]["prompt"]
+    assert "already committed parent evidence" in payloads[1][1]["prompt"]
+    assert "Do not create, replace, or force" in payloads[1][1]["prompt"]
+
 
 def test_bridge_refuses_local_candidate_without_task_authority(tmp_path):
     manifest = tmp_path / "candidates.json"
@@ -768,6 +797,7 @@ def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
     [
         ("native-canary-m2-candidates-26-27.json", [26, 27]),
         ("native-canary-m3-candidates-28-32.json", [28, 29, 30, 31, 32, 33]),
+        ("native-canary-m3-candidate-44-verification.json", [44]),
     ],
 )
 def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
@@ -803,7 +833,7 @@ def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
         item["expected_effect_artifact"].startswith("local-file:.drover-native-canary/")
         for item in items
     )
-    if fixture_name.startswith("native-canary-m3"):
+    if fixture_name == "native-canary-m3-candidates-28-32.json":
         integration = [item for item in items if item["number"] in {31, 32}]
         assert all(
             "delivery:integration" in item["operator_authority_labels"]
@@ -811,6 +841,11 @@ def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
         )
         deployment = next(item for item in items if item["number"] == 33)
         assert "delivery:integration" not in deployment["operator_authority_labels"]
+    if fixture_name == "native-canary-m3-candidate-44-verification.json":
+        body = items[0]["body"]
+        assert "git add -f" in body
+        assert "Run role is verify" in body
+        assert "untracked-only evidence is a verification failure" in body
 
 
 def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_path):

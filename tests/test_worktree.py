@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -138,6 +139,47 @@ def test_cleanup_keeps_ignored_only_worktree_files(repo, tmp_path):
 
     assert cleanup_session_worktree(wt) == "kept"
     assert scratch.read_text() == "only copy\n"
+
+
+def test_child_worktree_receives_only_committed_parent_provenance(repo, tmp_path):
+    """A separate verifier sees the worker branch, never its ignored scratch."""
+    (repo / ".gitignore").write_text(".drover-native-canary/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore local canary artifacts")
+
+    worktrees = tmp_path / "worktrees"
+    worker = create_session_worktree(str(repo), "harness-worker", worktrees)
+    assert worker is not None
+    worker_path = Path(worker.path)
+    marker = worker_path / ".drover-native-canary" / "source-task-44.json"
+    marker.parent.mkdir()
+    marker.write_text('{"candidate":44}\n')
+    implementation = worker_path / "candidate_44.py"
+    implementation.write_text("VALUE = 44\n")
+
+    uncommitted_verify = create_session_worktree(
+        worker.path, "harness-verify-uncommitted", worktrees
+    )
+    assert uncommitted_verify is not None
+    assert not (
+        Path(uncommitted_verify.path) / marker.relative_to(worker_path)
+    ).exists()
+    assert not (Path(uncommitted_verify.path) / implementation.name).exists()
+
+    _git(worker.path, "add", implementation.name)
+    _git(worker.path, "add", "-f", str(marker.relative_to(worker_path)))
+    _git(worker.path, "commit", "-m", "candidate 44 evidence")
+    committed_head = _git(worker.path, "rev-parse", "HEAD")
+
+    verify = create_session_worktree(worker.path, "harness-verify", worktrees)
+    assert verify is not None
+    verify_path = Path(verify.path)
+    assert verify.path != worker.path
+    assert _git(verify.path, "rev-parse", "HEAD") == committed_head
+    assert (
+        verify_path / marker.relative_to(worker_path)
+    ).read_text() == '{"candidate":44}\n'
+    assert (verify_path / implementation.name).read_text() == "VALUE = 44\n"
 
 
 def test_cleanup_keeps_worktree_with_new_commits(repo, tmp_path):

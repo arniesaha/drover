@@ -94,6 +94,28 @@ must join the worker session/turn and all source events to the final owner
 receipt and ACK. A chat message, a direct coordinator call, or a cron trigger
 is not an unattended stage.
 
+### Separate-verifier provenance
+
+A `verify` run is deliberately a new isolated Git worktree.  It is created from
+the parent worker branch's committed `HEAD`; ignored or uncommitted files in
+the worker worktree are not a handoff channel.  This preserves isolation and
+prevents a verifier from treating shared mutable scratch as evidence.
+
+[`fixtures/native-canary-m3-candidate-44-verification.json`](fixtures/native-canary-m3-candidate-44-verification.json)
+is the next ordinary ingress record. Its work role creates harmless source and
+focused-test files plus the bound local-file evidence, force-adds the ignored
+`.drover-native-canary` evidence files, and commits all of that evidence on its
+own session branch before requesting deferred completion. Its verify role only
+reads the resulting child worktree and reruns the committed focused test. It
+must not recreate a missing marker, implementation, or test. A missing,
+changed, or untracked-only file is a failed verification, not a reason to copy
+files between worktrees.
+
+This uses the existing `create_session_worktree` provenance rule; it does not
+add a shared path, cross-worktree read capability, or new authority. The exact
+signed `local-file:` marker remains confined to the worker/child session branch
+and the native owner continues to attest it through the bound daemon endpoint.
+
 ### Independent overlap and fenced integration
 
 Submit two independent ready candidates with distinct assigned worktrees while
