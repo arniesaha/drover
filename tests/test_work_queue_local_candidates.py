@@ -799,6 +799,7 @@ def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
         ("native-canary-m3-candidates-28-32.json", [28, 29, 30, 31, 32, 33]),
         ("native-canary-m3-candidate-44-verification.json", [44]),
         ("native-canary-m3-candidate-45-stdlib-verification.json", [45]),
+        ("native-canary-m3-candidate-48-committed-provenance.json", [48]),
     ],
 )
 def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
@@ -852,6 +853,10 @@ def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
         assert "python3 tests/test_native_canary_m3_45.py" in body
         assert "without optional `evidence_key` or `estimated_cost`" in body
         assert "untracked-only evidence is a verification failure" in body
+    if fixture_name == "native-canary-m3-candidate-48-committed-provenance.json":
+        body = items[0]["body"]
+        assert "signed coordinator binding explicitly permits" in body
+        assert "If the signed binding does not permit it" in body
 
 
 def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_path):
@@ -863,6 +868,12 @@ def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_p
     path.write_text(json.dumps(manifest), encoding="utf-8")
 
     provider = LocalCandidateProvider("local-workspace", _scope(path))
+    with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
+        provider.authenticate()
+
+    manifest["items"][0].pop("authority_scope")
+    manifest["items"][0]["committed_provenance"] = True
+    path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
         provider.authenticate()
 
@@ -950,6 +961,158 @@ def test_policy_opted_local_deployment_selector_is_hub_signed(tmp_path):
             continuity_owner_harness="codex",
             local_candidate_authority_scopes={"33": "deployment"},
         )
+
+
+def test_policy_opted_committed_provenance_is_hub_signed_and_body_cannot_select_it(
+    tmp_path,
+):
+    """Only reviewed policy/config can permit one local M3 provenance commit."""
+    path = tmp_path / "candidates.json"
+    _manifest(path)
+    policy_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "drover"
+        / "server"
+        / "work_queue"
+        / "policy-v1.json"
+    )
+    policy = json.loads(policy_source.read_text(encoding="utf-8"))
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    base = {
+        "policy_path": str(policy_path),
+        "execution_enabled": True,
+        "execution_cwds": {"host": str(tmp_path / "checkout")},
+        "brief_ref": "docs/native-canary-m3-committed-provenance.md",
+        "continuity_owner_id": "drover:owner/goal-local",
+        "continuity_owner_harness": "codex",
+        "local_candidate_committed_provenance": {"47": "m3"},
+    }
+    with pytest.raises(ValueError, match="policy opt-in"):
+        _scope(path, **base)
+
+    policy["authority"]["local_candidate_committed_provenance_enabled"] = True
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    scope = _scope(path, **base)
+    policy["authority"]["local_candidate_deployment_scope_enabled"] = True
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot select deployment authority"):
+        _scope(
+            path,
+            **{
+                **base,
+                "local_candidate_authority_scopes": {"47": "deployment"},
+            },
+        )
+    config = WorkQueueConfig(
+        enabled=True, shadow_mode=False, workspace_id="local-workspace", goals=[scope]
+    )
+    payloads = []
+    bridge = object.__new__(HarnessBridge)
+    bridge.config = config
+    bridge.collector = SimpleNamespace(
+        work_coordinator_continuity_secret="hub-secret",
+        proxy_create_harness_session=lambda host, payload: (
+            payloads.append(payload) or (201, '{"session_id":"worker-47"}')
+        ),
+    )
+    bridge.registry = SimpleNamespace()
+    ref = ItemRef(
+        "local-workspace", "local_file", "example/project", 47, "local://goal-local/47"
+    )
+    authority = {
+        "labels": ["goal:local", "status:queued"],
+        "body": "Commit a harmless local provenance fixture.",
+        "local_candidate_number": 47,
+        "local_candidate_cwd": None,
+        "expected_effect_artifact": "local-file:.drover-native-canary/source-task-47.json",
+    }
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "a" * 32,
+            ref,
+            "work",
+            None,
+            scope.goal_id,
+            authority=authority,
+        )
+        == "worker-47"
+    )
+    work_payload = payloads[-1]
+    parsed, _ = parse_work_coordinator_continuity(
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": work_payload["work_coordinator_continuity"],
+        },
+        hub_secret="hub-secret",
+    )
+    assert parsed.committed_provenance is True
+    assert "signed coordinator binding explicitly permits" in work_payload["prompt"]
+    assert "task body cannot expand" in work_payload["prompt"]
+
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "b" * 32,
+            ref,
+            "verify",
+            None,
+            scope.goal_id,
+            authority=authority,
+        )
+        == "worker-47"
+    )
+    verify_payload = payloads[-1]
+    parsed_verify, _ = parse_work_coordinator_continuity(
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": verify_payload[
+                "work_coordinator_continuity"
+            ],
+        },
+        hub_secret="hub-secret",
+    )
+    assert parsed_verify.committed_provenance is False
+    assert "does not permit a source commit" in verify_payload["prompt"]
+
+    legacy_scope = _scope(
+        path,
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path / "checkout")},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+    )
+    bridge.config = SimpleNamespace(goals=[legacy_scope])
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "c" * 32,
+            ref,
+            "work",
+            None,
+            legacy_scope.goal_id,
+            authority=authority,
+        )
+        == "worker-47"
+    )
+    legacy_payload = payloads[-1]
+    parsed_legacy, _ = parse_work_coordinator_continuity(
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": legacy_payload[
+                "work_coordinator_continuity"
+            ],
+        },
+        hub_secret="hub-secret",
+    )
+    assert parsed_legacy.committed_provenance is False
+    assert "does not permit a source commit" in legacy_payload["prompt"]
 
 
 def test_deployment_selector_refuses_recovery_without_existing_signed_session(tmp_path):

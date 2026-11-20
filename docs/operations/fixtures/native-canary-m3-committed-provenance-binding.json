@@ -1,0 +1,13 @@
+{
+  "policy_authority_delta": {
+    "local_candidate_committed_provenance_enabled": true
+  },
+  "goal_scope_delta": {
+    "brief_ref": "/Users/arnab/scratch/drover-native-canary-setup-20261118/runtime/source/docs/operations/native-local-candidate-canary-m3-committed-provenance.md",
+    "local_candidate_committed_provenance": {
+      "48": "m3"
+    }
+  },
+  "fixture": "docs/operations/fixtures/native-canary-m3-candidate-48-committed-provenance.json",
+  "notes": "Offline review input only. The manifest body cannot select this permission; policy and exact goal selector must both be staged before ordinary ingress."
+}

@@ -51,6 +51,10 @@ class Authority(Model):
     # only when this reviewed policy opt-in and a goal configuration selector
     # name the exact candidate number.
     local_candidate_deployment_scope_enabled: bool = False
+    # Committed local provenance is disabled by default. A reviewed policy and
+    # exact candidate selector are both required before a local worker may make
+    # an isolated session-branch commit for a separate verifier.
+    local_candidate_committed_provenance_enabled: bool = False
 
 
 class Acceptance(Model):
@@ -210,6 +214,12 @@ class GoalScope(Model):
     local_candidate_authority_scopes: dict[str, Literal["deployment"]] = Field(
         default_factory=dict
     )
+    # An M3 committed-provenance exception is selected only by reviewed goal
+    # configuration for an exact local candidate. Manifest bodies cannot grant
+    # it, and verifier runs never inherit it.
+    local_candidate_committed_provenance: dict[str, Literal["m3"]] = Field(
+        default_factory=dict
+    )
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -283,10 +293,33 @@ class GoalScope(Model):
                     raise ValueError(
                         "local deployment scope requires positive item keys"
                     )
+            if self.local_candidate_committed_provenance:
+                if owner != native_owner:
+                    raise ValueError(
+                        "local committed provenance requires this goal's native owner"
+                    )
+                if not policy.authority.local_candidate_committed_provenance_enabled:
+                    raise ValueError(
+                        "local committed provenance requires policy opt-in"
+                    )
+                if any(
+                    not number.isdigit() or int(number) <= 0
+                    for number in self.local_candidate_committed_provenance
+                ):
+                    raise ValueError(
+                        "local committed provenance requires positive item keys"
+                    )
+                if set(self.local_candidate_committed_provenance) & set(
+                    self.local_candidate_authority_scopes
+                ):
+                    raise ValueError(
+                        "local committed provenance cannot select deployment authority"
+                    )
         elif (
             self.local_candidates_path is not None
             or self.local_candidate_worktrees
             or self.local_candidate_authority_scopes
+            or self.local_candidate_committed_provenance
         ):
             raise ValueError(
                 "GitHub candidate source cannot configure local candidate paths"

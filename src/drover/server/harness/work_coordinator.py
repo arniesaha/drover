@@ -41,6 +41,9 @@ class WorkCoordinatorContinuity:
     # or update through its per-session stdio MCP bridge.
     goal_id: str | None = None
     item_number: int | None = None
+    # Only the hub-signed work binding can grant this exact local candidate
+    # permission to commit provenance for a separate verifier.
+    committed_provenance: bool = False
 
     @property
     def source_session_id(self) -> str:
@@ -111,6 +114,7 @@ def _parse_work_coordinator_continuity(
     serialization_fields = {"delivery_role", "repository", "serialization_key"}
     expected_effect_fields = {"expected_effect_artifact"}
     work_item_fields = {"goal_id", "item_number"}
+    committed_provenance_fields = {"committed_provenance"}
     if not isinstance(raw, Mapping) or not (
         base_fields
         <= set(raw)
@@ -118,6 +122,7 @@ def _parse_work_coordinator_continuity(
         | serialization_fields
         | expected_effect_fields
         | work_item_fields
+        | committed_provenance_fields
     ):
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
     signature = raw["binding_signature"]
@@ -150,6 +155,23 @@ def _parse_work_coordinator_continuity(
     expected_effect_artifact = raw.get("expected_effect_artifact")
     goal_id = raw.get("goal_id")
     item_number = raw.get("item_number")
+    committed_provenance = raw.get("committed_provenance", False)
+    if not isinstance(committed_provenance, bool):
+        raise FactoryObserverRequestError(
+            "work continuity committed provenance is invalid"
+        )
+    if committed_provenance and (goal_id is None or item_number is None):
+        raise FactoryObserverRequestError(
+            "work continuity committed provenance requires item binding"
+        )
+    if committed_provenance and scope != "implementation":
+        raise FactoryObserverRequestError(
+            "work continuity committed provenance requires implementation authority"
+        )
+    if committed_provenance and expected_effect_artifact is None:
+        raise FactoryObserverRequestError(
+            "work continuity committed provenance requires expected effect"
+        )
     if (goal_id is None) != (item_number is None):
         raise FactoryObserverRequestError("work continuity item binding is invalid")
     if goal_id is not None and (
@@ -199,6 +221,7 @@ def _parse_work_coordinator_continuity(
             expected_effect_artifact,
             goal_id,
             item_number,
+            committed_provenance,
         ),
         normalized,
         unsigned,
