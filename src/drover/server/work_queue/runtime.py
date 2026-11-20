@@ -299,6 +299,50 @@ class HarnessBridge:
             fetch=self.collector.fetch_harness_provider_usage,
         )["accounts"]
 
+    def coordinator_failure_category(self, run_key):
+        """Read one terminal coordinator failure without interpreting prose."""
+        session = self.resolve(run_key)
+        if session is None or session.status not in TERMINAL_SESSION_STATUSES:
+            return None
+        if session.handoff_mode != "work_coordinator":
+            return None
+        return self.registry.coordinator_turn_failure_category(session.session_id)
+
+    def expected_effect_materialized(self, run_key, artifact):
+        """Ask the bound daemon whether its exact candidate effect exists.
+
+        ``None`` means the readback was unavailable or malformed and is
+        intentionally not recoverable.  The owner uses the same endpoint
+        before dispatching a candidate action.
+        """
+        session = self.resolve(run_key)
+        if session is None or session.handoff_mode != "work_coordinator":
+            return None
+        # The provider manifest can change after launch. Recovery must compare
+        # its current value with the original hub-verified binding rather than
+        # reconstructing authority from that mutable provider data.
+        bound_artifact = self.registry.work_coordinator_expected_effect_artifact(
+            session.session_id, "work-" + run_key
+        )
+        if bound_artifact != artifact:
+            return None
+        status, body = self.collector.proxy_harness_session_action(
+            session.session_id, "expected-effect", {"artifact": artifact}
+        )
+        if not 200 <= status < 300:
+            return None
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        verification = payload.get("verification")
+        materialized = payload.get("materialized")
+        if verification == "materialized" and materialized is True:
+            return True
+        if verification == "absent" and materialized is False:
+            return False
+        return None
+
     def launch(
         self, host, harness, run_key, ref, role, parent, goal_id, *, authority=None
     ):

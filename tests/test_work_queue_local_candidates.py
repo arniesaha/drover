@@ -8,7 +8,8 @@ from drover.server.work_queue.github import ProviderUnavailable
 from drover.server.work_queue.local_candidates import LocalCandidateProvider
 from drover.server.work_queue.provider import ItemRef
 from drover.server.work_queue.reconciler import QueueExecutionWorker, ShadowReconciler
-from drover.server.work_queue.service import WorkService
+from drover.server.work_queue.runtime import HarnessBridge
+from drover.server.work_queue.service import WorkService, identity
 from drover.server.work_queue.store import WorkStore
 
 
@@ -103,6 +104,63 @@ def test_local_candidate_effect_reference_is_explicit_and_bounded(tmp_path):
         _manifest(path, expected_effect=invalid)
         with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
             provider.authenticate()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"materialized": False, "verification": "absent"}, False),
+        ({"materialized": True, "verification": "materialized"}, True),
+        ({"materialized": False}, None),
+        ({"materialized": False, "verification": "unknown"}, None),
+    ],
+)
+def test_bridge_requires_explicit_absent_effect_verification(payload, expected):
+    bridge = object.__new__(HarnessBridge)
+    bridge.resolve = lambda run_key: SimpleNamespace(
+        session_id="coordinator", handoff_mode="work_coordinator"
+    )
+    bridge.registry = SimpleNamespace(
+        work_coordinator_expected_effect_artifact=lambda session_id, run_id: (
+            "local-file:.drover-native-canary/source-task-1.json"
+        )
+    )
+    bridge.collector = SimpleNamespace(
+        proxy_harness_session_action=lambda session_id, action, body: (
+            200,
+            json.dumps(payload),
+        )
+    )
+    assert (
+        bridge.expected_effect_materialized(
+            "run", "local-file:.drover-native-canary/source-task-1.json"
+        )
+        is expected
+    )
+
+
+def test_bridge_refuses_current_manifest_artifact_that_differs_from_signed_binding():
+    bridge = object.__new__(HarnessBridge)
+    bridge.resolve = lambda run_key: SimpleNamespace(
+        session_id="coordinator", handoff_mode="work_coordinator"
+    )
+    bridge.registry = SimpleNamespace(
+        work_coordinator_expected_effect_artifact=lambda session_id, run_id: (
+            "local-file:.drover-native-canary/source-task-original.json"
+        )
+    )
+    called = []
+    bridge.collector = SimpleNamespace(
+        proxy_harness_session_action=lambda *args: called.append(args)
+    )
+
+    assert (
+        bridge.expected_effect_materialized(
+            "run", "local-file:.drover-native-canary/source-task-changed.json"
+        )
+        is None
+    )
+    assert called == []
 
 
 def test_local_candidate_manifest_rejects_cross_scope_and_malformed_content(tmp_path):
@@ -278,3 +336,239 @@ def test_queue_worker_launches_an_explicit_local_candidate_through_work_service(
         {"name": "agent:nix"},
         {"name": "status:running"},
     ]
+
+
+def _terminal_local_worker_service(
+    tmp_path,
+    pg_control_path,
+    *,
+    category,
+    materialized,
+    provider_artifact=None,
+    bound_artifact=None,
+):
+    path = tmp_path / "candidates.json"
+    expected = "local-file:.drover-native-canary/source-task-1.json"
+    _manifest(path, expected_effect=provider_artifact or expected)
+    manifest = json.loads(path.read_text())
+    manifest["items"][0]["labels"] = [
+        "goal:local",
+        "status:running",
+        "agent:nix",
+    ]
+    path.write_text(json.dumps(manifest))
+    scope = _scope(
+        path,
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path)},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+        local_candidate_worktrees={"1": str(tmp_path / "worktree-1")},
+    )
+    config = WorkQueueConfig(
+        enabled=True,
+        shadow_mode=False,
+        workspace_id="local-workspace",
+        goals=[scope],
+    )
+
+    class Harness:
+        def __init__(self):
+            self.bound_artifact = bound_artifact or expected
+            self.sessions = {
+                "terminal-run": SimpleNamespace(
+                    session_id="terminal-worker",
+                    status="completed",
+                    handoff_mode="work_coordinator",
+                )
+            }
+            self.launches = []
+
+        def resolve(self, run_key):
+            return self.sessions.get(run_key)
+
+        def active(self, links, *, release_finalised=True):
+            return []
+
+        def coordinator_failure_category(self, run_key):
+            assert run_key in self.sessions
+            return category
+
+        def expected_effect_materialized(self, run_key, artifact):
+            assert run_key in self.sessions
+            if artifact != self.bound_artifact:
+                return None
+            return materialized
+
+        def quota(self):
+            return [
+                {
+                    "provider": "openai",
+                    "status": "ok",
+                    "source": "codex-app-server",
+                    "harnesses": ["codex"],
+                    "hosts": [{"host_id": "host"}],
+                    "windows": [{"kind": "primary", "status": "ok", "used_percent": 1}],
+                }
+            ]
+
+        def eligible(self, goal_id=None, parent_session_id=None):
+            return {("host", "codex")}
+
+        def launch(self, host, harness, run_key, ref, role, parent, goal_id, **kwargs):
+            self.launches.append(run_key)
+            self.sessions[run_key] = SimpleNamespace(
+                session_id="terminal-successor",
+                status="completed",
+                handoff_mode="work_coordinator",
+            )
+            return "terminal-successor"
+
+    provider = LocalCandidateProvider(config.workspace_id, scope)
+    store = WorkStore(pg_control_path, config.workspace_id)
+    harness = Harness()
+    service = WorkService(config, store, {scope.goal_id: provider}, harness)
+    store.intent(
+        "control:queue-execution",
+        _ref(),
+        scope.goal_id,
+        "terminal-run",
+        "work",
+        0,
+        scope.goal_label,
+    )
+    store.associate("terminal-run", "terminal-worker")
+    return path, scope, service, store
+
+
+def test_queue_worker_rearms_only_typed_pre_effect_worker_auth_failure(
+    tmp_path, pg_control_path
+):
+    path, scope, service, store = _terminal_local_worker_service(
+        tmp_path,
+        pg_control_path,
+        category="authentication_required",
+        materialized=False,
+    )
+    worker = QueueExecutionWorker(service)
+
+    worker.process_once()
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:queued"]
+    recovery_key = identity(
+        "automatic-work-coordinator-auth-recovery", scope.goal_id, "1"
+    )
+    recovery_events = store.events(recovery_key)
+    assert [(event["event_kind"], event["outcome"]) for event in recovery_events] == [
+        ("intent", None),
+        ("outcome", "queued"),
+    ]
+
+    # The next ordinary queue pass creates a successor with its inherited
+    # failure count. A second typed terminal failure remains running: the
+    # lineage-wide journal allows exactly one automatic recovery.
+    worker.process_once()
+    links = store.links(goal_id=scope.goal_id, number=1)
+    assert len(links) == 2
+    assert links[-1]["failure_count"] == 1
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:running"]
+    worker.process_once()
+    assert len(store.events(recovery_key)) == 2
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:running"]
+
+
+@pytest.mark.parametrize(
+    ("category", "materialized"),
+    [
+        (None, False),
+        ("authentication_required", True),
+        ("authentication_required", None),
+    ],
+    ids=[
+        "human-or-prose-block",
+        "materialized-candidate-effect",
+        "unknown-effect-readback",
+    ],
+)
+def test_queue_worker_never_rearms_human_or_materialized_candidate_work(
+    tmp_path, pg_control_path, category, materialized
+):
+    path, scope, service, store = _terminal_local_worker_service(
+        tmp_path, pg_control_path, category=category, materialized=materialized
+    )
+
+    QueueExecutionWorker(service).process_once()
+
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:running"]
+    assert not store.events(
+        identity("automatic-work-coordinator-auth-recovery", scope.goal_id, "1")
+    )
+
+
+def test_queue_worker_refuses_changed_manifest_artifact_after_original_effect(
+    tmp_path, pg_control_path
+):
+    path, scope, service, store = _terminal_local_worker_service(
+        tmp_path,
+        pg_control_path,
+        category="authentication_required",
+        materialized=True,
+        provider_artifact="local-file:.drover-native-canary/source-task-changed.json",
+        bound_artifact="local-file:.drover-native-canary/source-task-1.json",
+    )
+
+    QueueExecutionWorker(service).process_once()
+
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:running"]
+    assert not store.events(
+        identity("automatic-work-coordinator-auth-recovery", scope.goal_id, "1")
+    )
+
+
+def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
+    tmp_path, pg_control_path, monkeypatch
+):
+    _, scope, service, store = _terminal_local_worker_service(
+        tmp_path,
+        pg_control_path,
+        category="authentication_required",
+        materialized=False,
+    )
+    provider = service.providers[scope.goal_id]
+
+    def fail_set_labels(*args, **kwargs):
+        raise OSError("manifest unavailable")
+
+    monkeypatch.setattr(provider, "set_labels", fail_set_labels)
+    worker = QueueExecutionWorker(service)
+    worker.process_once()
+    recovery_key = identity(
+        "automatic-work-coordinator-auth-recovery", scope.goal_id, "1"
+    )
+    assert [
+        (event["event_kind"], event["outcome"]) for event in store.events(recovery_key)
+    ] == [("intent", None)]
+    assert store.links(goal_id=scope.goal_id, number=1)[0]["failure_count"] == 1
+
+    worker.process_once()
+    assert len(store.events(recovery_key)) == 1

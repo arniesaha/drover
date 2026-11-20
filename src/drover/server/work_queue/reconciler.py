@@ -159,6 +159,99 @@ class QueueExecutionWorker:
         report["execution"] = execution
         return report
 
+    def _recover_typed_worker_auth_failure(self, candidate):
+        """Requeue one terminal local worker after a typed auth failure.
+
+        This is not a general retry for a worker-declared block.  It requires
+        the exact structured daemon category, the terminal session bound to
+        the current durable work link, and a negative expected-effect
+        readback.  An append-only intent/outcome pair fences the recovery to
+        one automatic requeue for that source run.  Human gates, prose-only
+        blocks, unavailable readbacks, and already-materialized effects stay
+        fail-closed.
+        """
+        goal_id = candidate.get("goal_id")
+        number = candidate.get("number")
+        scope = next(
+            (goal for goal in self.service.config.goals if goal.goal_id == goal_id),
+            None,
+        )
+        if (
+            scope is None
+            or scope.candidate_source != "local_file"
+            or not scope.continuity_owner_id
+        ):
+            return False
+        try:
+            provider, policy, ref, item = self.service.item(goal_id, number)
+        except (KeyError, PermissionError, ValueError):
+            return False
+        statuses = {
+            label["name"]
+            for label in item.get("labels", [])
+            if isinstance(label, dict) and isinstance(label.get("name"), str)
+        }
+        if policy.labels.status_prefix + "running" not in statuses:
+            return False
+        artifact = item.get("expected_effect_artifact")
+        if not isinstance(artifact, str) or not artifact:
+            return False
+        links = self.service.store.links(goal_id=goal_id, number=number)
+        work_links = [link for link in links if link.get("run_role") == "work"]
+        if not work_links:
+            return False
+        link = work_links[-1]
+        run_key = link["run_key"]
+        if self.service.harness.coordinator_failure_category(run_key) != (
+            "authentication_required"
+        ):
+            return False
+        # A positive result is durable candidate evidence and must never be
+        # retried into a second possible effect.  Unknown readback is equally
+        # unsafe to retry.
+        if (
+            self.service.harness.expected_effect_materialized(run_key, artifact)
+            is not False
+        ):
+            return False
+        # This is one bounded recovery for the candidate lineage, rather than
+        # one recovery for every freshly generated relaunch key. The ordinary
+        # retry budget remains the outer bound: the original failed link is
+        # charged before the candidate is queued again.
+        key = identity("automatic-work-coordinator-auth-recovery", goal_id, str(number))
+        events = self.service.store.events(key)
+        if events:
+            return False
+        failures = max((row["failure_count"] for row in work_links), default=0)
+        if failures + 1 >= policy.retries.attempts:
+            return False
+        actor = WorkActor("control:queue-execution", "nix")
+        self.service.store.event(
+            actor.principal,
+            ref,
+            key,
+            "intent",
+            "recover_authenticated_worker",
+            link_id=link["id"],
+        )
+        self.service.store.failure(run_key, failures + 1)
+        try:
+            self.service.status(provider, policy, ref, item, "queued")
+        except Exception:
+            # The durable intent makes an uncertain provider write
+            # inspection-required rather than repeatedly relaunching work.
+            return False
+        self.service.store.event(
+            actor.principal,
+            ref,
+            key,
+            "outcome",
+            "recover_authenticated_worker",
+            outcome="queued",
+            link_id=link["id"],
+        )
+        return True
+
     def process_once(self):
         report = self.reconciler.poll()
         for candidate in report["actions"]:
@@ -176,6 +269,14 @@ class QueueExecutionWorker:
                         "category": self._failure_category(exc),
                     }
                     log.exception("work queue launch candidate failed")
+            elif candidate["kind"] == "inspect_execution":
+                try:
+                    self._recover_typed_worker_auth_failure(candidate)
+                except Exception:
+                    # Recovery is intentionally best-effort and fenced by a
+                    # durable intent. A bad status read must not stop other
+                    # ready candidates or become a generic retry.
+                    log.exception("work queue typed worker recovery failed")
 
     def start(self, shutdown_event=None):
         if self._thread is not None:

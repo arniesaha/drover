@@ -2014,8 +2014,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.BAD_REQUEST,
             )
             return
+        verification = _expected_effect_verification(session.cwd, artifact)
         self._write_json(
-            {"materialized": _materialized_expected_effect(session.cwd, artifact)}
+            {
+                # Preserve the owner-facing boolean contract. Recovery reads
+                # the additional verification field and never treats this
+                # false value as evidence of absence by itself.
+                "materialized": verification == "materialized",
+                "verification": verification,
+            }
         )
 
     def _fs_list(self, query: str) -> None:
@@ -3178,6 +3185,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
         prompt = body.get("prompt")
         prompt_text = prompt.strip() if isinstance(prompt, str) else ""
+        if work_continuity is not None and session_cwd is not None:
+            # The daemon may replace the requested checkout with a fresh
+            # isolated worktree.  Tell the coordinator worker the resolved
+            # path that is already bound to its signed session, rather than
+            # making it infer an assignment from a local-candidate map.  This
+            # is path metadata only; no credential or expected-effect value is
+            # exposed in the prompt.
+            prompt_text = (
+                f"{prompt_text}\n\n"
+                f"Assigned isolated worktree: {session_cwd}\n"
+                "Perform local work only in that assigned worktree."
+            ).strip()
         images = body.get("images") or []
         if prompt_text or images:
             try:
@@ -4529,30 +4548,65 @@ def _directories_exist(paths: Any) -> dict[str, bool]:
     return result
 
 
-def _materialized_expected_effect(cwd: str | None, artifact: Any) -> bool:
-    """Confine a local candidate effect check to the structured session cwd."""
+def _expected_effect_verification(cwd: str | None, artifact: Any) -> str:
+    """Classify a candidate effect without collapsing unsafe reads to absence.
+
+    ``absent`` is returned only for a valid, in-root reference beneath an
+    accessible structured worktree. Invalid references, inaccessible paths,
+    directories, and non-file targets are ``unknown``. Existing owner
+    settlement keeps using the boolean wrapper below and therefore remains
+    fail-closed for every non-materialized state.
+    """
     if not isinstance(cwd, str) or not cwd or not isinstance(artifact, str):
-        return False
+        return "unknown"
     prefix = "local-file:"
     if not artifact.startswith(prefix):
-        return False
+        return "unknown"
     reference = artifact.removeprefix(prefix)
     if not reference or "\\" in reference:
-        return False
+        return "unknown"
     path = Path(reference)
     if path.is_absolute() or len(path.parts) < 2:
-        return False
+        return "unknown"
     if any(part in {"", ".", ".."} for part in path.parts):
-        return False
+        return "unknown"
     if path.parts[0] != ".drover-native-canary":
-        return False
+        return "unknown"
     try:
         root = Path(cwd).resolve(strict=True)
-        target = root.joinpath(*path.parts).resolve(strict=True)
-        target.relative_to(root)
-    except (OSError, ValueError):
-        return False
-    return target.is_file()
+        if not root.is_dir():
+            return "unknown"
+    except (OSError, ValueError, RuntimeError):
+        return "unknown"
+    # Do not resolve the target first: a dangling symlink resolves to a
+    # missing path and would otherwise look like a safe absence. Every
+    # supplied component must be a directly readable non-symlink directory,
+    # until the final regular file (or genuinely missing child).
+    target = root
+    for index, part in enumerate(path.parts):
+        target = target / part
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "unknown"
+        if target.is_symlink():
+            return "unknown"
+        if index < len(path.parts) - 1:
+            if not target.is_dir():
+                return "unknown"
+            continue
+        try:
+            return "materialized" if target.is_file() else "unknown"
+        except OSError:
+            return "unknown"
+    return "unknown"
+
+
+def _materialized_expected_effect(cwd: str | None, artifact: Any) -> bool:
+    """Compatibility wrapper for owner settlement's fail-closed check."""
+    return _expected_effect_verification(cwd, artifact) == "materialized"
 
 
 def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:
