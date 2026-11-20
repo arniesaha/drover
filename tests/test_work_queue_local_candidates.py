@@ -8,6 +8,7 @@ from drover.server.work_queue.github import ProviderUnavailable
 from drover.server.work_queue.local_candidates import LocalCandidateProvider
 from drover.server.work_queue.provider import ItemRef
 from drover.server.work_queue.reconciler import QueueExecutionWorker, ShadowReconciler
+from drover.server.work_queue.runtime import HarnessBridge
 from drover.server.work_queue.service import WorkService, identity
 from drover.server.work_queue.store import WorkStore
 
@@ -103,6 +104,34 @@ def test_local_candidate_effect_reference_is_explicit_and_bounded(tmp_path):
         _manifest(path, expected_effect=invalid)
         with pytest.raises(ProviderUnavailable, match="manifest_invalid"):
             provider.authenticate()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"materialized": False, "verification": "absent"}, False),
+        ({"materialized": True, "verification": "materialized"}, True),
+        ({"materialized": False}, None),
+        ({"materialized": False, "verification": "unknown"}, None),
+    ],
+)
+def test_bridge_requires_explicit_absent_effect_verification(payload, expected):
+    bridge = object.__new__(HarnessBridge)
+    bridge.resolve = lambda run_key: SimpleNamespace(
+        session_id="coordinator", handoff_mode="work_coordinator"
+    )
+    bridge.collector = SimpleNamespace(
+        proxy_harness_session_action=lambda session_id, action, body: (
+            200,
+            json.dumps(payload),
+        )
+    )
+    assert (
+        bridge.expected_effect_materialized(
+            "run", "local-file:.drover-native-canary/source-task-1.json"
+        )
+        is expected
+    )
 
 
 def test_local_candidate_manifest_rejects_cross_scope_and_malformed_content(tmp_path):
@@ -311,27 +340,53 @@ def _terminal_local_worker_service(
 
     class Harness:
         def __init__(self):
-            self.session = SimpleNamespace(
-                session_id="terminal-worker",
-                status="completed",
-                handoff_mode="work_coordinator",
-            )
+            self.sessions = {
+                "terminal-run": SimpleNamespace(
+                    session_id="terminal-worker",
+                    status="completed",
+                    handoff_mode="work_coordinator",
+                )
+            }
+            self.launches = []
 
         def resolve(self, run_key):
-            assert run_key == "terminal-run"
-            return self.session
+            return self.sessions.get(run_key)
 
         def active(self, links, *, release_finalised=True):
             return []
 
         def coordinator_failure_category(self, run_key):
-            assert run_key == "terminal-run"
+            assert run_key in self.sessions
             return category
 
         def expected_effect_materialized(self, run_key, artifact):
-            assert run_key == "terminal-run"
+            assert run_key in self.sessions
             assert artifact == expected
             return materialized
+
+        def quota(self):
+            return [
+                {
+                    "provider": "openai",
+                    "status": "ok",
+                    "source": "codex-app-server",
+                    "harnesses": ["codex"],
+                    "hosts": [{"host_id": "host"}],
+                    "windows": [{"kind": "primary", "status": "ok", "used_percent": 1}],
+                }
+            ]
+
+        def eligible(self, goal_id=None, parent_session_id=None):
+            return {("host", "codex")}
+
+        def launch(self, host, harness, run_key, ref, role, parent, goal_id, **kwargs):
+            self.launches.append(run_key)
+            self.sessions[run_key] = SimpleNamespace(
+                session_id="terminal-successor",
+                status="completed",
+                handoff_mode="work_coordinator",
+            )
+            return "terminal-successor"
 
     provider = LocalCandidateProvider(config.workspace_id, scope)
     store = WorkStore(pg_control_path, config.workspace_id)
@@ -367,24 +422,48 @@ def test_queue_worker_rearms_only_typed_pre_effect_worker_auth_failure(
         for label in json.loads(path.read_text())["items"][0]["labels"]
         if label.startswith("status:")
     ] == ["status:queued"]
-    recovery_events = store.events(
-        identity("automatic-work-coordinator-auth-recovery", "terminal-run")
+    recovery_key = identity(
+        "automatic-work-coordinator-auth-recovery", scope.goal_id, "1"
     )
+    recovery_events = store.events(recovery_key)
     assert [(event["event_kind"], event["outcome"]) for event in recovery_events] == [
         ("intent", None),
         ("outcome", "queued"),
     ]
 
-    # The immutable intent/outcome pair prevents a terminal source session
-    # from being rearmed repeatedly if a future poll sees it again.
+    # The next ordinary queue pass creates a successor with its inherited
+    # failure count. A second typed terminal failure remains running: the
+    # lineage-wide journal allows exactly one automatic recovery.
     worker.process_once()
-    assert len(store.events(recovery_events[0]["request_key"])) == 2
+    links = store.links(goal_id=scope.goal_id, number=1)
+    assert len(links) == 2
+    assert links[-1]["failure_count"] == 1
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:running"]
+    worker.process_once()
+    assert len(store.events(recovery_key)) == 2
+    assert [
+        label
+        for label in json.loads(path.read_text())["items"][0]["labels"]
+        if label.startswith("status:")
+    ] == ["status:running"]
 
 
 @pytest.mark.parametrize(
     ("category", "materialized"),
-    [(None, False), ("authentication_required", True)],
-    ids=["human-or-prose-block", "materialized-candidate-effect"],
+    [
+        (None, False),
+        ("authentication_required", True),
+        ("authentication_required", None),
+    ],
+    ids=[
+        "human-or-prose-block",
+        "materialized-candidate-effect",
+        "unknown-effect-readback",
+    ],
 )
 def test_queue_worker_never_rearms_human_or_materialized_candidate_work(
     tmp_path, pg_control_path, category, materialized
@@ -401,5 +480,34 @@ def test_queue_worker_never_rearms_human_or_materialized_candidate_work(
         if label.startswith("status:")
     ] == ["status:running"]
     assert not store.events(
-        identity("automatic-work-coordinator-auth-recovery", "terminal-run")
+        identity("automatic-work-coordinator-auth-recovery", scope.goal_id, "1")
     )
+
+
+def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
+    tmp_path, pg_control_path, monkeypatch
+):
+    _, scope, service, store = _terminal_local_worker_service(
+        tmp_path,
+        pg_control_path,
+        category="authentication_required",
+        materialized=False,
+    )
+    provider = service.providers[scope.goal_id]
+
+    def fail_set_labels(*args, **kwargs):
+        raise OSError("manifest unavailable")
+
+    monkeypatch.setattr(provider, "set_labels", fail_set_labels)
+    worker = QueueExecutionWorker(service)
+    worker.process_once()
+    recovery_key = identity(
+        "automatic-work-coordinator-auth-recovery", scope.goal_id, "1"
+    )
+    assert [
+        (event["event_kind"], event["outcome"]) for event in store.events(recovery_key)
+    ] == [("intent", None)]
+    assert store.links(goal_id=scope.goal_id, number=1)[0]["failure_count"] == 1
+
+    worker.process_once()
+    assert len(store.events(recovery_key)) == 1

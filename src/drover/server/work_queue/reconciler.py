@@ -214,9 +214,16 @@ class QueueExecutionWorker:
             is not False
         ):
             return False
-        key = identity("automatic-work-coordinator-auth-recovery", run_key)
+        # This is one bounded recovery for the candidate lineage, rather than
+        # one recovery for every freshly generated relaunch key. The ordinary
+        # retry budget remains the outer bound: the original failed link is
+        # charged before the candidate is queued again.
+        key = identity("automatic-work-coordinator-auth-recovery", goal_id, str(number))
         events = self.service.store.events(key)
         if events:
+            return False
+        failures = max((row["failure_count"] for row in work_links), default=0)
+        if failures + 1 >= policy.retries.attempts:
             return False
         actor = WorkActor("control:queue-execution", "nix")
         self.service.store.event(
@@ -227,6 +234,7 @@ class QueueExecutionWorker:
             "recover_authenticated_worker",
             link_id=link["id"],
         )
+        self.service.store.failure(run_key, failures + 1)
         try:
             self.service.status(provider, policy, ref, item, "queued")
         except Exception:

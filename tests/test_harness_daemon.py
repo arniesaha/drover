@@ -40,6 +40,7 @@ from drover.server.harness.daemon import (
     HarnessDaemonState,
     HarnessPreset,
     ProviderUsageRefreshCache,
+    _expected_effect_verification,
     _materialized_expected_effect,
     create_harness_server,
     discover_native_history_metadata,
@@ -90,6 +91,19 @@ def test_expected_effect_attestation_is_confined_to_the_structured_worktree(tmp_
     assert not _materialized_expected_effect(
         str(worktree),
         "local-file:worktrees/work-b/.drover-native-canary/source-task-13.json",
+    )
+    assert _expected_effect_verification(str(worktree), artifact) == "materialized"
+    assert (
+        _expected_effect_verification(
+            str(worktree), "local-file:.drover-native-canary/missing.json"
+        )
+        == "absent"
+    )
+    assert (
+        _expected_effect_verification(
+            str(worktree), "local-file:.drover-native-canary/../../outside.json"
+        )
+        == "unknown"
     )
 
 
@@ -255,12 +269,18 @@ def test_harnessd_attests_only_a_work_coordinator_session_effect(tmp_path):
             f"{base_url}/sessions/{session.session_id}/expected-effect",
             payload={"artifact": artifact},
         )
-        assert status == 200 and payload == {"materialized": True}
+        assert status == 200 and payload == {
+            "materialized": True,
+            "verification": "materialized",
+        }
         status, payload = _json_request(
             f"{base_url}/sessions/{session.session_id}/expected-effect",
             payload={"artifact": "local-file:.drover-native-canary/../../outside.json"},
         )
-        assert status == 200 and payload == {"materialized": False}
+        assert status == 200 and payload == {
+            "materialized": False,
+            "verification": "unknown",
+        }
     finally:
         state.pty.close_all()
         server.shutdown()

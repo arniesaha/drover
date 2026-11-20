@@ -327,8 +327,13 @@ class HarnessBridge:
             payload = json.loads(body)
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
+        verification = payload.get("verification")
         materialized = payload.get("materialized")
-        return materialized if isinstance(materialized, bool) else None
+        if verification == "materialized" and materialized is True:
+            return True
+        if verification == "absent" and materialized is False:
+            return False
+        return None
 
     def launch(
         self, host, harness, run_key, ref, role, parent, goal_id, *, authority=None
