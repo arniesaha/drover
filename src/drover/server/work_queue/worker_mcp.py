@@ -51,6 +51,10 @@ class BoundWorkControl:
             parsed = urlsplit(control_url)
         except ValueError as exc:
             raise BoundWorkError("bound work control is invalid") from exc
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise BoundWorkError("bound work control is invalid") from exc
         if (
             parsed.scheme != "http"
             or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
@@ -59,6 +63,8 @@ class BoundWorkControl:
             or parsed.query
             or parsed.fragment
             or parsed.path not in {"", "/"}
+            or port is None
+            or not 1 <= port <= 65535
         ):
             raise BoundWorkError("bound work control is invalid")
         try:

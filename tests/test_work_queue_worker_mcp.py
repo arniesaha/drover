@@ -69,16 +69,17 @@ def test_bound_stdio_tools_use_existing_authenticated_hub_transport(
 def test_bound_stdio_worker_rejects_missing_or_cross_scope_configuration():
     with pytest.raises(BoundWorkError):
         BoundWorkControl.from_environment({})
-    with pytest.raises(BoundWorkError):
-        BoundWorkControl.from_environment(
-            {
-                "DROVER_WORK_CONTROL_URL": "http://[::1:28182",
-                "DROVER_MCP_TOKEN": "private",
-                "DROVER_WORK_RUN_KEY": "a" * 32,
-                "DROVER_WORK_GOAL_ID": "goal",
-                "DROVER_WORK_ITEM_NUMBER": "1",
-            }
-        )
+    for url in ("http://[::1:28182", "http://127.0.0.1:65536"):
+        with pytest.raises(BoundWorkError):
+            BoundWorkControl.from_environment(
+                {
+                    "DROVER_WORK_CONTROL_URL": url,
+                    "DROVER_MCP_TOKEN": "private",
+                    "DROVER_WORK_RUN_KEY": "a" * 32,
+                    "DROVER_WORK_GOAL_ID": "goal",
+                    "DROVER_WORK_ITEM_NUMBER": "1",
+                }
+            )
     bound = BoundWorkControl("http://127.0.0.1:28180", "private", "a" * 32, "goal", 1)
     with pytest.raises(BoundWorkError):
         bound.update("verified")

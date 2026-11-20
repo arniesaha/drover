@@ -443,6 +443,7 @@ def test_work_coordinator_mcp_uses_bound_stdio_bridge_without_listener():
         "http://user@127.0.0.1:28180",
         "http://127.0.0.1:28180?token=forbidden",
         "http://[::1:28182",
+        "http://127.0.0.1:65536",
     ],
 )
 def test_work_coordinator_mcp_rejects_invalid_control_routes(url):
