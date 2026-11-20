@@ -18,6 +18,7 @@ from drover.server.continuity_schema import (
     NATIVE_OWNER_CLAIM_EPOCH_DDL,
     NATIVE_OWNER_DDL,
 )
+from drover.server.control_outbox import is_postgres_connection
 from drover.server.db import control_plane_connection
 from drover.server.harness.continuity import (
     MAX_DELIVERIES,
@@ -1131,6 +1132,72 @@ class NativeOwnerRunner:
                 [wake_id, turn_id],
             )
 
+    def _recovery_owner_bearer_factory(self, scope, session_id: str):
+        """Build a one-use callback for the exact missing owner session.
+
+        The session/generation comparison and owner credential rotation are one
+        linearizable operation.  A stale recovery may never revoke a bearer
+        that a successor has already installed.
+        """
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+        link = self._link(scope)
+        expected_generation = (
+            int(link["generation"]) if link.get("session_id") == session_id else None
+        )
+        expected_credential_id = link.get("credential_id")
+
+        def apply(credential, con) -> bool:
+            if expected_generation is None:
+                return False
+            if con is None:
+                with self._transaction() as transaction:
+                    return apply_to_connection(transaction, credential.id)
+            return apply_to_connection(con, credential.id)
+
+        def apply_to_connection(con, credential_id: str) -> bool:
+            lock = " FOR UPDATE" if is_postgres_connection(con) else ""
+            row = con.execute(
+                """SELECT generation, credential_id FROM continuity_owner_sessions
+                WHERE goal_id = ? AND owner_id = ? AND session_id = ?""" + lock,
+                [scope.goal_id, owner_id, session_id],
+            ).fetchone()
+            if (
+                row is None
+                or int(row[0]) != expected_generation
+                or row[1] != expected_credential_id
+            ):
+                return False
+            updated = con.execute(
+                """UPDATE continuity_owner_sessions SET credential_id = ?, updated_at = ?
+                WHERE goal_id = ? AND owner_id = ? AND session_id = ?
+                AND generation = ? AND credential_id IS NOT DISTINCT FROM ?
+                RETURNING owner_id""",
+                [
+                    credential_id,
+                    self.clock(),
+                    scope.goal_id,
+                    owner_id,
+                    session_id,
+                    expected_generation,
+                    expected_credential_id,
+                ],
+            ).fetchone()
+            return updated is not None
+
+        def issue() -> dict[str, str] | None:
+            issued = self.credentials.issue_owner_if_current(
+                label="recovered native continuity owner",
+                owner_id=owner_id,
+                apply=apply,
+            )
+            if issued is None:
+                return None
+            _credential, token = issued
+            return {"continuity_owner_bearer": token}
+
+        return issue
+
     def _claim(
         self, scope, run_id: str, session_id: str, wake_id: str, owner_epoch: int
     ) -> str | None:
@@ -1280,6 +1347,9 @@ class NativeOwnerRunner:
                 ),
                 "client_turn_id": turn_id,
             },
+            recovery_payload_factory=self._recovery_owner_bearer_factory(
+                scope, session_id
+            ),
         )
         if 200 <= response < 300:
             with self._transaction() as con:

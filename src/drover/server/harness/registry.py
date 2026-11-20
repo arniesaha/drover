@@ -2715,6 +2715,53 @@ class HarnessRegistry:
                 return True
         return False
 
+    def has_successfully_completed_turn(self, session_id: str, turn_id: str) -> bool:
+        """Require one exact submitted turn to finish successfully.
+
+        This is stricter than :meth:`has_completed_turn`: deferred work
+        verification cannot use a terminal status from an older turn, a newer
+        active turn, or a non-zero/unknown terminal outcome as authority.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT event_id, event_type FROM harness_events
+                WHERE session_id = ? AND event_type IN ('user_input', 'status')
+                ORDER BY created_at, COALESCE(seq, 0), event_id""",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        submitted = False
+        successful = False
+        pending_success = False
+        for event_id, event_type in rows:
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if event_type == "user_input":
+                submitted_turn_id = payload.get("turn_id")
+                if submitted and submitted_turn_id != turn_id:
+                    return False
+                submitted = submitted_turn_id == turn_id
+                if submitted and pending_success:
+                    successful = True
+                continue
+            completed_turn_id = _completion_turn_id(payload)
+            if completed_turn_id != turn_id:
+                continue
+            inner = payload.get("payload", payload)
+            if not isinstance(inner, dict) or "exited" not in inner:
+                continue
+            if inner.get("exited") != 0:
+                return False
+            if submitted:
+                successful = True
+            else:
+                pending_success = True
+        return submitted and successful
+
     def owner_turn_failure_category(self, session_id: str, turn_id: str) -> str | None:
         """Return a bounded structured infrastructure category for one turn.
 

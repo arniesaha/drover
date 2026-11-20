@@ -526,6 +526,44 @@ def test_completed_turn_kind_reads_postgres_payload_relation(pg_control_path):
     }
 
 
+def test_successful_completed_turn_requires_its_exact_latest_turn(registry):
+    registry.append_event(
+        session_id="sess-1", event_type="user_input", payload={"turn_id": "first"}
+    )
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        payload={"turn_id": "first", "payload": {"exited": 0}},
+    )
+    assert registry.has_successfully_completed_turn("sess-1", "first")
+
+    # A newer active turn fences the earlier success instead of borrowing it.
+    registry.append_event(
+        session_id="sess-1", event_type="user_input", payload={"turn_id": "newer"}
+    )
+    assert not registry.has_successfully_completed_turn("sess-1", "first")
+    assert not registry.has_successfully_completed_turn("sess-1", "newer")
+
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        payload={"turn_id": "newer", "payload": {"exited": 1}},
+    )
+    assert not registry.has_successfully_completed_turn("sess-1", "newer")
+
+
+def test_successful_completed_turn_rejects_unknown_terminal_status(registry):
+    registry.append_event(
+        session_id="sess-1", event_type="user_input", payload={"turn_id": "exact"}
+    )
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        payload={"turn_id": "exact", "payload": {"turn_complete": True}},
+    )
+    assert not registry.has_successfully_completed_turn("sess-1", "exact")
+
+
 def test_completed_turn_kind_recognizes_turn_exited_status(registry):
     registry.append_event(
         session_id="sess-1",

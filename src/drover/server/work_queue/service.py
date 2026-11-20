@@ -416,6 +416,7 @@ class WorkService:
         actor,
         run_role="work",
         parent_session_id=None,
+        verified_terminal_parent=False,
     ):
         provider, policy, ref, item = self.item(goal_id, number)
         self.coordinator(actor, policy)
@@ -466,6 +467,24 @@ class WorkService:
         )
         if status not in {l["name"] for l in item["labels"]}:
             raise ValueError("item not ready for this run role")
+        parent = None
+        if run_role == "verify":
+            parent = next(
+                (
+                    l
+                    for l in links
+                    if l["session_id"] == parent_session_id and l["run_role"] == "work"
+                ),
+                None,
+            )
+            if not parent or request_key != identity(
+                parent["run_key"], "verify", item.get("body")
+            ):
+                raise ValueError(
+                    "verification must reference work and current criteria"
+                )
+        elif verified_terminal_parent:
+            raise ValueError("only verification may release a terminal parent")
         active = [
             link
             for link in self.harness.active(self.store.links())
@@ -486,24 +505,16 @@ class WorkService:
             and not stale_sessionless_intent(
                 l, minutes=self.config.execution.orphan_intent_minutes
             )
+            and not (
+                verified_terminal_parent
+                and run_role == "verify"
+                and parent is not None
+                and l["run_key"] == parent["run_key"]
+                and l["session_id"] == parent_session_id
+            )
             for l in self.harness.active(self.store.links(), release_finalised=False)
         ):
             raise WorkDenied("existing execution requires inspection")
-        if run_role == "verify":
-            parent = next(
-                (
-                    l
-                    for l in links
-                    if l["session_id"] == parent_session_id and l["run_role"] == "work"
-                ),
-                None,
-            )
-            if not parent or request_key != identity(
-                parent["run_key"], "verify", item.get("body")
-            ):
-                raise ValueError(
-                    "verification must reference work and current criteria"
-                )
         host, harness = route(
             self.harness.quota(),
             policy,
@@ -606,6 +617,7 @@ class WorkService:
             actor=WorkActor("control:queue-execution", policy.authority.coordinator),
             run_role="verify",
             parent_session_id=row["session_id"],
+            verified_terminal_parent=True,
         )
 
     def advance_deferred_completion(self, goal_id, number):
@@ -642,7 +654,7 @@ class WorkService:
             ):
                 return None
             session = self.harness.resolve(row["run_key"])
-            if session is None or session.status != "completed":
+            if session is None:
                 return None
             artifact = item.get("expected_effect_artifact")
             terminal_done = getattr(self.harness, "terminal_work_done", None)

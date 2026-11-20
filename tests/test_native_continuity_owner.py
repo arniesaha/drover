@@ -101,7 +101,9 @@ class Collector:
         )
         return 202, json.dumps({"session_id": session.session_id})
 
-    def proxy_harness_session_action(self, session_id, action, payload):
+    def proxy_harness_session_action(
+        self, session_id, action, payload, *, recovery_payload_factory=None
+    ):
         if action == "expected-effect":
             self.effect_attestation_attempts.append((session_id, payload))
             return 200, json.dumps(
@@ -205,6 +207,83 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     token = payload["continuity_owner_bearer"]
     assert runner.credentials.find_active(token).owner_id == "drover:owner/goal-native"
     assert store.status(run_id)["owner"]["live"]
+
+
+def test_recovery_owner_bearer_rotates_only_for_the_missing_link(tmp_path):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    session_id = collector.turn_attempts[0][0]
+    old_token = collector.launches[0][1]["continuity_owner_bearer"]
+    original_link = runner._link(scope)
+
+    recovery_payload = runner._recovery_owner_bearer_factory(scope, session_id)()
+
+    assert recovery_payload is not None
+    fresh_token = recovery_payload["continuity_owner_bearer"]
+    assert fresh_token != old_token
+    assert runner.credentials.find_active(old_token) is None
+    fresh = runner.credentials.find_active(fresh_token)
+    assert fresh is not None
+    assert fresh.owner_id == scope.continuity_owner_id
+    refreshed_link = runner._link(scope)
+    assert refreshed_link["session_id"] == session_id
+    assert refreshed_link["credential_id"] == fresh.id
+    assert refreshed_link["generation"] == original_link["generation"]
+
+
+def test_recovery_owner_bearer_factory_rotates_one_bound_credential_once(tmp_path):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    recovery = runner._recovery_owner_bearer_factory(
+        scope, collector.turn_attempts[0][0]
+    )
+
+    first = recovery()
+    assert first is not None
+    assert recovery() is None
+    assert runner.credentials.find_active(first["continuity_owner_bearer"]) is not None
+
+
+def test_recovery_owner_bearer_fences_generation_before_credential_rotation(
+    tmp_path,
+):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    session_id = collector.turn_attempts[0][0]
+    original_token = collector.launches[0][1]["continuity_owner_bearer"]
+    recovery = runner._recovery_owner_bearer_factory(scope, session_id)
+
+    # The callback was constructed for generation 1. A successor generation
+    # wins before the relay requests its recovery payload.
+    with runner._transaction() as con:
+        con.execute(
+            """UPDATE continuity_owner_sessions SET generation = generation + 1,
+            session_id = ?, credential_id = NULL
+            WHERE goal_id = ? AND owner_id = ?""",
+            ["successor-session", scope.goal_id, scope.continuity_owner_id],
+        )
+    assert recovery() is None
+    assert runner.credentials.find_active(original_token) is not None
+
+
+def test_recovery_owner_bearer_refuses_a_replaced_session_link(tmp_path):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    session_id = collector.turn_attempts[0][0]
+    original_token = collector.launches[0][1]["continuity_owner_bearer"]
+    with runner._transaction() as con:
+        con.execute(
+            """UPDATE continuity_owner_sessions SET session_id = ?
+            WHERE goal_id = ? AND owner_id = ?""",
+            ["successor-session", scope.goal_id, scope.continuity_owner_id],
+        )
+
+    assert runner._recovery_owner_bearer_factory(scope, session_id)() is None
+    assert runner.credentials.find_active(original_token) is not None
 
 
 def _advance_final_delivery_to_third_deadline(store, run_id, clock):

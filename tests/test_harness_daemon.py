@@ -59,6 +59,7 @@ from drover.server.harness.model_catalog import (
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import client_handshake
+from drover.server.harness.work_coordinator import work_coordinator_turn_id
 from drover.server.providers.claude import ClaudeUsageProbe
 from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 
@@ -347,6 +348,9 @@ def test_work_coordinator_prompt_preserves_candidate_task_and_worktree_authority
     assert task in delivered
     assert f"Assigned isolated worktree: {tmp_path}" in delivered
     assert "authoritative worktree for this task" in delivered
+    assert state.structured.turns[0][2]["client_turn_id"] == work_coordinator_turn_id(
+        binding["run_id"]
+    )
 
 
 def test_harnessd_attests_only_a_work_coordinator_session_effect(tmp_path):
@@ -3862,7 +3866,12 @@ def test_harnessd_reconciles_orphaned_pty_sessions_on_startup(tmp_path):
 
 
 def _seed_restart_lost_structured_session(
-    state, tmp_path, *, session_id="harness-recoverable", harness="codex"
+    state,
+    tmp_path,
+    *,
+    session_id="harness-recoverable",
+    harness="codex",
+    handoff_mode=None,
 ):
     cwd = tmp_path / session_id
     cwd.mkdir()
@@ -3875,6 +3884,7 @@ def _seed_restart_lost_structured_session(
         mode="structured",
         cwd=str(cwd),
         native_session_id="provider-session-1",
+        handoff_mode=handoff_mode,
     )
     state.registry.append_event(
         session_id=session_id,
@@ -3948,6 +3958,64 @@ def test_harnessd_recovery_is_idempotent_when_session_is_live(tmp_path):
         )
     finally:
         _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_recovery_requires_and_scopes_native_owner_bearer(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(
+        state,
+        tmp_path,
+        handoff_mode="drover_native_continuity_owner",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": "provider-session-1"},
+            )
+        assert missing.value.code == 409
+        assert not state.structured.has(session_id)
+
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session_id}/recover",
+            payload={
+                "native_session_id": "provider-session-1",
+                "continuity_owner_bearer": "test-recovered-owner-bearer",
+            },
+        )
+        assert status == 200
+        assert payload["recovered"] is True
+        driver = state.structured._require_entry(session_id).driver
+        assert (
+            driver.env["DROVER_CONTINUITY_OWNER_BEARER"]
+            == "test-recovered-owner-bearer"
+        )
+        assert driver.env["DROVER_MCP_TOKEN"] == "test-recovered-owner-bearer"
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_recovery_rejects_owner_bearer_for_non_owner_session(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={
+                    "native_session_id": "provider-session-1",
+                    "continuity_owner_bearer": "test-owner-bearer",
+                },
+            )
+        assert refused.value.code == 400
+        assert not state.structured.has(session_id)
+    finally:
         state.pty.close_all()
         server.shutdown()
         server.server_close()
