@@ -1,9 +1,9 @@
 # #924 isolated acceptance
 
 This procedure produces fixture evidence only. It does not establish live
-acceptance. The implementation begins at commit
-`34bc500e8d0d05e877eb5fe779a8f1d38d07f9ca`; this procedure changes no runtime
-behavior or installed configuration.
+acceptance. Record the checked-out source identity with `git rev-parse HEAD`
+before every fixture or live run; this procedure changes no runtime behavior or
+installed configuration.
 
 From the isolated writer worktree, run the focused suite in the foreground:
 

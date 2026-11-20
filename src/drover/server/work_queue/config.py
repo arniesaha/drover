@@ -47,6 +47,10 @@ class Authority(Model):
     allowed_actions: list[str]
     human_actions: list[str]
     ambiguous_requires_decision: bool
+    # Local manifests cannot select authority. A deployment scope is available
+    # only when this reviewed policy opt-in and a goal configuration selector
+    # name the exact candidate number.
+    local_candidate_deployment_scope_enabled: bool = False
 
 
 class Acceptance(Model):
@@ -201,6 +205,11 @@ class GoalScope(Model):
     # Per-item worktrees are local-file-only and must be declared in the
     # server configuration; manifest content cannot choose an arbitrary path.
     local_candidate_worktrees: dict[str, str] = Field(default_factory=dict)
+    # A deployment authority is selected only by the reviewed goal config for
+    # an exact local candidate. Manifest labels and bodies cannot choose it.
+    local_candidate_authority_scopes: dict[str, Literal["deployment"]] = Field(
+        default_factory=dict
+    )
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -260,7 +269,25 @@ class GoalScope(Model):
                     raise ValueError(
                         "local candidate worktrees require positive item keys and absolute paths"
                     )
-        elif self.local_candidates_path is not None or self.local_candidate_worktrees:
+            if self.local_candidate_authority_scopes:
+                if owner != native_owner:
+                    raise ValueError(
+                        "local deployment scope requires this goal's native owner"
+                    )
+                if not policy.authority.local_candidate_deployment_scope_enabled:
+                    raise ValueError("local deployment scope requires policy opt-in")
+                if any(
+                    not number.isdigit() or int(number) <= 0
+                    for number in self.local_candidate_authority_scopes
+                ):
+                    raise ValueError(
+                        "local deployment scope requires positive item keys"
+                    )
+        elif (
+            self.local_candidates_path is not None
+            or self.local_candidate_worktrees
+            or self.local_candidate_authority_scopes
+        ):
             raise ValueError(
                 "GitHub candidate source cannot configure local candidate paths"
             )
