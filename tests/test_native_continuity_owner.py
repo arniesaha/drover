@@ -221,6 +221,44 @@ def test_owner_turn_waits_for_materialized_candidate_effect_attestation(tmp_path
     assert len(collector.turn_attempts) == 1
 
 
+def test_worker_started_observation_does_not_wait_for_candidate_effect(tmp_path):
+    """A start observation is not the candidate's final effect settlement."""
+    expected = "local-file:.drover-native-canary/source-task-23.json"
+    runner, collector, store, run_id, _ = _runner(
+        tmp_path, expected_effect=expected, event_kind="worker_started"
+    )
+
+    assert runner.process_once() == 1
+    start = store.status(run_id)["next_action"]
+    assert start["type"] == "observe_worker_start"
+    assert "expected_effect_artifact" not in start
+
+    _acknowledge_current_wake(store, run_id, runner.config.goals[0].continuity_owner_id)
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="worker-done",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="candidate completed",
+    )
+
+    # The final candidate action still cannot dispatch from a generic start
+    # acknowledgement; it waits for the exact bound effect readback.
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 1
+    collector.expected_effect_attestations["observer-session"] = True
+    assert runner.process_once() == 1
+    final = store.status(run_id)["next_action"]
+    assert final["type"] == "review_worker_result"
+    assert final["expected_effect_artifact"] == expected
+
+
 def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     runner, collector, _, _, _ = _runner(tmp_path)
 

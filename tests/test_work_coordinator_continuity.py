@@ -213,21 +213,73 @@ def test_signed_candidate_effect_binding_is_persisted_and_rejects_generic_receip
         is None
     )
     lease = store.lease("work-expected-effect", owner_id=unsigned["owner_id"])
+    start = store.consume(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+    )
+    # Starting a candidate is only an observation. It must not require or
+    # consume the final candidate effect before the worker has finished.
+    assert start["type"] == "observe_worker_start"
+    assert "expected_effect_artifact" not in start
+    store.action_intent(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+        wake_id=start["event_id"],
+        action_fingerprint=start["action_id"],
+        artifact="local-file:.drover-native-canary/actions/start-observed.json",
+    )
+    store.acknowledge(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+        event_id=start["event_id"],
+        checkpoint="worker start observed",
+    )
+
+    done = store.report(
+        "work-expected-effect",
+        source="drover-work-coordinator",
+        source_event_id="harness-expected-effect:done",
+        subject="harness-expected-effect",
+        sequence=1,
+        kind="worker_done",
+        summary="Bounded candidate effect completed.",
+    )
     action = store.consume(
         "work-expected-effect",
         owner_id=unsigned["owner_id"],
         owner_epoch=lease["owner_epoch"],
     )
+    assert action["type"] == "review_worker_result"
     assert action["expected_effect_artifact"] == expected
     with pytest.raises(ContinuityConflict, match="expected effect"):
         store.action_intent(
             "work-expected-effect",
             owner_id=unsigned["owner_id"],
             owner_epoch=lease["owner_epoch"],
-            wake_id=action["event_id"],
+            wake_id=done,
             action_fingerprint=action["action_id"],
             artifact="local-file:.drover-native-canary/actions/generic-wake.json",
         )
+    terminal_receipt = store.action_intent(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+        wake_id=done,
+        action_fingerprint=action["action_id"],
+        artifact=expected,
+    )
+    assert terminal_receipt["state"] == "complete"
+    assert terminal_receipt["artifact"] == expected
+    store.acknowledge(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+        event_id=done,
+        checkpoint="candidate effect verified",
+    )
 
 
 def test_work_coordinator_binding_rejects_noncanonical_owner():

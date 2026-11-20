@@ -300,15 +300,36 @@ class NativeOwnerRunner:
                 [self.clock(), row[0], row[1]],
             )
 
-    def _expected_effect_materialized(self, status: dict) -> bool:
-        """Verify a candidate effect through its paired source daemon.
+    @staticmethod
+    def _requires_expected_effect(status: dict) -> bool:
+        """Whether the next delivery settles the candidate's final effect."""
+        if status.get("expected_effect_artifact") is None:
+            return False
+        action = status.get("next_action")
+        if isinstance(action, dict):
+            return action.get("type") != "observe_worker_start"
+        # Pending reports have not been consumed into an action yet.  The
+        # oldest one is the next delivery selected by FactoryObserverContinuity.
+        for event in status.get("events", []):
+            if event.get("state") != "pending":
+                continue
+            report = event.get("report")
+            return not (
+                isinstance(report, dict) and report.get("kind") == "worker_started"
+            )
+        # Unknown projections fail closed rather than treating an arbitrary
+        # candidate event as a harmless observation.
+        return True
 
-        Non-candidate actions have no expected artifact and retain generic
-        settlement. Candidate actions fail closed before owner dispatch.
+    def _expected_effect_materialized(self, status: dict) -> bool:
+        """Verify a final candidate effect through its paired source daemon.
+
+        Worker-start observations retain generic settlement.  Candidate final
+        actions fail closed before owner dispatch.
         """
-        artifact = status.get("expected_effect_artifact")
-        if artifact is None:
+        if not self._requires_expected_effect(status):
             return True
+        artifact = status.get("expected_effect_artifact")
         session_id = status.get("session_id")
         if not isinstance(artifact, str) or not isinstance(session_id, str):
             return False
