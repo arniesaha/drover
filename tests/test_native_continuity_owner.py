@@ -186,6 +186,86 @@ def _runner(tmp_path, *, expected_effect=None, event_kind="worker_blocked"):
     return runner, collector, store, run_id, clock
 
 
+def test_runner_surfaces_signed_deployment_gate_without_owner_turn(tmp_path):
+    runner, collector, store, implementation_run, _ = _runner(tmp_path)
+    registry = collector.registry
+    registry.create_session(
+        session_id="deployment-observer",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/deployment",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-deployment-native@1",
+    )
+    deployment_run = store.initialize(
+        session_id="deployment-observer",
+        objective="Await a signed deployment approval",
+        checkpoint="approval pending",
+        authority_scope="deployment",
+        authorized_owner_id="drover:owner/goal-native",
+        expected_effect_artifact="local-file:.drover-native-canary/source-task-57.json",
+    )
+    store.report(
+        deployment_run,
+        source="hub",
+        source_event_id="deployment-start",
+        subject="worker-deployment",
+        sequence=1,
+        kind="worker_started",
+        summary="deployment worker started",
+    )
+    store.report(
+        deployment_run,
+        source="hub",
+        source_event_id="deployment-done",
+        subject="worker-deployment",
+        sequence=2,
+        kind="worker_done",
+        summary="deployment worker done",
+    )
+
+    # The independent implementation run still receives its normal owner turn.
+    assert runner.process_once() == 1
+    assert len(collector.launches) == 1
+    assert len(collector.turn_attempts) == 1
+    assert implementation_run in collector.turn_attempts[0][1]["text"]
+
+    status = store.status(deployment_run)
+    action = status["next_action"]
+    assert action is not None
+    assert action["type"] == "request_explicit_approval"
+    assert action["authority_scope"] == "deployment"
+    assert action["authorized"] is False
+    assert "expected_effect_artifact" in action
+    assert status["recovery"] == "approval_required"
+    assert status["owner_wake"] is False
+    assert status["inbox_counts"] == {"delivered": 1, "pending": 1}
+    assert store.pending_deployment_gate_runs("drover:owner/goal-native") == []
+
+    # Surfacing the gate does not create an executor claim, effect, or ACK.
+    with control_plane_connection(runner.path) as con:
+        claims = con.execute(
+            "SELECT count(*) FROM continuity_owner_turn_claims WHERE run_id = ?",
+            [deployment_run],
+        ).fetchone()[0]
+        intents = con.execute(
+            "SELECT count(*) FROM continuity_owner_action_intents WHERE run_id = ?",
+            [deployment_run],
+        ).fetchone()[0]
+    assert claims == 0
+    assert intents == 0
+    with pytest.raises(ContinuityConflict, match="approval"):
+        store.acknowledge(
+            deployment_run,
+            owner_id="drover:owner/goal-native",
+            owner_epoch=status["owner"]["epoch"],
+            event_id=action["event_id"],
+            checkpoint="unauthorized deployment",
+        )
+
+
 def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     runner, collector, store, run_id, _ = _runner(tmp_path)
 

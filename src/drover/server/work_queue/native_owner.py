@@ -1361,6 +1361,40 @@ class NativeOwnerRunner:
         self._release_failed_claim(session_id, action["event_id"], turn_id)
         return False
 
+    def _surface_deployment_gate(self, scope, run_id: str) -> bool:
+        """Durably surface one signed human gate without dispatching an owner turn."""
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+        status = self.continuity.status(run_id)
+        if (
+            status["authority_scope"] != "deployment"
+            or status["owner_handoff"]["authorized_owner_id"] != owner_id
+            or status["next_action"] is not None
+        ):
+            return False
+        owner = status["owner"]
+        lease = self.continuity.lease(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"] if owner["id"] == owner_id else None,
+            lease_seconds=MAX_LEASE_SECONDS,
+        )
+        action = self.continuity.consume(
+            run_id, owner_id=owner_id, owner_epoch=lease["owner_epoch"]
+        )
+        if action is None:
+            return False
+        if (
+            action.get("type") != "request_explicit_approval"
+            or action.get("authority_scope") != "deployment"
+            or action.get("authorized") is not False
+        ):
+            raise RuntimeError("deployment gate must remain an unanswered approval")
+        # No native session, turn claim, action intent, external effect, or ACK
+        # is created here. The durable delivery only makes the signed human
+        # gate observable while unrelated implementation work may proceed.
+        return True
+
     def process_once(self) -> int:
         # The durable claim protects restart/cross-hub recovery. This local
         # gate closes the in-process consume-then-claim race between a relay
@@ -1382,6 +1416,16 @@ class NativeOwnerRunner:
             if owner_id is None:
                 continue
             self._complete_finished_claims(scope)
+            for run_id in self.continuity.pending_deployment_gate_runs(owner_id):
+                run = {"goal_id": scope.goal_id, "run_id": run_id}
+                report["runs"].append(run)
+                try:
+                    surfaced = self._surface_deployment_gate(scope, run_id)
+                except Exception as exc:
+                    run.update(state="gate_failed", error_type=type(exc).__name__)
+                    report["state"] = "partial_failure"
+                    continue
+                run["state"] = "approval_pending" if surfaced else "gate_not_surfaced"
             run_ids = self.continuity.owner_runs(owner_id)
             for run_id in self._exhausted_terminal_runs(scope):
                 if run_id not in run_ids:

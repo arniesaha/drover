@@ -51,9 +51,13 @@ recovery journal, lease fence, and same-wake redelivery path. The fixture proves
 marker reconciliation for its local effect target. It does not prove arbitrary
 external API exactly-once behavior, a machine crash, or daemon failure.
 
-The deployment branch is excluded from automatic owner runs before dispatch.
-The negative probe is test verification only: it creates no deployment effect,
-and it cannot acknowledge the delivery. No human decision is fabricated.
+The deployment branch is excluded from automatic **executor** runs. The native
+runner may lease and deliver exactly one signed `request_explicit_approval` action
+so the unanswered gate is visible in the durable projection. That delivery creates
+no owner session, turn claim, action intent, effect, or acknowledgement; a second
+source event remains pending while the gate is unanswered. The negative probe is
+test verification only: it creates no deployment effect and cannot acknowledge the
+delivery. No human decision is fabricated.
 
 Interpret a local receipt through these sources:
 
