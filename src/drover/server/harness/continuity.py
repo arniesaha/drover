@@ -69,6 +69,17 @@ ACTION_TYPES = {
     "ci_red": "correct_ci",
     "ci_green": "review_ci",
 }
+# An integration reservation covers the whole worker lifecycle. A start/input
+# observation can checkpoint independently, but only a terminal worker report
+# with its normal completed action receipt may release the serialized key.
+TERMINAL_WORKER_REPORT_KINDS = frozenset(
+    {
+        "worker_brief_completed",
+        "worker_done",
+        "worker_blocked",
+        "worker_needs_approval",
+    }
+)
 
 
 class ContinuityConflict(ValueError):
@@ -1684,7 +1695,19 @@ class FactoryObserverContinuity:
                 next_action_json = NULL, updated_at = ? WHERE run_id = ?""",
                 [checkpoint, now, run_id],
             )
-            self._release_integration(con, run, owner_id, owner_epoch, now)
+            if run["delivery_role"] == "integration_serialized":
+                try:
+                    report = json.loads(event["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ContinuityConflict(
+                        "terminal integration release requires a valid report"
+                    ) from exc
+                if not isinstance(report, dict):
+                    raise ContinuityConflict(
+                        "terminal integration release requires a valid report"
+                    )
+                if report.get("kind") in TERMINAL_WORKER_REPORT_KINDS:
+                    self._release_integration(con, run, owner_id, owner_epoch, now)
 
     def pending_deployment_gate_runs(
         self, owner_id: str, *, limit: int = 20

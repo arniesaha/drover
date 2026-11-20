@@ -318,7 +318,9 @@ contains exact normal ingress records for:
 - candidates 31 and 32, each carrying `delivery:integration`, so the existing
   goal's serialization label/key select a normal signed
   `delivery_role=integration_serialized` binding. Actual reservation generation,
-  epoch, fence and release-after-ACK evidence remains required; and
+  epoch and fence evidence remains required. A worker-start observation may be
+  acknowledged as a checkpoint but retains the reservation; only the matching
+  terminal action with its completed receipt and ACK releases it; and
 - candidate 33, the genuine human-gated branch. Its manifest has no authority
   label or scope field. The reviewed policy and goal-scope delta alone select
   deployment authority for this exact candidate number.
