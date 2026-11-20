@@ -464,6 +464,47 @@ def test_trusted_initialize_redeems_first_handoff_with_its_scope(tmp_path, scope
     assert reply.continuity.authority_scope == scope
 
 
+@pytest.mark.parametrize("provenance", [True, False, None])
+def test_owner_protocol_round_trips_committed_provenance_tristate(
+    make_harness, provenance
+):
+    """Owner tools preserve the signed bit without turning unknown into false."""
+    harness, endpoint, _ = make_harness()
+    get = endpoint.get
+
+    def projection(path, *, query):
+        raw = get(path, query=query)
+        raw["continuity"]["committed_provenance"] = provenance
+        return raw
+
+    endpoint.get = projection
+    assert harness.call("poll")["continuity"]["committed_provenance"] is provenance
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"committed_provenance": "false"},
+        {"committed_provenance": False, "unrelated_authority": "publish"},
+    ],
+)
+def test_owner_protocol_rejects_invalid_or_unrelated_continuity_fields(
+    make_harness, patch
+):
+    """The optional field cannot coerce values or broaden strict wire input."""
+    harness, endpoint, _ = make_harness()
+    get = endpoint.get
+
+    def malformed(path, *, query):
+        raw = get(path, query=query)
+        raw["continuity"].update(patch)
+        return raw
+
+    endpoint.get = malformed
+    with pytest.raises(ValidationError):
+        harness.call("poll")
+
+
 def test_descriptor_has_versioned_object_schema_but_does_not_register_runtime():
     definition = owner_tool_definition()
     assert definition["name"] == TOOL_NAME

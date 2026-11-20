@@ -246,6 +246,9 @@ class ContinuityProjection(WireModel):
     # Older hubs do not project this field.  Keep that reply compatible while
     # accepting the optional candidate-bound attestation from newer hubs.
     expected_effect_artifact: Checkpoint | None = None
+    # New signed runs carry an explicit bool. A pre-migration run has no
+    # immutable provenance selection, which remains an explicit wire unknown.
+    committed_provenance: bool | None = None
     integration_serialization: IntegrationSerialization | None
     owner_handoff: OwnerHandoff
     owner: OwnerLease
