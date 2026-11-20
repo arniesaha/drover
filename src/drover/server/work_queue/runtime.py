@@ -472,6 +472,19 @@ class HarnessBridge:
                 "authorization gate. Do not use another worktree or substitute "
                 "the requested effect."
             )
+            if role == "verify":
+                # A verifier receives a fresh isolated Git worktree rooted at
+                # the parent worker branch's committed HEAD.  It must inspect
+                # that immutable source provenance, never reconstruct missing
+                # worker output or treat its own worktree as shared scratch.
+                brief += (
+                    "\n\nThis is a separate verification run. Inspect only the "
+                    "already committed parent evidence present in your assigned "
+                    "worktree, including the bound effect. Re-run the stated "
+                    "focused check there. Do not create, replace, or force an "
+                    "expected effect or implementation artifact; a missing or "
+                    "changed parent artifact is a verification failure."
+                )
         payload = {
             "cwd": cwd,
             "harness": harness,

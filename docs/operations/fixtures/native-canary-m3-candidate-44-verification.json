@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "workspace_id": "native-canary-924-848",
+  "goal_id": "native-canary-924-848",
+  "items": [
+    {
+      "number": 44,
+      "state": "open",
+      "body": "M3 committed-provenance work and verification. If Run role is work, only in the daemon-assigned disposable worktree create a harmless tracked module `tests/fixtures/native_canary_m3_44.py` and a focused test `tests/test_native_canary_m3_44.py`; run that focused test. Create regular JSON evidence files `.drover-native-canary/m3-44-analysis.json`, `.drover-native-canary/m3-44-implementation.json`, `.drover-native-canary/m3-44-focused-tests.json`, and `.drover-native-canary/source-task-44.json` identifying candidate 44 and phase m3-committed-provenance. Before `drover_work_update(action=complete)`, commit exactly those harmless source/test/evidence files on this assigned session branch, using `git add -f` for the `.drover-native-canary` files because they are ignored. Record the resulting 40-character HEAD in the final state line. If Run role is verify, do not create or alter any artifact: inspect the already committed files in the assigned verifier worktree, confirm its HEAD contains them, and rerun only `python -m pytest tests/test_native_canary_m3_44.py -q`. Missing, changed, or untracked-only evidence is a verification failure. Do not modify configuration, credentials, network resources, or external services.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-44.json"
+    }
+  ]
+}
