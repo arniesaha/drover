@@ -746,10 +746,15 @@ class WorkService:
             session = self.harness.resolve(run_key)
             if session is None:
                 raise ValueError("work session must complete before verification")
+            scope = next(
+                scope for scope in self.config.goals if scope.goal_id == goal_id
+            )
+            if scope.candidate_source == "local_file":
+                # The bound worker cannot select a verification route or quota
+                # estimate.  Use the reviewed goal value both for a normal
+                # terminal successor and for the active-turn deferred path.
+                estimated_cost = scope.execution_estimated_cost
             if session.status != "completed":
-                scope = next(
-                    scope for scope in self.config.goals if scope.goal_id == goal_id
-                )
                 # Only a task-bound local candidate may defer its request. The
                 # terminal queue path will re-check this immutable candidate
                 # effect before it creates the separate verifier.

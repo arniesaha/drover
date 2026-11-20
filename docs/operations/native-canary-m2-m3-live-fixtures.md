@@ -101,15 +101,20 @@ the parent worker branch's committed `HEAD`; ignored or uncommitted files in
 the worker worktree are not a handoff channel.  This preserves isolation and
 prevents a verifier from treating shared mutable scratch as evidence.
 
-[`fixtures/native-canary-m3-candidate-44-verification.json`](fixtures/native-canary-m3-candidate-44-verification.json)
+Candidate 44 demonstrated the committed-provenance boundary but passed
+prose-shaped `evidence_key` metadata to `complete`; that field is not a bound
+completion input. It also required pytest, which is not part of the disposable
+worker worktree contract. Its failure remains evidence and is not replayed.
+
+[`fixtures/native-canary-m3-candidate-45-stdlib-verification.json`](fixtures/native-canary-m3-candidate-45-stdlib-verification.json)
 is the next ordinary ingress record. Its work role creates harmless source and
-focused-test files plus the bound local-file evidence, force-adds the ignored
-`.drover-native-canary` evidence files, and commits all of that evidence on its
-own session branch before requesting deferred completion. Its verify role only
-reads the resulting child worktree and reruns the committed focused test. It
-must not recreate a missing marker, implementation, or test. A missing,
-changed, or untracked-only file is a failed verification, not a reason to copy
-files between worktrees.
+a standard-library focused test plus the bound local-file evidence, force-adds
+the ignored `.drover-native-canary` evidence files, and commits all of that
+evidence on its own session branch before requesting deferred completion. Its
+verify role only reads the resulting child worktree and reruns the committed
+`python3` test. It must not recreate a missing marker, implementation, or test.
+A missing, changed, or untracked-only file is a failed verification, not a
+reason to copy files between worktrees.
 
 This uses the existing `create_session_worktree` provenance rule; it does not
 add a shared path, cross-worktree read capability, or new authority. The exact

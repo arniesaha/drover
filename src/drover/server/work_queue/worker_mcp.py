@@ -94,6 +94,14 @@ class BoundWorkControl:
     ) -> dict[str, Any]:
         if action not in {"complete", "failed", "progress"}:
             raise BoundWorkError("bound worker action is invalid")
+        if action in {"complete", "failed"}:
+            # A task-bound terminal request has no caller-selected evidence or
+            # quota estimate: the service derives its exact effect and local
+            # verification cost from the signed run and goal scope.  Dropping
+            # prose-shaped optional metadata keeps a normal completion from
+            # being rejected by the generic opaque-code validator.
+            evidence_key = None
+            estimated_cost = None
         return self._call(
             "update",
             {
