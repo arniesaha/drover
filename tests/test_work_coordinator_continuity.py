@@ -763,3 +763,58 @@ def test_work_continuity_item_binding_is_signed_and_requires_the_complete_pair()
         parse_unverified_work_coordinator_continuity(
             {"work_coordinator_continuity": {**partial, "binding_signature": "x"}}
         )
+
+
+def test_signed_m2_handoff_requires_bound_effect_and_cannot_be_body_selected():
+    unsigned = {
+        "run_id": "work-m2-handoff",
+        "owner_id": "drover:owner/goal",
+        "authority_scope": "implementation",
+        "objective": "M2 receipt handoff",
+        "m2_ack_pending": True,
+    }
+    with pytest.raises(ValueError, match="requires item binding"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **unsigned,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        unsigned, "hub"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )
+
+    signed = {
+        **unsigned,
+        "goal_id": "goal",
+        "item_number": 51,
+        "expected_effect_artifact": "local-file:.drover-native-canary/m2-51.json",
+    }
+    binding, _ = parse_work_coordinator_continuity(
+        {
+            "work_coordinator_continuity": {
+                **signed,
+                "binding_signature": sign_work_coordinator_continuity(signed, "hub"),
+            }
+        },
+        hub_secret="hub",
+    )
+    assert binding is not None and binding.m2_ack_pending is True
+
+    forged = {**signed, "m2_ack_pending": False}
+    with pytest.raises(ValueError, match="hub authenticated"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **forged,
+                    "binding_signature": (
+                        signed["binding_signature"]
+                        if "binding_signature" in signed
+                        else "forged"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )

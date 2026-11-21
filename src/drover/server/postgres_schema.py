@@ -44,6 +44,7 @@ EXPECTED_EFFECT_ARTIFACT_MIGRATION = 42
 OWNER_CLAIM_EPOCH_MIGRATION = 43
 COMMITTED_PROVENANCE_MIGRATION = 44
 WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION = 45
+M2_ACK_PENDING_MIGRATION = 46
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1095,6 +1096,13 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
         (
             "ALTER TABLE execution_links ADD COLUMN IF NOT EXISTS work_coordinator_binding_json TEXT",
+        ),
+    ),
+    # Legacy rows have no immutable M2 selection and therefore remain NULL.
+    (
+        M2_ACK_PENDING_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS m2_ack_pending BOOLEAN",
         ),
     ),
 )

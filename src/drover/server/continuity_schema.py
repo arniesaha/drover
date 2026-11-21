@@ -97,7 +97,8 @@ CONTINUITY_DDL = (
       serialization_repository TEXT, serialization_key TEXT,
       serialization_generation BIGINT,
       expected_effect_artifact TEXT,
-      committed_provenance BOOLEAN
+      committed_provenance BOOLEAN,
+      m2_ack_pending BOOLEAN
     )
     """,
     """

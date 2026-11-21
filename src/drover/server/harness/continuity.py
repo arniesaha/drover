@@ -1081,6 +1081,7 @@ class FactoryObserverContinuity:
         serialization_key: str | None = None,
         expected_effect_artifact: str | None = None,
         committed_provenance: bool | None = None,
+        m2_ack_pending: bool | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
@@ -1105,6 +1106,12 @@ class FactoryObserverContinuity:
             raise ValueError("committed_provenance must be boolean or null")
         if committed_provenance is True and expected_effect_artifact is None:
             raise ValueError("committed provenance requires expected effect")
+        if m2_ack_pending is not None and not isinstance(m2_ack_pending, bool):
+            raise ValueError("m2_ack_pending must be boolean or null")
+        if m2_ack_pending is True and (
+            authority_scope != "implementation" or expected_effect_artifact is None
+        ):
+            raise ValueError("M2 handoff requires implementation expected effect")
         if (
             delivery_role == "integration_serialized"
             and authority_scope != "implementation"
@@ -1129,8 +1136,8 @@ class FactoryObserverContinuity:
                 (run_id, session_id, expected_revision, objective, checkpoint,
                  authority_scope, authorized_owner_id, delivery_role,
                  serialization_repository, serialization_key, expected_effect_artifact,
-                 committed_provenance, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 committed_provenance, m2_ack_pending, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (run_id) DO NOTHING""",
                 [
                     run_id,
@@ -1145,6 +1152,7 @@ class FactoryObserverContinuity:
                     serialization_key,
                     expected_effect_artifact,
                     committed_provenance,
+                    m2_ack_pending,
                     self.clock(),
                 ],
             )
@@ -1165,6 +1173,7 @@ class FactoryObserverContinuity:
                 "serialization_key": serialization_key,
                 "expected_effect_artifact": expected_effect_artifact,
                 "committed_provenance": committed_provenance,
+                "m2_ack_pending": m2_ack_pending,
             }.items():
                 if existing[name] != value:
                     raise ContinuityConflict(f"run {name} is immutable")
@@ -1577,6 +1586,8 @@ class FactoryObserverContinuity:
                     and action["type"] != "observe_worker_start"
                 ):
                     action["expected_effect_artifact"] = run["expected_effect_artifact"]
+                    if run.get("m2_ack_pending") is True:
+                        action["m2_ack_pending"] = True
                 if not late and report["kind"].startswith("worker_"):
                     con.execute(
                         "UPDATE factory_observer_runs SET worker_state = ? WHERE run_id = ?",
@@ -1734,18 +1745,24 @@ class FactoryObserverContinuity:
                 raise ContinuityConflict(
                     "explicit deployment approval is required outside this bridge"
                 )
-            if (
-                owner_id.startswith("drover:owner/")
-                and _row(
+            receipt = None
+            if owner_id.startswith("drover:owner/"):
+                receipt = _row(
                     con,
-                    """SELECT 1 AS present FROM continuity_owner_action_intents
-                WHERE wake_id = ? AND action_fingerprint = ? AND run_id = ?
-                AND owner_id = ? AND state = 'complete'""",
+                    """SELECT owner_epoch FROM continuity_owner_action_intents
+                    WHERE wake_id = ? AND action_fingerprint = ? AND run_id = ?
+                    AND owner_id = ? AND state = 'complete'""",
                     [event_id, action["action_id"], run_id, owner_id],
                 )
-                is None
-            ):
-                raise ContinuityConflict("completed action intent receipt is required")
+                if receipt is None:
+                    raise ContinuityConflict(
+                        "completed action intent receipt is required"
+                    )
+            if action.get("m2_ack_pending") is True:
+                if receipt is None or owner_epoch <= int(receipt["owner_epoch"]):
+                    raise ContinuityConflict(
+                        "M2 receipt recovery requires successor epoch"
+                    )
             con.execute(
                 "UPDATE factory_observer_inbox SET state = 'acknowledged', acknowledged_at = ? WHERE event_id = ?",
                 [now, event_id],
@@ -1999,6 +2016,11 @@ class FactoryObserverContinuity:
                 "committed_provenance": (
                     run.get("committed_provenance")
                     if isinstance(run.get("committed_provenance"), bool)
+                    else None
+                ),
+                "m2_ack_pending": (
+                    run.get("m2_ack_pending")
+                    if isinstance(run.get("m2_ack_pending"), bool)
                     else None
                 ),
                 "integration_serialization": integration_serialization,

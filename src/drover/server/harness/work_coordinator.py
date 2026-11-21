@@ -44,6 +44,8 @@ class WorkCoordinatorContinuity:
     # Only the hub-signed work binding can grant this exact local candidate
     # permission to commit provenance for a separate verifier.
     committed_provenance: bool = False
+    # A hub-signed M2-only receipt handoff; never accepted from task text.
+    m2_ack_pending: bool = False
 
     @property
     def source_session_id(self) -> str:
@@ -115,6 +117,7 @@ def _parse_work_coordinator_continuity(
     expected_effect_fields = {"expected_effect_artifact"}
     work_item_fields = {"goal_id", "item_number"}
     committed_provenance_fields = {"committed_provenance"}
+    m2_ack_pending_fields = {"m2_ack_pending"}
     if not isinstance(raw, Mapping) or not (
         base_fields
         <= set(raw)
@@ -123,6 +126,7 @@ def _parse_work_coordinator_continuity(
         | expected_effect_fields
         | work_item_fields
         | committed_provenance_fields
+        | m2_ack_pending_fields
     ):
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
     signature = raw["binding_signature"]
@@ -156,9 +160,24 @@ def _parse_work_coordinator_continuity(
     goal_id = raw.get("goal_id")
     item_number = raw.get("item_number")
     committed_provenance = raw.get("committed_provenance", False)
+    m2_ack_pending = raw.get("m2_ack_pending", False)
     if not isinstance(committed_provenance, bool):
         raise FactoryObserverRequestError(
             "work continuity committed provenance is invalid"
+        )
+    if not isinstance(m2_ack_pending, bool):
+        raise FactoryObserverRequestError("work continuity M2 handoff is invalid")
+    if m2_ack_pending and (goal_id is None or item_number is None):
+        raise FactoryObserverRequestError(
+            "work continuity M2 handoff requires item binding"
+        )
+    if m2_ack_pending and scope != "implementation":
+        raise FactoryObserverRequestError(
+            "work continuity M2 handoff requires implementation authority"
+        )
+    if m2_ack_pending and expected_effect_artifact is None:
+        raise FactoryObserverRequestError(
+            "work continuity M2 handoff requires expected effect"
         )
     if committed_provenance and (goal_id is None or item_number is None):
         raise FactoryObserverRequestError(
@@ -222,6 +241,7 @@ def _parse_work_coordinator_continuity(
             goal_id,
             item_number,
             committed_provenance,
+            m2_ack_pending,
         ),
         normalized,
         unsigned,

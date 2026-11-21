@@ -2851,6 +2851,20 @@ class HarnessRegistry:
             ).fetchone()
         return row[0] if row is not None and isinstance(row[0], bool) else None
 
+    def work_coordinator_m2_ack_pending(
+        self, session_id: str, run_id: str
+    ) -> bool | None:
+        """Read the immutable hub-signed M2 handoff selection for one worker run."""
+        if not session_id or not run_id:
+            return None
+        with self._connect() as con:
+            row = con.execute(
+                """SELECT m2_ack_pending FROM factory_observer_runs
+                     WHERE session_id = ? AND run_id = ?""",
+                [session_id, run_id],
+            ).fetchone()
+        return row[0] if row is not None and isinstance(row[0], bool) else None
+
     def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
         """Classify idle turns without changing the session's resumable state.
 

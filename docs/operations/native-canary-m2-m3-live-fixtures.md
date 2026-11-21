@@ -40,6 +40,15 @@ The integration owner performs these steps only in the approved disposable
 allocation, after recording a positive supported allowance readback. This worker
 does not edit the manifest or restart a service.
 
+A reviewed M2 run additionally requires both the policy opt-in
+`local_candidate_m2_ack_pending_enabled: true` and the exact GoalScope selector
+`local_candidate_m2_ack_pending: {"<fresh-candidate>": "m2"}`. The hub signs
+that selection into the work binding and persists it with the run. A manifest
+body cannot request it; unsigned, legacy-unknown, deployment, committed-
+provenance, verifier, and integration-serialized runs remain on the ordinary
+ACK path. The selector applies only after a final expected-artifact receipt is
+complete: worker-start observations and ordinary owners remain unchanged.
+
 1. Add exactly one fresh ordinary local candidate using the already accepted
    manifest shape and policy labels. Its body must make one harmless marker in
    its assigned worktree. Its immutable

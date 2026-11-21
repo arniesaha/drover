@@ -11,7 +11,8 @@
     "human_actions": ["production_cutover", "data_migration", "delete_data", "outward_post"],
     "ambiguous_requires_decision": true,
     "local_candidate_deployment_scope_enabled": false,
-    "local_candidate_committed_provenance_enabled": false
+    "local_candidate_committed_provenance_enabled": false,
+    "local_candidate_m2_ack_pending_enabled": false
   },
   "acceptance": {
     "criteria_owner": "nix", "amendment_record_required": true,
