@@ -8,6 +8,8 @@ import threading
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.work_coordinator import (
+    FactoryObserverRequestError,
+    parse_work_coordinator_continuity,
     sign_work_coordinator_continuity,
     work_coordinator_turn_id,
 )
@@ -545,6 +547,47 @@ class HarnessBridge:
             expected_effect_artifact=authority.get("expected_effect_artifact"),
             local_candidate_number=authority.get("local_candidate_number"),
         )
+
+    def reserve_work_coordinator_launch(self, binding):
+        """Reserve a signed integration binding before the daemon POST.
+
+        Standard work has no serialization reservation.  The signed envelope
+        is parsed again here so a persisted launch intent cannot use mutable
+        provider/configuration state to reserve authority on a later retry.
+        """
+        try:
+            parsed, _ = parse_work_coordinator_continuity(
+                {"work_coordinator_continuity": binding},
+                hub_secret=self.collector.work_coordinator_continuity_secret,
+            )
+        except (FactoryObserverRequestError, TypeError, ValueError) as exc:
+            raise WorkDenied(
+                "stored work continuity binding is invalid; inspection required"
+            ) from exc
+        if parsed is None or parsed.delivery_role != "integration_serialized":
+            return False
+        from drover.server.harness.continuity import (
+            FactoryObserverContinuity,
+            IntegrationReservationHeld,
+        )
+
+        try:
+            return FactoryObserverContinuity(
+                self.collector.duckdb_path
+            ).reserve_integration_launch(
+                run_id=parsed.run_id,
+                owner_id=parsed.owner_id,
+                authority_scope=parsed.authority_scope,
+                delivery_role=parsed.delivery_role,
+                repository=parsed.repository,
+                serialization_key=parsed.serialization_key,
+            )
+        except IntegrationReservationHeld as exc:
+            raise WorkDenied("integration reservation is held") from exc
+        except Exception as exc:
+            raise WorkDenied(
+                "integration reservation is unavailable; inspection required"
+            ) from exc
 
     def launch(
         self,

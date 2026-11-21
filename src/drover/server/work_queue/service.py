@@ -426,25 +426,50 @@ class WorkService:
         run_key = identity(
             self.config.workspace_id, goal_id, number, request_key, run_role
         )
+        deferred_binding = None
+        preflight = getattr(self.harness, "reserve_work_coordinator_launch", None)
         existing = self.store.links(run_key=run_key)
         if existing:
             row = existing[0]
             if not row["session_id"]:
                 session = self.harness.resolve(run_key)
                 if session is None:
-                    if not stale_sessionless_intent(
-                        row, minutes=self.config.execution.orphan_intent_minutes
-                    ):
-                        raise WorkDenied("launch intent uncertain; inspection required")
-                    failures = row["failure_count"] + 1
-                    self.store.failure(run_key, failures)
-                    if failures >= policy.retries.attempts:
-                        raise WorkDenied(
-                            "systemic review required before further attempts"
-                        )
-                    # Re-enter the normal launch path with the durable intent row.
-                    # ``intent`` is idempotent on run_key, so no duplicate is created.
-                    existing = []
+                    # A signed serialized launch that has not reached the
+                    # daemon is a known, safe deferral while another run owns
+                    # the integration key. Re-check the immutable envelope;
+                    # a released matching reservation lets this exact intent
+                    # proceed without creating an orphan session.
+                    raw_binding = row.get("work_coordinator_binding_json")
+                    if raw_binding is not None and callable(preflight):
+                        try:
+                            candidate_binding = json.loads(raw_binding)
+                        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                            raise WorkDenied(
+                                "stored work continuity binding is invalid; inspection required"
+                            ) from exc
+                        if not isinstance(candidate_binding, dict):
+                            raise WorkDenied(
+                                "stored work continuity binding is invalid; inspection required"
+                            )
+                        if preflight(candidate_binding):
+                            deferred_binding = candidate_binding
+                            existing = []
+                    if existing:
+                        if not stale_sessionless_intent(
+                            row, minutes=self.config.execution.orphan_intent_minutes
+                        ):
+                            raise WorkDenied(
+                                "launch intent uncertain; inspection required"
+                            )
+                        failures = row["failure_count"] + 1
+                        self.store.failure(run_key, failures)
+                        if failures >= policy.retries.attempts:
+                            raise WorkDenied(
+                                "systemic review required before further attempts"
+                            )
+                        # Re-enter the normal launch path with the durable intent row.
+                        # ``intent`` is idempotent on run_key, so no duplicate is created.
+                        existing = []
                 else:
                     row = self.store.associate(run_key, session.session_id)
             if existing and (
@@ -537,7 +562,7 @@ class WorkService:
         prepare_binding = getattr(
             self.harness, "prepare_work_coordinator_binding", None
         )
-        binding = (
+        binding = deferred_binding or (
             prepare_binding(run_key, run_role, ref, goal_id, authority=authority)
             if callable(prepare_binding)
             else None
@@ -547,6 +572,8 @@ class WorkService:
         )
         if binding is not None:
             binding = self.store.bind_work_coordinator_launch(run_key, binding)
+            if not deferred_binding and callable(preflight):
+                preflight(binding)
         # The intent and, when applicable, its signed continuity envelope are
         # committed before this call. Any exception leaves them inspectable.
         launch_kwargs = {"authority": authority}

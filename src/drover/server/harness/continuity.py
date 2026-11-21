@@ -86,6 +86,10 @@ class ContinuityConflict(ValueError):
     """An owner fence or immutable identity does not match."""
 
 
+class IntegrationReservationHeld(ContinuityConflict):
+    """A different signed integration launch currently owns the key."""
+
+
 def continuity_request(store: FactoryObserverContinuity, body: dict) -> dict:
     """Fixed boundary operations for OpenClaw and future owner adapters."""
     contracts = {
@@ -935,7 +939,7 @@ class FactoryObserverContinuity:
                 reservation["run_id"] != run["run_id"]
                 or reservation["owner_id"] != owner_id
             ):
-                raise ContinuityConflict("integration reservation is held")
+                raise IntegrationReservationHeld("integration reservation is held")
         elif reservation["state"] == "released":
             reservation = _row(
                 con,
@@ -959,6 +963,62 @@ class FactoryObserverContinuity:
             [generation, run["run_id"]],
         )
         run["serialization_generation"] = generation
+
+    def reserve_integration_launch(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        authority_scope: str,
+        delivery_role: str,
+        repository: str | None,
+        serialization_key: str | None,
+    ) -> bool:
+        """Fence a signed serialized launch before creating its daemon session.
+
+        The reservation row itself is the durable pre-create intent.  It may
+        name a run that has not received a daemon session yet; ``initialize``
+        later verifies that same immutable run before reporting its first
+        worker event.  A competing run is therefore deferred before a daemon
+        side effect, rather than becoming an unbound session after create.
+        """
+        _text(run_id, "run_id", 191)
+        _text(owner_id, "owner_id", 191)
+        if authority_scope not in SCOPES:
+            raise ValueError("unsupported authority_scope")
+        delivery_role, repository, serialization_key = _serialization_binding(
+            delivery_role, repository, serialization_key
+        )
+        if delivery_role != "integration_serialized":
+            return False
+        if authority_scope != "implementation" or not owner_id.startswith(
+            "drover:owner/"
+        ):
+            raise ValueError(
+                "integration serialization requires a native implementation owner"
+            )
+        with self._transaction() as (con, _):
+            existing = _row(
+                con,
+                "SELECT run_id FROM factory_observer_runs WHERE run_id = ?",
+                [run_id],
+            )
+            if existing is not None:
+                # A known run must be recovered through its session/ledger,
+                # never re-reserved as a new pre-create launch.
+                raise ContinuityConflict(
+                    "integration launch already has a continuity run"
+                )
+            launch = {
+                "run_id": run_id,
+                "delivery_role": delivery_role,
+                "serialization_repository": repository,
+                "serialization_key": serialization_key,
+                "authorized_owner_id": owner_id,
+                "serialization_generation": None,
+            }
+            self._reserve_integration(con, launch, self.clock())
+        return True
 
     @staticmethod
     def _fence_integration(con, run: dict, owner_id: str, owner_epoch: int) -> None:

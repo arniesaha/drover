@@ -332,6 +332,111 @@ def test_ambiguous_create_recovers_only_the_precommitted_signed_binding(
     assert status["events"][0]["report"]["kind"] == "worker_started"
 
 
+def test_serialized_launch_defers_before_daemon_create_until_terminal_ack(
+    launch_path,
+):
+    """A held integration key must not create an unbound daemon session."""
+    service, _bridge, _registry, provider, harnessd = launch_path
+    items = {}
+    for number in (866, 867):
+        items[number] = {
+            "number": number,
+            "state": "open",
+            "body": "Launch a trivial worker turn.",
+            "created_at": "2026-10-27T00:00:00Z",
+            "labels": [
+                {"name": "status:queued"},
+                {"name": "agent:nix"},
+                {"name": "goal:launch"},
+                {"name": "delivery:integration"},
+            ],
+            "operator_authority_labels": ["delivery:integration"],
+        }
+
+    def get_item(ref):
+        return items[ref.number]
+
+    def set_labels(ref, labels):
+        items[ref.number]["labels"] = [{"name": label} for label in labels]
+
+    provider.get_item = get_item
+    provider.set_labels = set_labels
+    provider.list_items = lambda: list(items.values())
+    worker = QueueExecutionWorker(service)
+    worker.reconciler.providers["launch"] = provider
+    worker.process_once()
+    first = service.store.links(goal_id="launch", number=866)[0]
+    first_run = "work-" + first["run_key"]
+
+    # The ordinary queue worker sees both queued items. It starts the first
+    # and defers the second before the daemon POST while the key is held.
+    second_intent = service.store.links(goal_id="launch", number=867)[0]
+    assert second_intent["session_id"] is None
+    assert len(harnessd.requests) == 1
+    assert worker.report()["execution"]["recent_launch_failures"] == [
+        {"goal_id": "launch", "item_number": 867, "category": "work_denied"}
+    ]
+
+    continuity = FactoryObserverContinuity(service.store.path)
+    lease = continuity.lease(first_run, owner_id="drover:owner/launch")
+    fence = {"owner_id": "drover:owner/launch", "owner_epoch": lease["owner_epoch"]}
+    start = continuity.consume(first_run, **fence)
+    continuity.action_intent(
+        first_run,
+        **fence,
+        wake_id=start["event_id"],
+        action_fingerprint=start["action_id"],
+        artifact="fixture:start-observed",
+    )
+    continuity.acknowledge(
+        first_run,
+        **fence,
+        event_id=start["event_id"],
+        checkpoint="start observed",
+    )
+    done = continuity.report(
+        first_run,
+        source="fixture",
+        source_event_id="integration-terminal",
+        subject=first["session_id"],
+        sequence=1,
+        kind="worker_done",
+        summary="serialized fixture worker completed",
+    )
+    terminal = continuity.consume(first_run, **fence)
+    continuity.action_intent(
+        first_run,
+        **fence,
+        wake_id=done,
+        action_fingerprint=terminal["action_id"],
+        artifact="fixture:terminal-effect",
+    )
+    continuity.acknowledge(
+        first_run,
+        **fence,
+        event_id=done,
+        checkpoint="terminal effect verified",
+    )
+
+    # The same ordinary queue worker now sees the released key, reserves
+    # generation two for the persisted signed intent, and posts one create.
+    worker.process_once()
+    second = service.store.links(goal_id="launch", number=867)[0]
+    assert second["session_id"] == "stub-session-2"
+    assert len(harnessd.requests) == 2
+    successor = continuity.status("work-" + second["run_key"])[
+        "integration_serialization"
+    ]
+    assert successor == {
+        "repository": "arniesaha/drover",
+        "key": "main-write",
+        "generation": 2,
+        "owner_epoch": 0,
+        "state": "reserved",
+        "held_by_run": True,
+    }
+
+
 def test_native_owner_explicit_integration_label_claims_configured_reservation(
     launch_path,
 ):
