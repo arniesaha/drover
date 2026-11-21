@@ -29,12 +29,20 @@ cursor-agent status --format json
 
 If it reports unauthenticated, the user signs in privately on the Studio:
 
-```sh
-cursor-agent login
-```
+1. In Drover, open the Studio host's Cursor harness authentication sheet.
+2. Select **Sign In**. Drover runs `cursor-agent login` with Cursor's
+   documented `NO_OPEN_BROWSER=1` handoff, displays the private URL returned
+   by the CLI, and offers **Open Browser**.
+3. Complete Cursor's normal browser login. Cursor stores credentials locally
+   on the Studio; when its login process exits, Drover performs one bounded
+   `cursor-agent status --format json` probe and shows authenticated or the
+   returned error state.
 
-`login` uses Cursor's normal browser route. Do not copy tokens, callback URLs,
-or credentials into Drover configuration, logs, or tickets.
+Cursor documents this as a browser callback flow, not a device-code flow, so
+Drover does not present a code-paste field. Do not copy tokens, callback URLs,
+or credentials into Drover configuration, logs, or tickets. For break-glass
+terminal troubleshooting only, Cursor's native command is `cursor-agent login`;
+normal owner authentication should begin from the Drover entry point above.
 
 ## Included-use and billing boundary
 

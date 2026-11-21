@@ -353,11 +353,22 @@ class CursorAdapter(_StructuredAdapter):
         command = _resolve_login_command("cursor-agent", shell=shell)
         if command is None:
             return None
+        # Cursor's documented browser login normally opens the host's default
+        # browser itself.  The managed Drover flow instead needs the URL on
+        # its authenticated, private UI surface so the user can explicitly
+        # open it there.  Cursor documents NO_OPEN_BROWSER=1 for precisely
+        # that handoff; it still stores the resulting credentials locally.
+        # It is a browser callback flow, not a device-code prompt, so it must
+        # not advertise a terminal input field to the user.
+        login_command = list(command)
+        if len(login_command) >= 3 and login_command[1] == "-lc":
+            login_command[2] = "export NO_OPEN_BROWSER=1; " + login_command[2]
+        else:
+            login_command = ["env", "NO_OPEN_BROWSER=1", *login_command]
         return CommandAuthAdapter(
             self.id,
             _command_with_args(command, "status", "--format", "json"),
-            _command_with_args(command, "login"),
-            requires_pty=True,
+            _command_with_args(login_command, "login"),
         )
 
 

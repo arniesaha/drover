@@ -312,6 +312,85 @@ def test_cursor_status_parses_authenticated_json(tmp_path):
     assert status.detail == "Cursor Agent CLI"
 
 
+@pytest.mark.parametrize(
+    ("authenticated", "expected_state"),
+    [(True, "authenticated"), (False, "failed")],
+)
+def test_cursor_browser_handoff_reprobes_status_without_terminal_input(
+    tmp_path, authenticated, expected_state
+):
+    """Cursor's documented URL handoff completes through the browser callback.
+
+    The fixture requires the supported NO_OPEN_BROWSER switch.  It verifies
+    the complete managed path: request, private URL capture, no code input,
+    and the single status refresh after the CLI exits.
+    """
+    cli = tmp_path / "cursor-agent"
+    auth_json = "true" if authenticated else "false"
+    cli.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "status" ]; then\n'
+        f'  printf \'%s\\n\' \'{{"isAuthenticated":{auth_json},"accessToken":"private"}}\'\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = "login" ]; then\n'
+        '  test "$NO_OPEN_BROWSER" = "1" || exit 9\n'
+        "  printf '%s\\n' 'Open https://cursor.example.test/login?state=private-browser-state'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 2\n"
+    )
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="cursor",
+        status_command=[str(cli), "status", "--format", "json"],
+        login_command=["env", "NO_OPEN_BROWSER=1", str(cli), "login"],
+    )
+    manager = AuthFlowManager({"cursor": adapter}, timeout_s=5, retention_s=60)
+
+    flow = manager.start("cursor")
+    current = wait_for_state(manager, "cursor", flow["flow_id"], expected_state)
+
+    assert current["login_url"] == (
+        "https://cursor.example.test/login?state=private-browser-state"
+    )
+    assert current["supports_input"] is False
+    if authenticated:
+        assert current["last_error"] is None
+    else:
+        assert current["last_error"] == (
+            "authentication status is unauthenticated after successful login: "
+            "Cursor login required"
+        )
+
+
+def test_cursor_adapter_uses_documented_browser_handoff_without_a_pty(monkeypatch):
+    from drover.server.harness.structured.adapters import CursorAdapter
+
+    monkeypatch.setattr(
+        "drover.server.harness.structured.adapters.is_staging", lambda: False
+    )
+    monkeypatch.setattr(
+        "drover.server.harness.structured.adapters._resolve_login_command",
+        lambda binary, shell=None: ["/bin/zsh", "-lc", "exec /opt/cursor-agent"],
+    )
+
+    adapter = CursorAdapter().auth_adapter(shell="/bin/zsh")
+
+    assert isinstance(adapter, CommandAuthAdapter)
+    assert adapter.requires_pty is False
+    assert adapter.status_command == [
+        "/bin/zsh",
+        "-lc",
+        "exec /opt/cursor-agent status --format json",
+    ]
+    assert adapter.command() == [
+        "/bin/zsh",
+        "-lc",
+        "export NO_OPEN_BROWSER=1; exec /opt/cursor-agent login",
+    ]
+
+
 def test_default_auth_adapters_use_login_shell_command_and_nvm_path(
     monkeypatch, tmp_path
 ):
