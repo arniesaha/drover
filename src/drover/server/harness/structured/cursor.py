@@ -7,13 +7,13 @@ the CLI's ``--resume <session_id>`` preserves its native chat when available.
 
 from __future__ import annotations
 
-from collections import deque
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import threading
+from collections import deque
 from typing import Any
 
 from drover.server.harness.auth import redact_auth_text
