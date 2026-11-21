@@ -331,10 +331,10 @@ def test_control_migrations_28_through_45_classify_from_v0628_baseline():
     from drover.server.postgres_schema import (
         _MIGRATIONS,
         COMMITTED_PROVENANCE_MIGRATION,
-        WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
         EXPECTED_EFFECT_ARTIFACT_MIGRATION,
         INTEGRATION_SERIALIZATION_MIGRATION,
         OWNER_CLAIM_EPOCH_MIGRATION,
+        WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
     )
 
     current = [

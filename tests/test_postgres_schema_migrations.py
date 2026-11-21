@@ -41,9 +41,9 @@ from drover.server.postgres_schema import (
     OWNER_CLAIM_EPOCH_MIGRATION,
     OWNER_CREDENTIAL_MIGRATION,
     PROFILE_MIGRATION,
+    WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
     WORK_ITEM_EVENTS_MIGRATION,
     WORKER_STATES_MIGRATION,
-    WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
 )
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
@@ -266,7 +266,6 @@ def test_work_coordinator_launch_binding_migration_45_is_additive(pg_control_pat
     """Old links gain the nullable envelope column without inferred authority."""
     from drover.server.control_store import postgres_control_store
     from drover.server.postgres_schema import bootstrap_postgres_control_store
-
     from drover.server.work_queue.provider import ItemRef
     from drover.server.work_queue.store import WorkStore
 
