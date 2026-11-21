@@ -285,7 +285,7 @@ struct WorkAttentionTests {
         })
     }
 
-    @Test func completeWorkspaceSnapshotsClearResolvedWorkAlertsIncludingEmptyResults() async throws {
+    @Test func onlyCompleteWorkspaceResponsesClearAbsentWorkAlerts() async throws {
         let suite = "work-attention-cleanup-\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -293,30 +293,52 @@ struct WorkAttentionTests {
         let active = try attentionResponse([
             attentionItemJSON(kind: "agent_question", id: "still-open")
         ], workspaceID: "workspace")
+        let partial = try attentionResponse([
+            attentionItemJSON(kind: "environment_approval", id: "visible-in-partial")
+        ], truncated: true, workspaceID: "workspace")
         let empty = try attentionResponse([], workspaceID: "workspace")
-        let store = WorkAttentionStore(service: AttentionService([active, empty]))
+        let store = WorkAttentionStore(service: AttentionService([active, partial, empty]))
 
-        // Match MainTabView's foreground call chain: response decoding keeps
-        // its workspace even after the second, empty successful refresh.
+        // Match MainTabView: complete response permits cleanup.
         await store.refresh()
         await WorkAttentionNotifications.evaluate(
             store.items,
-            workspaceIDs: Set(store.workspaceID.map { [$0] } ?? []),
+            resolvedWorkspaceIDs: store.resolvedWorkspaceIDs,
             notifier: notifier, defaults: defaults
         )
+        // Foreground partial response may still announce its visible approval,
+        // but must never treat omitted rows as resolved.
         await store.refresh()
         await WorkAttentionNotifications.evaluate(
             store.items,
-            workspaceIDs: Set(store.workspaceID.map { [$0] } ?? []),
+            resolvedWorkspaceIDs: store.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        // BackgroundRefresh uses the response counterpart of the same scope
+        // rule, so it is equally non-authoritative while truncated.
+        #expect(partial.resolvedWorkspaceIDs.isEmpty)
+        await WorkAttentionNotifications.evaluate(
+            partial.items,
+            resolvedWorkspaceIDs: partial.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        // An empty complete response is authoritative for its workspace.
+        await store.refresh()
+        await WorkAttentionNotifications.evaluate(
+            store.items,
+            resolvedWorkspaceIDs: store.resolvedWorkspaceIDs,
             notifier: notifier, defaults: defaults
         )
 
         let cleanups = await notifier.resolvedWorkSets
-        #expect(cleanups.count == 2)
+        #expect(cleanups.count == 4)
         #expect(cleanups[0].active == [WorkAttentionRef(workspaceID: "workspace", id: "still-open")])
         #expect(cleanups[0].workspaces == ["workspace"])
-        #expect(cleanups[1].active.isEmpty)
-        #expect(cleanups[1].workspaces == ["workspace"])
+        #expect(cleanups[1].workspaces.isEmpty)
+        #expect(cleanups[2].workspaces.isEmpty)
+        #expect(cleanups[3].active.isEmpty)
+        #expect(cleanups[3].workspaces == ["workspace"])
+        #expect(await notifier.notifications.map(\.ref.id) == ["still-open", "visible-in-partial"])
     }
 }
 

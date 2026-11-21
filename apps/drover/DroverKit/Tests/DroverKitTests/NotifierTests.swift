@@ -389,7 +389,7 @@ struct NotifierTests {
     #expect(await spy.notifications.map(\.id) == ["sess-42"])
 }
 
-@Test func aNewSourceActionOnTheSameSessionAlertsOnceThenReplaysSilently() async throws {
+@Test func aChangingHeartbeatDoesNotReplayTheSameAwaitingAction() async throws {
     func snapshot(awaiting: String?, activity: String) throws -> HarnessSnapshot {
         let awaitingJSON = awaiting.map { "\"\($0)\"" } ?? "null"
         return try HarnessSnapshot.decode(from: Data("""
@@ -405,17 +405,15 @@ struct NotifierTests {
     await watcher.evaluate(first)
     await watcher.evaluate(first) // reconnect/app-open replay
 
-    let resolved = try snapshot(awaiting: nil, activity: "2026-11-21T20:01:00Z")
-    await watcher.evaluate(resolved)
-    let second = try snapshot(awaiting: "approval", activity: "2026-11-21T20:02:00Z")
-    await watcher.evaluate(second)
-    await watcher.evaluate(second) // identical second-action replay
+    // `update_session_activity` rewrites last_activity even if a harness
+    // repeats the same awaiting state. That must not make a local fallback
+    // replay the same alert.
+    let heartbeat = try snapshot(awaiting: "input", activity: "2026-11-21T20:02:00Z")
+    await watcher.evaluate(heartbeat)
 
     let notifications = await spy.notifications
-    #expect(notifications.map(\.id) == ["same-session", "same-session"])
-    #expect(notifications.map(\.body) == [
-        "Codex · reply requested", "Codex · approval required"
-    ])
+    #expect(notifications.map(\.id) == ["same-session"])
+    #expect(notifications.map(\.body) == ["Codex · reply requested"])
 }
 
 // MARK: - One announcer at a time

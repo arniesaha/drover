@@ -89,11 +89,16 @@ writer:
   question/approval alerts in that workspace. Other workspaces, session input,
   and non-input categories remain untouched. The foreground store and
   background refresh both pass that scope to the shared evaluator.
-- Session receipts now combine the session id, awaiting kind, and the hub
-  supplied `last_activity` (falling back to hub `updated_at`). This is source
-  metadata rather than a client timestamp: an unchanged action is silent over
-  reconnect/app-open, while a later source action on the same session alerts.
-  Legacy id-only receipts are absorbed once during upgrade to avoid replay.
+- Session receipts remain session-id based. Production-source inspection found
+  `HarnessRegistry.update_session_activity` rewrites `last_activity` to the
+  current time even when a harness repeats the same awaiting state, while the
+  snapshot listing exposes no awaiting-transition id or sequence. Using that
+  timestamp would replay heartbeat alerts, so it was removed. The local
+  fallback therefore correctly dedupes reconnect/app-open/heartbeat replay,
+  but cannot distinguish a second same-session action after it has resolved
+  and re-entered. Registered devices use the hub's transition-aware APNs path;
+  unregistered local-fallback devices need a server-provided transition id to
+  meet that distinct-action requirement. No server writer was changed here.
 
 Focused round-1 result: `swift test --filter
 'NotifierTests|NotificationRoutingTests|WorkAttentionTests|UATRecheckTests'`
@@ -110,3 +115,21 @@ question and approval on a provisioned sandbox iPhone with notification
 permission, verifying one remote delivery per source action, pending and
 delivered resolution cleanup, visible-session suppression, and cold/warm tap
 routing—without creating a production session or turn.
+
+### Final lifecycle correction (review round 2)
+
+The work-attention endpoint deliberately returns `items[:limit]` and sets
+`truncated` when omitted rows exist. A truncated result is now explicitly
+non-authoritative for absence cleanup in both call paths: `MainTabView` uses
+`WorkAttentionStore.resolvedWorkspaceIDs`, and `BackgroundRefresh` uses the
+matching response property. Both yield an empty cleanup scope for stale or
+truncated responses, while still evaluating visible question/approval rows for
+notification and persisted dedupe. Only a complete non-stale response supplies
+its workspace id for removal; an empty complete response consequently clears
+that workspace's now-absent action alerts without touching other workspaces.
+
+The final targeted run remained **68/68 passed** at
+`/Users/arnab/scratch/drover-ios-981-worker/notification-lifecycle-round3-swift-test.log`.
+It covers the foreground store contract, the background response contract,
+partial visible-action notify/dedupe with no cleanup, complete empty-result
+cleanup, workspace isolation, and changing-heartbeat replay suppression.

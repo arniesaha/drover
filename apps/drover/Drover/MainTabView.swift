@@ -306,7 +306,7 @@ struct MainTabView: View {
                 if workStore.isReachable {
                     await WorkAttentionNotifications.evaluate(
                         workStore.items,
-                        workspaceIDs: Set(workStore.workspaceID.map { [$0] } ?? []),
+                        resolvedWorkspaceIDs: workStore.resolvedWorkspaceIDs,
                         notifier: notifier, defaults: defaults
                     )
                 }

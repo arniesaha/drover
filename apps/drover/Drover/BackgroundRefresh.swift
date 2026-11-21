@@ -61,7 +61,7 @@ enum BackgroundRefresh {
                 if let response = try? await built.client.workAttention(), !response.stale {
                     await WorkAttentionNotifications.evaluate(
                         response.items,
-                        workspaceIDs: Set(response.workspaceID.map { [$0] } ?? []),
+                        resolvedWorkspaceIDs: response.resolvedWorkspaceIDs,
                         notifier: notifier
                     )
                 }

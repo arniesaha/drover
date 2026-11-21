@@ -110,6 +110,13 @@ public struct WorkAttentionResponse: Decodable, Sendable {
         case workspaceID = "workspace_id"
         case pollIntervalSeconds = "poll_interval_seconds"
     }
+
+    /// Only an untruncated, non-stale response is authoritative about which
+    /// previously-alerted actions are absent. Partial rows can still notify.
+    public var resolvedWorkspaceIDs: Set<String> {
+        guard !stale, !truncated, let workspaceID, !workspaceID.isEmpty else { return [] }
+        return [workspaceID]
+    }
 }
 
 public struct WorkDecisionResponse: Decodable, Sendable {
@@ -139,6 +146,13 @@ public final class WorkAttentionStore {
     public init(service: any WorkAttentionServing) { self.service = service }
 
     public var isVisible: Bool { !items.isEmpty || truncated }
+
+    /// MainTabView's foreground counterpart to
+    /// `WorkAttentionResponse.resolvedWorkspaceIDs` used by BG refresh.
+    public var resolvedWorkspaceIDs: Set<String> {
+        guard isReachable, !truncated, let workspaceID, !workspaceID.isEmpty else { return [] }
+        return [workspaceID]
+    }
 
     public func refresh() async {
         guard !isRefreshing, !isDeciding else { return }
@@ -254,16 +268,15 @@ public enum WorkAttentionNotifications {
     }
 
     public static func evaluate(
-        _ items: [WorkAttentionItem], workspaceIDs: Set<String> = [],
+        _ items: [WorkAttentionItem], resolvedWorkspaceIDs: Set<String> = [],
         notifier: any Notifying, defaults: UserDefaults = .standard
     ) async {
         let groups = Dictionary(grouping: items.filter { !$0.isStale() }, by: \.workspaceID)
-        let scopedWorkspaces = workspaceIDs.union(groups.keys)
         let activeRefs = Set(groups.flatMap { workspace, rows in
             rows.compactMap { notification(for: $0, workspaceID: workspace)?.ref }
         })
         await notifier.clearResolvedWorkAttention(
-            activeRefs: activeRefs, workspaceIDs: scopedWorkspaces
+            activeRefs: activeRefs, workspaceIDs: resolvedWorkspaceIDs
         )
         for (workspace, rows) in groups {
             let seen = Set(defaults.stringArray(forKey: key(workspace)) ?? [])
