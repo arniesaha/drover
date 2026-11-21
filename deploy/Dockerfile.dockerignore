@@ -1,0 +1,18 @@
+# Applies to `docker build -f deploy/Dockerfile .` from the repository root
+# (BuildKit reads <Dockerfile>.dockerignore beside the Dockerfile).
+.git
+.venv
+.pytest_cache
+**/__pycache__
+**/node_modules
+apps/drover
+apps/web/screenshots
+apps/web/tests
+docs
+reports
+roadmap
+site
+tests
+target
+harnessd-rs
+src/drover/server/web/static/client
