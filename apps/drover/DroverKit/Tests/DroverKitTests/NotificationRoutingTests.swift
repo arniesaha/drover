@@ -25,6 +25,17 @@ import Testing
         == ["remote-a", "local-a"])
 }
 
+@Test func clearingResolvedAwaitingAlertsLeavesActiveAndCompletionAlertsAlone() {
+    let delivered = [
+        SessionNotificationDelivery.Delivered(identifier: "resolved-input", sessionID: "resolved", categoryIdentifier: "input"),
+        SessionNotificationDelivery.Delivered(identifier: "active-input", sessionID: "active", categoryIdentifier: "input"),
+        SessionNotificationDelivery.Delivered(identifier: "finished", sessionID: "resolved", categoryIdentifier: "finished")
+    ]
+    #expect(SessionNotificationDelivery.identifiersToClearForResolvedAwaiting(
+        activeSessionIDs: ["active"], delivered: delivered
+    ) == ["resolved-input"])
+}
+
 @Test func aPushPayloadResolvesToItsSession() {
     let id = NotificationRoute.sessionID(
         userInfo: ["session_id": "harness-abc"], requestIdentifier: "ignored"

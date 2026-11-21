@@ -223,11 +223,13 @@ struct WorkAttentionTests {
         #expect(store.message?.contains("unknown") == true)
     }
 
-    @Test func attentionNotificationRoutesWithoutSessionFallbackAndHasGenericText() throws {
+    @Test func actionableAttentionNotificationRoutesWithoutSessionFallback() throws {
         let ref = WorkAttentionRef(workspaceID: "workspace", id: "source-1")
-        let content = LocalNotifier.content(attention: ref)
-        #expect(content.title == "Needs you")
-        #expect(content.body == "Open Drover to review pending work.")
+        let content = LocalNotifier.content(attention: WorkAttentionNotification(
+            ref: ref, title: "Drover needs you", body: "Agent question needs a reply"
+        ))
+        #expect(content.title == "Drover needs you")
+        #expect(content.body == "Agent question needs a reply")
         #expect(NotificationRoute.attentionRef(userInfo: content.userInfo) == ref)
         #expect(NotificationRoute.sessionID(userInfo: content.userInfo, requestIdentifier: "source-1") == nil)
         #expect(NotificationRoute.sessionIDs(userInfo: content.userInfo) == nil)
@@ -254,11 +256,42 @@ struct WorkAttentionTests {
         await WorkAttentionNotifications.evaluate(items, notifier: notifier, defaults: defaults)
         #expect(await notifier.count == 1)
     }
+
+    @Test func onlyQuestionsAndApprovalsAlertWithSafeActionCopy() async throws {
+        let suite = "work-attention-notification-kinds-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let notifier = AttentionSpy()
+        let items = try attentionResponse([
+            attentionItemJSON(kind: "agent_question", id: "question"),
+            attentionItemJSON(kind: "environment_approval", id: "approval"),
+            attentionItemJSON(kind: "draft_pr", id: "draft"),
+            attentionItemJSON(kind: "failed_session", id: "failed")
+        ]).items
+
+        await WorkAttentionNotifications.evaluate(items, notifier: notifier, defaults: defaults)
+
+        let notifications = await notifier.notifications
+        #expect(notifications.map(\.ref.id).sorted() == ["approval", "question"])
+        #expect(notifications.allSatisfy { $0.title == "Drover needs you" })
+        #expect(notifications.map(\.body).sorted() == [
+            "Agent question needs a reply", "Environment approval required"
+        ])
+        #expect(notifications.allSatisfy {
+            !$0.body.contains("example/project") && !$0.body.contains("github.com")
+        })
+    }
 }
 
 private actor AttentionSpy: Notifying {
-    var count = 0
-    func notify(title: String, body: String, id: String) async { count += 1 }
+    var notifications: [WorkAttentionNotification] = []
+    var count: Int { notifications.count }
+    func notify(title: String, body: String, id: String) async {
+        notifications.append(WorkAttentionNotification(
+            ref: WorkAttentionRef(workspaceID: "session", id: id), title: title, body: body
+        ))
+    }
+    func notify(attention: WorkAttentionNotification) async { notifications.append(attention) }
     func setBadge(_ count: Int) async {}
 }
 

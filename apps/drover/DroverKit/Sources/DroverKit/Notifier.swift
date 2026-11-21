@@ -20,13 +20,19 @@ public enum SessionNotificationKind: String, Codable, Sendable {
 public protocol Notifying: Sendable {
     func notify(title: String, body: String, id: String) async
     func setBadge(_ count: Int) async
-    func notify(attention: WorkAttentionRef) async
+    func clearResolvedAwaiting(sessionIDs: Set<String>) async
+    func notify(attention: WorkAttentionNotification) async
     func notify(kind: SessionNotificationKind, id: String) async
 }
 
 extension Notifying {
-    public func notify(attention: WorkAttentionRef) async {
-        await notify(title: "Needs you", body: "Open Drover to review pending work.", id: attention.id)
+    /// Test notifiers and push-only implementations do not own a notification
+    /// center. Production `LocalNotifier` overrides this to retire delivered
+    /// local input alerts after a successful snapshot.
+    public func clearResolvedAwaiting(sessionIDs: Set<String>) async {}
+
+    public func notify(attention: WorkAttentionNotification) async {
+        await notify(title: attention.title, body: attention.body, id: attention.ref.id)
     }
 
     public func notify(kind: SessionNotificationKind, id: String) async {
@@ -45,7 +51,13 @@ public struct LocalNotifier: Notifying {
     public init() {}
 
     public func notify(title: String, body: String, id: String) async {
-        await notify(kind: .input, id: id)
+        guard NotificationMode.saved().allowsImmediate(.input) else { return }
+        let request = UNNotificationRequest(
+            identifier: id,
+            content: Self.content(title: title, body: body, id: id),
+            trigger: nil
+        )
+        try? await UNUserNotificationCenter.current().add(request)
     }
 
     public func notify(kind: SessionNotificationKind, id: String) async {
@@ -73,27 +85,54 @@ public struct LocalNotifier: Notifying {
         return content
     }
 
-    public func notify(attention: WorkAttentionRef) async {
+    /// The local fallback has no prompt or transcript access. Its caller only
+    /// supplies a bounded harness label and an actionable state, so this keeps
+    /// the alert useful without bypassing the hub's content-privacy gate.
+    static func content(title: String, body: String, id: String) -> UNMutableNotificationContent {
+        let content = UNMutableNotificationContent()
+        content.categoryIdentifier = SessionNotificationKind.input.rawValue
+        content.title = title
+        content.body = body
+        content.threadIdentifier = id
+        content.sound = .default
+        // A real unanswered question or approval can block work; completions,
+        // failures, and all non-session work remain at the normal level.
+        content.interruptionLevel = .timeSensitive
+        content.userInfo[NotificationPayloadKey.sessionID] = id
+        return content
+    }
+
+    public func notify(attention: WorkAttentionNotification) async {
         guard NotificationMode.saved() != .digest else { return }
-        let request = UNNotificationRequest(identifier: attention.id,
-                                           content: Self.content(attention: attention), trigger: nil)
+        let request = UNNotificationRequest(
+            identifier: attention.ref.id,
+            content: Self.content(attention: attention), trigger: nil
+        )
         try? await UNUserNotificationCenter.current().add(request)
     }
 
-    static func content(attention: WorkAttentionRef) -> UNMutableNotificationContent {
+    static func content(attention: WorkAttentionNotification) -> UNMutableNotificationContent {
         let content = UNMutableNotificationContent()
-        content.title = "Needs you"
-        content.body = "Open Drover to review pending work."
+        content.categoryIdentifier = SessionNotificationKind.input.rawValue
+        content.title = attention.title
+        content.body = attention.body
         content.sound = .default
         content.threadIdentifier = "work-attention"
+        // Only the two kinds admitted by WorkAttentionNotifications reach
+        // here, and both represent a live person-blocking decision.
+        content.interruptionLevel = .timeSensitive
         content.userInfo[NotificationPayloadKey.attentionRef] = [
-            "workspace_id": attention.workspaceID, "id": attention.id
+            "workspace_id": attention.ref.workspaceID, "id": attention.ref.id
         ]
         return content
     }
 
     public func setBadge(_ count: Int) async {
         try? await UNUserNotificationCenter.current().setBadgeCount(count)
+    }
+
+    public func clearResolvedAwaiting(sessionIDs: Set<String>) async {
+        await SessionNotificationDelivery.clearResolvedAwaiting(activeSessionIDs: sessionIDs)
     }
 }
 
@@ -174,6 +213,7 @@ public struct AttentionWatcher: Sendable {
     /// on screen is noise.
     public func sync(_ snapshot: HarnessSnapshot) async {
         let needsYou = Self.needingUser(snapshot.sessions)
+        await notifier.clearResolvedAwaiting(sessionIDs: Set(needsYou.map(\.id)))
         await notifier.setBadge(needsYou.count)
         seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)
         seenStore.set(Self.completionReceipts(snapshot), forKey: Self.finishedKey)
@@ -203,6 +243,7 @@ public struct AttentionWatcher: Sendable {
     /// and behaviour is sane if push is ever turned off again.
     public func evaluate(_ snapshot: HarnessSnapshot) async {
         let needsYou = Self.needsYou(in: snapshot)
+        await notifier.clearResolvedAwaiting(sessionIDs: Set(needsYou.map(\.id)))
         let previousIDs = Set(seenStore.stringArray(forKey: Self.seenKey) ?? [])
         let fresh = SessionStore.newlyNeedsYou(current: snapshot.sessions, previousIDs: previousIDs)
 
@@ -215,8 +256,8 @@ public struct AttentionWatcher: Sendable {
             }
             for session in fresh {
                 await notifier.notify(
-                    title: "\(session.harness) needs you",
-                    body: "\(Self.cwdBasename(session)) · \(Self.bodySuffix(session))",
+                    title: "Drover needs you",
+                    body: "\(Self.harnessLabel(session)) · \(Self.bodySuffix(session))",
                     id: session.id
                 )
             }
@@ -264,11 +305,19 @@ public struct AttentionWatcher: Sendable {
     }
 
     private static func bodySuffix(_ session: SessionSummary) -> String {
-        session.attention == .needsApproval ? "approval required" : "your turn"
+        session.attention == .needsApproval ? "approval required" : "reply requested"
     }
 
-    private static func cwdBasename(_ session: SessionSummary) -> String {
-        guard let cwd = session.cwd, !cwd.isEmpty else { return session.harness }
-        return URL(fileURLWithPath: cwd).lastPathComponent
+    /// Never put a repository, path, prompt, or transcript in the local
+    /// fallback.  The harness family is stable operational metadata and makes
+    /// the alert distinguishable without revealing task content.
+    private static func harnessLabel(_ session: SessionSummary) -> String {
+        switch session.harness.lowercased().replacingOccurrences(of: "_", with: "-") {
+        case "codex": "Codex"
+        case "claude", "claude-code": "Claude Code"
+        case "gemini": "Gemini"
+        case "opencode": "OpenCode"
+        default: "Coding agent"
+        }
     }
 }

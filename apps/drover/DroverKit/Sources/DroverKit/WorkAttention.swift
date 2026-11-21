@@ -222,6 +222,20 @@ public struct WorkAttentionRef: Sendable, Equatable {
     }
 }
 
+/// The only work-control alerts that may interrupt the user.  The copy names
+/// the actionable class, never repository, goal, URL, actor, or agent text.
+public struct WorkAttentionNotification: Sendable, Equatable {
+    public let ref: WorkAttentionRef
+    public let title: String
+    public let body: String
+
+    public init(ref: WorkAttentionRef, title: String, body: String) {
+        self.ref = ref
+        self.title = title
+        self.body = body
+    }
+}
+
 /// Foreground and background checks share source receipts with delivered push alerts.
 @MainActor
 public enum WorkAttentionNotifications {
@@ -240,8 +254,24 @@ public enum WorkAttentionNotifications {
             let seen = Set(defaults.stringArray(forKey: key(workspace)) ?? [])
             defaults.set(rows.map(\.id), forKey: key(workspace))
             for row in rows where !seen.contains(row.id) {
-                await notifier.notify(attention: WorkAttentionRef(workspaceID: workspace, id: row.id))
+                guard let notification = notification(for: row, workspaceID: workspace) else { continue }
+                await notifier.notify(attention: notification)
             }
         }
+    }
+
+    private static func notification(
+        for item: WorkAttentionItem, workspaceID: String
+    ) -> WorkAttentionNotification? {
+        let body: String
+        switch item.kind {
+        case "environment_approval": body = "Environment approval required"
+        case "agent_question": body = "Agent question needs a reply"
+        default: return nil
+        }
+        return WorkAttentionNotification(
+            ref: WorkAttentionRef(workspaceID: workspaceID, id: item.id),
+            title: "Drover needs you", body: body
+        )
     }
 }
