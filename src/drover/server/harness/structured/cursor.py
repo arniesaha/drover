@@ -7,6 +7,7 @@ the CLI's ``--resume <session_id>`` preserves its native chat when available.
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
 import shlex
@@ -183,7 +184,10 @@ class CursorDriver:
         return [*self.command, *args]
 
     def _run_turn(self, process: subprocess.Popen[str], turn_id: str) -> None:
-        stderr_lines: list[str] = []
+        # Cursor can keep writing diagnostics while a network or login problem
+        # persists. Keep only what can be shown in the terminal error rather
+        # than retaining an unbounded amount of potentially sensitive output.
+        stderr_lines: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
 
         def pump_stderr() -> None:
             assert process.stderr is not None
@@ -193,6 +197,8 @@ class CursorDriver:
         stderr_thread = threading.Thread(target=pump_stderr, daemon=True)
         stderr_thread.start()
         saw_result = False
+        stream_failed = False
+        returncode: int | None = None
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -204,11 +210,45 @@ class CursorDriver:
                         saw_result = True
                     self.emit(message)
             returncode = process.wait()
-            stderr_thread.join(timeout=2)
+        except Exception:
+            # A decoder/read/parser/emit failure must not leave the child
+            # running after Drover has forgotten its ownership. Deliberately
+            # do not surface the exception: it can contain provider output.
+            stream_failed = True
+            returncode = self._terminate_and_reap(process)
         finally:
+            if returncode is None:
+                returncode = self._terminate_and_reap(process)
+            stderr_thread.join(timeout=2)
             with self._turn_lock:
                 self._turn_process = None
                 self._turn_active = False
+
+        if stream_failed:
+            self.emit(
+                StructuredMessage(
+                    type="error",
+                    role="system",
+                    text="Cursor Agent stream processing failed",
+                    payload={"stream_failure": True},
+                    turn_id=turn_id,
+                )
+            )
+            self.emit(
+                StructuredMessage(
+                    type="status",
+                    role="system",
+                    text="turn failed",
+                    payload={
+                        "turn_complete": True,
+                        "awaiting": "input",
+                        "error": True,
+                        "stream_failure": True,
+                    },
+                    turn_id=turn_id,
+                )
+            )
+            return
 
         if returncode == 0 and not saw_result:
             self.emit(
@@ -235,6 +275,23 @@ class CursorDriver:
                     turn_id=turn_id,
                 )
             )
+
+    @staticmethod
+    def _terminate_and_reap(process: subprocess.Popen[str]) -> int:
+        """Return a child exit status after giving an abnormal stream a stop."""
+
+        if process.poll() is None:
+            process.terminate()
+        try:
+            return process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                return process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # A process that cannot be reaped must still leave a stable
+                # error path; Popen uses None while it remains unreaped.
+                return process.returncode if process.returncode is not None else -1
 
     def parse_stream_line(self, line: str, turn_id: str) -> list[StructuredMessage]:
         try:
@@ -372,7 +429,20 @@ class CursorDriver:
                     text=redact_auth_text(text),
                     payload={"cursor_result": "error"},
                     turn_id=turn_id,
-                )
+                ),
+                StructuredMessage(
+                    type="status",
+                    role="system",
+                    text="turn failed",
+                    payload={
+                        "turn_complete": True,
+                        "awaiting": "input",
+                        "error": True,
+                        "cursor_result": "error",
+                        "native_session_id": self.native_session_id,
+                    },
+                    turn_id=turn_id,
+                ),
             ]
 
         return [

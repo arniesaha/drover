@@ -426,9 +426,17 @@ def _parse_cursor_status(output: str, returncode: int) -> HarnessAuthStatus:
     try:
         data = json.loads(output)
     except json.JSONDecodeError:
-        return HarnessAuthStatus("cursor", "unknown", detail=output or None)
+        return HarnessAuthStatus(
+            "cursor",
+            "unknown",
+            detail="Cursor status could not be read; sign in through Drover if needed",
+        )
     if not isinstance(data, dict):
-        return HarnessAuthStatus("cursor", "unknown", detail=output or None)
+        return HarnessAuthStatus(
+            "cursor",
+            "unknown",
+            detail="Cursor status could not be read; sign in through Drover if needed",
+        )
     if returncode != 0 or data.get("isAuthenticated") is False:
         return HarnessAuthStatus(
             "cursor", "unauthenticated", detail="Cursor login required"

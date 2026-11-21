@@ -21,6 +21,7 @@ from drover.server.harness.auth import (
     StaticAuthAdapter,
     TerminalSignInRequired,
     _resolve_known_versioned_cli,
+    _parse_cursor_status,
     _uses_env_node,
     default_auth_adapters,
     redact_auth_text,
@@ -310,6 +311,26 @@ def test_cursor_status_parses_authenticated_json(tmp_path):
 
     assert status.state == "authenticated"
     assert status.detail == "Cursor Agent CLI"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        '{"access_token":"private-token"',
+        '["refresh_token: private-token"]',
+        '"token private-token"',
+        "Cursor status failed: token private-token",
+    ],
+)
+def test_cursor_status_never_exposes_malformed_or_non_object_output(output):
+    status = _parse_cursor_status(output, returncode=1)
+
+    assert status.state == "unknown"
+    assert (
+        status.detail
+        == "Cursor status could not be read; sign in through Drover if needed"
+    )
+    assert "private-token" not in (status.detail or "")
 
 
 @pytest.mark.parametrize(

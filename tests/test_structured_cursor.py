@@ -167,3 +167,92 @@ def test_nonzero_turn_emits_error_not_completion():
 
     assert not any(row.payload.get("turn_complete") for row in got)
     assert "hidden" not in next(row.text for row in got if row.type == "error")
+
+
+def test_result_error_with_zero_exit_marks_turn_terminal_without_missing_result():
+    got = []
+    driver = CursorDriver(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "print(json.dumps({'type': 'result', 'subtype': 'error', "
+                "'is_error': True, 'result': 'token private-result'}))"
+            ),
+        ],
+        None,
+        got.append,
+    )
+
+    driver.send_turn("hello", "turn-1")
+    _wait_for(got, lambda rows: any(row.payload.get("turn_complete") for row in rows))
+    driver.close()
+
+    error = next(row for row in got if row.type == "error")
+    terminal = next(row for row in got if row.payload.get("turn_complete"))
+    assert "private-result" not in error.text
+    assert terminal.text == "turn failed"
+    assert terminal.payload["error"] is True
+    assert terminal.payload.get("missing_result") is None
+
+
+def test_stream_failure_reaps_child_and_emits_safe_terminal_error(monkeypatch):
+    import drover.server.harness.structured.cursor as cursor_module
+
+    got = []
+    launched = []
+    real_popen = cursor_module.subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        launched.append(process)
+        return process
+
+    def emit(message):
+        if message.type == "raw":
+            raise RuntimeError("token private-emit-error")
+        got.append(message)
+
+    monkeypatch.setattr(cursor_module.subprocess, "Popen", capture_popen)
+    driver = CursorDriver(
+        [
+            sys.executable,
+            "-c",
+            "import time; print('not-json', flush=True); time.sleep(30)",
+        ],
+        None,
+        emit,
+    )
+
+    driver.send_turn("hello", "turn-1")
+    _wait_for(got, lambda rows: any(row.payload.get("stream_failure") for row in rows))
+
+    assert launched[0].poll() is not None
+    assert driver._turn_process is None
+    assert driver.has_turn_in_flight() is False
+    error = next(row for row in got if row.type == "error")
+    terminal = next(row for row in got if row.payload.get("turn_complete"))
+    assert error.text == "Cursor Agent stream processing failed"
+    assert "private-emit-error" not in error.text
+    assert terminal.payload["stream_failure"] is True
+
+
+def test_large_cursor_stderr_only_reports_the_bounded_tail():
+    got = []
+    script = (
+        "import sys; "
+        "[sys.stderr.write(f'line-{index}\\n') for index in range(1000)]; "
+        "raise SystemExit(1)"
+    )
+    driver = CursorDriver([sys.executable, "-c", script], None, got.append)
+
+    driver.send_turn("hello", "turn-1")
+    _wait_for(got, lambda rows: any(row.type == "error" for row in rows))
+    driver.close()
+
+    error = next(row for row in got if row.type == "error")
+    assert "line-999" in error.text
+    assert "line-980" in error.text
+    assert "line-979" not in error.text
+    assert "line-0" not in error.text
