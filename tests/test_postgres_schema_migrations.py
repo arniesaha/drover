@@ -36,6 +36,7 @@ from drover.server.postgres_schema import (
     GITHUB_WORK_ITEM_EVENTS_MIGRATION,
     HUB_WORK_ITEMS_MIGRATION,
     INTEGRATION_SERIALIZATION_MIGRATION,
+    M2_ACK_PENDING_MIGRATION,
     NATIVE_CONTINUITY_OWNER_MIGRATION,
     NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION,
     OWNER_CLAIM_EPOCH_MIGRATION,
@@ -48,6 +49,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    M2_ACK_PENDING_MIGRATION: "459f66c940aa8ec7a24b5736e5271a30d6d82fa96a783b937b3c78b148a9e811",
     WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION: "cff55639aaf01f98ea23005e5bb6001b80e98277ce1f97d7f424ff44f82f4588",
     COMMITTED_PROVENANCE_MIGRATION: "3eb6eb9caf7990e23375a2c62e93bacd846978689629ccbb80aa523bcba58092",
     OWNER_CLAIM_EPOCH_MIGRATION: "81e448da38f14ff3ce08aa90ab01eafbb7256e21985c31d1a5022c93185e168d",
@@ -577,3 +579,49 @@ def test_freshness_migration_existing_store_and_index_plan(pg_control_path):
             "SELECT count(*) FROM control_schema_migrations WHERE version = 16"
         ).fetchone()
         assert applied == 1
+
+
+def test_m2_ack_pending_migration_46_preserves_preupgrade_runs_as_unknown(
+    pg_control_path,
+):
+    """A pre-46 run cannot acquire the restart handoff from mutable input."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.harness.continuity import FactoryObserverContinuity
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    registry = HarnessRegistry(pg_control_path)
+    session = registry.create_session(
+        session_id="harness-pre46-m2",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="work_coordinator",
+        source_session_id="work/work-pre46-m2@0",
+    )
+    run_id = FactoryObserverContinuity(pg_control_path).initialize(
+        session_id=session.session_id,
+        objective="Pre-upgrade M2 candidate",
+        checkpoint="launched",
+        expected_effect_artifact="local-file:.drover-native-canary/m2-51.json",
+        m2_ack_pending=False,
+    )
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute("ALTER TABLE factory_observer_runs DROP COLUMN m2_ack_pending")
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [M2_ACK_PENDING_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+
+    status = FactoryObserverContinuity(pg_control_path).status(run_id)
+    assert status["m2_ack_pending"] is None
+    assert (
+        HarnessRegistry(pg_control_path).work_coordinator_m2_ack_pending(
+            session.session_id, run_id
+        )
+        is None
+    )

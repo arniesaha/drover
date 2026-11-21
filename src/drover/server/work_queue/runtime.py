@@ -233,6 +233,23 @@ class HarnessBridge:
         )
 
     @staticmethod
+    def _local_candidate_m2_ack_pending(scope, role, local_candidate_number):
+        """Return the reviewed M2 receipt handoff for one work launch only."""
+        if (
+            getattr(scope, "candidate_source", None) != "local_file"
+            or role != "work"
+            or not isinstance(local_candidate_number, int)
+            or local_candidate_number <= 0
+        ):
+            return False
+        return (
+            getattr(scope, "local_candidate_m2_ack_pending", {}).get(
+                str(local_candidate_number)
+            )
+            == "m2"
+        )
+
+    @staticmethod
     def _local_candidate_committed_provenance(scope, role, local_candidate_number):
         """Return the reviewed M3 commit exception for one work launch only."""
         if (
@@ -283,19 +300,24 @@ class HarnessBridge:
         committed_provenance = self._local_candidate_committed_provenance(
             scope, role, local_candidate_number
         )
-        if committed_provenance and authority_scope != "implementation":
+        m2_ack_pending = self._local_candidate_m2_ack_pending(
+            scope, role, local_candidate_number
+        )
+        if (
+            committed_provenance or m2_ack_pending
+        ) and authority_scope != "implementation":
             raise WorkDenied(
-                "committed provenance cannot select non-implementation authority"
+                "candidate provenance or M2 handoff cannot select non-implementation authority"
             )
         serialization_key = getattr(scope, "integration_serialization_key", None)
         serialization_label = getattr(scope, "integration_serialization_label", None)
         if (
-            committed_provenance
+            (committed_provenance or m2_ack_pending)
             and serialization_label is not None
             and serialization_label in set(authority_labels or ())
         ):
             raise WorkDenied(
-                "committed provenance cannot select integration serialization"
+                "candidate provenance or M2 handoff cannot select integration serialization"
             )
         if (
             isinstance(goal_id, str)
@@ -317,6 +339,10 @@ class HarnessBridge:
             if expected_effect_artifact is None:
                 raise WorkDenied("committed provenance requires expected effect")
             binding["committed_provenance"] = True
+        if m2_ack_pending:
+            if expected_effect_artifact is None:
+                raise WorkDenied("M2 handoff requires expected effect")
+            binding["m2_ack_pending"] = True
         if (
             authority_scope != "implementation"
             and serialization_label is not None

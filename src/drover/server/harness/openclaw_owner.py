@@ -249,6 +249,9 @@ class ContinuityProjection(WireModel):
     # New signed runs carry an explicit bool. A pre-migration run has no
     # immutable provenance selection, which remains an explicit wire unknown.
     committed_provenance: bool | None = None
+    # A signed M2 run may intentionally hand off only after receipt completion.
+    # Legacy rows remain null; ordinary new runs carry false.
+    m2_ack_pending: bool | None = None
     integration_serialization: IntegrationSerialization | None
     owner_handoff: OwnerHandoff
     owner: OwnerLease

@@ -142,7 +142,9 @@ class Collector:
         return 202, "{}"
 
 
-def _runner(tmp_path, *, expected_effect=None, event_kind="worker_blocked"):
+def _runner(
+    tmp_path, *, expected_effect=None, event_kind="worker_blocked", m2_ack_pending=None
+):
     path = tmp_path / "control.duckdb"
     bootstrap_control_plane_store(path)
     registry = HarnessRegistry(path)
@@ -171,6 +173,7 @@ def _runner(tmp_path, *, expected_effect=None, event_kind="worker_blocked"):
         checkpoint="started",
         authorized_owner_id=owner_id,
         expected_effect_artifact=expected_effect,
+        m2_ack_pending=m2_ack_pending,
     )
     store.report(
         run_id,
@@ -2479,3 +2482,288 @@ def test_start_retry_delay_is_capped_and_deterministic_for_large_attempts():
     assert _observation_retry_delay("a" * 64, 10_000_000) != _observation_retry_delay(
         "b" * 64, 10_000_000
     )
+
+
+def test_signed_m2_receipt_handoff_recovers_same_wake_after_two_hub_recreations(
+    tmp_path,
+):
+    expected = "local-file:.drover-native-canary/m2-51.json"
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path,
+        expected_effect=expected,
+        event_kind="worker_done",
+        m2_ack_pending=True,
+    )
+    collector.expected_effect_attestations["observer-session"] = True
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    # First owner turn is a real native dispatch. It may persist and verify the
+    # exact effect receipt, but the signed handoff forbids an ACK at its epoch.
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    first_action = status["next_action"]
+    first_fence = {"owner_id": owner_id, "owner_epoch": status["owner"]["epoch"]}
+    assert first_action["m2_ack_pending"] is True
+    receipt = store.action_intent(
+        run_id,
+        **first_fence,
+        wake_id=first_action["event_id"],
+        action_fingerprint=first_action["action_id"],
+        artifact=expected,
+    )
+    assert receipt["state"] == "complete"
+    with pytest.raises(ContinuityConflict, match="successor epoch"):
+        store.acknowledge(
+            run_id,
+            **first_fence,
+            event_id=first_action["event_id"],
+            checkpoint="must wait for restart",
+        )
+
+    first_session = collector.turn_attempts[-1][0]
+    first_turn = collector.turn_attempts[-1][1]["client_turn_id"]
+    runner.registry.append_event(
+        session_id=first_session,
+        event_type="status",
+        payload={"turn_id": first_turn, "turn_complete": True, "exited": 0},
+    )
+    runner.registry.update_session_activity(first_session, awaiting="input")
+    runner._complete_finished_claim(runner.config.goals[0], first_session)
+    # A separate ready run is durable before interruption. It must progress
+    # normally; the M2 handoff may never consume or discard it.
+    runner.registry.create_session(
+        session_id="observer-ready",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/ready",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-ready@1",
+    )
+    ready_run = store.initialize(
+        session_id="observer-ready",
+        objective="Independent ready work",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    store.report(
+        ready_run,
+        source="hub",
+        source_event_id="ready-done",
+        subject="worker-ready",
+        sequence=1,
+        kind="worker_done",
+        summary="independent ready work",
+    )
+    # The original process keeps the completed receipt visible rather than
+    # fencing itself or spending another delivery attempt.
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+    assert store.status(run_id)["inbox_counts"] == {"delivered": 1}
+    ready_status = store.status(ready_run)
+    assert ready_status["inbox_counts"] == {"delivered": 1}
+    ready_action = ready_status["next_action"]
+    ready_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": ready_status["owner"]["epoch"],
+    }
+    store.action_intent(
+        ready_run,
+        **ready_fence,
+        wake_id=ready_action["event_id"],
+        action_fingerprint=ready_action["action_id"],
+        artifact="issue-comment:ready",
+    )
+    store.acknowledge(
+        ready_run,
+        **ready_fence,
+        event_id=ready_action["event_id"],
+        checkpoint="independent ready work settled",
+    )
+    ready_session = collector.turn_attempts[-1][0]
+    ready_turn = collector.turn_attempts[-1][1]["client_turn_id"]
+    runner.registry.append_event(
+        session_id=ready_session,
+        event_type="status",
+        payload={"turn_id": ready_turn, "turn_complete": True, "exited": 0},
+    )
+    runner.registry.update_session_activity(ready_session, awaiting="input")
+    runner._complete_finished_claim(runner.config.goals[0], ready_session)
+
+    # Recreating the hub runner loses only its local hold marker. It fences the
+    # same durable wake, not the effect, and requires a successor epoch.
+    restarted = NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert restarted.process_once() == 0
+    recovered = store.status(run_id)
+    assert recovered["owner"]["epoch"] == first_fence["owner_epoch"] + 1
+    assert recovered["next_action"]["event_id"] == first_action["event_id"]
+    assert recovered["next_action"]["action_id"] == first_action["action_id"]
+
+    clock.advance(6)
+    assert restarted.process_once() == 1
+    second_action = store.status(run_id)["next_action"]
+    assert second_action["action_intent"]["state"] == "complete"
+    assert len(collector.turn_attempts) == 3
+    second_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": store.status(run_id)["owner"]["epoch"],
+    }
+
+    # A second hub interruption happens after the successor has received the
+    # real recovery prompt, but before it can ACK.  Its completed turn leaves
+    # the receipt durable and the exact wake unacknowledged.
+    second_session = collector.turn_attempts[-1][0]
+    second_turn = collector.turn_attempts[-1][1]["client_turn_id"]
+    restarted.registry.append_event(
+        session_id=second_session,
+        event_type="status",
+        payload={"turn_id": second_turn, "turn_complete": True, "exited": 0},
+    )
+    restarted.registry.update_session_activity(second_session, awaiting="input")
+    restarted._complete_finished_claim(restarted.config.goals[0], second_session)
+
+    restarted_again = NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert restarted_again.process_once() == 0
+    later = store.status(run_id)
+    recovery_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": later["owner"]["epoch"],
+    }
+    assert recovery_fence["owner_epoch"] == second_fence["owner_epoch"] + 1
+    assert later["next_action"]["event_id"] == first_action["event_id"]
+    assert later["next_action"]["action_id"] == first_action["action_id"]
+    with pytest.raises(ContinuityConflict):
+        store.acknowledge(
+            run_id,
+            **first_fence,
+            event_id=first_action["event_id"],
+            checkpoint="stale initial epoch",
+        )
+    with pytest.raises(ContinuityConflict):
+        store.acknowledge(
+            run_id,
+            **second_fence,
+            event_id=first_action["event_id"],
+            checkpoint="stale intermediate epoch",
+        )
+
+    # The later successor reconciles the original completed receipt through
+    # action_intent.  It neither recreates the effect nor consumes a new wake.
+    # The second delivery was consumed at the prior successor turn, so wait
+    # past its real lease deadline rather than fabricating another consume.
+    clock.advance(11)
+    assert restarted_again.process_once() == 1
+    final_status = store.status(run_id)
+    third_action = final_status["next_action"]
+    final_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": final_status["owner"]["epoch"],
+    }
+    assert final_fence["owner_epoch"] == recovery_fence["owner_epoch"] + 1
+    assert third_action["action_intent"]["state"] == "complete"
+    assert "hub-signed M2 recovery" in collector.turn_attempts[-1][1]["text"]
+    assert len(collector.turn_attempts) == 4
+    with pytest.raises(ContinuityConflict):
+        store.acknowledge(
+            run_id,
+            **recovery_fence,
+            event_id=third_action["event_id"],
+            checkpoint="expired recovery epoch",
+        )
+    reconciled = store.action_intent(
+        run_id,
+        **final_fence,
+        wake_id=third_action["event_id"],
+        action_fingerprint=third_action["action_id"],
+        artifact=expected,
+    )
+    assert reconciled == receipt
+    with control_plane_connection(runner.path) as con:
+        receipt_row = con.execute(
+            """
+            SELECT owner_epoch, artifact, created_at
+              FROM continuity_owner_action_intents
+             WHERE wake_id = ?
+            """,
+            [first_action["event_id"]],
+        ).fetchone()
+    assert receipt_row[:2] == (first_fence["owner_epoch"], expected)
+    assert receipt_row[2] is not None
+
+    store.acknowledge(
+        run_id,
+        **final_fence,
+        event_id=third_action["event_id"],
+        checkpoint="M2 receipt recovered after two hub interruptions",
+    )
+    checkpoint = store.status(run_id)["checkpoint"]
+    # A redelivery/replay cannot create another effect receipt or overwrite the
+    # durable checkpoint after the exact wake is acknowledged.
+    store.acknowledge(
+        run_id,
+        **final_fence,
+        event_id=third_action["event_id"],
+        checkpoint="duplicate must not replace checkpoint",
+    )
+    assert store.status(run_id)["checkpoint"] == checkpoint
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+    assert store.status(ready_run)["inbox_counts"] == {"acknowledged": 1}
+    with control_plane_connection(runner.path) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_action_intents WHERE wake_id = ?",
+                [first_action["event_id"]],
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_m2_handoff_rejects_missing_receipt_wrong_artifact_and_stale_epoch(tmp_path):
+    expected = "local-file:.drover-native-canary/m2-negative.json"
+    runner, collector, store, run_id, _clock = _runner(
+        tmp_path,
+        expected_effect=expected,
+        event_kind="worker_done",
+        m2_ack_pending=True,
+    )
+    collector.expected_effect_attestations["observer-session"] = True
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    action = status["next_action"]
+    fence = {
+        "owner_id": runner.config.goals[0].continuity_owner_id,
+        "owner_epoch": status["owner"]["epoch"],
+    }
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="none"
+        )
+    with pytest.raises(ContinuityConflict, match="expected effect"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact="local-file:.drover-native-canary/wrong.json",
+        )
+    with pytest.raises(ContinuityConflict):
+        store.action_intent(
+            run_id,
+            **{**fence, "owner_epoch": fence["owner_epoch"] + 1},
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact=expected,
+        )

@@ -220,6 +220,18 @@
             }
           ]
         },
+        "m2_ack_pending": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "M2 Ack Pending"
+        },
         "next_action": {
           "anyOf": [
             {

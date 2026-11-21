@@ -326,13 +326,14 @@ def test_control_migration_refuses_unsafe_inline_checks(statement):
     }
 
 
-def test_control_migrations_28_through_45_classify_from_v0628_baseline():
+def test_control_migrations_28_through_46_classify_from_v0628_baseline():
     from drover.server.lake.rollout import classify_release_kind
     from drover.server.postgres_schema import (
         _MIGRATIONS,
         COMMITTED_PROVENANCE_MIGRATION,
         EXPECTED_EFFECT_ARTIFACT_MIGRATION,
         INTEGRATION_SERIALIZATION_MIGRATION,
+        M2_ACK_PENDING_MIGRATION,
         OWNER_CLAIM_EPOCH_MIGRATION,
         WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
     )
@@ -343,7 +344,7 @@ def test_control_migrations_28_through_45_classify_from_v0628_baseline():
         if version <= 27
     ]
     target = [[version, list(statements)] for version, statements in _MIGRATIONS]
-    expected_migrations = list(range(28, WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION + 1))
+    expected_migrations = list(range(28, M2_ACK_PENDING_MIGRATION + 1))
     assert [version for version, _ in target if version > 27] == expected_migrations
 
     allowed, evidence = classify_release_kind(

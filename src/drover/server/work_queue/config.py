@@ -55,6 +55,10 @@ class Authority(Model):
     # exact candidate selector are both required before a local worker may make
     # an isolated session-branch commit for a separate verifier.
     local_candidate_committed_provenance_enabled: bool = False
+    # A reviewed M2-only receipt handoff is disabled by default.  It permits
+    # one exact local candidate to stop after its durable effect receipt so a
+    # real hub restart can exercise successor-epoch acknowledgement recovery.
+    local_candidate_m2_ack_pending_enabled: bool = False
 
 
 class Acceptance(Model):
@@ -220,6 +224,11 @@ class GoalScope(Model):
     local_candidate_committed_provenance: dict[str, Literal["m3"]] = Field(
         default_factory=dict
     )
+    # M2 restart evidence is selected only by reviewed config for one exact
+    # local candidate. Task bodies and manifests cannot request this handoff.
+    local_candidate_m2_ack_pending: dict[str, Literal["m2"]] = Field(
+        default_factory=dict
+    )
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -315,11 +324,31 @@ class GoalScope(Model):
                     raise ValueError(
                         "local committed provenance cannot select deployment authority"
                     )
+            if self.local_candidate_m2_ack_pending:
+                if owner != native_owner:
+                    raise ValueError(
+                        "local M2 handoff requires this goal's native owner"
+                    )
+                if not policy.authority.local_candidate_m2_ack_pending_enabled:
+                    raise ValueError("local M2 handoff requires policy opt-in")
+                if any(
+                    not number.isdigit() or int(number) <= 0
+                    for number in self.local_candidate_m2_ack_pending
+                ):
+                    raise ValueError("local M2 handoff requires positive item keys")
+                if set(self.local_candidate_m2_ack_pending) & (
+                    set(self.local_candidate_authority_scopes)
+                    | set(self.local_candidate_committed_provenance)
+                ):
+                    raise ValueError(
+                        "local M2 handoff cannot select deployment or committed provenance"
+                    )
         elif (
             self.local_candidates_path is not None
             or self.local_candidate_worktrees
             or self.local_candidate_authority_scopes
             or self.local_candidate_committed_provenance
+            or self.local_candidate_m2_ack_pending
         ):
             raise ValueError(
                 "GitHub candidate source cannot configure local candidate paths"

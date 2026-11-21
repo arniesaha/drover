@@ -1871,3 +1871,90 @@ def test_queue_worker_never_advances_deferred_completion_without_terminal_bound_
         for label in provider.get_item(_ref())["labels"]
         if label["name"].startswith("status:")
     ] == ["status:running"]
+
+
+def test_policy_opted_m2_handoff_is_hub_signed_and_work_only(tmp_path):
+    """Task text cannot select the M2 receipt handoff or extend it to verify."""
+    path = tmp_path / "candidates.json"
+    _manifest(path)
+    policy_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "drover"
+        / "server"
+        / "work_queue"
+        / "policy-v1.json"
+    )
+    policy = json.loads(policy_source.read_text(encoding="utf-8"))
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    base = {
+        "policy_path": str(policy_path),
+        "execution_enabled": True,
+        "execution_cwds": {"host": str(tmp_path / "checkout")},
+        "brief_ref": "docs/native-canary-m2-restart.md",
+        "continuity_owner_id": "drover:owner/goal-local",
+        "continuity_owner_harness": "codex",
+        "local_candidate_m2_ack_pending": {"51": "m2"},
+    }
+    with pytest.raises(ValueError, match="policy opt-in"):
+        _scope(path, **base)
+
+    policy["authority"]["local_candidate_m2_ack_pending_enabled"] = True
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    scope = _scope(path, **base)
+    policy["authority"]["local_candidate_committed_provenance_enabled"] = True
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    with pytest.raises(ValueError, match="cannot select deployment or committed"):
+        _scope(
+            path,
+            **{
+                **base,
+                "local_candidate_committed_provenance": {"51": "m3"},
+            },
+        )
+
+    bridge = object.__new__(HarnessBridge)
+    bridge.config = SimpleNamespace(goals=[scope])
+    bridge.collector = SimpleNamespace(work_coordinator_continuity_secret="hub-secret")
+    expected = "local-file:.drover-native-canary/m2-51.json"
+    binding = bridge._work_coordinator_binding(
+        "a" * 32,
+        "work",
+        "local://goal-local/51",
+        scope.goal_id,
+        expected_effect_artifact=expected,
+        local_candidate_number=51,
+    )
+    parsed, _ = parse_work_coordinator_continuity(
+        {"work_coordinator_continuity": binding}, hub_secret="hub-secret"
+    )
+    assert parsed is not None and parsed.m2_ack_pending is True
+
+    verify = bridge._work_coordinator_binding(
+        "b" * 32,
+        "verify",
+        "local://goal-local/51",
+        scope.goal_id,
+        expected_effect_artifact=expected,
+        local_candidate_number=51,
+    )
+    parsed_verify, _ = parse_work_coordinator_continuity(
+        {"work_coordinator_continuity": verify}, hub_secret="hub-secret"
+    )
+    assert parsed_verify is not None and parsed_verify.m2_ack_pending is False
+
+    unsigned = {
+        key: value for key, value in binding.items() if key != "binding_signature"
+    }
+    unsigned["m2_ack_pending"] = False
+    with pytest.raises(ValueError, match="hub authenticated"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **unsigned,
+                    "binding_signature": binding["binding_signature"],
+                }
+            },
+            hub_secret="hub-secret",
+        )
