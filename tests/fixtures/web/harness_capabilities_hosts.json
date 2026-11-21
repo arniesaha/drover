@@ -92,6 +92,26 @@
             }
           },
           {
+            "name": "cursor",
+            "enabled": true,
+            "description": "Cursor Agent CLI",
+            "command": [],
+            "capabilities": {
+              "schema_version": 1,
+              "harness_id": "cursor",
+              "launch_modes": ["structured"],
+              "approvals": false,
+              "interrupt": true,
+              "native_resume": true,
+              "model_catalog": true,
+              "usage": false,
+              "worktree": false,
+              "attachments": [],
+              "turn_preferences": false,
+              "interactive_auth": true
+            }
+          },
+          {
             "name": "deepseek-harness",
             "enabled": true,
             "description": "DeepSeek Harness (local Web RPC)",

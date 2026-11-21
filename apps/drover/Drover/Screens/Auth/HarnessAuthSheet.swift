@@ -121,6 +121,21 @@ struct HarnessAuthSheet: View {
 
         if let flow = model.flow {
             Section("Sign In") {
+                switch flow.state {
+                case .starting:
+                    Text("Preparing secure browser sign-in…")
+                        .foregroundStyle(.secondary)
+                case .waitingForUser:
+                    Text(flow.loginURL == nil
+                         ? "Waiting for the sign-in link from the CLI…"
+                         : "Complete sign-in in your browser. Drover will verify this host when Cursor finishes.")
+                        .foregroundStyle(.secondary)
+                case .authenticated:
+                    Text("Authenticated on this host.")
+                        .foregroundStyle(.green)
+                default:
+                    EmptyView()
+                }
                 if let url = flow.loginURL {
                     Button {
                         openURL(url)
