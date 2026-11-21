@@ -28,35 +28,44 @@ import { LINKS } from '../site';
     <div class="wrap">
       <span class="eyebrow">Before you begin</span>
       <h2>Prerequisites</h2>
-      <p class="lede">Ensure your hub and hosts are running before connecting your orchestrator.</p>
+      <p class="lede">
+        Install the hub, pair a browser with its built-in web cockpit, then issue a credential for your orchestrator.
+        No Xcode or phone is required to get started.
+      </p>
 
       <div class="grid cols-3 prereqs-grid">
         <div class="card">
           <div class="icon"><Icon name="fleet" /></div>
-          <h3>1. Hub installed</h3>
+          <h3>1. Install the hub</h3>
           <p>
             <code>drover-server</code> runs on one central machine, listening on port <code>7080</code> for the fleet API
-            and <code>7077</code> for loopback MCP.
+            and web cockpit and <code>7077</code> for loopback MCP. The installer also sets up PostgreSQL for you:
           </p>
-          <p class="card-hint">Run <code>curl -fsSL {LINKS.installScript} | bash</code> to install.</p>
+          <p class="card-hint">
+            <code>curl -fsSL {LINKS.installScript} | bash -s -- --control-store managed</code>
+            <br />Already run PostgreSQL? Use <code>--control-store existing</code> with <code>DROVER_CONTROL_DSN</code> set.
+          </p>
         </div>
 
         <div class="card">
           <div class="icon ember"><Icon name="phone" /></div>
-          <h3>2. Phone paired</h3>
+          <h3>2. Pair a browser (or phone)</h3>
           <p>
-            Open the Drover iOS app, tap <strong>Settings -> Pair Device</strong>, and scan the QR code or enter a token
-            generated with <code>drover pairing token issue</code>.
+            Open the web cockpit at <code>http://127.0.0.1:7080/ui</code> on the hub machine, then run{' '}
+            <code>drover-server pair</code> and enter the one-time code it prints.
           </p>
-          <p class="card-hint">Provides your mobile control surface and approval inbox.</p>
+          <p class="card-hint">
+            The same command shows a QR code for the Drover iOS app. Add more machines with{' '}
+            <code>drover-server pair-host --name &lt;host&gt;</code>.
+          </p>
         </div>
 
         <div class="card">
           <div class="icon wheat"><Icon name="profile" /></div>
-          <h3>3. Credentials issued</h3>
+          <h3>3. Issue an agent credential</h3>
           <p>
-            Issue an agent credential with <code>drover profile agents issue &lt;agent-id&gt; --tier trusted</code>.
-            Export <code>DROVER_MCP_TOKEN</code> and <code>DROVER_MCP_URL=http://localhost:7077/mcp</code>.
+            Run <code>drover-server profile agents issue &lt;agent-id&gt; --tier trusted</code>; the token is printed once.
+            Export it as <code>DROVER_MCP_TOKEN</code> with <code>DROVER_MCP_URL=http://127.0.0.1:7077/mcp</code>.
           </p>
           <p class="card-hint">Never commit credentials or tokens into repositories.</p>
         </div>
