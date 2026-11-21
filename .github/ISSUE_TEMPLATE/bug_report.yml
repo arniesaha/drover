@@ -1,0 +1,60 @@
+name: Bug report
+description: Something in Drover does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Do not file security vulnerabilities here; follow
+        [SECURITY.md](https://github.com/arniesaha/drover/blob/main/SECURITY.md) instead.
+        Redact tokens, DSNs, hostnames, IP addresses, and home-directory paths before posting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Install with `install.sh --control-store managed`
+        2. Run `drover-server pair`
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Hub (drover-server)
+        - Host daemon (drover-harnessd)
+        - Web cockpit (/ui)
+        - iOS app or widget
+        - Installer (install.sh)
+        - MCP / orchestrator integration
+        - Docs or drover.fyi
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Drover version
+      description: Output of `drover-server --version`, or the release tag or commit.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, Python version, control-store mode (managed, existing, duckdb), harnesses involved.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redacted log excerpts. This is rendered as code.
+      render: text

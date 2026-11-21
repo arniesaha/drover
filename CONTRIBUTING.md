@@ -31,9 +31,12 @@ Start with issues labeled:
 
 ### Getting Help
 
-- **General questions**: Open a discussion on GitHub
-- **Bug reports**: Use the bug report template
-- **Feature requests**: Open a feature request and propose implementation details
+- **General questions**: Open a GitHub issue; the maintainers will point you to the right place
+- **Bug reports**: Use the bug report issue template
+- **Feature requests**: Use the feature request issue template and propose implementation details
+- **Security vulnerabilities**: Report privately as described in [SECURITY.md](SECURITY.md), never in a public issue
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Developer Environment Setup
 
@@ -381,8 +384,7 @@ See [Security Policy](SECURITY.md) for full disclosure process.
 ### Contributors
 
 - Check existing issues/PRs for your topic
-- Join discussions on GitHub
-- Ask questions in the Drover discussions forum
+- Ask questions in a GitHub issue
 
 ### Maintainers
 
