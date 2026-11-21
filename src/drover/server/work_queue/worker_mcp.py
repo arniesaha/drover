@@ -92,8 +92,24 @@ class BoundWorkControl:
         evidence_key: str | None = None,
         estimated_cost: float | None = None,
     ) -> dict[str, Any]:
-        if action not in {"complete", "failed", "progress"}:
+        if action not in {"complete", "failed", "progress", "verified"}:
             raise BoundWorkError("bound worker action is invalid")
+        if action == "verified":
+            if not isinstance(evidence_key, str) or not evidence_key:
+                raise BoundWorkError("bound verifier evidence is required")
+            return self._call(
+                "update",
+                {
+                    "goal_id": self.goal_id,
+                    "number": self.number,
+                    "run_key": self.run_key,
+                    "action": action,
+                    "evidence_key": evidence_key,
+                    "estimated_cost": None,
+                    "behavioral_passed": True,
+                    "checks_rerun": True,
+                },
+            )
         if action in {"complete", "failed"}:
             # A task-bound terminal request has no caller-selected evidence or
             # quota estimate: the service derives its exact effect and local

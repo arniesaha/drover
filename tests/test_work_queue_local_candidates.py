@@ -1236,6 +1236,14 @@ def test_policy_opted_committed_provenance_is_hub_signed_and_body_cannot_select_
     )
     assert parsed_verify.committed_provenance is False
     assert "does not permit a source commit" in verify_payload["prompt"]
+    assert (
+        "do not request `drover_work_update(action=complete)`"
+        in verify_payload["prompt"]
+    )
+    assert (
+        "drover_work_update(action=verified, evidence_key=...)"
+        in verify_payload["prompt"]
+    )
 
     legacy_scope = _scope(
         path,
@@ -1812,6 +1820,101 @@ def test_queue_worker_defers_bound_completion_until_terminal_then_launches_verif
     # The durable deferred-completion intent yields one verification successor.
     worker.process_once()
     assert len(service.store.links(goal_id=scope.goal_id, number=1)) == 2
+
+
+def test_bound_verifier_reports_then_queue_accepts_only_its_terminal_turn(
+    tmp_path, pg_control_path
+):
+    """A committed candidate verifier cannot self-accept while it is active."""
+    scope, provider, harness, service, worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path
+    )
+    host = WorkActor("credential:host", "worker", host_id="host")
+
+    assert service.update(
+        scope.goal_id, 1, work["run_key"], "complete", actor=host
+    ) == {"outcome": "deferred"}
+    harness.sessions[work["run_key"]].turn_finished = True
+    worker.process_once()
+    verify = service.store.links(goal_id=scope.goal_id, number=1)[-1]
+    assert verify["run_role"] == "verify"
+
+    with pytest.raises(ValueError, match="verification needs behavioral result"):
+        service.update(scope.goal_id, 1, verify["run_key"], "complete", actor=host)
+    with pytest.raises(
+        PermissionError, match="execution reporting credential required"
+    ):
+        service.update(
+            scope.goal_id,
+            1,
+            verify["run_key"],
+            "verified",
+            actor=WorkActor("credential:other", "worker", host_id="other"),
+            behavioral_passed=True,
+            checks_rerun=True,
+            evidence_key="check:other-host",
+        )
+    with pytest.raises(ValueError, match="successful behavioral evidence"):
+        service.update(
+            scope.goal_id,
+            1,
+            verify["run_key"],
+            "verified",
+            actor=host,
+            behavioral_passed=True,
+            checks_rerun=False,
+            evidence_key="check:incomplete",
+        )
+
+    assert service.update(
+        scope.goal_id,
+        1,
+        verify["run_key"],
+        "verified",
+        actor=host,
+        behavioral_passed=True,
+        checks_rerun=True,
+        evidence_key="check:focused-pass",
+    ) == {"outcome": "deferred"}
+    assert provider.get_item(_ref())["state"] == "open"
+    # The active verifier cannot close the item merely by reporting success.
+    worker.process_once()
+    assert provider.get_item(_ref())["state"] == "open"
+
+    harness.sessions[verify["run_key"]].turn_finished = True
+    # The deferred report is bound to the original work/verify request. A
+    # later mutable criteria change cannot close the item with that report.
+    provider._change(_ref(), lambda item: item.__setitem__("body", "changed criteria"))
+    worker.process_once()
+    assert provider.get_item(_ref())["state"] == "open"
+    provider._change(
+        _ref(),
+        lambda item: item.__setitem__(
+            "body", "Perform only a harmless local canary effect."
+        ),
+    )
+    worker.process_once()
+    assert provider.get_item(_ref())["state"] == "closed"
+    events = service.store.events(identity(verify["run_key"], "verified", None))
+    assert [
+        (event["event_kind"], event["provider_operation_id"]) for event in events
+    ] == [
+        ("intent", "check:focused-pass"),
+        ("outcome", "check:focused-pass"),
+    ]
+    # A replay cannot close twice or replace the recorded behavioral evidence.
+    worker.process_once()
+    assert provider.get_item(_ref())["state"] == "closed"
+    assert service.update(
+        scope.goal_id,
+        1,
+        verify["run_key"],
+        "verified",
+        actor=host,
+        behavioral_passed=True,
+        checks_rerun=True,
+        evidence_key="check:focused-pass",
+    ) == {"outcome": "verified"}
 
 
 def test_queue_worker_does_not_infer_completion_without_worker_request(
