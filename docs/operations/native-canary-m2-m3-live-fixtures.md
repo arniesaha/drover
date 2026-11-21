@@ -109,6 +109,35 @@ must join the worker session/turn and all source events to the final owner
 receipt and ACK. A chat message, a direct coordinator call, or a cron trigger
 is not an unattended stage.
 
+### Candidate 80: substantive committed-provenance lineage
+
+[`fixtures/native-canary-m3-candidate-80-substantive-lineage.json`](fixtures/native-canary-m3-candidate-80-substantive-lineage.json)
+is an offline ordinary-ingress record for a fresh candidate only. It has an
+exact policy/GoalScope selector addition in
+[`fixtures/native-canary-followon-binding-input.json`](fixtures/native-canary-followon-binding-input.json):
+`"80": "m3"` is the only new committed-provenance entry. It leaves the M2
+selector, deployment selector, integration key, cap, and budget unchanged.
+
+Its worker must commit a bounded analysis, scoped implementation, real
+standard-library focused-test evidence, review request with parent commit and
+upstream file hashes, and the signed `source-task-80.json` effect. The review
+request hashes only files written before it; the final effect then names that
+request and its SHA-256, forming an acyclic immutable chain. The separate verifier
+is read-only: it recomputes those hashes, inspects the committed analysis and
+implementation, reruns the exact test, then makes the existing bound
+`verified` report only on success. The durable work-coordinator verified intent
+and outcome are the verifier's review result and authorized next action; the
+verifier cannot write a self-authored review artifact. If a review question
+fails, it sends no verified report and no item acceptance occurs. For a later
+live run, preserve the joined immutable record: worker
+`work-<run_key>`/session/turn; parent commit and hashes from the
+signed final artifact; deferred `complete` intent; separate verifier
+run/session/terminal turn; verifier `verified` intent and queue outcome; then
+the final worker-done wake, native-owner action intent/receipt, and ACK with
+timestamps. Those joins are produced by the existing queue and owner lifecycle;
+this fixture does not dispatch stages itself. It is offline validation input,
+not a live acceptance record or authorization to stage the manifest/configuration.
+
 ### Separate-verifier provenance
 
 A `verify` run is deliberately a new isolated Git worktree.  It is created from
