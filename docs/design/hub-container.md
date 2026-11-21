@@ -26,9 +26,12 @@ wheel is installed, and `deploy/Dockerfile.dockerignore` scopes the context.
 It runs only
 `drover-server` as an unprivileged user and deliberately does not include a
 harness CLI, Git, `sqlite3`, PostgreSQL client tools, Tailscale, a service
-manager, or troubleshooting utilities. Compose and Helm templates remain
-follow-up work; platform configuration must still meet the persistent-service
-contract below.
+manager, or troubleshooting utilities. `deploy/compose.yaml` is the one-command
+single-VM stack: PostgreSQL 17 with pgvector (the image CI pins), a one-shot
+`control-store init`, and the hub published on `127.0.0.1:7080` with
+`deploy/compose/config.toml` mounted read-only and secrets from `deploy/.env`.
+A Helm template remains follow-up work; platform configuration must still meet
+the persistent-service contract below.
 
 For Railway or another generic container platform, provide (1) a private
 PostgreSQL service for the control store and DuckLake catalog, (2) one durable
