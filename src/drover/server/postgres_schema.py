@@ -43,6 +43,7 @@ INTEGRATION_SERIALIZATION_MIGRATION = 41
 EXPECTED_EFFECT_ARTIFACT_MIGRATION = 42
 OWNER_CLAIM_EPOCH_MIGRATION = 43
 COMMITTED_PROVENANCE_MIGRATION = 44
+WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION = 45
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1086,6 +1087,14 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         COMMITTED_PROVENANCE_MIGRATION,
         (
             "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS committed_provenance BOOLEAN",
+        ),
+    ),
+    # Persist the exact hub-signed coordinator envelope before daemon create.
+    # Pre-upgrade rows remain NULL and are never reconstructed from mutable input.
+    (
+        WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
+        (
+            "ALTER TABLE execution_links ADD COLUMN IF NOT EXISTS work_coordinator_binding_json TEXT",
         ),
     ),
 )

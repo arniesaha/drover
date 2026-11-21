@@ -41,12 +41,14 @@ from drover.server.postgres_schema import (
     OWNER_CLAIM_EPOCH_MIGRATION,
     OWNER_CREDENTIAL_MIGRATION,
     PROFILE_MIGRATION,
+    WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
     WORK_ITEM_EVENTS_MIGRATION,
     WORKER_STATES_MIGRATION,
 )
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION: "cff55639aaf01f98ea23005e5bb6001b80e98277ce1f97d7f424ff44f82f4588",
     COMMITTED_PROVENANCE_MIGRATION: "3eb6eb9caf7990e23375a2c62e93bacd846978689629ccbb80aa523bcba58092",
     OWNER_CLAIM_EPOCH_MIGRATION: "81e448da38f14ff3ce08aa90ab01eafbb7256e21985c31d1a5022c93185e168d",
     EXPECTED_EFFECT_ARTIFACT_MIGRATION: "745ad20c33fa21000cb8d8879127dbb2768b7d5ff40a5d3bddf7f8d749d50a48",
@@ -257,6 +259,53 @@ def test_committed_provenance_migration_44_preserves_preupgrade_runs_as_unknown(
         assert con.execute(
             "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
             [COMMITTED_PROVENANCE_MIGRATION],
+        ).fetchone() == (1,)
+
+
+def test_work_coordinator_launch_binding_migration_45_is_additive(pg_control_path):
+    """Old links gain the nullable envelope column without inferred authority."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+    from drover.server.work_queue.provider import ItemRef
+    from drover.server.work_queue.store import WorkStore
+
+    queue = WorkStore(pg_control_path, "preupgrade-workspace")
+    queue.intent(
+        "control:test",
+        ItemRef(
+            "preupgrade-workspace", "github", "example/project", 1, "https://example/1"
+        ),
+        "goal",
+        "a" * 64,
+        "work",
+        0,
+        "goal:preupgrade",
+    )
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute(
+            "ALTER TABLE execution_links DROP COLUMN work_coordinator_binding_json"
+        )
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        assert (
+            con.execute(
+                "SELECT work_coordinator_binding_json FROM execution_links LIMIT 0"
+            ).description[0][0]
+            == "work_coordinator_binding_json"
+        )
+        assert con.execute(
+            "SELECT work_coordinator_binding_json FROM execution_links "
+            "WHERE workspace_id = 'preupgrade-workspace'"
+        ).fetchone() == (None,)
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION],
         ).fetchone() == (1,)
 
 

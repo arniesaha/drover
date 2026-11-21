@@ -151,6 +151,34 @@ class HarnessBridge:
         if len(links) != 1:
             raise WorkDenied("cannot recover unique work launch intent")
         link = links[0]
+        stored_binding = link.get("work_coordinator_binding_json")
+        if stored_binding is not None:
+            from drover.server.harness.work_coordinator import (
+                FactoryObserverRequestError,
+                parse_work_coordinator_continuity,
+            )
+
+            try:
+                raw_binding = json.loads(stored_binding)
+                if not isinstance(raw_binding, dict):
+                    raise ValueError("stored binding is not an object")
+                binding, _ = parse_work_coordinator_continuity(
+                    {"work_coordinator_continuity": raw_binding},
+                    hub_secret=self.collector.work_coordinator_continuity_secret,
+                )
+                if binding is None or binding.run_id != "work-" + run_key:
+                    raise ValueError("stored binding run does not match")
+            except (
+                FactoryObserverRequestError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise WorkDenied(
+                    "stored work continuity binding is invalid; inspection required"
+                ) from exc
+            payload["work_coordinator_continuity"] = raw_binding
+            return payload
         scope = next(
             (
                 scope
@@ -500,8 +528,36 @@ class HarnessBridge:
             return False
         return None
 
+    def prepare_work_coordinator_binding(
+        self, run_key, role, ref, goal_id, *, authority=None
+    ):
+        """Build the one signed envelope persisted before daemon create."""
+        scope = next(g for g in self.config.goals if g.goal_id == goal_id)
+        if not scope.continuity_owner_id:
+            return None
+        authority = authority or {}
+        return self._work_coordinator_binding(
+            run_key,
+            role,
+            ref.url,
+            goal_id,
+            authority_labels=authority.get("labels", []),
+            expected_effect_artifact=authority.get("expected_effect_artifact"),
+            local_candidate_number=authority.get("local_candidate_number"),
+        )
+
     def launch(
-        self, host, harness, run_key, ref, role, parent, goal_id, *, authority=None
+        self,
+        host,
+        harness,
+        run_key,
+        ref,
+        role,
+        parent,
+        goal_id,
+        *,
+        authority=None,
+        continuity_binding=None,
     ):
         scope = next(g for g in self.config.goals if g.goal_id == goal_id)
         parent_session = self.registry.get_session(parent) if parent else None
@@ -606,21 +662,16 @@ class HarnessBridge:
             ),
         }
         if scope.continuity_owner_id:
-            # The committed run key is the producer identity and binds the
-            # exact launched session to the coordinator work item. The hub
-            # verifies and initializes the durable ledger before reporting
-            # launch success to the work coordinator.
-            # The daemon accepts coordinator mode only when this exact binding
-            # was signed by the hub's continuity secret. The host receives the
-            # binding but never the HMAC secret or the hub bearer token.
-            payload["work_coordinator_continuity"] = self._work_coordinator_binding(
-                run_key,
-                role,
-                ref.url,
-                goal_id,
-                authority_labels=authority.get("labels", []),
-                expected_effect_artifact=authority.get("expected_effect_artifact"),
-                local_candidate_number=local_number,
+            # The exact signed envelope was persisted with the idempotent work
+            # intent before this POST.  Direct bridge callers retain the same
+            # construction path, but normal WorkService launches pass that
+            # durable envelope back here unchanged.
+            payload["work_coordinator_continuity"] = (
+                continuity_binding
+                if continuity_binding is not None
+                else self.prepare_work_coordinator_binding(
+                    run_key, role, ref, goal_id, authority=authority
+                )
             )
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:

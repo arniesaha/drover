@@ -1391,6 +1391,56 @@ def test_followon_marker_only_bindings_cannot_inherit_committed_provenance(
     assert "Do not request `drover_work_update(action=complete)`" in payload["prompt"]
 
 
+def test_local_candidate_recovery_uses_only_the_precommitted_signed_binding(tmp_path):
+    """An ambiguous create may recover the original signed candidate envelope."""
+    path = tmp_path / "candidates.json"
+    _manifest(
+        path, expected_effect="local-file:.drover-native-canary/source-task-33.json"
+    )
+    scope = _scope(
+        path,
+        execution_enabled=True,
+        execution_cwds={"host": str(tmp_path / "checkout")},
+        brief_ref="docs/local-canary.md",
+        continuity_owner_id="drover:owner/goal-local",
+        continuity_owner_harness="codex",
+    )
+    bridge = object.__new__(HarnessBridge)
+    bridge.config = SimpleNamespace(goals=[scope])
+    bridge.collector = SimpleNamespace(work_coordinator_continuity_secret="hub-secret")
+    run_key = "a" * 64
+    binding = bridge._work_coordinator_binding(
+        run_key,
+        "work",
+        "local://goal-local/33",
+        scope.goal_id,
+        expected_effect_artifact="local-file:.drover-native-canary/source-task-33.json",
+        local_candidate_number=33,
+    )
+    bridge.collector.work_control = SimpleNamespace(
+        store=SimpleNamespace(
+            links=lambda *, run_key: [
+                {
+                    "run_key": run_key,
+                    "goal_id": scope.goal_id,
+                    "run_role": "work",
+                    "item_number": 33,
+                    "item_url": "local://goal-local/33",
+                    "work_coordinator_binding_json": json.dumps(binding),
+                }
+            ]
+        )
+    )
+
+    recovered = bridge._recovery_payload(run_key, {"harness": "codex"})
+
+    assert recovered["work_coordinator_continuity"] == binding
+    assert (
+        recovered["work_coordinator_continuity"]["expected_effect_artifact"]
+        == "local-file:.drover-native-canary/source-task-33.json"
+    )
+
+
 def test_deployment_selector_refuses_recovery_without_existing_signed_session(tmp_path):
     """A lost create response cannot recompute deployment authority from config."""
     path = tmp_path / "candidates.json"
