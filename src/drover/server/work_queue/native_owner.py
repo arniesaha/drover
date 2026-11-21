@@ -1381,6 +1381,13 @@ class NativeOwnerRunner:
             if not self._recover_session(scope, run_id):
                 return False
             session_id = None
+        # A completed claim only proves that its exact prior wake settled.  It
+        # does not reserve the reusable structured session against a different
+        # turn already accepted by harnessd.  Checking that host-local turn
+        # state before ``consume`` keeps this wake pending rather than spending
+        # a delivery attempt on a submit that the shared owner must reject.
+        if session_id is not None and not self._owner_session_turn_idle(session_id):
+            return False
         status = self.continuity.status(run_id)
         if not self._expected_effect_materialized(status):
             return False

@@ -785,6 +785,96 @@ def test_shared_owner_busy_turn_does_not_spend_second_terminal_wake(tmp_path, ac
     }
 
 
+def test_shared_owner_active_turn_after_prior_claim_settles_keeps_final_wake_pending(
+    tmp_path,
+):
+    """A host-confirmed live shared turn must block consume after an old claim settles.
+
+    The durable claim can be completed after its exact wake is acknowledged while
+    harnessd has already accepted another turn on that reusable owner.  That
+    second turn has no claim for this runner to observe, so the host state is
+    the final admission guard before ``consume`` spends a terminal delivery.
+    """
+    runner, collector, store, first_run, _ = _runner(tmp_path, event_kind="worker_done")
+    scope = runner.config.goals[0]
+    owner_id = scope.continuity_owner_id
+
+    assert runner.process_once() == 1
+    first_wake = _acknowledge_current_wake(store, first_run, owner_id)
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    first_turn = collector.turn_attempts[0][1]["client_turn_id"]
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={
+            "payload": {
+                "turn_id": first_turn,
+                "turn_complete": True,
+                "awaiting": "input",
+            }
+        },
+    )
+    assert runner.process_once() == 0
+    with control_plane_connection(runner.path) as con:
+        [first_state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake],
+        ).fetchone()
+    assert first_state == "completed"
+
+    runner.registry.create_session(
+        session_id="observer-session-two",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/project-two",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-second@1",
+    )
+    second_run = store.initialize(
+        session_id="observer-session-two",
+        objective="Native continuity two",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    second_wake = store.report(
+        second_run,
+        source="hub",
+        source_event_id="done-2",
+        subject="worker-2",
+        sequence=1,
+        kind="worker_done",
+        summary="done",
+    )
+
+    # This models a different already-accepted turn on the one reusable owner
+    # after the first claim has settled.  No second runner claim exists to
+    # block the pre-consume check.
+    collector.turn_active = True
+    assert runner.process_once() == 0
+    event = store.status(second_run)["events"][0]
+    assert {key: event[key] for key in ("event_id", "state", "attempts")} == {
+        "event_id": second_wake,
+        "state": "pending",
+        "attempts": 0,
+    }
+    assert len(collector.turn_attempts) == 1
+
+    collector.turn_active = False
+    assert runner.process_once() == 1
+    delivered = store.status(second_run)["events"][0]
+    assert {key: delivered[key] for key in ("event_id", "state", "attempts")} == {
+        "event_id": second_wake,
+        "state": "delivered",
+        "attempts": 1,
+    }
+    assert len(collector.turn_attempts) == 2
+
+
 def test_active_claim_ignores_prior_failed_session_turn_until_exact_ack(tmp_path):
     """A stale session result must not fence the current submitted owner wake."""
     runner, collector, store, run_id, _ = _runner(tmp_path)
