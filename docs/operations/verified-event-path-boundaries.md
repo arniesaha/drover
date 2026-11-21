@@ -208,9 +208,9 @@ Authority scopes enforce strict limits on worker and coordinator capabilities:
    (`item.publish: true`).
 3. **Merge Gate**: Merging to `main` requires exact-head green CI and no
    unanswered automation gates (`automation_gate: "none"`).
-4. **Configured Hard Stops**: Critical operations—production state/config
+4. **Configured Hard Stops**: Critical operations - production state/config
    changes, gateway restarts, data deletion, financial transactions, and public
-   release signing—remain governed by explicit authorization and policy gates
+   release signing - remain governed by explicit authorization and policy gates
    and cannot be automated without authorized credentials and scope.
 
 ## 4. Available Event and Status Visibility
