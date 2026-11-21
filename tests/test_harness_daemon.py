@@ -807,6 +807,21 @@ def test_structured_session_get_exposes_live_turn_activity(tmp_path):
         assert _fetch_session(base_url, "session-1")["turn_active"] is True
         fake.busy = False
         assert _fetch_session(base_url, "session-1")["turn_active"] is False
+        # A durable row alone cannot claim host-idle after the structured
+        # manager lost it; the hub must retain its submitted claim.
+        state.registry.create_session(
+            session_id="unknown-manager-session",
+            host_id=state.host_id,
+            harness="codex",
+            command="codex",
+            status="running",
+            cwd=str(tmp_path),
+            mode="structured",
+        )
+        fake.closed.add("unknown-manager-session")
+        assert (
+            _fetch_session(base_url, "unknown-manager-session")["turn_active"] is None
+        )
     finally:
         state.pty.close_all()
         server.shutdown()
@@ -3518,7 +3533,11 @@ def test_harnessd_listing_merges_pty_registry_and_manager_only_sessions(tmp_path
             cwd=str(tmp_path),
             mode="structured",
         )
+        # Model a genuine in-memory-only entry. A registry row by itself is
+        # unknown, while an entry the manager owns has a live busy reading.
         state.structured.session_ids = lambda: ["manager-only"]  # type: ignore[method-assign]
+        state.structured.has = lambda session_id: session_id == "manager-only"  # type: ignore[method-assign]
+        state.structured.is_busy = lambda session_id: False  # type: ignore[method-assign]
 
         status, inventory = _json_request(f"{base_url}/sessions")
         assert status == 200
@@ -3539,16 +3558,20 @@ def test_harnessd_listing_merges_pty_registry_and_manager_only_sessions(tmp_path
         assert by_id[pty_id]["awaiting"] == pty_row.awaiting
         assert by_id[pty_id]["model"] == pty_row.model
         assert by_id[pty_id]["thinking_effort"] == pty_row.thinking_effort
+        assert "turn_active" not in by_id[pty_id]
 
         for session_id in ("structured-0", "structured-1", "structured-2"):
             expected = _expected_structured_json(state.registry.get_session(session_id))
             assert by_id[session_id] == expected
             assert expected["status"] == "terminated"
 
-        # The manager-only id still resolves through the per-id lookup.
-        assert by_id["manager-only"] == _expected_structured_json(
+        # The manager-only id still resolves through the per-id lookup and
+        # has an explicit host-backed idle state. Registry-only rows above do
+        # not claim a live structured-turn state.
+        manager_expected = _expected_structured_json(
             state.registry.get_session("manager-only")
-        )
+        ) | {"turn_active": False}
+        assert by_id["manager-only"] == manager_expected
         assert by_id["manager-only"]["status"] == "running"
     finally:
         state.pty.close_all()
