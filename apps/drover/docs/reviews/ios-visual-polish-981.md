@@ -133,3 +133,17 @@ The final targeted run remained **68/68 passed** at
 It covers the foreground store contract, the background response contract,
 partial visible-action notify/dedupe with no cleanup, complete empty-result
 cleanup, workspace isolation, and changing-heartbeat replay suppression.
+
+### Owner integration correction: persisted receipts
+
+After the final worker round, owner reproduced complete A,B -> partial A ->
+complete A,B replaying unchanged B. The new focused regression failed before
+the fix (including complete-empty receipt retirement) and passed after it.
+Partial polls now union visible source IDs with existing receipts; only an
+authoritative complete workspace response replaces receipts, including an
+empty complete result. Other workspaces are unchanged.
+
+Owner focused notification lifecycle suite: **69/69 passed**. Evidence:
+`/Users/arnab/scratch/drover-ios-981-worker/owner-partial-receipts-before.log`
+and `owner-partial-receipts-after.log`. This does not establish physical APNs
+or resolve the documented missing local-fallback transition identity.

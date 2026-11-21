@@ -278,9 +278,14 @@ public enum WorkAttentionNotifications {
         await notifier.clearResolvedWorkAttention(
             activeRefs: activeRefs, workspaceIDs: resolvedWorkspaceIDs
         )
-        for (workspace, rows) in groups {
+        for workspace in Set(groups.keys).union(resolvedWorkspaceIDs) {
+            let rows = groups[workspace] ?? []
             let seen = Set(defaults.stringArray(forKey: key(workspace)) ?? [])
-            defaults.set(rows.map(\.id), forKey: key(workspace))
+            let visible = Set(rows.map(\.id))
+            // Only authoritative responses may retire omitted receipts. A
+            // partial poll must not make unchanged actions alert on reappearance.
+            let retained = resolvedWorkspaceIDs.contains(workspace) ? visible : seen.union(visible)
+            defaults.set(Array(retained), forKey: key(workspace))
             for row in rows where !seen.contains(row.id) {
                 guard let notification = notification(for: row, workspaceID: workspace) else { continue }
                 await notifier.notify(attention: notification)

@@ -285,6 +285,42 @@ struct WorkAttentionTests {
         })
     }
 
+    @Test func partialResponsesPreserveOmittedReceiptsUntilAuthoritativeResolution() async throws {
+        let suite = "work-attention-partial-receipts-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let notifier = AttentionSpy()
+        let complete = try attentionResponse([
+            attentionItemJSON(kind: "agent_question", id: "A"),
+            attentionItemJSON(kind: "environment_approval", id: "B")
+        ])
+        let partial = try attentionResponse([
+            attentionItemJSON(kind: "agent_question", id: "A")
+        ], truncated: true)
+        for response in [complete, partial, complete] {
+            await WorkAttentionNotifications.evaluate(
+                response.items, resolvedWorkspaceIDs: response.resolvedWorkspaceIDs,
+                notifier: notifier, defaults: defaults
+            )
+        }
+        #expect(await notifier.notifications.map(\.ref.id).sorted() == ["A", "B"])
+        WorkAttentionNotifications.markSeen(
+            WorkAttentionRef(workspaceID: "other", id: "other-action"), defaults: defaults
+        )
+        let empty = try attentionResponse([])
+        await WorkAttentionNotifications.evaluate(
+            empty.items, resolvedWorkspaceIDs: empty.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        #expect(defaults.stringArray(forKey: "drover.work.seen.workspace") == [])
+        #expect(defaults.stringArray(forKey: "drover.work.seen.other") == ["other-action"])
+        await WorkAttentionNotifications.evaluate(
+            complete.items, resolvedWorkspaceIDs: complete.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        #expect(await notifier.count == 4)
+    }
+
     @Test func onlyCompleteWorkspaceResponsesClearAbsentWorkAlerts() async throws {
         let suite = "work-attention-cleanup-\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
