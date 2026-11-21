@@ -326,10 +326,10 @@ public struct AttentionWatcher: Sendable {
     /// the alert distinguishable without revealing task content.
     private static func harnessLabel(_ session: SessionSummary) -> String {
         switch session.harness.lowercased().replacingOccurrences(of: "_", with: "-") {
-        case "codex": "Codex"
-        case "claude", "claude-code": "Claude Code"
-        case "gemini": "Gemini"
-        case "opencode": "OpenCode"
+        case "codex": "Codex"  // harness-name: display-only notification label, not a control
+        case "claude", "claude-code": "Claude Code"  // harness-name: display-only notification label, not a control
+        case "gemini": "Gemini"  // harness-name: display-only notification label, not a control
+        case "opencode": "OpenCode"  // harness-name: display-only notification label, not a control
         default: "Coding agent"
         }
     }
