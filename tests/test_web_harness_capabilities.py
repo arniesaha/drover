@@ -111,7 +111,14 @@ def test_provider_controls_follow_their_matrices():
     out = _js(
         {
             name: f"pick(C.harnessControls(host('mac-mini'), '{name}'), {keys})"
-            for name in ("claude-code", "codex", "agy", "cursor", "deepseek-harness", "shell")
+            for name in (
+                "claude-code",
+                "codex",
+                "agy",
+                "cursor",
+                "deepseek-harness",
+                "shell",
+            )
         }
     )
     images = ["image/gif", "image/jpeg", "image/png", "image/webp"]
