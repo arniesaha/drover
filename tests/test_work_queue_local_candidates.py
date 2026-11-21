@@ -1660,6 +1660,74 @@ def test_completed_local_candidate_uses_goal_estimate_not_worker_metadata(
     assert captured["estimated_cost"] == scope.execution_estimated_cost
 
 
+def test_host_bound_committed_completion_rejects_human_and_other_host(
+    tmp_path, pg_control_path
+):
+    """Only the assigned non-human host may request its signed verifier."""
+    scope, _provider, _harness, service, _worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path
+    )
+
+    for actor, message in (
+        (
+            WorkActor("credential:other-host", "worker", host_id="other-host"),
+            "execution reporting credential required",
+        ),
+        (
+            WorkActor("credential:device", "worker", human=True, host_id="host"),
+            "coordinator required",
+        ),
+    ):
+        with pytest.raises(PermissionError, match=message):
+            service.update(scope.goal_id, 1, work["run_key"], "complete", actor=actor)
+    host_actor = WorkActor("credential:host", "worker", host_id="host")
+    with pytest.raises(PermissionError, match="execution outside item"):
+        service.update(scope.goal_id, 1, "a" * 64, "complete", actor=host_actor)
+    assert not service.store.events(identity(work["run_key"], "complete", None))
+
+
+@pytest.mark.parametrize("provenance", [False, None], ids=["marker-only", "unknown"])
+def test_host_bound_completion_requires_immutable_committed_provenance(
+    tmp_path, pg_control_path, provenance
+):
+    """A bound host cannot choose a verifier for marker-only or legacy work."""
+    scope, _provider, _harness, service, _worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path, committed_provenance=provenance
+    )
+
+    with pytest.raises(PermissionError, match="coordinator required"):
+        service.update(
+            scope.goal_id,
+            1,
+            work["run_key"],
+            "complete",
+            actor=WorkActor("credential:host", "worker", host_id="host"),
+        )
+    assert not service.store.events(identity(work["run_key"], "complete", None))
+
+
+def test_host_bound_completion_cannot_directly_launch_terminal_verifier(
+    tmp_path, pg_control_path
+):
+    """Only queue reconciliation may launch the separate verifier."""
+    scope, _provider, harness, service, _worker, work = _deferred_completion_service(
+        tmp_path, pg_control_path
+    )
+    harness.sessions[work["run_key"]].status = "completed"
+    harness.sessions[work["run_key"]].turn_finished = True
+
+    with pytest.raises(PermissionError, match="coordinator required"):
+        service.update(
+            scope.goal_id,
+            1,
+            work["run_key"],
+            "complete",
+            actor=WorkActor("credential:host", "worker", host_id="host"),
+        )
+    assert len(harness.launches) == 1
+    assert not service.store.events(identity(work["run_key"], "complete", None))
+
+
 def test_queue_worker_defers_bound_completion_until_terminal_then_launches_verify(
     tmp_path, pg_control_path
 ):
