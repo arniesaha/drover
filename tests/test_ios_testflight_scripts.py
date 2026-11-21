@@ -778,6 +778,30 @@ def test_widget_ipa_accepts_matching_metadata(chain):
     assert "metadata verified" in result.stdout
 
 
+@pytest.mark.parametrize(
+    "ats",
+    [None, {}, {"NSAllowsArbitraryLoads": True}, {"NSAllowsLocalNetworking": False}],
+)
+def test_widget_ipa_rejects_non_local_ats(chain, ats):
+    root, run, _, _, _ = chain
+    path = root / "fixture/Drover.app/PlugIns/DroverWidget.appex/Info.plist"
+    info = plistlib.loads(path.read_bytes())
+    if ats is None:
+        info.pop("NSAppTransportSecurity")
+    else:
+        info["NSAppTransportSecurity"] = ats
+    path.write_bytes(plistlib.dumps(info))
+    result = run(
+        "verify_widget_ipa.sh",
+        "--ipa",
+        root / "fixture.ipa",
+        "--expected-profile-uuid",
+        WIDGET_ISSUER,
+    )
+    assert result.returncode != 0
+    assert "NSAppTransportSecurity" in result.stderr
+
+
 def test_widget_ipa_rejects_missing_app_icon(chain):
     root, run, _, _, _ = chain
     path = root / "fixture/Drover.app/Info.plist"

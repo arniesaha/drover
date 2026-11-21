@@ -163,11 +163,20 @@ targets:
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: DroverWidget/DroverWidget.entitlements
         GENERATE_INFOPLIST_FILE: YES
+        # The widget fetches from the paired hub with the same DroverClient as
+        # the app, so it carries the same ATS policy: Debug keeps the broad
+        # fixture exception, Release and StoreRelease declare local networking
+        # only. See the app target's "Prepare typed ATS metadata" phase.
+        INFOPLIST_FILE: "$(DERIVED_FILE_DIR)/DroverWidget-Info.plist"
+        DROVER_ATS_MODE: arbitrary
         CURRENT_PROJECT_VERSION: 1
         MARKETING_VERSION: "0.1.0"
         SWIFT_VERSION: 6.0
       configs:
+        Release:
+          DROVER_ATS_MODE: local
         StoreRelease:
+          DROVER_ATS_MODE: local
           CODE_SIGN_ENTITLEMENTS: DroverWidget/DroverWidget-AppStore.entitlements
           CODE_SIGN_STYLE: "$(DROVER_CODE_SIGN_STYLE)"
           DEVELOPMENT_TEAM: "$(DROVER_DEVELOPMENT_TEAM)"
@@ -190,6 +199,33 @@ targets:
         NSLocalNetworkUsageDescription: >-
           Drover connects to your Drover server on your local network to
           manage agent sessions.
+    preBuildScripts:
+      - name: Prepare typed widget ATS metadata
+        # Same contract as the app target: Release/StoreRelease artifacts must
+        # never ship NSAllowsArbitraryLoads (App Review), only local networking.
+        script: |
+          set -eu
+          case "$DROVER_ATS_MODE" in
+            arbitrary)
+              ats_key=NSAllowsArbitraryLoads
+              ;;
+            local)
+              ats_key=NSAllowsLocalNetworking
+              ;;
+            *) echo "DROVER_ATS_MODE must be arbitrary or local" >&2; exit 1 ;;
+          esac
+          /bin/cp "$SRCROOT/DroverWidget/Info.plist" "$DERIVED_FILE_DIR/DroverWidget-Info.plist"
+          /usr/bin/plutil -remove NSAppTransportSecurity.NSAllowsArbitraryLoads \
+            "$DERIVED_FILE_DIR/DroverWidget-Info.plist" 2>/dev/null || true
+          /usr/bin/plutil -remove NSAppTransportSecurity.NSAllowsLocalNetworking \
+            "$DERIVED_FILE_DIR/DroverWidget-Info.plist" 2>/dev/null || true
+          /usr/bin/plutil -insert "NSAppTransportSecurity.$ats_key" -bool true \
+            "$DERIVED_FILE_DIR/DroverWidget-Info.plist"
+        inputFiles:
+          - "$(SRCROOT)/DroverWidget/Info.plist"
+        outputFiles:
+          - "$(DERIVED_FILE_DIR)/DroverWidget-Info.plist"
+        basedOnDependencyAnalysis: false
   DroverTests:
     type: bundle.unit-test
     platform: iOS
