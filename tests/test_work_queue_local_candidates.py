@@ -113,6 +113,94 @@ def test_local_candidate_effect_reference_is_explicit_and_bounded(tmp_path):
             provider.authenticate()
 
 
+def test_bridge_refuses_known_coordinator_session_without_immutable_ledger(monkeypatch):
+    """A live daemon row cannot replace the signed coordinator binding."""
+    from drover.server.harness.continuity import FactoryObserverContinuity
+
+    run_key = "orphaned-local-run"
+    session = SimpleNamespace(
+        session_id="harness-orphaned-local",
+        client_session_id=run_key,
+        status="running",
+        host_id="studio",
+        handoff_mode="work_coordinator",
+    )
+    calls = []
+    bridge = object.__new__(HarnessBridge)
+    bridge.registry = SimpleNamespace(
+        session_by_client_id=lambda key: session if key == run_key else None,
+        list_hosts=lambda: [
+            SimpleNamespace(
+                host_id="studio", liveness=lambda: SimpleNamespace(usable=True)
+            )
+        ],
+    )
+    bridge.collector = SimpleNamespace(
+        duckdb_path="unused-control-store",
+        _harness_request=lambda host, path, **kwargs: (
+            calls.append((host.host_id, path))
+            or (
+                200,
+                json.dumps(
+                    {
+                        "sessions": [
+                            {
+                                "session_id": session.session_id,
+                                "client_session_id": run_key,
+                                "status": "running",
+                            }
+                        ]
+                    }
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        FactoryObserverContinuity,
+        "status",
+        lambda *_: (_ for _ in ()).throw(KeyError("missing signed ledger")),
+    )
+
+    with pytest.raises(WorkDenied, match="continuity is unavailable"):
+        bridge.resolve(run_key)
+
+    assert calls == [("studio", "/sessions?client_session_id=" + run_key)]
+
+
+def test_bridge_reuses_known_coordinator_only_when_ledger_matches_session(monkeypatch):
+    from drover.server.harness.continuity import FactoryObserverContinuity
+
+    run_key = "bound-local-run"
+    session = SimpleNamespace(
+        session_id="harness-bound-local",
+        client_session_id=run_key,
+        status="running",
+        host_id="studio",
+        handoff_mode="work_coordinator",
+    )
+    bridge = object.__new__(HarnessBridge)
+    bridge.registry = SimpleNamespace(
+        session_by_client_id=lambda key: session if key == run_key else None,
+        list_hosts=lambda: [],
+    )
+    bridge.collector = SimpleNamespace(duckdb_path="unused-control-store")
+    monkeypatch.setattr(
+        FactoryObserverContinuity,
+        "status",
+        lambda *_: {"session_id": session.session_id, "worker_state": "running"},
+    )
+
+    assert bridge.resolve(run_key) is session
+
+    monkeypatch.setattr(
+        FactoryObserverContinuity,
+        "status",
+        lambda *_: {"session_id": "different-session", "worker_state": "running"},
+    )
+    with pytest.raises(WorkDenied, match="continuity is unavailable"):
+        bridge.resolve(run_key)
+
+
 def test_bridge_terminal_work_done_requires_bound_done_projection(monkeypatch):
     from drover.server.harness.continuity import FactoryObserverContinuity
 
