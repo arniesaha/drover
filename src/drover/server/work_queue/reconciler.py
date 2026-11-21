@@ -280,6 +280,16 @@ class QueueExecutionWorker:
                     # durable intent. A bad status read must not stop other
                     # ready candidates or become a generic retry.
                     log.exception("work queue typed worker recovery failed")
+            elif candidate["kind"] == "verify_candidate":
+                try:
+                    self.service.advance_deferred_verification(
+                        candidate["goal_id"], candidate["number"]
+                    )
+                except Exception:
+                    # A terminal verifier report is independently fenced by
+                    # its signed parent and exact verifier turn. Do not let an
+                    # unavailable readback turn into a caller-driven close.
+                    log.exception("work queue deferred verification failed")
 
     def start(self, shutdown_event=None):
         if self._thread is not None:

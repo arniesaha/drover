@@ -638,6 +638,29 @@ class WorkService:
             return None
         return value if isinstance(value, bool) else None
 
+    def _bound_host_verification_report(self, scope, row, run_key, session, actor):
+        """Allow only a bound verifier to defer its own terminal acceptance.
+
+        The parent work link carries the immutable committed-provenance bit.
+        A verifier's mutable prompt, goal configuration, or host role cannot
+        reconstruct that authority after launch.
+        """
+        if (
+            scope.candidate_source != "local_file"
+            or row["run_role"] != "verify"
+            or session is None
+            or session.status != "running"
+            or actor.human
+            or not actor.host_id
+            or actor.host_id != session.host_id
+        ):
+            return False
+        parent = self._work_parent(
+            links=self.store.links(goal_id=scope.goal_id, number=row["item_number"]),
+            row=row,
+        )
+        return parent is not None and self._signed_committed_provenance(parent) is True
+
     def _verification_request(self, goal_id, number, row, item):
         request = identity(row["run_key"], "verify", item.get("body"))
         return request, identity(
@@ -747,6 +770,60 @@ class WorkService:
             )
             return verification
 
+    def advance_deferred_verification(self, goal_id, number):
+        """Accept one bound verifier report after its exact turn succeeds.
+
+        This internal reconciliation is the verifier counterpart to
+        :meth:`advance_deferred_completion`: the verifier can report a passed
+        check while its structured turn is active, but it cannot self-accept.
+        """
+        with self.lock:
+            scope, provider, policy, ref = self.scope(goal_id, number)
+            if scope.candidate_source != "local_file":
+                return None
+            item = self.checked(scope, policy, provider.get_item(ref))
+            links = self.store.links(goal_id=goal_id, number=number)
+            verify_links = [link for link in links if link["run_role"] == "verify"]
+            if not verify_links:
+                return None
+            row = verify_links[-1]
+            key = identity(row["run_key"], "verified", None)
+            events = self.store.events(key)
+            if (
+                len(events) != 1
+                or events[0]["event_kind"] != "intent"
+                or events[0]["action_category"] != "verified"
+                or not events[0]["provider_operation_id"]
+            ):
+                return None
+            parent = self._work_parent(links=links, row=row)
+            if parent is None or self._signed_committed_provenance(parent) is not True:
+                return None
+            terminal_done = getattr(self.harness, "terminal_work_done", None)
+            if not callable(terminal_done) or terminal_done(row["run_key"]) is not True:
+                return None
+            expected = identity(
+                self.config.workspace_id,
+                goal_id,
+                number,
+                identity(parent, "verify", item.get("body")),
+                "verify",
+            )
+            if row["run_key"] != expected:
+                return None
+            provider.close(ref)
+            self.store.event(
+                "control:queue-execution",
+                ref,
+                key,
+                "outcome",
+                "verified",
+                outcome="verified",
+                operation_id=events[0]["provider_operation_id"],
+                link_id=row["id"],
+            )
+            return {"outcome": "verified"}
+
     def update(
         self,
         goal_id,
@@ -768,16 +845,18 @@ class WorkService:
             or rows[0]["item_number"] != number
         ):
             raise PermissionError("execution outside item")
-        if actor.role != policy.authority.coordinator:
-            session = self.harness.resolve(run_key)
-            if (
-                action == "verified"
-                or not actor.host_id
-                or not session
-                or session.host_id != actor.host_id
-            ):
-                raise PermissionError("execution reporting credential required")
         row = rows[0]
+        scope = next(scope for scope in self.config.goals if scope.goal_id == goal_id)
+        session = self.harness.resolve(run_key)
+        bound_host_verification = self._bound_host_verification_report(
+            scope, row, run_key, session, actor
+        )
+        if actor.role != policy.authority.coordinator:
+            if action == "verified":
+                if not bound_host_verification:
+                    raise PermissionError("execution reporting credential required")
+            elif not actor.host_id or not session or session.host_id != actor.host_id:
+                raise PermissionError("execution reporting credential required")
         if evidence_key is not None:
             code(evidence_key)
         key = identity(run_key, action, evidence_key if action == "progress" else None)
@@ -785,14 +864,13 @@ class WorkService:
         if any(e["event_kind"] == "outcome" for e in events):
             return {"outcome": events[-1]["outcome"]}
         if events:
-            if action == "complete" and all(
-                event["event_kind"] == "intent"
-                and event["action_category"] == "complete"
+            if action in {"complete", "verified"} and all(
+                event["event_kind"] == "intent" and event["action_category"] == action
                 for event in events
             ):
-                # The worker already asked for a terminal-only verification
-                # successor. Repeating that request must not create a second
-                # intent or launch while its turn is still active.
+                # A bound worker or verifier already requested its terminal
+                # successor/acceptance. Repeating that request cannot create a
+                # second launch, receipt, or provider action while its turn is active.
                 return {"outcome": "deferred"}
             raise WorkDenied("provider operation uncertain; inspection required")
         if item["state"] != "open":
@@ -803,9 +881,6 @@ class WorkService:
             session = self.harness.resolve(run_key)
             if session is None:
                 raise ValueError("work session must complete before verification")
-            scope = next(
-                scope for scope in self.config.goals if scope.goal_id == goal_id
-            )
             # A bound host may request only its own immutable, signed local
             # candidate verifier. Every other completion stays coordinator-only.
             bound_host_completion = (
@@ -881,9 +956,6 @@ class WorkService:
                     "successful behavioral evidence and rerun checks required"
                 )
             code(evidence_key)
-            session = self.harness.resolve(run_key)
-            if session is None or session.status != "completed":
-                raise ValueError("verification session must complete before acceptance")
             # Criteria changes invalidate this verification's stable identity.
             expected = identity(
                 self.config.workspace_id,
@@ -902,7 +974,32 @@ class WorkService:
                 raise ValueError(
                     "acceptance criteria changed; new verification required"
                 )
-        self.store.event(actor.principal, ref, key, "intent", action, link_id=row["id"])
+            if bound_host_verification:
+                # The bound verifier may report its own completed behavioral
+                # check, but its running turn cannot close an item. Queue
+                # reconciliation rechecks this exact terminal turn before it
+                # accepts the report below.
+                self.store.event(
+                    actor.principal,
+                    ref,
+                    key,
+                    "intent",
+                    action,
+                    operation_id=evidence_key,
+                    link_id=row["id"],
+                )
+                return {"outcome": "deferred"}
+            if session is None or session.status != "completed":
+                raise ValueError("verification session must complete before acceptance")
+        self.store.event(
+            actor.principal,
+            ref,
+            key,
+            "intent",
+            action,
+            operation_id=evidence_key if action == "verified" else None,
+            link_id=row["id"],
+        )
         if action == "verified":
             provider.close(ref)
         elif action == "failed":

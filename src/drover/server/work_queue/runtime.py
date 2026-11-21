@@ -714,7 +714,13 @@ class HarnessBridge:
                     "worktree, including the bound effect. Re-run the stated "
                     "focused check there. Do not create, replace, or force an "
                     "expected effect or implementation artifact; a missing or "
-                    "changed parent artifact is a verification failure."
+                    "changed parent artifact is a verification failure. Regardless "
+                    "of task-body wording, do not request `drover_work_update(action=complete)`: "
+                    "only the work role can request a verifier. After a successful "
+                    "rerun, report the stable check evidence with "
+                    "`drover_work_update(action=verified, evidence_key=...)`, then "
+                    "finish this structured turn. The queue accepts that report only "
+                    "after this exact verifier turn terminates successfully."
                 )
         payload = {
             "cwd": cwd,

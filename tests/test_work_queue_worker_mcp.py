@@ -109,6 +109,37 @@ def test_bound_completion_drops_nonsemantic_metadata_but_progress_keeps_it(
     ]
 
 
+def test_bound_verifier_forwards_only_a_successful_evidence_report(monkeypatch):
+    bound = BoundWorkControl("http://127.0.0.1:28180", "private", "a" * 32, "goal", 1)
+    calls = []
+
+    def call(_self, operation, args):
+        calls.append((operation, args))
+        return {"outcome": "deferred"}
+
+    monkeypatch.setattr(BoundWorkControl, "_call", call)
+    with pytest.raises(BoundWorkError, match="evidence"):
+        bound.update("verified")
+    assert bound.update("verified", evidence_key="check:focused-pass") == {
+        "outcome": "deferred"
+    }
+    assert calls == [
+        (
+            "update",
+            {
+                "goal_id": "goal",
+                "number": 1,
+                "run_key": "a" * 32,
+                "action": "verified",
+                "evidence_key": "check:focused-pass",
+                "estimated_cost": None,
+                "behavioral_passed": True,
+                "checks_rerun": True,
+            },
+        )
+    ]
+
+
 def test_bound_stdio_worker_rejects_missing_or_cross_scope_configuration():
     with pytest.raises(BoundWorkError):
         BoundWorkControl.from_environment({})
