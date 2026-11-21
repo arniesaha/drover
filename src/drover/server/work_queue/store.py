@@ -91,6 +91,36 @@ class WorkStore:
             )
         return self.links(run_key=run_key)[0]
 
+    def bind_work_coordinator_launch(self, run_key, binding):
+        """Persist one signed coordinator envelope before the daemon POST.
+
+        A repeat may only use byte-identical signed authority.  Legacy links
+        remain NULL and therefore fail closed during local-candidate recovery.
+        """
+        if not isinstance(binding, dict):
+            raise ValueError("work coordinator binding must be an object")
+        encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+        with self.connection() as con:
+            row = con.execute(
+                """UPDATE execution_links
+                   SET work_coordinator_binding_json = COALESCE(
+                         work_coordinator_binding_json, ?), updated_at = now()
+                 WHERE workspace_id = ? AND run_key = ?
+                   AND (work_coordinator_binding_json IS NULL
+                        OR work_coordinator_binding_json = ?)
+                 RETURNING work_coordinator_binding_json""",
+                [encoded, self.workspace_id, run_key, encoded],
+            ).fetchone()
+        if row is None:
+            raise ValueError("work coordinator launch binding conflict")
+        try:
+            persisted = json.loads(row[0])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored work coordinator binding is invalid") from exc
+        if not isinstance(persisted, dict):
+            raise ValueError("stored work coordinator binding is invalid")
+        return persisted
+
     def associate(self, run_key, session_id, pr_ref=None):
         with self.connection() as con:
             con.execute(

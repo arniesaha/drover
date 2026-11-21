@@ -278,6 +278,60 @@ def test_native_owner_standard_queued_issue_does_not_claim_integration_reservati
     ]
 
 
+def test_ambiguous_create_recovers_only_the_precommitted_signed_binding(
+    launch_path, monkeypatch
+):
+    """A lost create reply cannot make local authority depend on current input."""
+    service, bridge, registry, _provider, harnessd = launch_path
+    request_key = "ambiguous-signed-create"
+    run_key = identity(service.config.workspace_id, "launch", 866, request_key, "work")
+    observed = []
+    original_create = bridge.collector.proxy_create_harness_session
+
+    def lost_reply(host, payload):
+        observed.append(payload)
+        return 503, '{"error":"reply lost"}'
+
+    monkeypatch.setattr(bridge.collector, "proxy_create_harness_session", lost_reply)
+    with pytest.raises(WorkDenied, match="launch uncertain"):
+        service.launch(
+            "launch",
+            866,
+            request_key,
+            5,
+            actor=WorkActor("control:queue-execution", "nix"),
+        )
+
+    link = service.store.links(run_key=run_key)[0]
+    assert link["session_id"] is None
+    assert (
+        json.loads(link["work_coordinator_binding_json"])
+        == observed[0]["work_coordinator_continuity"]
+    )
+
+    # The daemon accepted the original request even though its reply was lost.
+    # Recovery reads the persisted signature; it neither posts a second turn
+    # nor rebuilds the authority from provider/configuration state.
+    harnessd.sessions["ambiguous-session"] = {
+        "session_id": "ambiguous-session",
+        "client_session_id": run_key,
+        "harness": "codex",
+        "mode": "structured",
+        "status": "running",
+        "cwd": "/repo/drover",
+    }
+    monkeypatch.setattr(
+        bridge.collector, "proxy_create_harness_session", original_create
+    )
+    session = bridge.resolve(run_key)
+
+    assert session and session.session_id == "ambiguous-session"
+    assert not harnessd.requests
+    status = FactoryObserverContinuity(service.store.path).status("work-" + run_key)
+    assert status["session_id"] == "ambiguous-session"
+    assert status["events"][0]["report"]["kind"] == "worker_started"
+
+
 def test_native_owner_explicit_integration_label_claims_configured_reservation(
     launch_path,
 ):

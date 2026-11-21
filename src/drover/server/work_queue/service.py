@@ -527,10 +527,31 @@ class WorkService:
             raise PermissionError("parent session outside workspace")
         scope = next(g for g in self.config.goals if g.goal_id == goal_id)
         goal_ref = scope.goal_label or f"milestone:{scope.milestone}"
+        authority = {
+            "labels": item.get("operator_authority_labels", []),
+            "body": item.get("body"),
+            "local_candidate_number": number,
+            "local_candidate_cwd": scope.local_candidate_worktrees.get(str(number)),
+            "expected_effect_artifact": item.get("expected_effect_artifact"),
+        }
+        prepare_binding = getattr(
+            self.harness, "prepare_work_coordinator_binding", None
+        )
+        binding = (
+            prepare_binding(run_key, run_role, ref, goal_id, authority=authority)
+            if callable(prepare_binding)
+            else None
+        )
         row = self.store.intent(
             actor.principal, ref, goal_id, run_key, run_role, failures, goal_ref
         )
-        # The intent is committed before this call. Any exception leaves it inspectable.
+        if binding is not None:
+            binding = self.store.bind_work_coordinator_launch(run_key, binding)
+        # The intent and, when applicable, its signed continuity envelope are
+        # committed before this call. Any exception leaves them inspectable.
+        launch_kwargs = {"authority": authority}
+        if binding is not None:
+            launch_kwargs["continuity_binding"] = binding
         session_id = self.harness.launch(
             host,
             harness,
@@ -539,13 +560,7 @@ class WorkService:
             run_role,
             parent_session_id,
             goal_id,
-            authority={
-                "labels": item.get("operator_authority_labels", []),
-                "body": item.get("body"),
-                "local_candidate_number": number,
-                "local_candidate_cwd": scope.local_candidate_worktrees.get(str(number)),
-                "expected_effect_artifact": item.get("expected_effect_artifact"),
-            },
+            **launch_kwargs,
         )
         linked = self.store.associate(row["run_key"], session_id)
         if run_role == "work":
