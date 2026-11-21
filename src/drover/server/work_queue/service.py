@@ -798,7 +798,6 @@ class WorkService:
         if item["state"] != "open":
             raise ValueError("item already closed")
         if action == "complete":
-            self.coordinator(actor, policy)
             if row["run_role"] != "work":
                 raise ValueError("verification needs behavioral result")
             session = self.harness.resolve(run_key)
@@ -807,6 +806,17 @@ class WorkService:
             scope = next(
                 scope for scope in self.config.goals if scope.goal_id == goal_id
             )
+            # A bound host may request only its own immutable, signed local
+            # candidate verifier. Every other completion stays coordinator-only.
+            bound_host_completion = (
+                scope.candidate_source == "local_file"
+                and self._signed_committed_provenance(run_key) is True
+                and session.status == "running"
+                and not actor.human
+                and actor.host_id == session.host_id
+            )
+            if not bound_host_completion:
+                self.coordinator(actor, policy)
             if scope.candidate_source == "local_file":
                 # The immutable signed binding, not mutable goal config or a
                 # worker body, decides whether this worker can create a verifier.

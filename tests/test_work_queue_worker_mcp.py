@@ -151,9 +151,9 @@ def test_bound_stdio_child_lists_tools_and_defers_through_existing_hub(
     host, host_token = credentials.issue(
         scope="host", label="synthetic host", host_id="host"
     )
-    service.config = service.config.model_copy(
-        update={"principal_roles": {"credential:" + host.id: "nix"}}
-    )
+    # The stdio child receives a host credential. It is not a coordinator:
+    # its authority is the immutable host/run binding from the launch.
+    assert service.config.principal_roles.get("credential:" + host.id) is None
     auth = AuthSettings(
         enabled=True, api_token="synthetic-legacy", credentials=credentials
     )
