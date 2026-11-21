@@ -94,6 +94,9 @@ machine and pair the browser with the one-time code printed by
 Xcode or phone is needed to start. To reach the hub from other devices, set
 `[server] advertised_url` to a private LAN or Tailscale address first.
 
+To look around before any host is connected, open
+`http://127.0.0.1:7080/ui/?fixture` for a read-only preview with sample data.
+
 Add another machine with the one-liner printed by
 `drover-server pair-host --name <host>`.
 
