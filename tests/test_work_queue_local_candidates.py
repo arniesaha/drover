@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -1196,6 +1197,101 @@ def test_candidate80_fixture_requires_signed_provenance_and_role_bound_review(
     )
     assert unsigned is not None and unsigned.committed_provenance is False
     assert "marker-only work run" in payloads[-1]["prompt"]
+
+
+def test_candidate80_offline_lineage_has_an_acyclic_hash_chain(tmp_path):
+    """The readonly verifier can recompute every upstream artifact without a hash cycle."""
+    fixture = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "docs"
+            / "operations"
+            / "fixtures"
+            / "native-canary-m3-candidate-80-substantive-lineage.json"
+        ).read_text(encoding="utf-8")
+    )
+    item = fixture["items"][0]
+    assert item["expected_effect_artifact"] == (
+        "local-file:.drover-native-canary/source-task-80.json"
+    )
+    assert "must not hash the final effect" in item["body"]
+    assert "required acyclic construction order" in item["body"]
+
+    parent = "a" * 40
+    upstream = {
+        ".drover-native-canary/m3-80-analysis.json": {
+            "candidate": 80,
+            "observed_requirement": "classify non-negative integers",
+        },
+        ".drover-native-canary/m3-80-implementation.json": {
+            "candidate": 80,
+            "source": "tests/fixtures/native_canary_m3_80.py",
+        },
+        ".drover-native-canary/m3-80-focused-tests.json": {
+            "command": "python3 tests/test_native_canary_m3_80.py",
+            "exit_status": 0,
+        },
+        "tests/fixtures/native_canary_m3_80.py": "def classify(values):\n    return values\n",
+        "tests/test_native_canary_m3_80.py": "from tests.fixtures.native_canary_m3_80 import classify\nassert classify([2]) == [2]\n",
+    }
+
+    def write(relative, value):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(value, dict):
+            path.write_text(
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            path.write_text(value, encoding="utf-8")
+        return path
+
+    def digest(relative):
+        return hashlib.sha256((tmp_path / relative).read_bytes()).hexdigest()
+
+    for relative, value in upstream.items():
+        write(relative, value)
+    request_path = ".drover-native-canary/m3-80-review-request.json"
+    request = {
+        "candidate": 80,
+        "parent_commit": parent,
+        "artifact_sha256": {relative: digest(relative) for relative in upstream},
+        "authorized_next_action": "verified",
+    }
+    write(request_path, request)
+    effect_path = ".drover-native-canary/source-task-80.json"
+    effect = {
+        "candidate": 80,
+        "parent_commit": parent,
+        "lineage_paths": [*upstream, request_path],
+        "review_request": request_path,
+        "review_request_sha256": digest(request_path),
+    }
+    write(effect_path, effect)
+
+    def valid_lineage():
+        review = json.loads((tmp_path / request_path).read_text(encoding="utf-8"))
+        final = json.loads((tmp_path / effect_path).read_text(encoding="utf-8"))
+        return (
+            review["candidate"] == final["candidate"] == 80
+            and review["parent_commit"] == final["parent_commit"] == parent
+            and set(review["artifact_sha256"]) == set(upstream)
+            and effect_path not in review["artifact_sha256"]
+            and all(
+                digest(relative) == expected
+                for relative, expected in review["artifact_sha256"].items()
+            )
+            and final["review_request"] == request_path
+            and final["review_request_sha256"] == digest(request_path)
+            and final["lineage_paths"] == [*upstream, request_path]
+        )
+
+    assert valid_lineage()
+    (tmp_path / "tests/fixtures/native_canary_m3_80.py").write_text(
+        "def classify(values):\n    return []\n", encoding="utf-8"
+    )
+    assert not valid_lineage()
 
 
 def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_path):

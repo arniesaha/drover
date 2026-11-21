@@ -120,7 +120,9 @@ selector, deployment selector, integration key, cap, and budget unchanged.
 
 Its worker must commit a bounded analysis, scoped implementation, real
 standard-library focused-test evidence, review request with parent commit and
-file hashes, and the signed `source-task-80.json` effect. The separate verifier
+upstream file hashes, and the signed `source-task-80.json` effect. The review
+request hashes only files written before it; the final effect then names that
+request and its SHA-256, forming an acyclic immutable chain. The separate verifier
 is read-only: it recomputes those hashes, inspects the committed analysis and
 implementation, reruns the exact test, then makes the existing bound
 `verified` report only on success. The durable work-coordinator verified intent
