@@ -302,7 +302,13 @@ class NativeOwnerRunner:
         # input state alone could be stale while a turn runs.
         if not completed and not (
             acknowledged_and_receipted
-            and (session.effective_awaiting == "input" or terminal_settlement)
+            and (
+                (
+                    session.effective_awaiting == "input"
+                    and self._owner_session_turn_idle(session_id)
+                )
+                or terminal_settlement
+            )
         ):
             return
         with self._transaction() as con:
@@ -312,6 +318,25 @@ class NativeOwnerRunner:
                 AND state IN ('claimed', 'sent')""",
                 [self.clock(), row[0], row[1]],
             )
+
+    def _owner_session_turn_idle(self, session_id: str) -> bool:
+        """Return whether harnessd confirms that this reusable owner is idle.
+
+        ``awaiting=input`` is a compatibility completion signal for native
+        adapters that do not emit a terminal turn status.  It is not enough on
+        its own when the structured host still has a turn in flight: a reused
+        owner could otherwise release this claim, consume a second run's wake,
+        and have its submit rejected after that wake has spent an attempt.
+        Unknown host state deliberately remains non-idle.
+        """
+        reader = getattr(self.collector, "harness_session_turn_active", None)
+        if not callable(reader):
+            return False
+        try:
+            active = reader(session_id)
+        except Exception:  # noqa: BLE001 - unavailable host state is non-idle
+            return False
+        return active is False
 
     @staticmethod
     def _requires_expected_effect(status: dict) -> bool:
@@ -856,7 +881,10 @@ class NativeOwnerRunner:
                 continue
             completed = self.registry.has_completed_turn(session_id, turn_id)
             if not completed and not (
-                session.effective_awaiting == "input" and acknowledged and receipted
+                session.effective_awaiting == "input"
+                and acknowledged
+                and receipted
+                and self._owner_session_turn_idle(session_id)
             ):
                 continue
             with self._transaction() as con:

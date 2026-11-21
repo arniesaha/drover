@@ -3686,7 +3686,19 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         registry_session = self._safe_get_session(session_id)
         if registry_session is None:
             return None
-        return _structured_session_row_json(registry_session)
+        payload = _structured_session_row_json(registry_session)
+        # ``awaiting`` is a durable projection and may lag the structured
+        # driver.  The live busy bit fences another hub turn until the host has
+        # actually released the current one.
+        # A registry row without a live manager entry is not evidence that a
+        # structured turn is idle (for example, after a daemon restart).  Keep
+        # that distinction explicit so hub claim settlement can fail closed.
+        payload["turn_active"] = (
+            self.server.state.structured.is_busy(session_id)
+            if self.server.state.structured.has(session_id)
+            else None
+        )
+        return payload
 
     def _list_sessions(self, query: str = "") -> None:
         """Every live session, then one bounded page of finished ones.

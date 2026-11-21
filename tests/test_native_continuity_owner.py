@@ -82,6 +82,11 @@ class Collector:
         self.recorded_failed_turns = 0
         self.expected_effect_attestations = {}
         self.effect_attestation_attempts = []
+        self.turn_active = False
+
+    def harness_session_turn_active(self, session_id):
+        del session_id
+        return self.turn_active
 
     def proxy_create_harness_session(self, host_id, payload):
         self.launches.append((host_id, payload))
@@ -115,6 +120,8 @@ class Collector:
             )
         assert action == "turns"
         self.turn_attempts.append((session_id, payload))
+        if self.turn_active:
+            return 409, '{"error":"turn already in flight"}'
         if self.failed_turns:
             self.failed_turns -= 1
             if self.recorded_failed_turns:
@@ -675,6 +682,104 @@ def test_concurrent_owner_kicks_do_not_spend_final_wake_before_claim(
     ]
     assert sum(attempts) == 1
     assert len(collector.turn_attempts) == 1
+
+
+@pytest.mark.parametrize("active", [True, None])
+def test_shared_owner_busy_turn_does_not_spend_second_terminal_wake(tmp_path, active):
+    """A reused owner keeps another final wake pending until its exact turn ends."""
+    runner, collector, store, first_run, _ = _runner(tmp_path, event_kind="worker_done")
+    scope = runner.config.goals[0]
+    owner_id = scope.continuity_owner_id
+    registry = runner.registry
+
+    registry.create_session(
+        session_id="observer-session-two",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/project-two",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-second@1",
+    )
+    second_run = store.initialize(
+        session_id="observer-session-two",
+        objective="Native continuity two",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    second_wake = store.report(
+        second_run,
+        source="hub",
+        source_event_id="done-2",
+        subject="worker-2",
+        sequence=1,
+        kind="worker_done",
+        summary="done",
+    )
+
+    # The first run owns the reusable session and has already durably finished
+    # its effect/ACK, but its exact submitted turn remains live on harnessd.
+    assert runner.process_once() == 1
+    first_wake = _acknowledge_current_wake(store, first_run, owner_id)
+    owner_session = registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    first_turn = collector.turn_attempts[0][1]["client_turn_id"]
+    registry.update_session_activity(owner_session.session_id, awaiting="input")
+    registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"awaiting": "input"}},
+    )
+    collector.turn_active = active
+
+    # The old awaiting-only settlement released first_wake, consumed second_wake
+    # and got a 409 from the still-active structured owner.  A live busy read
+    # keeps the exact first claim instead, so no second delivery is spent.
+    assert runner.process_once() == 0
+    pending = store.status(second_run)["events"]
+    assert len(pending) == 1
+    assert {key: pending[0][key] for key in ("event_id", "state", "attempts")} == {
+        "event_id": second_wake,
+        "state": "pending",
+        "attempts": 0,
+    }
+    with control_plane_connection(runner.path) as con:
+        [first_state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake],
+        ).fetchone()
+    assert first_state == "sent"
+    assert len(collector.turn_attempts) == 1
+
+    # Only the exact first turn's terminal event frees the shared owner; then
+    # the same pending wake is submitted once without a duplicate effect.
+    collector.turn_active = False
+    registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=3,
+        payload={
+            "payload": {
+                "turn_id": first_turn,
+                "turn_complete": True,
+                "awaiting": "input",
+            }
+        },
+    )
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+    second_status = store.status(second_run)
+    assert second_status["next_action"]["event_id"] == second_wake
+    delivered = second_status["events"]
+    assert len(delivered) == 1
+    assert {key: delivered[0][key] for key in ("event_id", "state", "attempts")} == {
+        "event_id": second_wake,
+        "state": "delivered",
+        "attempts": 1,
+    }
 
 
 def test_active_claim_ignores_prior_failed_session_turn_until_exact_ack(tmp_path):
