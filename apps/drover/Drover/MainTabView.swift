@@ -304,7 +304,11 @@ struct MainTabView: View {
             while !Task.isCancelled {
                 await workStore.refresh()
                 if workStore.isReachable {
-                    await WorkAttentionNotifications.evaluate(workStore.items, notifier: notifier, defaults: defaults)
+                    await WorkAttentionNotifications.evaluate(
+                        workStore.items,
+                        workspaceIDs: Set(workStore.workspaceID.map { [$0] } ?? []),
+                        notifier: notifier, defaults: defaults
+                    )
                 }
                 guard let interval = workStore.pollIntervalSeconds else { return }
                 do { try await Task.sleep(for: .seconds(interval)) }

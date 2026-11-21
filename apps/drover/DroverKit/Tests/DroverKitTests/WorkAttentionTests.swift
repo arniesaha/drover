@@ -16,9 +16,12 @@ func attentionItemJSON(kind: String = "agent_question", uncertain: Bool = false,
     """
 }
 
-func attentionResponse(_ items: [String], truncated: Bool = false) throws -> WorkAttentionResponse {
-    try JSONDecoder().decode(WorkAttentionResponse.self, from: Data("""
-    {"items":[\(items.joined(separator: ","))],"stale":false,"truncated":\(truncated),"poll_interval_seconds":120}
+func attentionResponse(
+    _ items: [String], truncated: Bool = false, workspaceID: String? = "workspace"
+) throws -> WorkAttentionResponse {
+    let workspace = workspaceID.map { "\"workspace_id\":\"\($0)\"," } ?? ""
+    return try JSONDecoder().decode(WorkAttentionResponse.self, from: Data("""
+    {\(workspace)"items":[\(items.joined(separator: ","))],"stale":false,"truncated":\(truncated),"poll_interval_seconds":120}
     """.utf8))
 }
 
@@ -281,10 +284,45 @@ struct WorkAttentionTests {
             !$0.body.contains("example/project") && !$0.body.contains("github.com")
         })
     }
+
+    @Test func completeWorkspaceSnapshotsClearResolvedWorkAlertsIncludingEmptyResults() async throws {
+        let suite = "work-attention-cleanup-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let notifier = AttentionSpy()
+        let active = try attentionResponse([
+            attentionItemJSON(kind: "agent_question", id: "still-open")
+        ], workspaceID: "workspace")
+        let empty = try attentionResponse([], workspaceID: "workspace")
+        let store = WorkAttentionStore(service: AttentionService([active, empty]))
+
+        // Match MainTabView's foreground call chain: response decoding keeps
+        // its workspace even after the second, empty successful refresh.
+        await store.refresh()
+        await WorkAttentionNotifications.evaluate(
+            store.items,
+            workspaceIDs: Set(store.workspaceID.map { [$0] } ?? []),
+            notifier: notifier, defaults: defaults
+        )
+        await store.refresh()
+        await WorkAttentionNotifications.evaluate(
+            store.items,
+            workspaceIDs: Set(store.workspaceID.map { [$0] } ?? []),
+            notifier: notifier, defaults: defaults
+        )
+
+        let cleanups = await notifier.resolvedWorkSets
+        #expect(cleanups.count == 2)
+        #expect(cleanups[0].active == [WorkAttentionRef(workspaceID: "workspace", id: "still-open")])
+        #expect(cleanups[0].workspaces == ["workspace"])
+        #expect(cleanups[1].active.isEmpty)
+        #expect(cleanups[1].workspaces == ["workspace"])
+    }
 }
 
 private actor AttentionSpy: Notifying {
     var notifications: [WorkAttentionNotification] = []
+    var resolvedWorkSets: [(active: Set<WorkAttentionRef>, workspaces: Set<String>)] = []
     var count: Int { notifications.count }
     func notify(title: String, body: String, id: String) async {
         notifications.append(WorkAttentionNotification(
@@ -293,6 +331,11 @@ private actor AttentionSpy: Notifying {
     }
     func notify(attention: WorkAttentionNotification) async { notifications.append(attention) }
     func setBadge(_ count: Int) async {}
+    func clearResolvedWorkAttention(
+        activeRefs: Set<WorkAttentionRef>, workspaceIDs: Set<String>
+    ) async {
+        resolvedWorkSets.append((activeRefs, workspaceIDs))
+    }
 }
 
 extension MockNetworkTests {
@@ -307,7 +350,7 @@ struct WorkAttentionClientTests {
             if request.httpMethod == "GET" {
                 #expect(request.url?.path == "/work/list")
                 #expect(request.url?.query == "view=attention&limit=100")
-                return (200, Data("{\"items\":[\(json)],\"stale\":false,\"truncated\":false,\"poll_interval_seconds\":120}".utf8))
+                return (200, Data("{\"workspace_id\":\"workspace\",\"items\":[\(json)],\"stale\":false,\"truncated\":false,\"poll_interval_seconds\":120}".utf8))
             }
             #expect(request.url?.path == "/work/decide")
             let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
@@ -317,7 +360,9 @@ struct WorkAttentionClientTests {
             return (200, Data(#"{"resolved":true}"#.utf8))
         }
         let client = mock.client()
-        let items = try await client.workAttention().items
+        let response = try await client.workAttention()
+        let items = response.items
+        #expect(response.workspaceID == "workspace")
         #expect(try await client.workDecide(item: items[0], action: "reject").resolved)
     }
 }

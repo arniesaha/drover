@@ -75,3 +75,38 @@ one approval, then verify exactly one remote alert per new action, foreground
 suppression for the visible session, resolution cleanup, and cold/warm tap
 routing. No production session, turn, token, or TestFlight action is authorized
 for that check.
+
+### Lifecycle acceptance correction (review round 1)
+
+This correction closes three review findings without changing the server
+writer:
+
+- `clearResolvedAwaiting` now reads both delivered and pending notification
+  requests before removing resolved `input` alerts. A pending-only request is
+  therefore retired; active input and finished/failed requests remain.
+- Work alerts carry `attention_ref`. Successful work responses now retain their
+  top-level `workspace_id` even when `items` is empty, then clear only resolved
+  question/approval alerts in that workspace. Other workspaces, session input,
+  and non-input categories remain untouched. The foreground store and
+  background refresh both pass that scope to the shared evaluator.
+- Session receipts now combine the session id, awaiting kind, and the hub
+  supplied `last_activity` (falling back to hub `updated_at`). This is source
+  metadata rather than a client timestamp: an unchanged action is silent over
+  reconnect/app-open, while a later source action on the same session alerts.
+  Legacy id-only receipts are absorbed once during upgrade to avoid replay.
+
+Focused round-1 result: `swift test --filter
+'NotifierTests|NotificationRoutingTests|WorkAttentionTests|UATRecheckTests'`
+passed **68/68**. The log is retained at
+`/Users/arnab/scratch/drover-ios-981-worker/notification-lifecycle-round2-swift-test.log`.
+The suite includes pending-only delivery coordination, workspace-scoped
+empty-result cleanup through `WorkAttentionStore`, and same-session
+distinct-action/replay coverage.
+
+Physical/APNs limits remain unchanged: simulator fixtures do not establish a
+device token, APNs delivery, Focus/Time Sensitive entitlement behavior, or
+lock-screen cleanup. The precise remaining authorized check is a fixture-backed
+question and approval on a provisioned sandbox iPhone with notification
+permission, verifying one remote delivery per source action, pending and
+delivered resolution cleanup, visible-session suppression, and cold/warm tap
+routing—without creating a production session or turn.

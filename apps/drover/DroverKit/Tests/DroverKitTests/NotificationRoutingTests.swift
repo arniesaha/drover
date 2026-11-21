@@ -25,15 +25,41 @@ import Testing
         == ["remote-a", "local-a"])
 }
 
-@Test func clearingResolvedAwaitingAlertsLeavesActiveAndCompletionAlertsAlone() {
+@Test func clearingResolvedAwaitingCoordinatesDeliveredAndPendingAlerts() {
     let delivered = [
         SessionNotificationDelivery.Delivered(identifier: "resolved-input", sessionID: "resolved", categoryIdentifier: "input"),
         SessionNotificationDelivery.Delivered(identifier: "active-input", sessionID: "active", categoryIdentifier: "input"),
         SessionNotificationDelivery.Delivered(identifier: "finished", sessionID: "resolved", categoryIdentifier: "finished")
     ]
+    let pending = [
+        // This is the regression: it has never been delivered, so a
+        // delivered-only lookup left it behind forever.
+        SessionNotificationDelivery.Delivered(identifier: "pending-resolved", sessionID: "resolved", categoryIdentifier: "input"),
+        SessionNotificationDelivery.Delivered(identifier: "pending-active", sessionID: "active", categoryIdentifier: "input"),
+        SessionNotificationDelivery.Delivered(identifier: "pending-failed", sessionID: "resolved", categoryIdentifier: "failed")
+    ]
     #expect(SessionNotificationDelivery.identifiersToClearForResolvedAwaiting(
-        activeSessionIDs: ["active"], delivered: delivered
-    ) == ["resolved-input"])
+        activeSessionIDs: ["active"], delivered: delivered, pending: pending
+    ) == ["pending-resolved", "resolved-input"])
+}
+
+@Test func clearingResolvedWorkAlertsIsWorkspaceScopedAndPreservesOtherKinds() {
+    let resolved = WorkAttentionRef(workspaceID: "one", id: "resolved")
+    let active = WorkAttentionRef(workspaceID: "one", id: "active")
+    let otherWorkspace = WorkAttentionRef(workspaceID: "two", id: "other")
+    let delivered = [
+        SessionNotificationDelivery.Delivered(identifier: "resolved-work", sessionID: nil, attentionRef: resolved, categoryIdentifier: "input"),
+        SessionNotificationDelivery.Delivered(identifier: "active-work", sessionID: nil, attentionRef: active, categoryIdentifier: "input"),
+        SessionNotificationDelivery.Delivered(identifier: "other-work", sessionID: nil, attentionRef: otherWorkspace, categoryIdentifier: "input"),
+        SessionNotificationDelivery.Delivered(identifier: "finished-work", sessionID: nil, attentionRef: resolved, categoryIdentifier: "finished")
+    ]
+    let pending = [
+        SessionNotificationDelivery.Delivered(identifier: "pending-resolved-work", sessionID: nil, attentionRef: resolved, categoryIdentifier: "input"),
+        SessionNotificationDelivery.Delivered(identifier: "session-input", sessionID: "resolved", categoryIdentifier: "input")
+    ]
+    #expect(SessionNotificationDelivery.identifiersToClearForResolvedWorkAttention(
+        activeAttentionRefs: [active], workspaceIDs: ["one"], delivered: delivered, pending: pending
+    ) == ["pending-resolved-work", "resolved-work"])
 }
 
 @Test func aPushPayloadResolvesToItsSession() {

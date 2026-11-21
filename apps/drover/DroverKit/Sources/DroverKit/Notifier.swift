@@ -21,6 +21,7 @@ public protocol Notifying: Sendable {
     func notify(title: String, body: String, id: String) async
     func setBadge(_ count: Int) async
     func clearResolvedAwaiting(sessionIDs: Set<String>) async
+    func clearResolvedWorkAttention(activeRefs: Set<WorkAttentionRef>, workspaceIDs: Set<String>) async
     func notify(attention: WorkAttentionNotification) async
     func notify(kind: SessionNotificationKind, id: String) async
 }
@@ -30,6 +31,9 @@ extension Notifying {
     /// center. Production `LocalNotifier` overrides this to retire delivered
     /// local input alerts after a successful snapshot.
     public func clearResolvedAwaiting(sessionIDs: Set<String>) async {}
+    public func clearResolvedWorkAttention(
+        activeRefs: Set<WorkAttentionRef>, workspaceIDs: Set<String>
+    ) async {}
 
     public func notify(attention: WorkAttentionNotification) async {
         await notify(title: attention.title, body: attention.body, id: attention.ref.id)
@@ -133,6 +137,14 @@ public struct LocalNotifier: Notifying {
 
     public func clearResolvedAwaiting(sessionIDs: Set<String>) async {
         await SessionNotificationDelivery.clearResolvedAwaiting(activeSessionIDs: sessionIDs)
+    }
+
+    public func clearResolvedWorkAttention(
+        activeRefs: Set<WorkAttentionRef>, workspaceIDs: Set<String>
+    ) async {
+        await SessionNotificationDelivery.clearResolvedWorkAttention(
+            activeAttentionRefs: activeRefs, workspaceIDs: workspaceIDs
+        )
     }
 }
 
@@ -244,8 +256,14 @@ public struct AttentionWatcher: Sendable {
     public func evaluate(_ snapshot: HarnessSnapshot) async {
         let needsYou = Self.needsYou(in: snapshot)
         await notifier.clearResolvedAwaiting(sessionIDs: Set(needsYou.map(\.id)))
-        let previousIDs = Set(seenStore.stringArray(forKey: Self.seenKey) ?? [])
-        let fresh = SessionStore.newlyNeedsYou(current: snapshot.sessions, previousIDs: previousIDs)
+        let previousReceipts = Set(seenStore.stringArray(forKey: Self.seenKey) ?? [])
+        let fresh = needsYou.filter { session in
+            let receipt = Self.attentionReceipt(session)
+            // Session-ID receipts came from versions before source-action
+            // identity was retained. Absorb one existing action at upgrade,
+            // then persist the new receipt for later transitions.
+            return !previousReceipts.contains(receipt) && !previousReceipts.contains(session.id)
+        }
 
         let completions = Self.completionReceipts(snapshot)
         let previousCompletions = seenStore.dictionary(forKey: Self.finishedKey) as? [String: String] ?? [:]
@@ -266,7 +284,7 @@ public struct AttentionWatcher: Sendable {
         seenStore.set(completions, forKey: Self.finishedKey)
         let read = prunedRead(against: needsYou)
         await notifier.setBadge(needsYou.filter { !read.contains($0.id) }.count)
-        seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)
+        seenStore.set(needsYou.map(Self.attentionReceipt), forKey: Self.seenKey)
     }
 
     /// Record that the user has seen what this session is asking, and refresh
@@ -306,6 +324,15 @@ public struct AttentionWatcher: Sendable {
 
     private static func bodySuffix(_ session: SessionSummary) -> String {
         session.attention == .needsApproval ? "approval required" : "reply requested"
+    }
+
+    /// The hub's activity/update marker is source metadata, not a client
+    /// clock. It stays fixed through reconnect/app-open for one request and
+    /// changes when the session emits a later input or approval action.
+    private static func attentionReceipt(_ session: SessionSummary) -> String {
+        let marker = session.lastActivity ?? session.updatedAt
+        guard let marker else { return session.id }
+        return "\(session.id)|\(session.awaiting ?? "")|\(marker.timeIntervalSince1970)"
     }
 
     /// Never put a repository, path, prompt, or transcript in the local

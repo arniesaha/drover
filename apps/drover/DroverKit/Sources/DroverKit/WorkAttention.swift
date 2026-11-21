@@ -99,11 +99,15 @@ public enum WorkAttentionListPresentation {
 
 public struct WorkAttentionResponse: Decodable, Sendable {
     public let items: [WorkAttentionItem]
+    /// Present even when `items` is empty, so a successful response can
+    /// retire stale local work alerts for this workspace.
+    public let workspaceID: String?
     public let stale: Bool
     public let truncated: Bool
     public let pollIntervalSeconds: TimeInterval
     enum CodingKeys: String, CodingKey {
         case items, stale, truncated
+        case workspaceID = "workspace_id"
         case pollIntervalSeconds = "poll_interval_seconds"
     }
 }
@@ -128,6 +132,7 @@ public final class WorkAttentionStore {
     public private(set) var isDeciding = false
     public private(set) var message: String?
     public private(set) var truncated = false
+    public private(set) var workspaceID: String?
     public private(set) var pollIntervalSeconds: TimeInterval?
     private let service: any WorkAttentionServing
 
@@ -146,6 +151,7 @@ public final class WorkAttentionStore {
     private func load() async throws {
         let response = try await service.workAttention()
         items = response.items
+        workspaceID = response.workspaceID
         isReachable = !response.stale
         pollIntervalSeconds = response.pollIntervalSeconds > 0 ? response.pollIntervalSeconds : nil
         truncated = response.truncated
@@ -213,7 +219,7 @@ public final class WorkAttentionStore {
     }
 }
 
-public struct WorkAttentionRef: Sendable, Equatable {
+public struct WorkAttentionRef: Sendable, Hashable {
     public let workspaceID: String
     public let id: String
     public init(workspaceID: String, id: String) {
@@ -247,9 +253,18 @@ public enum WorkAttentionNotifications {
         defaults.set(Array(seen), forKey: key(ref.workspaceID))
     }
 
-    public static func evaluate(_ items: [WorkAttentionItem], notifier: any Notifying,
-                                defaults: UserDefaults = .standard) async {
+    public static func evaluate(
+        _ items: [WorkAttentionItem], workspaceIDs: Set<String> = [],
+        notifier: any Notifying, defaults: UserDefaults = .standard
+    ) async {
         let groups = Dictionary(grouping: items.filter { !$0.isStale() }, by: \.workspaceID)
+        let scopedWorkspaces = workspaceIDs.union(groups.keys)
+        let activeRefs = Set(groups.flatMap { workspace, rows in
+            rows.compactMap { notification(for: $0, workspaceID: workspace)?.ref }
+        })
+        await notifier.clearResolvedWorkAttention(
+            activeRefs: activeRefs, workspaceIDs: scopedWorkspaces
+        )
         for (workspace, rows) in groups {
             let seen = Set(defaults.stringArray(forKey: key(workspace)) ?? [])
             defaults.set(rows.map(\.id), forKey: key(workspace))

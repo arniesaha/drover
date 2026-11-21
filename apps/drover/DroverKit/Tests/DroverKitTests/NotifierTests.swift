@@ -10,6 +10,7 @@ private actor SpyNotifier: Notifying {
     private(set) var notifications: [(title: String, body: String, id: String)] = []
     private(set) var badgeCounts: [Int] = []
     private(set) var resolvedAwaitingSets: [Set<String>] = []
+    private(set) var resolvedWorkSets: [(active: Set<WorkAttentionRef>, workspaces: Set<String>)] = []
 
     func notify(title: String, body: String, id: String) async {
         notifications.append((title: title, body: body, id: id))
@@ -21,6 +22,12 @@ private actor SpyNotifier: Notifying {
 
     func clearResolvedAwaiting(sessionIDs: Set<String>) async {
         resolvedAwaitingSets.append(sessionIDs)
+    }
+
+    func clearResolvedWorkAttention(
+        activeRefs: Set<WorkAttentionRef>, workspaceIDs: Set<String>
+    ) async {
+        resolvedWorkSets.append((activeRefs, workspaceIDs))
     }
 }
 
@@ -380,6 +387,35 @@ struct NotifierTests {
     await watcher.evaluate(asking)
 
     #expect(await spy.notifications.map(\.id) == ["sess-42"])
+}
+
+@Test func aNewSourceActionOnTheSameSessionAlertsOnceThenReplaysSilently() async throws {
+    func snapshot(awaiting: String?, activity: String) throws -> HarnessSnapshot {
+        let awaitingJSON = awaiting.map { "\"\($0)\"" } ?? "null"
+        return try HarnessSnapshot.decode(from: Data("""
+        {"hosts":[],"sessions":[{"session_id":"same-session","host_id":"host-1",
+        "harness":"codex","mode":"structured","status":"running","awaiting":\(awaitingJSON),
+        "last_activity":"\(activity)"}],"cwd_suggestions":[]}
+        """.utf8))
+    }
+
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    let first = try snapshot(awaiting: "input", activity: "2026-11-21T20:00:00Z")
+    await watcher.evaluate(first)
+    await watcher.evaluate(first) // reconnect/app-open replay
+
+    let resolved = try snapshot(awaiting: nil, activity: "2026-11-21T20:01:00Z")
+    await watcher.evaluate(resolved)
+    let second = try snapshot(awaiting: "approval", activity: "2026-11-21T20:02:00Z")
+    await watcher.evaluate(second)
+    await watcher.evaluate(second) // identical second-action replay
+
+    let notifications = await spy.notifications
+    #expect(notifications.map(\.id) == ["same-session", "same-session"])
+    #expect(notifications.map(\.body) == [
+        "Codex · reply requested", "Codex · approval required"
+    ])
 }
 
 // MARK: - One announcer at a time
