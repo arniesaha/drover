@@ -90,6 +90,7 @@ def test_launch_targets_come_from_launch_modes_not_names():
         ["claude-code", "structured"],
         ["codex", "structured"],
         ["agy", "structured"],
+        ["cursor", "structured"],
         ["deepseek-harness", "structured"],
         ["shell", "pty"],
     ]
@@ -110,7 +111,7 @@ def test_provider_controls_follow_their_matrices():
     out = _js(
         {
             name: f"pick(C.harnessControls(host('mac-mini'), '{name}'), {keys})"
-            for name in ("claude-code", "codex", "agy", "deepseek-harness", "shell")
+            for name in ("claude-code", "codex", "agy", "cursor", "deepseek-harness", "shell")
         }
     )
     images = ["image/gif", "image/jpeg", "image/png", "image/webp"]
@@ -127,6 +128,11 @@ def test_provider_controls_follow_their_matrices():
     assert out["codex"]["approvals"] is False
     assert out["codex"]["worktree"] is True
     assert out["agy"] == {**out["codex"]}
+    assert out["cursor"] == {
+        **out["codex"],
+        "worktree": False,
+        "attachments": [],
+    }
     assert out["deepseek-harness"]["interactiveAuth"] is False
     assert out["shell"] == {
         "approvals": False,

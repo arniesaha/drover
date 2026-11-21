@@ -27,9 +27,10 @@ from drover.server.harness.model_catalog import (
     AgyCatalogAdapter,
     ClaudeCatalogAdapter,
     CodexCatalogAdapter,
+    CursorCatalogAdapter,
     DeepSeekCatalogAdapter,
 )
-from drover.server.harness.structured import agy, claude, codex, deepseek
+from drover.server.harness.structured import agy, claude, codex, cursor, deepseek
 from drover.server.harness.structured.driver import EmitFn
 from drover.server.staging_credentials import is_staging, read_api_key
 
@@ -310,6 +311,56 @@ class AgyAdapter(_WorktreeAdapter, _StructuredAdapter):
         )
 
 
+class CursorAdapter(_StructuredAdapter):
+    """Cursor Agent's documented print-mode NDJSON integration."""
+
+    id = "cursor"
+    display_name = "Cursor Agent CLI"
+    capabilities = HarnessCapabilities(
+        launch_modes=frozenset({"structured"}),
+        interrupt=True,
+        native_resume=True,
+        model_catalog=True,
+        interactive_auth=True,
+    )
+    catalog_type = CursorCatalogAdapter
+    catalog_suffix: tuple[str, ...] = ()
+    # Cursor's print mode starts one process per turn, and its documented
+    # --resume accepts the session ID emitted in stream-json. A restart
+    # between turns has the same contract as a normal subsequent turn.
+    recover_after_restart = True
+    # _StructuredAdapter implements image forwarding for the providers that
+    # declare it. Cursor's reviewed CLI does not expose a matching headless
+    # attachment contract, so restore the closed base hook explicitly.
+    send_attachments = HarnessAdapter.send_attachments
+
+    def default_command(self) -> list[str]:
+        return cursor.default_command()
+
+    def start(self, request: LaunchRequest, emit: EmitFn) -> cursor.CursorDriver:
+        command = list(request.command) if request.command else self.default_command()
+        return cursor.CursorDriver(
+            command,
+            request.cwd,
+            emit,
+            native_session_id=request.native_session_id,
+            env=request.environment,
+        )
+
+    def auth_adapter(self, *, shell: str | None = None) -> object | None:
+        if is_staging():
+            return None
+        command = _resolve_login_command("cursor-agent", shell=shell)
+        if command is None:
+            return None
+        return CommandAuthAdapter(
+            self.id,
+            _command_with_args(command, "status", "--format", "json"),
+            _command_with_args(command, "login"),
+            requires_pty=True,
+        )
+
+
 class DeepSeekAdapter(_WorktreeAdapter, _StructuredAdapter):
     id = "deepseek-harness"
     display_name = "DeepSeek Harness (local Web RPC)"
@@ -336,5 +387,11 @@ class DeepSeekAdapter(_WorktreeAdapter, _StructuredAdapter):
 
 
 BUILTIN_ADAPTERS = HarnessAdapterRegistry(
-    [ClaudeCodeAdapter(), CodexAdapter(), AgyAdapter(), DeepSeekAdapter()]
+    [
+        ClaudeCodeAdapter(),
+        CodexAdapter(),
+        AgyAdapter(),
+        CursorAdapter(),
+        DeepSeekAdapter(),
+    ]
 )

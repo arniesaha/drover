@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from .agy import AgyCatalogAdapter
 from .claude import ClaudeCatalogAdapter, ClaudeModelPolicy
 from .codex import CodexCatalogAdapter
+from .cursor import CursorCatalogAdapter
 from .deepseek import DeepSeekCatalogAdapter
 from .models import (
     MAX_CATALOG_WIRE_BYTES,
@@ -69,6 +70,7 @@ __all__ = [
     "AccountScopeIDs",
     "ModelCatalogService",
     "CodexCatalogAdapter",
+    "CursorCatalogAdapter",
     "AgyCatalogAdapter",
     "ClaudeCatalogAdapter",
     "ClaudeModelPolicy",

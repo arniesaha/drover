@@ -324,6 +324,8 @@ class CommandAuthAdapter:
             return _parse_codex_status(output, result.returncode)
         if self.harness == "agy":
             return _parse_agy_status(output, result.returncode)
+        if self.harness == "cursor":
+            return _parse_cursor_status(output, result.returncode)
         return HarnessAuthStatus(self.harness, "unknown", detail=output or None)
 
     def command(self) -> list[str]:
@@ -410,6 +412,30 @@ def _parse_agy_status(
     ).exists():
         return HarnessAuthStatus("agy", "authenticated", detail="Antigravity CLI")
     return HarnessAuthStatus("agy", "unknown", detail=output or None)
+
+
+def _parse_cursor_status(output: str, returncode: int) -> HarnessAuthStatus:
+    """Cursor Agent's reviewed ``status --format json`` contract.
+
+    The status response contains token-presence booleans as well as the
+    authoritative ``isAuthenticated`` flag. Never expose its raw JSON: that
+    prevents future credential-bearing fields from entering the public auth
+    surface while still giving users an actionable sign-in state.
+    """
+
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        return HarnessAuthStatus("cursor", "unknown", detail=output or None)
+    if not isinstance(data, dict):
+        return HarnessAuthStatus("cursor", "unknown", detail=output or None)
+    if returncode != 0 or data.get("isAuthenticated") is False:
+        return HarnessAuthStatus(
+            "cursor", "unauthenticated", detail="Cursor login required"
+        )
+    if data.get("isAuthenticated") is True:
+        return HarnessAuthStatus("cursor", "authenticated", detail="Cursor Agent CLI")
+    return HarnessAuthStatus("cursor", "unknown", detail="Cursor status was incomplete")
 
 
 def _spawn_on_pty(command: Sequence[str]) -> tuple[subprocess.Popen[Any], int]:

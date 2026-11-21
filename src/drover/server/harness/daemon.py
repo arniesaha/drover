@@ -372,6 +372,12 @@ DEFAULT_PRESETS = {
         enabled=False,
         description="Antigravity CLI (agy)",
     ),
+    "cursor": HarnessPreset(
+        name="cursor",
+        command=("cursor-agent",),
+        enabled=False,
+        description="Cursor Agent CLI",
+    ),
     # OpenClaw and Hermes are observe-only: collect Sources, parsers,
     # attribution, metrics and recall ingest their history, but neither has a
     # drive adapter, so neither is a preset, a launch target or a resume

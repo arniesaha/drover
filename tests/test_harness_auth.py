@@ -261,7 +261,7 @@ def test_command_adapter_redacts_status_output_and_replaces_invalid_bytes(tmp_pa
 def test_default_auth_adapters_include_structured_harnesses(monkeypatch, tmp_path):
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    for name in ("claude", "codex", "agy"):
+    for name in ("claude", "codex", "agy", "cursor-agent"):
         path = bindir / name
         path.write_text("#!/bin/sh\nexit 0\n")
         path.chmod(0o755)
@@ -269,7 +269,47 @@ def test_default_auth_adapters_include_structured_harnesses(monkeypatch, tmp_pat
 
     adapters = default_auth_adapters()
 
-    assert sorted(adapters) == ["agy", "claude-code", "codex"]
+    assert sorted(adapters) == ["agy", "claude-code", "codex", "cursor"]
+
+
+def test_cursor_status_parses_reviewed_json_without_exposing_raw_fields(tmp_path):
+    cli = tmp_path / "cursor-agent"
+    cli.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' '{\"isAuthenticated\":false,\"hasAccessToken\":false}'\n"
+    )
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="cursor",
+        status_command=[str(cli), "status", "--format", "json"],
+        login_command=[str(cli), "login"],
+        requires_pty=True,
+    )
+
+    status = adapter.status()
+
+    assert status.state == "unauthenticated"
+    assert status.detail == "Cursor login required"
+    assert adapter.command() == [str(cli), "login"]
+
+
+def test_cursor_status_parses_authenticated_json(tmp_path):
+    cli = tmp_path / "cursor-agent"
+    cli.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' \'{"isAuthenticated":true,"message":"private"}\'\n'
+    )
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="cursor",
+        status_command=[str(cli), "status", "--format", "json"],
+        login_command=[str(cli), "login"],
+    )
+
+    status = adapter.status()
+
+    assert status.state == "authenticated"
+    assert status.detail == "Cursor Agent CLI"
 
 
 def test_default_auth_adapters_use_login_shell_command_and_nvm_path(
