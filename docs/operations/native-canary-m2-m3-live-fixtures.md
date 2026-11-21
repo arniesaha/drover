@@ -75,7 +75,9 @@ complete: worker-start observations and ordinary owners remain unchanged.
    independent ready candidate was retained and later advances normally. A hub
    restart that occurs after an ACK is not M2 evidence.
 
-`NativeOwnerRunner._settle_expired_claims`, `_recover_abandoned_claim`, and
+`NativeOwnerRunner._settle_expired_claims`, `_recover_abandoned_claim`,
+`_owner_session_turn_idle` (deferring shared owner delivery while an owner turn
+is active on the host), and
 `FactoryObserverContinuity.lease/consume/action_intent/acknowledge` are the
 relevant implementation boundaries. The retry design remains delivery-only:
 it must not replay a provider turn or materialized effect, must respect active
@@ -127,9 +129,13 @@ a standard-library focused test plus the bound local-file evidence, force-adds
 the ignored `.drover-native-canary` evidence files, and commits all of that
 evidence on its own session branch before requesting deferred completion. Its
 verify role only reads the resulting child worktree and reruns the committed
-`python3` test. It must not recreate a missing marker, implementation, or test.
-A missing, changed, or untracked-only file is a failed verification, not a
-reason to copy files between worktrees.
+`python3` test. The verifier cannot request `complete`: after a successful rerun
+it reports evidence via `drover_work_update(action=verified, evidence_key=...)`
+with behavioral results. That update returns deferred; the queue accepts it and
+closes the candidate only after this exact verifier structured turn terminates.
+It must not recreate a missing marker, implementation, or test. A missing, changed,
+or untracked-only file is a failed verification, not a reason to copy files between
+worktrees.
 
 The legacy canary brief remains marker-only and blocks a source commit even if
 a manifest body requests one. For the separately reviewed committed-provenance
