@@ -5,12 +5,20 @@
   },
   "goal_scope_delta_template": {
     "brief_ref": "<approved-canary-runtime>/source/docs/operations/native-local-candidate-canary-m3-committed-provenance.md",
-    "local_candidate_committed_provenance": {"48": "m3", "49": "m3", "50": "m3"},
-    "local_candidate_authority_scopes": {"57": "deployment"}
+    "local_candidate_committed_provenance": {
+      "48": "m3",
+      "49": "m3",
+      "50": "m3",
+      "80": "m3"
+    },
+    "local_candidate_authority_scopes": {
+      "57": "deployment"
+    }
   },
   "fixture_sequence": [
     "docs/operations/fixtures/native-canary-m3-candidates-49-50-committed-provenance.json",
+    "docs/operations/fixtures/native-canary-m3-candidate-80-substantive-lineage.json",
     "docs/operations/fixtures/native-canary-followon-m2-m3-candidates-51-58.json"
   ],
-  "owner_resolution": "Offline review template only. Resolve <approved-canary-runtime> to the existing disposable runtime root during approved alignment; the configuration parser does not expand it. Candidates 51, 52, 53, 54, 55, 56, 57, and 58 are intentionally absent from local_candidate_committed_provenance: each remains a direct-attested marker-only work run. Existing integration serialization key/label is reused for 55 and 56; only 57 receives the reviewed deployment authority selector. Do not add committed provenance to any of those items."
+  "owner_resolution": "Offline review template only. Resolve <approved-canary-runtime> to the existing disposable runtime root during approved alignment; the configuration parser does not expand it. Candidates 51, 52, 53, 54, 55, 56, 57, and 58 are intentionally absent from local_candidate_committed_provenance: each remains a direct-attested marker-only work run. Existing integration serialization key/label is reused for 55 and 56; only 57 receives the reviewed deployment authority selector. Do not add committed provenance to any of those items. Candidate 80 is the sole additional committed-provenance selector and remains implementation-only; it cannot select deployment or integration serialization."
 }

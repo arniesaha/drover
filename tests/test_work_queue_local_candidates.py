@@ -889,6 +889,7 @@ def test_queue_worker_does_not_replay_an_uncertain_recovery_write(
         ("native-canary-m3-candidate-45-stdlib-verification.json", [45]),
         ("native-canary-m3-candidate-48-committed-provenance.json", [48]),
         ("native-canary-m3-candidates-49-50-committed-provenance.json", [49, 50]),
+        ("native-canary-m3-candidate-80-substantive-lineage.json", [80]),
         ("native-canary-followon-m2-m3-candidates-51-58.json", list(range(51, 59))),
     ],
 )
@@ -956,6 +957,12 @@ def test_reviewed_native_canary_fixture_manifests_match_local_ingress_schema(
             "delivery:integration" not in item["operator_authority_labels"]
             for item in items
         )
+    if fixture_name == "native-canary-m3-candidate-80-substantive-lineage.json":
+        body = items[0]["body"]
+        assert "m3-80-analysis.json" in body
+        assert "m3-80-review-request.json" in body
+        assert "behavioral_passed=true" in body
+        assert "do not create, alter, commit, or reconstruct anything" in body
     if fixture_name == "native-canary-followon-m2-m3-candidates-51-58.json":
         assert all("Do not commit" in item["body"] for item in items)
         integration = [item for item in items if item["number"] in {55, 56}]
@@ -1011,10 +1018,184 @@ def test_reviewed_followon_binding_delta_keeps_selectors_narrow_and_portable():
         "48": "m3",
         "49": "m3",
         "50": "m3",
+        "80": "m3",
     }
     assert delta["local_candidate_authority_scopes"] == {"57": "deployment"}
     assert "<approved-canary-runtime>" in delta["brief_ref"]
     assert "/Users/" not in fixture.read_text(encoding="utf-8")
+
+
+def test_candidate80_fixture_requires_signed_provenance_and_role_bound_review(
+    tmp_path,
+):
+    """Candidate 80 stays ordinary ingress while only the worker gets commit authority."""
+    fixture = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "operations"
+        / "fixtures"
+        / "native-canary-m3-candidate-80-substantive-lineage.json"
+    )
+    path = tmp_path / "candidates.json"
+    path.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    policy_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "drover"
+        / "server"
+        / "work_queue"
+        / "policy-v1.json"
+    )
+    policy = json.loads(policy_source.read_text(encoding="utf-8"))
+    policy["authority"]["local_candidate_committed_provenance_enabled"] = True
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    scope = GoalScope.model_validate(
+        {
+            "goal_id": "native-canary-924-848",
+            "repo": "arniesaha/drover",
+            "goal_label": "goal:native-canary-924-848",
+            "candidate_source": "local_file",
+            "local_candidates_path": str(path),
+            "policy_path": str(policy_path),
+            "execution_enabled": True,
+            "execution_cwds": {"host": str(tmp_path / "checkout")},
+            "brief_ref": "docs/operations/native-local-candidate-canary-m3-committed-provenance.md",
+            "continuity_owner_id": "drover:owner/native-canary-924-848",
+            "continuity_owner_harness": "codex",
+            "local_candidate_committed_provenance": {"80": "m3"},
+            "credential": {
+                "token_env": "UNUSED_LOCAL_CANDIDATE_TOKEN",
+                "capabilities": ["issues_read"],
+            },
+        }
+    )
+    provider = LocalCandidateProvider("native-canary-924-848", scope)
+    item = provider.get_item(
+        ItemRef(
+            "native-canary-924-848",
+            "local_file",
+            "arniesaha/drover",
+            80,
+            "local://native-canary-924-848/80",
+        )
+    )
+    payloads = []
+    bridge = object.__new__(HarnessBridge)
+    bridge.config = WorkQueueConfig(
+        enabled=True,
+        shadow_mode=False,
+        workspace_id="native-canary-924-848",
+        goals=[scope],
+    )
+    bridge.collector = SimpleNamespace(
+        work_coordinator_continuity_secret="hub-secret",
+        proxy_create_harness_session=lambda _host, payload: (
+            payloads.append(payload) or (201, '{"session_id":"candidate-80"}')
+        ),
+    )
+    bridge.registry = SimpleNamespace()
+    ref = ItemRef(
+        "native-canary-924-848",
+        "local_file",
+        "arniesaha/drover",
+        80,
+        "local://native-canary-924-848/80",
+    )
+    authority = {
+        "labels": [label["name"] for label in item["labels"]],
+        "body": item["body"],
+        "local_candidate_number": 80,
+        "local_candidate_cwd": None,
+        "expected_effect_artifact": item["expected_effect_artifact"],
+    }
+
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "a" * 32,
+            ref,
+            "work",
+            None,
+            scope.goal_id,
+            authority=authority,
+        )
+        == "candidate-80"
+    )
+    work, _ = parse_work_coordinator_continuity(
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": payloads[-1]["work_coordinator_continuity"],
+        },
+        hub_secret="hub-secret",
+    )
+    assert work is not None and work.committed_provenance is True
+    assert work.expected_effect_artifact == item["expected_effect_artifact"]
+    assert "m3-80-analysis.json" in payloads[-1]["prompt"]
+    assert "m3-80-review-request.json" in payloads[-1]["prompt"]
+
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "b" * 32,
+            ref,
+            "verify",
+            None,
+            scope.goal_id,
+            authority=authority,
+        )
+        == "candidate-80"
+    )
+    verify, _ = parse_work_coordinator_continuity(
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": payloads[-1]["work_coordinator_continuity"],
+        },
+        hub_secret="hub-secret",
+    )
+    assert verify is not None and verify.committed_provenance is False
+    assert "separate verification run" in payloads[-1]["prompt"]
+    assert (
+        "drover_work_update(action=verified, evidence_key=...)"
+        in payloads[-1]["prompt"]
+    )
+    assert (
+        "do not request `drover_work_update(action=complete)`" in payloads[-1]["prompt"]
+    )
+
+    unsigned_scope = scope.model_copy(
+        update={"local_candidate_committed_provenance": {}}
+    )
+    bridge.config = WorkQueueConfig(
+        enabled=True,
+        shadow_mode=False,
+        workspace_id="native-canary-924-848",
+        goals=[unsigned_scope],
+    )
+    assert (
+        bridge.launch(
+            "host",
+            "codex",
+            "c" * 32,
+            ref,
+            "work",
+            None,
+            unsigned_scope.goal_id,
+            authority=authority,
+        )
+        == "candidate-80"
+    )
+    unsigned, _ = parse_work_coordinator_continuity(
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": payloads[-1]["work_coordinator_continuity"],
+        },
+        hub_secret="hub-secret",
+    )
+    assert unsigned is not None and unsigned.committed_provenance is False
+    assert "marker-only work run" in payloads[-1]["prompt"]
 
 
 def test_local_candidate_manifest_rejects_caller_selected_deployment_scope(tmp_path):
