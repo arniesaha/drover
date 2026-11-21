@@ -6,6 +6,10 @@ serialized StoreWriter and unified durable delivery/reconciliation path. Pending
 and quarantined originals survive acknowledged-tail pruning. It never opens the
 Python DuckDB registry. Worktree ownership locks are shared with Python.
 
+Requires Rust 1.89 or newer (`rust-version` in `Cargo.toml`; the locked
+dependency graph does not build on older toolchains). CI uses current stable,
+whose `clippy` lints are the ones `-D warnings` enforces.
+
 ```sh
 cargo build --locked --release -p drover-harnessd
 cargo test -p drover-harnessd
