@@ -1,4 +1,4 @@
-# iOS visual polish #981 — worker review record
+# iOS visual polish #981  -  worker review record
 
 Base: `909fafd60eeb6cb5928af53d7937b4b28648b216`
 Dedicated simulator: `42FB9708-1580-49A6-B291-667720C0F0EE`
@@ -18,10 +18,10 @@ Dedicated simulator: `42FB9708-1580-49A6-B291-667720C0F0EE`
 
 The post-change Xcode result bundle, attachments, and runner log are retained outside the checkout so generated review media is not committed:
 
-- `/Users/arnab/scratch/drover-ios-981-worker/demo-full-journey-accepted.xcresult` — 1/1 passing, nine post-change screenshots.
-- `/Users/arnab/scratch/drover-ios-981-worker/after-screenshots/manifest.json` — mapping for the exported screenshots.
-- `/Users/arnab/scratch/drover-ios-981-worker/demo-full-journey-accepted.mov` — 59-second simulator interaction recording.
-- `/Users/arnab/scratch/drover-ios-981-worker/visual-polish-rerun.xcresult` — prior broad Dynamic Type/dark-light run; 16/17 passed before the stale demo test was repaired.
+- `EVIDENCE_ROOT/demo-full-journey-accepted.xcresult`  -  1/1 passing, nine post-change screenshots.
+- `EVIDENCE_ROOT/after-screenshots/manifest.json`  -  mapping for the exported screenshots.
+- `EVIDENCE_ROOT/demo-full-journey-accepted.mov`  -  59-second simulator interaction recording.
+- `EVIDENCE_ROOT/visual-polish-rerun.xcresult`  -  prior broad Dynamic Type/dark-light run; 16/17 passed before the stale demo test was repaired.
 
 Focused execution uses the core-journey’s normal `MainTabView` for the onboarding/normal-root checks (not the observability fixture shell), with `DemoModeFullJourney` for demo navigation. `AccessibilityJourneyUITests` supplies dark and largest-text snapshots. `swift test --filter InboxAttentionPresentationTests` passes the approval/question membership rule. Fixtures are synthetic; APNs, physical hardware, production sessions, and App Store workflow are intentionally outside this worker’s scope.
 
@@ -58,9 +58,9 @@ notification routing across rapid tabs and rotation.
 Post-change outputs (all simulator/synthetic-fixture evidence, not physical
 APNs) are retained outside the checkout:
 
-- `/Users/arnab/scratch/drover-ios-981-worker/notification-followup-swift-test.log`
-- `/Users/arnab/scratch/drover-ios-981-worker/notification-stale-route.xcresult` — 1/1 pass.
-- `/Users/arnab/scratch/drover-ios-981-worker/notification-after-screenshots/manifest.json`
+- `EVIDENCE_ROOT/notification-followup-swift-test.log`
+- `EVIDENCE_ROOT/notification-stale-route.xcresult`  -  1/1 pass.
+- `EVIDENCE_ROOT/notification-after-screenshots/manifest.json`
 
 The exported `notification-stale-target-recovery` attachment visibly shows the
 Home recovery notice and current-session list. A combined rerun of the older
@@ -95,15 +95,17 @@ writer:
   snapshot listing exposes no awaiting-transition id or sequence. Using that
   timestamp would replay heartbeat alerts, so it was removed. The local
   fallback therefore correctly dedupes reconnect/app-open/heartbeat replay,
-  but cannot distinguish a second same-session action after it has resolved
-  and re-entered. Registered devices use the hub's transition-aware APNs path;
+  and re-alerts when a resolved snapshot is observed before re-entry (covered
+  by sessionThatLeftAndReenteredNeedsYouReAlerts). It cannot distinguish a
+  second same-session action when resolution and re-entry both occur BETWEEN
+  snapshots. Registered devices use the hub's transition-aware APNs path;
   unregistered local-fallback devices need a server-provided transition id to
   meet that distinct-action requirement. No server writer was changed here.
 
 Focused round-1 result: `swift test --filter
 'NotifierTests|NotificationRoutingTests|WorkAttentionTests|UATRecheckTests'`
 passed **68/68**. The log is retained at
-`/Users/arnab/scratch/drover-ios-981-worker/notification-lifecycle-round2-swift-test.log`.
+`EVIDENCE_ROOT/notification-lifecycle-round2-swift-test.log`.
 The suite includes pending-only delivery coordination, workspace-scoped
 empty-result cleanup through `WorkAttentionStore`, and same-session
 distinct-action/replay coverage.
@@ -114,7 +116,7 @@ lock-screen cleanup. The precise remaining authorized check is a fixture-backed
 question and approval on a provisioned sandbox iPhone with notification
 permission, verifying one remote delivery per source action, pending and
 delivered resolution cleanup, visible-session suppression, and cold/warm tap
-routing—without creating a production session or turn.
+routing - without creating a production session or turn.
 
 ### Final lifecycle correction (review round 2)
 
@@ -129,7 +131,7 @@ its workspace id for removal; an empty complete response consequently clears
 that workspace's now-absent action alerts without touching other workspaces.
 
 The final targeted run remained **68/68 passed** at
-`/Users/arnab/scratch/drover-ios-981-worker/notification-lifecycle-round3-swift-test.log`.
+`EVIDENCE_ROOT/notification-lifecycle-round3-swift-test.log`.
 It covers the foreground store contract, the background response contract,
 partial visible-action notify/dedupe with no cleanup, complete empty-result
 cleanup, workspace isolation, and changing-heartbeat replay suppression.
@@ -144,6 +146,16 @@ authoritative complete workspace response replaces receipts, including an
 empty complete result. Other workspaces are unchanged.
 
 Owner focused notification lifecycle suite: **69/69 passed**. Evidence:
-`/Users/arnab/scratch/drover-ios-981-worker/owner-partial-receipts-before.log`
+`EVIDENCE_ROOT/owner-partial-receipts-before.log`
 and `owner-partial-receipts-after.log`. This does not establish physical APNs
 or resolve the documented missing local-fallback transition identity.
+
+### Owner evidence clarification
+
+EVIDENCE_ROOT is an operator-local review directory outside the checkout; its
+concrete location is retained in the private owner checkpoint, not public docs.
+Owner sampled chronological frames from the 59-second interaction recording:
+streaming feedback/composer, Inbox approval, approved tool result and Home
+attention-count reduction are visible. Sampling is not full-motion interaction
+acceptance or physical APNs proof. Missed between-poll transition identity
+remains an explicit limitation; observed resolution/re-entry already re-alerts.
