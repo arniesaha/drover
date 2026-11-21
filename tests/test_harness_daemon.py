@@ -740,12 +740,17 @@ class _FakeStructuredManager:
         self.turns = []
         self.accepted_turns = {}
         self.closed = set()
+        self.busy = False
 
     def has(self, session_id: str) -> bool:
         return session_id not in self.closed
 
     def harness_for(self, session_id: str) -> str:
         return self.harness
+
+    def is_busy(self, session_id: str) -> bool:
+        del session_id
+        return self.busy
 
     def start(self, *args, **kwargs) -> None:
         self.starts.append((args, kwargs))
@@ -782,6 +787,30 @@ def _enabled_preset(name: str, executable: str = "/resolved/harness"):
         enabled=True,
         executable=executable,
     )
+
+
+def test_structured_session_get_exposes_live_turn_activity(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    fake = _FakeStructuredManager(harness="codex")
+    state.structured = fake
+    state.registry.create_session(
+        session_id="session-1",
+        host_id=state.host_id,
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd=str(tmp_path),
+        mode="structured",
+    )
+    try:
+        fake.busy = True
+        assert _fetch_session(base_url, "session-1")["turn_active"] is True
+        fake.busy = False
+        assert _fetch_session(base_url, "session-1")["turn_active"] is False
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
 
 
 def test_model_catalog_route_is_host_scoped_and_forceable(tmp_path):

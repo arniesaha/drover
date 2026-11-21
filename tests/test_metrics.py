@@ -2598,6 +2598,39 @@ def test_empty_registry_is_complete_local_only_content_consent(tmp_path) -> None
     assert json.loads(revoked_body)["hosts"] == []
 
 
+def test_harness_session_turn_active_requires_explicit_boolean(
+    collector_with_hosts,
+) -> None:
+    collector = collector_with_hosts
+    HarnessRegistry(collector.duckdb_path).create_session(
+        session_id="owner-session",
+        host_id="laptop",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/owner",
+        mode="structured",
+    )
+
+    class _TurnRelay(_FakeRelay):
+        def __init__(self, body: str) -> None:
+            super().__init__()
+            self.body = body
+
+        def request(self, host_id, method, path, body, timeout_s=15):
+            self.calls.append((host_id, method, path, body))
+            self.timeouts.append(timeout_s)
+            return 200, self.body
+
+    relay = _TurnRelay('{"turn_active": true}')
+    collector.relay_manager = relay
+    assert collector.harness_session_turn_active("owner-session") is True
+    assert relay.calls == [("laptop", "GET", "/sessions/owner-session", {})]
+
+    collector.relay_manager = _TurnRelay('{"turn_active": "false"}')
+    assert collector.harness_session_turn_active("owner-session") is None
+
+
 def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
     collector = collector_with_hosts
     fake = _FakeRelay()

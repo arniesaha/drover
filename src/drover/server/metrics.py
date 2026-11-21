@@ -2190,6 +2190,33 @@ class MetricsCollector:
                 except Exception:
                     store.attempted(operation_id, "reconciliation_unavailable")
 
+    def harness_session_turn_active(self, session_id: str) -> bool | None:
+        """Read the host's live structured-turn state without changing it.
+
+        A missing, malformed, or unreachable value is deliberately ``None``:
+        callers must keep their durable claim rather than infer idleness from a
+        mutable registry projection.
+        """
+        session = self._harness_session(session_id)
+        if session is None:
+            return None
+        host = self._harness_host(session.host_id)
+        if host is None:
+            return None
+        status, body = self._harness_request(
+            host, f"/sessions/{session_id}", method="GET", payload={}, timeout_s=1.0
+        )
+        if not 200 <= status < 300:
+            return None
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        active = payload.get("turn_active")
+        return active if isinstance(active, bool) else None
+
     def proxy_harness_session_action(
         self,
         session_id: str,
