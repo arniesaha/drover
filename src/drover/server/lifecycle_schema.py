@@ -1,6 +1,7 @@
 """Additive lifecycle records shared by central and local control stores."""
 
 SESSION_COLUMNS = {
+    "attention_id": "VARCHAR",
     "end_reason": "TEXT",
     "archived_at": "TIMESTAMPTZ",
     "retention_policy": "TEXT DEFAULT 'auto'",

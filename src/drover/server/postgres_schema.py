@@ -45,6 +45,7 @@ OWNER_CLAIM_EPOCH_MIGRATION = 43
 COMMITTED_PROVENANCE_MIGRATION = 44
 WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION = 45
 M2_ACK_PENDING_MIGRATION = 46
+ATTENTION_GENERATION_MIGRATION = 47
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1104,6 +1105,10 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         (
             "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS m2_ack_pending BOOLEAN",
         ),
+    ),
+    (
+        ATTENTION_GENERATION_MIGRATION,
+        ("ALTER TABLE harness_sessions ADD COLUMN IF NOT EXISTS attention_id TEXT",),
     ),
 )
 
