@@ -212,3 +212,5 @@ def test_release_readiness_says_what_it_did_not_check(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "does not run the" in result.stdout
     assert "pytest" in result.stdout
+    assert "Release workflow then refuses" in result.stdout
+    assert "scripts/require_main_ci.py" in result.stdout

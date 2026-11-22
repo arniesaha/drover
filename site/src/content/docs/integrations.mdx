@@ -141,7 +141,7 @@ Each client reads the profile one time at session start and adds the `bundle` to
 1. Issue a read-only profile credential for the agent:
 
    ```bash
-   drover profile agents issue my-agent --tier trusted
+   drover-server profile agents issue my-agent --tier trusted
    ```
 
    The command prints the credential one time. The default tier is general.
@@ -158,7 +158,7 @@ Each client reads the profile one time at session start and adds the `bundle` to
      "$DROVER_HTTP_URL/profile?scope=first_turn"
    ```
 
-A profile credential can read only the profile. To revoke it, run `drover profile agents revoke my-agent`.
+A profile credential can read only the profile. To revoke it, run `drover-server profile agents revoke my-agent`.
 
 Use profile text as data, not as authorization. Do not stop the session start if the read fails.
 

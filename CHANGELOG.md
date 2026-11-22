@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `deploy/compose.yaml`: one-command Docker Compose hub (PostgreSQL 17 with
+  pgvector, schema init, hub on loopback), documented in Getting Started.
+- Community health files: code of conduct, issue forms, and a pull request
+  template.
+- `scripts/require_main_ci.py` (refuse to release a commit whose `ci.yml`
+  push run on main is not green) and `scripts/changelog_section.py` (curated
+  release notes from this file), for the Release workflow.
+
+### Fixed
+- Native continuity claims settle again through the real structured relay:
+  harnessd now reports `turn_active` from the live turn state instead of the
+  restart-quiescence `is_busy` bit, which stayed true for idle persistent
+  adapters.
+- The hub image builds and serves the `/ui` web client.
+- The widget extension ships the app's local-networking ATS policy in
+  Release and StoreRelease builds instead of `NSAllowsArbitraryLoads`.
+- Quickstart and docs name commands that exist on an installed machine
+  (`drover-server pair`, `drover-server profile agents issue`) and lead with
+  the web cockpit.
+- `harnessd-rs` declares its 1.89 minimum Rust version.
+
 ## [0.6.57] - 2026-11-08
 
 ### Fixed

@@ -69,6 +69,10 @@ for key in ("CFBundleDisplayName", "CFBundleShortVersionString", "CFBundleVersio
 icons = app_info.get("CFBundleIcons", {}).get("CFBundlePrimaryIcon", {})
 if icons.get("CFBundleIconName") != "AppIcon" or not icons.get("CFBundleIconFiles"):
     raise SystemExit("exported app primary AppIcon metadata is missing")
+if widget_info.get("NSAppTransportSecurity") != {"NSAllowsLocalNetworking": True}:
+    raise SystemExit(
+        "exported widget NSAppTransportSecurity must be exactly NSAllowsLocalNetworking"
+    )
 print("widget IPA metadata verified: display name, version/build and MinimumOSVersion match app; AppIcon present")
 entitlements_data = stdout.read_bytes()
 if not entitlements_data.strip():

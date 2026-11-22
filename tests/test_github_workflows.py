@@ -530,6 +530,7 @@ def test_release_workflow_is_tag_triggered_and_publishes_three_artifacts() -> No
 
     job = workflow["jobs"]["release"]
     assert job["runs-on"] == "ubuntu-latest"
+    assert job["permissions"] == {"contents": "write", "actions": "read"}
     steps = " ".join(step.get("run", "") for step in job["steps"])
     assert "uv build" in steps
     assert "uv export" in steps
@@ -755,3 +756,35 @@ def test_release_verifies_the_published_artifact_end_to_end() -> None:
     assert (
         ".local/bin/drover-server" in steps
     ), "must prove the CLI is reachable as a command, not just on disk"
+
+
+def test_release_publishes_only_a_checked_out_commit_with_green_main_ci() -> None:
+    steps = load_workflow("release.yml")["jobs"]["release"]["steps"]
+    names = [step.get("name") for step in steps]
+    gate_index = names.index("Require green main CI for the tagged commit")
+    gate = steps[gate_index]
+
+    assert "scripts/require_main_ci.py" in gate["run"]
+    assert 'RELEASE_SHA="$(git rev-parse HEAD)"' in gate["run"]
+    assert gate["env"] == {"GITHUB_TOKEN": "${{ github.token }}"}
+    assert gate["timeout-minutes"] == "50"
+    # The gate runs after checkout and before any release build or publication.
+    checkout_index = next(
+        i
+        for i, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("actions/checkout")
+    )
+    assert checkout_index < gate_index < names.index("Publish the release")
+    assert gate_index < next(
+        i for i, step in enumerate(steps) if "uv build" in step.get("run", "")
+    )
+
+
+def test_release_notes_lead_with_the_changelog_section() -> None:
+    steps = load_workflow("release.yml")["jobs"]["release"]["steps"]
+    publish = next(step for step in steps if step.get("name") == "Publish the release")
+    run = publish["run"]
+
+    assert 'scripts/changelog_section.py "${RELEASE_TAG}"' in run
+    assert '--notes-file "${RUNNER_TEMP}/release-notes.md"' in run
+    assert run.index("changelog_section.py") < run.index("gh release create")
