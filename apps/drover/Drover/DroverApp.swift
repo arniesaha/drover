@@ -324,6 +324,7 @@ private struct FixturePreparedRoot: View {
     let scenario: UITestScenario
     let notifier: Notifying
     @State private var isPrepared = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Group {
@@ -357,6 +358,20 @@ private struct FixturePreparedRoot: View {
                         .font(.caption2)
                         .foregroundStyle(.clear)
                         .allowsHitTesting(false)
+                    }
+                }
+                .overlay(alignment: .topLeading) {
+                    if ProcessInfo.processInfo.environment["DROVER_UI_TEST_ASSERT_REDUCE_MOTION"] == "1" {
+                        // This invisible DEBUG probe reads the system-provided
+                        // SwiftUI environment at the actual app root. The test
+                        // flag only exposes the value; it cannot override it.
+                        Text(reduceMotion ? "Reduce Motion fixture enabled" : "Reduce Motion fixture disabled")
+                            .font(.system(size: 1))
+                            .foregroundStyle(.clear)
+                            .frame(width: 1, height: 1)
+                            .accessibilityIdentifier("fixture-reduce-motion-state")
+                            .accessibilityElement(children: .ignore)
+                            .allowsHitTesting(false)
                     }
                 }
             } else {
