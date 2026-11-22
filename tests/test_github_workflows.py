@@ -98,6 +98,45 @@ def test_production_testflight_requires_exact_sha_ci_instead_of_repeating_tests(
     assert REQUIRED_CHECKS == {ios["jobs"]["build-and-test"]["name"]}
 
 
+def test_app_store_inventory_is_manual_main_only_and_get_only():
+    workflow = load_workflow("ios-app-store-inventory.yml")
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert workflow["permissions"] == {"contents": "read"}
+    assert set(workflow["jobs"]) == {"inventory"}
+    job = workflow["jobs"]["inventory"]
+    assert job["if"] == "github.ref == 'refs/heads/main'"
+    assert job["environment"] == "ios-testflight-upload"
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["permissions"] == {"contents": "read"}
+    commands = "\n".join(step.get("run", "") for step in job["steps"])
+    assert "scripts/ios/testflight_inventory.py" in commands
+    for forbidden in (
+        "archive.sh",
+        "export_ipa.sh",
+        "setup_distribution_signing.sh",
+        "upload_testflight.sh",
+        "xcodebuild",
+        "keychain",
+        "POST",
+        "PATCH",
+    ):
+        assert forbidden not in commands
+    query = next(
+        step
+        for step in job["steps"]
+        if step.get("name") == "Query App Store Connect inventory"
+    )
+    assert set(query["env"]) == {
+        "DROVER_APPSTORE_API_KEY_ID",
+        "DROVER_APPSTORE_API_ISSUER_ID",
+    }
+    assert any(
+        step.get("name") == "Remove transient ASC credential"
+        and step.get("if") == "always()"
+        for step in job["steps"]
+    )
+
+
 def _run_production_python_step(name, monkeypatch, tmp_path):
     """Execute the real embedded workflow program; callers stub external tools."""
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
