@@ -481,7 +481,14 @@ class ProviderUsageService:
                 configured = snapshot.status != "not_configured"
                 succeeded = snapshot.status in _SUCCESS_STATUSES and (
                     snapshot.error_category
-                    in {None, "no_usage_reported", "not_configured"}
+                    in {
+                        None,
+                        "no_usage_reported",
+                        "not_configured",
+                        # The connector completed and authenticated the account,
+                        # but its supported contract has no quota endpoint.
+                        "quota_unsupported",
+                    }
                 )
                 con.execute(
                     """
