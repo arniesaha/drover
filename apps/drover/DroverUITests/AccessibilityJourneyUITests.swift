@@ -349,12 +349,21 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
-    func testCoreJourneyReduceMotionFixtureKeepsPrimaryNavigationReachable() {
+    func testCoreJourneyReduceMotionFixtureKeepsPrimaryNavigationReachable() throws {
         let app = coreJourneyApp(assertReduceMotion: true)
         app.launch()
 
         let motionState = app.staticTexts["fixture-reduce-motion-state"]
-        XCTAssertTrue(motionState.waitForExistence(timeout: timeout))
+        XCTAssertTrue(
+            motionState.waitForExistence(timeout: timeout),
+            "The DEBUG app-root Reduce Motion probe must exist when this test requests it."
+        )
+        guard motionState.label == "Reduce Motion fixture enabled" else {
+            throw XCTSkip(
+                "Requires a simulator with Settings > Accessibility > Motion > Reduce Motion enabled; "
+                    + "the app-root probe reported \(motionState.label). This test does not override system accessibility settings."
+            )
+        }
         XCTAssertEqual(motionState.label, "Reduce Motion fixture enabled")
 
         let fleet = app.scrollViews["fleet-list"]
