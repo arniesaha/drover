@@ -371,7 +371,9 @@ def test_committed_retune_receipt_survives_compaction_failure_and_retry(
     export_lake, monkeypatch
 ):
     import json
+
     import psycopg
+
     from drover.server.lake import maintenance
     from drover.server.lake.runtime import lake_connection
     from drover.server.lake.serving_proof import check_proof, proof_pin
