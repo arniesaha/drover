@@ -586,3 +586,58 @@ def test_completed_turn_kind_recognizes_turn_exited_status(registry):
         payload={"payload": {"exited": 1}},
     )
     assert registry.completed_turn_kinds(["sess-1"]) == {"sess-1": "failed"}
+
+
+def test_attention_generation_survives_missed_clear_and_heartbeat(registry):
+    registry.update_session_activity("sess-1", awaiting="input")
+    first = registry.get_session("sess-1").attention_id
+    assert first
+    registry.update_session_activity("sess-1", awaiting="input")
+    assert registry.get_session("sess-1").attention_id == first
+    registry.update_session_activity("sess-1", awaiting=None)
+    assert registry.get_session("sess-1").attention_id is None
+    registry.update_session_activity("sess-1", awaiting="input")
+    second = registry.get_session("sess-1").attention_id
+    assert second and second != first
+
+
+def test_recovery_creates_fresh_attention_generation(registry):
+    registry.update_session_activity("sess-1", awaiting="input")
+    first = registry.get_session("sess-1").attention_id
+    recovered = registry.mark_session_recovered("sess-1", "native-new")
+    assert recovered.attention_id and recovered.attention_id != first
+
+
+def test_structured_attention_batch_generation(registry):
+    def event(seq, kind, payload):
+        return {
+            "event_id": f"attention-{seq}",
+            "session_id": "sess-1",
+            "event_type": kind,
+            "payload": payload,
+            "seq": seq,
+            "created_at": datetime.now(timezone.utc),
+        }
+
+    first = event(1, "approval_prompt", {"prompt": "First?"})
+    registry.ingest_structured_events([first])
+    original = registry.get_session("sess-1").attention_id
+    assert original == "attention-1"
+    batch = [
+        event(2, "user_input", {}),
+        event(3, "approval_prompt", {"prompt": "Second?"}),
+    ]
+    registry.ingest_structured_events(batch)
+    second = registry.get_session("sess-1").attention_id
+    assert second == "attention-3" and second != original
+    registry.ingest_structured_events(batch)
+    assert registry.get_session("sess-1").attention_id == second
+    registry.ingest_structured_events([event(4, "session.exited", {"exited": 0})])
+    assert registry.get_session("sess-1").attention_id is None
+
+
+def test_terminal_status_clears_attention_generation(registry):
+    registry.update_session_activity("sess-1", awaiting="input")
+    assert registry.get_session("sess-1").attention_id
+    registry.update_session_status("sess-1", "completed")
+    assert registry.get_session("sess-1").attention_id is None

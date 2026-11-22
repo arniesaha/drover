@@ -119,6 +119,7 @@ func attentionDerivation(status: String, awaiting: String?, expected: AttentionS
     ("claude-code", "Claude", "brain"),
     ("codex", "Codex", "chevron.left.forwardslash.chevron.right"),
     ("agy", "Antigravity", "sparkles"),
+    ("cursor", "Cursor", "cursorarrow.rays"),
     ("deepseek-harness", "DeepSeek Harness", "cpu"),
     ("shell", "Shell", "terminal"),
     ("custom-harness", "custom-harness", "terminal"),

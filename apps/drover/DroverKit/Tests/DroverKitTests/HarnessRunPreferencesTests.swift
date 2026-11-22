@@ -12,6 +12,7 @@ struct HarnessRunPreferencesTests {
         #expect(editable("claude-code") == false)
         #expect(editable("codex") == true)
         #expect(editable("agy") == true)
+        #expect(editable("cursor") == true)
         #expect(editable("deepseek-harness") == true)
         #expect(editable("shell") == false)
     }
