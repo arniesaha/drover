@@ -23,7 +23,11 @@ external services, or write outside the assigned worktree.
 The exception is unavailable to verifier runs. A verifier must inspect the
 already committed parent files and rerun the named local focused check; it must
 not create, replace, commit, or reconstruct missing evidence. Missing, changed,
-or untracked-only evidence remains a failed verification.
+or untracked-only evidence remains a failed verification. The verifier cannot
+request `complete`; after a successful rerun it reports evidence via
+`drover_work_update(action=verified, evidence_key=...)`. That update returns
+deferred, and the queue accepts verification only after this exact verifier
+structured turn terminates.
 
 ## Native owner action
 
