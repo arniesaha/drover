@@ -494,6 +494,18 @@ class HostUpdater:
             )
             self._record_refusal(target, "smoke_test")
             return False
+        # A shared lake fault survives a code rollback. Test the exact selected
+        # catalog under this service's environment before closing any PTYs or
+        # draining a working host, not only after its replacement starts.
+        if self._cfg.analytics.backend == "ducklake":
+            from drover.server.lake.serving import check_selected
+
+            try:
+                check_selected(self._cfg.duckdb_path)
+            except Exception:  # never expose catalog credentials in update logs
+                self._record_refusal(target, "lake_preflight")
+                log.error("selected lake preflight failed; preserving running service")
+                return False
         if not drain_for_restart(self._state):
             self._record_refusal(target, "not_quiescent")
             return False
