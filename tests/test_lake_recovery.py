@@ -206,3 +206,36 @@ def test_serving_retune_preserves_logical_rows_and_receipted_proof(export_lake):
         assert any("30 days" in str(row) for row in options)
     journal = json.loads((proof.parent / "maintenance-receipts.json").read_text())
     assert journal[-1]["tables"] == journal[-1]["after_tables"]
+
+
+def test_bad_shared_lake_refuses_update_before_any_drain(monkeypatch, tmp_path):
+    from drover.server.harness import updater
+    from drover.server.lake import serving
+    from drover.server.lake.runtime import LakeError
+
+    host = updater.HostUpdater.__new__(updater.HostUpdater)
+    host._lock = threading.Lock()
+    host._pending = "0.1.4"
+    host._state = None
+    host._cfg = SimpleNamespace(
+        update_runtime_root=None,
+        analytics=SimpleNamespace(backend="ducklake"),
+        duckdb_path=tmp_path / "selected",
+    )
+    host._layout = SimpleNamespace(verify_runtime=lambda _: True)
+    refused = []
+    host._record_refusal = lambda version, reason: refused.append((version, reason))
+    monkeypatch.setattr(updater, "runtime_dependency_preflight", lambda _: [])
+    monkeypatch.setattr(
+        serving,
+        "check_selected",
+        lambda _: (_ for _ in ()).throw(LakeError("lake_verification_file_limit")),
+    )
+    monkeypatch.setattr(
+        updater,
+        "drain_for_restart",
+        lambda _: pytest.fail("must preserve running service"),
+    )
+    assert host.maybe_activate() is False
+    assert refused == [("0.1.4", "lake_preflight")]
+    assert host._pending == "0.1.4"
