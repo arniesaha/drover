@@ -469,11 +469,28 @@ final class AccessibilityJourneyUITests: XCTestCase {
         let session = app.buttons["fixture-session"]
         for _ in 0..<12 {
             if session.exists {
-                let visible = session.frame.intersection(fleet.frame)
-                if !visible.isNull, visible.height >= min(160, session.frame.height), session.isHittable {
-                    // Wrapped rows may be taller than the viewport. Tap their
-                    // visible portion, without requiring the whole row to fit.
-                    session.tap()
+                // Accessibility scroll frames can include the bottom chrome's hit
+                // region. The recording showed a row-coordinate tap opening
+                // New Session; exclude that actual control before choosing a point.
+                var viewport = fleet.frame.intersection(app.frame)
+                let launch = app.buttons["launch-button"]
+                if launch.exists, viewport.intersects(launch.frame) {
+                    viewport.size.height = max(0, launch.frame.minY - viewport.minY - 8)
+                }
+                let tabBar = app.tabBars.firstMatch
+                if tabBar.exists, viewport.intersects(tabBar.frame) {
+                    viewport.size.height = max(0, tabBar.frame.minY - viewport.minY - 8)
+                }
+                let visible = session.frame.intersection(viewport)
+                if !visible.isNull, visible.height >= min(44, session.frame.height),
+                   visible.width >= 44, session.isHittable {
+                    // At XXXL a row can exceed the viewport. Tap the actual
+                    // visible intersection, not XCUIElement.tap()'s full-row
+                    // activation point, which can be outside that viewport.
+                    let point = app.coordinate(withNormalizedOffset: .zero)
+                        .withOffset(CGVector(dx: visible.midX - app.frame.minX,
+                                             dy: visible.midY - app.frame.minY))
+                    point.tap()
                     return
                 }
             }
@@ -481,7 +498,11 @@ final class AccessibilityJourneyUITests: XCTestCase {
             let end = fleet.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45))
             start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
         }
-        XCTFail("the wrapped sample session should be reachable at XXXL")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Unreachable XXXL fleet session"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        XCTFail("the wrapped sample session should be reachable at XXXL; fleet=\(fleet.frame), session=\(session.frame), hittable=\(session.isHittable)")
     }
 
     @MainActor
