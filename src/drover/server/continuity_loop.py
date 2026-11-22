@@ -113,6 +113,19 @@ def _activity(facts: dict[str, Any]) -> datetime | None:
     stamps.append(_time(release.get("publishedAt")))
     worker = facts.get("worker") or {}
     stamps.append(_time(worker.get("last_activity")))
+    markers = facts.get("markers") or {}
+    # External activity belongs only to the session or exact owner identity
+    # that the fact source bound to this issue. Another agent's heartbeat is
+    # neither progress nor proof that this issue is alive.
+    bound_keys = {
+        value
+        for value in (markers.get("session"), markers.get("owner"))
+        if isinstance(value, str) and value
+    }
+    external_activity = facts.get("external_session_activity") or {}
+    for key, val in external_activity.items():
+        if key in bound_keys:
+            stamps.append(_time(val))
     return max((stamp for stamp in stamps if stamp is not None), default=None)
 
 
@@ -203,6 +216,22 @@ def normalize_facts(facts: dict[str, Any]) -> dict[str, Any]:
     session = _bounded_text(markers.get("session"), limit=191)
     if markers.get("session") is not None and session is None:
         raise ValueError("facts.markers.session is invalid")
+    owner_candidates = (
+        markers.get("owner"),
+        facts.get("owner"),
+        facts.get("owner_id"),
+        facts.get("authorized_owner_id"),
+    )
+    owners = []
+    for candidate in owner_candidates:
+        owner = _bounded_text(candidate, limit=191)
+        if candidate is not None and owner is None:
+            raise ValueError("facts owner binding is invalid")
+        if owner is not None:
+            owners.append(owner)
+    if len(set(owners)) > 1:
+        raise ValueError("facts owner binding is inconsistent")
+    owner = owners[0] if owners else None
 
     bot = facts.get("bot", [])
     if not isinstance(bot, list) or len(bot) > 100:
@@ -250,16 +279,34 @@ def normalize_facts(facts: dict[str, Any]) -> dict[str, Any]:
         "startedAt": timestamp(release.get("startedAt"), "facts.release.startedAt"),
         "running": release.get("running", False),
     }
+
+    external_activity = facts.get("external_session_activity")
+    if external_activity is not None and not isinstance(external_activity, dict):
+        raise ValueError("facts.external_session_activity must be an object")
+    normalized_external_activity = {}
+    if external_activity:
+        if len(external_activity) > 32:
+            raise ValueError("facts.external_session_activity must be a bounded object")
+        for key, value in external_activity.items():
+            if not isinstance(key, str) or len(key) > 191 or not key:
+                raise ValueError(
+                    "facts.external_session_activity keys must be bounded non-empty strings"
+                )
+            normalized_external_activity[key] = timestamp(
+                value, f"facts.external_session_activity.{key}", required=True
+            )
+
     return {
         "number": number,
         "labels": labels,
         "created": created,
         "human_activity": human_activity,
         "prs": normalized_prs,
-        "markers": {"session": session, "done": done},
+        "markers": {"session": session, "owner": owner, "done": done},
         "bot": normalized_bot,
         "worker": normalized_worker,
         "release": normalized_release,
+        "external_session_activity": normalized_external_activity,
     }
 
 

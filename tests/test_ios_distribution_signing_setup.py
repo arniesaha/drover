@@ -760,3 +760,25 @@ def test_cleanup_removes_credentials_but_retains_recovery_state_when_restore_fai
     assert fixture["workspace"].is_dir()
     assert fixture["state_file"].is_file()
     assert fixture["keychain_state"].is_file()
+
+
+def test_widget_store_builds_use_the_app_local_networking_ats_policy():
+    """The widget fetches from the hub with the app's client, so its Release
+    and StoreRelease artifacts must not ship NSAllowsArbitraryLoads either."""
+    project = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "apps/drover/project.yml").read_text()
+    )
+    widget = project["targets"]["DroverWidget"]
+    settings = widget["settings"]
+    assert settings["base"]["DROVER_ATS_MODE"] == "arbitrary"
+    assert settings["base"]["INFOPLIST_FILE"] == (
+        "$(DERIVED_FILE_DIR)/DroverWidget-Info.plist"
+    )
+    for config in ("Release", "StoreRelease"):
+        assert settings["configs"][config]["DROVER_ATS_MODE"] == "local"
+    scripts = [phase["script"] for phase in widget["preBuildScripts"]]
+    assert any("NSAllowsLocalNetworking" in script for script in scripts)
+    assert any(
+        "plutil -remove NSAppTransportSecurity.NSAllowsArbitraryLoads" in script
+        for script in scripts
+    )

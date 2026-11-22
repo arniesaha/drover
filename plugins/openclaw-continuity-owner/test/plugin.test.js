@@ -10,6 +10,7 @@ const PARENT = "agent:main:mock-parent";
 const OWNER_PRINCIPAL = "legacy:operator";
 const EVENT = "a".repeat(64);
 const MODEL_CREDENTIAL = "fixture-model-input";
+let fixtureSequence = 0;
 const action = {
   action_id: "observer-action-" + EVENT, event_id: EVENT, type: "review_worker_result",
   authority_scope: "implementation", authorized: true,
@@ -20,6 +21,7 @@ function projection(overrides = {}) {
     version: 1, run_id: "run_PLUGIN497", session_id: "mock-observer", expected_revision: 4,
     authority: "taskflow", objective: "Canary", checkpoint: "Waiting for explicit owner",
     authority_scope: "implementation", scope_limit: "commit_only",
+    delivery_role: "standard", integration_serialization: null,
     owner_handoff: { authorized_owner_id: OWNER_PRINCIPAL, state: "owner_lease_required" },
     owner: { id: OWNER_PRINCIPAL, epoch: 1, lease_until: "2099-10-03T00:00:00+00:00", live: true },
     worker_state: "brief_completed", terminal_release: false, next_action: null,
@@ -37,7 +39,8 @@ async function fixture(t, handler = (_req, res) => res.end(JSON.stringify({ cont
     const parts = [];
     for await (const chunk of req) parts.push(chunk);
     const body = parts.length ? JSON.parse(Buffer.concat(parts)) : null;
-    if (new URL(req.url, "http://x").searchParams.has("owner_id")) {
+    const query = new URL(req.url, "http://x").searchParams;
+    if (!query.has("run_id") && query.has("owner_id")) {
       listings.push(req.url);
       res.setHeader("Content-Type", "application/json");
       return res.end(JSON.stringify({ owner_runs: listing.runs }));
@@ -47,15 +50,16 @@ async function fixture(t, handler = (_req, res) => res.end(JSON.stringify({ cont
     handler(req, res, body);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const tokenEnvName = `DROVER_PLUGIN_TEST_TOKEN_${fixtureSequence++}`;
   t.after(async () => {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
-    delete process.env.DROVER_PLUGIN_TEST_TOKEN;
+    delete process.env[tokenEnvName];
   });
-  process.env.DROVER_PLUGIN_TEST_TOKEN = "synthetic-canary-token";
+  process.env[tokenEnvName] = "synthetic-canary-token";
   const config = {
     enabled: true, droverOrigin: `http://127.0.0.1:${server.address().port}`,
-    tokenEnvName: "DROVER_PLUGIN_TEST_TOKEN", runId: "run_PLUGIN497",
+    tokenEnvName, runId: "run_PLUGIN497",
     ownerSessionKey: OWNER, ownerPrincipal: OWNER_PRINCIPAL, canarySessionKey: PARENT, authorityScope: "implementation",
   };
   return { config, calls, listings, listing, server };
@@ -138,9 +142,13 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
   runtime.services[0].start(health.context);
   await eventually(() => runtime.subagentWakeRequests.length === 1, "owner wake was not dispatched");
   await runtime.services[0].stop(health.context);
-  assert.deepEqual(f.calls.map((request) => request.method), ["GET", "GET", "POST"]);
+  assert.deepEqual(f.calls.map((request) => request.method), ["GET", "GET", "POST", "GET", "POST"]);
   assert.equal(f.calls[2].body.operation, "lease");
   assert.equal(f.calls[2].body.owner_id, OWNER_PRINCIPAL);
+  assert.deepEqual(f.calls[4].body, {
+    operation: "lease", owner_epoch: 2, lease_seconds: 0,
+    run_id: "run_PLUGIN497", owner_id: OWNER_PRINCIPAL,
+  });
   assert.equal(runtime.systemEvents.length, 1);
   assert.deepEqual(runtime.systemEvents[0].options, {
     sessionKey: OWNER,
@@ -149,6 +157,57 @@ test("owner mode acquires the trusted lease and wakes only the exact bound owner
   assert.deepEqual(runtime.subagentWakeRequests[0], { sessionKey: OWNER });
   assert.equal(runtime.wakeRequests.length, 0, "subagent owners must not use the plain heartbeat");
   assert.match(runtime.systemEvents[0].text, /acknowledge only after.*durably verified/);
+  assert.equal(health.failures.length, 0);
+});
+
+test("poll telemetry is attributed only after the exact owner binding is read", async (t) => {
+  const f = await fixture(t);
+  await tool({ ...f.config, mode: "owner" }).execute("poll", call("poll", {
+    session_activity_at: "2026-10-03T00:00:00.000Z",
+    last_error: "transient transport failure",
+  }));
+  assert.equal(f.calls.length, 2);
+  const initial = new URL(f.calls[0].url, "http://x").searchParams;
+  const telemetry = new URL(f.calls[1].url, "http://x").searchParams;
+  assert.equal(initial.get("owner_id"), null);
+  assert.equal(telemetry.get("owner_id"), OWNER_PRINCIPAL);
+  assert.equal(telemetry.get("session_activity_at"), "2026-10-03T00:00:00.000Z");
+  assert.equal(telemetry.get("last_error"), "transient transport failure");
+});
+
+test("service stop releases every held lease concurrently inside one drain deadline", async (t) => {
+  const bound = (runId, owner = OWNER) => projection({
+    run_id: runId,
+    owner_handoff: { authorized_owner_id: owner, state: "owner_lease_required" },
+    owner: { id: owner, epoch: 2, lease_until: "2099-10-03T00:00:00+00:00", live: true },
+    owner_wake: false,
+  });
+  const releases = [];
+  const f = await fixture(t, (req, res, body) => {
+    const runId = new URL(req.url, "http://x").searchParams.get("run_id") ?? body?.run_id;
+    if (req.method === "POST" && body.operation === "lease" && body.lease_seconds === 0) {
+      releases.push({ at: Date.now(), body });
+      return setTimeout(() => res.end(JSON.stringify({ continuity: bound(runId) })), 25);
+    }
+    res.end(JSON.stringify({ continuity: bound(runId) }));
+  });
+  f.listing.runs = ["run_A", "run_B"];
+  const { runId: _fixed, ...sessionConfig } = f.config;
+  const runtime = fakeApi({ ...sessionConfig, mode: "owner", wakePollIntervalMs: 10, maxDrainMs: 80 });
+  register(runtime.api);
+  const health = serviceContext(runtime.api.pluginConfig);
+  runtime.services[0].start(health.context);
+  await eventually(
+    // The third scoped poll can only begin after the first loop has stored
+    // both leased runs. Waiting for merely two polls races the second map
+    // insertion and can make the stop assertion observe only one held lease.
+    () => f.calls.filter((request) => request.method === "GET" && new URL(request.url, "http://x").searchParams.has("run_id")).length >= 3,
+    `listed runs were not fully leased: ${health.failures.map((failure) => String(failure)).join("; ")}`,
+  );
+  await runtime.services[0].stop(health.context);
+  assert.equal(releases.length, 2);
+  assert.ok(Math.abs(releases[0].at - releases[1].at) < 20, "releases must not consume serial timeout windows");
+  assert.ok(releases.every(({ body }) => body.owner_epoch === 2 && body.lease_seconds === 0));
   assert.equal(health.failures.length, 0);
 });
 
@@ -205,8 +264,8 @@ test("a coordinator run authorized to the agent session key is leased and woken 
   runtime.services[0].start(health.context);
   await eventually(() => runtime.subagentWakeRequests.length === 1, "owner wake was not dispatched");
   await runtime.services[0].stop(health.context);
-  assert.equal(f.calls[2].body.operation, "lease");
-  assert.equal(f.calls[2].body.owner_id, OWNER);
+  const lease = f.calls.find((request) => request.body?.operation === "lease" && request.body.lease_seconds !== 0);
+  assert.equal(lease.body.owner_id, OWNER);
   assert.equal(health.failures.length, 0);
 });
 
@@ -216,9 +275,9 @@ test("wake retries are bounded and durable acknowledgement suppresses replay", a
     report: { source: "drover", source_event_id: "worker-1", subject: "worker", sequence: 1,
       kind: "worker_brief_completed", summary: "Worker completed" } }] });
   const acknowledged = projection({ owner_wake: false, inbox_counts: { acknowledged: 1 }, events: [], has_more: false });
-  const f = await fixture(t, (_req, res) => {
-    polls++;
-    res.end(JSON.stringify({ continuity: polls >= 2 ? acknowledged : pending }));
+  const f = await fixture(t, (req, res) => {
+    if (req.method === "GET") polls++;
+    res.end(JSON.stringify({ continuity: polls >= 3 ? acknowledged : pending }));
   });
   const runtime = fakeApi({ ...f.config, mode: "owner", wakePollIntervalMs: 10, wakeRetryIntervalMs: 1000 });
   register(runtime.api);
@@ -310,7 +369,7 @@ test("a competing live owner is fenced without a wake or lease mutation", async 
   runtime.services[0].start(health.context);
   await eventually(() => health.failures.length > 0);
   await runtime.services[0].stop(health.context);
-  assert.deepEqual(f.calls.map((request) => request.method), ["GET"]);
+  assert.ok(f.calls.length >= 1 && f.calls.every((request) => request.method === "GET"));
   assert.equal(runtime.subagentWakeRequests.length, 0);
   assert.match(String(health.failures[0]), /competing live owner/);
 });
@@ -401,10 +460,10 @@ test("trusted configuration rejects unsafe origins, unknown keys and token argum
 
 test("missing credential, HTTP authorization refusal and redirects are not bypassed or retried", async (t) => {
   const f = await fixture(t, (_req, res) => { res.statusCode = 401; res.end('{"error":"contains synthetic-canary-token"}'); });
-  delete process.env.DROVER_PLUGIN_TEST_TOKEN;
+  delete process.env[f.config.tokenEnvName];
   await assert.rejects(tool(f.config).execute("poll", call("poll")), /credential environment variable/);
   assert.equal(f.calls.length, 0);
-  process.env.DROVER_PLUGIN_TEST_TOKEN = "synthetic-canary-token";
+  process.env[f.config.tokenEnvName] = "synthetic-canary-token";
   await assert.rejects(tool(f.config).execute("poll", call("poll")), (error) => {
     assert.match(error.message, /HTTP 401/);
     assert.ok(!error.message.includes("synthetic-canary-token"));
@@ -601,7 +660,7 @@ test("listed run ids are validated and truncation is warned", async (t) => {
   runtime.services[0].start(health.context);
   await eventually(() => f.calls.length >= 1);
   await runtime.services[0].stop(health.context);
-  assert.ok(f.calls.every((request) => new URL(request.url, "http://x").searchParams.get("run_id") === "run_OK"));
+  assert.ok(f.calls.filter((request) => request.method === "GET").every((request) => new URL(request.url, "http://x").searchParams.get("run_id") === "run_OK"));
   assert.equal(health.failures.filter((m) => /malformed listed run id/.test(m)).length, 2);
   const full = await fixture(t);
   full.listing.runs = Array.from({ length: 50 }, (_, index) => `run_${index}`);
@@ -623,7 +682,7 @@ test("a fixed runId restricts discovery to that run; null run_id means omitted",
   await eventually(() => f.calls.length >= 1);
   await runtime.services[0].stop(health.context);
   assert.equal(f.listings.length, 0);
-  assert.ok(f.calls.every((request) => new URL(request.url, "http://x").searchParams.get("run_id") === "run_PLUGIN497"));
+  assert.ok(f.calls.filter((request) => request.method === "GET").every((request) => new URL(request.url, "http://x").searchParams.get("run_id") === "run_PLUGIN497"));
   const polled = await tool({ ...f.config, mode: "owner" }).execute("poll", call("poll", { run_id: null }));
   assert.equal(polled.details.continuity.run_id, "run_PLUGIN497");
 });

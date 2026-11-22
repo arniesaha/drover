@@ -13,6 +13,7 @@ from drover.server.continuity_loop import (
     ShadowCompareService,
     action_identity,
     decide,
+    normalize_facts,
 )
 from drover.server.metrics import MetricsCollector
 from drover.server.web.app import start_metrics_server
@@ -162,6 +163,14 @@ def test_shadow_compare_accepts_legacy_action_only_payload():
         lambda value: value.update(worker="not-an-object"),
         lambda value: value.update(markers={"done": "not-a-list"}),
         lambda value: value.update(release={"running": "yes"}),
+        lambda value: value.update(external_session_activity="not-a-dict"),
+        lambda value: value.update(external_session_activity={"a": "not-a-time"}),
+        lambda value: value.update(
+            external_session_activity={"x" * 200: NOW.isoformat()}
+        ),
+        lambda value: value.update(
+            external_session_activity={f"k{i}": NOW.isoformat() for i in range(33)}
+        ),
     ],
 )
 def test_shadow_compare_rejects_malformed_nested_facts(mutate):
@@ -181,6 +190,33 @@ def test_shadow_compare_mutation_is_thread_safe_and_bounded():
         results = list(workers.map(compare, range(1000, 1050)))
     assert all(result["recorded"] for result in results)
     assert len(service.mismatches) == 7
+
+
+def test_external_activity_requires_the_exact_bound_owner_or_session():
+    owner_a = "agent:owner-a:main"
+    owner_b = "agent:owner-b:main"
+    stalled = facts(
+        markers={"session": "session-a", "owner": owner_a, "done": []},
+        external_session_activity={owner_b: NOW.isoformat()},
+    )
+    # A different active agent must not hide owner A's stalled issue.
+    assert decide(stalled, NOW).action == "nudge"
+    active = facts(
+        markers={"session": "session-a", "owner": owner_a, "done": []},
+        external_session_activity={owner_a: NOW.isoformat(), owner_b: NOW.isoformat()},
+    )
+    assert decide(active, NOW).action == "none"
+    assert normalize_facts(active)["markers"] == {
+        "session": "session-a",
+        "owner": owner_a,
+        "done": [],
+    }
+    assert (
+        normalize_facts(
+            facts(markers={"session": "session-a", "done": []}, owner_id=owner_a)
+        )["markers"]["owner"]
+        == owner_a
+    )
 
 
 def test_shadow_compare_http_returns_400_for_malformed_nested_facts(tmp_path):
@@ -215,3 +251,98 @@ def test_shadow_compare_http_returns_400_for_malformed_nested_facts(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_openclaw_session_activity_prevents_false_stall():
+    # Worker activity was 45m ago (> 30m idle window) so without external activity it nudges.
+    stale_worker = facts(
+        created=(NOW - timedelta(minutes=60)).isoformat(),
+        markers={"session": "agent:coder:main", "done": []},
+        worker={
+            "state": "working",
+            "state_at": (NOW - timedelta(minutes=45)).isoformat(),
+            "last_activity": (NOW - timedelta(minutes=45)).isoformat(),
+        },
+    )
+    assert decide(stale_worker, NOW).action == "nudge"
+
+    # With recent OpenClaw session activity (within 30m), decide() returns "none" (no false stall).
+    active_worker = facts(
+        created=(NOW - timedelta(minutes=60)).isoformat(),
+        markers={"session": "agent:coder:main", "done": []},
+        worker={
+            "state": "working",
+            "state_at": (NOW - timedelta(minutes=45)).isoformat(),
+            "last_activity": (NOW - timedelta(minutes=45)).isoformat(),
+        },
+        external_session_activity={
+            "agent:coder:main": (NOW - timedelta(minutes=10)).isoformat(),
+        },
+    )
+    assert decide(active_worker, NOW).action == "none"
+
+    # External activity older than 30m does not prevent nudge/stall.
+    stale_external = facts(
+        created=(NOW - timedelta(minutes=60)).isoformat(),
+        markers={"session": "agent:coder:main", "done": []},
+        worker={
+            "state": "working",
+            "state_at": (NOW - timedelta(minutes=45)).isoformat(),
+            "last_activity": (NOW - timedelta(minutes=45)).isoformat(),
+        },
+        external_session_activity={
+            "agent:coder:main": (NOW - timedelta(minutes=35)).isoformat(),
+        },
+    )
+    assert decide(stale_external, NOW).action == "nudge"
+
+
+def test_lease_renewal_survives_hub_restart(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    from drover.server.continuity_leases import LeaseConflict, OwnerLeaseStore
+    from drover.server.postgres_schema import CONTINUITY_LEASES_DDL
+
+    db_path = tmp_path / "control.duckdb"
+
+    # First hub connection: acquire initial lease
+    con1 = duckdb.connect(str(db_path))
+    for ddl in CONTINUITY_LEASES_DDL[:2]:
+        con1.execute(ddl)
+    store1 = OwnerLeaseStore(con1, clock=lambda: NOW)
+    initial_lease = store1.acquire(
+        "drover#821", owner_id="agent:coder:main", lease_seconds=60
+    )
+    assert initial_lease["owner_epoch"] == 1
+    assert initial_lease["owner_id"] == "agent:coder:main"
+    con1.close()
+
+    # Hub restart simulation: reconnect with new connection/store instance
+    con2 = duckdb.connect(str(db_path))
+    store2 = OwnerLeaseStore(con2, clock=lambda: NOW + timedelta(seconds=15))
+
+    # Same owner renews lease with epoch 1 across the restart
+    renewed = store2.renew(
+        "drover#821", owner_id="agent:coder:main", owner_epoch=1, lease_seconds=60
+    )
+    assert renewed["owner_epoch"] == 1
+    assert renewed["owner_id"] == "agent:coder:main"
+
+    # Competing owner takeover during live lease is rejected
+    with pytest.raises(LeaseConflict):
+        store2.acquire("drover#821", owner_id="agent:other:main")
+
+    # Mismatched epoch renew is rejected
+    with pytest.raises(LeaseConflict):
+        store2.renew("drover#821", owner_id="agent:coder:main", owner_epoch=99)
+
+    # After expiry/release, re-acquisition monotonically advances epoch
+    store2.release("drover#821", owner_id="agent:coder:main", owner_epoch=1)
+    reacquired = store2.acquire(
+        "drover#821", owner_id="agent:coder:main", lease_seconds=60
+    )
+    assert reacquired["owner_epoch"] == 2
+
+    # Old epoch 1 is now fenced
+    with pytest.raises(LeaseConflict):
+        store2.renew("drover#821", owner_id="agent:coder:main", owner_epoch=1)
+    con2.close()

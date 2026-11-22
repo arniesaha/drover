@@ -27,7 +27,7 @@ A request without a valid credential returns `401`. The health checks, the login
 | --- | --- | --- |
 | Device | A pairing code from `drover-server pair` | The fleet API. The phone holds one. |
 | Host | A pairing code from `drover-server pair-host` | Host registration and relay. |
-| Profile | `drover profile agents issue AGENT` | Read-only. Only the profile. |
+| Profile | `drover-server profile agents issue AGENT` | Read-only. Only the profile. |
 | Preflight | `drover-server credentials issue-preflight` | Read-only. Health, release identity and the host list. |
 | Shared token | `~/.drover/api_token` | All routes, and operator actions. |
 

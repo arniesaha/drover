@@ -1,0 +1,28 @@
+# Minimal hub config for deploy/compose.yaml. Every value not set here takes
+# the default from `drover-server init`; see docs/getting-started.md.
+# Secrets never go in this file: the DSN and API token arrive through the
+# environment variables named below.
+
+[paths]
+# All state lives on the drover-data volume mounted at /var/lib/drover.
+incoming_dir = "/var/lib/drover/incoming"
+parquet_dir  = "/var/lib/drover/parquet"
+duckdb_path  = "/var/lib/drover/drover.duckdb"
+
+[control_store]
+backend = "postgres"
+dsn_env = "DROVER_CONTROL_DSN"
+
+[server]
+# Listen on every container interface so the published port reaches the hub.
+# compose.yaml publishes it on 127.0.0.1 only; widen that deliberately.
+metrics_host = "0.0.0.0"
+metrics_http_port = 7080
+# Set this to the private LAN or Tailscale URL phones and other hosts use to
+# reach this machine before running `drover-server pair`.
+advertised_url = ""
+
+[auth]
+# Token resolution: DROVER_API_TOKEN from the environment first.
+enabled = true
+api_token = ""
