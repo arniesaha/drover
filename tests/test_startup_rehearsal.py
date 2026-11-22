@@ -99,7 +99,7 @@ def test_ducklake_startup_pins_before_workers_without_requiring_retirement(
     from types import SimpleNamespace
 
     from drover.config import MemoryBudgetConfig
-    from drover.server.lake import writer_gate
+    from drover.server.lake import serving, writer_gate
 
     path = tmp_path / "analytical.duckdb"
     cfg = SimpleNamespace(
@@ -109,7 +109,21 @@ def test_ducklake_startup_pins_before_workers_without_requiring_retirement(
         analytics=SimpleNamespace(backend=backend, retire_legacy_writers=retired),
         duckdb_path=path,
     )
-    monkeypatch.setattr(server_main, "_resolve_config", lambda _: cfg)
+
+    def resolve(_path, *, validate_analytics=True):
+        # run intentionally defers the physical lake gate until role selection.
+        assert validate_analytics is False
+        return cfg
+
+    monkeypatch.setattr(server_main, "_resolve_config", resolve)
+    # This test owns pin-before-bootstrap ordering; the actual-config recovery
+    # regressions cover registration/proof behavior through the real resolver.
+    configure = Mock()
+    validate = Mock()
+    check = Mock()
+    monkeypatch.setattr(serving, "configure_analytics", configure)
+    monkeypatch.setattr(serving, "validate_startup_config", validate)
+    monkeypatch.setattr(serving, "check_selected", check)
     monkeypatch.setattr(server_main, "_register_stack_dump", lambda: None)
     monkeypatch.setattr(threading.Thread, "start", Mock())
     monkeypatch.setattr(server_main, "require_control_store_ready", Mock())
@@ -124,6 +138,14 @@ def test_ducklake_startup_pins_before_workers_without_requiring_retirement(
         )
     pin.assert_called_once_with(path, enabled=expected)
     bootstrap.assert_not_called()
+    if backend == "ducklake":
+        configure.assert_called_once_with(path, cfg.analytics)
+        validate.assert_called_once_with(cfg.analytics)
+        check.assert_called_once_with(path)
+    else:
+        configure.assert_not_called()
+        validate.assert_not_called()
+        check.assert_not_called()
 
 
 def test_backlog_prunes_archive_before_enumeration(tmp_path):
