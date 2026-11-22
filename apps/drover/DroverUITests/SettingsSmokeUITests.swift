@@ -67,6 +67,38 @@ final class SettingsSmokeUITests: XCTestCase {
     }
 
     @MainActor
+    func testManualCodeFieldTapStaysOnPairingPage() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_BASE_URL"] = " "
+        app.launchEnvironment["DROVER_TOKEN"] = " "
+        app.launchArguments += ["-drover.server.url", " "]
+        app.launch()
+
+        let alreadyHaveServer = app.buttons["onboarding-already-have-server-button"]
+        XCTAssertTrue(alreadyHaveServer.waitForExistence(timeout: 10))
+        alreadyHaveServer.tap()
+
+        let urlField = app.textFields["onboarding-server-url-field"]
+        XCTAssertTrue(urlField.waitForExistence(timeout: 10))
+        urlField.tap()
+        // This inert private-LAN shape is never submitted, so the test has no
+        // server, credential, or pairing-code side effect.
+        urlField.typeText("http://192.168.1.99:7080")
+
+        let codeField = app.textFields["onboarding-pairing-code-field"]
+        XCTAssertTrue(codeField.waitForExistence(timeout: 10))
+        XCTAssertTrue(codeField.isHittable)
+        codeField.tap()
+
+        XCTAssertTrue(
+            app.textFields["onboarding-server-url-field"].waitForExistence(timeout: 5),
+            "tapping the manual code field must leave the pairing page active"
+        )
+        XCTAssertFalse(app.otherElements["tab-home"].exists,
+                       "the code-field tap must not be intercepted as Demo")
+    }
+
+    @MainActor
     func testWorkerHostShowsPrimaryHubPairingCommand() {
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_BASE_URL"] = " "

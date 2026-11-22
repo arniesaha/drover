@@ -300,54 +300,12 @@ struct OnboardingView: View {
                         .droverText(.subtitle)
                         .foregroundStyle(DroverColor.accentHi)
                 }
+
+                manualPairActions
             }
             .padding(.horizontal, 18)
             .padding(.top, 10)
             .padding(.bottom, 28)
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 8) {
-                Button {
-                    guard let payload = pairingModel.manualPayload() else { return }
-                    Task { await pair(payload) }
-                } label: {
-                    Text(pairingModel.isPairing ? "Pairing..." : "Pair")
-                        .droverText(.h3)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                }
-                .disabled(!pairingModel.canSubmitManualCode || pairingModel.isPairing)
-                .foregroundStyle(DroverColor.accentHi)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(DroverColor.accentHi, lineWidth: 1)
-                }
-                .accessibilityIdentifier("onboarding-pair-submit-button")
-
-                Button {
-                    environment.enterDemoMode()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "sparkles")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text("Try a demo — no computer needed")
-                            .font(.system(.subheadline, design: .default, weight: .medium))
-                    }
-                            .foregroundStyle(DroverColor.accentHi)
-                            .frame(maxWidth: .infinity)
-                            .frame(minHeight: 44)
-                    .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(DroverColor.line, lineWidth: 1)
-                    }
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("pairing-try-demo-button")
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 10)
-            .background(DroverColor.bg)
         }
         .scrollDismissesKeyboard(.interactively)
         .onAppear {
@@ -355,6 +313,49 @@ struct OnboardingView: View {
                 pairingModel.serverURLString = config.baseURL.absoluteString
             }
         }
+    }
+
+    private var manualPairActions: some View {
+        VStack(spacing: 8) {
+            Button {
+                guard let payload = pairingModel.manualPayload() else { return }
+                Task { await pair(payload) }
+            } label: {
+                Text(pairingModel.isPairing ? "Pairing..." : "Pair")
+                    .droverText(.h3)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+            }
+            .disabled(!pairingModel.canSubmitManualCode || pairingModel.isPairing)
+            .foregroundStyle(DroverColor.accentHi)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+            }
+            .accessibilityIdentifier("onboarding-pair-submit-button")
+
+            Button {
+                environment.enterDemoMode()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("Try a demo — no computer needed")
+                        .font(.system(.subheadline, design: .default, weight: .medium))
+                }
+                .foregroundStyle(DroverColor.accentHi)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: 44)
+                .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(DroverColor.line, lineWidth: 1)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("pairing-try-demo-button")
+        }
+        .padding(.top, 4)
     }
 
     // MARK: - Helpers
