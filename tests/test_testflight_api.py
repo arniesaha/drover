@@ -5,7 +5,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
-from ios.testflight_api import Client, Rejected, distribute, token
+from ios.testflight_api import Client, Rejected, distribute, inventory, token
 
 INFO = {
     "CFBundleIdentifier": "com.arnab.drover",
@@ -258,6 +258,209 @@ def test_client_pagination_and_timeout_with_fake_opener(key):
     assert client.collection("/v1/apps", deadline=5) == [{"id": "one"}, {"id": "two"}]
     with pytest.raises(Rejected, match="unsafe pagination"):
         client.request("GET", "https://evil.example/v1/apps", deadline=5)
+
+
+def test_client_collection_rejects_a_next_page_beyond_the_bound(key):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, limit):
+            return json.dumps(
+                {
+                    "data": [{"id": "one"}],
+                    "links": {
+                        "next": "https://api.appstoreconnect.apple.com/v1/apps?cursor=two"
+                    },
+                }
+            ).encode()
+
+    class Opener:
+        def open(self, request, timeout):
+            return Response()
+
+    client = Client(key[0], "KEY", "issuer", opener=Opener(), clock=lambda: 0)
+    with pytest.raises(Rejected, match="page limit"):
+        client.collection("/v1/apps", deadline=5, max_pages=1)
+
+
+class InventoryClient:
+    def __init__(self):
+        self.calls = []
+
+    def collection(self, path, *, params=None, deadline, max_pages=None):
+        self.calls.append((path, params, deadline, max_pages))
+        if path == "/v1/apps":
+            return [{"id": "private-app-id"}]
+        if path == "/v1/preReleaseVersions":
+            return [
+                {"id": "version-2", "attributes": {"version": "2.0"}},
+                {"id": "version-1", "attributes": {"version": "1.9"}},
+            ]
+        if path == "/v1/preReleaseVersions/version-2/builds":
+            return [
+                {
+                    "id": "private-build-id",
+                    "attributes": {"version": "42", "processingState": "VALID"},
+                }
+            ]
+        if path == "/v1/preReleaseVersions/version-1/builds":
+            return [
+                {
+                    "id": "another-private-build-id",
+                    "attributes": {"version": "41", "processingState": "PROCESSING"},
+                }
+            ]
+        if path == "/v1/betaGroups":
+            return [
+                {
+                    "id": "private-group-id",
+                    "attributes": {"name": "Drover Internal", "isInternalGroup": True},
+                }
+            ]
+        raise AssertionError(path)
+
+
+def test_inventory_is_get_only_paginated_bounded_and_allowlisted():
+    client = InventoryClient()
+
+    result = inventory(
+        client,
+        "com.arnab.drover",
+        timeout=60,
+        max_pages=2,
+        max_versions=2,
+        max_builds_per_version=2,
+        clock=lambda: 0,
+    )
+
+    assert result == {
+        "versions": [{"version": "1.9"}, {"version": "2.0"}],
+        "builds": [
+            {"version": "1.9", "build": "41", "processing_state": "PROCESSING"},
+            {"version": "2.0", "build": "42", "processing_state": "VALID"},
+        ],
+        "internal_groups": [{"name": "Drover Internal"}],
+    }
+    assert all(call[3] == 2 for call in client.calls)
+    assert client.calls[0][1] == {"filter[bundleId]": "com.arnab.drover", "limit": 2}
+    assert "private-" not in json.dumps(result)
+    assert {call[0] for call in client.calls} == {
+        "/v1/apps",
+        "/v1/preReleaseVersions",
+        "/v1/preReleaseVersions/version-2/builds",
+        "/v1/preReleaseVersions/version-1/builds",
+        "/v1/betaGroups",
+    }
+
+
+@pytest.mark.parametrize(
+    "response",
+    [[], [{"id": "app"}, {"id": "other"}], [{"attributes": {}}]],
+)
+def test_inventory_rejects_missing_or_ambiguous_app_metadata(response):
+    class BadClient(InventoryClient):
+        def collection(self, path, **kwargs):
+            if path == "/v1/apps":
+                return response
+            return super().collection(path, **kwargs)
+
+    with pytest.raises(Rejected, match="app record"):
+        inventory(BadClient(), "com.arnab.drover", clock=lambda: 0)
+
+
+def test_inventory_fails_closed_on_collection_failure_without_exposing_error():
+    from ios.testflight_api import Retryable
+
+    class FailingClient(InventoryClient):
+        def collection(self, path, **kwargs):
+            raise Retryable("private API body")
+
+    with pytest.raises(Rejected, match="temporarily unavailable") as error:
+        inventory(FailingClient(), "com.arnab.drover", clock=lambda: 0)
+    assert "private" not in str(error.value)
+
+
+def test_inventory_command_writes_only_allowlisted_record(tmp_path, monkeypatch):
+    from ios import testflight_inventory as command
+
+    key = tmp_path / "AuthKey_EXAMPLE123.p8"
+    key.write_text("synthetic private key")
+    key.chmod(0o600)
+    output = tmp_path / "inventory.json"
+    monkeypatch.setattr(command, "Client", lambda *args: object())
+    monkeypatch.setattr(
+        command,
+        "inventory",
+        lambda *args: {
+            "versions": [{"version": "2.0"}],
+            "builds": [{"version": "2.0", "build": "42", "processing_state": "VALID"}],
+            "internal_groups": [{"name": "Drover Internal"}],
+        },
+    )
+
+    command.main(
+        [
+            "--bundle-id",
+            "com.arnab.drover",
+            "--api-key-id",
+            "EXAMPLE123",
+            "--api-issuer",
+            "11111111-2222-3333-4444-555555555555",
+            "--private-key",
+            str(key),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert json.loads(output.read_text()) == {
+        "versions": [{"version": "2.0"}],
+        "builds": [{"version": "2.0", "build": "42", "processing_state": "VALID"}],
+        "internal_groups": [{"name": "Drover Internal"}],
+    }
+
+
+def test_inventory_command_rejects_an_unallowlisted_artifact_field(
+    tmp_path, monkeypatch
+):
+    from ios import testflight_inventory as command
+
+    key = tmp_path / "AuthKey_EXAMPLE123.p8"
+    key.write_text("synthetic private key")
+    key.chmod(0o600)
+    output = tmp_path / "inventory.json"
+    monkeypatch.setattr(command, "Client", lambda *args: object())
+    monkeypatch.setattr(
+        command,
+        "inventory",
+        lambda *args: {
+            "versions": [],
+            "builds": [],
+            "internal_groups": [],
+            "private_api_detail": "must not be written",
+        },
+    )
+
+    with pytest.raises(SystemExit, match="private diagnostics discarded"):
+        command.main(
+            [
+                "--bundle-id",
+                "com.arnab.drover",
+                "--api-key-id",
+                "EXAMPLE123",
+                "--api-issuer",
+                "11111111-2222-3333-4444-555555555555",
+                "--private-key",
+                str(key),
+                "--output",
+                str(output),
+            ]
+        )
+    assert not output.exists()
 
 
 def test_http_errors_never_expose_key_or_body(key):

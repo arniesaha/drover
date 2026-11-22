@@ -1,0 +1,97 @@
+name: App Store Connect inventory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-app-store-inventory
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    environment: ios-testflight-upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Install ASC API dependency
+      run: python3 -m pip install 'cryptography>=42,<47'
+    - name: Materialize transient ASC credential
+      env:
+        DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
+        DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
+        DROVER_APPSTORE_API_PRIVATE_KEY_BASE64: ${{ secrets.DROVER_APPSTORE_API_PRIVATE_KEY_BASE64 }}
+      run: |
+        python3 - <<'PY'
+        import base64, os, re, shutil
+        from pathlib import Path
+        try:
+            root = Path(os.environ["RUNNER_TEMP"])
+            key_id = os.environ["DROVER_APPSTORE_API_KEY_ID"]
+            issuer = os.environ["DROVER_APPSTORE_API_ISSUER_ID"]
+            if not re.fullmatch(r"[A-Z0-9]{8,20}", key_id):
+                raise ValueError()
+            if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", issuer):
+                raise ValueError()
+            directory = root / "drover-asc-inventory-key"
+            directory.mkdir(mode=0o700)
+            material = base64.b64decode(os.environ["DROVER_APPSTORE_API_PRIVATE_KEY_BASE64"], validate=True)
+            path = directory / f"AuthKey_{key_id}.p8"
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(material)
+        except Exception:
+            try:
+                shutil.rmtree(Path(os.environ["RUNNER_TEMP"]) / "drover-asc-inventory-key")
+            except Exception:
+                pass
+            raise SystemExit("ASC inventory credential unavailable; private diagnostics discarded")
+        PY
+    - name: Query App Store Connect inventory
+      env:
+        DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
+        DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
+      run: |
+        python3 scripts/ios/testflight_inventory.py \
+          --bundle-id com.arnab.drover \
+          --api-key-id "$DROVER_APPSTORE_API_KEY_ID" \
+          --api-issuer "$DROVER_APPSTORE_API_ISSUER_ID" \
+          --private-key "$RUNNER_TEMP/drover-asc-inventory-key/AuthKey_${DROVER_APPSTORE_API_KEY_ID}.p8" \
+          --output "$RUNNER_TEMP/app-store-connect-inventory.json"
+    - name: Remove transient ASC credential
+      if: always()
+      run: |
+        python3 - <<'PY'
+        import os, shutil
+        from pathlib import Path
+        try:
+            directory = Path(os.environ["RUNNER_TEMP"]) / "drover-asc-inventory-key"
+            if directory.is_symlink():
+                raise ValueError()
+            if directory.exists():
+                shutil.rmtree(directory)
+            if directory.exists():
+                raise ValueError()
+        except Exception:
+            raise SystemExit("ASC inventory credential cleanup failed; private diagnostics discarded")
+        PY
+    - name: Upload sanitized inventory
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-store-connect-inventory
+        path: ${{ runner.temp }}/app-store-connect-inventory.json
+        if-no-files-found: ignore
+        retention-days: 7
