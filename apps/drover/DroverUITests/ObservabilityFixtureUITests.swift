@@ -538,6 +538,11 @@ final class ObservabilityFixtureUITests: XCTestCase {
             XCTAssertTrue(analyticsHeader.exists)
         }
 
+        // Release only after every physical gesture and loading assertion.
+        let release = app.buttons["fixture-release-analytics"]
+        XCTAssertTrue(release.exists)
+        release.tap()
+
         let firstAnalyticsResponse = NSPredicate(format: "label == %@", "1")
         let initialUpdate = expectation(
             for: firstAnalyticsResponse,

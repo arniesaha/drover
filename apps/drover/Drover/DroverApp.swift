@@ -334,6 +334,14 @@ private struct FixturePreparedRoot: View {
                     chatModelFactory: scenario.makeClient().chatModelFactory,
                     backgroundActivityEnabled: false
                 )
+                .overlay(alignment: .bottomTrailing) {
+                    if scenario.transport.receiptState.delaysAnalytics {
+                        Button("Release analytics fixture") {
+                            scenario.transport.receiptState.releaseAnalytics()
+                        }
+                        .accessibilityIdentifier("fixture-release-analytics")
+                    }
+                }
                 .overlay(alignment: .topTrailing) {
                     TimelineView(.periodic(from: .now, by: 0.2)) { _ in
                         VStack {

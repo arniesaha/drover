@@ -18,6 +18,8 @@ final class FixtureReceiptState: @unchecked Sendable {
     private let defaults: UserDefaults
     let kind: FixtureScenarioKind
     let delaysAnalytics: Bool
+    private var analyticsReleased = false
+    private var pendingAnalytics: [UUID: @Sendable () -> Void] = [:]
 
     init(
         runID: String,
@@ -47,6 +49,30 @@ final class FixtureReceiptState: @unchecked Sendable {
 
     var analyticsResponseCount: Int {
         lock.withLock { defaults.integer(forKey: Key.analyticsResponseCount) }
+    }
+
+    /// Test-controlled barrier: gestures, not elapsed wall time, release the response.
+    func holdAnalytics(id: UUID, delivery: @escaping @Sendable () -> Void) {
+        let held = lock.withLock {
+            guard delaysAnalytics, !analyticsReleased else { return false }
+            pendingAnalytics[id] = delivery
+            return true
+        }
+        if !held { delivery() }
+    }
+
+    func cancelAnalytics(id: UUID) {
+        lock.withLock { _ = pendingAnalytics.removeValue(forKey: id) }
+    }
+
+    func releaseAnalytics() {
+        let deliveries = lock.withLock {
+            analyticsReleased = true
+            let deliveries = Array(pendingAnalytics.values)
+            pendingAnalytics.removeAll()
+            return deliveries
+        }
+        for delivery in deliveries { delivery() }
     }
 
     func recordAnalyticsResponse() {
@@ -118,7 +144,7 @@ final class FixtureReceiptState: @unchecked Sendable {
     }
 }
 
-struct FixtureHubResponse {
+struct FixtureHubResponse: Sendable {
     let status: Int
     let body: Data
 
@@ -133,7 +159,10 @@ struct FixtureHubResponse {
 /// URLSession-only fixture transport. It is installed into one ephemeral
 /// session by `UITestScenario`; it can never receive a request from the live
 /// app session and it never opens a network connection.
-final class FixtureHubURLProtocol: URLProtocol {
+final class FixtureHubURLProtocol: URLProtocol, @unchecked Sendable {
+    private let deliveryLock = NSRecursiveLock()
+    private var stopped = false
+    private let analyticsID = UUID()
     private static let stateLock = NSLock()
     // `URLProtocol` invokes instances off the main actor. Accesses are
     // serialized by `stateLock`; make that externally synchronized contract
@@ -158,15 +187,20 @@ final class FixtureHubURLProtocol: URLProtocol {
             return
         }
         let response = route(request, url: url, state: state)
-        // This only runs in the UI-test transport. It deliberately keeps the
-        // real Analytics view in its loading state long enough to exercise
-        // horizontal gestures, rather than changing app transition timing.
-        if url.path == "/analytics" {
-            if state.delaysAnalytics {
-                Thread.sleep(forTimeInterval: 6)
+        if url.path == "/analytics", state.delaysAnalytics {
+            state.holdAnalytics(id: analyticsID) { [weak self] in
+                self?.deliver(response, url: url, state: state)
             }
-            state.recordAnalyticsResponse()
+        } else {
+            deliver(response, url: url, state: state)
         }
+    }
+
+    private func deliver(_ response: FixtureHubResponse, url: URL, state: FixtureReceiptState) {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        guard !stopped else { return }
+        if url.path == "/analytics" { state.recordAnalyticsResponse() }
         let http = HTTPURLResponse(
             url: url,
             statusCode: response.status,
@@ -178,7 +212,10 @@ final class FixtureHubURLProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        deliveryLock.withLock { stopped = true }
+        Self.state?.cancelAnalytics(id: analyticsID)
+    }
 
     private func route(
         _ request: URLRequest,
