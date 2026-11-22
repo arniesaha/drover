@@ -38,6 +38,8 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
         "drover_work_update",
         "drover_work_question",
         "drover_work_decide",
+        "drover_work_delegate",
+        "drover_work_revoke_delegation",
         "drover_profile",
         "drover_profile_propose",
         "drover_memory_acceptance",

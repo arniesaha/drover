@@ -62,7 +62,15 @@ def test_every_registered_read_enforces_caps(tmp_path, monkeypatch):
         "drover_profile_propose",
         *{
             "drover_work_" + operation
-            for operation in ("launch", "link", "update", "question", "decide")
+            for operation in (
+                "launch",
+                "link",
+                "update",
+                "question",
+                "decide",
+                "delegate",
+                "revoke_delegation",
+            )
         },
     } == set(READ_CAPS)
     for tool in registered:

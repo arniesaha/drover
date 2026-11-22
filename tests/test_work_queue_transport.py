@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -132,7 +133,90 @@ def test_bound_live_reads_and_shadow_write_guard(transport):
     assert not service.store.links()
 
 
-def test_mcp_seven_tools_are_thin_control_proxies(
+def test_http_delegation_is_paired_exact_and_replay_safe(transport):
+    service, _, url, device, host, _ = transport
+    principal = next(iter(service.config.principal_roles))
+    headers = {"Authorization": "Bearer " + device}
+    grant_args = {
+        "goal_id": "goal",
+        "number": 1,
+        "request_key": "http:delegation:grant",
+        "delegatee_principal": principal,
+        "action": "launch",
+        "stage": "work",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    }
+    disabled = requests.post(
+        url + "/work/delegate", json=grant_args, headers=headers, timeout=5
+    )
+    assert disabled.status_code == 403
+    service.config = service.config.model_copy(
+        update={
+            "principal_roles": {principal: "worker"},
+            "audited_delegation": service.config.audited_delegation.model_copy(
+                update={"enabled": True}
+            ),
+        }
+    )
+    ordinary = requests.post(
+        url + "/work/launch",
+        json={
+            "goal_id": "goal",
+            "number": 1,
+            "request_key": "http:delegation:ordinary",
+            "estimated_cost": 5,
+        },
+        headers=headers,
+        timeout=5,
+    )
+    assert ordinary.status_code == 403
+    for token in (host, "synthetic-legacy"):
+        denied = requests.post(
+            url + "/work/delegate",
+            json=grant_args,
+            headers={"Authorization": "Bearer " + token},
+            timeout=5,
+        )
+        assert denied.status_code == 403
+    grant = requests.post(
+        url + "/work/delegate", json=grant_args, headers=headers, timeout=5
+    )
+    assert grant.status_code == 200
+    delegation_id = grant.json()["delegation_id"]
+    launch_args = {
+        "goal_id": "goal",
+        "number": 1,
+        "request_key": "http:delegation:launch",
+        "estimated_cost": 5,
+        "delegation_id": delegation_id,
+    }
+    legacy = requests.post(
+        url + "/work/launch",
+        json=launch_args,
+        headers={"Authorization": "Bearer synthetic-legacy"},
+        timeout=5,
+    )
+    assert legacy.status_code == 403
+    delegated = requests.post(
+        url + "/work/launch", json=launch_args, headers=headers, timeout=5
+    )
+    assert delegated.status_code == 200
+    assert (
+        requests.post(
+            url + "/work/launch", json=launch_args, headers=headers, timeout=5
+        ).json()
+        == delegated.json()
+    )
+    replay = requests.post(
+        url + "/work/launch",
+        json={**launch_args, "request_key": "http:delegation:replay"},
+        headers=headers,
+        timeout=5,
+    )
+    assert replay.status_code == 403
+
+
+def test_mcp_nine_tools_are_thin_control_proxies(
     transport, monkeypatch, authenticated_mcp
 ):
     service, auth, url, device, _, _ = transport
@@ -153,7 +237,17 @@ def test_mcp_seven_tools_are_thin_control_proxies(
     tools = asyncio.run(server.list_tools())
     assert {
         "drover_work_" + name
-        for name in ("list", "get", "launch", "link", "update", "question", "decide")
+        for name in (
+            "list",
+            "get",
+            "launch",
+            "link",
+            "update",
+            "question",
+            "decide",
+            "delegate",
+            "revoke_delegation",
+        )
     } <= {t.name for t in tools}
 
     def call(name, args):
