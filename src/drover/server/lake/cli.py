@@ -359,10 +359,12 @@ def preflight_cmd(ctx):
     """
     from drover.server.__main__ import _resolve_config
 
-    from .serving import check_selected
+    from .serving import check_selected, configure_analytics, validate_startup_config
 
-    cfg = _resolve_config(ctx.obj["config_path"])
+    cfg = _resolve_config(ctx.obj["config_path"], validate_analytics=False)
     try:
+        configure_analytics(cfg.duckdb_path, cfg.analytics)
+        validate_startup_config(cfg.analytics)
         check_selected(cfg.duckdb_path)
     except LakeError as exc:
         raise _lake_failure(exc, cfg.analytics.data_root) from None

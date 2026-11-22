@@ -3226,10 +3226,19 @@ def run(
         )
     if cfg.analytics.backend == "ducklake":
         from drover.server.lake.runtime import LakeError
-        from drover.server.lake.serving import check_selected
+        from drover.server.lake.serving import (
+            check_selected,
+            configure_analytics,
+            validate_startup_config,
+        )
 
         try:
             with _startup_phase("preflight_ducklake_serving"):
+                # Resolution deliberately skips analytics for the no-touch API
+                # role. Register here before checking: an unregistered path
+                # otherwise selects the legacy backend and silently skips proof.
+                configure_analytics(cfg.duckdb_path, cfg.analytics)
+                validate_startup_config(cfg.analytics)
                 check_selected(cfg.duckdb_path)
         except LakeError as exc:
             if selected_role != "all" or cfg.control_store.backend != "postgres":

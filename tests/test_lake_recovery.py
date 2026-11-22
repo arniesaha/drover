@@ -35,6 +35,8 @@ def test_unservable_lake_starts_only_explicit_recovery_control(monkeypatch):
         ),
     )
     monkeypatch.setattr(entry, "_resolve_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr(serving, "_CONFIGS", {})
+    monkeypatch.setattr(serving, "validate_startup_config", lambda *_a: None)
     monkeypatch.setattr(process_memory, "configure_memory_guard", lambda *_a: None)
     for name in ("FootprintWatchdog", "StartupFootprintSampler"):
         monkeypatch.setattr(entry, name, lambda: SimpleNamespace(start=lambda: None))
@@ -239,3 +241,120 @@ def test_bad_shared_lake_refuses_update_before_any_drain(monkeypatch, tmp_path):
     assert host.maybe_activate() is False
     assert refused == [("0.1.4", "lake_preflight")]
     assert host._pending == "0.1.4"
+
+
+@pytest.mark.parametrize(
+    "role", ["all", "analytics", "api", "success", "validation", "preflight"]
+)
+def test_real_config_registers_selected_lake_before_startup(
+    monkeypatch, tmp_path, role
+):
+    """Fresh-process selection must not silently become the legacy backend."""
+    import json
+
+    from drover.server import __main__ as entry
+    from drover.server import control_store, db, process_memory
+    from drover.server.lake import runtime, serving
+
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    config = tmp_path / "config.toml"
+    selector = tmp_path / "selector"
+    config.write_text(
+        "[paths]\nduckdb_path = " + json.dumps(str(selector)) + "\n"
+        '[control_store]\nbackend = "postgres"\ndsn_env = "TEST_CONTROL_DSN"\n'
+        '[analytics]\nbackend = "ducklake"\ncatalog_dsn_env = "TEST_READER_DSN"\n'
+        "data_root = " + json.dumps(str(lake)) + "\n"
+        "extension_dir = " + json.dumps(str(tmp_path / "extensions")) + "\n"
+        'engine_sha256 = "' + "0" * 64 + '"\n'
+        'verification_sha256 = "' + "1" * 64 + '"\n'
+    )
+    monkeypatch.setenv("TEST_CONTROL_DSN", "postgresql://localhost/test_control")
+    monkeypatch.setenv("TEST_READER_DSN", "postgresql://localhost/test_lake")
+    monkeypatch.setenv("DROVER_API_TO_ANALYTICS_TOKEN", "test-internal")
+    monkeypatch.setenv("DROVER_ANALYTICS_TO_API_TOKEN", "test-return")
+    monkeypatch.setattr(serving, "_CONFIGS", {})
+    # Keep resolver, path registration, startup validation, check_selected,
+    # open_history and HistoryConnection real; replace only physical IO.
+    monkeypatch.setattr(runtime, "verify_runtime", lambda spec: None)
+    monkeypatch.setattr(process_memory, "configure_memory_guard", lambda *_: None)
+    for name in ("FootprintWatchdog", "StartupFootprintSampler"):
+        monkeypatch.setattr(entry, name, lambda: SimpleNamespace(start=lambda: None))
+
+    class IdentityConnection:
+        def execute(self, *_):
+            return self
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+    monkeypatch.setattr(db, "control_plane_connection", lambda _: IdentityConnection())
+    queries = []
+
+    def query(spec, sql, params, **kwargs):
+        assert serving.selected_config(selector).backend == "ducklake"
+        assert spec.catalog_dsn_env == "TEST_READER_DSN"
+        queries.append(sql)
+        if role != "success":
+            raise runtime.LakeError("lake_verification_file_limit")
+        return {"columns": ["1"], "types": ["INTEGER"], "rows": [[1]]}
+
+    monkeypatch.setattr(serving, "query", query)
+    called = []
+    monkeypatch.setattr(entry, "_run_api_role", lambda **kw: called.append(kw))
+
+    class ReachedBootstrap(Exception):
+        pass
+
+    def bootstrap(**kwargs):
+        assert serving.selected_config(selector).backend == "ducklake"
+        raise ReachedBootstrap()
+
+    monkeypatch.setattr(entry, "bootstrap", bootstrap)
+    # Stop successful startup before any real pool/bootstrap/filesystem workers.
+    monkeypatch.setattr(
+        entry, "startup_control_plane_checkpoint", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(entry, "pin_control_plane_connection", lambda *_a, **_k: None)
+    monkeypatch.setattr(entry, "pin_analytical_connection", lambda *_a, **_k: None)
+    selected_role = "all" if role in ("success", "validation") else role
+    if role in ("validation", "preflight"):
+        lake.rmdir()
+    args = ["--config", str(config)] + (
+        ["lake", "preflight"]
+        if role == "preflight"
+        else ["run", "--role", selected_role]
+    )
+    result = CliRunner().invoke(entry.main, args)
+    if role == "preflight":
+        assert result.exit_code != 0
+        assert "lake_data_root_missing" in result.output
+        assert queries == []
+        assert called == []
+    elif role == "validation":
+        assert result.exit_code == 0, result.output
+        assert queries == []
+        assert called[0]["analytics_failure"] == "lake_data_root_missing"
+    elif role == "api":
+        assert result.exit_code == 0, result.output
+        assert queries == []
+        assert "analytics_failure" not in called[0]
+    elif role == "all":
+        assert result.exit_code == 0, result.output
+        assert queries == ["SELECT 1"]
+        assert called[0]["analytics_failure"] == "lake_verification_file_limit"
+    elif role == "analytics":
+        assert isinstance(result.exception, runtime.LakeError), repr(result.exception)
+        assert result.exception.code == "lake_verification_file_limit"
+        assert queries == ["SELECT 1"]
+        assert called == []
+    else:
+        assert isinstance(result.exception, ReachedBootstrap), repr(result.exception)
+        assert queries == ["SELECT 1"]
+        assert called == []
