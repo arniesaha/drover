@@ -610,15 +610,23 @@ def test_recovery_creates_fresh_attention_generation(registry):
 
 def test_structured_attention_batch_generation(registry):
     def event(seq, kind, payload):
-        return {"event_id": f"attention-{seq}", "session_id": "sess-1",
-                "event_type": kind, "payload": payload, "seq": seq,
-                "created_at": datetime.now(timezone.utc)}
+        return {
+            "event_id": f"attention-{seq}",
+            "session_id": "sess-1",
+            "event_type": kind,
+            "payload": payload,
+            "seq": seq,
+            "created_at": datetime.now(timezone.utc),
+        }
+
     first = event(1, "approval_prompt", {"prompt": "First?"})
     registry.ingest_structured_events([first])
     original = registry.get_session("sess-1").attention_id
     assert original == "attention-1"
-    batch = [event(2, "user_input", {}),
-             event(3, "approval_prompt", {"prompt": "Second?"})]
+    batch = [
+        event(2, "user_input", {}),
+        event(3, "approval_prompt", {"prompt": "Second?"}),
+    ]
     registry.ingest_structured_events(batch)
     second = registry.get_session("sess-1").attention_id
     assert second == "attention-3" and second != original
