@@ -288,6 +288,7 @@ func backendContentConsentFixturesPreserveFleetPropagation(
     let account = try JSONDecoder().decode(ProviderAccount.self, from: fixture)
 
     #expect(account.windows.isEmpty)
+    #expect(account.harnesses.isEmpty)
     #expect(account.errorCategory == nil)
 }
 

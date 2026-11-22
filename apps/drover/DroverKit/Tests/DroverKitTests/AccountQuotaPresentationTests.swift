@@ -26,6 +26,18 @@ final class AccountQuotaPresentationTests: XCTestCase {
         XCTAssertEqual(AccountQuotaPresentation.remainingText(harness: "unrelated", hostID: "mac-mini", accounts: accounts), "quota unknown")
     }
 
+    func testCursorQuotaUnsupportedIsUnknownAndExplainsWhereToCheck() throws {
+        let accounts = try accounts(from: #"""
+        [{"snapshot_id":"cursor","dedup_key":"cursor","provider":"cursor","account_label":"Cursor","host_id":"studio","harnesses":["cursor"],"status":"usage_unavailable","observed_at":"2026-10-01T00:00:00Z","source":"harness-inventory","error_category":"quota_unsupported","windows":[]}]
+        """#)
+
+        XCTAssertEqual(AccountQuotaPresentation.remainingText(harness: "cursor", hostID: "studio", accounts: accounts), "quota unknown")
+        XCTAssertEqual(
+            ProviderSubscriptionGrouping.group(accounts, now: .distantPast).first?.hosts.first?.detail,
+            "View Cursor usage in Cursor settings or Grok dashboard"
+        )
+    }
+
     private func accounts(from json: String) throws -> [ProviderAccount] {
         try JSONDecoder().decode([ProviderAccount].self, from: Data(json.utf8))
     }
