@@ -147,6 +147,39 @@ def test_continuity_owner_accepts_legacy_or_its_exact_native_goal_identity():
             scope(continuity_owner_id=owner)
 
 
+def test_integration_serialization_requires_the_goal_native_owner():
+    with pytest.raises(ValueError, match="native owner"):
+        scope(
+            continuity_owner_id="agent:coder:main",
+            integration_serialization_key="main-write",
+        )
+
+
+def test_integration_serialization_repository_key_is_unique_across_goals():
+    first = scope(
+        goal_id="goal-a",
+        repo="example/project",
+        continuity_owner_id="drover:owner/goal-a",
+        execution_enabled=True,
+        execution_cwds={"studio": "/workspace/project"},
+        brief_ref="docs/brief.md",
+        continuity_owner_harness="codex",
+        integration_serialization_key="main-write",
+    )
+    second = scope(
+        goal_id="goal-b",
+        repo="example/project",
+        continuity_owner_id="drover:owner/goal-b",
+        execution_enabled=True,
+        execution_cwds={"studio": "/workspace/project"},
+        brief_ref="docs/brief.md",
+        continuity_owner_harness="codex",
+        integration_serialization_key="main-write",
+    )
+    with pytest.raises(ValueError, match="duplicate integration serialization"):
+        WorkQueueConfig(enabled=True, workspace_id="test", goals=[first, second])
+
+
 def test_runtime_config_defaults_and_toml_opt_in(tmp_path):
     assert not default_config().work_queue.enabled
     path = tmp_path / "config.toml"

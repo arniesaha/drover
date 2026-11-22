@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Safely roll a Studio hub and its local harnessd to one staged runtime.
+"""Advanced maintenance tool: roll a Studio hub and local harnessd together.
+
+This is not the default for a compatible server-only private update; follow
+``docs/operations/private-server-update.md`` for that path. Keep this tool for
+an explicitly scoped offline/multi-role maintenance operation that needs its
+paired-service and rollback safeguards.
 
 This is deliberately an operator tool, not an installer hook.  It refuses a
 partly specified release and makes its rollback choice explicit in the JSON
@@ -657,6 +662,24 @@ def wait_for_health(checks: Mapping[str, str], timeout: float) -> tuple[bool, di
         time.sleep(2)
 
 
+def wait_for_relays(
+    read_hosts: Callable[[], tuple[bool, Mapping[str, object]]],
+    expected: set[str],
+    timeout: float,
+) -> tuple[bool, list[str]]:
+    """Wait for relays present before the switch to reconnect after restart."""
+    deadline = time.monotonic() + timeout
+    missing = sorted(expected)
+    while True:
+        listed, payload = read_hosts()
+        relay_ok, missing = relay_reconnected(payload, expected)
+        if listed and relay_ok:
+            return True, missing
+        if time.monotonic() >= deadline:
+            return False, missing
+        time.sleep(2)
+
+
 def _health_checks(tailscale_url: str) -> dict[str, str]:
     return {
         "hub_loopback": "http://127.0.0.1:7080/healthz",
@@ -1031,15 +1054,16 @@ def main(argv: list[str] | None = None) -> int:
         report["checks"]["work_queue_after"] = queue_after
         if not settled:
             raise RolloutError("work_queue_launches_not_settled_after_switch")
-        relayed, hosts_after = api_json(local + "/harness/hosts", token)
-        relay_ok, missing_relays = relay_reconnected(
-            hosts_after, relay_hosts(hosts_before)
+        relayed, missing_relays = wait_for_relays(
+            lambda: api_json(local + "/harness/hosts", token),
+            relay_hosts(hosts_before),
+            args.health_timeout,
         )
         report["checks"]["relay_reconnect"] = {
-            "ok": relayed and relay_ok,
+            "ok": relayed,
             "missing": missing_relays,
         }
-        if not relayed or not relay_ok:
+        if not relayed:
             raise RolloutError("relay_reconnect_failed")
         report["last_good_snapshot"] = str(
             record_last_good(

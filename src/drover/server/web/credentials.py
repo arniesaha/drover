@@ -19,13 +19,14 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 from uuid import uuid4
 
 CREDENTIALS_FILENAME = "credentials.json"
 STORE_VERSION = 1
 TOKEN_BYTES = 32
 TOUCH_DEBOUNCE_SECONDS = 60.0
-SCOPES = ("device", "host", "preflight", "profile")
+SCOPES = ("device", "host", "owner", "preflight", "profile")
 APNS_ENVIRONMENTS = ("sandbox", "production")
 _VERIFIER_DOMAIN = b"drover-cred-v1\0"
 
@@ -64,6 +65,7 @@ class Credential:
     verifier: str
     created_at: str
     host_id: str | None = None
+    owner_id: str | None = None
     last_used_at: str | None = None
     revoked_at: str | None = None
     notification_mode: str = "action"
@@ -97,6 +99,7 @@ class Credential:
             "verifier": self.verifier,
             "created_at": self.created_at,
             "host_id": self.host_id,
+            "owner_id": self.owner_id,
             "last_used_at": self.last_used_at,
             "revoked_at": self.revoked_at,
             "notification_mode": self.notification_mode,
@@ -145,12 +148,21 @@ class CredentialStore:
         return self._fleet_name
 
     def issue(
-        self, *, scope: str, label: str, host_id: str | None = None
+        self,
+        *,
+        scope: str,
+        label: str,
+        host_id: str | None = None,
+        owner_id: str | None = None,
     ) -> tuple[Credential, str]:
         if scope not in SCOPES:
             raise ValueError(f"unknown scope: {scope}")
         if scope == "host" and (not isinstance(host_id, str) or not host_id.strip()):
             raise ValueError("host credentials require host_id")
+        if scope == "owner" and (
+            not isinstance(owner_id, str) or not owner_id.startswith("drover:owner/")
+        ):
+            raise ValueError("owner credentials require a native owner_id")
         token = secrets.token_urlsafe(TOKEN_BYTES)
         credential = Credential(
             id=str(uuid4()),
@@ -159,6 +171,7 @@ class CredentialStore:
             verifier=verifier_from_token(token),
             created_at=_now_iso(),
             host_id=host_id,
+            owner_id=owner_id,
         )
         with self._lock:
             if scope == "host":
@@ -169,6 +182,52 @@ class CredentialStore:
                         and previous.is_active
                     ):
                         self._index(replace(previous, revoked_at=_now_iso()))
+            if scope == "owner":
+                for previous in list(self._by_id.values()):
+                    if (
+                        previous.scope == "owner"
+                        and previous.owner_id == owner_id
+                        and previous.is_active
+                    ):
+                        self._index(replace(previous, revoked_at=_now_iso()))
+            self._index(credential)
+            self._write()
+        return credential, token
+
+    def issue_owner_if_current(
+        self,
+        *,
+        label: str,
+        owner_id: str,
+        apply: Callable[[Credential, Any | None], bool],
+    ) -> tuple[Credential, str] | None:
+        """Issue an owner bearer only while a caller-held durable fence holds.
+
+        The JSON store is single-process by design.  Its credential lock keeps
+        the compare-and-issue operation linearizable with other local owner
+        rotations; PostgreSQL supplies the fleet-wide equivalent below.
+        """
+        if not isinstance(owner_id, str) or not owner_id.startswith("drover:owner/"):
+            raise ValueError("owner credentials require a native owner_id")
+        token = secrets.token_urlsafe(TOKEN_BYTES)
+        credential = Credential(
+            id=str(uuid4()),
+            scope="owner",
+            label=label,
+            verifier=verifier_from_token(token),
+            created_at=_now_iso(),
+            owner_id=owner_id,
+        )
+        with self._lock:
+            if not apply(credential, None):
+                return None
+            for previous in list(self._by_id.values()):
+                if (
+                    previous.scope == "owner"
+                    and previous.owner_id == owner_id
+                    and previous.is_active
+                ):
+                    self._index(replace(previous, revoked_at=_now_iso()))
             self._index(credential)
             self._write()
         return credential, token
@@ -408,6 +467,42 @@ class CredentialStore:
             self._write()
             return True
 
+    def revoke_owner(self, owner_id: str) -> bool:
+        """Revoke the native owner's active bearer before fencing its session."""
+        with self._lock:
+            revoked = False
+            for credential in list(self._by_id.values()):
+                if (
+                    credential.scope == "owner"
+                    and credential.owner_id == owner_id
+                    and credential.is_active
+                ):
+                    self._index(replace(credential, revoked_at=_now_iso()))
+                    revoked = True
+            if revoked:
+                self._write()
+            return revoked
+
+    def revoke_owner_credential(self, owner_id: str, credential_id: str) -> bool:
+        """Revoke one known native-owner bearer, never a successor's bearer.
+
+        Recovery retains the credential identity that belonged to the fenced
+        session.  Treat an already-revoked matching credential as success so
+        a retry can finish after a concurrent successor issuance revoked it.
+        """
+        with self._lock:
+            credential = self._by_id.get(credential_id)
+            if (
+                credential is None
+                or credential.scope != "owner"
+                or credential.owner_id != owner_id
+            ):
+                return False
+            if credential.is_active:
+                self._index(replace(credential, revoked_at=_now_iso()))
+                self._write()
+            return True
+
     def list_all(self) -> list[Credential]:
         with self._lock:
             return sorted(self._by_id.values(), key=lambda item: item.created_at)
@@ -449,6 +544,7 @@ class CredentialStore:
                     verifier=str(item["verifier"]),
                     created_at=str(item["created_at"]),
                     host_id=item.get("host_id"),
+                    owner_id=item.get("owner_id"),
                     last_used_at=item.get("last_used_at"),
                     revoked_at=item.get("revoked_at"),
                     notification_mode=item.get("notification_mode", "action"),
@@ -495,7 +591,7 @@ class CredentialStore:
 
 
 _CREDENTIAL_COLUMNS = """
-credential_id, scope, label, verifier, created_at, host_id, last_used_at,
+credential_id, scope, label, verifier, created_at, host_id, owner_id, last_used_at,
 revoked_at, apns_token, apns_environment, apns_failure_reason, apns_failed_at,
 apns_failed_fingerprint, notification_mode, notification_timezone, notification_hour
 """
@@ -518,16 +614,17 @@ def _credential_from_row(row: tuple[object, ...]) -> Credential:
         verifier=str(row[3]),
         created_at=created_at,
         host_id=str(row[5]) if row[5] is not None else None,
-        last_used_at=timestamp(row[6]),
-        revoked_at=timestamp(row[7]),
-        apns_token=str(row[8]) if row[8] is not None else None,
-        apns_environment=str(row[9]) if row[9] is not None else None,
-        apns_failure_reason=str(row[10]) if row[10] is not None else None,
-        apns_failed_at=timestamp(row[11]),
-        apns_failed_fingerprint=str(row[12]) if row[12] is not None else None,
-        notification_mode=str(row[13]),
-        notification_timezone=str(row[14] or "UTC"),
-        notification_hour=int(row[15]) if row[15] is not None else None,
+        owner_id=str(row[6]) if row[6] is not None else None,
+        last_used_at=timestamp(row[7]),
+        revoked_at=timestamp(row[8]),
+        apns_token=str(row[9]) if row[9] is not None else None,
+        apns_environment=str(row[10]) if row[10] is not None else None,
+        apns_failure_reason=str(row[11]) if row[11] is not None else None,
+        apns_failed_at=timestamp(row[12]),
+        apns_failed_fingerprint=str(row[13]) if row[13] is not None else None,
+        notification_mode=str(row[14]),
+        notification_timezone=str(row[15] or "UTC"),
+        notification_hour=int(row[16]) if row[16] is not None else None,
     )
 
 
@@ -555,12 +652,21 @@ class PostgresCredentialStore:
         return self._fleet_name
 
     def issue(
-        self, *, scope: str, label: str, host_id: str | None = None
+        self,
+        *,
+        scope: str,
+        label: str,
+        host_id: str | None = None,
+        owner_id: str | None = None,
     ) -> tuple[Credential, str]:
         if scope not in SCOPES:
             raise ValueError(f"unknown scope: {scope}")
         if scope == "host" and (not isinstance(host_id, str) or not host_id.strip()):
             raise ValueError("host credentials require host_id")
+        if scope == "owner" and (
+            not isinstance(owner_id, str) or not owner_id.startswith("drover:owner/")
+        ):
+            raise ValueError("owner credentials require a native owner_id")
         token = secrets.token_urlsafe(TOKEN_BYTES)
         credential = Credential(
             id=str(uuid4()),
@@ -569,6 +675,7 @@ class PostgresCredentialStore:
             verifier=verifier_from_token(token),
             created_at=_now_iso(),
             host_id=host_id,
+            owner_id=owner_id,
         )
         with self._connection() as con:
             con.execute("BEGIN")
@@ -583,10 +690,20 @@ class PostgresCredentialStore:
                         "WHERE scope = 'host' AND host_id = ? AND revoked_at IS NULL",
                         [_now_iso(), host_id],
                     )
+                if scope == "owner":
+                    con.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                        ["owner-credential:" + owner_id],
+                    )
+                    con.execute(
+                        "UPDATE control_credentials SET revoked_at = ? "
+                        "WHERE scope = 'owner' AND owner_id = ? AND revoked_at IS NULL",
+                        [_now_iso(), owner_id],
+                    )
                 con.execute(
                     """INSERT INTO control_credentials
-                       (credential_id, scope, label, verifier, created_at, host_id)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                       (credential_id, scope, label, verifier, created_at, host_id, owner_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     [
                         credential.id,
                         credential.scope,
@@ -594,6 +711,66 @@ class PostgresCredentialStore:
                         credential.verifier,
                         credential.created_at,
                         credential.host_id,
+                        credential.owner_id,
+                    ],
+                )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+        return credential, token
+
+    def issue_owner_if_current(
+        self,
+        *,
+        label: str,
+        owner_id: str,
+        apply: Callable[[Credential, Any], bool],
+    ) -> tuple[Credential, str] | None:
+        """Atomically fence a native-owner rotation and revoke its predecessor.
+
+        ``apply`` runs on the same PostgreSQL transaction that owns the
+        owner-credential advisory lock.  It must lock and compare the durable
+        owner-session generation before the prior credential is revoked.
+        """
+        if not isinstance(owner_id, str) or not owner_id.startswith("drover:owner/"):
+            raise ValueError("owner credentials require a native owner_id")
+        token = secrets.token_urlsafe(TOKEN_BYTES)
+        credential = Credential(
+            id=str(uuid4()),
+            scope="owner",
+            label=label,
+            verifier=verifier_from_token(token),
+            created_at=_now_iso(),
+            owner_id=owner_id,
+        )
+        with self._connection() as con:
+            con.execute("BEGIN")
+            try:
+                con.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                    ["owner-credential:" + owner_id],
+                )
+                if not apply(credential, con):
+                    con.execute("ROLLBACK")
+                    return None
+                con.execute(
+                    "UPDATE control_credentials SET revoked_at = ? "
+                    "WHERE scope = 'owner' AND owner_id = ? AND revoked_at IS NULL",
+                    [_now_iso(), owner_id],
+                )
+                con.execute(
+                    """INSERT INTO control_credentials
+                       (credential_id, scope, label, verifier, created_at, host_id, owner_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        credential.id,
+                        credential.scope,
+                        credential.label,
+                        credential.verifier,
+                        credential.created_at,
+                        credential.host_id,
+                        credential.owner_id,
                     ],
                 )
                 con.execute("COMMIT")
@@ -881,6 +1058,34 @@ class PostgresCredentialStore:
                 [_now_iso(), credential_id],
             ).fetchone()
         return row is not None
+
+    def revoke_owner(self, owner_id: str) -> bool:
+        with self._connection() as con:
+            row = con.execute(
+                """UPDATE control_credentials SET revoked_at = ?
+                   WHERE scope = 'owner' AND owner_id = ? AND revoked_at IS NULL
+                   RETURNING credential_id""",
+                [_now_iso(), owner_id],
+            ).fetchone()
+        return row is not None
+
+    def revoke_owner_credential(self, owner_id: str, credential_id: str) -> bool:
+        """Idempotently revoke exactly the recovered session's bearer."""
+        with self._connection() as con:
+            row = con.execute(
+                """SELECT revoked_at FROM control_credentials
+                   WHERE credential_id = ? AND scope = 'owner' AND owner_id = ?""",
+                [credential_id, owner_id],
+            ).fetchone()
+            if row is None:
+                return False
+            if row[0] is None:
+                con.execute(
+                    """UPDATE control_credentials SET revoked_at = ?
+                       WHERE credential_id = ? AND revoked_at IS NULL""",
+                    [_now_iso(), credential_id],
+                )
+        return True
 
     def list_all(self) -> list[Credential]:
         with self._connection() as con:

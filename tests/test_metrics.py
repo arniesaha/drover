@@ -2598,6 +2598,39 @@ def test_empty_registry_is_complete_local_only_content_consent(tmp_path) -> None
     assert json.loads(revoked_body)["hosts"] == []
 
 
+def test_harness_session_turn_active_requires_explicit_boolean(
+    collector_with_hosts,
+) -> None:
+    collector = collector_with_hosts
+    HarnessRegistry(collector.duckdb_path).create_session(
+        session_id="owner-session",
+        host_id="laptop",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/owner",
+        mode="structured",
+    )
+
+    class _TurnRelay(_FakeRelay):
+        def __init__(self, body: str) -> None:
+            super().__init__()
+            self.body = body
+
+        def request(self, host_id, method, path, body, timeout_s=15):
+            self.calls.append((host_id, method, path, body))
+            self.timeouts.append(timeout_s)
+            return 200, self.body
+
+    relay = _TurnRelay('{"turn_active": true}')
+    collector.relay_manager = relay
+    assert collector.harness_session_turn_active("owner-session") is True
+    assert relay.calls == [("laptop", "GET", "/sessions/owner-session", {})]
+
+    collector.relay_manager = _TurnRelay('{"turn_active": "false"}')
+    assert collector.harness_session_turn_active("owner-session") is None
+
+
 def test_harness_request_prefers_live_relay(collector_with_hosts) -> None:
     collector = collector_with_hosts
     fake = _FakeRelay()
@@ -5057,6 +5090,71 @@ def test_turn_recovery_retries_original_payload_once(monkeypatch, tmp_path):
     ]
 
 
+def test_turn_recovery_uses_launch_only_owner_context(monkeypatch, tmp_path):
+    collector = _recovery_collector(tmp_path)
+    responses = iter(
+        [
+            (404, '{"error":"unknown structured session: harness-recover"}\n'),
+            (
+                200,
+                '{"session_id":"harness-recover","status":"running",'
+                '"recovered":true,"native_session_id":"provider-thread-1"}\n',
+            ),
+            (202, '{"turn_id":"turn-recovered"}\n'),
+        ]
+    )
+    calls: list[tuple[str, str, dict]] = []
+    issued = []
+
+    def request(_host, path, *, method, payload, **_kwargs):
+        calls.append((method, path, dict(payload)))
+        return next(responses)
+
+    monkeypatch.setattr(collector, "_harness_request", request)
+    turn = {"text": "continue safely", "client_turn_id": "turn-1"}
+
+    status, _body = collector.proxy_harness_session_action(
+        "harness-recover",
+        "turns",
+        turn,
+        recovery_payload_factory=lambda: issued.append("called")
+        or {"continuity_owner_bearer": "test-recovery-owner-bearer"},
+    )
+
+    assert status == 202
+    assert issued == ["called"]
+    assert calls == [
+        ("POST", "/sessions/harness-recover/turns", turn),
+        (
+            "POST",
+            "/sessions/harness-recover/recover",
+            {
+                "native_session_id": "provider-thread-1",
+                "continuity_owner_bearer": "test-recovery-owner-bearer",
+            },
+        ),
+        ("POST", "/sessions/harness-recover/turns", turn),
+    ]
+
+
+def test_turn_recovery_does_not_evaluate_context_without_missing_session(
+    monkeypatch, tmp_path
+):
+    collector = _recovery_collector(tmp_path)
+    monkeypatch.setattr(
+        collector, "_harness_request", lambda *_args, **_kwargs: (202, "{}")
+    )
+    called = []
+
+    assert collector.proxy_harness_session_action(
+        "harness-recover",
+        "turns",
+        {"text": "continue"},
+        recovery_payload_factory=lambda: called.append(True),
+    ) == (202, "{}")
+    assert called == []
+
+
 def test_central_terminate_waits_for_recovery_retry(monkeypatch, tmp_path):
     collector = _recovery_collector(tmp_path)
     recovery_reached = threading.Event()
@@ -5802,6 +5900,28 @@ def test_successful_create_without_session_id_fails_closed(tmp_path):
 
     assert status == 503
     assert json.loads(body) == {"error": "hub continuity initialization failed"}
+
+
+def test_failed_create_logs_status_and_body(tmp_path, caplog):
+    collector = _collector_for_proxy(tmp_path)
+    collector._harness_request = lambda *args, **kwargs: (  # type: ignore[method-assign]
+        400,
+        '{"error":"work continuity owner_id must be a canonical agent key"}',
+    )
+    collector._harness_host = lambda host_id: type(  # type: ignore[method-assign]
+        "H",
+        (),
+        {"host_id": host_id, "connection_kind": "direct"},
+    )()
+
+    status, body = collector.proxy_create_harness_session(
+        "studio", {"harness": "codex"}
+    )
+
+    assert status == 400
+    assert "canonical agent key" in body
+    assert "host_id=studio status=400" in caplog.text
+    assert "canonical agent key" in caplog.text
 
 
 def test_a_create_that_outruns_the_hub_is_not_reported_as_unreachable(

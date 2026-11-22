@@ -9,6 +9,7 @@ overwrite something the control plane has since written.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -109,6 +110,33 @@ def test_first_start_moves_existing_control_plane_rows_into_their_own_store(tmp_
         con.close()
     assert not {"live_session_recaps", "live_recap_jobs"} & tables
     assert HarnessRegistry(duckdb_path).get_session("legacy-1") is not None
+
+
+def test_first_start_moves_integration_reservation_with_composite_key(tmp_path):
+    """The legacy split preserves a serialized run's durable fence."""
+    duckdb_path = _legacy_lakehouse(tmp_path)
+    with duckdb.connect(str(duckdb_path)) as con:
+        con.execute("""INSERT INTO continuity_integration_reservations
+            (repository, serialization_key, owner_id, run_id, generation,
+             owner_epoch, state, acquired_at)
+            VALUES ('acme/drover', 'integration-main', 'drover:owner/goal-1',
+                    'run-1', 3, 4, 'reserved', TIMESTAMPTZ '2026-09-20 19:00:00+00')""")
+
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+
+    assert _control_plane_rows(duckdb_path, "continuity_integration_reservations") == [
+        (
+            "acme/drover",
+            "integration-main",
+            "drover:owner/goal-1",
+            "run-1",
+            3,
+            4,
+            "reserved",
+            datetime(2026, 9, 20, 19, 0, tzinfo=timezone.utc),
+            None,
+        )
+    ]
 
 
 def test_running_the_migration_again_neither_duplicates_nor_drops_rows(tmp_path):

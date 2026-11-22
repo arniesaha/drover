@@ -40,6 +40,8 @@ from drover.server.harness.daemon import (
     HarnessDaemonState,
     HarnessPreset,
     ProviderUsageRefreshCache,
+    _expected_effect_verification,
+    _materialized_expected_effect,
     create_harness_server,
     discover_native_history_metadata,
     discover_native_resume_sessions,
@@ -57,6 +59,7 @@ from drover.server.harness.model_catalog import (
 from drover.server.harness.pty import PtySessionManager
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.websocket import client_handshake
+from drover.server.harness.work_coordinator import work_coordinator_turn_id
 from drover.server.providers.claude import ClaudeUsageProbe
 from drover.server.providers.types import ProviderAccountSnapshot, ProviderUsageWindow
 
@@ -73,6 +76,319 @@ class _FailingRegistry:
 
     def append_event(self, **kwargs):
         raise RuntimeError("locked")
+
+
+def test_expected_effect_attestation_is_confined_to_the_structured_worktree(tmp_path):
+    worktree = tmp_path / "worktrees" / "work-a"
+    effect = worktree / ".drover-native-canary" / "source-task-13.json"
+    effect.parent.mkdir(parents=True)
+    effect.write_text("{}", encoding="utf-8")
+    artifact = "local-file:.drover-native-canary/source-task-13.json"
+
+    assert _materialized_expected_effect(str(worktree), artifact)
+    assert not _materialized_expected_effect(
+        str(worktree), "local-file:.drover-native-canary/../../outside.json"
+    )
+    assert not _materialized_expected_effect(
+        str(worktree),
+        "local-file:worktrees/work-b/.drover-native-canary/source-task-13.json",
+    )
+    assert _expected_effect_verification(str(worktree), artifact) == "materialized"
+    assert (
+        _expected_effect_verification(
+            str(worktree), "local-file:.drover-native-canary/missing.json"
+        )
+        == "absent"
+    )
+    empty_worktree = tmp_path / "empty-worktree"
+    empty_worktree.mkdir()
+    assert _expected_effect_verification(str(empty_worktree), artifact) == "absent"
+    assert (
+        _expected_effect_verification(
+            str(worktree), "local-file:.drover-native-canary/../../outside.json"
+        )
+        == "unknown"
+    )
+    dangling = worktree / ".drover-native-canary" / "dangling.json"
+    dangling.symlink_to("missing.json")
+    assert (
+        _expected_effect_verification(
+            str(worktree), "local-file:.drover-native-canary/dangling.json"
+        )
+        == "unknown"
+    )
+    (worktree / ".drover-native-canary" / "directory").mkdir()
+    assert (
+        _expected_effect_verification(
+            str(worktree), "local-file:.drover-native-canary/directory"
+        )
+        == "unknown"
+    )
+
+
+def test_work_coordinator_session_gets_paired_mcp_bearer_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("DROVER_MCP_TOKEN", "ambient-worker-token")
+    server, state, base_url = _start_test_server(tmp_path)
+    state.host_token = "test-paired-host-bearer"
+    probe = (
+        "import json, os\n"
+        "from pathlib import Path\n"
+        'Path(os.environ["CODEX_ENV_LOG"]).write_text(json.dumps({'
+        '"mcp": os.environ.get("DROVER_MCP_TOKEN"), '
+        '"owner": os.environ.get("DROVER_CONTINUITY_OWNER_BEARER")}))\n'
+        'print(json.dumps({"type": "turn.completed", "usage": {}}), flush=True)\n'
+    )
+    coordinator_log = tmp_path / "coordinator-env.json"
+    ordinary_log = tmp_path / "ordinary-env.json"
+    binding = {
+        "run_id": "work-" + "a" * 32,
+        "owner_id": "drover:owner/goal-native",
+        "authority_scope": "implementation",
+        "objective": "read the bound work item",
+        "binding_signature": "opaque-hub-signature",
+    }
+    try:
+        monkeypatch.setenv("CODEX_ENV_LOG", str(coordinator_log))
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": [sys.executable, "-c", probe],
+                "cwd": str(tmp_path),
+                "prompt": "read work",
+                "work_coordinator_continuity": binding,
+            },
+        )
+        assert status == 201
+        _wait_until(coordinator_log.exists, what="coordinator child environment")
+        assert json.loads(coordinator_log.read_text()) == {
+            "mcp": "test-paired-host-bearer",
+            "owner": None,
+        }
+
+        monkeypatch.setenv("CODEX_ENV_LOG", str(ordinary_log))
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": [sys.executable, "-c", probe],
+                "cwd": str(tmp_path),
+                "prompt": "ordinary work",
+            },
+        )
+        assert status == 201
+        _wait_until(ordinary_log.exists, what="ordinary child environment")
+        assert json.loads(ordinary_log.read_text()) == {
+            "mcp": "ambient-worker-token",
+            "owner": None,
+        }
+
+        owner_log = tmp_path / "native-owner-env.json"
+        monkeypatch.setenv("CODEX_ENV_LOG", str(owner_log))
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": [sys.executable, "-c", probe],
+                "cwd": str(tmp_path),
+                "prompt": "read the fenced native owner wake",
+                "handoff_mode": "drover_native_continuity_owner",
+                "continuity_owner_bearer": "test-native-owner-bearer",
+            },
+        )
+        assert status == 201
+        _wait_until(owner_log.exists, what="native owner child environment")
+        assert json.loads(owner_log.read_text()) == {
+            "mcp": "test-native-owner-bearer",
+            "owner": "test-native-owner-bearer",
+        }
+
+        # Missing paired-host state must not mint or substitute a bearer.
+        state.host_token = None
+        unpaired_log = tmp_path / "unpaired-coordinator-env.json"
+        monkeypatch.setenv("CODEX_ENV_LOG", str(unpaired_log))
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "command": [sys.executable, "-c", probe],
+                "cwd": str(tmp_path),
+                "prompt": "read work without pairing",
+                "work_coordinator_continuity": binding,
+            },
+        )
+        assert status == 201
+        _wait_until(unpaired_log.exists, what="unpaired coordinator child environment")
+        assert json.loads(unpaired_log.read_text()) == {
+            "mcp": "ambient-worker-token",
+            "owner": None,
+        }
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_work_coordinator_session_scopes_bound_stdio_work_control(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _FakeStructuredManager(harness="codex")
+    state.host_token = "test-paired-host-bearer"
+    state.central_url = base_url
+    binding = {
+        "run_id": "work-" + "d" * 32,
+        "owner_id": "drover:owner/goal-native",
+        "authority_scope": "implementation",
+        "objective": "complete the bound work",
+        "goal_id": "native-canary-924-848",
+        "item_number": 41,
+        "binding_signature": "opaque-hub-signature",
+    }
+    try:
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "cwd": str(tmp_path),
+                "prompt": "complete the bound work",
+                "work_coordinator_continuity": binding,
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 201
+    environment = state.structured.starts[0][1]["environment"]
+    assert environment == {
+        "DROVER_MCP_TOKEN": "test-paired-host-bearer",
+        "DROVER_WORK_CONTROL_URL": base_url,
+        "DROVER_WORK_RUN_KEY": "d" * 32,
+        "DROVER_WORK_GOAL_ID": "native-canary-924-848",
+        "DROVER_WORK_ITEM_NUMBER": "41",
+    }
+
+
+def test_work_coordinator_prompt_names_the_resolved_isolated_worktree(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _FakeStructuredManager(harness="codex")
+    binding = {
+        "run_id": "work-" + "b" * 32,
+        "owner_id": "drover:owner/goal-native",
+        "authority_scope": "implementation",
+        "objective": "write the bound local effect",
+        "binding_signature": "opaque-hub-signature",
+    }
+    try:
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "cwd": str(tmp_path),
+                "prompt": "Read the bound local candidate.",
+                "work_coordinator_continuity": binding,
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 201
+    assert len(state.structured.turns) == 1
+    assert f"Assigned isolated worktree: {tmp_path}" in state.structured.turns[0][1]
+    assert (
+        "Perform local work only in that assigned worktree."
+        in state.structured.turns[0][1]
+    )
+
+
+def test_work_coordinator_prompt_preserves_candidate_task_and_worktree_authority(
+    tmp_path,
+):
+    server, state, base_url = _start_test_server(tmp_path)
+    state.structured = _FakeStructuredManager(harness="codex")
+    task = "Write .drover-native-canary/source-task-19.json in the assigned worktree."
+    binding = {
+        "run_id": "work-" + "c" * 32,
+        "owner_id": "drover:owner/goal-native",
+        "authority_scope": "implementation",
+        "objective": "write the bound local effect",
+        "binding_signature": "opaque-hub-signature",
+    }
+    prompt = (
+        f"Local candidate task #19:\n{task}\n\n"
+        "The `Assigned isolated worktree` appended by harnessd is the "
+        "authoritative worktree for this task and its bound local effect."
+    )
+    try:
+        status, _ = _json_request(
+            f"{base_url}/sessions",
+            payload={
+                "harness": "codex",
+                "mode": "structured",
+                "cwd": str(tmp_path),
+                "prompt": prompt,
+                "work_coordinator_continuity": binding,
+            },
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert status == 201
+    delivered = state.structured.turns[0][1]
+    assert task in delivered
+    assert f"Assigned isolated worktree: {tmp_path}" in delivered
+    assert "authoritative worktree for this task" in delivered
+    assert state.structured.turns[0][2]["client_turn_id"] == work_coordinator_turn_id(
+        binding["run_id"]
+    )
+
+
+def test_harnessd_attests_only_a_work_coordinator_session_effect(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    worktree = tmp_path / "worktrees" / "work-a"
+    effect = worktree / ".drover-native-canary" / "source-task-13.json"
+    effect.parent.mkdir(parents=True)
+    effect.write_text("{}", encoding="utf-8")
+    artifact = "local-file:.drover-native-canary/source-task-13.json"
+    session = state.registry.create_session(
+        host_id="test-host",
+        harness="codex",
+        command="codex",
+        cwd=str(worktree),
+        mode="structured",
+        handoff_mode="work_coordinator",
+    )
+    try:
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session.session_id}/expected-effect",
+            payload={"artifact": artifact},
+        )
+        assert status == 200 and payload == {
+            "materialized": True,
+            "verification": "materialized",
+        }
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session.session_id}/expected-effect",
+            payload={"artifact": "local-file:.drover-native-canary/../../outside.json"},
+        )
+        assert status == 200 and payload == {
+            "materialized": False,
+            "verification": "unknown",
+        }
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
 
 
 def test_run_harnessd_closes_auth_flows_on_shutdown(monkeypatch, tmp_path):
@@ -424,12 +740,17 @@ class _FakeStructuredManager:
         self.turns = []
         self.accepted_turns = {}
         self.closed = set()
+        self.busy = False
 
     def has(self, session_id: str) -> bool:
         return session_id not in self.closed
 
     def harness_for(self, session_id: str) -> str:
         return self.harness
+
+    def is_busy(self, session_id: str) -> bool:
+        del session_id
+        return self.busy
 
     def start(self, *args, **kwargs) -> None:
         self.starts.append((args, kwargs))
@@ -466,6 +787,45 @@ def _enabled_preset(name: str, executable: str = "/resolved/harness"):
         enabled=True,
         executable=executable,
     )
+
+
+def test_structured_session_get_exposes_live_turn_activity(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    fake = _FakeStructuredManager(harness="codex")
+    state.structured = fake
+    state.registry.create_session(
+        session_id="session-1",
+        host_id=state.host_id,
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd=str(tmp_path),
+        mode="structured",
+    )
+    try:
+        fake.busy = True
+        assert _fetch_session(base_url, "session-1")["turn_active"] is True
+        fake.busy = False
+        assert _fetch_session(base_url, "session-1")["turn_active"] is False
+        # A durable row alone cannot claim host-idle after the structured
+        # manager lost it; the hub must retain its submitted claim.
+        state.registry.create_session(
+            session_id="unknown-manager-session",
+            host_id=state.host_id,
+            harness="codex",
+            command="codex",
+            status="running",
+            cwd=str(tmp_path),
+            mode="structured",
+        )
+        fake.closed.add("unknown-manager-session")
+        assert (
+            _fetch_session(base_url, "unknown-manager-session")["turn_active"] is None
+        )
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
 
 
 def test_model_catalog_route_is_host_scoped_and_forceable(tmp_path):
@@ -3130,6 +3490,7 @@ def _expected_structured_json(row) -> dict:
         "status": row.status,
         "mode": row.mode or "structured",
         "awaiting": row.awaiting,
+        "attention_id": row.attention_id,
         "model": row.model,
         "thinking_effort": row.thinking_effort,
         "last_activity": (row.last_activity.isoformat() if row.last_activity else None),
@@ -3173,7 +3534,11 @@ def test_harnessd_listing_merges_pty_registry_and_manager_only_sessions(tmp_path
             cwd=str(tmp_path),
             mode="structured",
         )
+        # Model a genuine in-memory-only entry. A registry row by itself is
+        # unknown, while an entry the manager owns has a live busy reading.
         state.structured.session_ids = lambda: ["manager-only"]  # type: ignore[method-assign]
+        state.structured.has = lambda session_id: session_id == "manager-only"  # type: ignore[method-assign]
+        state.structured.is_busy = lambda session_id: False  # type: ignore[method-assign]
 
         status, inventory = _json_request(f"{base_url}/sessions")
         assert status == 200
@@ -3194,16 +3559,20 @@ def test_harnessd_listing_merges_pty_registry_and_manager_only_sessions(tmp_path
         assert by_id[pty_id]["awaiting"] == pty_row.awaiting
         assert by_id[pty_id]["model"] == pty_row.model
         assert by_id[pty_id]["thinking_effort"] == pty_row.thinking_effort
+        assert "turn_active" not in by_id[pty_id]
 
         for session_id in ("structured-0", "structured-1", "structured-2"):
             expected = _expected_structured_json(state.registry.get_session(session_id))
             assert by_id[session_id] == expected
             assert expected["status"] == "terminated"
 
-        # The manager-only id still resolves through the per-id lookup.
-        assert by_id["manager-only"] == _expected_structured_json(
+        # The manager-only id still resolves through the per-id lookup and
+        # has an explicit host-backed idle state. Registry-only rows above do
+        # not claim a live structured-turn state.
+        manager_expected = _expected_structured_json(
             state.registry.get_session("manager-only")
-        )
+        ) | {"turn_active": False}
+        assert by_id["manager-only"] == manager_expected
         assert by_id["manager-only"]["status"] == "running"
     finally:
         state.pty.close_all()
@@ -3550,7 +3919,12 @@ def test_harnessd_reconciles_orphaned_pty_sessions_on_startup(tmp_path):
 
 
 def _seed_restart_lost_structured_session(
-    state, tmp_path, *, session_id="harness-recoverable", harness="codex"
+    state,
+    tmp_path,
+    *,
+    session_id="harness-recoverable",
+    harness="codex",
+    handoff_mode=None,
 ):
     cwd = tmp_path / session_id
     cwd.mkdir()
@@ -3563,6 +3937,7 @@ def _seed_restart_lost_structured_session(
         mode="structured",
         cwd=str(cwd),
         native_session_id="provider-session-1",
+        handoff_mode=handoff_mode,
     )
     state.registry.append_event(
         session_id=session_id,
@@ -3636,6 +4011,64 @@ def test_harnessd_recovery_is_idempotent_when_session_is_live(tmp_path):
         )
     finally:
         _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_recovery_requires_and_scopes_native_owner_bearer(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(
+        state,
+        tmp_path,
+        handoff_mode="drover_native_continuity_owner",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={"native_session_id": "provider-session-1"},
+            )
+        assert missing.value.code == 409
+        assert not state.structured.has(session_id)
+
+        status, payload = _json_request(
+            f"{base_url}/sessions/{session_id}/recover",
+            payload={
+                "native_session_id": "provider-session-1",
+                "continuity_owner_bearer": "test-recovered-owner-bearer",
+            },
+        )
+        assert status == 200
+        assert payload["recovered"] is True
+        driver = state.structured._require_entry(session_id).driver
+        assert (
+            driver.env["DROVER_CONTINUITY_OWNER_BEARER"]
+            == "test-recovered-owner-bearer"
+        )
+        assert driver.env["DROVER_MCP_TOKEN"] == "test-recovered-owner-bearer"
+    finally:
+        _close_structured_sessions(state)
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+
+def test_harnessd_recovery_rejects_owner_bearer_for_non_owner_session(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path)
+    session_id = _seed_restart_lost_structured_session(state, tmp_path)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            _json_request(
+                f"{base_url}/sessions/{session_id}/recover",
+                payload={
+                    "native_session_id": "provider-session-1",
+                    "continuity_owner_bearer": "test-owner-bearer",
+                },
+            )
+        assert refused.value.code == 400
+        assert not state.structured.has(session_id)
+    finally:
         state.pty.close_all()
         server.shutdown()
         server.server_close()

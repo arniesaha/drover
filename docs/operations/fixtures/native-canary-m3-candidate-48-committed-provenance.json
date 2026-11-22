@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "workspace_id": "native-canary-924-848",
+  "goal_id": "native-canary-924-848",
+  "items": [
+    {
+      "number": 48,
+      "state": "open",
+      "body": "M3 committed-provenance fixture. Only if the signed coordinator binding explicitly permits committed provenance for this work run, in the daemon-assigned disposable worktree create harmless tracked `tests/fixtures/native_canary_m3_48.py` and `tests/test_native_canary_m3_48.py`; run exactly `python3 tests/test_native_canary_m3_48.py`. Create regular JSON evidence files `.drover-native-canary/m3-48-analysis.json`, `.drover-native-canary/m3-48-implementation.json`, `.drover-native-canary/m3-48-focused-tests.json`, and `.drover-native-canary/source-task-48.json` identifying candidate 48 and phase m3-committed-provenance. Before `drover_work_update(action=complete)`, commit exactly those source, test, and evidence files on this assigned session branch, using `git add -f` only for the ignored evidence files. Invoke complete without optional `evidence_key` or `estimated_cost`. If the signed binding does not permit it, do not commit or create an effect; report blocked. If Run role is verify, inspect the already committed parent files and rerun exactly the named standard-library test; do not create, alter, or commit an artifact. Do not modify configuration, credentials, network resources, or external services.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-48.json"
+    }
+  ]
+}

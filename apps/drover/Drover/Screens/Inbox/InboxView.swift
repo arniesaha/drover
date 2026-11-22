@@ -69,7 +69,7 @@ struct InboxView: View {
 
                 if !waitingSessions.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Awaiting your answer · \(waitingSessions.count)").font(.headline)
+                        Text("Needs your attention · \(waitingSessions.count)").font(.headline)
                         ForEach(waitingSessions) { session in
                             Button { onOpenSession(session.id) } label: {
                                 SessionRow(

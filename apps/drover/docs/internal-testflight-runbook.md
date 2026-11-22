@@ -98,6 +98,11 @@ checks out the dispatch SHA, grants only `contents: read`, `actions: read` and
 `concurrency.group: ios-testflight-production`. The independent archive-only
 workflow uses `ios-distribution`; it does not upload to TestFlight.
 
+The release workflow's macOS harnessd signing and notarization job uses the
+separate `macos-signing` environment, not `ios-testflight-upload`. Keep
+required reviewers on `ios-testflight-upload`; `macos-signing` is the distinct
+credential boundary for unattended macOS signing and notarization.
+
 ## Require iOS CI on the exact dispatch SHA
 
 Before dispatch, wait for [iOS CI](../../../.github/workflows/ios.yml) to pass on

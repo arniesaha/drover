@@ -322,3 +322,7 @@ uv run drover-server mcp tools
 Agent-log collection and OTLP ingestion are optional extensions. See
 [Integrations](integrations.md) and [Context Store](context-store.md) after the
 command plane works end to end.
+
+## Verify A Public Release
+
+Use a pinned GitHub release and its published checksums. `install.sh --verify-release` performs a disposable verification without selecting a runtime or changing `~/.drover`. Private test builds and locally named runtime aliases are not public release artifacts; do not use their version labels for an upgrade decision.

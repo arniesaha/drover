@@ -29,6 +29,31 @@ from drover.server.harness.registry import HarnessRegistry
 MAX_DELIVERIES = 3
 MAX_LEASE_SECONDS = 300
 MAX_COMPLETION_PROJECTION_BATCH = 100
+
+
+def _observation_retry_delay(event_id: str, attempts: int) -> int:
+    """Return a capped deterministic retry delay for a start observation.
+
+    A start observation never performs the worker's effect.  It can therefore
+    retain its durable identity and retry after a transient owner failure.  The
+    first three delays preserve the historical 5/10/20-second cadence; later
+    retries add deterministic jitter inside the capped exponential window so
+    recovering owners do not synchronize on the same wake.
+    """
+    # Bound the exponent before calculating it: this path intentionally has
+    # no fixed attempt cutoff, so a pathological durable counter must never
+    # turn retry scheduling into unbounded arithmetic.
+    base = 5 * 2 ** min(attempts - 1, 6)
+    base = min(base, MAX_LEASE_SECONDS)
+    if attempts <= MAX_DELIVERIES:
+        return base
+    spread = max(1, min(base // 5, 30))
+    seed = int.from_bytes(
+        hashlib.sha256(f"{event_id}:{attempts}".encode()).digest()[:2], "big"
+    )
+    return base - spread + seed % (spread + 1)
+
+
 SCOPES = {
     "implementation": "commit_only",
     "integration": "publish_review",
@@ -44,10 +69,25 @@ ACTION_TYPES = {
     "ci_red": "correct_ci",
     "ci_green": "review_ci",
 }
+# An integration reservation covers the whole worker lifecycle. A start/input
+# observation can checkpoint independently, but only a terminal worker report
+# with its normal completed action receipt may release the serialized key.
+TERMINAL_WORKER_REPORT_KINDS = frozenset(
+    {
+        "worker_brief_completed",
+        "worker_done",
+        "worker_blocked",
+        "worker_needs_approval",
+    }
+)
 
 
 class ContinuityConflict(ValueError):
     """An owner fence or immutable identity does not match."""
+
+
+class IntegrationReservationHeld(ContinuityConflict):
+    """A different signed integration launch currently owns the key."""
 
 
 def continuity_request(store: FactoryObserverContinuity, body: dict) -> dict:
@@ -131,6 +171,32 @@ def _row(con, sql, params):
     result = con.execute(sql, params)
     row = result.fetchone()
     return dict(zip((col[0] for col in result.description), row)) if row else None
+
+
+def _serialization_binding(
+    delivery_role: str, repository: str | None, serialization_key: str | None
+) -> tuple[str, str | None, str | None]:
+    """Validate the signed logical serialization extension.
+
+    It fences a conflicting delivery under implementation authority; it is not
+    the broader integration/publish authority scope.
+    """
+    if delivery_role == "standard":
+        if repository is not None or serialization_key is not None:
+            raise ValueError("standard delivery cannot carry serialization metadata")
+        return delivery_role, None, None
+    if delivery_role != "integration_serialized":
+        raise ValueError("unknown delivery role")
+    import re
+
+    if (
+        not isinstance(repository, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+        or not isinstance(serialization_key, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}", serialization_key)
+    ):
+        raise ValueError("invalid integration serialization binding")
+    return delivery_role, repository, serialization_key
 
 
 def _intent_wire(row: dict) -> dict:
@@ -360,6 +426,7 @@ def record_observer_worker_completion(
             continuity_event_id=None,
             recorded_at=received_at,
         )
+    # Only the literal completion flag authorizes a completed-worker fact.
     if completion.get("turn_complete") is not True:
         return _record_completion_receipt(
             con,
@@ -840,6 +907,166 @@ class FactoryObserverContinuity:
                 con, now=self.clock(), deadline_seconds=deadline_seconds
             )
 
+    @staticmethod
+    def _reserve_integration(con, run: dict, now: datetime) -> None:
+        """Acquire one repository/key reservation or reject the live holder."""
+        if run["delivery_role"] != "integration_serialized":
+            return
+        repository = run["serialization_repository"]
+        key = run["serialization_key"]
+        owner_id = run["authorized_owner_id"]
+        if not repository or not key or not owner_id:
+            raise ContinuityConflict("integration serialization binding is incomplete")
+        con.execute(
+            """INSERT INTO continuity_integration_reservations
+            (repository, serialization_key, owner_id, run_id, generation,
+             owner_epoch, state, acquired_at)
+            VALUES (?, ?, ?, ?, 1, 0, 'reserved', ?)
+            ON CONFLICT (repository, serialization_key) DO NOTHING""",
+            [repository, key, owner_id, run["run_id"], now],
+        )
+        lock = " FOR UPDATE" if is_postgres_connection(con) else ""
+        reservation = _row(
+            con,
+            """SELECT * FROM continuity_integration_reservations
+            WHERE repository = ? AND serialization_key = ?""" + lock,
+            [repository, key],
+        )
+        if reservation is None:
+            raise ContinuityConflict("integration reservation is unavailable")
+        if reservation["state"] == "reserved":
+            if (
+                reservation["run_id"] != run["run_id"]
+                or reservation["owner_id"] != owner_id
+            ):
+                raise IntegrationReservationHeld("integration reservation is held")
+        elif reservation["state"] == "released":
+            reservation = _row(
+                con,
+                """UPDATE continuity_integration_reservations SET
+                owner_id = ?, run_id = ?, generation = generation + 1,
+                owner_epoch = 0, state = 'reserved', acquired_at = ?, released_at = NULL
+                WHERE repository = ? AND serialization_key = ? AND state = 'released'
+                RETURNING *""",
+                [owner_id, run["run_id"], now, repository, key],
+            )
+            if reservation is None:
+                raise ContinuityConflict("integration reservation changed")
+        elif reservation["run_id"] != run["run_id"]:
+            raise ContinuityConflict("integration reservation is unavailable")
+        generation = reservation["generation"]
+        if run.get("serialization_generation") not in {None, generation}:
+            raise ContinuityConflict("integration reservation generation changed")
+        con.execute(
+            """UPDATE factory_observer_runs SET serialization_generation = ?
+            WHERE run_id = ? AND serialization_generation IS NULL""",
+            [generation, run["run_id"]],
+        )
+        run["serialization_generation"] = generation
+
+    def reserve_integration_launch(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        authority_scope: str,
+        delivery_role: str,
+        repository: str | None,
+        serialization_key: str | None,
+    ) -> bool:
+        """Fence a signed serialized launch before creating its daemon session.
+
+        The reservation row itself is the durable pre-create intent.  It may
+        name a run that has not received a daemon session yet; ``initialize``
+        later verifies that same immutable run before reporting its first
+        worker event.  A competing run is therefore deferred before a daemon
+        side effect, rather than becoming an unbound session after create.
+        """
+        _text(run_id, "run_id", 191)
+        _text(owner_id, "owner_id", 191)
+        if authority_scope not in SCOPES:
+            raise ValueError("unsupported authority_scope")
+        delivery_role, repository, serialization_key = _serialization_binding(
+            delivery_role, repository, serialization_key
+        )
+        if delivery_role != "integration_serialized":
+            return False
+        if authority_scope != "implementation" or not owner_id.startswith(
+            "drover:owner/"
+        ):
+            raise ValueError(
+                "integration serialization requires a native implementation owner"
+            )
+        with self._transaction() as (con, _):
+            existing = _row(
+                con,
+                "SELECT run_id FROM factory_observer_runs WHERE run_id = ?",
+                [run_id],
+            )
+            if existing is not None:
+                # A known run must be recovered through its session/ledger,
+                # never re-reserved as a new pre-create launch.
+                raise ContinuityConflict(
+                    "integration launch already has a continuity run"
+                )
+            launch = {
+                "run_id": run_id,
+                "delivery_role": delivery_role,
+                "serialization_repository": repository,
+                "serialization_key": serialization_key,
+                "authorized_owner_id": owner_id,
+                "serialization_generation": None,
+            }
+            self._reserve_integration(con, launch, self.clock())
+        return True
+
+    @staticmethod
+    def _fence_integration(con, run: dict, owner_id: str, owner_epoch: int) -> None:
+        if run["delivery_role"] != "integration_serialized":
+            return
+        changed = con.execute(
+            """UPDATE continuity_integration_reservations SET owner_epoch = ?
+            WHERE repository = ? AND serialization_key = ? AND run_id = ?
+              AND owner_id = ? AND generation = ? AND state = 'reserved'
+              AND owner_epoch <= ? RETURNING generation""",
+            [
+                owner_epoch,
+                run["serialization_repository"],
+                run["serialization_key"],
+                run["run_id"],
+                owner_id,
+                run["serialization_generation"],
+                owner_epoch,
+            ],
+        ).fetchone()
+        if changed is None:
+            raise ContinuityConflict("integration reservation fence changed")
+
+    @staticmethod
+    def _release_integration(
+        con, run: dict, owner_id: str, owner_epoch: int, now: datetime
+    ) -> None:
+        if run["delivery_role"] != "integration_serialized":
+            return
+        changed = con.execute(
+            """UPDATE continuity_integration_reservations
+            SET state = 'released', released_at = ?
+            WHERE repository = ? AND serialization_key = ? AND run_id = ?
+              AND owner_id = ? AND generation = ? AND owner_epoch = ?
+              AND state = 'reserved' RETURNING generation""",
+            [
+                now,
+                run["serialization_repository"],
+                run["serialization_key"],
+                run["run_id"],
+                owner_id,
+                run["serialization_generation"],
+                owner_epoch,
+            ],
+        ).fetchone()
+        if changed is None:
+            raise ContinuityConflict("integration reservation fence changed")
+
     def initialize(
         self,
         *,
@@ -849,6 +1076,12 @@ class FactoryObserverContinuity:
         authority_scope: str = "implementation",
         authorized_owner_id: str | None = None,
         handoff_token: str | None = None,
+        delivery_role: str = "standard",
+        repository: str | None = None,
+        serialization_key: str | None = None,
+        expected_effect_artifact: str | None = None,
+        committed_provenance: bool | None = None,
+        m2_ack_pending: bool | None = None,
     ) -> str:
         """Idempotent opt-in; never launch or change the correlated session."""
         _text(session_id, "session_id", 191)
@@ -862,6 +1095,35 @@ class FactoryObserverContinuity:
                 raise PermissionError("handoff redemption requires an owner identity")
         if authority_scope not in SCOPES:
             raise ValueError("unsupported authority_scope")
+        delivery_role, repository, serialization_key = _serialization_binding(
+            delivery_role, repository, serialization_key
+        )
+        if expected_effect_artifact is not None:
+            _text(expected_effect_artifact, "expected_effect_artifact", 2000)
+        if committed_provenance is not None and not isinstance(
+            committed_provenance, bool
+        ):
+            raise ValueError("committed_provenance must be boolean or null")
+        if committed_provenance is True and expected_effect_artifact is None:
+            raise ValueError("committed provenance requires expected effect")
+        if m2_ack_pending is not None and not isinstance(m2_ack_pending, bool):
+            raise ValueError("m2_ack_pending must be boolean or null")
+        if m2_ack_pending is True and (
+            authority_scope != "implementation" or expected_effect_artifact is None
+        ):
+            raise ValueError("M2 handoff requires implementation expected effect")
+        if (
+            delivery_role == "integration_serialized"
+            and authority_scope != "implementation"
+        ):
+            raise ValueError(
+                "integration serialization requires implementation authority"
+            )
+        if delivery_role == "integration_serialized" and not (
+            isinstance(authorized_owner_id, str)
+            and authorized_owner_id.startswith("drover:owner/")
+        ):
+            raise ValueError("integration serialization requires a native owner")
         session = HarnessRegistry(self.path).get_session(session_id)
         projection = factory_observer_projection(session)
         if projection is None:
@@ -872,8 +1134,10 @@ class FactoryObserverContinuity:
             con.execute(
                 """INSERT INTO factory_observer_runs
                 (run_id, session_id, expected_revision, objective, checkpoint,
-                 authority_scope, authorized_owner_id, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 authority_scope, authorized_owner_id, delivery_role,
+                 serialization_repository, serialization_key, expected_effect_artifact,
+                 committed_provenance, m2_ack_pending, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (run_id) DO NOTHING""",
                 [
                     run_id,
@@ -883,6 +1147,12 @@ class FactoryObserverContinuity:
                     checkpoint,
                     authority_scope,
                     authorized_owner_id,
+                    delivery_role,
+                    repository,
+                    serialization_key,
+                    expected_effect_artifact,
+                    committed_provenance,
+                    m2_ack_pending,
                     self.clock(),
                 ],
             )
@@ -898,6 +1168,12 @@ class FactoryObserverContinuity:
                 "objective": objective,
                 "authority_scope": authority_scope,
                 "expected_revision": projection["expected_revision"],
+                "delivery_role": delivery_role,
+                "serialization_repository": repository,
+                "serialization_key": serialization_key,
+                "expected_effect_artifact": expected_effect_artifact,
+                "committed_provenance": committed_provenance,
+                "m2_ack_pending": m2_ack_pending,
             }.items():
                 if existing[name] != value:
                     raise ContinuityConflict(f"run {name} is immutable")
@@ -937,6 +1213,7 @@ class FactoryObserverContinuity:
                 existing_owner is not None or authorized_owner_id is not None
             ):
                 raise ContinuityConflict("run authorized owner is immutable")
+            self._reserve_integration(con, existing, self.clock())
             if authorized_owner_id is not None:
                 _recover_pending_completions(con, session_id=session_id)
         return run_id
@@ -1055,11 +1332,70 @@ class FactoryObserverContinuity:
                 owner_epoch = ?, lease_until = ?, updated_at = ? WHERE run_id = ?""",
                 [owner_id, epoch, until, now, run_id],
             )
+            self._fence_integration(con, run, owner_id, epoch)
         return {
             "owner_id": owner_id,
             "owner_epoch": epoch,
             "lease_until": until.isoformat(),
         }
+
+    def fence_owner(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        expected_epoch: int | None = None,
+        recovery_wake_id: str | None = None,
+        recovery_executor_id: str | None = None,
+    ) -> int | None:
+        """Invalidate a lost native-owner session before its replacement runs.
+
+        This is a hub-only recovery primitive. The owner identity remains the
+        same, but every lease token held by the replaced harness session is
+        stale before the runner launches its successor.
+        """
+        if (recovery_wake_id is None) != (recovery_executor_id is None):
+            raise ValueError("recovery fence requires wake and executor identity")
+        now = self.clock()
+        with self._transaction(run_id) as (con, run):
+            self._authorized_owner(run, owner_id)
+            if expected_epoch is not None and run["owner_epoch"] != expected_epoch:
+                return None
+            epoch = run["owner_epoch"] + 1
+            clauses = ["run_id = ?", "owner_id = ?", "owner_epoch = ?"]
+            params: list[object] = [
+                epoch,
+                now,
+                now,
+                run_id,
+                owner_id,
+                run["owner_epoch"],
+            ]
+            if recovery_wake_id is not None:
+                clauses.append("""EXISTS (SELECT 1 FROM continuity_owner_recoveries r
+                    WHERE r.wake_id = ? AND r.state = 'fencing'
+                      AND r.executor_id = ? AND r.executor_until > ?)""")
+                params.extend([recovery_wake_id, recovery_executor_id, now])
+            changed = con.execute(
+                """UPDATE factory_observer_runs SET owner_epoch = ?, lease_until = ?,
+                updated_at = ? WHERE """
+                + " AND ".join(clauses)
+                + " RETURNING owner_epoch",
+                params,
+            ).fetchone()
+            if changed is None:
+                return None
+            if recovery_wake_id is not None:
+                marked = con.execute(
+                    """UPDATE continuity_owner_recoveries SET fenced_at = ?
+                    WHERE wake_id = ? AND state = 'fencing' AND executor_id = ?
+                      AND executor_until > ? RETURNING wake_id""",
+                    [now, recovery_wake_id, recovery_executor_id, now],
+                ).fetchone()
+                if marked is None:
+                    raise RuntimeError("recovery executor changed during owner fence")
+            self._fence_integration(con, run, owner_id, epoch)
+        return epoch
 
     @staticmethod
     def _authorized_owner(run, owner_id):
@@ -1116,6 +1452,7 @@ class FactoryObserverContinuity:
             now = self.clock()
             self._authorized_owner(run, owner_id)
             self._fence(run, owner_id, owner_epoch, now)
+            self._fence_integration(con, run, owner_id, owner_epoch)
             action = (
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
             )
@@ -1127,22 +1464,91 @@ class FactoryObserverContinuity:
                 )
                 if event["state"] == "exhausted" or event["next_delivery_at"] > now:
                     return None
-                if event["attempts"] >= MAX_DELIVERIES:
-                    action["escalation"] = {
-                        "state": "blocked:human",
-                        "wake_id": event["event_id"],
-                    }
-                    con.execute(
-                        "UPDATE factory_observer_inbox SET state = 'exhausted', action_json = ? WHERE event_id = ?",
-                        [canonical_payload(action), event["event_id"]],
-                    )
-                    con.execute(
-                        """UPDATE factory_observer_runs SET next_action_json = NULL,
-                        worker_state = 'blocked:human', updated_at = ? WHERE run_id = ?""",
-                        [now, run_id],
-                    )
-                    return None
-            else:
+                # A later terminal report for this exact worker supersedes a
+                # stalled start observation. Preserve the original delivery as
+                # a durable non-acknowledged record, then allow the terminal,
+                # effect-bound result to progress.
+                if action.get("type") == "observe_worker_start":
+                    successor = None
+                    rows = con.execute(
+                        """SELECT event_id, sequence, payload_json FROM factory_observer_inbox
+                        WHERE run_id = ? AND state = 'pending' AND source = ? AND subject = ?
+                          AND sequence > ? ORDER BY sequence, received_at, event_id""",
+                        [run_id, event["source"], event["subject"], event["sequence"]],
+                    ).fetchall()
+                    for successor_id, _, successor_payload in rows:
+                        try:
+                            successor_report = json.loads(successor_payload)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        if successor_report.get("kind") in {
+                            "worker_done",
+                            "worker_brief_completed",
+                            "worker_blocked",
+                            "worker_needs_approval",
+                        }:
+                            successor = successor_id
+                            break
+                    if successor is not None:
+                        action["escalation"] = {
+                            "state": "superseded_by_terminal",
+                            "wake_id": event["event_id"],
+                            "successor_wake_id": successor,
+                        }
+                        con.execute(
+                            """UPDATE factory_observer_inbox SET state = 'exhausted',
+                            action_json = ? WHERE event_id = ? AND state = 'delivered'""",
+                            [canonical_payload(action), event["event_id"]],
+                        )
+                        con.execute(
+                            """UPDATE factory_observer_runs SET next_action_json = NULL,
+                            updated_at = ? WHERE run_id = ?""",
+                            [now, run_id],
+                        )
+                        action = None
+                if action is not None and event["attempts"] >= MAX_DELIVERIES:
+                    # A native ``worker_started`` delivery is a durable
+                    # observation, never the worker's final effect.  A
+                    # transient owner/lease outage must not fabricate a human
+                    # block or discard that exact source event after three
+                    # attempts.  Keep its immutable wake/action identity and
+                    # surface a durable stalled-delivery record instead.
+                    if action.get("type") == "observe_worker_start":
+                        prior_escalation = action.get("escalation")
+                        if not (
+                            isinstance(prior_escalation, dict)
+                            and prior_escalation.get("state") == "delivery_stalled"
+                            and prior_escalation.get("wake_id") == event["event_id"]
+                        ):
+                            # Persist one stable health signal for this wake.
+                            # Later retries update delivery state, never create
+                            # another alert identity or another owner action.
+                            action["escalation"] = {
+                                "state": "delivery_stalled",
+                                "wake_id": event["event_id"],
+                                "attempts": event["attempts"],
+                            }
+                        con.execute(
+                            """UPDATE factory_observer_runs SET next_action_json = ?,
+                            updated_at = ? WHERE run_id = ?""",
+                            [canonical_payload(action), now, run_id],
+                        )
+                    else:
+                        action["escalation"] = {
+                            "state": "blocked:human",
+                            "wake_id": event["event_id"],
+                        }
+                        con.execute(
+                            "UPDATE factory_observer_inbox SET state = 'exhausted', action_json = ? WHERE event_id = ?",
+                            [canonical_payload(action), event["event_id"]],
+                        )
+                        con.execute(
+                            """UPDATE factory_observer_runs SET next_action_json = NULL,
+                            worker_state = 'blocked:human', updated_at = ? WHERE run_id = ?""",
+                            [now, run_id],
+                        )
+                        return None
+            if action is None:
                 event = _row(
                     con,
                     """SELECT * FROM factory_observer_inbox
@@ -1171,6 +1577,17 @@ class FactoryObserverContinuity:
                 }
                 if scope == "deployment":
                     action["type"] = "request_explicit_approval"
+                # A worker-start observation is not settlement of the
+                # candidate's final effect.  It may use ordinary owner
+                # evidence, while the terminal worker result remains bound to
+                # the signed candidate artifact below.
+                if (
+                    run.get("expected_effect_artifact") is not None
+                    and action["type"] != "observe_worker_start"
+                ):
+                    action["expected_effect_artifact"] = run["expected_effect_artifact"]
+                    if run.get("m2_ack_pending") is True:
+                        action["m2_ack_pending"] = True
                 if not late and report["kind"].startswith("worker_"):
                     con.execute(
                         "UPDATE factory_observer_runs SET worker_state = ? WHERE run_id = ?",
@@ -1187,7 +1604,14 @@ class FactoryObserverContinuity:
                 [
                     canonical_payload(action),
                     attempts,
-                    now + timedelta(seconds=5 * 2 ** (attempts - 1)),
+                    now
+                    + timedelta(
+                        seconds=(
+                            _observation_retry_delay(event["event_id"], attempts)
+                            if action.get("type") == "observe_worker_start"
+                            else 5 * 2 ** (attempts - 1)
+                        )
+                    ),
                     event["event_id"],
                 ],
             )
@@ -1221,6 +1645,7 @@ class FactoryObserverContinuity:
             now = self.clock()
             self._authorized_owner(run, owner_id)
             self._fence(run, owner_id, owner_epoch, now)
+            self._fence_integration(con, run, owner_id, owner_epoch)
             event = _row(
                 con,
                 """SELECT state, action_json FROM factory_observer_inbox
@@ -1237,6 +1662,14 @@ class FactoryObserverContinuity:
             ):
                 raise ContinuityConflict(
                     "action intent must match the consumed delivery"
+                )
+            expected_effect_artifact = action.get("expected_effect_artifact")
+            if (
+                expected_effect_artifact is not None
+                and artifact != expected_effect_artifact
+            ):
+                raise ContinuityConflict(
+                    "action intent artifact must match the expected effect"
                 )
             existing = _row(
                 con,
@@ -1304,6 +1737,7 @@ class FactoryObserverContinuity:
                 raise KeyError(event_id)
             if event["state"] == "acknowledged":
                 return  # A replay must never clobber a newer checkpoint/action.
+            self._fence_integration(con, run, owner_id, owner_epoch)
             if not event["action_json"]:
                 raise ContinuityConflict("consume the report before acknowledging")
             action = json.loads(event["action_json"])
@@ -1311,18 +1745,24 @@ class FactoryObserverContinuity:
                 raise ContinuityConflict(
                     "explicit deployment approval is required outside this bridge"
                 )
-            if (
-                owner_id.startswith("drover:owner/")
-                and _row(
+            receipt = None
+            if owner_id.startswith("drover:owner/"):
+                receipt = _row(
                     con,
-                    """SELECT 1 AS present FROM continuity_owner_action_intents
-                WHERE wake_id = ? AND action_fingerprint = ? AND run_id = ?
-                AND owner_id = ? AND state = 'complete'""",
+                    """SELECT owner_epoch FROM continuity_owner_action_intents
+                    WHERE wake_id = ? AND action_fingerprint = ? AND run_id = ?
+                    AND owner_id = ? AND state = 'complete'""",
                     [event_id, action["action_id"], run_id, owner_id],
                 )
-                is None
-            ):
-                raise ContinuityConflict("completed action intent receipt is required")
+                if receipt is None:
+                    raise ContinuityConflict(
+                        "completed action intent receipt is required"
+                    )
+            if action.get("m2_ack_pending") is True:
+                if receipt is None or owner_epoch <= int(receipt["owner_epoch"]):
+                    raise ContinuityConflict(
+                        "M2 receipt recovery requires successor epoch"
+                    )
             con.execute(
                 "UPDATE factory_observer_inbox SET state = 'acknowledged', acknowledged_at = ? WHERE event_id = ?",
                 [now, event_id],
@@ -1332,6 +1772,47 @@ class FactoryObserverContinuity:
                 next_action_json = NULL, updated_at = ? WHERE run_id = ?""",
                 [checkpoint, now, run_id],
             )
+            if run["delivery_role"] == "integration_serialized":
+                try:
+                    report = json.loads(event["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ContinuityConflict(
+                        "terminal integration release requires a valid report"
+                    ) from exc
+                if not isinstance(report, dict):
+                    raise ContinuityConflict(
+                        "terminal integration release requires a valid report"
+                    )
+                if report.get("kind") in TERMINAL_WORKER_REPORT_KINDS:
+                    self._release_integration(con, run, owner_id, owner_epoch, now)
+
+    def pending_deployment_gate_runs(
+        self, owner_id: str, *, limit: int = 20
+    ) -> list[str]:
+        """Return signed deployment runs that need one non-executor gate delivery.
+
+        Deployment authority is deliberately excluded from :meth:`owner_runs`:
+        a native owner must never turn an unanswered human approval into a
+        provider turn.  The runner can still lease and consume one durable
+        ``request_explicit_approval`` action so status exposes the gate.  Once
+        that action is stored, ``next_action_json`` prevents a second source
+        event from being consumed until an authorized human decision exists.
+        """
+        _text(owner_id, "owner_id", 191)
+        _integer(limit, "limit", 1, 50)
+        with self._transaction() as (con, _):
+            rows = con.execute(
+                """SELECT r.run_id FROM factory_observer_runs r
+                WHERE r.authorized_owner_id = ? AND r.authority_scope = 'deployment'
+                  AND r.next_action_json IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM factory_observer_inbox i
+                    WHERE i.run_id = r.run_id AND i.state = 'pending'
+                  )
+                ORDER BY r.updated_at, r.run_id LIMIT ?""",
+                [owner_id, limit],
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def owner_runs(
         self,
@@ -1374,22 +1855,73 @@ class FactoryObserverContinuity:
                     [run_id],
                 ).fetchall()
             )
+            # Counts drive health and recovery decisions, so they must not
+            # depend on the bounded event page returned to this caller. A
+            # superseded start remains auditable in ``events`` but is not an
+            # exhausted final action and must not make a later terminal wake
+            # appear lost.
+            superseded = 0
+            for (action_payload,) in con.execute(
+                """SELECT action_json FROM factory_observer_inbox
+                WHERE run_id = ? AND state = 'exhausted'""",
+                [run_id],
+            ).fetchall():
+                try:
+                    escalation = json.loads(action_payload or "null").get("escalation")
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    escalation = None
+                if (
+                    isinstance(escalation, dict)
+                    and escalation.get("state") == "superseded_by_terminal"
+                    and isinstance(escalation.get("successor_wake_id"), str)
+                ):
+                    superseded += 1
+            if superseded:
+                counts["exhausted"] = max(0, counts.get("exhausted", 0) - superseded)
+                if not counts["exhausted"]:
+                    counts.pop("exhausted")
+            visible_total = con.execute(
+                "SELECT count(*) FROM factory_observer_inbox WHERE run_id = ? AND state <> 'acknowledged'",
+                [run_id],
+            ).fetchone()[0]
             result = con.execute(
                 """SELECT event_id, state, attempts, next_delivery_at,
-                payload_json FROM factory_observer_inbox WHERE run_id = ? AND state <> 'acknowledged'
+                payload_json, action_json FROM factory_observer_inbox
+                WHERE run_id = ? AND state <> 'acknowledged'
                 ORDER BY received_at, event_id LIMIT ?""",
                 [run_id, limit],
             )
-            events = [
-                {
-                    "event_id": eid,
-                    "state": state,
-                    "attempts": attempts,
-                    "next_delivery_at": due.isoformat() if due else None,
-                    "report": json.loads(payload),
-                }
-                for eid, state, attempts, due, payload in result.fetchall()
-            ]
+            events = []
+            for eid, state, attempts, due, payload, action_payload in result.fetchall():
+                try:
+                    event_action = json.loads(action_payload or "null")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    event_action = None
+                escalation = (
+                    event_action.get("escalation")
+                    if isinstance(event_action, dict)
+                    else None
+                )
+                successor = (
+                    escalation.get("successor_wake_id")
+                    if isinstance(escalation, dict)
+                    and escalation.get("state") == "superseded_by_terminal"
+                    else None
+                )
+                events.append(
+                    {
+                        "event_id": eid,
+                        "state": state,
+                        "attempts": attempts,
+                        "next_delivery_at": due.isoformat() if due else None,
+                        "report": json.loads(payload),
+                        **(
+                            {"superseded_by_terminal": successor}
+                            if successor is not None
+                            else {}
+                        ),
+                    }
+                )
             action = (
                 json.loads(run["next_action_json"]) if run["next_action_json"] else None
             )
@@ -1404,6 +1936,25 @@ class FactoryObserverContinuity:
                 if receipt is not None:
                     action["action_intent"] = _intent_wire(receipt)
             blocked = run["authority_scope"] == "deployment"
+            integration_serialization = None
+            if run.get("delivery_role") == "integration_serialized":
+                reservation = _row(
+                    con,
+                    """SELECT owner_id, run_id, generation, owner_epoch, state
+                    FROM continuity_integration_reservations
+                    WHERE repository = ? AND serialization_key = ?""",
+                    [run["serialization_repository"], run["serialization_key"]],
+                )
+                if reservation is None:
+                    raise ContinuityConflict("integration reservation is missing")
+                integration_serialization = {
+                    "repository": run["serialization_repository"],
+                    "key": run["serialization_key"],
+                    "generation": reservation["generation"],
+                    "owner_epoch": reservation["owner_epoch"],
+                    "state": reservation["state"],
+                    "held_by_run": reservation["run_id"] == run_id,
+                }
             receipt_counts = dict(
                 con.execute(
                     "SELECT state, count(*) FROM factory_observer_completion_receipts "
@@ -1429,21 +1980,23 @@ class FactoryObserverContinuity:
                 handoff_state = "acknowledgement_required"
             elif counts.get("pending") or counts.get("delivered"):
                 handoff_state = "owner_lease_required"
+            elif counts.get("exhausted"):
+                # An acknowledgement for an earlier wake cannot settle a
+                # different exhausted delivery.  Keep this distinct from a
+                # successful handoff so an owner never treats aggregate
+                # counts as proof that its exact wake was acknowledged.
+                handoff_state = "delivery_exhausted"
             elif counts.get("acknowledged"):
                 handoff_state = "acknowledged"
             else:
                 handoff_state = "awaiting_completion"
             recovery = (
-                ("claim_owner" if not run["owner_id"] else "reclaim_expired_owner")
-                if not live
+                "manual_attention"
+                if counts.get("exhausted")
                 else (
-                    "approval_required"
-                    if blocked
-                    else (
-                        "manual_attention"
-                        if counts.get("exhausted")
-                        else "continue_owner"
-                    )
+                    ("claim_owner" if not run["owner_id"] else "reclaim_expired_owner")
+                    if not live
+                    else ("approval_required" if blocked else "continue_owner")
                 )
             )
             return {
@@ -1456,6 +2009,21 @@ class FactoryObserverContinuity:
                 "checkpoint": run["checkpoint"],
                 "authority_scope": run["authority_scope"],
                 "scope_limit": SCOPES[run["authority_scope"]],
+                "delivery_role": run.get("delivery_role", "standard"),
+                "expected_effect_artifact": run.get("expected_effect_artifact"),
+                # A migration-44 legacy row has no immutable signed mode.
+                # Do not collapse that unknown into marker-only authority.
+                "committed_provenance": (
+                    run.get("committed_provenance")
+                    if isinstance(run.get("committed_provenance"), bool)
+                    else None
+                ),
+                "m2_ack_pending": (
+                    run.get("m2_ack_pending")
+                    if isinstance(run.get("m2_ack_pending"), bool)
+                    else None
+                ),
+                "integration_serialization": integration_serialization,
                 "owner_handoff": {
                     "authorized_owner_id": run.get("authorized_owner_id"),
                     "state": handoff_state,
@@ -1484,8 +2052,7 @@ class FactoryObserverContinuity:
                     "errors": receipt_errors,
                 },
                 "events": events,
-                "has_more": sum(
-                    n for state, n in counts.items() if state != "acknowledged"
-                )
-                > len(events),
+                # ``inbox_counts`` intentionally coalesces superseded start
+                # observations; pagination still exposes each durable event.
+                "has_more": visible_total > len(events),
             }

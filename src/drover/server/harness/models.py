@@ -105,6 +105,7 @@ class HarnessSession:
     model: str | None = None
     thinking_effort: str | None = None
     awaiting: str | None = None
+    attention_id: str | None = None
     last_activity: datetime | None = None
     end_reason: str | None = None
     archived_at: datetime | None = None
@@ -147,6 +148,7 @@ class HarnessSession:
             model=row.get("model"),
             thinking_effort=row.get("thinking_effort"),
             awaiting=row.get("awaiting"),
+            attention_id=row.get("attention_id"),
             last_activity=row.get("last_activity"),
             parent_session_id=row.get("parent_session_id"),
             client_session_id=row.get("client_session_id"),

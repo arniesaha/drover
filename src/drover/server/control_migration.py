@@ -25,6 +25,7 @@ import duckdb
 from drover.server.continuity_schema import (
     CONTINUITY_BASE_TABLES,
     CONTINUITY_RECEIPT_TABLE,
+    CONTINUITY_RESERVATION_TABLE,
     CONTINUITY_TABLES,
 )
 from drover.server.control_outbox import payload_sha256
@@ -36,7 +37,13 @@ from drover.server.db import (
 )
 
 _EXTRA_TABLES = ("control_server_identity", "control_credentials")
-_ALL_TABLES = CONTROL_PLANE_TABLES + _EXTRA_TABLES
+# The reservation has a composite primary key, so it is intentionally excluded
+# from the generic live-control snapshot helpers that rely on one key column.
+# Offline control-store migration still copies and verifies it with the other
+# continuity relations; otherwise a serialized run would arrive without its
+# durable fence.
+_MIGRATION_TABLES = (*CONTROL_PLANE_TABLES, CONTINUITY_RESERVATION_TABLE)
+_ALL_TABLES = _MIGRATION_TABLES + _EXTRA_TABLES
 
 # Legacy usage writers stored their instants as naive UTC in DuckDB.  These
 # columns have producer-specific provenance, so applying an operator's old
@@ -68,6 +75,10 @@ _REQUIRED_SOURCE_COLUMNS: dict[str, frozenset[str]] = {
     CONTINUITY_RECEIPT_TABLE: frozenset(
         "harness_event_id run_id session_id sequence state reason continuity_event_id "
         "recorded_at".split()
+    ),
+    CONTINUITY_RESERVATION_TABLE: frozenset(
+        "repository serialization_key owner_id run_id generation owner_epoch state "
+        "acquired_at released_at".split()
     ),
     "harness_hosts": frozenset(
         {"host_id", "display_name", "kind", "status", "capabilities_json"}
@@ -378,14 +389,14 @@ def _source_table_rows(
         raise ValueError("snapshot must supply both continuity tables or neither")
     missing = [
         table
-        for table in CONTROL_PLANE_TABLES
+        for table in _MIGRATION_TABLES
         if table not in tables and table not in CONTINUITY_TABLES
     ]
     if missing:
         raise ValueError(
             "legacy snapshot is missing central table(s): " + ", ".join(missing)
         )
-    for table in CONTROL_PLANE_TABLES:
+    for table in _MIGRATION_TABLES:
         if table == "harness_events" and not include_events:
             continue
         if table not in tables:
@@ -559,7 +570,7 @@ def _validate_source_inventory(
     ]
     if any(base_continuity_columns) and not all(base_continuity_columns):
         raise ValueError("snapshot must supply both continuity tables or neither")
-    for table in CONTROL_PLANE_TABLES:
+    for table in _MIGRATION_TABLES:
         source_columns = set(_source_columns(source_snapshot, table))
         if table in CONTINUITY_TABLES and not source_columns:
             continue
@@ -843,7 +854,7 @@ def _verify_rows(
         "actual": actual_events["count"],
         "match": expected_events == actual_events,
     }
-    for table in CONTROL_PLANE_TABLES:
+    for table in _MIGRATION_TABLES:
         if table == "harness_events":
             continue
         expected = _table_summary(source_rows[table])
@@ -1025,7 +1036,7 @@ def import_legacy_snapshot(
 
                 con.execute("BEGIN")
                 _lock_import_admission(con)
-                for table in CONTROL_PLANE_TABLES:
+                for table in _MIGRATION_TABLES:
                     if table == "harness_events":
                         for rows in _iter_source_rows(source.connection, table, zone):
                             metadata = []

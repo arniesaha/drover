@@ -166,14 +166,10 @@ struct OnboardingView: View {
                     } label: {
                         Text("Set Up Drover")
                             .font(.system(.subheadline, design: .default, weight: .medium))
-                            .foregroundStyle(DroverColor.accentHi)
+                            .foregroundStyle(DroverColor.bg)
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 13)
-                            .background(DroverColor.bg, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .strokeBorder(DroverColor.accent, lineWidth: 1)
-                            }
+                            .frame(minHeight: 48)
+                            .background(DroverColor.accentHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("onboarding-setup-drover-button")
@@ -185,9 +181,10 @@ struct OnboardingView: View {
                     } label: {
                         Text("I already have a server")
                             .font(.system(.subheadline, design: .default, weight: .medium))
-                            .foregroundStyle(DroverColor.faint)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 13)
+                        .foregroundStyle(DroverColor.accentHi)
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 44)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("onboarding-already-have-server-button")
@@ -201,9 +198,9 @@ struct OnboardingView: View {
                             Text("Try a demo — no computer needed")
                                 .font(.system(.subheadline, design: .default, weight: .medium))
                         }
-                        .foregroundStyle(DroverColor.accentHi)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 13)
+                    .foregroundStyle(DroverColor.accentHi)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: 44)
                         .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .overlay {
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -336,9 +333,9 @@ struct OnboardingView: View {
                         Text("Try a demo — no computer needed")
                             .font(.system(.subheadline, design: .default, weight: .medium))
                     }
-                    .foregroundStyle(DroverColor.accentHi)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
+                            .foregroundStyle(DroverColor.accentHi)
+                            .frame(maxWidth: .infinity)
+                            .frame(minHeight: 44)
                     .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: 10, style: .continuous)

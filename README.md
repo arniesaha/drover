@@ -51,11 +51,26 @@ Analytics expands provider-reported quota windows and usage distributions.
 - DuckDB remains available as a compatibility control store and backs
   host-local harness spools. OpenTelemetry spans are optional diagnostic data,
   off by default.
+- The **work coordinator and event-driven continuity** runs autonomous
+  coding and verification tasks through a single, bounded coordinator:
+  - For configured `local_file` native-owner canary goals, work advances across
+    strict boundaries: automatic work (`run_role="work"`) in an isolated
+    worktree requests deferred completion; after terminal completion, internal
+    reconciliation launches a separate verification run (`run_role="verify"`) in
+    a fresh isolated worktree checked out from the parent's committed HEAD; upon
+    successful terminal verification, the item closes and the hub-native owner
+    (`drover:owner/<goal>`) leases, consumes, and acknowledges the delivery wake.
+  - For real GitHub-backed workloads, automatic queue admission and execution
+    links dispatch workers commit-only in isolated worktrees, while the integration
+    owner separately reviews and publishes PRs; external-owner lease/consume/ACK
+    tools are not exposed in the current effective OpenClaw catalog, so end-to-end
+    event-to-owner completion remains unproven on GitHub.
 - The **MCP surface** exposes that context to coding agents as `drover_*` tools.
 
 See [Architecture](docs/architecture.md) for the component boundaries and
 [Context Store](docs/context-store.md) for the data model. Operators should
-read [PostgreSQL control store](docs/postgresql-control-store.md) and the
+read [Normal private server update](docs/operations/private-server-update.md),
+[PostgreSQL control store](docs/postgresql-control-store.md), and the
 [lake operations runbooks](docs/operations/lake-serving.md).
 
 ## Quickstart
@@ -166,6 +181,9 @@ device signing, and server configuration.
 - [iOS app](apps/drover/README.md) and [TestFlight runbook](apps/drover/docs/internal-testflight-runbook.md)
 - [Context Store](docs/context-store.md)
 - [PostgreSQL Control Store](docs/postgresql-control-store.md)
+- [Verified Event-Path and Automatic Flow Boundaries](docs/operations/verified-event-path-boundaries.md)
+- [#924 Isolated Acceptance](docs/operations/continuity-924-isolated-acceptance.md)
+- [Normal private server update](docs/operations/private-server-update.md)
 - [Integrations](docs/integrations.md)
 - [Multi-Host](docs/multi-host.md)
 - [Security](docs/security.md)
@@ -176,8 +194,8 @@ device signing, and server configuration.
 ## Status and limitations
 
 Drover is source-distributed software for technical users operating a trusted
-personal fleet. The latest release is **v0.6.26**; see the
-[changelog](CHANGELOG.md) for upgrade notes and changes. The Python server and
+personal fleet. The latest public release is **v0.6.56**; see the
+[changelog](CHANGELOG.md) and [GitHub releases](https://github.com/arniesaha/drover/releases) for upgrade notes and checksums. Verify a pinned public release with `install.sh --verify-release`; private validation artifacts are not public releases. The Python server and
 native iOS client are
 functional. The iOS app is built from source or distributed to testers through
 the TestFlight production lane; it is not on the public App Store. Push notifications work when the

@@ -7,8 +7,10 @@ from time import monotonic
 from typing import Any
 
 from drover.server.continuity_schema import (
-    NATIVE_OWNER_DDL,
+    INTEGRATION_SERIALIZATION_DDL,
+    NATIVE_OWNER_BASE_DDL,
     NATIVE_OWNER_RECEIPT_DDL,
+    NATIVE_OWNER_RECOVERY_DDL,
     POSTGRES_V10_CONTINUITY_DDL,
 )
 from drover.server.lifecycle_schema import PUBLICATION_MIGRATION, STOP_MIGRATION
@@ -35,6 +37,15 @@ CONTINUITY_WAKES_MIGRATION = 35
 CONTINUITY_WAKE_DELIVERY_FENCE_MIGRATION = 36
 NATIVE_CONTINUITY_OWNER_MIGRATION = 37
 NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION = 38
+OWNER_CREDENTIAL_MIGRATION = 39
+NATIVE_OWNER_RECOVERY_MIGRATION = 40
+INTEGRATION_SERIALIZATION_MIGRATION = 41
+EXPECTED_EFFECT_ARTIFACT_MIGRATION = 42
+OWNER_CLAIM_EPOCH_MIGRATION = 43
+COMMITTED_PROVENANCE_MIGRATION = 44
+WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION = 45
+M2_ACK_PENDING_MIGRATION = 46
+ATTENTION_GENERATION_MIGRATION = 47
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1041,8 +1052,64 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         ("ALTER TABLE continuity_wakes ADD COLUMN IF NOT EXISTS delivery_token TEXT",),
     ),
     # Hub-native owner session links and turn fencing (#848).
-    (NATIVE_CONTINUITY_OWNER_MIGRATION, NATIVE_OWNER_DDL),
+    (NATIVE_CONTINUITY_OWNER_MIGRATION, NATIVE_OWNER_BASE_DDL),
     (NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION, NATIVE_OWNER_RECEIPT_DDL),
+    (
+        OWNER_CREDENTIAL_MIGRATION,
+        (
+            "ALTER TABLE control_credentials ADD COLUMN IF NOT EXISTS owner_id TEXT",
+            "CREATE INDEX IF NOT EXISTS control_credentials_active_owner ON control_credentials (owner_id) WHERE scope = 'owner' AND revoked_at IS NULL",
+        ),
+    ),
+    (NATIVE_OWNER_RECOVERY_MIGRATION, NATIVE_OWNER_RECOVERY_DDL),
+    (
+        INTEGRATION_SERIALIZATION_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS delivery_role TEXT NOT NULL DEFAULT 'standard'",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS serialization_repository TEXT",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS serialization_key TEXT",
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS serialization_generation BIGINT",
+            *INTEGRATION_SERIALIZATION_DDL,
+        ),
+    ),
+    (
+        EXPECTED_EFFECT_ARTIFACT_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS expected_effect_artifact TEXT",
+        ),
+    ),
+    # A claim may renew only the same fenced owner epoch that created it.
+    (
+        OWNER_CLAIM_EPOCH_MIGRATION,
+        (
+            "ALTER TABLE continuity_owner_turn_claims ADD COLUMN IF NOT EXISTS owner_epoch BIGINT",
+        ),
+    ),
+    (
+        COMMITTED_PROVENANCE_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS committed_provenance BOOLEAN",
+        ),
+    ),
+    # Persist the exact hub-signed coordinator envelope before daemon create.
+    # Pre-upgrade rows remain NULL and are never reconstructed from mutable input.
+    (
+        WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
+        (
+            "ALTER TABLE execution_links ADD COLUMN IF NOT EXISTS work_coordinator_binding_json TEXT",
+        ),
+    ),
+    # Legacy rows have no immutable M2 selection and therefore remain NULL.
+    (
+        M2_ACK_PENDING_MIGRATION,
+        (
+            "ALTER TABLE factory_observer_runs ADD COLUMN IF NOT EXISTS m2_ack_pending BOOLEAN",
+        ),
+    ),
+    (
+        ATTENTION_GENERATION_MIGRATION,
+        ("ALTER TABLE harness_sessions ADD COLUMN IF NOT EXISTS attention_id TEXT",),
+    ),
 )
 
 #: Session embeddings need pgvector, which is a server-side extension the

@@ -1,4 +1,6 @@
 import json
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -7,12 +9,23 @@ import pytest
 from drover.schema import bootstrap_control_plane_store
 from drover.server.db import control_plane_connection
 from drover.server.harness.continuity import (
+    MAX_LEASE_SECONDS,
     ContinuityConflict,
     FactoryObserverContinuity,
+    _observation_retry_delay,
 )
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.web.auth import AuthSettings, request_authorized
+from drover.server.web.credentials import CredentialStore
 from drover.server.work_queue.config import GoalScope
 from drover.server.work_queue.native_owner import NativeOwnerRunner
+
+
+@pytest.fixture(autouse=True)
+def _keep_test_host_launchable(monkeypatch):
+    """Registry timestamps are wall-clock based; keep this unit fixture independent of DST."""
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
 
 
 class Clock:
@@ -67,6 +80,13 @@ class Collector:
         self.failed_launches = 0
         self.failed_turns = 0
         self.recorded_failed_turns = 0
+        self.expected_effect_attestations = {}
+        self.effect_attestation_attempts = []
+        self.turn_active = False
+
+    def harness_session_turn_active(self, session_id):
+        del session_id
+        return self.turn_active
 
     def proxy_create_harness_session(self, host_id, payload):
         self.launches.append((host_id, payload))
@@ -74,7 +94,7 @@ class Collector:
             self.failed_launches -= 1
             return 503, "{}"
         session = self.registry.create_session(
-            session_id="owner-session",
+            session_id="owner-" + payload["client_session_id"][-8:],
             host_id=host_id,
             harness=payload["harness"],
             command="codex",
@@ -86,9 +106,22 @@ class Collector:
         )
         return 202, json.dumps({"session_id": session.session_id})
 
-    def proxy_harness_session_action(self, session_id, action, payload):
+    def proxy_harness_session_action(
+        self, session_id, action, payload, *, recovery_payload_factory=None
+    ):
+        if action == "expected-effect":
+            self.effect_attestation_attempts.append((session_id, payload))
+            return 200, json.dumps(
+                {
+                    "materialized": self.expected_effect_attestations.get(
+                        session_id, False
+                    )
+                }
+            )
         assert action == "turns"
         self.turn_attempts.append((session_id, payload))
+        if self.turn_active:
+            return 409, '{"error":"turn already in flight"}'
         if self.failed_turns:
             self.failed_turns -= 1
             if self.recorded_failed_turns:
@@ -109,7 +142,9 @@ class Collector:
         return 202, "{}"
 
 
-def _runner(tmp_path):
+def _runner(
+    tmp_path, *, expected_effect=None, event_kind="worker_blocked", m2_ack_pending=None
+):
     path = tmp_path / "control.duckdb"
     bootstrap_control_plane_store(path)
     registry = HarnessRegistry(path)
@@ -125,6 +160,7 @@ def _runner(tmp_path):
         harness="codex",
         command="codex",
         status="running",
+        cwd="/workspace/worktrees/project",
         handoff_mode="factory_observer",
         source_session_id="factory/run-native@1",
     )
@@ -136,6 +172,8 @@ def _runner(tmp_path):
         objective="Native continuity",
         checkpoint="started",
         authorized_owner_id=owner_id,
+        expected_effect_artifact=expected_effect,
+        m2_ack_pending=m2_ack_pending,
     )
     store.report(
         run_id,
@@ -143,14 +181,99 @@ def _runner(tmp_path):
         source_event_id="blocked-1",
         subject="worker-1",
         sequence=1,
-        kind="worker_blocked",
-        summary="blocked",
+        kind=event_kind,
+        summary=event_kind,
     )
     collector = Collector(path, registry)
+    credentials = CredentialStore(tmp_path / "credentials.json")
     runner = NativeOwnerRunner(
-        collector, SimpleNamespace(goals=[_scope()]), clock=clock, claim_seconds=10
+        collector,
+        SimpleNamespace(goals=[_scope()]),
+        credential_store=credentials,
+        clock=clock,
+        claim_seconds=10,
     )
     return runner, collector, store, run_id, clock
+
+
+def test_runner_surfaces_signed_deployment_gate_without_owner_turn(tmp_path):
+    runner, collector, store, implementation_run, _ = _runner(tmp_path)
+    registry = collector.registry
+    registry.create_session(
+        session_id="deployment-observer",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/deployment",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-deployment-native@1",
+    )
+    deployment_run = store.initialize(
+        session_id="deployment-observer",
+        objective="Await a signed deployment approval",
+        checkpoint="approval pending",
+        authority_scope="deployment",
+        authorized_owner_id="drover:owner/goal-native",
+        expected_effect_artifact="local-file:.drover-native-canary/source-task-57.json",
+    )
+    store.report(
+        deployment_run,
+        source="hub",
+        source_event_id="deployment-start",
+        subject="worker-deployment",
+        sequence=1,
+        kind="worker_started",
+        summary="deployment worker started",
+    )
+    store.report(
+        deployment_run,
+        source="hub",
+        source_event_id="deployment-done",
+        subject="worker-deployment",
+        sequence=2,
+        kind="worker_done",
+        summary="deployment worker done",
+    )
+
+    # The independent implementation run still receives its normal owner turn.
+    assert runner.process_once() == 1
+    assert len(collector.launches) == 1
+    assert len(collector.turn_attempts) == 1
+    assert implementation_run in collector.turn_attempts[0][1]["text"]
+
+    status = store.status(deployment_run)
+    action = status["next_action"]
+    assert action is not None
+    assert action["type"] == "request_explicit_approval"
+    assert action["authority_scope"] == "deployment"
+    assert action["authorized"] is False
+    assert "expected_effect_artifact" in action
+    assert status["recovery"] == "approval_required"
+    assert status["owner_wake"] is False
+    assert status["inbox_counts"] == {"delivered": 1, "pending": 1}
+    assert store.pending_deployment_gate_runs("drover:owner/goal-native") == []
+
+    # Surfacing the gate does not create an executor claim, effect, or ACK.
+    with control_plane_connection(runner.path) as con:
+        claims = con.execute(
+            "SELECT count(*) FROM continuity_owner_turn_claims WHERE run_id = ?",
+            [deployment_run],
+        ).fetchone()[0]
+        intents = con.execute(
+            "SELECT count(*) FROM continuity_owner_action_intents WHERE run_id = ?",
+            [deployment_run],
+        ).fetchone()[0]
+    assert claims == 0
+    assert intents == 0
+    with pytest.raises(ContinuityConflict, match="approval"):
+        store.acknowledge(
+            deployment_run,
+            owner_id="drover:owner/goal-native",
+            owner_epoch=status["owner"]["epoch"],
+            event_id=action["event_id"],
+            checkpoint="unauthorized deployment",
+        )
 
 
 def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
@@ -162,7 +285,319 @@ def test_owner_wake_launches_one_hub_native_owner_turn(tmp_path):
     prompt = collector.turn_attempts[0][1]["text"]
     assert f"run_id: {run_id}" in prompt
     assert "wake_id:" in prompt and "action_intent" in prompt
+    assert "DROVER_CONTINUITY_OWNER_BEARER" in prompt
+    assert (
+        "authorized brief referenced by brief_ref is the deliverable contract" in prompt
+    )
+    assert "read-only summary or other non-code evidence" in prompt
+    assert "rather than requiring or accepting a code SHA" in prompt
+    assert "code-SHA verification for briefs that require implementation" in prompt
+    assert "without explicit human approval" in prompt
+    payload = collector.launches[0][1]
+    token = payload["continuity_owner_bearer"]
+    assert runner.credentials.find_active(token).owner_id == "drover:owner/goal-native"
     assert store.status(run_id)["owner"]["live"]
+
+
+def test_recovery_owner_bearer_rotates_only_for_the_missing_link(tmp_path):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    session_id = collector.turn_attempts[0][0]
+    old_token = collector.launches[0][1]["continuity_owner_bearer"]
+    original_link = runner._link(scope)
+
+    recovery_payload = runner._recovery_owner_bearer_factory(scope, session_id)()
+
+    assert recovery_payload is not None
+    fresh_token = recovery_payload["continuity_owner_bearer"]
+    assert fresh_token != old_token
+    assert runner.credentials.find_active(old_token) is None
+    fresh = runner.credentials.find_active(fresh_token)
+    assert fresh is not None
+    assert fresh.owner_id == scope.continuity_owner_id
+    refreshed_link = runner._link(scope)
+    assert refreshed_link["session_id"] == session_id
+    assert refreshed_link["credential_id"] == fresh.id
+    assert refreshed_link["generation"] == original_link["generation"]
+
+
+def test_recovery_owner_bearer_factory_rotates_one_bound_credential_once(tmp_path):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    recovery = runner._recovery_owner_bearer_factory(
+        scope, collector.turn_attempts[0][0]
+    )
+
+    first = recovery()
+    assert first is not None
+    assert recovery() is None
+    assert runner.credentials.find_active(first["continuity_owner_bearer"]) is not None
+
+
+def test_recovery_owner_bearer_fences_generation_before_credential_rotation(
+    tmp_path,
+):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    session_id = collector.turn_attempts[0][0]
+    original_token = collector.launches[0][1]["continuity_owner_bearer"]
+    recovery = runner._recovery_owner_bearer_factory(scope, session_id)
+
+    # The callback was constructed for generation 1. A successor generation
+    # wins before the relay requests its recovery payload.
+    with runner._transaction() as con:
+        con.execute(
+            """UPDATE continuity_owner_sessions SET generation = generation + 1,
+            session_id = ?, credential_id = NULL
+            WHERE goal_id = ? AND owner_id = ?""",
+            ["successor-session", scope.goal_id, scope.continuity_owner_id],
+        )
+    assert recovery() is None
+    assert runner.credentials.find_active(original_token) is not None
+
+
+def test_recovery_owner_bearer_refuses_a_replaced_session_link(tmp_path):
+    runner, collector, _store, _run_id, _clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    scope = runner.config.goals[0]
+    session_id = collector.turn_attempts[0][0]
+    original_token = collector.launches[0][1]["continuity_owner_bearer"]
+    with runner._transaction() as con:
+        con.execute(
+            """UPDATE continuity_owner_sessions SET session_id = ?
+            WHERE goal_id = ? AND owner_id = ?""",
+            ["successor-session", scope.goal_id, scope.continuity_owner_id],
+        )
+
+    assert runner._recovery_owner_bearer_factory(scope, session_id)() is None
+    assert runner.credentials.find_active(original_token) is not None
+
+
+def _advance_final_delivery_to_third_deadline(store, run_id, clock):
+    """Model the 5/10/20-second delivery schedule without replaying a turn."""
+    status = store.status(run_id)
+    action = status["next_action"]
+    owner = status["owner"]
+    fence = {"owner_id": owner["id"], "owner_epoch": owner["epoch"]}
+
+    clock.advance(5)
+    assert store.consume(run_id, **fence)["event_id"] == action["event_id"]
+    clock.advance(10)
+    assert store.consume(run_id, **fence)["event_id"] == action["event_id"]
+    third = next(
+        event
+        for event in store.status(run_id)["events"]
+        if event["event_id"] == action["event_id"]
+    )
+    assert third["state"] == "delivered"
+    assert third["attempts"] == 3
+    # The third delivery is due at t+35; candidate 37's owner double-consumed
+    # after that deadline.
+    clock.advance(21)
+    return action, fence
+
+
+def test_terminal_double_consume_after_third_deadline_exhausts_without_intent(tmp_path):
+    """Reproduce the candidate-37 handoff failure before correcting its prompt."""
+    expected = "local-file:.drover-native-canary/source-task-37.json"
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, expected_effect=expected, event_kind="worker_done"
+    )
+    collector.expected_effect_attestations["observer-session"] = True
+
+    assert runner.process_once() == 1
+    action, fence = _advance_final_delivery_to_third_deadline(store, run_id, clock)
+
+    # A second owner-side consume at t+36 hits the final-event cutoff. It does
+    # not rediscover the hub-delivered wake and there is no completed receipt.
+    assert store.consume(run_id, **fence) is None
+    status = store.status(run_id)
+    event = next(
+        event for event in status["events"] if event["event_id"] == action["event_id"]
+    )
+    assert event["state"] == "exhausted"
+    assert event["attempts"] == 3
+    assert status["next_action"] is None
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="old-contract"
+        )
+    with control_plane_connection(runner.collector.duckdb_path) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_action_intents WHERE wake_id = ?",
+                [action["event_id"]],
+            ).fetchone()[0]
+            == 0
+        )
+    assert len(collector.turn_attempts) == 1
+
+
+def test_preconsumed_terminal_delivery_can_intent_and_ack_after_third_deadline(
+    tmp_path,
+):
+    """The exact delivered wake remains safely reconcilable after its deadline."""
+    expected = "local-file:.drover-native-canary/source-task-37.json"
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, expected_effect=expected, event_kind="worker_done"
+    )
+    collector.expected_effect_attestations["observer-session"] = True
+
+    assert runner.process_once() == 1
+    action, fence = _advance_final_delivery_to_third_deadline(store, run_id, clock)
+    prompt = collector.turn_attempts[0][1]["text"]
+
+    assert "already consumed and fenced the exact wake" in prompt
+    assert "Do not call consume to fetch a replacement delivery" in prompt
+    assert f"expected_effect_artifact: {expected}" in prompt
+    assert f"wake_id: {action['event_id']}" in prompt
+    assert f"action_fingerprint: {action['action_id']}" in prompt
+    with pytest.raises(KeyError):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id="not-the-delivered-wake",
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict, match="match the consumed delivery"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint="wrong-fingerprint",
+        )
+    with pytest.raises(ContinuityConflict, match="current owner lease and epoch"):
+        store.action_intent(
+            run_id,
+            owner_id=fence["owner_id"],
+            owner_epoch=fence["owner_epoch"] + 1,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict, match="artifact must match"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact="local-file:.drover-native-canary/generic-marker.json",
+        )
+
+    # The terminal binding requires a verified artifact before it writes any
+    # receipt, so an unverified delivery cannot be acknowledged.
+    with pytest.raises(ContinuityConflict, match="artifact must match"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="unverified"
+        )
+
+    # Reconcile the same immutable wake/fingerprint/artifact. This completes
+    # one durable effect receipt without another provider turn or consume.
+    complete = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact=expected,
+    )
+    assert complete == {
+        "wake_id": action["event_id"],
+        "action_fingerprint": action["action_id"],
+        "state": "complete",
+        "artifact": expected,
+    }
+    assert (
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact=expected,
+        )
+        == complete
+    )
+    store.acknowledge(
+        run_id, **fence, event_id=action["event_id"], checkpoint="reconciled"
+    )
+    store.acknowledge(run_id, **fence, event_id=action["event_id"], checkpoint="replay")
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+    with control_plane_connection(runner.collector.duckdb_path) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_action_intents "
+                "WHERE wake_id = ? AND action_fingerprint = ?",
+                [action["event_id"], action["action_id"]],
+            ).fetchone()[0]
+            == 1
+        )
+    # The runner submitted only the original owner turn; reconciliation did
+    # not invoke another provider turn or consume a second delivery.
+    assert len(collector.turn_attempts) == 1
+
+
+def test_owner_turn_waits_for_materialized_candidate_effect_attestation(tmp_path):
+    expected = "local-file:.drover-native-canary/source-task-13.json"
+    runner, collector, _, _, _ = _runner(tmp_path, expected_effect=expected)
+
+    assert runner.process_once() == 0
+    assert collector.launches == []
+    assert collector.turn_attempts == []
+    assert collector.effect_attestation_attempts == [
+        ("observer-session", {"artifact": expected})
+    ]
+
+    collector.expected_effect_attestations["observer-session"] = True
+    assert runner.process_once() == 1
+    assert len(collector.launches) == 1
+    assert len(collector.turn_attempts) == 1
+
+
+def test_worker_started_observation_does_not_wait_for_candidate_effect(tmp_path):
+    """A start observation is not the candidate's final effect settlement."""
+    expected = "local-file:.drover-native-canary/source-task-23.json"
+    runner, collector, store, run_id, _ = _runner(
+        tmp_path, expected_effect=expected, event_kind="worker_started"
+    )
+
+    assert runner.process_once() == 1
+    start = store.status(run_id)["next_action"]
+    assert start["type"] == "observe_worker_start"
+    assert "expected_effect_artifact" not in start
+    assert "expected_effect_artifact:" not in collector.turn_attempts[0][1]["text"]
+
+    _acknowledge_current_wake(store, run_id, runner.config.goals[0].continuity_owner_id)
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="worker-done",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="candidate completed",
+    )
+
+    # The final candidate action still cannot dispatch from a generic start
+    # acknowledgement; it waits for the exact bound effect readback.
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 1
+    collector.expected_effect_attestations["observer-session"] = True
+    assert runner.process_once() == 1
+    final = store.status(run_id)["next_action"]
+    assert final["type"] == "review_worker_result"
+    assert final["expected_effect_artifact"] == expected
 
 
 def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
@@ -171,6 +606,388 @@ def test_rewake_does_not_dispatch_another_owner_turn_while_claimed(tmp_path):
     assert runner.process_once() == 1
     assert runner.process_once() == 0
     assert len(collector.turn_attempts) == 1
+
+
+def test_concurrent_owner_kicks_do_not_spend_final_wake_before_claim(
+    tmp_path, monkeypatch
+):
+    """One shared owner slot serializes concurrent terminal deliveries first."""
+    runner, collector, store, first_run, _ = _runner(tmp_path, event_kind="worker_done")
+    scope = runner.config.goals[0]
+    assert runner._session(scope) is not None
+
+    runner.registry.create_session(
+        session_id="observer-session-two",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/project-two",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-second@1",
+    )
+    second_run = store.initialize(
+        session_id="observer-session-two",
+        objective="Native continuity two",
+        checkpoint="started",
+        authorized_owner_id=scope.continuity_owner_id,
+    )
+    store.report(
+        second_run,
+        source="hub",
+        source_event_id="done-2",
+        subject="worker-2",
+        sequence=1,
+        kind="worker_done",
+        summary="done",
+    )
+
+    runs = {"first-owner-kick": first_run, "second-owner-kick": second_run}
+    monkeypatch.setattr(
+        runner.continuity,
+        "owner_runs",
+        lambda _owner: [runs[threading.current_thread().name]],
+    )
+    start_gate = threading.Barrier(2)
+    active_check_gate = threading.Barrier(2, timeout=0.2)
+    original_active_claim = runner._has_active_claim
+
+    def synchronize_active_check(candidate_scope):
+        try:
+            active_check_gate.wait()
+        except threading.BrokenBarrierError:
+            # A serialized runner has exactly one active check at a time.
+            pass
+        return original_active_claim(candidate_scope)
+
+    monkeypatch.setattr(runner, "_has_active_claim", synchronize_active_check)
+    failures = []
+
+    def kick():
+        try:
+            start_gate.wait()
+            runner.process_once()
+        except Exception as exc:  # pragma: no cover - assertion below retains it
+            failures.append(exc)
+
+    first = threading.Thread(target=kick, name="first-owner-kick")
+    second = threading.Thread(target=kick, name="second-owner-kick")
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not failures
+    assert not first.is_alive() and not second.is_alive()
+    attempts = [
+        store.status(run_id)["events"][0]["attempts"]
+        for run_id in (first_run, second_run)
+    ]
+    assert sum(attempts) == 1
+    assert len(collector.turn_attempts) == 1
+
+
+@pytest.mark.parametrize("active", [True, None])
+def test_shared_owner_busy_turn_does_not_spend_second_terminal_wake(tmp_path, active):
+    """A reused owner keeps another final wake pending until its exact turn ends."""
+    runner, collector, store, first_run, _ = _runner(tmp_path, event_kind="worker_done")
+    scope = runner.config.goals[0]
+    owner_id = scope.continuity_owner_id
+    registry = runner.registry
+
+    registry.create_session(
+        session_id="observer-session-two",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/project-two",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-second@1",
+    )
+    second_run = store.initialize(
+        session_id="observer-session-two",
+        objective="Native continuity two",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    second_wake = store.report(
+        second_run,
+        source="hub",
+        source_event_id="done-2",
+        subject="worker-2",
+        sequence=1,
+        kind="worker_done",
+        summary="done",
+    )
+
+    # The first run owns the reusable session and has already durably finished
+    # its effect/ACK, but its exact submitted turn remains live on harnessd.
+    assert runner.process_once() == 1
+    first_wake = _acknowledge_current_wake(store, first_run, owner_id)
+    owner_session = registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    first_turn = collector.turn_attempts[0][1]["client_turn_id"]
+    registry.update_session_activity(owner_session.session_id, awaiting="input")
+    registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"awaiting": "input"}},
+    )
+    collector.turn_active = active
+
+    # The old awaiting-only settlement released first_wake, consumed second_wake
+    # and got a 409 from the still-active structured owner.  A live busy read
+    # keeps the exact first claim instead, so no second delivery is spent.
+    assert runner.process_once() == 0
+    pending = store.status(second_run)["events"]
+    assert len(pending) == 1
+    assert {key: pending[0][key] for key in ("event_id", "state", "attempts")} == {
+        "event_id": second_wake,
+        "state": "pending",
+        "attempts": 0,
+    }
+    with control_plane_connection(runner.path) as con:
+        [first_state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake],
+        ).fetchone()
+    assert first_state == "sent"
+    assert len(collector.turn_attempts) == 1
+
+    # Only the exact first turn's terminal event frees the shared owner; then
+    # the same pending wake is submitted once without a duplicate effect.
+    collector.turn_active = False
+    registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=3,
+        payload={
+            "payload": {
+                "turn_id": first_turn,
+                "turn_complete": True,
+                "awaiting": "input",
+            }
+        },
+    )
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+    second_status = store.status(second_run)
+    assert second_status["next_action"]["event_id"] == second_wake
+    delivered = second_status["events"]
+    assert len(delivered) == 1
+    assert {key: delivered[0][key] for key in ("event_id", "state", "attempts")} == {
+        "event_id": second_wake,
+        "state": "delivered",
+        "attempts": 1,
+    }
+
+
+def test_shared_owner_active_turn_after_prior_claim_settles_keeps_final_wake_pending(
+    tmp_path,
+):
+    """A host-confirmed live shared turn must block consume after an old claim settles.
+
+    The durable claim can be completed after its exact wake is acknowledged while
+    harnessd has already accepted another turn on that reusable owner.  That
+    second turn has no claim for this runner to observe, so the host state is
+    the final admission guard before ``consume`` spends a terminal delivery.
+    """
+    runner, collector, store, first_run, _ = _runner(tmp_path, event_kind="worker_done")
+    scope = runner.config.goals[0]
+    owner_id = scope.continuity_owner_id
+
+    assert runner.process_once() == 1
+    first_wake = _acknowledge_current_wake(store, first_run, owner_id)
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    first_turn = collector.turn_attempts[0][1]["client_turn_id"]
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={
+            "payload": {
+                "turn_id": first_turn,
+                "turn_complete": True,
+                "awaiting": "input",
+            }
+        },
+    )
+    assert runner.process_once() == 0
+    with control_plane_connection(runner.path) as con:
+        [first_state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake],
+        ).fetchone()
+    assert first_state == "completed"
+
+    runner.registry.create_session(
+        session_id="observer-session-two",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/project-two",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-second@1",
+    )
+    second_run = store.initialize(
+        session_id="observer-session-two",
+        objective="Native continuity two",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    second_wake = store.report(
+        second_run,
+        source="hub",
+        source_event_id="done-2",
+        subject="worker-2",
+        sequence=1,
+        kind="worker_done",
+        summary="done",
+    )
+
+    # This models a different already-accepted turn on the one reusable owner
+    # after the first claim has settled.  No second runner claim exists to
+    # block the pre-consume check.
+    collector.turn_active = True
+    assert runner.process_once() == 0
+    event = store.status(second_run)["events"][0]
+    assert {key: event[key] for key in ("event_id", "state", "attempts")} == {
+        "event_id": second_wake,
+        "state": "pending",
+        "attempts": 0,
+    }
+    assert len(collector.turn_attempts) == 1
+
+    collector.turn_active = False
+    assert runner.process_once() == 1
+    delivered = store.status(second_run)["events"][0]
+    assert {key: delivered[key] for key in ("event_id", "state", "attempts")} == {
+        "event_id": second_wake,
+        "state": "delivered",
+        "attempts": 1,
+    }
+    assert len(collector.turn_attempts) == 2
+
+
+def test_active_claim_ignores_prior_failed_session_turn_until_exact_ack(tmp_path):
+    """A stale session result must not fence the current submitted owner wake."""
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    owner = status["owner"]
+    action = status["next_action"]
+    session_id, turn_payload = collector.turn_attempts[-1]
+    turn_id = turn_payload["client_turn_id"]
+
+    # The session is reusable. Its latest status can belong to an earlier,
+    # explicitly correlated failed turn while this wake remains active.
+    runner.registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        seq=1,
+        payload={"payload": {"turn_id": "older-turn", "exited": 1}},
+    )
+    assert runner.registry.completed_turn_kinds([session_id]) == {session_id: "failed"}
+    assert not runner.registry.has_completed_turn(session_id, turn_id)
+
+    assert (
+        store.action_intent(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"],
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact="issue-comment:done",
+        )["state"]
+        == "complete"
+    )
+
+    # A session-wide failure must not advance this live wake's epoch or send a
+    # duplicate owner turn before the exact wake gets its fenced acknowledgement.
+    assert runner.process_once() == 0
+    assert store.status(run_id)["owner"]["epoch"] == owner["epoch"]
+    assert len(collector.turn_attempts) == 1
+
+    store.acknowledge(
+        run_id,
+        owner_id=owner_id,
+        owner_epoch=owner["epoch"],
+        event_id=action["event_id"],
+        checkpoint="exact-current-wake",
+    )
+    with pytest.raises(ContinuityConflict, match="owner lease and epoch"):
+        store.acknowledge(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"] - 1,
+            event_id=action["event_id"],
+            checkpoint="stale-owner",
+        )
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+
+    # The following ready report remains deliverable after the exact claim has
+    # settled; the stale prior status did not consume or lose later work.
+    runner.registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"turn_id": turn_id, "exited": 0}},
+    )
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="next-ready",
+        subject="worker-1",
+        sequence=2,
+        kind="ci_green",
+        summary="next ready work",
+    )
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+
+
+def test_failed_fenced_run_does_not_starve_later_ready_run(tmp_path, monkeypatch):
+    runner, _, _, run_id, _ = _runner(tmp_path)
+    monkeypatch.setattr(
+        runner.continuity,
+        "owner_runs",
+        lambda _owner_id: ["fenced-run", run_id],
+    )
+
+    def process(_scope, candidate_run_id):
+        if candidate_run_id == "fenced-run":
+            raise ContinuityConflict("stale epoch")
+        return True
+
+    monkeypatch.setattr(runner, "_process_run", process)
+
+    assert runner.process_once() == 1
+    assert runner.observability() == {
+        "state": "partial_failure",
+        "at": "2026-10-09T00:00:00+00:00",
+        "dispatched": 1,
+        "runs": [
+            {
+                "goal_id": "goal-native",
+                "run_id": "fenced-run",
+                "state": "failed",
+                "error_type": "ContinuityConflict",
+            },
+            {
+                "goal_id": "goal-native",
+                "run_id": run_id,
+                "state": "dispatched",
+            },
+        ],
+    }
 
 
 def test_native_ack_requires_completed_intent_across_redelivery(tmp_path):
@@ -221,12 +1038,53 @@ def test_expired_claim_after_restart_never_redispatches_a_mid_turn(tmp_path):
     # permission to send another turn into the same owner session.
     clock.advance(61)
     restarted = NativeOwnerRunner(
-        collector, runner.config, clock=clock, claim_seconds=10
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
     )
 
     assert restarted.process_once() == 0
     assert len(collector.turn_attempts) == 1
     assert collector.accepted_turns == {first_turn}
+
+
+def test_expired_sent_claim_with_completed_receipt_settles_for_successor(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    clock.advance(11)
+
+    runner._settle_expired_claims(runner.config.goals[0])
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+    assert not runner._has_active_claim(runner.config.goals[0])
+
+
+def test_expired_sent_claim_without_receipt_remains_fenced(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    clock.advance(11)
+
+    runner._settle_expired_claims(runner.config.goals[0])
+    assert runner._has_active_claim(runner.config.goals[0])
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 1
 
 
 def test_failed_owner_launches_exhaust_wake_once(tmp_path):
@@ -241,6 +1099,147 @@ def test_failed_owner_launches_exhaust_wake_once(tmp_path):
     assert len(collector.launches) == 3
     assert store.status(run_id)["worker_state"] == "blocked:human"
     assert store.owner_runs("drover:owner/goal-native") == []
+
+
+def _mark_owner_auth_failure(runner, collector):
+    owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+    assert owner_session is not None
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="tool_result",
+        content_preview='{"error":"authentication required"}',
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        payload={"payload": {"exited": 0, "awaiting": "input"}},
+    )
+    return owner_session.session_id
+
+
+def test_structured_auth_failure_rearms_only_completed_worker_wake_once(tmp_path):
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+
+    # A typed owner-auth failure is a permanent breaker for this start wake,
+    # not a reason to spend provider turns forever. A later terminal worker
+    # report remains the authoritative successor and can progress normally.
+    assert runner.process_once() == 1
+    _mark_owner_auth_failure(runner, collector)
+    clock.advance(5)
+    assert runner.process_once() == 0
+    start = store.status(run_id)["next_action"]
+    assert start["escalation"] == {
+        "state": "delivery_blocked",
+        "wake_id": start["event_id"],
+        "reason": "authentication_required",
+    }
+    assert len(collector.turn_attempts) == 1
+    done_wake = store.report(
+        run_id,
+        source="hub",
+        source_event_id="done-1",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="done",
+    )
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    start_event = next(
+        event for event in status["events"] if event["event_id"] != done_wake
+    )
+    done_event = next(
+        event for event in status["events"] if event["event_id"] == done_wake
+    )
+    assert start_event["state"] == "exhausted"
+    assert start_event["superseded_by_terminal"] == done_wake
+    assert done_event["state"] == "delivered"
+    assert done_event["attempts"] == 1
+
+    # Only the terminal wake may take the bounded structured-auth recovery.
+    for delay in (5, 10, 20):
+        owner_session_id = _mark_owner_auth_failure(runner, collector)
+        assert runner.registry.completed_turn_kinds([owner_session_id]) == {
+            owner_session_id: "finished"
+        }
+        assert (
+            runner.registry.owner_turn_failure_category(
+                owner_session_id, collector.turn_attempts[-1][1]["client_turn_id"]
+            )
+            == "authentication_required"
+        )
+        clock.advance(delay)
+        assert runner.process_once() == (1 if delay != 20 else 0)
+
+    # The post-exhaustion pass reserves and fences the eligible done wake,
+    # restoring it to pending; the next normal runner pass creates its fresh
+    # owner turn. The earlier started wake remains exhausted.
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"exhausted": 1}
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"delivered": 1}
+    done_event = next(
+        event for event in status["events"] if event["event_id"] == done_wake
+    )
+    with control_plane_connection(runner.path) as con:
+        recovery = con.execute(
+            "SELECT wake_id, state FROM continuity_owner_recoveries"
+        ).fetchone()
+    assert recovery == (done_wake, "recovered")
+    assert done_event["attempts"] == 1
+
+
+def test_finished_owner_turn_without_structured_auth_stays_exhausted(tmp_path):
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_done"
+    )
+
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+        assert owner_session is not None
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            payload={"payload": {"exited": 0, "awaiting": "input"}},
+        )
+        clock.advance(delay)
+
+    assert runner.process_once() == 0
+    assert runner.process_once() == 0
+    assert store.status(run_id)["inbox_counts"] == {"exhausted": 1}
+    assert len(collector.turn_attempts) == 3
+
+
+def test_terminal_failed_owner_turn_never_rearms_worker_human_block(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+
+    for delay in (5, 10, 20):
+        assert runner.process_once() == 1
+        owner_session = runner.registry.get_session(collector.turn_attempts[-1][0])
+        assert owner_session is not None
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            payload={"payload": {"exited": 1, "awaiting": "input"}},
+        )
+        clock.advance(delay)
+
+    assert runner.process_once() == 0
+    assert runner.process_once() == 0
+    assert store.status(run_id)["inbox_counts"] == {"exhausted": 1}
+    assert store.status(run_id)["worker_state"] == "blocked:human"
+    assert len(collector.turn_attempts) == 3
 
 
 def test_failed_turn_submission_retries_the_same_owner_turn(tmp_path):
@@ -264,7 +1263,11 @@ def test_recorded_turn_stays_fenced_after_failed_submission_response(tmp_path):
     assert runner.process_once() == 0
     clock.advance(5)
     restarted = NativeOwnerRunner(
-        collector, runner.config, clock=clock, claim_seconds=10
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
     )
     assert restarted.process_once() == 0
     assert len(collector.turn_attempts) == 1
@@ -277,7 +1280,11 @@ def test_restart_after_failed_submission_dead_letters_once(tmp_path):
     assert runner.process_once() == 0
     clock.advance(5)
     restarted = NativeOwnerRunner(
-        collector, runner.config, clock=clock, claim_seconds=10
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
     )
     for delay in (10, 20):
         assert restarted.process_once() == 0
@@ -293,3 +1300,1560 @@ def test_restart_after_failed_submission_dead_letters_once(tmp_path):
             "SELECT action_json FROM factory_observer_inbox WHERE run_id = ?", [run_id]
         ).fetchone()
     assert json.loads(action_json)["escalation"]["state"] == "blocked:human"
+
+
+def _acknowledge_current_wake(store, run_id, owner_id):
+    status = store.status(run_id)
+    owner = status["owner"]
+    action = status["next_action"]
+    fence = {"owner_id": owner_id, "owner_epoch": owner["epoch"]}
+    receipt = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact="issue-comment:done",
+    )
+    assert receipt["state"] == "complete"
+    store.acknowledge(run_id, **fence, event_id=action["event_id"], checkpoint="done")
+    return action["event_id"]
+
+
+def test_exhausted_worker_wake_is_not_hidden_by_an_earlier_acknowledgement(tmp_path):
+    runner, _, store, run_id, clock = _runner(tmp_path, event_kind="worker_started")
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    assert runner.process_once() == 1
+    acknowledged_wake = _acknowledge_current_wake(store, run_id, owner_id)
+    exhausted_wake = store.report(
+        run_id,
+        source="hub",
+        source_event_id="done-after-ack",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="done",
+    )
+
+    def consume_current_wake():
+        owner = store.status(run_id)["owner"]
+        lease = store.lease(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=owner["epoch"] if owner["live"] else None,
+        )
+        return store.consume(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=lease["owner_epoch"],
+        )
+
+    for delay in (5, 10, 20):
+        action = consume_current_wake()
+        assert action and action["event_id"] == exhausted_wake
+        clock.advance(delay)
+    assert consume_current_wake() is None
+
+    status = store.status(run_id)
+    assert status["inbox_counts"] == {"acknowledged": 1, "exhausted": 1}
+    assert status["owner_handoff"]["state"] == "delivery_exhausted"
+    assert status["recovery"] == "manual_attention"
+    assert status["next_action"] is None
+    assert not status["owner_wake"]
+    assert acknowledged_wake != exhausted_wake
+
+
+def test_acknowledged_idle_owner_turn_completes_claim_and_delivers_successor(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    first_wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    session_id = collector.launches[0][1]["client_session_id"]
+    owner_session = runner.registry.session_by_client_id(session_id)
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        # This is the native-owner terminal path seen in #905: it signals
+        # idle input without a turn_complete or exited marker.
+        payload={"payload": {"awaiting": "input"}},
+    )
+
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="ci-1",
+        subject="worker-1",
+        sequence=2,
+        kind="ci_green",
+        summary="ci green",
+    )
+    clock.advance(5)
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
+def test_final_acknowledged_owner_turn_completes_claim_without_successor(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"turn_complete": True, "awaiting": "input"}},
+    )
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=3,
+        payload={"payload": {"exited": 0}},
+    )
+
+    # The final acknowledged wake leaves owner_runs empty.
+    assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+    assert runner.process_once() == 0
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
+def test_artifact_only_delivery_settlement_is_not_task_acceptance_or_release(tmp_path):
+    """A completed native-owner receipt releases its claim, not the issue itself."""
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        # Native owners may become input-idle without a generic done marker.
+        payload={"payload": {"awaiting": "input"}},
+    )
+
+    projection = store.status(run_id)
+    assert projection["owner_handoff"]["state"] == "acknowledged"
+    assert projection["next_action"] is None
+    assert not projection["owner_wake"]
+    assert projection["terminal_release"] is False
+
+    # The native runner may settle this exact acknowledged receipt, but neither
+    # the receipt nor the settled claim is task acceptance or a release.
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
+def _terminalize_owner_turn(runner, collector):
+    owner_session = runner.registry.session_by_client_id(
+        collector.launches[0][1]["client_session_id"]
+    )
+    runner.registry.update_session_status(owner_session.session_id, "terminated")
+    return owner_session
+
+
+def test_terminal_acknowledged_owner_turn_settles_without_owner_run(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    _terminalize_owner_turn(runner, collector)
+    assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+    assert runner.process_once() == 0
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone()
+    assert state == "completed"
+
+
+@pytest.mark.parametrize("acknowledge, receipt", [(False, True), (True, False)])
+def test_terminal_owner_turn_requires_acknowledgement_and_completed_receipt(
+    tmp_path, acknowledge, receipt
+):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    owner_id = runner.config.goals[0].continuity_owner_id
+    action = status["next_action"]
+    fence = {"owner_id": owner_id, "owner_epoch": status["owner"]["epoch"]}
+    if receipt:
+        assert (
+            store.action_intent(
+                run_id,
+                **fence,
+                wake_id=action["event_id"],
+                action_fingerprint=action["action_id"],
+                artifact="issue-comment:done",
+            )["state"]
+            == "complete"
+        )
+    if acknowledge and not receipt:
+        with pytest.raises(
+            ContinuityConflict, match="completed action intent receipt is required"
+        ):
+            store.acknowledge(
+                run_id, **fence, event_id=action["event_id"], checkpoint="done"
+            )
+    elif acknowledge:
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="done"
+        )
+    _terminalize_owner_turn(runner, collector)
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [action["event_id"]],
+        ).fetchone()
+    assert state == "sent"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("wake_id", "wrong-wake"),
+        ("session_id", "wrong-session"),
+        ("client_turn_id", "wrong-turn"),
+    ],
+)
+def test_terminal_owner_settlement_keeps_wake_session_and_turn_fences(
+    tmp_path, field, value
+):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    _terminalize_owner_turn(runner, collector)
+    with control_plane_connection(runner.path) as con:
+        con.execute(
+            f"UPDATE continuity_owner_turn_claims SET {field} = ? WHERE wake_id = ?",
+            [value, wake_id],
+        )
+    assert runner.process_once() == 0
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE state = 'sent'"
+        ).fetchone()
+    assert state == "sent"
+
+
+def test_acknowledged_owner_claim_stays_sent_while_turn_is_executing(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    first_wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="ci-1",
+        subject="worker-1",
+        sequence=2,
+        kind="ci_green",
+        summary="ci green",
+    )
+
+    clock.advance(5)
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 1
+    with control_plane_connection(runner.path) as con:
+        [state] = con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake_id],
+        ).fetchone()
+    assert state == "sent"
+
+
+def _ingest_owner_events(runner, collector, events):
+    """Exercise the HTTP ingest handler without opening a listening service."""
+    from drover.server.web.app import _MetricsHandler
+
+    responses = []
+    handler = SimpleNamespace(
+        headers={},
+        auth=SimpleNamespace(enabled=False),
+        collector=collector,
+        _read_json=lambda: {"events": events},
+        _harness_registry=lambda: runner.registry,
+        _send=lambda status, content_type, body: responses.append(
+            (status, json.loads(body))
+        ),
+    )
+    _MetricsHandler._ingest_harness_events(handler)
+    return responses
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_completion_predicate_keeps_turn_boundary_and_durable_evidence(
+    tmp_path, nested
+):
+    runner, collector, _, _, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    session_id, turn = collector.turn_attempts[0]
+    registry = runner.registry
+    assert not registry.has_completed_turn(session_id, turn["client_turn_id"])
+    assert not registry.has_completed_turn(session_id, "unsubmitted-turn")
+    # An explicit completion for another turn must not settle this submitted
+    # claim merely because it shares the owner session.
+    registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        payload={
+            "turn_id": "stale-turn",
+            "payload": {"turn_complete": True},
+        },
+    )
+    assert not registry.has_completed_turn(session_id, turn["client_turn_id"])
+    completion = {"turn_complete": True}
+    registry.append_event(
+        session_id=session_id,
+        event_type="status",
+        payload={"payload": completion} if nested else completion,
+    )
+    registry.append_event(
+        session_id=session_id, event_type="status", payload={"awaiting": "input"}
+    )
+    assert registry.has_completed_turn(session_id, turn["client_turn_id"])
+    registry.append_event(
+        session_id=session_id, event_type="user_input", payload={"turn_id": "next-turn"}
+    )
+    assert not registry.has_completed_turn(session_id, "next-turn")
+    # A successor's completion cannot be borrowed by a submitted turn that
+    # never completed before the next input arrived.
+    registry.append_event(
+        session_id=session_id,
+        event_type="user_input",
+        payload={"turn_id": "third-turn"},
+    )
+    registry.append_event(
+        session_id=session_id, event_type="status", payload=completion
+    )
+    assert not registry.has_completed_turn(session_id, "next-turn")
+    assert registry.has_completed_turn(session_id, "third-turn")
+
+
+def test_post_ingest_completion_settles_claim_and_delivers_successor_once(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    collector.idle_undeclared_worker = SimpleNamespace(owner_runner=runner)
+    assert runner.process_once() == 1
+    first_wake = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    session_id = collector.turn_attempts[0][0]
+    turn_id = collector.turn_attempts[0][1]["client_turn_id"]
+    events = [
+        {
+            "event_id": "owner-completed-924",
+            "session_id": session_id,
+            "seq": 2,
+            "type": "status",
+            "turn_id": turn_id,
+            "payload": {"turn_complete": True},
+        },
+        {
+            "event_id": "owner-exited-924",
+            "session_id": session_id,
+            "seq": 3,
+            "type": "status",
+            "turn_id": turn_id,
+            "payload": {"exited": 0},
+        },
+        {
+            "event_id": "worker-completed-924",
+            "session_id": "observer-session",
+            "seq": 4,
+            "type": "status",
+            "payload": {"turn_complete": True},
+        },
+    ]
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 3})]
+    assert runner.registry.get_session(session_id).effective_awaiting is None
+    assert runner.registry.has_completed_turn(session_id, turn_id)
+    assert len(collector.turn_attempts) == 2
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [first_wake],
+        ).fetchone() == ("completed",)
+        assert con.execute(
+            "SELECT state FROM continuity_owner_action_intents WHERE wake_id = ?",
+            [first_wake],
+        ).fetchone() == ("complete",)
+    status = store.status(run_id)
+    assert status["completion_receipts"]["counts"] == {"projected": 1}
+    assert status["inbox_counts"] == {"acknowledged": 1, "delivered": 1}
+
+    # Replayed source events cannot duplicate a wake or settle the new claim
+    # using its predecessor's completion, even when the claim expires.
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 0})]
+    runner.clock.advance(11)
+    assert runner.process_once() == 0
+    assert len(collector.turn_attempts) == 2
+    assert runner._has_active_claim(runner.config.goals[0])
+
+
+def test_post_ingest_kick_failure_keeps_commit_and_replay_retries(tmp_path):
+    runner, collector, store, run_id, _ = _runner(tmp_path)
+    assert runner.process_once() == 1
+    wake_id = _acknowledge_current_wake(
+        store, run_id, runner.config.goals[0].continuity_owner_id
+    )
+    session_id = collector.turn_attempts[0][0]
+    turn_id = collector.turn_attempts[0][1]["client_turn_id"]
+    events = [
+        {
+            "event_id": "final-completion-924",
+            "session_id": session_id,
+            "seq": 2,
+            "type": "status",
+            "turn_id": turn_id,
+            "payload": {"turn_complete": True},
+        }
+    ]
+
+    def fail():
+        # The kick must see the committed source event on another connection.
+        assert runner.registry.get_event("final-completion-924") is not None
+        raise RuntimeError("injected owner kick failure")
+
+    collector.idle_undeclared_worker = SimpleNamespace(
+        owner_runner=SimpleNamespace(process_once=fail)
+    )
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 1})]
+    assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+    assert runner._has_active_claim(runner.config.goals[0])
+
+    collector.idle_undeclared_worker.owner_runner = runner
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 0})]
+    assert runner.registry.has_completed_turn(session_id, turn_id)
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+            [wake_id],
+        ).fetchone() == ("completed",)
+    assert len(collector.turn_attempts) == 1
+
+
+@pytest.mark.parametrize("flag", [False, "true", 1, None])
+def test_nonliteral_completion_does_not_settle_owner_claim(tmp_path, flag):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    collector.idle_undeclared_worker = SimpleNamespace(owner_runner=runner)
+    assert runner.process_once() == 1
+    events = [
+        {
+            "event_id": "not-completed-924",
+            "session_id": collector.turn_attempts[0][0],
+            "seq": 2,
+            "type": "status",
+            "payload": {"turn_complete": flag},
+        }
+    ]
+    assert _ingest_owner_events(runner, collector, events) == [(200, {"ingested": 1})]
+    clock.advance(11)
+    runner._settle_expired_claims(runner.config.goals[0])
+    assert runner._has_active_claim(runner.config.goals[0])
+    assert len(collector.turn_attempts) == 1
+
+
+def test_stale_owner_without_submitted_turn_is_fenced_recreated_and_acked(tmp_path):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    _, old_token = runner.credentials.issue(
+        scope="owner",
+        label="stale native owner",
+        owner_id="drover:owner/goal-native",
+    )
+    scope = runner.config.goals[0]
+    owner_id = scope.continuity_owner_id
+    stale = runner.registry.create_session(
+        session_id="stale-v0650-owner",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/project",
+        mode="structured",
+        client_session_id="v0650-owner",
+        handoff_mode="drover_native_continuity_owner",
+    )
+    link = runner._link(scope)
+    with control_plane_connection(runner.path) as con:
+        con.execute(
+            """UPDATE continuity_owner_sessions SET session_id = ?,
+            client_session_id = ?, updated_at = ? WHERE goal_id = ? AND owner_id = ?""",
+            [stale.session_id, "v0650-owner", clock(), scope.goal_id, owner_id],
+        )
+
+    runner.registry.update_session_activity(
+        stale.session_id,
+        awaiting="input",
+        last_activity=clock() - timedelta(seconds=11),
+    )
+    old_lease = store.lease(run_id, owner_id=owner_id)
+    old_epoch = old_lease["owner_epoch"]
+    old_action = store.consume(run_id, owner_id=owner_id, owner_epoch=old_epoch)
+    assert old_action is not None  # v0.6.50 delivered it without a turn claim.
+    clock.advance(5)
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == len(collector.turn_attempts) == 1
+    new_token = collector.launches[0][1]["continuity_owner_bearer"]
+    assert new_token != old_token
+    assert runner.credentials.find_active(old_token) is None
+    assert runner.credentials.find_active(new_token) is not None
+    assert not request_authorized(
+        AuthSettings(enabled=True, api_token="", credentials=runner.credentials),
+        {"Authorization": f"Bearer {old_token}"},
+        method="POST",
+        path="/harness/factory-observer/continuity",
+    )
+    with control_plane_connection(runner.path) as con:
+        generation, session_id = con.execute(
+            """SELECT generation, session_id FROM continuity_owner_sessions
+            WHERE goal_id = ? AND owner_id = ?""",
+            [scope.goal_id, owner_id],
+        ).fetchone()
+    assert generation == link["generation"] + 1
+    assert session_id != stale.session_id
+    with pytest.raises(ContinuityConflict):
+        store.consume(run_id, owner_id=owner_id, owner_epoch=old_epoch)
+
+    status = store.status(run_id)
+    fence = {"owner_id": owner_id, "owner_epoch": status["owner"]["epoch"]}
+    action = status["next_action"]
+    receipt = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact="issue-comment:recovered",
+    )
+    assert receipt["state"] == "complete"
+    store.acknowledge(run_id, **fence, event_id=action["event_id"], checkpoint="acked")
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+
+
+def test_terminal_failed_owner_turn_is_replaced_before_redelivery(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+
+    assert runner.process_once() == 1
+    session_id = collector.launches[0][1]["client_session_id"]
+    owner_session = runner.registry.session_by_client_id(session_id)
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"exited": 1, "awaiting": "input"}},
+    )
+    clock.advance(5)
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == len(collector.turn_attempts) == 2
+    assert collector.launches[1][1]["client_session_id"] != session_id
+
+
+def test_expired_sent_claim_missing_session_recovers_same_wake_once(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_token = collector.launches[0][1]["continuity_owner_bearer"]
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+
+    assert runner.process_once() == 1
+    assert len(collector.launches) == 2
+    assert len(collector.turn_attempts) == 2
+    assert (
+        collector.turn_attempts[0][1]["client_turn_id"]
+        == collector.turn_attempts[1][1]["client_turn_id"]
+    )
+    assert (
+        collector.launches[0][1]["client_session_id"]
+        != collector.launches[1][1]["client_session_id"]
+    )
+    assert runner.credentials.find_active(old_token) is None
+    assert (
+        runner.credentials.find_active(
+            collector.launches[1][1]["continuity_owner_bearer"]
+        )
+        is not None
+    )
+    with control_plane_connection(runner.path) as con:
+        assert (
+            con.execute("SELECT state FROM continuity_owner_recoveries").fetchone()[0]
+            == "recovered"
+        )
+
+
+def _assert_public_run_failure(runner, run_id, error_type):
+    """The runner contains per-run failures but preserves their safe outcome."""
+    report = runner.observability()
+    assert report["state"] == "partial_failure"
+    assert report["dispatched"] == 0
+    assert {
+        "run_id": run_id,
+        "state": "failed",
+        "error_type": error_type,
+    }.items() <= report["runs"][0].items()
+
+
+def test_abandoned_claim_fence_failure_leaves_blocking_claim(tmp_path, monkeypatch):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    monkeypatch.setattr(
+        runner.continuity,
+        "fence_owner",
+        lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")),
+    )
+
+    assert runner.process_once() == 0
+    _assert_public_run_failure(
+        runner,
+        runner.continuity.owner_runs(runner.config.goals[0].continuity_owner_id)[0],
+        "ContinuityConflict",
+    )
+    with control_plane_connection(runner.path) as con:
+        assert (
+            con.execute("SELECT state FROM continuity_owner_turn_claims").fetchone()[0]
+            == "sent"
+        )
+    assert len(collector.turn_attempts) == 1
+
+
+def test_fence_failure_journal_retries_without_second_epoch_fence(
+    tmp_path, monkeypatch
+):
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    original = runner.continuity.fence_owner
+    calls = []
+
+    def fail_once(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ContinuityConflict("fence failed")
+
+    monkeypatch.setattr(runner.continuity, "fence_owner", fail_once)
+    assert runner.process_once() == 0
+    _assert_public_run_failure(runner, run_id, "ContinuityConflict")
+    monkeypatch.setattr(runner.continuity, "fence_owner", original)
+
+    assert runner.process_once() == 1
+    assert len(calls) == 1
+    assert store.status(run_id)["owner"]["epoch"] == 3
+    assert len(collector.turn_attempts) == 2
+
+
+def test_stale_recovery_snapshot_cannot_revoke_successor(tmp_path):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        row = con.execute(
+            "SELECT wake_id, client_turn_id, session_id, run_id, claim_until FROM continuity_owner_turn_claims"
+        ).fetchone()
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    assert runner._recover_abandoned_claim(runner.config.goals[0], row)
+    assert runner.process_once() == 1
+    successor = collector.launches[-1][1]["continuity_owner_bearer"]
+    epoch = runner.continuity.status(row[3])["owner"]["epoch"]
+
+    assert not runner._recover_abandoned_claim(runner.config.goals[0], row)
+    assert runner.credentials.find_active(successor) is not None
+    assert runner.continuity.status(row[3])["owner"]["epoch"] == epoch
+
+
+def test_terminal_session_cannot_bypass_fencing_journal(tmp_path, monkeypatch):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    runner.registry.update_session_status(session_id, "failed")
+    # This is the receiptless abandoned path: an existing terminal session
+    # must not replace the link before the missing submitted turn is fenced.
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [session_id])
+    clock.advance(11)
+    monkeypatch.setattr(
+        runner.continuity,
+        "fence_owner",
+        lambda *_a, **_k: (_ for _ in ()).throw(ContinuityConflict("fence failed")),
+    )
+    assert runner.process_once() == 0
+    _assert_public_run_failure(
+        runner,
+        runner.continuity.owner_runs(runner.config.goals[0].continuity_owner_id)[0],
+        "ContinuityConflict",
+    )
+    link = runner._link(runner.config.goals[0])
+    assert runner._session(runner.config.goals[0], launch=False) is None
+    assert runner._link(runner.config.goals[0])["generation"] == link["generation"]
+
+
+def test_status_pause_cannot_revoke_successor_from_other_runner(tmp_path, monkeypatch):
+    runner_a, collector, _, _, clock = _runner(tmp_path)
+    assert runner_a.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    with control_plane_connection(runner_a.path) as con:
+        claim = con.execute(
+            "SELECT wake_id, client_turn_id, session_id, run_id, claim_until FROM continuity_owner_turn_claims"
+        ).fetchone()
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [session_id])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [session_id])
+    clock.advance(11)
+    runner_b = NativeOwnerRunner(
+        collector,
+        runner_a.config,
+        credential_store=runner_a.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    original_status = runner_a.continuity.status
+    paused = False
+
+    def status_then_other_runner(run_id):
+        nonlocal paused
+        if not paused:
+            paused = True
+            assert runner_b.process_once() == 1
+        return original_status(run_id)
+
+    monkeypatch.setattr(runner_a.continuity, "status", status_then_other_runner)
+    assert not runner_a._recover_abandoned_claim(runner_a.config.goals[0], claim)
+    successor = collector.launches[-1][1]["continuity_owner_bearer"]
+    assert runner_a.credentials.find_active(successor) is not None
+    assert len(collector.turn_attempts) == 2
+
+
+def test_expired_recovery_executor_cannot_revoke_or_fence_successor(
+    tmp_path, monkeypatch
+):
+    """An executor lease fences the Python frame, not merely its reservation."""
+    runner_a, collector, store, run_id, clock = _runner(tmp_path)
+    assert runner_a.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner_a.path) as con:
+        claim = con.execute(
+            "SELECT wake_id, client_turn_id, session_id, run_id, claim_until "
+            "FROM continuity_owner_turn_claims"
+        ).fetchone()
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    runner_b = NativeOwnerRunner(
+        collector,
+        runner_a.config,
+        credential_store=runner_a.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    original_revoke = runner_a.credentials.revoke_owner_credential
+    paused = False
+    successor_epoch = None
+
+    def expire_then_reclaim(owner_id, credential_id):
+        nonlocal paused, successor_epoch
+        if not paused:
+            paused = True
+            # A has reserved the recovery.  Its executor lease now expires
+            # before the irreversible credential/epoch side effects.
+            clock.advance(11)
+            assert runner_b.process_once() == 1
+            successor_epoch = store.status(run_id)["owner"]["epoch"]
+        return original_revoke(owner_id, credential_id)
+
+    monkeypatch.setattr(
+        runner_a.credentials, "revoke_owner_credential", expire_then_reclaim
+    )
+    assert not runner_a._recover_abandoned_claim(runner_a.config.goals[0], claim)
+
+    successor = collector.launches[-1][1]["continuity_owner_bearer"]
+    assert runner_a.credentials.find_active(successor) is not None
+    assert store.status(run_id)["owner"]["epoch"] == successor_epoch
+    assert len(collector.turn_attempts) == 2
+    with control_plane_connection(runner_a.path) as con:
+        state, executor_id = con.execute(
+            "SELECT state, executor_id FROM continuity_owner_recoveries"
+        ).fetchone()
+    assert state == "recovered"
+    assert executor_id == runner_b._recovery_executor_id
+
+
+def test_recovery_revocation_failure_keeps_claim_blocked_until_retry(
+    tmp_path, monkeypatch
+):
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    original_revoke = runner.credentials.revoke_owner_credential
+    monkeypatch.setattr(
+        runner.credentials, "revoke_owner_credential", lambda *_args: False
+    )
+
+    assert runner.process_once() == 0
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims"
+        ).fetchone() == ("sent",)
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("fencing",)
+
+    monkeypatch.setattr(runner.credentials, "revoke_owner_credential", original_revoke)
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+
+
+def test_crashed_post_fence_executor_reclaims_one_same_wake(tmp_path, monkeypatch):
+    runner_a, collector, _, _, clock = _runner(tmp_path)
+    assert runner_a.process_once() == 1
+    first_turn = collector.turn_attempts[0][1]["client_turn_id"]
+    old_session = collector.turn_attempts[0][0]
+    with control_plane_connection(runner_a.path) as con:
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [old_session])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [old_session])
+    clock.advance(11)
+    original_fence = runner_a.continuity.fence_owner
+
+    def fence_then_crash(*args, **kwargs):
+        original_fence(*args, **kwargs)
+        raise RuntimeError("simulated executor crash after fence")
+
+    monkeypatch.setattr(runner_a.continuity, "fence_owner", fence_then_crash)
+    assert runner_a.process_once() == 0
+    _assert_public_run_failure(
+        runner_a,
+        runner_a.continuity.owner_runs(runner_a.config.goals[0].continuity_owner_id)[0],
+        "RuntimeError",
+    )
+    with control_plane_connection(runner_a.path) as con:
+        assert con.execute(
+            "SELECT state, fenced_at IS NOT NULL FROM continuity_owner_recoveries"
+        ).fetchone() == ("fencing", True)
+
+    clock.advance(11)
+    runner_b = NativeOwnerRunner(
+        collector,
+        runner_a.config,
+        credential_store=runner_a.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert runner_b.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+    assert collector.turn_attempts[-1][1]["client_turn_id"] == first_turn
+    with control_plane_connection(runner_a.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("recovered",)
+
+
+def test_populated_v0656_native_owner_upgrade_rehearsal_is_additive(
+    tmp_path, monkeypatch
+):
+    """Rehearse the v0.6.56 native tables through journal use and rollback read."""
+    runner, collector, _, _, clock = _runner(tmp_path)
+    assert runner.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    with control_plane_connection(runner.path) as con:
+        # This is the exact v0.6.56 session shape, populated with a sent claim.
+        con.execute("DROP TABLE continuity_owner_recoveries")
+        con.execute("ALTER TABLE continuity_owner_sessions RENAME TO v0656_sessions")
+        con.execute("""CREATE TABLE continuity_owner_sessions (
+            goal_id TEXT NOT NULL, owner_id TEXT NOT NULL, session_id TEXT,
+            client_session_id TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (goal_id, owner_id), UNIQUE (client_session_id))""")
+        con.execute("""INSERT INTO continuity_owner_sessions
+            (goal_id, owner_id, session_id, client_session_id, generation, updated_at)
+            SELECT goal_id, owner_id, session_id, client_session_id, generation, updated_at
+            FROM v0656_sessions""")
+        con.execute("DROP TABLE v0656_sessions")
+        con.execute("DELETE FROM harness_events WHERE session_id = ?", [session_id])
+        con.execute("DELETE FROM harness_sessions WHERE session_id = ?", [session_id])
+
+    # Upgrade, then rerun the additive DDL as a process restart would.
+    upgraded = NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    with control_plane_connection(runner.path) as con:
+        session_columns = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info('continuity_owner_sessions')"
+            ).fetchall()
+        }
+        recovery_columns = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info('continuity_owner_recoveries')"
+            ).fetchall()
+        }
+    assert "credential_id" in session_columns
+    assert "old_credential_id" in recovery_columns
+
+    clock.advance(11)
+    monkeypatch.setattr(
+        upgraded.continuity,
+        "fence_owner",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ContinuityConflict("hold")),
+    )
+    assert upgraded.process_once() == 0
+    _assert_public_run_failure(
+        upgraded,
+        upgraded.continuity.owner_runs(upgraded.config.goals[0].continuity_owner_id)[0],
+        "ContinuityConflict",
+    )
+
+    with control_plane_connection(runner.path) as con:
+        # A v0.6.56 binary never reads the additive journal. Its old claim
+        # query still sees the pending sent row during a failed new recovery.
+        assert con.execute(
+            "SELECT state FROM continuity_owner_turn_claims"
+        ).fetchone() == ("sent",)
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("fencing",)
+
+    # The failed upgraded process has left its bounded executor lease behind.
+    clock.advance(11)
+    resumed = NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert resumed.process_once() == 1
+    with control_plane_connection(runner.path) as con:
+        assert con.execute(
+            "SELECT state FROM continuity_owner_recoveries"
+        ).fetchone() == ("recovered",)
+
+
+@pytest.fixture(autouse=True)
+def _native_owner_connection_has_no_cursor_description(monkeypatch):
+    """Enforce PostgreSQL's result-only description contract in all recovery tests."""
+    import drover.server.work_queue.native_owner as native_owner
+
+    original = native_owner.control_plane_connection
+
+    class ConnectionOnly:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, *args, **kwargs):
+            return self.connection.execute(*args, **kwargs)
+
+        def __getattr__(self, name):
+            if name == "description":
+                raise AttributeError("description belongs to the execute result")
+            return getattr(self.connection, name)
+
+    @contextmanager
+    def connect(*args, **kwargs):
+        with original(*args, **kwargs) as connection:
+            yield ConnectionOnly(connection)
+
+    monkeypatch.setattr(native_owner, "control_plane_connection", connect)
+
+
+def test_isolated_same_claim_delivery_ack_settlement_receipt(tmp_path, capsys):
+    """Disposable control-plane E2E: one inert owner action settles one sent claim."""
+    runner, collector, store, run_id, clock = _runner(tmp_path)
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    assert runner.process_once() == 1
+    session_id = collector.launches[0][1]["client_session_id"]
+    owner_session = runner.registry.session_by_client_id(session_id)
+    with control_plane_connection(runner.path) as con:
+        wake_id, claim_turn_id, claim_state = con.execute(
+            "SELECT wake_id, client_turn_id, state FROM continuity_owner_turn_claims"
+        ).fetchone()
+    assert claim_state == "sent"
+    assert collector.turn_attempts == [
+        (owner_session.session_id, collector.turn_attempts[0][1])
+    ]
+    assert collector.turn_attempts[0][1]["client_turn_id"] == claim_turn_id
+
+    action = store.status(run_id)["next_action"]
+    fence = {
+        "owner_id": owner_id,
+        "owner_epoch": store.status(run_id)["owner"]["epoch"],
+    }
+    receipt = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=wake_id,
+        action_fingerprint=action["action_id"],
+        artifact="no-op:isolated-claim-e2e",
+    )
+    store.acknowledge(run_id, **fence, event_id=wake_id, checkpoint="no-op complete")
+    assert receipt["wake_id"] == wake_id
+    assert receipt["action_fingerprint"] == action["action_id"]
+    assert receipt["state"] == "complete"
+
+    runner.registry.update_session_activity(owner_session.session_id, awaiting="input")
+    runner.registry.append_event(
+        session_id=owner_session.session_id,
+        event_type="status",
+        seq=2,
+        payload={"payload": {"awaiting": "input"}},
+    )
+    store.report(
+        run_id,
+        source="hub",
+        source_event_id="successor-1",
+        subject="worker-1",
+        sequence=2,
+        kind="ci_green",
+        summary="successor",
+    )
+    clock.advance(5)
+    assert runner.process_once() == 1
+
+    with control_plane_connection(runner.path) as con:
+        state, ack_state, receipt_state = con.execute(
+            """SELECT c.state, i.state, r.state
+               FROM continuity_owner_turn_claims c
+               JOIN factory_observer_inbox i ON i.event_id = c.wake_id AND i.run_id = c.run_id
+               JOIN continuity_owner_action_intents r ON r.wake_id = c.wake_id AND r.run_id = c.run_id
+               WHERE c.wake_id = ?""",
+            [wake_id],
+        ).fetchone()
+        [linked_sessions] = con.execute(
+            "SELECT count(*) FROM continuity_owner_sessions WHERE goal_id = ? AND owner_id = ?",
+            [runner.config.goals[0].goal_id, owner_id],
+        ).fetchone()
+    assert (state, ack_state, receipt_state) == (
+        "completed",
+        "acknowledged",
+        "complete",
+    )
+    assert linked_sessions == 1
+    assert len(collector.launches) == 1
+    assert len(collector.turn_attempts) == 2
+    assert len({turn[1]["client_turn_id"] for turn in collector.turn_attempts}) == 2
+    print(
+        f"claim_id={wake_id} turn_id={claim_turn_id} receipt_id={receipt['action_fingerprint']} ack_id={wake_id} state={state} sessions={linked_sessions} turns={len(collector.turn_attempts)}"
+    )
+
+
+def test_active_start_claim_renews_lease_before_owner_action(tmp_path):
+    """A live native start turn keeps its exact epoch while it is still active."""
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+    runner.claim_seconds = 3600
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    action = status["next_action"]
+    owner = status["owner"]
+    assert owner["epoch"] == 1
+
+    # The former 60-second owner lease expired before a normal structured
+    # observation turn could persist its action intent.
+    clock.advance(61)
+    assert runner.process_once() == 0
+    renewed = store.status(run_id)["owner"]
+    assert renewed["epoch"] == owner["epoch"]
+    assert renewed["live"]
+
+    receipt = store.action_intent(
+        run_id,
+        owner_id=owner_id,
+        owner_epoch=renewed["epoch"],
+        wake_id=action["event_id"],
+        action_fingerprint=action["action_id"],
+        artifact="issue-comment:start-observed",
+    )
+    assert receipt["state"] == "complete"
+    store.acknowledge(
+        run_id,
+        owner_id=owner_id,
+        owner_epoch=renewed["epoch"],
+        event_id=action["event_id"],
+        checkpoint="start observed",
+    )
+    assert len(collector.turn_attempts) == 1
+
+
+def test_worker_start_delivery_stalls_without_fixed_attempt_cutoff(tmp_path):
+    """A start observation retries durably without pretending a human blocked it."""
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+    collector.failed_launches = 5
+
+    for attempt in range(5):
+        assert runner.process_once() == 0
+        status = store.status(run_id)
+        event = status["events"][0]
+        assert event["state"] == "delivered"
+        assert event["attempts"] == attempt + 1
+        if attempt >= 3:
+            assert status["worker_state"] == "started"
+            assert status["next_action"]["escalation"] == {
+                "state": "delivery_stalled",
+                "wake_id": event["event_id"],
+                "attempts": 3,
+            }
+            if attempt == 4:
+                # The same durable wake/action remains the one stall signal;
+                # each failed launch retains that identity rather than creating
+                # another durable warning or another wake.
+                assert len(collector.launches) == 5
+                assert len(status["events"]) == 1
+                break
+        due = datetime.fromisoformat(event["next_delivery_at"])
+        clock.advance((due - clock()).total_seconds())
+
+
+def test_terminal_or_expired_claim_never_renews_owner_lease(tmp_path):
+    """A stale claim cannot keep an ended owner or successor epoch alive."""
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="worker_started"
+    )
+    runner.claim_seconds = 3600
+    assert runner.process_once() == 1
+    session_id = collector.turn_attempts[0][0]
+    before = store.status(run_id)["owner"]
+
+    runner.registry.update_session_status(session_id, "terminated")
+    clock.advance(61)
+    assert not runner._renew_active_claim_lease(runner.config.goals[0])
+    terminal = store.status(run_id)["owner"]
+    assert terminal["epoch"] == before["epoch"]
+    assert terminal["lease_until"] == before["lease_until"]
+
+    # An unfinished submitted turn is deliberately retained for fenced
+    # recovery after its claim expires; it must not be silently renewed.
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path / "expired", event_kind="worker_started"
+    )
+    assert runner.process_once() == 1
+    before = store.status(run_id)["owner"]
+    clock.advance(runner.claim_seconds + 1)
+    assert not runner._renew_active_claim_lease(runner.config.goals[0])
+    expired = store.status(run_id)["owner"]
+    assert expired["epoch"] == before["epoch"]
+    assert expired["lease_until"] == before["lease_until"]
+    assert runner._has_active_claim(runner.config.goals[0])
+
+
+def test_stale_claim_epoch_cannot_renew_successor_lease(tmp_path):
+    """A claim records the epoch that submitted its owner turn."""
+    runner, _, store, run_id, _ = _runner(tmp_path, event_kind="worker_started")
+    owner_id = runner.config.goals[0].continuity_owner_id
+    assert runner.process_once() == 1
+    assert store.status(run_id)["owner"]["epoch"] == 1
+
+    assert store.fence_owner(run_id, owner_id=owner_id, expected_epoch=1) == 2
+    successor = store.lease(run_id, owner_id=owner_id, owner_epoch=2)
+    assert successor["owner_epoch"] == 3
+    assert not runner._renew_active_claim_lease(runner.config.goals[0])
+    assert store.status(run_id)["owner"]["epoch"] == 3
+
+
+def test_superseded_start_health_count_is_page_independent(tmp_path):
+    """A bounded status page cannot hide a durable superseded start wake."""
+    runner, _, store, run_id, _ = _runner(tmp_path, event_kind="worker_started")
+    start = store.status(run_id)["events"][0]
+    done = store.report(
+        run_id,
+        source="hub",
+        source_event_id="done-after-start",
+        subject="worker-1",
+        sequence=2,
+        kind="worker_done",
+        summary="done",
+    )
+    action = {
+        "action_id": "observer-action-" + start["event_id"],
+        "event_id": start["event_id"],
+        "type": "observe_worker_start",
+        "authority_scope": "implementation",
+        "authorized": True,
+        "escalation": {
+            "state": "superseded_by_terminal",
+            "wake_id": start["event_id"],
+            "successor_wake_id": done,
+        },
+    }
+    with control_plane_connection(runner.path) as con:
+        con.execute(
+            "UPDATE factory_observer_inbox SET state = 'exhausted', action_json = ? WHERE event_id = ?",
+            [json.dumps(action, sort_keys=True), start["event_id"]],
+        )
+
+    first_page = store.status(run_id, limit=1)
+    full_page = store.status(run_id, limit=20)
+    assert first_page["inbox_counts"] == full_page["inbox_counts"] == {"pending": 1}
+    assert first_page["events"][0]["superseded_by_terminal"] == done
+    assert first_page["has_more"]
+    assert not full_page["has_more"]
+
+
+def test_start_retry_delay_is_capped_and_deterministic_for_large_attempts():
+    """No-progress delivery retries never grow arithmetic or synchronize wakes."""
+    for attempts in (4, 8, 10_000_000):
+        delay = _observation_retry_delay("a" * 64, attempts)
+        assert 1 <= delay <= MAX_LEASE_SECONDS
+        assert delay == _observation_retry_delay("a" * 64, attempts)
+    assert _observation_retry_delay("a" * 64, 10_000_000) != _observation_retry_delay(
+        "b" * 64, 10_000_000
+    )
+
+
+def test_signed_m2_receipt_handoff_recovers_same_wake_after_two_hub_recreations(
+    tmp_path,
+):
+    expected = "local-file:.drover-native-canary/m2-51.json"
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path,
+        expected_effect=expected,
+        event_kind="worker_done",
+        m2_ack_pending=True,
+    )
+    collector.expected_effect_attestations["observer-session"] = True
+    owner_id = runner.config.goals[0].continuity_owner_id
+
+    # First owner turn is a real native dispatch. It may persist and verify the
+    # exact effect receipt, but the signed handoff forbids an ACK at its epoch.
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    first_action = status["next_action"]
+    first_fence = {"owner_id": owner_id, "owner_epoch": status["owner"]["epoch"]}
+    assert first_action["m2_ack_pending"] is True
+    receipt = store.action_intent(
+        run_id,
+        **first_fence,
+        wake_id=first_action["event_id"],
+        action_fingerprint=first_action["action_id"],
+        artifact=expected,
+    )
+    assert receipt["state"] == "complete"
+    with pytest.raises(ContinuityConflict, match="successor epoch"):
+        store.acknowledge(
+            run_id,
+            **first_fence,
+            event_id=first_action["event_id"],
+            checkpoint="must wait for restart",
+        )
+
+    first_session = collector.turn_attempts[-1][0]
+    first_turn = collector.turn_attempts[-1][1]["client_turn_id"]
+    runner.registry.append_event(
+        session_id=first_session,
+        event_type="status",
+        payload={"turn_id": first_turn, "turn_complete": True, "exited": 0},
+    )
+    runner.registry.update_session_activity(first_session, awaiting="input")
+    runner._complete_finished_claim(runner.config.goals[0], first_session)
+    # A separate ready run is durable before interruption. It must progress
+    # normally; the M2 handoff may never consume or discard it.
+    runner.registry.create_session(
+        session_id="observer-ready",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        cwd="/workspace/worktrees/ready",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-ready@1",
+    )
+    ready_run = store.initialize(
+        session_id="observer-ready",
+        objective="Independent ready work",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    store.report(
+        ready_run,
+        source="hub",
+        source_event_id="ready-done",
+        subject="worker-ready",
+        sequence=1,
+        kind="worker_done",
+        summary="independent ready work",
+    )
+    # The original process keeps the completed receipt visible rather than
+    # fencing itself or spending another delivery attempt.
+    assert runner.process_once() == 1
+    assert len(collector.turn_attempts) == 2
+    assert store.status(run_id)["inbox_counts"] == {"delivered": 1}
+    ready_status = store.status(ready_run)
+    assert ready_status["inbox_counts"] == {"delivered": 1}
+    ready_action = ready_status["next_action"]
+    ready_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": ready_status["owner"]["epoch"],
+    }
+    store.action_intent(
+        ready_run,
+        **ready_fence,
+        wake_id=ready_action["event_id"],
+        action_fingerprint=ready_action["action_id"],
+        artifact="issue-comment:ready",
+    )
+    store.acknowledge(
+        ready_run,
+        **ready_fence,
+        event_id=ready_action["event_id"],
+        checkpoint="independent ready work settled",
+    )
+    ready_session = collector.turn_attempts[-1][0]
+    ready_turn = collector.turn_attempts[-1][1]["client_turn_id"]
+    runner.registry.append_event(
+        session_id=ready_session,
+        event_type="status",
+        payload={"turn_id": ready_turn, "turn_complete": True, "exited": 0},
+    )
+    runner.registry.update_session_activity(ready_session, awaiting="input")
+    runner._complete_finished_claim(runner.config.goals[0], ready_session)
+
+    # Recreating the hub runner loses only its local hold marker. It fences the
+    # same durable wake, not the effect, and requires a successor epoch.
+    restarted = NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert restarted.process_once() == 0
+    recovered = store.status(run_id)
+    assert recovered["owner"]["epoch"] == first_fence["owner_epoch"] + 1
+    assert recovered["next_action"]["event_id"] == first_action["event_id"]
+    assert recovered["next_action"]["action_id"] == first_action["action_id"]
+
+    clock.advance(6)
+    assert restarted.process_once() == 1
+    second_action = store.status(run_id)["next_action"]
+    assert second_action["action_intent"]["state"] == "complete"
+    assert len(collector.turn_attempts) == 3
+    second_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": store.status(run_id)["owner"]["epoch"],
+    }
+
+    # A second hub interruption happens after the successor has received the
+    # real recovery prompt, but before it can ACK.  Its completed turn leaves
+    # the receipt durable and the exact wake unacknowledged.
+    second_session = collector.turn_attempts[-1][0]
+    second_turn = collector.turn_attempts[-1][1]["client_turn_id"]
+    restarted.registry.append_event(
+        session_id=second_session,
+        event_type="status",
+        payload={"turn_id": second_turn, "turn_complete": True, "exited": 0},
+    )
+    restarted.registry.update_session_activity(second_session, awaiting="input")
+    restarted._complete_finished_claim(restarted.config.goals[0], second_session)
+
+    restarted_again = NativeOwnerRunner(
+        collector,
+        runner.config,
+        credential_store=runner.credentials,
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert restarted_again.process_once() == 0
+    later = store.status(run_id)
+    recovery_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": later["owner"]["epoch"],
+    }
+    assert recovery_fence["owner_epoch"] == second_fence["owner_epoch"] + 1
+    assert later["next_action"]["event_id"] == first_action["event_id"]
+    assert later["next_action"]["action_id"] == first_action["action_id"]
+    with pytest.raises(ContinuityConflict):
+        store.acknowledge(
+            run_id,
+            **first_fence,
+            event_id=first_action["event_id"],
+            checkpoint="stale initial epoch",
+        )
+    with pytest.raises(ContinuityConflict):
+        store.acknowledge(
+            run_id,
+            **second_fence,
+            event_id=first_action["event_id"],
+            checkpoint="stale intermediate epoch",
+        )
+
+    # The later successor reconciles the original completed receipt through
+    # action_intent.  It neither recreates the effect nor consumes a new wake.
+    # The second delivery was consumed at the prior successor turn, so wait
+    # past its real lease deadline rather than fabricating another consume.
+    clock.advance(11)
+    assert restarted_again.process_once() == 1
+    final_status = store.status(run_id)
+    third_action = final_status["next_action"]
+    final_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": final_status["owner"]["epoch"],
+    }
+    assert final_fence["owner_epoch"] == recovery_fence["owner_epoch"] + 1
+    assert third_action["action_intent"]["state"] == "complete"
+    assert "hub-signed M2 recovery" in collector.turn_attempts[-1][1]["text"]
+    assert len(collector.turn_attempts) == 4
+    with pytest.raises(ContinuityConflict):
+        store.acknowledge(
+            run_id,
+            **recovery_fence,
+            event_id=third_action["event_id"],
+            checkpoint="expired recovery epoch",
+        )
+    reconciled = store.action_intent(
+        run_id,
+        **final_fence,
+        wake_id=third_action["event_id"],
+        action_fingerprint=third_action["action_id"],
+        artifact=expected,
+    )
+    assert reconciled == receipt
+    with control_plane_connection(runner.path) as con:
+        receipt_row = con.execute(
+            """
+            SELECT owner_epoch, artifact, created_at
+              FROM continuity_owner_action_intents
+             WHERE wake_id = ?
+            """,
+            [first_action["event_id"]],
+        ).fetchone()
+    assert receipt_row[:2] == (first_fence["owner_epoch"], expected)
+    assert receipt_row[2] is not None
+
+    store.acknowledge(
+        run_id,
+        **final_fence,
+        event_id=third_action["event_id"],
+        checkpoint="M2 receipt recovered after two hub interruptions",
+    )
+    checkpoint = store.status(run_id)["checkpoint"]
+    # A redelivery/replay cannot create another effect receipt or overwrite the
+    # durable checkpoint after the exact wake is acknowledged.
+    store.acknowledge(
+        run_id,
+        **final_fence,
+        event_id=third_action["event_id"],
+        checkpoint="duplicate must not replace checkpoint",
+    )
+    assert store.status(run_id)["checkpoint"] == checkpoint
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+    assert store.status(ready_run)["inbox_counts"] == {"acknowledged": 1}
+    with control_plane_connection(runner.path) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_action_intents WHERE wake_id = ?",
+                [first_action["event_id"]],
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_m2_handoff_rejects_missing_receipt_wrong_artifact_and_stale_epoch(tmp_path):
+    expected = "local-file:.drover-native-canary/m2-negative.json"
+    runner, collector, store, run_id, _clock = _runner(
+        tmp_path,
+        expected_effect=expected,
+        event_kind="worker_done",
+        m2_ack_pending=True,
+    )
+    collector.expected_effect_attestations["observer-session"] = True
+    assert runner.process_once() == 1
+    status = store.status(run_id)
+    action = status["next_action"]
+    fence = {
+        "owner_id": runner.config.goals[0].continuity_owner_id,
+        "owner_epoch": status["owner"]["epoch"],
+    }
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=action["event_id"], checkpoint="none"
+        )
+    with pytest.raises(ContinuityConflict, match="expected effect"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact="local-file:.drover-native-canary/wrong.json",
+        )
+    with pytest.raises(ContinuityConflict):
+        store.action_intent(
+            run_id,
+            **{**fence, "owner_epoch": fence["owner_epoch"] + 1},
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+            artifact=expected,
+        )

@@ -7,13 +7,15 @@ import Testing
         let base = Date(timeIntervalSince1970: 1_700_000_000)
         let answered = SessionSummary(id: "answered", hostID: "studio", harness: "codex", mode: "structured", status: "working", awaiting: nil, cwd: nil, lastActivity: base)
         let waiting = SessionSummary(id: "waiting", hostID: "studio", harness: "codex", mode: "structured", status: "working", awaiting: "input", cwd: nil, lastActivity: base.addingTimeInterval(60))
+        let approval = SessionSummary(id: "approval", hostID: "studio", harness: "codex", mode: "structured", status: "working", awaiting: "approval", cwd: nil, lastActivity: base.addingTimeInterval(90))
         let resolvedHigh = Self.insight(id: "resolved", state: .resolved, severity: .high, date: base)
         let openHigh = Self.insight(id: "open", state: .open, severity: .high, date: base.addingTimeInterval(120))
 
         let zero = InboxAttentionPresentation.count(workItems: [], sessions: [answered], insights: [resolvedHigh])
         #expect(zero == 0)
         #expect(InboxAttentionPresentation.badgeValue(for: zero) == nil)
-        #expect(InboxAttentionPresentation.count(workItems: [], sessions: [answered, waiting], insights: [resolvedHigh, openHigh]) == 2)
+        #expect(InboxAttentionPresentation.sessionsAwaitingAnswer([waiting, approval]).map(\.id) == ["approval", "waiting"])
+        #expect(InboxAttentionPresentation.count(workItems: [], sessions: [answered, waiting, approval], insights: [resolvedHigh, openHigh]) == 3)
         #expect(InboxAttentionPresentation.openPriorityInsights([resolvedHigh, openHigh]).map(\.findingID) == ["open"])
     }
 

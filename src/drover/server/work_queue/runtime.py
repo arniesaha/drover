@@ -7,12 +7,18 @@ import threading
 
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.harness.work_coordinator import sign_work_coordinator_continuity
+from drover.server.harness.work_coordinator import (
+    FactoryObserverRequestError,
+    parse_work_coordinator_continuity,
+    sign_work_coordinator_continuity,
+    work_coordinator_turn_id,
+)
 from drover.server.harness.worker_state import worker_brief
 from drover.server.mcp.contract import ReadCaps, bound_response
 from drover.server.web.auth import bearer_credential
 
-from .github import GitHubProvider, ProviderUnavailable
+from .github import ProviderUnavailable
+from .providers import provider_for_scope
 from .service import SYSTEMIC_COMMENT, WorkActor, WorkDenied, WorkService
 from .store import WorkStore
 
@@ -28,6 +34,40 @@ class HarnessBridge:
     def resolve(self, run_key):
         session = self.registry.session_by_client_id(run_key)
         if session is not None:
+            # The hub registry can lag a terminal daemon transition across a
+            # relay restart. Confirm a known nonterminal work session with
+            # its own live host before letting it suppress a terminal relaunch.
+            # An unavailable host remains fail-closed as the registry value.
+            host_id = getattr(session, "host_id", None)
+            if host_id and session.status not in TERMINAL_SESSION_STATUSES:
+                for host in self.registry.list_hosts():
+                    if host.host_id != host_id or not host.liveness().usable:
+                        continue
+                    status, body = self.collector._harness_request(
+                        host,
+                        "/sessions?client_session_id=" + run_key,
+                        method="GET",
+                        timeout_s=10,
+                    )
+                    if status != 200:
+                        log.warning(
+                            "harness inspection unavailable host_id=%s status=%s",
+                            host.host_id,
+                            status,
+                        )
+                        break
+                    for row in json.loads(body).get("sessions", []):
+                        if (
+                            row.get("client_session_id") == run_key
+                            and row.get("status") in TERMINAL_SESSION_STATUSES
+                        ):
+                            payload = self._recovery_payload(run_key, row)
+                            self.collector._sync_created_harness_session(
+                                host.host_id, payload, json.dumps(row)
+                            )
+                            return self.registry.session_by_client_id(run_key)
+                    break
+            self._require_bound_work_continuity(session, run_key)
             return session
         # A response may have been lost before the control registry was synced.
         # Read each reachable daemon, never replay POST to discover the outcome.
@@ -67,6 +107,34 @@ class HarnessBridge:
             raise WorkDenied("harness inspection unavailable")
         return None
 
+    def _require_bound_work_continuity(self, session, run_key):
+        """Reject a coordinator session that lacks its immutable ledger.
+
+        A coordinator create is only usable after the hub has persisted the
+        signed continuity run.  A daemon can still be live when its create
+        response reached the hub but initialization then failed (for example,
+        because a serialized integration reservation was already held).  The
+        registry row alone cannot reconstruct a local-candidate authority or
+        expected effect, so it must never turn that orphan into a reusable
+        launch result.
+        """
+        if getattr(session, "handoff_mode", None) != "work_coordinator":
+            return
+        from drover.server.harness.continuity import FactoryObserverContinuity
+
+        try:
+            status = FactoryObserverContinuity(self.collector.duckdb_path).status(
+                "work-" + run_key
+            )
+        except Exception as exc:  # unknown ledger is never safe to recover
+            raise WorkDenied(
+                "bound work continuity is unavailable; inspection required"
+            ) from exc
+        if status.get("session_id") != session.session_id:
+            raise WorkDenied(
+                "bound work continuity is unavailable; inspection required"
+            )
+
     def _recovery_payload(self, run_key, row):
         payload = {
             "client_session_id": run_key,
@@ -85,17 +153,130 @@ class HarnessBridge:
         if len(links) != 1:
             raise WorkDenied("cannot recover unique work launch intent")
         link = links[0]
+        stored_binding = link.get("work_coordinator_binding_json")
+        if stored_binding is not None:
+            from drover.server.harness.work_coordinator import (
+                FactoryObserverRequestError,
+                parse_work_coordinator_continuity,
+            )
+
+            try:
+                raw_binding = json.loads(stored_binding)
+                if not isinstance(raw_binding, dict):
+                    raise ValueError("stored binding is not an object")
+                binding, _ = parse_work_coordinator_continuity(
+                    {"work_coordinator_continuity": raw_binding},
+                    hub_secret=self.collector.work_coordinator_continuity_secret,
+                )
+                if binding is None or binding.run_id != "work-" + run_key:
+                    raise ValueError("stored binding run does not match")
+            except (
+                FactoryObserverRequestError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise WorkDenied(
+                    "stored work continuity binding is invalid; inspection required"
+                ) from exc
+            payload["work_coordinator_continuity"] = raw_binding
+            return payload
+        scope = next(
+            (
+                scope
+                for scope in self.config.goals
+                if scope.goal_id == link.get("goal_id")
+            ),
+            None,
+        )
+        if scope is None:
+            raise WorkDenied("cannot recover work continuity goal")
+        authority_labels = ()
+        expected_effect_artifact = None
+        if (
+            getattr(scope, "integration_serialization_label", None) is not None
+            or getattr(scope, "candidate_source", None) == "local_file"
+        ):
+            _, _, _, item = service.item(link.get("goal_id"), link.get("item_number"))
+            authority_labels = item.get("operator_authority_labels", [])
+            expected_effect_artifact = item.get("expected_effect_artifact")
+        if getattr(scope, "candidate_source", None) == "local_file":
+            # The original local-candidate authority and expected effect are
+            # hub-signed at launch.  A missing create response has no durable
+            # signed binding to recover, so mutable goal config must never
+            # reconstruct either an implementation binding or a downgraded
+            # former deployment binding.
+            raise WorkDenied(
+                "local candidate continuity recovery requires existing signed session"
+            )
         binding = self._work_coordinator_binding(
             run_key,
             link.get("run_role"),
             link.get("item_url"),
             link.get("goal_id"),
+            authority_labels=authority_labels,
+            expected_effect_artifact=expected_effect_artifact,
+            local_candidate_number=link.get("item_number"),
         )
         if binding is not None:
             payload["work_coordinator_continuity"] = binding
         return payload
 
-    def _work_coordinator_binding(self, run_key, role, item_url, goal_id):
+    @staticmethod
+    def _local_candidate_authority_scope(scope, local_candidate_number):
+        if getattr(scope, "candidate_source", None) != "local_file":
+            return "implementation"
+        if not isinstance(local_candidate_number, int) or local_candidate_number <= 0:
+            raise WorkDenied("local candidate authority binding is invalid")
+        return getattr(scope, "local_candidate_authority_scopes", {}).get(
+            str(local_candidate_number), "implementation"
+        )
+
+    @staticmethod
+    def _local_candidate_m2_ack_pending(scope, role, local_candidate_number):
+        """Return the reviewed M2 receipt handoff for one work launch only."""
+        if (
+            getattr(scope, "candidate_source", None) != "local_file"
+            or role != "work"
+            or not isinstance(local_candidate_number, int)
+            or local_candidate_number <= 0
+        ):
+            return False
+        return (
+            getattr(scope, "local_candidate_m2_ack_pending", {}).get(
+                str(local_candidate_number)
+            )
+            == "m2"
+        )
+
+    @staticmethod
+    def _local_candidate_committed_provenance(scope, role, local_candidate_number):
+        """Return the reviewed M3 commit exception for one work launch only."""
+        if (
+            getattr(scope, "candidate_source", None) != "local_file"
+            or role != "work"
+            or not isinstance(local_candidate_number, int)
+            or local_candidate_number <= 0
+        ):
+            return False
+        return (
+            getattr(scope, "local_candidate_committed_provenance", {}).get(
+                str(local_candidate_number)
+            )
+            == "m3"
+        )
+
+    def _work_coordinator_binding(
+        self,
+        run_key,
+        role,
+        item_url,
+        goal_id,
+        *,
+        authority_labels=(),
+        expected_effect_artifact=None,
+        local_candidate_number=None,
+    ):
         scope = next(
             (scope for scope in self.config.goals if scope.goal_id == goal_id), None
         )
@@ -107,12 +288,82 @@ class HarnessBridge:
             or not item_url
         ):
             raise WorkDenied("cannot reconstruct work continuity binding")
+        authority_scope = self._local_candidate_authority_scope(
+            scope, local_candidate_number
+        )
         binding = {
             "run_id": "work-" + run_key,
             "owner_id": scope.continuity_owner_id,
-            "authority_scope": "implementation",
+            "authority_scope": authority_scope,
             "objective": f"Work coordinator {role} for {item_url}",
         }
+        committed_provenance = self._local_candidate_committed_provenance(
+            scope, role, local_candidate_number
+        )
+        m2_ack_pending = self._local_candidate_m2_ack_pending(
+            scope, role, local_candidate_number
+        )
+        if (
+            committed_provenance or m2_ack_pending
+        ) and authority_scope != "implementation":
+            raise WorkDenied(
+                "candidate provenance or M2 handoff cannot select non-implementation authority"
+            )
+        serialization_key = getattr(scope, "integration_serialization_key", None)
+        serialization_label = getattr(scope, "integration_serialization_label", None)
+        if (
+            (committed_provenance or m2_ack_pending)
+            and serialization_label is not None
+            and serialization_label in set(authority_labels or ())
+        ):
+            raise WorkDenied(
+                "candidate provenance or M2 handoff cannot select integration serialization"
+            )
+        if (
+            isinstance(goal_id, str)
+            and goal_id
+            and not isinstance(local_candidate_number, bool)
+            and isinstance(local_candidate_number, int)
+            and local_candidate_number > 0
+        ):
+            binding.update(goal_id=goal_id, item_number=local_candidate_number)
+        if expected_effect_artifact is not None:
+            if (
+                not isinstance(expected_effect_artifact, str)
+                or not expected_effect_artifact.strip()
+                or len(expected_effect_artifact) > 2000
+            ):
+                raise WorkDenied("local candidate expected effect is invalid")
+            binding["expected_effect_artifact"] = expected_effect_artifact
+        if committed_provenance:
+            if expected_effect_artifact is None:
+                raise WorkDenied("committed provenance requires expected effect")
+            binding["committed_provenance"] = True
+        if m2_ack_pending:
+            if expected_effect_artifact is None:
+                raise WorkDenied("M2 handoff requires expected effect")
+            binding["m2_ack_pending"] = True
+        if (
+            authority_scope != "implementation"
+            and serialization_label is not None
+            and serialization_label in set(authority_labels or ())
+        ):
+            raise WorkDenied(
+                "deployment candidate cannot select integration serialization"
+            )
+        if (
+            role == "work"
+            and serialization_key is not None
+            and (
+                serialization_label is None
+                or serialization_label in set(authority_labels or ())
+            )
+        ):
+            binding.update(
+                delivery_role="integration_serialized",
+                repository=scope.repo,
+                serialization_key=serialization_key,
+            )
         binding["binding_signature"] = sign_work_coordinator_continuity(
             binding, self.collector.work_coordinator_continuity_secret
         )
@@ -164,14 +415,39 @@ class HarnessBridge:
             self.registry.get_session(parent_session_id) if parent_session_id else None
         )
         hosts = {parent.host_id} if parent and parent.cwd else set(scope.execution_cwds)
+        # Native-owner goals bind their durable lifecycle to one configured
+        # harness. Their work turn must use that same worktree-capable harness:
+        # never let quota preference select a shared-CWD adapter.
+        native_owner = isinstance(scope.continuity_owner_id, str) and (
+            scope.continuity_owner_id.startswith("drover:owner/")
+        )
+        required_harness = scope.continuity_owner_harness if native_owner else None
+        if native_owner and not isinstance(required_harness, str):
+            return set()
+        if native_owner and not required_harness.strip():
+            return set()
+
+        def eligible_row(row):
+            if not isinstance(row, dict) or not row.get("enabled"):
+                return False
+            capabilities = row.get("capabilities")
+            if not isinstance(capabilities, dict):
+                return False
+            if "structured" not in capabilities.get("launch_modes", []):
+                return False
+            if required_harness is None:
+                return True
+            return (
+                row.get("name") == required_harness
+                and capabilities.get("worktree") is True
+            )
+
         return {
             (host.host_id, row["name"])
             for host in self.registry.list_hosts()
             if host.liveness().usable and host.host_id in hosts
             for row in host.capabilities.get("harnesses", [])
-            if isinstance(row, dict)
-            and row.get("enabled")
-            and "structured" in row.get("capabilities", {}).get("launch_modes", [])
+            if eligible_row(row)
         }
 
     def quota(self):
@@ -187,8 +463,170 @@ class HarnessBridge:
             fetch=self.collector.fetch_harness_provider_usage,
         )["accounts"]
 
+    def coordinator_failure_category(self, run_key):
+        """Read one terminal coordinator failure without interpreting prose."""
+        session = self.resolve(run_key)
+        if session is None or session.status not in TERMINAL_SESSION_STATUSES:
+            return None
+        if session.handoff_mode != "work_coordinator":
+            return None
+        return self.registry.coordinator_turn_failure_category(session.session_id)
+
+    def terminal_work_done(self, run_key):
+        """Return true only after the bound worker's exact turn is safely idle.
+
+        Codex is a reusable structured session: a successful turn emits an
+        ``exited`` status with its turn id while the session remains running
+        and awaits its next input. Requiring the whole session to terminate
+        stranded a deferred verification intent forever. A live session is
+        therefore acceptable only when its most recent turn is durably
+        finished and it is awaiting input; active, failed, and unknown turns
+        remain ineligible.
+        """
+        session = self.resolve(run_key)
+        if session is None or session.handoff_mode != "work_coordinator":
+            return False
+        expected_turn_id = work_coordinator_turn_id("work-" + run_key)
+        if session.status == "completed":
+            turn_finished = self.registry.has_successfully_completed_turn(
+                session.session_id, expected_turn_id
+            )
+        elif session.status == "running" and session.effective_awaiting == "input":
+            turn_finished = self.registry.has_successfully_completed_turn(
+                session.session_id, expected_turn_id
+            )
+        else:
+            turn_finished = False
+        if not turn_finished:
+            return False
+        from drover.server.harness.continuity import FactoryObserverContinuity
+
+        try:
+            status = FactoryObserverContinuity(self.collector.duckdb_path).status(
+                "work-" + run_key
+            )
+        except Exception:  # unknown terminal projection must not schedule a verifier
+            return False
+        return (
+            status.get("session_id") == session.session_id
+            and status.get("worker_state") == "done"
+        )
+
+    def work_coordinator_committed_provenance(self, run_key):
+        """Return the immutable provenance mode from the bound hub run."""
+        session = self.resolve(run_key)
+        if session is None or session.handoff_mode != "work_coordinator":
+            return None
+        return self.registry.work_coordinator_committed_provenance(
+            session.session_id, "work-" + run_key
+        )
+
+    def expected_effect_materialized(self, run_key, artifact):
+        """Ask the bound daemon whether its exact candidate effect exists.
+
+        ``None`` means the readback was unavailable or malformed and is
+        intentionally not recoverable.  The owner uses the same endpoint
+        before dispatching a candidate action.
+        """
+        session = self.resolve(run_key)
+        if session is None or session.handoff_mode != "work_coordinator":
+            return None
+        # The provider manifest can change after launch. Recovery must compare
+        # its current value with the original hub-verified binding rather than
+        # reconstructing authority from that mutable provider data.
+        bound_artifact = self.registry.work_coordinator_expected_effect_artifact(
+            session.session_id, "work-" + run_key
+        )
+        if bound_artifact != artifact:
+            return None
+        status, body = self.collector.proxy_harness_session_action(
+            session.session_id, "expected-effect", {"artifact": artifact}
+        )
+        if not 200 <= status < 300:
+            return None
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        verification = payload.get("verification")
+        materialized = payload.get("materialized")
+        if verification == "materialized" and materialized is True:
+            return True
+        if verification == "absent" and materialized is False:
+            return False
+        return None
+
+    def prepare_work_coordinator_binding(
+        self, run_key, role, ref, goal_id, *, authority=None
+    ):
+        """Build the one signed envelope persisted before daemon create."""
+        scope = next(g for g in self.config.goals if g.goal_id == goal_id)
+        if not scope.continuity_owner_id:
+            return None
+        authority = authority or {}
+        return self._work_coordinator_binding(
+            run_key,
+            role,
+            ref.url,
+            goal_id,
+            authority_labels=authority.get("labels", []),
+            expected_effect_artifact=authority.get("expected_effect_artifact"),
+            local_candidate_number=authority.get("local_candidate_number"),
+        )
+
+    def reserve_work_coordinator_launch(self, binding):
+        """Reserve a signed integration binding before the daemon POST.
+
+        Standard work has no serialization reservation.  The signed envelope
+        is parsed again here so a persisted launch intent cannot use mutable
+        provider/configuration state to reserve authority on a later retry.
+        """
+        try:
+            parsed, _ = parse_work_coordinator_continuity(
+                {"work_coordinator_continuity": binding},
+                hub_secret=self.collector.work_coordinator_continuity_secret,
+            )
+        except (FactoryObserverRequestError, TypeError, ValueError) as exc:
+            raise WorkDenied(
+                "stored work continuity binding is invalid; inspection required"
+            ) from exc
+        if parsed is None or parsed.delivery_role != "integration_serialized":
+            return False
+        from drover.server.harness.continuity import (
+            FactoryObserverContinuity,
+            IntegrationReservationHeld,
+        )
+
+        try:
+            return FactoryObserverContinuity(
+                self.collector.duckdb_path
+            ).reserve_integration_launch(
+                run_id=parsed.run_id,
+                owner_id=parsed.owner_id,
+                authority_scope=parsed.authority_scope,
+                delivery_role=parsed.delivery_role,
+                repository=parsed.repository,
+                serialization_key=parsed.serialization_key,
+            )
+        except IntegrationReservationHeld as exc:
+            raise WorkDenied("integration reservation is held") from exc
+        except Exception as exc:
+            raise WorkDenied(
+                "integration reservation is unavailable; inspection required"
+            ) from exc
+
     def launch(
-        self, host, harness, run_key, ref, role, parent, goal_id, *, authority=None
+        self,
+        host,
+        harness,
+        run_key,
+        ref,
+        role,
+        parent,
+        goal_id,
+        *,
+        authority=None,
+        continuity_binding=None,
     ):
         scope = next(g for g in self.config.goals if g.goal_id == goal_id)
         parent_session = self.registry.get_session(parent) if parent else None
@@ -197,6 +635,17 @@ class HarnessBridge:
             if parent_session and parent_session.host_id == host
             else scope.execution_cwds.get(host)
         )
+        authority = authority or {}
+        local_number = authority.get("local_candidate_number")
+        local_cwd = authority.get("local_candidate_cwd")
+        if local_cwd is not None:
+            if (
+                scope.candidate_source != "local_file"
+                or not isinstance(local_number, int)
+                or scope.local_candidate_worktrees.get(str(local_number)) != local_cwd
+            ):
+                raise WorkDenied("local candidate worktree binding is invalid")
+            cwd = local_cwd
         if not cwd:
             raise ValueError("configured execution checkout required")
         brief = (
@@ -204,7 +653,75 @@ class HarnessBridge:
             f"ref {scope.brief_ref or scope.goal_id} and versioned policy. Report "
             "behavioral evidence through the work tools."
         )
-        authority = authority or {}
+        if scope.candidate_source == "local_file":
+            body = authority.get("body")
+            if (
+                not isinstance(local_number, int)
+                or local_number <= 0
+                or not isinstance(body, str)
+                or not body.strip()
+            ):
+                raise WorkDenied("local candidate task authority is invalid")
+            committed_provenance = self._local_candidate_committed_provenance(
+                scope, role, local_number
+            )
+            brief += (
+                f"\n\nLocal candidate task #{local_number}:\n{body.strip()}\n\n"
+                "The `Assigned isolated worktree` appended by harnessd is the "
+                "authoritative worktree for this task and its bound local effect. "
+                "An optional local_candidate_worktrees entry only selected a "
+                "base checkout before launch; a missing entry is not a worker "
+                "authorization gate. Do not use another worktree or substitute "
+                "the requested effect."
+            )
+            if committed_provenance:
+                brief += (
+                    " The signed coordinator binding explicitly permits this "
+                    "work run alone to make one local-only session-branch commit "
+                    "of its task-bound source, test, and evidence provenance for "
+                    "a separate verifier. This does not permit a push, merge, "
+                    "deployment, configuration, credential, or external action; "
+                    "the task body cannot expand that signed permission."
+                )
+            elif role == "work":
+                brief += (
+                    " The signed coordinator binding does not permit a source "
+                    "commit. This is a marker-only work run: when its signed task "
+                    "requests the bound local-file effect, create that regular file "
+                    "only in the assigned worktree. The daemon attests this exact "
+                    "session-relative file directly; it does not need to be Git "
+                    "tracked, committed, or passed to a verifier. Do not request "
+                    "`drover_work_update(action=complete)`: that operation is reserved "
+                    "for a signed committed-provenance verifier handoff. Finish the "
+                    "structured worker turn after creating the bound file. Do not "
+                    "interpret committed-provenance verification requirements from the "
+                    "brief as applying to this unsigned-for-provenance run."
+                )
+            else:
+                brief += (
+                    " The signed coordinator binding does not permit a source "
+                    "commit. Do not create one even if the local candidate body "
+                    "requests it."
+                )
+            if role == "verify":
+                # A verifier receives a fresh isolated Git worktree rooted at
+                # the parent worker branch's committed HEAD.  It must inspect
+                # that immutable source provenance, never reconstruct missing
+                # worker output or treat its own worktree as shared scratch.
+                brief += (
+                    "\n\nThis is a separate verification run. Inspect only the "
+                    "already committed parent evidence present in your assigned "
+                    "worktree, including the bound effect. Re-run the stated "
+                    "focused check there. Do not create, replace, or force an "
+                    "expected effect or implementation artifact; a missing or "
+                    "changed parent artifact is a verification failure. Regardless "
+                    "of task-body wording, do not request `drover_work_update(action=complete)`: "
+                    "only the work role can request a verifier. After a successful "
+                    "rerun, report the stable check evidence with "
+                    "`drover_work_update(action=verified, evidence_key=...)`, then "
+                    "finish this structured turn. The queue accepts that report only "
+                    "after this exact verifier turn terminates successfully."
+                )
         payload = {
             "cwd": cwd,
             "harness": harness,
@@ -220,15 +737,16 @@ class HarnessBridge:
             ),
         }
         if scope.continuity_owner_id:
-            # The committed run key is the producer identity and binds the
-            # exact launched session to the coordinator work item. The hub
-            # verifies and initializes the durable ledger before reporting
-            # launch success to the work coordinator.
-            # The daemon accepts coordinator mode only when this exact binding
-            # was signed by the hub's continuity secret. The host receives the
-            # binding but never the HMAC secret or the hub bearer token.
-            payload["work_coordinator_continuity"] = self._work_coordinator_binding(
-                run_key, role, ref.url, goal_id
+            # The exact signed envelope was persisted with the idempotent work
+            # intent before this POST.  Direct bridge callers retain the same
+            # construction path, but normal WorkService launches pass that
+            # durable envelope back here unchanged.
+            payload["work_coordinator_continuity"] = (
+                continuity_binding
+                if continuity_binding is not None
+                else self.prepare_work_coordinator_binding(
+                    run_key, role, ref, goal_id, authority=authority
+                )
             )
         status, body = self.collector.proxy_create_harness_session(host, payload)
         if not 200 <= status < 300:
@@ -246,7 +764,7 @@ def start_work_service(collector, config):
             return None
         raise ValueError("live work control requires Postgres")
     providers = {
-        g.goal_id: GitHubProvider(
+        g.goal_id: provider_for_scope(
             config.workspace_id,
             g,
             public_text_validator=lambda text: text == SYSTEMIC_COMMENT,
@@ -360,7 +878,9 @@ class IdleUndeclaredWorker:
         self._stop.set()
 
 
-def start_idle_undeclared_worker(collector, config, shutdown_event):
+def start_idle_undeclared_worker(
+    collector, config, shutdown_event, *, credential_store=None
+):
     """Only goals that opted into an owner get idle-worker wakes."""
     if getattr(collector, "work_control", None) is None or not any(
         g.continuity_owner_id for g in config.goals
@@ -375,7 +895,11 @@ def start_idle_undeclared_worker(collector, config, shutdown_event):
     if native_scopes:
         from drover.server.work_queue.native_owner import NativeOwnerRunner
 
-        owner_runner = NativeOwnerRunner(collector, config)
+        if credential_store is None:
+            raise RuntimeError("native continuity owners require a credential store")
+        owner_runner = NativeOwnerRunner(
+            collector, config, credential_store=credential_store
+        )
     worker = IdleUndeclaredWorker(
         collector.duckdb_path,
         config.idle_undeclared_seconds,

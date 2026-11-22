@@ -17,6 +17,9 @@ public struct HarnessPresentation: Sendable, Equatable {
         case "agy":
             name = "Antigravity"
             symbolName = "sparkles"
+        case "cursor":
+            name = "Cursor"
+            symbolName = "cursorarrow.rays"
         case "deepseek-harness":
             name = "DeepSeek Harness"
             symbolName = "cpu"

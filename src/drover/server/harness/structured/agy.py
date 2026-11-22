@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -59,12 +60,14 @@ class AgyDriver:
         emit: EmitFn,
         native_session_id: str | None = None,
         host_id: str = "local",
+        env: dict[str, str] | None = None,
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.emit = emit
         self.native_session_id = native_session_id
         self.host_id = host_id
+        self.env = {**os.environ, **(env or {})}
         self._turn_lock = threading.Lock()
         self._turn_active = False
         self._turn_process: subprocess.Popen[str] | None = None
@@ -149,6 +152,7 @@ class AgyDriver:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                env=self.env,
             )
             worker = threading.Thread(
                 target=self._run_turn, args=(process, turn_id), daemon=True

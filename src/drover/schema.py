@@ -25,6 +25,7 @@ import duckdb
 
 from drover.agent_aliases import canonicalize_sql
 from drover.event_identity import canonical_agent_events_cte
+from drover.server.continuity_schema import CONTINUITY_RESERVATION_TABLE
 from drover.server.control_store import (
     is_postgres_control_store,
     postgres_control_store,
@@ -1795,6 +1796,7 @@ def bootstrap_control_plane_store(duckdb_path: Path) -> Path:
 
 
 HARNESS_EVENTS_TABLE = "harness_events"
+_LEGACY_CONTROL_MIGRATION_TABLES = (*CONTROL_PLANE_TABLES, CONTINUITY_RESERVATION_TABLE)
 
 #: Kept well under DuckDB's parameter ceiling; the list is only ever as long as
 #: the number of pre-split rows the control plane is missing, which is zero on
@@ -1819,6 +1821,34 @@ def _copy_by_primary_key(
             f"SELECT src.* FROM main.{table} src "
             f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst "
             f"WHERE dst.{key} = src.{key})"
+        )
+        remaining = int(con.execute(missing_sql).fetchone()[0])
+        if remaining:
+            raise RuntimeError(
+                f"control-plane migration left {remaining} {table} row(s) "
+                f"behind in {duckdb_path}"
+            )
+    return pending
+
+
+def _copy_integration_reservation(
+    con: duckdb.DuckDBPyConnection, *, alias: str, duckdb_path: Path
+) -> int:
+    """Copy the one composite-key continuity relation during the legacy split."""
+    table = CONTINUITY_RESERVATION_TABLE
+    matching = " AND ".join(
+        f"dst.{column} = src.{column}" for column in ("repository", "serialization_key")
+    )
+    missing_sql = (
+        f"SELECT count(*) FROM main.{table} src "
+        f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst WHERE {matching})"
+    )
+    pending = int(con.execute(missing_sql).fetchone()[0])
+    if pending:
+        con.execute(
+            f"INSERT INTO {alias}.{table} BY NAME "
+            f"SELECT src.* FROM main.{table} src "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {alias}.{table} dst WHERE {matching})"
         )
         remaining = int(con.execute(missing_sql).fetchone()[0])
         if remaining:
@@ -2139,7 +2169,7 @@ def migrate_control_plane_tables(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_type = 'BASE TABLE'"
         ).fetchall()
-    } & set(CONTROL_PLANE_TABLES)
+    } & set(_LEGACY_CONTROL_MIGRATION_TABLES)
     if not legacy:
         return {}
 
@@ -2159,11 +2189,16 @@ def migrate_control_plane_tables(
 
     copied: dict[str, int] = {}
     try:
-        for table in CONTROL_PLANE_TABLES:
+        for table in _LEGACY_CONTROL_MIGRATION_TABLES:
             if table not in legacy:
                 continue
             if table == HARNESS_EVENTS_TABLE:
                 copied[table] = _copy_harness_events_by_identity(
+                    con, alias=alias, duckdb_path=duckdb_path
+                )
+                continue
+            if table == CONTINUITY_RESERVATION_TABLE:
+                copied[table] = _copy_integration_reservation(
                     con, alias=alias, duckdb_path=duckdb_path
                 )
                 continue

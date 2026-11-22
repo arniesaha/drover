@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 
 from drover.server.postgres_schema import (
+    COMMITTED_PROVENANCE_MIGRATION,
     CONTINUITY_LEASES_MIGRATION,
     CONTINUITY_OWNER_HANDOFF_MIGRATION,
     CONTINUITY_OWNER_HANDOFF_TOKEN_MIGRATION,
@@ -28,20 +29,35 @@ from drover.server.postgres_schema import (
     CONTINUITY_WAKES_MIGRATION,
     DAILY_DIGEST_LEASE_MIGRATION,
     DAILY_DIGEST_MIGRATION,
+    EXPECTED_EFFECT_ARTIFACT_MIGRATION,
     EXPORTER_FRESHNESS_MIGRATION,
     EXPORTER_RESTART_GUARD_MIGRATION,
     GITHUB_ENVIRONMENT_APPROVALS_MIGRATION,
     GITHUB_WORK_ITEM_EVENTS_MIGRATION,
     HUB_WORK_ITEMS_MIGRATION,
+    INTEGRATION_SERIALIZATION_MIGRATION,
+    M2_ACK_PENDING_MIGRATION,
     NATIVE_CONTINUITY_OWNER_MIGRATION,
     NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION,
+    OWNER_CLAIM_EPOCH_MIGRATION,
+    OWNER_CREDENTIAL_MIGRATION,
     PROFILE_MIGRATION,
+    WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION,
     WORK_ITEM_EVENTS_MIGRATION,
     WORKER_STATES_MIGRATION,
 )
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    47: "8d57ec091e2eb2cbc96c95cd68ddd6bb06986a4cb2e3b351604da31a6325ddfc",
+    M2_ACK_PENDING_MIGRATION: "459f66c940aa8ec7a24b5736e5271a30d6d82fa96a783b937b3c78b148a9e811",
+    WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION: "cff55639aaf01f98ea23005e5bb6001b80e98277ce1f97d7f424ff44f82f4588",
+    COMMITTED_PROVENANCE_MIGRATION: "3eb6eb9caf7990e23375a2c62e93bacd846978689629ccbb80aa523bcba58092",
+    OWNER_CLAIM_EPOCH_MIGRATION: "81e448da38f14ff3ce08aa90ab01eafbb7256e21985c31d1a5022c93185e168d",
+    EXPECTED_EFFECT_ARTIFACT_MIGRATION: "745ad20c33fa21000cb8d8879127dbb2768b7d5ff40a5d3bddf7f8d749d50a48",
+    INTEGRATION_SERIALIZATION_MIGRATION: "aabc4c9680acd4920282106fb2c38919d896ca27e8a35ef3b2d67364b07ed190",
+    40: "bb64a15b1b33c15395d2003c7bd8f20bfcee496b900a69afb5fc9f7a547c7e62",
+    OWNER_CREDENTIAL_MIGRATION: "4f8a02bc72e85de23eb7f833664aff4e9fdf28d1436d2ed08910c1f4b7b24a38",
     NATIVE_CONTINUITY_OWNER_RECEIPTS_MIGRATION: "8808095813b5cfecc3dc9855f30abc2a2d7f8df46cbea4cb1758e654cd88aa68",
     NATIVE_CONTINUITY_OWNER_MIGRATION: "84f182dbb2eed84a5f82193f01846266fbae71ce0124ee59f1211d7deb3e919b",
     CONTINUITY_REAP_OPERATIONS_MIGRATION: "99d8ea687b6d112c12d541fc07dc747b62bcef35d5dd96d18eb3a5b6ecb0f260",
@@ -135,6 +151,165 @@ def test_migration_versions_are_unique_and_ascending():
     assert versions == sorted(set(versions))
     assert VECTOR_MIGRATION not in versions
     assert sorted([*versions, VECTOR_MIGRATION]) == list(range(1, max(versions) + 1))
+
+
+def test_expected_effect_artifact_migration_42_is_additive(pg_control_path):
+    """Existing PostgreSQL control stores gain the immutable effect reference."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute(
+            "ALTER TABLE factory_observer_runs DROP COLUMN expected_effect_artifact"
+        )
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [EXPECTED_EFFECT_ARTIFACT_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        assert (
+            con.execute(
+                "SELECT expected_effect_artifact FROM factory_observer_runs LIMIT 0"
+            ).description[0][0]
+            == "expected_effect_artifact"
+        )
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [EXPECTED_EFFECT_ARTIFACT_MIGRATION],
+        ).fetchone() == (1,)
+
+
+def test_owner_claim_epoch_migration_43_is_additive(pg_control_path):
+    """Existing PostgreSQL stores gain the epoch fence without rewriting claims."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute("ALTER TABLE continuity_owner_turn_claims DROP COLUMN owner_epoch")
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [OWNER_CLAIM_EPOCH_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        assert (
+            con.execute(
+                "SELECT owner_epoch FROM continuity_owner_turn_claims LIMIT 0"
+            ).description[0][0]
+            == "owner_epoch"
+        )
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [OWNER_CLAIM_EPOCH_MIGRATION],
+        ).fetchone() == (1,)
+
+
+def test_committed_provenance_migration_44_preserves_preupgrade_runs_as_unknown(
+    pg_control_path,
+):
+    """A pre-44 run may not be silently downgraded to marker-only authority."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.harness.continuity import FactoryObserverContinuity
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    registry = HarnessRegistry(pg_control_path)
+    session = registry.create_session(
+        session_id="harness-pre44-provenance",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="work_coordinator",
+        source_session_id="work/work-pre44-provenance@0",
+    )
+    run_id = FactoryObserverContinuity(pg_control_path).initialize(
+        session_id=session.session_id,
+        objective="Pre-upgrade candidate",
+        checkpoint="launched",
+        expected_effect_artifact="local-file:.drover-native-canary/source-task-48.json",
+    )
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute(
+            "ALTER TABLE factory_observer_runs DROP COLUMN committed_provenance"
+        )
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [COMMITTED_PROVENANCE_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+
+    status = FactoryObserverContinuity(pg_control_path).status(run_id)
+    assert status["committed_provenance"] is None
+    assert (
+        HarnessRegistry(pg_control_path).work_coordinator_committed_provenance(
+            session.session_id, run_id
+        )
+        is None
+    )
+    with store.connection() as con:
+        assert con.execute(
+            "SELECT committed_provenance FROM factory_observer_runs WHERE run_id = ?",
+            [run_id],
+        ).fetchone() == (None,)
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [COMMITTED_PROVENANCE_MIGRATION],
+        ).fetchone() == (1,)
+
+
+def test_work_coordinator_launch_binding_migration_45_is_additive(pg_control_path):
+    """Old links gain the nullable envelope column without inferred authority."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+    from drover.server.work_queue.provider import ItemRef
+    from drover.server.work_queue.store import WorkStore
+
+    queue = WorkStore(pg_control_path, "preupgrade-workspace")
+    queue.intent(
+        "control:test",
+        ItemRef(
+            "preupgrade-workspace", "github", "example/project", 1, "https://example/1"
+        ),
+        "goal",
+        "a" * 64,
+        "work",
+        0,
+        "goal:preupgrade",
+    )
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute(
+            "ALTER TABLE execution_links DROP COLUMN work_coordinator_binding_json"
+        )
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        assert (
+            con.execute(
+                "SELECT work_coordinator_binding_json FROM execution_links LIMIT 0"
+            ).description[0][0]
+            == "work_coordinator_binding_json"
+        )
+        assert con.execute(
+            "SELECT work_coordinator_binding_json FROM execution_links "
+            "WHERE workspace_id = 'preupgrade-workspace'"
+        ).fetchone() == (None,)
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION],
+        ).fetchone() == (1,)
 
 
 def test_lake_export_batches_backfill_matches_migration_2():
@@ -405,3 +580,49 @@ def test_freshness_migration_existing_store_and_index_plan(pg_control_path):
             "SELECT count(*) FROM control_schema_migrations WHERE version = 16"
         ).fetchone()
         assert applied == 1
+
+
+def test_m2_ack_pending_migration_46_preserves_preupgrade_runs_as_unknown(
+    pg_control_path,
+):
+    """A pre-46 run cannot acquire the restart handoff from mutable input."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.harness.continuity import FactoryObserverContinuity
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    registry = HarnessRegistry(pg_control_path)
+    session = registry.create_session(
+        session_id="harness-pre46-m2",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="work_coordinator",
+        source_session_id="work/work-pre46-m2@0",
+    )
+    run_id = FactoryObserverContinuity(pg_control_path).initialize(
+        session_id=session.session_id,
+        objective="Pre-upgrade M2 candidate",
+        checkpoint="launched",
+        expected_effect_artifact="local-file:.drover-native-canary/m2-51.json",
+        m2_ack_pending=False,
+    )
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        con.execute("ALTER TABLE factory_observer_runs DROP COLUMN m2_ack_pending")
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [M2_ACK_PENDING_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+
+    status = FactoryObserverContinuity(pg_control_path).status(run_id)
+    assert status["m2_ack_pending"] is None
+    assert (
+        HarnessRegistry(pg_control_path).work_coordinator_m2_ack_pending(
+            session.session_id, run_id
+        )
+        is None
+    )

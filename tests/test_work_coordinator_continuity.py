@@ -6,9 +6,11 @@ import pytest
 
 from drover.schema import bootstrap_control_plane_store
 from drover.server.harness.continuity import (
+    ContinuityConflict,
     FactoryObserverContinuity,
     record_work_coordinator_state,
 )
+from drover.server.harness.factory_observer import FactoryObserverRequestError
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.harness.work_coordinator import (
     parse_unverified_work_coordinator_continuity,
@@ -159,6 +161,128 @@ def test_work_coordinator_binding_is_exact_and_projects_start_done_blocked_and_a
     assert store.status(run)["owner_handoff"]["authorized_owner_id"] == binding.owner_id
 
 
+def test_signed_candidate_effect_binding_is_persisted_and_rejects_generic_receipts(
+    tmp_path,
+):
+    """The hub persists the signed local effect before any owner delivery."""
+    from drover.server.metrics import MetricsCollector
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    expected = "local-file:.drover-native-canary/source-task-9.json"
+    unsigned = {
+        "run_id": "work-expected-effect",
+        "owner_id": "drover:owner/native-canary",
+        "authority_scope": "implementation",
+        "objective": "Bounded candidate effect",
+        "expected_effect_artifact": expected,
+    }
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        api_token="hub-secret",
+        work_coordinator_continuity_secret="hub-continuity-secret",
+    )
+    MetricsCollector._sync_created_harness_session(
+        collector,
+        "studio",
+        {
+            "harness": "codex",
+            "work_coordinator_continuity": {
+                **unsigned,
+                "binding_signature": sign_work_coordinator_continuity(
+                    unsigned, "hub-continuity-secret"
+                ),
+            },
+        },
+        json.dumps({"session_id": "harness-expected-effect", "status": "running"}),
+    )
+    store = FactoryObserverContinuity(path)
+    status = store.status("work-expected-effect")
+    assert status["expected_effect_artifact"] == expected
+    assert (
+        HarnessRegistry(path).work_coordinator_expected_effect_artifact(
+            "harness-expected-effect", "work-expected-effect"
+        )
+        == expected
+    )
+    assert (
+        HarnessRegistry(path).work_coordinator_expected_effect_artifact(
+            "harness-expected-effect", "work-other"
+        )
+        is None
+    )
+    lease = store.lease("work-expected-effect", owner_id=unsigned["owner_id"])
+    start = store.consume(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+    )
+    # Starting a candidate is only an observation. It must not require or
+    # consume the final candidate effect before the worker has finished.
+    assert start["type"] == "observe_worker_start"
+    assert "expected_effect_artifact" not in start
+    store.action_intent(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+        wake_id=start["event_id"],
+        action_fingerprint=start["action_id"],
+        artifact="local-file:.drover-native-canary/actions/start-observed.json",
+    )
+    store.acknowledge(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+        event_id=start["event_id"],
+        checkpoint="worker start observed",
+    )
+
+    done = store.report(
+        "work-expected-effect",
+        source="drover-work-coordinator",
+        source_event_id="harness-expected-effect:done",
+        subject="harness-expected-effect",
+        sequence=1,
+        kind="worker_done",
+        summary="Bounded candidate effect completed.",
+    )
+    action = store.consume(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+    )
+    assert action["type"] == "review_worker_result"
+    assert action["expected_effect_artifact"] == expected
+    with pytest.raises(ContinuityConflict, match="expected effect"):
+        store.action_intent(
+            "work-expected-effect",
+            owner_id=unsigned["owner_id"],
+            owner_epoch=lease["owner_epoch"],
+            wake_id=done,
+            action_fingerprint=action["action_id"],
+            artifact="local-file:.drover-native-canary/actions/generic-wake.json",
+        )
+    terminal_receipt = store.action_intent(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+        wake_id=done,
+        action_fingerprint=action["action_id"],
+        artifact=expected,
+    )
+    assert terminal_receipt["state"] == "complete"
+    assert terminal_receipt["artifact"] == expected
+    store.acknowledge(
+        "work-expected-effect",
+        owner_id=unsigned["owner_id"],
+        owner_epoch=lease["owner_epoch"],
+        event_id=done,
+        checkpoint="candidate effect verified",
+    )
+
+
 def test_work_coordinator_binding_rejects_noncanonical_owner():
     try:
         unsigned = {
@@ -182,6 +306,109 @@ def test_work_coordinator_binding_rejects_noncanonical_owner():
         assert "canonical" in str(exc)
     else:
         raise AssertionError("noncanonical owner accepted")
+
+
+def test_integration_serialization_binding_is_signed_and_retains_commit_only_scope():
+    """A serialization class is metadata, never the integration authority."""
+    unsigned = {
+        "run_id": "work-integration-abc",
+        "owner_id": "drover:owner/goal",
+        "authority_scope": "implementation",
+        "objective": "Serialized implementation work",
+        "delivery_role": "integration_serialized",
+        "repository": "example/project",
+        "serialization_key": "main-write",
+    }
+
+    binding, _ = parse_work_coordinator_continuity(
+        {
+            "work_coordinator_continuity": {
+                **unsigned,
+                "binding_signature": sign_work_coordinator_continuity(unsigned, "hub"),
+            }
+        },
+        hub_secret="hub",
+    )
+
+    assert binding is not None
+    assert binding.authority_scope == "implementation"
+    assert binding.delivery_role == "integration_serialized"
+    assert binding.repository == "example/project"
+    assert binding.serialization_key == "main-write"
+
+
+def test_integration_serialization_binding_rejects_authority_escalation():
+    unsigned = {
+        "run_id": "work-integration-abc",
+        "owner_id": "drover:owner/goal",
+        "authority_scope": "integration",
+        "objective": "Serialized implementation work",
+        "delivery_role": "integration_serialized",
+        "repository": "example/project",
+        "serialization_key": "main-write",
+    }
+
+    with pytest.raises(ValueError, match="implementation"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **unsigned,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        unsigned, "hub"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )
+
+
+def test_work_coordinator_committed_provenance_requires_signed_item_binding():
+    unsigned = {
+        "run_id": "work-committed-provenance",
+        "owner_id": "drover:owner/goal",
+        "authority_scope": "implementation",
+        "objective": "Committed local provenance",
+        "committed_provenance": True,
+    }
+    with pytest.raises(ValueError, match="requires item binding"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **unsigned,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        unsigned, "hub"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )
+
+    signed = {**unsigned, "goal_id": "goal", "item_number": 48}
+    with pytest.raises(ValueError, match="requires expected effect"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **signed,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        signed, "hub"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )
+    signed["expected_effect_artifact"] = (
+        "local-file:.drover-native-canary/source-task-48.json"
+    )
+    binding, _ = parse_work_coordinator_continuity(
+        {
+            "work_coordinator_continuity": {
+                **signed,
+                "binding_signature": sign_work_coordinator_continuity(signed, "hub"),
+            }
+        },
+        hub_secret="hub",
+    )
+    assert binding is not None and binding.committed_provenance is True
 
 
 def test_work_coordinator_binding_rejects_forged_hub_signature():
@@ -332,6 +559,120 @@ def test_hub_sync_is_the_only_ledger_initializer(tmp_path):
     assert [event["report"]["kind"] for event in status["events"]] == ["worker_started"]
 
 
+def test_registry_preserves_signed_committed_provenance_tristate(tmp_path):
+    """Only an initialized binding can distinguish false from legacy unknown."""
+    from drover.server.db import control_plane_connection
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    registry = HarnessRegistry(path)
+    store = FactoryObserverContinuity(path)
+    runs = {}
+    for name, provenance in (("true", True), ("false", False), ("legacy", False)):
+        session = registry.create_session(
+            session_id=f"harness-provenance-{name}",
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            status="running",
+            handoff_mode="work_coordinator",
+            source_session_id=f"work/work-provenance-{name}@0",
+        )
+        runs[name] = store.initialize(
+            session_id=session.session_id,
+            objective=f"Provenance {name}",
+            checkpoint="launched",
+            expected_effect_artifact="local-file:.drover-native-canary/effect.json",
+            committed_provenance=provenance,
+        )
+    with control_plane_connection(path) as con:
+        con.execute(
+            "UPDATE factory_observer_runs SET committed_provenance = NULL WHERE run_id = ?",
+            [runs["legacy"]],
+        )
+
+    assert (
+        registry.work_coordinator_committed_provenance(
+            "harness-provenance-true", runs["true"]
+        )
+        is True
+    )
+    assert (
+        registry.work_coordinator_committed_provenance(
+            "harness-provenance-false", runs["false"]
+        )
+        is False
+    )
+    assert (
+        registry.work_coordinator_committed_provenance(
+            "harness-provenance-legacy", runs["legacy"]
+        )
+        is None
+    )
+    assert store.status(runs["legacy"])["committed_provenance"] is None
+
+
+def test_hub_sync_persists_immutable_committed_provenance_mode(tmp_path):
+    """Only the hub-signed binding may select a verifier-capable work run."""
+    import json
+
+    from drover.server.metrics import MetricsCollector
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        api_token="hub-secret",
+        work_coordinator_continuity_secret="hub-continuity-secret",
+    )
+    unsigned = {
+        "run_id": "work-hub-committed",
+        "owner_id": "agent:main:telegram:owner",
+        "authority_scope": "implementation",
+        "objective": "Bound committed provenance",
+        "goal_id": "goal",
+        "item_number": 48,
+        "expected_effect_artifact": "local-file:.drover-native-canary/source-task-48.json",
+        "committed_provenance": True,
+    }
+    payload = {
+        "harness": "codex",
+        "mode": "structured",
+        "work_coordinator_continuity": {
+            **unsigned,
+            "binding_signature": sign_work_coordinator_continuity(
+                unsigned, "hub-continuity-secret"
+            ),
+        },
+    }
+    response = json.dumps({"session_id": "harness-hub-committed", "status": "running"})
+    MetricsCollector._sync_created_harness_session(
+        collector, "studio", payload, response
+    )
+    status = FactoryObserverContinuity(path).status("work-hub-committed")
+    assert status["committed_provenance"] is True
+
+    unsigned["committed_provenance"] = False
+    payload["work_coordinator_continuity"] = {
+        **unsigned,
+        "binding_signature": sign_work_coordinator_continuity(
+            unsigned, "hub-continuity-secret"
+        ),
+    }
+    with pytest.raises(RuntimeError, match="hub continuity initialization failed"):
+        MetricsCollector._sync_created_harness_session(
+            collector, "studio", payload, response
+        )
+    assert (
+        FactoryObserverContinuity(path).status("work-hub-committed")[
+            "committed_provenance"
+        ]
+        is True
+    )
+
+
 def test_hub_sync_fails_closed_when_binding_cannot_initialize(tmp_path):
     import json
 
@@ -393,3 +734,87 @@ def test_hub_sync_rejects_success_response_without_session_id(tmp_path):
         collector._sync_created_harness_session("studio", {}, '{"status": "running"}')
     with pytest.raises(ValueError, match="valid JSON"):
         collector._sync_created_harness_session("studio", {}, "not-json")
+
+
+def test_work_continuity_item_binding_is_signed_and_requires_the_complete_pair():
+    unsigned = {
+        "run_id": "work-" + "d" * 32,
+        "owner_id": "drover:owner/native",
+        "authority_scope": "implementation",
+        "objective": "bound worker update",
+        "goal_id": "native-canary-924-848",
+        "item_number": 41,
+    }
+    binding, _ = parse_work_coordinator_continuity(
+        {
+            "work_coordinator_continuity": {
+                **unsigned,
+                "binding_signature": sign_work_coordinator_continuity(unsigned, "hub"),
+            }
+        },
+        hub_secret="hub",
+    )
+    assert binding is not None
+    assert (binding.goal_id, binding.item_number) == ("native-canary-924-848", 41)
+
+    partial = dict(unsigned)
+    partial.pop("item_number")
+    with pytest.raises(FactoryObserverRequestError, match="item binding"):
+        parse_unverified_work_coordinator_continuity(
+            {"work_coordinator_continuity": {**partial, "binding_signature": "x"}}
+        )
+
+
+def test_signed_m2_handoff_requires_bound_effect_and_cannot_be_body_selected():
+    unsigned = {
+        "run_id": "work-m2-handoff",
+        "owner_id": "drover:owner/goal",
+        "authority_scope": "implementation",
+        "objective": "M2 receipt handoff",
+        "m2_ack_pending": True,
+    }
+    with pytest.raises(ValueError, match="requires item binding"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **unsigned,
+                    "binding_signature": sign_work_coordinator_continuity(
+                        unsigned, "hub"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )
+
+    signed = {
+        **unsigned,
+        "goal_id": "goal",
+        "item_number": 51,
+        "expected_effect_artifact": "local-file:.drover-native-canary/m2-51.json",
+    }
+    binding, _ = parse_work_coordinator_continuity(
+        {
+            "work_coordinator_continuity": {
+                **signed,
+                "binding_signature": sign_work_coordinator_continuity(signed, "hub"),
+            }
+        },
+        hub_secret="hub",
+    )
+    assert binding is not None and binding.m2_ack_pending is True
+
+    forged = {**signed, "m2_ack_pending": False}
+    with pytest.raises(ValueError, match="hub authenticated"):
+        parse_work_coordinator_continuity(
+            {
+                "work_coordinator_continuity": {
+                    **forged,
+                    "binding_signature": (
+                        signed["binding_signature"]
+                        if "binding_signature" in signed
+                        else "forged"
+                    ),
+                }
+            },
+            hub_secret="hub",
+        )

@@ -39,10 +39,10 @@ concurrency:
 jobs:
   sign-notarize:
     name: Build, sign and notarize harnessd (aarch64)
-    # This is the same protected environment that holds the existing App Store
-    # Connect API key. Environment approval is the boundary that permits a
-    # dispatch to use signing material; this workflow never runs on a PR.
-    environment: ios-testflight-upload
+    # This environment holds the macOS signing and notarization material. Keep
+    # it separate from the reviewer-gated TestFlight upload environment: this
+    # workflow never runs on a PR and does not submit an iOS build.
+    environment: macos-signing
     runs-on: macos-latest
     timeout-minutes: 45
     env:

@@ -849,6 +849,148 @@ def test_postgres_credentials_observe_cross_process_revocation(postgres_control_
     assert issuer.server_id == verifier.server_id
 
 
+def test_postgres_recovery_executor_cannot_fence_or_revoke_successor(
+    postgres_control_store,
+):
+    """A reclaimed executor can fence once without invalidating its successor."""
+    control_path, _ = postgres_control_store
+    from drover.schema import bootstrap_control_plane_store
+    from drover.server.db import control_plane_connection
+    from drover.server.harness.continuity import (
+        ContinuityConflict,
+        FactoryObserverContinuity,
+    )
+    from drover.server.harness.registry import HarnessRegistry
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    now = datetime(2026, 11, 4, tzinfo=timezone.utc)
+    owner_id = "drover:owner/pg-recovery"
+    run_id = "run-pg-recovery"
+    wake_id = "wake-pg-recovery"
+    credentials = PostgresCredentialStore(control_path)
+    continuity = FactoryObserverContinuity(control_path, clock=lambda: now)
+    HarnessRegistry(control_path).create_session(
+        session_id="pg-observer",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="factory_observer",
+        source_session_id="factory/run-pg-recovery@1",
+    )
+    continuity.initialize(
+        session_id="pg-observer",
+        objective="PostgreSQL native owner recovery",
+        checkpoint="started",
+        authorized_owner_id=owner_id,
+    )
+    predecessor, predecessor_token = credentials.issue(
+        scope="owner", label="predecessor", owner_id=owner_id
+    )
+    lease = continuity.lease(run_id, owner_id=owner_id, lease_seconds=60)
+    continuity.report(
+        run_id,
+        source="hub",
+        source_event_id="pg-recovery-report",
+        subject="worker",
+        sequence=1,
+        kind="worker_blocked",
+        summary="blocked",
+    )
+    action = continuity.consume(
+        run_id, owner_id=owner_id, owner_epoch=lease["owner_epoch"]
+    )
+
+    with control_plane_connection(control_path) as con:
+        con.execute(
+            """INSERT INTO continuity_owner_recoveries
+            (wake_id, goal_id, owner_id, run_id, old_session_id,
+             old_client_turn_id, old_claim_until, old_generation,
+             old_client_session_id, old_credential_id, old_owner_epoch,
+             executor_id, executor_until, state, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'fencing', ?)""",
+            [
+                wake_id,
+                "goal-pg-recovery",
+                owner_id,
+                run_id,
+                "old-session",
+                "old-turn",
+                now,
+                1,
+                "old-client-session",
+                predecessor.id,
+                lease["owner_epoch"],
+                "executor-a",
+                now,
+                now,
+            ],
+        )
+        reclaimed = con.execute(
+            """UPDATE continuity_owner_recoveries
+            SET executor_id = ?, executor_until = ?
+            WHERE wake_id = ? AND state = 'fencing' AND executor_until <= ?
+            RETURNING wake_id""",
+            ["executor-b", now + timedelta(seconds=30), wake_id, now],
+        ).fetchone()
+    assert reclaimed == (wake_id,)
+
+    successor, successor_token = credentials.issue(
+        scope="owner", label="successor", owner_id=owner_id
+    )
+    assert credentials.find_active(predecessor_token) is None
+    assert credentials.find_active(successor_token).id == successor.id
+    # Replaying A's identity-specific side effect is harmless: it cannot turn
+    # into a legacy owner-wide revocation after B has issued the successor.
+    assert credentials.revoke_owner_credential(owner_id, predecessor.id)
+    assert credentials.find_active(successor_token).id == successor.id
+
+    assert (
+        continuity.fence_owner(
+            run_id,
+            owner_id=owner_id,
+            expected_epoch=lease["owner_epoch"],
+            recovery_wake_id=wake_id,
+            recovery_executor_id="executor-a",
+        )
+        is None
+    )
+    assert continuity.status(run_id)["owner"]["epoch"] == lease["owner_epoch"]
+    assert (
+        continuity.fence_owner(
+            run_id,
+            owner_id=owner_id,
+            expected_epoch=lease["owner_epoch"],
+            recovery_wake_id=wake_id,
+            recovery_executor_id="executor-b",
+        )
+        == lease["owner_epoch"] + 1
+    )
+    with pytest.raises(ContinuityConflict):
+        continuity.acknowledge(
+            run_id,
+            owner_id=owner_id,
+            owner_epoch=lease["owner_epoch"],
+            event_id=action["event_id"],
+            checkpoint="stale executor acknowledgement",
+        )
+
+    # The additive recovery columns and the populated journal survive a
+    # bootstrap rerun on the same disposable PostgreSQL schema.
+    bootstrap_control_plane_store(control_path)
+    with control_plane_connection(control_path) as con:
+        columns = {
+            row[0]
+            for row in con.execute("""SELECT column_name FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'continuity_owner_recoveries'""").fetchall()
+        }
+        assert {"old_credential_id", "fenced_at"} <= columns
+        assert con.execute(
+            "SELECT executor_id, fenced_at IS NOT NULL FROM continuity_owner_recoveries"
+        ).fetchone() == ("executor-b", True)
+
+
 def test_load_auth_uses_postgres_credentials_for_the_registered_control_path(
     postgres_control_store, tmp_path: Path
 ):
@@ -1148,3 +1290,246 @@ def test_postgres_concurrent_host_issuance_keeps_one_active(postgres_control_sto
         )
     assert sum(stores[0].find_active(token) is not None for _, token in issued) == 1
     assert sum(item.is_active for item in stores[0].list_all()) == 1
+
+
+def test_postgres_owner_credential_fence_serializes_generation_replacement(
+    postgres_control_store, tmp_path, monkeypatch
+):
+    """A stale recovery cannot revoke the successor it waits behind."""
+    import test_native_continuity_owner as native
+
+    from drover.server.control_store import close_control_store, configure_control_store
+    from drover.server.db import control_plane_connection
+    from drover.server.web.credentials import PostgresCredentialStore
+
+    _, config = postgres_control_store
+    path = tmp_path / "control.duckdb"
+    configure_control_store(path, config)
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
+    try:
+        runner, collector, _store, _run_id, _clock = native._runner(tmp_path)
+        credentials = PostgresCredentialStore(path)
+        runner.credentials = credentials
+        assert runner.process_once() == 1
+        scope = runner.config.goals[0]
+        link = runner._link(scope)
+        stale_ready = threading.Event()
+        release_stale = threading.Event()
+        successor_attempted = threading.Event()
+        successor_done = threading.Event()
+        result = {}
+
+        def apply_for(session_id, generation, credential, con, *, block=False):
+            row = con.execute(
+                """SELECT generation FROM continuity_owner_sessions
+                WHERE goal_id = ? AND owner_id = ? AND session_id = ? FOR UPDATE""",
+                [scope.goal_id, scope.continuity_owner_id, session_id],
+            ).fetchone()
+            if row is None or int(row[0]) != generation:
+                return False
+            if block:
+                stale_ready.set()
+                assert release_stale.wait(timeout=5)
+            changed = con.execute(
+                """UPDATE continuity_owner_sessions SET credential_id = ?
+                WHERE goal_id = ? AND owner_id = ? AND session_id = ?
+                AND generation = ? RETURNING owner_id""",
+                [
+                    credential.id,
+                    scope.goal_id,
+                    scope.continuity_owner_id,
+                    session_id,
+                    generation,
+                ],
+            ).fetchone()
+            return changed is not None
+
+        def stale():
+            result["stale"] = credentials.issue_owner_if_current(
+                label="stale recovery",
+                owner_id=scope.continuity_owner_id,
+                apply=lambda credential, con: apply_for(
+                    link["session_id"], link["generation"], credential, con, block=True
+                ),
+            )
+
+        def successor():
+            assert stale_ready.wait(timeout=5)
+            successor_attempted.set()
+            with control_plane_connection(path) as con:
+                con.execute(
+                    """UPDATE continuity_owner_sessions SET session_id = ?,
+                    generation = generation + 1, credential_id = NULL
+                    WHERE goal_id = ? AND owner_id = ? AND generation = ?""",
+                    [
+                        "successor-owner-session",
+                        scope.goal_id,
+                        scope.continuity_owner_id,
+                        link["generation"],
+                    ],
+                )
+            successor_link = runner._link(scope)
+            result["successor"] = credentials.issue_owner_if_current(
+                label="successor recovery",
+                owner_id=scope.continuity_owner_id,
+                apply=lambda credential, con: apply_for(
+                    successor_link["session_id"],
+                    successor_link["generation"],
+                    credential,
+                    con,
+                ),
+            )
+            successor_done.set()
+
+        stale_thread = threading.Thread(target=stale)
+        successor_thread = threading.Thread(target=successor)
+        stale_thread.start()
+        assert stale_ready.wait(timeout=5)
+        successor_thread.start()
+        assert successor_attempted.wait(timeout=5)
+        assert not successor_done.wait(timeout=0.1)
+        release_stale.set()
+        stale_thread.join(timeout=5)
+        successor_thread.join(timeout=5)
+        assert not stale_thread.is_alive() and not successor_thread.is_alive()
+        assert result["stale"] is not None and result["successor"] is not None
+        assert credentials.find_active(result["stale"][1]) is None
+        assert credentials.find_active(result["successor"][1]) is not None
+    finally:
+        close_control_store(path)
+
+
+def test_native_recovery_migration_upgrades_released_store(postgres_control_store):
+    from drover.server.control_store import postgres_control_store as pg_store
+    from drover.server.db import control_plane_connection
+    from drover.server.postgres_schema import NATIVE_OWNER_RECOVERY_MIGRATION
+
+    path, _ = postgres_control_store
+    with control_plane_connection(path) as con:
+        con.execute("DROP TABLE continuity_owner_recoveries")
+        con.execute("ALTER TABLE continuity_owner_sessions DROP COLUMN credential_id")
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [NATIVE_OWNER_RECOVERY_MIGRATION],
+        )
+        con.execute(
+            "INSERT INTO continuity_owner_sessions "
+            "(goal_id, owner_id, session_id, client_session_id, generation, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                "upgrade-goal",
+                "upgrade-owner",
+                "old-session",
+                "old-client",
+                7,
+                datetime.now(timezone.utc),
+            ],
+        )
+    pg_store(path).bootstrap()
+    pg_store(path).bootstrap()
+    with control_plane_connection(path) as con:
+        assert con.execute(
+            "SELECT session_id, generation, credential_id FROM continuity_owner_sessions "
+            "WHERE goal_id = ?",
+            ["upgrade-goal"],
+        ).fetchone() == ("old-session", 7, None)
+        assert con.execute(
+            "SELECT count(*) FROM continuity_owner_recoveries"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("legacy_null_credential", [False, True])
+def test_native_owner_full_recovery_uses_typed_nullable_credential(
+    postgres_control_store, tmp_path, monkeypatch, legacy_null_credential
+):
+    # Run the actual native runner against PostgreSQL, not a cursor-shaped fake.
+    import test_native_continuity_owner as native
+
+    from drover.server.control_store import close_control_store, configure_control_store
+    from drover.server.db import control_plane_connection
+
+    _, config = postgres_control_store
+    path = tmp_path / "control.duckdb"
+    configure_control_store(path, config)
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
+    try:
+        runner, collector, store, run_id, clock = native._runner(tmp_path)
+        assert runner.process_once() == 1
+        old_session = collector.turn_attempts[0][0]
+        with control_plane_connection(path) as con:
+            con.execute(
+                "DELETE FROM harness_events WHERE session_id = ?", [old_session]
+            )
+            con.execute(
+                "DELETE FROM harness_sessions WHERE session_id = ?", [old_session]
+            )
+            if legacy_null_credential:
+                con.execute("UPDATE continuity_owner_sessions SET credential_id = NULL")
+        clock.advance(11)
+        assert runner.process_once() == 1
+        assert len(collector.launches) == 2
+        assert (
+            collector.turn_attempts[0][1]["client_turn_id"]
+            == collector.turn_attempts[1][1]["client_turn_id"]
+        )
+        with control_plane_connection(path) as con:
+            state, fenced = con.execute(
+                "SELECT state, fenced_at IS NOT NULL FROM continuity_owner_recoveries"
+            ).fetchone()
+        assert (state, fenced) == ("recovered", True)
+        assert store.status(run_id)["owner"]["epoch"] >= 2
+    finally:
+        close_control_store(path)
+
+
+def test_postgres_final_acknowledged_owner_turn_settles_without_successor(
+    postgres_control_store, tmp_path, monkeypatch
+):
+    # Exercise the real PostgreSQL control store: no fake cursor or DB layer.
+    import test_native_continuity_owner as native
+
+    from drover.server.control_store import close_control_store, configure_control_store
+    from drover.server.db import control_plane_connection
+
+    _, config = postgres_control_store
+    path = tmp_path / "control.duckdb"
+    configure_control_store(path, config)
+    monkeypatch.setenv("DROVER_HOST_STALE_AFTER_SECONDS", "7200")
+    monkeypatch.setenv("DROVER_HOST_OFFLINE_AFTER_SECONDS", "7200")
+    try:
+        runner, collector, store, run_id, _ = native._runner(tmp_path)
+        assert runner.process_once() == 1
+        wake_id = native._acknowledge_current_wake(
+            store, run_id, runner.config.goals[0].continuity_owner_id
+        )
+        owner_session = runner.registry.session_by_client_id(
+            collector.launches[0][1]["client_session_id"]
+        )
+        runner.registry.update_session_activity(
+            owner_session.session_id, awaiting="input"
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            seq=2,
+            payload={"payload": {"turn_complete": True, "awaiting": "input"}},
+        )
+        runner.registry.append_event(
+            session_id=owner_session.session_id,
+            event_type="status",
+            seq=3,
+            payload={"payload": {"exited": 0}},
+        )
+
+        assert store.owner_runs(runner.config.goals[0].continuity_owner_id) == []
+        assert runner.process_once() == 0
+        with control_plane_connection(path) as con:
+            [state] = con.execute(
+                "SELECT state FROM continuity_owner_turn_claims WHERE wake_id = ?",
+                [wake_id],
+            ).fetchone()
+        assert state == "completed"
+    finally:
+        close_control_store(path)

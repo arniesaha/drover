@@ -550,9 +550,12 @@ def test_release_workflow_never_runs_on_pull_requests() -> None:
 
 def test_harnessd_macos_notarization_assesses_the_bare_binary() -> None:
     """A standalone Mach-O needs an open assessment, not an app-bundle one."""
-    steps = load_workflow("harnessd-macos-notarize.yml")["jobs"]["sign-notarize"][
-        "steps"
-    ]
+    workflow = load_workflow("harnessd-macos-notarize.yml")
+    job = workflow["jobs"]["sign-notarize"]
+    # TestFlight uploads retain their reviewer-gated environment; macOS
+    # signing/notarization must not wait on that unrelated approval.
+    assert job["environment"] == "macos-signing"
+    steps = job["steps"]
     verify = next(
         step["run"]
         for step in steps

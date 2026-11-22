@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.57] - 2026-11-08
+
+### Fixed
+- Preserve provider harness lists during lake rebuilds and reject unexpected source columns before import.
+- Route MCP replay, summary, and search reads through the selected lake worker, avoiding redundant prechecks while preserving fail-closed responses.
+
+### Known limitations
+- The Studio Claude CLI recap and handoff integration requires an existing authenticated login and was not exercised for this release candidate.
+- Release recovery remains limited to the documented, rollback-capable operator procedures; this release does not broaden recovery authority.
+
+## [0.6.56] - 2026-11-01
+
+### Fixed
+- Settle a native continuity owner's turn claim once the owner returns to
+  `awaiting=input` with an acknowledged wake and a completed action-intent
+  receipt, even without a `turn_complete`/`turn exited` event. Previously the
+  claim stayed `sent` and blocked the next serialized wake (#906).
+- Anchor the idle-undeclared test fixture clock to wall time; the fixed date
+  expired against the 7-day idle window on 2026-11-01.
+
+## [0.6.55] - 2026-10-31
+
+### Fixed
+- Give the Drover-native continuity owner its own owner-scoped bearer
+  (`DROVER_CONTINUITY_OWNER_BEARER`) so continuity lease/consume/ack calls no
+  longer 403 with the generic API token (#903).
+- Fence and replace stale native continuity-owner sessions when a delivery has
+  no durable submitted turn or its owner turn terminates with an error.
+
+## [0.6.54]
+
+### Fixed
+- Recognize terminal `turn_exited` status events so Drover-native continuity-owner claims complete and later wakes can proceed.
+
+## [0.6.53] - 2026-10-29
+
+### Fixed
+
+- Use the dedicated macOS signing environment for harnessd signing and notarization, independent of TestFlight upload approval (#895).
+
+## [0.6.52] - 2026-10-29
+
+### Fixed
+
+- Wait for relay reconnection after a guarded Studio rollout restart (#892).
+- Relaunch queued work items after their latest linked harness session has terminated (#893, #882).
+
+
+## [0.6.51] - 2026-10-28
+
+### Fixed
+
+- Accept native `drover:owner/` continuity owners for coordinator-acted lease, consume, and acknowledgement operations (#890, #882).
+
+## [0.6.50] - 2026-10-28
+
+### Fixed
+
+- Accept native `drover:owner/` continuity owners in work continuity launches and log failed harness creates (#887).
+
+## [0.6.49] - 2026-10-28
+
+### Fixed
+
+- Keep the hub API available when lake export fails and resume exporter backoff safely (#879).
+- Harden Studio rollout environment, queue-settle, plist matching, and relay-liveness checks (#871, #873, #875, #877).
+
+### Added
+
+- Add Postgres-backed end-to-end launch coverage (#866).
+
+
 ## [0.6.48] - 2026-10-27
 
 ### Added

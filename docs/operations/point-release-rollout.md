@@ -1,10 +1,17 @@
-# Point-release rollout
+# Advanced point-release maintenance
 
-Use this path for a release with unchanged lake schema and analytical runtime.
-It also admits a strictly appended control-DB migration only when every new SQL
-statement is mechanically proven additive. A patch version number alone does not
-establish compatibility. This runbook describes operator actions; the preflight
-itself changes no service, runtime symlink, config, lake catalog or database.
+> **Not the normal private server-update path.** For a compatible ordinary
+> server-only change, use [Normal private server update](private-server-update.md).
+> This runbook remains required for a migration, coherent snapshot, multi-role
+> compatibility change, exclusive writer, or another explicitly scoped
+> maintenance operation. Do not remove its backup, recovery, or rollback gates.
+
+Use this path only for an explicitly scoped maintenance release with unchanged
+lake schema and analytical runtime, or a strictly appended control-DB migration
+whose new SQL is mechanically proven additive. A patch version number alone
+does not establish compatibility. This runbook describes operator actions; the
+preflight itself changes no service, runtime symlink, config, lake catalog or
+database.
 
 Run tooling from a build containing `cutover release-preflight`. An older running
 service cannot expose a command added by a newer build. Set `TOOL` to that build's

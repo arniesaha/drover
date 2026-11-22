@@ -146,6 +146,15 @@ def _snapshot_from_responses(
     plan_label = _optional_text(account.get("planType"))
     rate_limits = rate_limit_response.get("rateLimits")
     if not isinstance(rate_limits, Mapping):
+        # Current app-server builds namespace ChatGPT limits by limit id.  Keep
+        # accepting the original shape, but recognize only the documented
+        # Codex namespace rather than treating arbitrary nested mappings as a
+        # positive allowance.
+        by_limit_id = rate_limit_response.get("rateLimitsByLimitId")
+        rate_limits = (
+            by_limit_id.get("codex") if isinstance(by_limit_id, Mapping) else None
+        )
+    if not isinstance(rate_limits, Mapping):
         raise _ProbeFailure("protocol_error")
     windows = tuple(
         window

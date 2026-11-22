@@ -150,14 +150,30 @@ def prepare(con, document):
 def _merge_events(con):
     # Target comparison uses the same pre-lineage payload hash as rebuild's
     # winner ranking. Attribution/timestamp/ID ties have a deterministic suffix.
-    # Use a union of only the affected target keys to choose one source winner;
-    # no full-history analytical projection or NULL-key merge is involved.
-    con.execute(
-        """CREATE TEMP TABLE affected AS
-        SELECT t.*, """
-        + row_hash_expression(EVENT_SCHEMA)
-        + " AS _winner_hash FROM lake.agent_events t WHERE dedup_key IN (SELECT dedup_key FROM export_events)"
-    )
+    # Materialize only keys first: a semi-join over the wide target can read
+    # historical payload/lineage columns even when no incoming key exists.
+    # Both reads stay in the caller's transaction; never prune by date because
+    # a matching historical winner may belong to a different partition.
+    con.execute("""CREATE TEMP TABLE affected_keys AS SELECT DISTINCT t.dedup_key
+        FROM lake.agent_events t
+        WHERE t.dedup_key IN (SELECT dedup_key FROM export_events)""")
+    if con.execute("SELECT EXISTS (SELECT 1 FROM affected_keys)").fetchone()[0]:
+        # Nonempty history retains the original full winner/hash semantics.
+        # This path still needs a separate bounded wide-scan strategy.
+        con.execute(
+            """CREATE TEMP TABLE affected AS SELECT t.*, """
+            + row_hash_expression(EVENT_SCHEMA)
+            + " AS _winner_hash FROM lake.agent_events t "
+            + "WHERE dedup_key IN (SELECT dedup_key FROM affected_keys)"
+        )
+    else:
+        # Explicit types avoid even planning a wide historical projection.
+        schema = POLICY_SCHEMA | LINEAGE | {"_winner_hash": "VARCHAR"}
+        con.execute(
+            "CREATE TEMP TABLE affected ("
+            + ",".join(f'"{name}" {kind}' for name, kind in schema.items())
+            + ")"
+        )
     columns = list(POLICY_SCHEMA | LINEAGE)
     con.execute(
         """CREATE TEMP TABLE merged_winners AS SELECT """

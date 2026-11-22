@@ -23,7 +23,9 @@ public struct HarnessModelSelection: Codable, Sendable, Equatable {
 /// identity labels never enter this envelope.
 public final class HarnessModelCatalogStore {
     public static let defaultsKey = "drover.model-catalog-store.v1"
-    public static let maximumPersistedModels = 256
+    // Keep this in step with the host model-catalog bound. Cursor's
+    // authenticated CLI can currently list 284 models.
+    public static let maximumPersistedModels = 512
     public static let maximumEncodedBytes = 256 * 1024
 
     private let defaults: UserDefaults

@@ -96,6 +96,13 @@ def _free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def _reserve_loopback_port() -> socket.socket:
+    """Keep a worker boundary port unavailable until this test owns it."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    return listener
+
+
 def _request_json(
     port: int,
     method: str,
@@ -484,11 +491,12 @@ def test_split_roles_use_real_postgres_auth_when_lake_is_absent_and_worker_chang
     from drover.server.harness.registry import HarnessRegistry
 
     schema = f"drover_runtime_{uuid4().hex}"
-    api_port, worker_port, worker_metrics_port = (
-        _free_loopback_port(),
+    api_port, worker_metrics_port = (
         _free_loopback_port(),
         _free_loopback_port(),
     )
+    worker_reservation = _reserve_loopback_port()
+    worker_port = int(worker_reservation.getsockname()[1])
     lake_guard = tmp_path / "lake-guard"
     lake_guard.write_text("API must never open this analytical path", encoding="utf-8")
     api_lake = lake_guard / "analytics.duckdb"
@@ -621,6 +629,7 @@ def test_split_roles_use_real_postgres_auth_when_lake_is_absent_and_worker_chang
         assert status == 503
         assert _request_json(api_port, "GET", "/harness", token=device_token)[0] == 200
 
+        worker_reservation.close()
         slow_server = _SlowDripServer(drip_stage="body", port=worker_port)
         slow_thread = threading.Thread(target=slow_server.serve_forever, daemon=True)
         slow_thread.start()
@@ -699,6 +708,7 @@ finally:
         assert revoked.returncode == 0, revoked.stderr
         assert _request_json(api_port, "GET", "/harness", token=device_token)[0] == 401
     finally:
+        worker_reservation.close()
         if slow_server is not None:
             slow_server.shutdown()
             slow_server.server_close()
@@ -777,8 +787,12 @@ def test_harnessd_keeps_local_duckdb_spool_when_postgres_dsn_is_inherited(
 
 
 @pytest.mark.parametrize("lifecycle_mode", ["off", "report"])
+@pytest.mark.parametrize("analytics_failure", [None, "lake_verification_file_limit"])
 def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lifecycle_mode: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    lifecycle_mode: str,
+    analytics_failure: str | None,
 ) -> None:
     """API startup must not create, stat, or warm an analytical DuckDB path."""
     from drover.config import LifecycleConfig, default_config
@@ -790,6 +804,25 @@ def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
         update_enabled=False,
         lifecycle=LifecycleConfig(mode=lifecycle_mode, idle_after="6h"),
     )
+    monkeypatch.setenv(
+        cfg.analytics_boundary.api_to_worker_token_env, "stale-worker-token"
+    )
+    if analytics_failure:
+        from drover.server.work_queue import reconciler, runtime
+
+        def forbidden(*_a, **_k):
+            pytest.fail("recovery must not admit background work")
+
+        monkeypatch.setattr(reconciler, "start_shadow_reconciler", forbidden)
+        for name in (
+            "start_work_service",
+            "start_work_item_event_worker",
+            "start_github_webhook_worker",
+            "start_work_item_rule_worker",
+            "start_queue_execution_worker",
+            "start_idle_undeclared_worker",
+        ):
+            monkeypatch.setattr(runtime, name, forbidden)
     # Shutdown immediately without replacing threading.Event globally: the
     # lifecycle reporter also needs real Event objects to start its thread.
     stop = threading.Event()
@@ -835,12 +868,26 @@ def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
     monkeypatch.setattr(
         server_main,
         "load_auth",
-        lambda _cfg: SimpleNamespace(enabled=False, api_token=""),
+        lambda _cfg: SimpleNamespace(enabled=False, api_token="", credentials=None),
     )
     monkeypatch.setattr(server_main, "_configure_push", lambda *_args: None)
-    monkeypatch.setattr(
-        server_main, "start_resilient_metrics_server", lambda **_kwargs: Server()
-    )
+
+    def listener(**kwargs):
+        boundary = kwargs["analytics_boundary"]
+        if analytics_failure:
+            assert boundary.health_report() == {"state": "unavailable"}
+            assert boundary._token == ""
+            with pytest.raises(AnalyticsBoundaryUnavailable):
+                boundary.request("GET", "/analytics", "", b"")
+            assert (
+                boundary.resolve(
+                    event_id="missing", batch_id="batch", payload_sha256="0" * 64
+                )
+                is None
+            )
+        return Server()
+
+    monkeypatch.setattr(server_main, "start_resilient_metrics_server", listener)
     monkeypatch.setattr(server_main, "threading", SimpleNamespace(Event=lambda: stop))
     monkeypatch.setattr(server_main.signal, "signal", lambda *_args: None)
     monkeypatch.setattr(
@@ -858,6 +905,7 @@ def test_api_role_starts_only_control_plane_and_never_bootstraps_the_lake(
         cfg=cfg,
         config_path=tmp_path / "config.toml",
         metrics_host="127.0.0.1",
+        analytics_failure=analytics_failure,
     )
 
     assert calls == [

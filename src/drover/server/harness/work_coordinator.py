@@ -9,11 +9,20 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
+from uuid import NAMESPACE_URL, uuid5
 
 from drover.server.control_outbox import canonical_payload
 from drover.server.harness.factory_observer import _RUN_ID, FactoryObserverRequestError
+
+
+def work_coordinator_turn_id(run_id: str) -> str:
+    """Return the immutable initial-turn id for one signed worker run."""
+    if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+        raise ValueError("work continuity run_id is invalid")
+    return str(uuid5(NAMESPACE_URL, "drover-work-coordinator-turn:" + run_id))
 
 
 @dataclass(frozen=True)
@@ -22,6 +31,21 @@ class WorkCoordinatorContinuity:
     owner_id: str
     authority_scope: str
     objective: str
+    delivery_role: str = "standard"
+    repository: str | None = None
+    serialization_key: str | None = None
+    # Opaque, signed reference to the single candidate effect the source daemon
+    # must attest before a native owner can settle its wake.
+    expected_effect_artifact: str | None = None
+    # The hub signs the exact WorkService item that a coordinator worker may read
+    # or update through its per-session stdio MCP bridge.
+    goal_id: str | None = None
+    item_number: int | None = None
+    # Only the hub-signed work binding can grant this exact local candidate
+    # permission to commit provenance for a separate verifier.
+    committed_provenance: bool = False
+    # A hub-signed M2-only receipt handoff; never accepted from task text.
+    m2_ack_pending: bool = False
 
     @property
     def source_session_id(self) -> str:
@@ -82,13 +106,28 @@ def _parse_work_coordinator_continuity(
     if raw is None:
         return None, normalized, {}, None
     normalized.pop("work_coordinator_continuity")
-    if not isinstance(raw, Mapping) or set(raw) != {
+    base_fields = {
         "run_id",
         "owner_id",
         "authority_scope",
         "objective",
         "binding_signature",
-    }:
+    }
+    serialization_fields = {"delivery_role", "repository", "serialization_key"}
+    expected_effect_fields = {"expected_effect_artifact"}
+    work_item_fields = {"goal_id", "item_number"}
+    committed_provenance_fields = {"committed_provenance"}
+    m2_ack_pending_fields = {"m2_ack_pending"}
+    if not isinstance(raw, Mapping) or not (
+        base_fields
+        <= set(raw)
+        <= base_fields
+        | serialization_fields
+        | expected_effect_fields
+        | work_item_fields
+        | committed_provenance_fields
+        | m2_ack_pending_fields
+    ):
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
     signature = raw["binding_signature"]
     unsigned = {key: value for key, value in raw.items() if key != "binding_signature"}
@@ -104,18 +143,106 @@ def _parse_work_coordinator_continuity(
         raise FactoryObserverRequestError("work continuity run_id is invalid")
     if (
         not isinstance(owner_id, str)
-        or not owner_id.startswith("agent:")
+        or not (owner_id.startswith("agent:") or owner_id.startswith("drover:owner/"))
         or len(owner_id) > 191
     ):
         raise FactoryObserverRequestError(
-            "work continuity owner_id must be a canonical agent key"
+            "work continuity owner_id must be a canonical agent or native owner key"
         )
-    if scope not in {"implementation", "integration"}:
+    if scope not in {"implementation", "integration", "deployment"}:
         raise FactoryObserverRequestError("work continuity scope is invalid")
     if not isinstance(objective, str) or not objective.strip() or len(objective) > 4000:
         raise FactoryObserverRequestError("work continuity objective is invalid")
+    delivery_role = raw.get("delivery_role", "standard")
+    repository = raw.get("repository")
+    serialization_key = raw.get("serialization_key")
+    expected_effect_artifact = raw.get("expected_effect_artifact")
+    goal_id = raw.get("goal_id")
+    item_number = raw.get("item_number")
+    committed_provenance = raw.get("committed_provenance", False)
+    m2_ack_pending = raw.get("m2_ack_pending", False)
+    if not isinstance(committed_provenance, bool):
+        raise FactoryObserverRequestError(
+            "work continuity committed provenance is invalid"
+        )
+    if not isinstance(m2_ack_pending, bool):
+        raise FactoryObserverRequestError("work continuity M2 handoff is invalid")
+    if m2_ack_pending and (goal_id is None or item_number is None):
+        raise FactoryObserverRequestError(
+            "work continuity M2 handoff requires item binding"
+        )
+    if m2_ack_pending and scope != "implementation":
+        raise FactoryObserverRequestError(
+            "work continuity M2 handoff requires implementation authority"
+        )
+    if m2_ack_pending and expected_effect_artifact is None:
+        raise FactoryObserverRequestError(
+            "work continuity M2 handoff requires expected effect"
+        )
+    if committed_provenance and (goal_id is None or item_number is None):
+        raise FactoryObserverRequestError(
+            "work continuity committed provenance requires item binding"
+        )
+    if committed_provenance and scope != "implementation":
+        raise FactoryObserverRequestError(
+            "work continuity committed provenance requires implementation authority"
+        )
+    if committed_provenance and expected_effect_artifact is None:
+        raise FactoryObserverRequestError(
+            "work continuity committed provenance requires expected effect"
+        )
+    if (goal_id is None) != (item_number is None):
+        raise FactoryObserverRequestError("work continuity item binding is invalid")
+    if goal_id is not None and (
+        not isinstance(goal_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}", goal_id)
+        or isinstance(item_number, bool)
+        or not isinstance(item_number, int)
+        or item_number <= 0
+    ):
+        raise FactoryObserverRequestError("work continuity item binding is invalid")
+    if expected_effect_artifact is not None and (
+        not isinstance(expected_effect_artifact, str)
+        or not expected_effect_artifact.strip()
+        or len(expected_effect_artifact) > 2000
+    ):
+        raise FactoryObserverRequestError("work continuity expected effect is invalid")
+    if delivery_role == "standard":
+        if repository is not None or serialization_key is not None:
+            raise FactoryObserverRequestError(
+                "standard work continuity cannot serialize"
+            )
+    elif delivery_role == "integration_serialized":
+        if scope != "implementation":
+            raise FactoryObserverRequestError(
+                "integration serialization requires implementation authority"
+            )
+        if (
+            not isinstance(repository, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+            or not isinstance(serialization_key, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}", serialization_key)
+        ):
+            raise FactoryObserverRequestError(
+                "integration serialization binding is invalid"
+            )
+    else:
+        raise FactoryObserverRequestError("work continuity delivery role is invalid")
     return (
-        WorkCoordinatorContinuity(run_id, owner_id, scope, objective.strip()),
+        WorkCoordinatorContinuity(
+            run_id,
+            owner_id,
+            scope,
+            objective.strip(),
+            delivery_role,
+            repository,
+            serialization_key,
+            expected_effect_artifact,
+            goal_id,
+            item_number,
+            committed_provenance,
+            m2_ack_pending,
+        ),
         normalized,
         unsigned,
         signature,

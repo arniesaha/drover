@@ -180,7 +180,7 @@ struct ProviderAccountCard: View {
                             .droverText(.subtitle)
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(.horizontal, 7)
-                            .padding(.vertical, 4)
+                            .frame(minHeight: 30)
                             .background(DroverColor.bg, in: RoundedRectangle(cornerRadius: 8))
                             // One VoiceOver stop per chip, not icon and name.
                             .accessibilityElement(children: .combine)
@@ -190,9 +190,10 @@ struct ProviderAccountCard: View {
                 }
 
                 ForEach(subscription.hosts.compactMap(\.detail), id: \.self) { detail in
-                    Text(detail)
-                        .droverText(.subtitle)
+                    Label(detail, systemImage: "exclamationmark.triangle")
+                        .droverText(.subtitle, accented: true)
                         .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel("Host issue: \(detail)")
                 }
 
                 if isExpanded {

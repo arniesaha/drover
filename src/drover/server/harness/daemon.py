@@ -95,6 +95,7 @@ from drover.server.harness.websocket import (
 )
 from drover.server.harness.work_coordinator import (
     parse_unverified_work_coordinator_continuity,
+    work_coordinator_turn_id,
 )
 from drover.server.harness.worktree import (
     SessionWorktree,
@@ -370,6 +371,12 @@ DEFAULT_PRESETS = {
         command=("agy",),
         enabled=False,
         description="Antigravity CLI (agy)",
+    ),
+    "cursor": HarnessPreset(
+        name="cursor",
+        command=("cursor-agent",),
+        enabled=False,
+        description="Cursor Agent CLI",
     ),
     # OpenClaw and Hermes are observe-only: collect Sources, parsers,
     # attribution, metrics and recall ingest their history, but neither has a
@@ -1981,7 +1988,49 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             self._interrupt_session(session_id)
             return
+        if parsed.path.startswith("/sessions/") and parsed.path.endswith(
+            "/expected-effect"
+        ):
+            session_id = (
+                parsed.path.removeprefix("/sessions/")
+                .removesuffix("/expected-effect")
+                .strip("/")
+            )
+            self._verify_expected_effect(session_id)
+            return
         self._write_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+
+    def _verify_expected_effect(self, session_id: str) -> None:
+        """Attest a signed local-file reference inside its structured session cwd."""
+        session = self._safe_get_session(session_id)
+        if (
+            session is None
+            or session.mode != "structured"
+            or session.handoff_mode != "work_coordinator"
+        ):
+            self._write_json(
+                {"error": "unknown work-coordinator session"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+        body = self._read_json() or {}
+        artifact = body.get("artifact")
+        if not isinstance(artifact, str):
+            self._write_json(
+                {"error": "expected effect artifact is required"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        verification = _expected_effect_verification(session.cwd, artifact)
+        self._write_json(
+            {
+                # Preserve the owner-facing boolean contract. Recovery reads
+                # the additional verification field and never treats this
+                # false value as evidence of absence by itself.
+                "materialized": verification == "materialized",
+                "verification": verification,
+            }
+        )
 
     def _fs_list(self, query: str) -> None:
         from drover.server.harness.folders import FolderError, list_folders
@@ -2832,6 +2881,17 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         factory_launch = body.get("_factory_observer_launch")
         work_continuity = body.get("_work_coordinator_continuity")
         harness = str(body.get("harness") or "")
+        owner_bearer = body.get("continuity_owner_bearer")
+        if owner_bearer is not None and (
+            body.get("handoff_mode") != "drover_native_continuity_owner"
+            or not isinstance(owner_bearer, str)
+            or not owner_bearer
+        ):
+            self._write_json(
+                {"error": "invalid native continuity owner credential"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
         try:
             adapter = self.server.state.adapters.resolve(
                 harness, operation="structured"
@@ -3091,6 +3151,35 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             seq=0,
         )
 
+        child_environment: dict[str, str] = {}
+        if owner_bearer is not None:
+            # Native owner tools use the normal MCP client, which reads
+            # DROVER_MCP_TOKEN.  Keep the explicit owner name for the prompt,
+            # and give that client the same launch-only, route-limited bearer.
+            # It is never persisted and cannot authorize work-item routes.
+            child_environment["DROVER_CONTINUITY_OWNER_BEARER"] = owner_bearer
+            child_environment["DROVER_MCP_TOKEN"] = owner_bearer
+        elif work_continuity is not None and self.server.state.host_token:
+            # A coordinator worker may use the already-paired host identity
+            # through a bound stdio MCP bridge. This
+            # is launch-only: the bearer is not persisted in the registry,
+            # continuity ledger, prompt, or hub request payload. Ordinary
+            # sessions never receive it here.
+            child_environment["DROVER_MCP_TOKEN"] = self.server.state.host_token
+            # This is a signed hub binding. The child receives only its own
+            # run/item identity and speaks to the existing central control API
+            # through a stdio MCP bridge; no additional MCP listener exists.
+            if (
+                self.server.state.central_url
+                and work_continuity.goal_id is not None
+                and work_continuity.item_number is not None
+            ):
+                child_environment.update(
+                    DROVER_WORK_CONTROL_URL=self.server.state.central_url,
+                    DROVER_WORK_RUN_KEY=work_continuity.run_id.removeprefix("work-"),
+                    DROVER_WORK_GOAL_ID=work_continuity.goal_id,
+                    DROVER_WORK_ITEM_NUMBER=str(work_continuity.item_number),
+                )
         try:
             self.server.state.structured.start(
                 session_id,
@@ -3101,6 +3190,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 on_message=self.server.state.push_event,
                 finalize=self._finalize_structured_session,
                 native_session_id=native_session_id,
+                environment=child_environment or None,
             )
         except Exception as exc:
             if registry_created:
@@ -3116,6 +3206,18 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
         prompt = body.get("prompt")
         prompt_text = prompt.strip() if isinstance(prompt, str) else ""
+        if work_continuity is not None and session_cwd is not None:
+            # The daemon may replace the requested checkout with a fresh
+            # isolated worktree.  Tell the coordinator worker the resolved
+            # path that is already bound to its signed session, rather than
+            # making it infer an assignment from a local-candidate map.  This
+            # is path metadata only; no credential or expected-effect value is
+            # exposed in the prompt.
+            prompt_text = (
+                f"{prompt_text}\n\n"
+                f"Assigned isolated worktree: {session_cwd}\n"
+                "Perform local work only in that assigned worktree."
+            ).strip()
         images = body.get("images") or []
         if prompt_text or images:
             try:
@@ -3123,13 +3225,22 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     self.server.state.attachments_dir, session_id, images
                 )
                 text = append_attachment_lines(prompt_text, saved)
-                self.server.state.structured.send_turn(
-                    session_id,
-                    text,
-                    images=saved or None,
-                    model=model,
-                    thinking_effort=thinking_effort,
-                )
+                if work_continuity is None:
+                    self.server.state.structured.send_turn(
+                        session_id,
+                        text,
+                        images=saved or None,
+                        model=model,
+                        thinking_effort=thinking_effort,
+                    )
+                else:
+                    self.server.state.structured.submit_turn(
+                        session_id,
+                        prepare=lambda: (text, saved or None),
+                        model=model,
+                        thinking_effort=thinking_effort,
+                        client_turn_id=work_coordinator_turn_id(work_continuity.run_id),
+                    )
             except ValueError as exc:
                 self._write_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
@@ -3293,6 +3404,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         native_session_id = _optional_text(
             body.get("native_session_id") if body is not None else None
         )
+        owner_bearer = body.get("continuity_owner_bearer") if body is not None else None
+        if owner_bearer is not None and (
+            not isinstance(owner_bearer, str) or not owner_bearer
+        ):
+            self._write_json(
+                {"error": "invalid native continuity owner credential"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
         with self.server.state.recovery_lock_for(session_id):
             if self.server.state.structured.is_alive(session_id):
                 session = self.server.state.registry.get_session(session_id)
@@ -3321,6 +3441,28 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                 )
             except (KeyError, UnsupportedHarnessOperation):
                 adapter = None
+            is_native_owner = (
+                session is not None
+                and session.handoff_mode == "drover_native_continuity_owner"
+            )
+            if owner_bearer is not None and not is_native_owner:
+                self._write_json(
+                    {
+                        "error": "native continuity owner credential is not valid for this session"
+                    },
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if is_native_owner and owner_bearer is None:
+                # A recovered owner without the launch-only bearer can only
+                # consume delivery attempts and fail closed later. Refuse
+                # before restarting it; the hub must rotate a scoped bearer
+                # during the same authenticated recovery request.
+                self._write_json(
+                    {"error": "native continuity owner recovery requires credential"},
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
             if (
                 session is None
                 or session.mode != "structured"
@@ -3357,6 +3499,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
             )
             if session.handoff_mode == "factory_observer":
                 command = factory_observer_command(session.harness, command)
+            child_environment: dict[str, str] = {}
+            if owner_bearer is not None:
+                # Keep the fresh route-limited bearer launch-only, matching
+                # initial native-owner creation. It is not written to the
+                # registry, event ledger, or resumed turn payload.
+                child_environment["DROVER_CONTINUITY_OWNER_BEARER"] = owner_bearer
+                child_environment["DROVER_MCP_TOKEN"] = owner_bearer
             try:
                 self.server.state.structured.start(
                     session_id,
@@ -3367,6 +3516,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
                     on_message=self.server.state.push_event,
                     finalize=self._finalize_structured_session,
                     native_session_id=native_session_id,
+                    environment=child_environment or None,
                 )
                 if not self.server.state.structured.is_alive(session_id):
                     raise RuntimeError("recovered driver exited during startup")
@@ -3523,6 +3673,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         if registry_session is not None:
             data["mode"] = registry_session.mode or "pty"
             data["awaiting"] = registry_session.effective_awaiting
+            data["attention_id"] = registry_session.attention_id
             data["last_activity"] = (
                 registry_session.last_activity.isoformat()
                 if registry_session.last_activity
@@ -3542,7 +3693,19 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         registry_session = self._safe_get_session(session_id)
         if registry_session is None:
             return None
-        return _structured_session_row_json(registry_session)
+        payload = _structured_session_row_json(registry_session)
+        # ``awaiting`` is a durable projection and may lag the structured
+        # driver.  The live busy bit fences another hub turn until the host has
+        # actually released the current one.
+        # A registry row without a live manager entry is not evidence that a
+        # structured turn is idle (for example, after a daemon restart).  Keep
+        # that distinction explicit so hub claim settlement can fail closed.
+        payload["turn_active"] = (
+            self.server.state.structured.is_busy(session_id)
+            if self.server.state.structured.has(session_id)
+            else None
+        )
+        return payload
 
     def _list_sessions(self, query: str = "") -> None:
         """Every live session, then one bounded page of finished ones.
@@ -4467,6 +4630,67 @@ def _directories_exist(paths: Any) -> dict[str, bool]:
     return result
 
 
+def _expected_effect_verification(cwd: str | None, artifact: Any) -> str:
+    """Classify a candidate effect without collapsing unsafe reads to absence.
+
+    ``absent`` is returned only for a valid, in-root reference beneath an
+    accessible structured worktree. Invalid references, inaccessible paths,
+    directories, and non-file targets are ``unknown``. Existing owner
+    settlement keeps using the boolean wrapper below and therefore remains
+    fail-closed for every non-materialized state.
+    """
+    if not isinstance(cwd, str) or not cwd or not isinstance(artifact, str):
+        return "unknown"
+    prefix = "local-file:"
+    if not artifact.startswith(prefix):
+        return "unknown"
+    reference = artifact.removeprefix(prefix)
+    if not reference or "\\" in reference:
+        return "unknown"
+    path = Path(reference)
+    if path.is_absolute() or len(path.parts) < 2:
+        return "unknown"
+    if any(part in {"", ".", ".."} for part in path.parts):
+        return "unknown"
+    if path.parts[0] != ".drover-native-canary":
+        return "unknown"
+    try:
+        root = Path(cwd).resolve(strict=True)
+        if not root.is_dir():
+            return "unknown"
+    except (OSError, ValueError, RuntimeError):
+        return "unknown"
+    # Do not resolve the target first: a dangling symlink resolves to a
+    # missing path and would otherwise look like a safe absence. Every
+    # supplied component must be a directly readable non-symlink directory,
+    # until the final regular file (or genuinely missing child).
+    target = root
+    for index, part in enumerate(path.parts):
+        target = target / part
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "unknown"
+        if target.is_symlink():
+            return "unknown"
+        if index < len(path.parts) - 1:
+            if not target.is_dir():
+                return "unknown"
+            continue
+        try:
+            return "materialized" if target.is_file() else "unknown"
+        except OSError:
+            return "unknown"
+    return "unknown"
+
+
+def _materialized_expected_effect(cwd: str | None, artifact: Any) -> bool:
+    """Compatibility wrapper for owner settlement's fail-closed check."""
+    return _expected_effect_verification(cwd, artifact) == "materialized"
+
+
 def _parse_auth_route(path: str) -> tuple[str, str | None, str] | None:
     parts = [unquote(part) for part in path.strip("/").split("/") if part]
     if len(parts) == 3 and parts[0] == "auth" and parts[2] in {"status", "start"}:
@@ -5126,6 +5350,7 @@ def _structured_session_row_json(registry_session: Any) -> dict[str, Any]:
         "status": registry_session.status,
         "mode": registry_session.mode or "structured",
         "awaiting": registry_session.effective_awaiting,
+        "attention_id": registry_session.attention_id,
         "model": registry_session.model,
         "thinking_effort": registry_session.thinking_effort,
         "last_activity": (

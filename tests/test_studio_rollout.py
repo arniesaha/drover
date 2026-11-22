@@ -8,6 +8,7 @@ import plistlib
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -318,6 +319,11 @@ def _main_fixture(tmp_path: Path, monkeypatch, *, changed: bool = True):
         lambda _config, label: _required_by_label()[label],
     )
     monkeypatch.setattr(ROLLOUT, "runtime_preflight", lambda *_: {})
+    monkeypatch.setattr(
+        ROLLOUT.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=ROLLOUT.MIN_FREE_BYTES),
+    )
     monkeypatch.setattr(ROLLOUT, "rollout_token", lambda *_args, **_kwargs: "token")
     monkeypatch.setattr(
         ROLLOUT,
@@ -508,6 +514,32 @@ def test_relay_reconnect_excludes_offline_hosts_from_the_before_set():
     assert ROLLOUT.relay_reconnected(payload, {"nas"}) == (True, [])
 
 
+def test_wait_for_relays_retries_until_online(monkeypatch):
+    payloads = iter(
+        [
+            (True, {"hosts": [{"host_id": "nas", "liveness": "offline"}]}),
+            (True, {"hosts": [{"host_id": "nas", "liveness": "online"}]}),
+        ]
+    )
+    clocks = iter([0, 0])
+    monkeypatch.setattr(ROLLOUT.time, "monotonic", lambda: next(clocks))
+    monkeypatch.setattr(ROLLOUT.time, "sleep", lambda _: None)
+
+    assert ROLLOUT.wait_for_relays(lambda: next(payloads), {"nas"}, 120) == (True, [])
+
+
+def test_wait_for_relays_reports_missing_at_deadline(monkeypatch):
+    clocks = iter([0, 1])
+    monkeypatch.setattr(ROLLOUT.time, "monotonic", lambda: next(clocks))
+    monkeypatch.setattr(ROLLOUT.time, "sleep", lambda _: None)
+
+    assert ROLLOUT.wait_for_relays(
+        lambda: (True, {"hosts": [{"host_id": "nas", "liveness": "offline"}]}),
+        {"nas"},
+        1,
+    ) == (False, ["nas"])
+
+
 def test_main_dry_run_reports_offline_relay_without_requiring_reconnect(
     tmp_path, monkeypatch, capsys
 ):
@@ -573,6 +605,7 @@ def test_main_rolls_back_when_an_online_relay_does_not_reconnect(
     )
     monkeypatch.setattr(ROLLOUT, "api_json", lambda *_: (True, next(hosts)))
     monkeypatch.setattr(ROLLOUT, "wait_for_health", lambda *_: (True, {}))
+    monkeypatch.setattr(ROLLOUT, "wait_for_relays", lambda *_: (False, ["nas"]))
 
     assert ROLLOUT.main(args) == 1
     report = json.loads(capsys.readouterr().out)

@@ -171,6 +171,15 @@ def test_uncertain_intent_blocks_even_a_different_request_key(service):
     assert len(service.harness.calls) == 1
 
 
+def test_running_nonlocal_work_cannot_defer_verification(service):
+    work = launch(service)
+
+    with pytest.raises(ValueError, match="work session must complete"):
+        update(service, work, "complete", estimated_cost=5)
+
+    assert not service.store.events(identity(work["run_key"], "complete", None))
+
+
 def test_failed_behavioral_check_cannot_close(service):
     work = launch(service)
     verify = complete(service, work)
@@ -388,6 +397,25 @@ def test_opt_in_execution_uses_launch_and_respects_budget_caps_and_kill_switch(s
         QueueExecutionCoordinator(service).launch_candidate("goal", 1)["denied"]
         == "kill_switch"
     )
+
+
+def test_coordinator_relaunches_queued_item_after_terminal_link(service):
+    from drover.server.work_queue.reconciler import QueueExecutionCoordinator
+
+    scope = service.config.goals[0].model_copy(
+        update={"execution_enabled": True, "execution_estimated_cost": 5.0}
+    )
+    service.config = service.config.model_copy(update={"goals": [scope]})
+    coordinator = QueueExecutionCoordinator(service)
+    first = coordinator.launch_candidate("goal", 1)["link"]
+    service.harness.sessions[first["run_key"]].status = "terminated"
+    service.providers["goal"].set_labels(None, ["goal:test", "status:queued"])
+
+    second = coordinator.launch_candidate("goal", 1)["link"]
+
+    assert second["session_id"] != first["session_id"]
+    assert second["run_key"] != first["run_key"]
+    assert len(service.store.links(goal_id="goal", number=1)) == 2
 
 
 def test_launch_denials_are_logged_and_counted_with_goal_and_issue(service, caplog):

@@ -122,6 +122,13 @@ def bearer_credential(auth: AuthSettings, headers) -> Credential | None:
     return _credential_for_token(auth, authorization.removeprefix("Bearer ").strip())
 
 
+def credential_principal(credential: Credential) -> str:
+    """Return the authority identity carried by a credential bearer."""
+    if credential.scope == "owner" and credential.owner_id:
+        return credential.owner_id
+    return "credential:" + credential.id
+
+
 # Restricted credentials authorize literal method/path pairs, never prefixes.
 CREDENTIAL_ROUTE_ALLOWLISTS = {
     "profile": frozenset({("GET", "/profile")}),
@@ -130,6 +137,12 @@ CREDENTIAL_ROUTE_ALLOWLISTS = {
             ("GET", "/release-identity"),
             ("GET", "/readyz"),
             ("GET", "/harness/hosts"),
+        }
+    ),
+    "owner": frozenset(
+        {
+            ("GET", "/harness/factory-observer/continuity"),
+            ("POST", "/harness/factory-observer/continuity"),
         }
     ),
 }

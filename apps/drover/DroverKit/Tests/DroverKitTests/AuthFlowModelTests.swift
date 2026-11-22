@@ -25,6 +25,26 @@ struct AuthFlowModelTests {
         #expect(model.errorMessage == nil)
     }
 
+    @Test @MainActor func cursorBrowserHandoffShowsNoCodeInputAndRefreshesToAuthenticated() async throws {
+        let state = PollTestState()
+        mock.handler = { request in
+            if request.url?.path.hasSuffix("/start") == true {
+                return (202, Data(#"{"host_id":"studio","harness":"cursor","flow_id":"cursor-flow-1","state":"waiting_for_user","login_url":"https://cursor.example.test/login?state=private","supports_input":false}"#.utf8))
+            }
+            state.incrementRequests()
+            return (200, Data(#"{"host_id":"studio","harness":"cursor","flow_id":"cursor-flow-1","state":"authenticated","supports_input":false}"#.utf8))
+        }
+        let model = AuthFlowModel(client: client(), hostID: "studio", harness: "cursor")
+
+        await model.start()
+
+        #expect(model.flow?.loginURL?.host == "cursor.example.test")
+        #expect(model.canSubmitCode == false)
+        try await waitUntil { model.flow?.state == .authenticated }
+        #expect(state.requestCount == 1)
+        #expect(model.errorMessage == nil)
+    }
+
     @Test @MainActor func cancelUpdatesTerminalFlow() async throws {
         mock.handler = { request in
             #expect(request.url?.path == "/harness/hosts/mac-mini/auth/codex/flows/auth-flow-1/cancel")
