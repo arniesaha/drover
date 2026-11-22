@@ -521,9 +521,11 @@ def test_lifecycle_13_fresh_existing_and_rerun(pg_control_path):
             con.execute("SELECT 1 FROM session_lifecycle_operations LIMIT 1").fetchone()
             is None
         )
-        # Recreate the version-12 table shape to exercise the additive upgrade.
+        # Recreate the version-12 table shape for migration 13 only.  Attention
+        # is owned by already-recorded migration 47, so an actual pre-13 store
+        # at this point retains that later additive column.
         con.execute("DROP TABLE session_lifecycle_operations")
-        for column in SESSION_COLUMNS:
+        for column in set(SESSION_COLUMNS) - {"attention_id"}:
             con.execute(f"ALTER TABLE harness_sessions DROP COLUMN {column}")
         con.execute("DELETE FROM control_schema_migrations WHERE version = 13")
     bootstrap_postgres_control_store(store)
