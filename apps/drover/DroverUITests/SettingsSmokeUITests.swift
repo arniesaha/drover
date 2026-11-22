@@ -99,6 +99,43 @@ final class SettingsSmokeUITests: XCTestCase {
     }
 
     @MainActor
+    func testManualCodeFieldScrollsFullyAboveKeyboard() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_BASE_URL"] = " "
+        app.launchEnvironment["DROVER_TOKEN"] = " "
+        app.launchArguments += ["-drover.server.url", " "]
+        app.launch()
+
+        let alreadyHaveServer = app.buttons["onboarding-already-have-server-button"]
+        XCTAssertTrue(alreadyHaveServer.waitForExistence(timeout: 10))
+        alreadyHaveServer.tap()
+
+        let urlField = app.textFields["onboarding-server-url-field"]
+        XCTAssertTrue(urlField.waitForExistence(timeout: 10))
+        urlField.tap()
+        urlField.typeText("http://192.168.1.99:7080")
+
+        let codeField = app.textFields["onboarding-pairing-code-field"]
+        XCTAssertTrue(codeField.waitForExistence(timeout: 10))
+        codeField.tap()
+
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 5))
+        let clearance = XCTAttachment(screenshot: app.screenshot())
+        clearance.name = "manual-code-field-above-keyboard"
+        clearance.lifetime = .keepAlways
+        add(clearance)
+        print(
+            "MANUAL_CODE_KEYBOARD_CLEARANCE=code-max-y:\(Int(codeField.frame.maxY)),keyboard-min-y:\(Int(keyboard.frame.minY))"
+        )
+        XCTAssertLessThanOrEqual(
+            codeField.frame.maxY,
+            keyboard.frame.minY,
+            "the focused manual code field must be fully clear of the keyboard"
+        )
+    }
+
+    @MainActor
     func testWorkerHostShowsPrimaryHubPairingCommand() {
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_BASE_URL"] = " "

@@ -20,12 +20,18 @@ enum OnboardingStep: Int, CaseIterable, Identifiable, Sendable {
 /// The multi-step first-launch onboarding experience for Drover.
 /// Guides the user through first-computer setup and QR or manual pairing recovery.
 struct OnboardingView: View {
+    private enum ManualPairField: Hashable {
+        case serverURL
+        case code
+    }
+
     var environment: AppEnvironment
     var onFinished: () -> Void = {}
 
     @State private var step: OnboardingStep = .welcome
     @State private var selectedSetupMode: ServerSetupMode = .hub
     @StateObject private var pairingModel = PairingModel()
+    @FocusState private var focusedManualPairField: ManualPairField?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -254,60 +260,71 @@ struct OnboardingView: View {
     // MARK: - Step 3: Pair & Connect
 
     private var pairStep: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                if step == .pair {
-                    QRScannerView { scanned in
-                        guard let payload = PairingPayload(scanned: scanned) else { return }
-                        Task { await pair(payload) }
-                    }
-                    .frame(height: 240)
-                    .frame(maxWidth: .infinity)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .strokeBorder(DroverColor.line, lineWidth: 1)
-                    }
-                    .accessibilityIdentifier("onboarding-qr-scanner")
-                } else {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(Color.black)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    if step == .pair {
+                        QRScannerView { scanned in
+                            guard let payload = PairingPayload(scanned: scanned) else { return }
+                            Task { await pair(payload) }
+                        }
                         .frame(height: 240)
                         .frame(maxWidth: .infinity)
-                }
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(DroverColor.line, lineWidth: 1)
+                        }
+                        .accessibilityIdentifier("onboarding-qr-scanner")
+                    } else {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.black)
+                            .frame(height: 240)
+                            .frame(maxWidth: .infinity)
+                    }
 
-                Text("Run `drover-server pair` on your Drover machine, then scan the code it prints.")
-                    .droverText(.subtitle)
-                    .foregroundStyle(DroverColor.faint)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Divider().overlay(DroverColor.line)
-
-                Text("Or enter it by hand").droverText(.h3)
-
-                field("http://host:7080", text: $pairingModel.serverURLString)
-                    .keyboardType(.URL)
-                    .accessibilityIdentifier("onboarding-server-url-field")
-                field("K7QP-2M4X", text: $pairingModel.manualCode)
-                    .textInputAutocapitalization(.characters)
-                    .accessibilityIdentifier("onboarding-pairing-code-field")
-
-                if let statusMessage = pairingModel.statusMessage {
-                    statusRow(statusMessage)
-                }
-                if pairingModel.requiresHTTPSRePairing {
-                    Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                    Text("Run `drover-server pair` on your Drover machine, then scan the code it prints.")
                         .droverText(.subtitle)
-                        .foregroundStyle(DroverColor.accentHi)
-                }
+                        .foregroundStyle(DroverColor.faint)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                manualPairActions
+                    Divider().overlay(DroverColor.line)
+
+                    Text("Or enter it by hand").droverText(.h3)
+
+                    field("http://host:7080", text: $pairingModel.serverURLString)
+                        .keyboardType(.URL)
+                        .focused($focusedManualPairField, equals: .serverURL)
+                        .accessibilityIdentifier("onboarding-server-url-field")
+                    field("K7QP-2M4X", text: $pairingModel.manualCode)
+                        .textInputAutocapitalization(.characters)
+                        .focused($focusedManualPairField, equals: .code)
+                        .accessibilityIdentifier("onboarding-pairing-code-field")
+                        .id(ManualPairField.code)
+
+                    if let statusMessage = pairingModel.statusMessage {
+                        statusRow(statusMessage)
+                    }
+                    if pairingModel.requiresHTTPSRePairing {
+                        Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                            .droverText(.subtitle)
+                            .foregroundStyle(DroverColor.accentHi)
+                    }
+
+                    manualPairActions
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 10)
+                .padding(.bottom, 28)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 10)
-            .padding(.bottom, 28)
+            .scrollDismissesKeyboard(.interactively)
+            .onChange(of: focusedManualPairField) { _, field in
+                guard let field else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(field, anchor: .center)
+                }
+            }
         }
-        .scrollDismissesKeyboard(.interactively)
         .onAppear {
             if pairingModel.serverURLString.isEmpty, let config = environment.config {
                 pairingModel.serverURLString = config.baseURL.absoluteString
