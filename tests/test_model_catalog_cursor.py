@@ -23,6 +23,12 @@ def fake_cursor(tmp_path):
                 print('{"isAuthenticated": ' + ("false" if mode == "signed-out" else "true") + "}")
                 raise SystemExit(0)
             if "models" in sys.argv:
+                if mode.startswith("listing-"):
+                    count = int(mode.removeprefix("listing-"))
+                    rows = [f"public-model-{index:03d} - Public Model {index}" for index in range(count)]
+                    rows[143] += " (current, default)"
+                    print("Available models\\n\\n" + "\\n".join(rows) + "\\n\\nTip: use --model <id>")
+                    raise SystemExit(0)
                 if mode == "malformed":
                     print("Available models\\n\\nvalid-model - Valid Model (default)\\nbad model - invalid\\n\\nTip: use --model")
                     raise SystemExit(0)
@@ -67,3 +73,19 @@ def test_cursor_catalog_ignores_malformed_rows_but_requires_real_model_rows(
 def test_cursor_catalog_nonzero_model_command_is_not_a_fake_catalog(fake_cursor):
     with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
         CursorCatalogAdapter((str(fake_cursor), "failed"), timeout_s=1).discover()
+
+
+def test_cursor_catalog_preserves_a_current_sized_listing_and_default(fake_cursor):
+    catalog = CursorCatalogAdapter(
+        (str(fake_cursor), "listing-284"), timeout_s=1
+    ).discover()
+
+    assert len(catalog.models) == 284
+    assert catalog.models[0].id == "public-model-000"
+    assert catalog.models[-1].id == "public-model-283"
+    assert catalog.models[143].is_default is True
+
+
+def test_cursor_catalog_rejects_listings_beyond_the_shared_bound(fake_cursor):
+    with pytest.raises(CatalogDiscoveryError, match="protocol_error"):
+        CursorCatalogAdapter((str(fake_cursor), "listing-513"), timeout_s=1).discover()
