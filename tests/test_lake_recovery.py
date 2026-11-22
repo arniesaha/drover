@@ -365,3 +365,66 @@ def test_real_config_registers_selected_lake_before_startup(
         assert isinstance(result.exception, ReachedBootstrap), repr(result.exception)
         assert queries == ["SELECT 1"]
         assert called == []
+
+
+def test_committed_retune_receipt_survives_compaction_failure_and_retry(
+    export_lake, monkeypatch
+):
+    import json
+    import psycopg
+    from drover.server.lake import maintenance
+    from drover.server.lake.runtime import lake_connection
+    from drover.server.lake.serving_proof import check_proof, proof_pin
+
+    with lake_connection(export_lake, read_only=False) as con:
+        for table in maintenance.EXPORT_MAINTENANCE_TABLES:
+            con.execute(
+                "CALL lake.set_option('data_inlining_row_limit', 0, table_name => ?)",
+                [table],
+            )
+        for index in range(80):
+            con.execute(
+                "INSERT INTO lake.agent_events(id,date) VALUES (?, '2026-11-21')",
+                [f"retry-preserved-{index}"],
+            )
+    write_serving_proof(export_lake)
+    pin = proof_pin(export_lake)
+    with psycopg.connect(export_lake.dsn()) as pg:
+        role = pg.execute("SELECT current_user").fetchone()[0]
+    with lake_connection(export_lake) as con:
+        before = {
+            table: maintenance._fingerprint(con, table)
+            for table in maintenance.EXPORT_MAINTENANCE_TABLES
+        }
+    journal = export_lake.data_root / "verification/maintenance-receipts.json"
+
+    # The first file-count call is inside compact(), after the separate retune
+    # transaction has committed AND its receipt has been atomically published.
+    def failed_compaction(*_args):
+        assert len(json.loads(journal.read_text())) == 1
+        raise RuntimeError("injected_compaction_phase_failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(maintenance, "_file_count", failed_compaction)
+        with pytest.raises(RuntimeError, match="injected_compaction_phase_failure"):
+            maintenance.compact_lake(export_lake, retune_exporter_role=role)
+    first_receipts = json.loads(journal.read_text())
+    assert len(first_receipts) == 1
+    assert first_receipts[0]["tables"] == first_receipts[0]["after_tables"]
+    with lake_connection(export_lake) as con:
+        # No checkpoint advance is needed to validate the committed retune.
+        check_proof(export_lake, con, pin)
+        assert {
+            table: maintenance._fingerprint(con, table) for table in before
+        } == before
+    result = maintenance.compact_lake(export_lake)
+    assert result["tables"]["agent_events"]["files_after"] < 80
+    final_receipts = json.loads(journal.read_text())
+    assert final_receipts[:1] == first_receipts
+    assert len(final_receipts) == 2
+    assert final_receipts[0]["after_snapshot"] == final_receipts[1]["before_snapshot"]
+    with lake_connection(export_lake) as con:
+        check_proof(export_lake, con, pin)
+        assert {
+            table: maintenance._fingerprint(con, table) for table in before
+        } == before

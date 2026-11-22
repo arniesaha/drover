@@ -45,9 +45,19 @@ candidate update. A restored runtime symlink alone is not recovered health.
 Raw `provision-exporter` is for explicit initial provisioning and invalidates a
 serving proof. For a backed-up serving lake, use the explicit
 `lake compact --retune-exporter-role <existing-exporter-group-role>` option.
-It applies the supported storage policy inside the same unchanged-content,
-receipted maintenance transaction, primes append-only inline mappings as admin,
-then refreshes exporter DML grants without giving the exporter schema CREATE.
+It holds one exclusive drained writer/reader fence across two separately
+unchanged-content-attested, receipted transactions: first apply storage policy
+and prime append-only inline mappings as admin, then compact/expire/clean up.
+DuckLake forbids mixing row changes and file compaction in one transaction.
+Only after both phases succeed does it advance the serving checkpoint and
+refresh exporter DML grants, without giving the exporter schema CREATE.
+If compaction fails after retuning commits, its completed retune receipt remains
+valid; compaction rolls back and readers still validate that receipt (subject to
+the unchanged file limit). Retry normal `lake compact` under the same backup and
+exclusion safeguards to finish compaction; repeat the explicit retune option if
+its final exporter-grant refresh is still required. A crash before a committed
+phase's receipt is published remains fail-closed and needs explicit recovery,
+not an anonymous snapshot or a proof bypass.
 The administrator needs TEMP on this catalog before any retune mutation.
 Mutable `agent_events` and `activity_daily` stay at zero inlining; only
 append-only outbox, event-version and receipt tables inline batches up to ten
