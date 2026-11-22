@@ -30,6 +30,7 @@ public enum AnalyticsDimension: String, Sendable, Hashable, CaseIterable {
 @MainActor
 @Observable
 public final class CockpitStore {
+    private let busyWait: @Sendable (Date) async throws -> Void
     private let client: any CockpitClient
     private var cockpitAPIVersion: Int?
     private var cockpitSections: Set<String> = []
@@ -108,6 +109,12 @@ public final class CockpitStore {
 
     public init(client: any CockpitClient) {
         self.client = client
+        self.busyWait = { try await RetryPolicy.wait(until: $0) }
+    }
+
+    init(client: any CockpitClient, busyWait: @escaping @Sendable (Date) async throws -> Void) {
+        self.client = client
+        self.busyWait = busyWait
     }
 
     deinit {
@@ -163,7 +170,7 @@ public final class CockpitStore {
             do { return try await operation() }
             catch DroverError.busy(let deadline) {
                 onBusy(RetryPolicy.busyMessage(until: deadline))
-                try await RetryPolicy.wait(until: deadline)
+                try await busyWait(deadline)
             }
         }
     }
