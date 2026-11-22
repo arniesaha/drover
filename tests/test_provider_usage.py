@@ -22,6 +22,7 @@ from drover.server.providers.inventory import detect_provider_accounts
 from drover.server.providers.service import ProviderUsageService
 from drover.server.providers.types import (
     ProviderAccountSnapshot,
+    ProviderRefreshDeferred,
     ProviderUsageWindow,
     provider_snapshot_table,
 )
@@ -827,6 +828,22 @@ def test_authenticated_cursor_quota_unsupported_refresh_is_fresh_and_recovers(
     assert capacity["data"][0]["error_category"] == "quota_unsupported"
     assert capacity["data"][0]["windows"] == ()
 
+    # A restarting API can know the persisted heartbeat before its in-memory
+    # relay has reattached. That is neither a provider failure nor evidence
+    # that Cursor's documented quota contract changed, so it must leave this
+    # truthful unsupported snapshot untouched.
+    with pytest.raises(ProviderRefreshDeferred):
+        service.refresh_host(
+            provider_host,
+            fetch=lambda _: (_ for _ in ()).throw(
+                ProviderRefreshDeferred("relay_not_attached")
+            ),
+        )
+    deferred = service.latest_accounts()[0]
+    assert deferred.status == "usage_unavailable"
+    assert deferred.error_category == "quota_unsupported"
+    assert deferred.windows == ()
+
     clock[0] += timedelta(minutes=5)
     service.refresh_host(provider_host, fetch=lambda _: quota_unsupported)
     refreshed = service.latest_accounts()[0]
@@ -1294,6 +1311,85 @@ def test_relay_host_with_a_fresh_heartbeat_is_still_probed(tmp_path):
     loop.run_once()
 
     assert probes == ["work-laptop"]
+
+
+def test_provider_refresh_retries_after_relay_admission_without_hiding_failures(
+    tmp_path,
+):
+    """Only the typed bridge admission gap is deferred after API restart."""
+
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    wall_clock = [datetime(2026, 11, 22, 17, 10, tzinfo=timezone.utc)]
+    monotonic_clock = [0.0]
+    service = ProviderUsageService(
+        duckdb_path, parquet_dir, clock=lambda: wall_clock[0]
+    )
+    host = HarnessHost(
+        host_id="relay-host",
+        display_name="Relay host",
+        kind="macos",
+        status="online",
+        connection_kind="relay",
+        last_seen_at=datetime.now(timezone.utc),
+    )
+
+    class _Registry:
+        def list_hosts(self):
+            return [host]
+
+    state = {"attached": True, "fail": False}
+
+    def _payload():
+        account = {**GOOD_PAYLOAD["accounts"][0], "host_id": host.host_id}
+        account["observed_at"] = wall_clock[0].isoformat()
+        account["windows"] = [
+            {
+                **account["windows"][0],
+                "resets_at": (wall_clock[0] + timedelta(hours=5)).isoformat(),
+            }
+        ]
+        return {"accounts": [account], "observed_at": wall_clock[0].isoformat()}
+
+    def _fetch(_host):
+        if not state["attached"]:
+            raise ProviderRefreshDeferred("relay_not_attached")
+        if state["fail"]:
+            raise RuntimeError("unavailable")
+        return _payload()
+
+    loop = ProviderRefreshLoop(
+        provider_usage=service,
+        registry=_Registry(),
+        shutdown_event=threading.Event(),
+        interval_seconds=300,
+        clock=lambda: monotonic_clock[0],
+        fetch=_fetch,
+    )
+
+    loop.run_once()
+    state["attached"] = False
+    wall_clock[0] += timedelta(seconds=1)
+    monotonic_clock[0] = 301.0
+    loop.run_once()
+    deferred = service.latest_accounts()[0]
+    assert (deferred.status, deferred.error_category) == ("ok", None)
+
+    state["attached"] = True
+    wall_clock[0] += timedelta(seconds=1)
+    monotonic_clock[0] = 302.0
+    loop.run_once()
+    recovered = service.latest_accounts()[0]
+    assert (recovered.status, recovered.error_category) == ("ok", None)
+    assert recovered.observed_at == wall_clock[0]
+
+    state["fail"] = True
+    wall_clock[0] += timedelta(seconds=1)
+    monotonic_clock[0] = 603.0
+    loop.run_once()
+    failed = service.latest_accounts()[0]
+    assert (failed.status, failed.error_category) == ("stale", "unavailable")
 
 
 def test_observed_exhausted_persists_in_latest_accounts_until_reset_passes(tmp_path):

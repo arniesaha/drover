@@ -30,6 +30,7 @@ from drover.server.analytics_boundary import (
     ANALYTICS_MUTATION_CONCURRENCY,
     ANALYTICS_UNAVAILABLE_BODY,
     ANALYTICS_UNAVAILABLE_HEADERS,
+    HOST_BRIDGE_RELAY_NOT_ATTACHED_BODY,
     AnalyticsBoundaryClient,
     AnalyticsBoundaryRequestInvalid,
     AnalyticsBoundaryUnavailable,
@@ -3878,6 +3879,23 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 host = self._harness_registry().get_host(unquote(parts[3]))
                 if host is None:
                     self._send(404, "application/json", '{"error":"not found"}\n')
+                    return
+                relay_required = getattr(
+                    host, "connection_kind", "direct"
+                ) == "relay" or self.collector._host_requires_relay(host)
+                relay = getattr(self.collector, "relay_manager", None)
+                if relay_required and (
+                    relay is None or not relay.is_live(host.host_id)
+                ):
+                    # Registry heartbeats are durable, whereas relay sockets
+                    # belong to this API process. After a restart, tell the
+                    # authenticated worker to defer this refresh instead of
+                    # turning the short admission gap into provider failure.
+                    self._send(
+                        503,
+                        "application/json",
+                        HOST_BRIDGE_RELAY_NOT_ATTACHED_BODY,
+                    )
                     return
                 payload = self.collector.fetch_harness_provider_usage(host)
                 self._send(200, "application/json", json.dumps(payload) + "\n")

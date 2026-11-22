@@ -35,6 +35,7 @@ from drover.server.db import (
     snapshot_scratch_root,
     supports_atomic_duckdb_clone,
 )
+from drover.server.providers.types import ProviderRefreshDeferred
 
 log = logging.getLogger("drover.cockpit")
 
@@ -716,6 +717,12 @@ class ProviderRefreshLoop:
                             host_id,
                             exc,
                         )
+            except ProviderRefreshDeferred:
+                # A hub restart loses relay sockets while the registry retains
+                # a recent heartbeat. That bridge-only admission gap must not
+                # persist an ``unavailable`` connector overlay or consume this
+                # loop's retry slot; a later scheduled pass retries normally.
+                self._last_attempt.pop(host_id, None)
             except Exception as exc:  # noqa: BLE001 - defensive connector isolation
                 log.warning("provider refresh failed for host %s: %s", host_id, exc)
 
