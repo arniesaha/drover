@@ -109,6 +109,13 @@ struct SessionRow: View {
                         // that a primary action is an accent outline.
                         Text(action.rawValue)
                             .font(.system(.caption, design: .default, weight: .medium))
+                            // The card itself is the target. Keep its action
+                            // verb intact rather than allowing an oversized
+                            // dynamic type face to split it under dock chrome.
+                            .lineLimit(1)
+                            .minimumScaleFactor(
+                                dynamicTypeSize.isAccessibilitySize ? 0.75 : 1
+                            )
                             .foregroundStyle(isWaiting ? DroverColor.accentHi : DroverColor.muted)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 4)
@@ -119,6 +126,7 @@ struct SessionRow: View {
                                 )
                             }
                             .fixedSize(horizontal: !dynamicTypeSize.isAccessibilitySize, vertical: true)
+                            .accessibilityIdentifier("session-action-\(session.id)")
                     } else if let note = card.staleNote {
                         // Deliberately not a capsule: the outline is what says
                         // "this is a thing you do", and there is nothing here

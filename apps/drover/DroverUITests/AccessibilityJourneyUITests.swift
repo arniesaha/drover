@@ -308,6 +308,47 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
+    func testHomeBottomSessionClearsFloatingChromeAtAccessibilityXXXL() {
+        let app = coreJourneyApp()
+        app.launch()
+        let fleet = app.scrollViews["fleet-list"]
+        XCTAssertTrue(fleet.waitForExistence(timeout: timeout))
+
+        let before = XCTAttachment(screenshot: app.screenshot())
+        before.name = "Home bottom session before XXXL clearance"
+        before.lifetime = .keepAlways
+        add(before)
+
+        // The last fixture item exercises the long-list boundary, where the
+        // floating New Session control and tab chrome are closest together.
+        let session = app.buttons["fixture-other-session"]
+        let action = app.staticTexts["session-action-fixture-other-session"]
+        XCTAssertTrue(action.waitForExistence(timeout: timeout))
+        let viewport = scrollElementFullyIntoClearFleetViewport(action, in: app)
+        XCTAssertTrue(session.exists)
+        XCTAssertTrue(session.isHittable)
+        XCTAssertTrue(
+            viewport.contains(action.frame),
+            "The session action label must scroll clear of floating chrome at XXXL"
+        )
+        XCTAssertTrue(session.label.contains("Fixture other journey"))
+
+        let after = XCTAttachment(screenshot: app.screenshot())
+        after.name = "Home bottom session clear of chrome XXXL"
+        after.lifetime = .keepAlways
+        add(after)
+
+        let point = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: action.frame.midX - app.frame.minX,
+                                 dy: action.frame.midY - app.frame.minY))
+        point.tap()
+        XCTAssertTrue(
+            app.textFields["composer-input"].waitForExistence(timeout: timeout),
+            "The clear card hit region must open the bottom running session"
+        )
+    }
+
+    @MainActor
     func testCoreJourneyKeepsRecoveryControlsReachableAtAccessibilityXXXL() {
         let app = coreJourneyApp()
         app.launch()
@@ -467,42 +508,100 @@ final class AccessibilityJourneyUITests: XCTestCase {
         let fleet = app.scrollViews["fleet-list"]
         XCTAssertTrue(fleet.waitForExistence(timeout: timeout))
         let session = app.buttons["fixture-session"]
-        for _ in 0..<12 {
-            // Both taps and scroll gestures must avoid floating controls.
-            // On iOS 18 the fleet accessibility frame includes their hit region.
-            var viewport = fleet.frame.intersection(app.frame)
-            let launch = app.buttons["launch-button"]
-            if launch.exists, viewport.intersects(launch.frame) {
-                viewport.size.height = max(0, launch.frame.minY - viewport.minY - 8)
+        let viewport = scrollSessionIntoClearFleetViewport(session, in: app)
+        if session.exists {
+            let visible = session.frame.intersection(viewport)
+            if !visible.isNull, visible.height >= min(44, session.frame.height),
+               visible.width >= 44, session.isHittable {
+                let point = app.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: visible.midX - app.frame.minX,
+                                         dy: visible.midY - app.frame.minY))
+                point.tap()
+                return
             }
-            let tabBar = app.tabBars.firstMatch
-            if tabBar.exists, viewport.intersects(tabBar.frame) {
-                viewport.size.height = max(0, tabBar.frame.minY - viewport.minY - 8)
-            }
-            if session.exists {
-                let visible = session.frame.intersection(viewport)
-                if !visible.isNull, visible.height >= min(44, session.frame.height),
-                   visible.width >= 44, session.isHittable {
-                    let point = app.coordinate(withNormalizedOffset: .zero)
-                        .withOffset(CGVector(dx: visible.midX - app.frame.minX,
-                                             dy: visible.midY - app.frame.minY))
-                    point.tap()
-                    return
-                }
-            }
-            guard !viewport.isNull, viewport.width >= 44, viewport.height >= 44 else { break }
-            let origin = app.coordinate(withNormalizedOffset: .zero)
-            let start = origin.withOffset(CGVector(dx: viewport.midX - app.frame.minX,
-                                                   dy: viewport.minY + viewport.height * 0.8 - app.frame.minY))
-            let end = origin.withOffset(CGVector(dx: viewport.midX - app.frame.minX,
-                                                 dy: viewport.minY + viewport.height * 0.2 - app.frame.minY))
-            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
         }
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "Unreachable XXXL fleet session"
         screenshot.lifetime = .keepAlways
         add(screenshot)
         XCTFail("the wrapped sample session should be reachable at XXXL; fleet=\(fleet.frame), session=\(session.frame), hittable=\(session.isHittable)")
+    }
+
+    @MainActor
+    private func scrollSessionIntoClearFleetViewport(
+        _ session: XCUIElement,
+        in app: XCUIApplication
+    ) -> CGRect {
+        let fleet = app.scrollViews["fleet-list"]
+        var viewport = clearFleetViewport(fleet, in: app)
+        for _ in 0..<12 {
+            viewport = clearFleetViewport(fleet, in: app)
+            if session.exists {
+                let visible = session.frame.intersection(viewport)
+                if !visible.isNull, visible.height >= min(44, session.frame.height),
+                   visible.width >= 44, session.isHittable {
+                    return viewport
+                }
+            }
+            guard !viewport.isNull, viewport.width >= 44, viewport.height >= 44 else { break }
+            dragFleet(in: viewport, upward: true, app: app)
+        }
+        return clearFleetViewport(fleet, in: app)
+    }
+
+    @MainActor
+    private func scrollElementFullyIntoClearFleetViewport(
+        _ element: XCUIElement,
+        in app: XCUIApplication
+    ) -> CGRect {
+        let fleet = app.scrollViews["fleet-list"]
+        var viewport = clearFleetViewport(fleet, in: app)
+        for _ in 0..<12 {
+            viewport = clearFleetViewport(fleet, in: app)
+            if element.exists, viewport.contains(element.frame) { return viewport }
+            guard !viewport.isNull, viewport.width >= 44, viewport.height >= 44 else { break }
+            let upward = !element.exists || element.frame.maxY > viewport.maxY
+            dragFleet(in: viewport, upward: upward, app: app)
+        }
+        return clearFleetViewport(fleet, in: app)
+    }
+
+    @MainActor
+    private func dragFleet(in viewport: CGRect, upward: Bool, app: XCUIApplication) {
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        let lower = origin.withOffset(CGVector(
+            dx: viewport.midX - app.frame.minX,
+            dy: viewport.minY + viewport.height * 0.8 - app.frame.minY
+        ))
+        let upper = origin.withOffset(CGVector(
+            dx: viewport.midX - app.frame.minX,
+            dy: viewport.minY + viewport.height * 0.2 - app.frame.minY
+        ))
+        (upward ? lower : upper).press(
+            forDuration: 0.05,
+            thenDragTo: upward ? upper : lower,
+            withVelocity: .slow,
+            thenHoldForDuration: 0.3
+        )
+    }
+
+    @MainActor
+    private func clearFleetViewport(
+        _ fleet: XCUIElement,
+        in app: XCUIApplication
+    ) -> CGRect {
+        // Both taps and scroll gestures must avoid floating controls. On iOS
+        // 18 the fleet accessibility frame includes their hit region.
+        var viewport = fleet.frame.intersection(app.frame)
+        let launch = app.buttons["launch-button"]
+        if launch.exists, viewport.intersects(launch.frame) {
+            viewport.size.height = max(0, launch.frame.minY - viewport.minY - 8)
+        }
+        let tabBar = app.tabBars.firstMatch
+        if tabBar.exists, viewport.intersects(tabBar.frame) {
+            viewport.size.height = max(0, tabBar.frame.minY - viewport.minY - 8)
+        }
+        return viewport
     }
 
     @MainActor
