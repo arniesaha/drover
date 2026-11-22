@@ -172,7 +172,7 @@
         "lease_seconds": {
           "default": 60,
           "maximum": 300,
-          "minimum": 1,
+          "minimum": 0,
           "title": "Lease Seconds",
           "type": "integer"
         },
@@ -219,6 +219,19 @@
     "Poll": {
       "additionalProperties": false,
       "properties": {
+        "last_error": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Error"
+        },
         "limit": {
           "default": 20,
           "maximum": 50,
@@ -245,6 +258,19 @@
           ],
           "default": null,
           "title": "Run Id"
+        },
+        "session_activity_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Activity At"
         }
       },
       "required": [

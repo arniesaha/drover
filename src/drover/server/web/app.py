@@ -2551,13 +2551,21 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         try:
             if query is not None:
                 params = parse_qs(query, keep_blank_values=True)
+                telemetry_fields = {"session_activity_at", "last_error"}
                 if (
                     set(params)
-                    - {"run_id", "owner_id", "authority_scope", "limit", "offset"}
-                    or ("run_id" in params) == ("owner_id" in params)
+                    - {
+                        "run_id",
+                        "owner_id",
+                        "authority_scope",
+                        "limit",
+                        "offset",
+                        *telemetry_fields,
+                    }
+                    or ("run_id" not in params and "owner_id" not in params)
                     or any(len(values) != 1 for values in params.values())
                 ):
-                    raise ValueError("exactly one of run_id or owner_id is required")
+                    raise ValueError("run_id or owner_id is required")
                 if "run_id" in params and params.keys() & {
                     "authority_scope",
                     "offset",
@@ -2565,8 +2573,22 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "authority_scope and offset apply to owner_id only"
                     )
+                if "run_id" not in params and params.keys() & telemetry_fields:
+                    raise ValueError("owner telemetry requires run_id")
+                if (
+                    "run_id" in params
+                    and "owner_id" not in params
+                    and params.keys() & telemetry_fields
+                ):
+                    raise ValueError("owner telemetry requires owner_id")
+                if (
+                    "run_id" in params
+                    and "owner_id" in params
+                    and not params.keys() & telemetry_fields
+                ):
+                    raise ValueError("owner_id applies to telemetry or owner listing")
                 limit = int(params.get("limit", ["20"])[0])
-                if "owner_id" in params:
+                if "run_id" not in params:
                     listed_owner = params["owner_id"][0]
                     if listed_owner != self._continuity_owner_principal() and (
                         self._continuity_coordinator_principal() is None
@@ -2583,6 +2605,30 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         )
                     }
                 else:
+                    if params.keys() & telemetry_fields:
+                        principal = self._continuity_owner_principal()
+                        owner_id = params["owner_id"][0]
+                        authorization = {
+                            "run_id": params["run_id"][0],
+                            "owner_id": owner_id,
+                        }
+                        if principal is None or (
+                            owner_id != principal
+                            and not self._coordinator_acts_for_bound_owner(
+                                store, authorization, principal
+                            )
+                        ):
+                            raise PermissionError(
+                                "owner identity does not match bearer credential"
+                            )
+                        store.record_owner_telemetry(
+                            params["run_id"][0],
+                            owner_id=owner_id,
+                            session_activity_at=params.get(
+                                "session_activity_at", [None]
+                            )[0],
+                            last_error=params.get("last_error", [None])[0],
+                        )
                     result = {
                         "continuity": store.status(params["run_id"][0], limit=limit)
                     }

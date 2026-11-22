@@ -44,6 +44,9 @@ class Poll(WireModel):
     operation: Literal["poll"]
     run_id: Id | None = None
     limit: Annotated[int, Field(ge=1, le=50)] = 20
+    # OpenClaw supplies these optional liveness hints on owner polls.
+    last_error: Annotated[str, Field(max_length=1000)] | None = None
+    session_activity_at: datetime | None = None
 
 
 class Initialize(WireModel):
@@ -54,7 +57,8 @@ class Lease(WireModel):
     operation: Literal["lease"]
     run_id: Id | None = None
     owner_epoch: Epoch | None = None
-    lease_seconds: Annotated[int, Field(ge=1, le=300)] = 60
+    # Zero is the bounded shutdown-path release sent by the plugin.
+    lease_seconds: Annotated[int, Field(ge=0, le=300)] = 60
 
 
 class Report(WireModel):
@@ -175,6 +179,14 @@ class OwnerLease(WireModel):
     live: bool
 
 
+class OwnerTelemetry(WireModel):
+    """Read-only owner liveness recorded by the bounded poll endpoint."""
+
+    owner_id: Id
+    session_activity_at: datetime | None
+    last_error: Annotated[str, Field(min_length=1, max_length=1000)] | None
+
+
 class OwnerHandoff(WireModel):
     authorized_owner_id: Id | None
     state: Literal[
@@ -255,6 +267,9 @@ class ContinuityProjection(WireModel):
     integration_serialization: IntegrationSerialization | None
     owner_handoff: OwnerHandoff
     owner: OwnerLease
+    # Older hubs omit telemetry entirely; newer hubs return only the exact
+    # handoff owner record, never a different agent's activity.
+    owner_telemetry: OwnerTelemetry | None = None
     worker_state: Literal[
         "unknown",
         "started",
