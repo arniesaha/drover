@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -155,7 +157,10 @@ def _baseline_snapshot(spec):
 
 
 def maintain_lake(
-    spec: LakeSpec, *, tables: tuple[str, ...] = EXPORT_MAINTENANCE_TABLES
+    spec: LakeSpec,
+    *,
+    tables: tuple[str, ...] = EXPORT_MAINTENANCE_TABLES,
+    retune_exporter_role: str | None = None,
 ):
     """Compact one catalog under the drained writer/reader fence.
 
@@ -168,6 +173,14 @@ def maintain_lake(
         table not in EXPORT_MAINTENANCE_TABLES for table in selected
     ):
         raise ValueError("maintenance tables must be export tables")
+    if retune_exporter_role is not None:
+        if set(selected) != set(EXPORT_MAINTENANCE_TABLES):
+            raise ValueError(
+                "export retuning requires fingerprints for every export table"
+            )
+        from .exporter import _catalog_temp_preflight
+
+        _catalog_temp_preflight(spec)
     started = monotonic()
     with (
         drained_mutation(spec.dsn()) as fence,
@@ -175,24 +188,70 @@ def maintain_lake(
     ):
         baseline, proof_digest, proof = _baseline_snapshot(spec)
         snapshots_before = _snapshot_count(con)
-        before_snapshot = max(row[0] for row in _snapshot_rows(con))
         from .serving_proof import check_referenced_files
 
         referenced_files_before = check_referenced_files(spec, con, limit=2**31 - 1)
         before = {table: _fingerprint(con, table) for table in selected}
         before_rows = {table: _row_count(con, table) for table in selected}
-        run_id = uuid4().hex
-        intent = {
-            "version": 1,
-            "proof_sha256": proof_digest,
-            "catalog_id": proof["catalog_id"],
-            "data_root": proof["data_root"],
-            "before_snapshot": before_snapshot,
-            "tables": before,
-        }
-        intent_digest = hashlib.sha256(
-            json.dumps(intent, sort_keys=True).encode()
-        ).hexdigest()
+
+        def attested_transaction(operation):
+            # DuckLake forbids row changes and file compaction in the same
+            # transaction. Keep each phase separately receipted while holding
+            # this SAME drained writer/reader fence across the whole operation.
+            before_snapshot = max(row[0] for row in _snapshot_rows(con))
+            run_id = uuid4().hex
+            intent = {
+                "version": 1,
+                "proof_sha256": proof_digest,
+                "catalog_id": proof["catalog_id"],
+                "data_root": proof["data_root"],
+                "before_snapshot": before_snapshot,
+                "tables": before,
+            }
+            intent_digest = hashlib.sha256(
+                json.dumps(intent, sort_keys=True).encode()
+            ).hexdigest()
+            con.execute("BEGIN")
+            try:
+                con.execute(
+                    "CALL lake.set_commit_message(?, ?, extra_info => ?)",
+                    [MAINTENANCE_AUTHOR, run_id, intent_digest],
+                )
+                operation()
+                after = {table: _fingerprint(con, table) for table in selected}
+                if after != before:
+                    raise ValueError("maintenance changed logical table content")
+                after_rows = {table: _row_count(con, table) for table in selected}
+                if after_rows != before_rows:
+                    raise ValueError("maintenance changed logical table row counts")
+                fence.check()
+                con.execute("COMMIT")
+            except BaseException:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            commits = _snapshot_rows(con, before_snapshot)
+            if any(
+                row[1:] != [MAINTENANCE_AUTHOR, run_id, intent_digest]
+                for row in commits
+            ):
+                raise ValueError("maintenance produced an unattested snapshot")
+            if commits:
+                _append_receipt(
+                    spec,
+                    {
+                        **intent,
+                        "after_snapshot": commits[-1][0],
+                        "commits": commits,
+                        "after_tables": after,
+                        "intent_sha256": intent_digest,
+                    },
+                    fence=fence,
+                )
+            return after_rows
+
         report = {"tables": {}}
         # Preserve both constraints: DuckLake's usual 30-day time-travel
         # window, and the proof/checkpoint baseline. The earlier cutoff is
@@ -204,12 +263,16 @@ def maintain_lake(
         timestamp = con.execute(
             "SELECT least(?, now() - INTERVAL '30 days')", [baseline_timestamp]
         ).fetchone()[0]
-        con.execute("BEGIN")
-        try:
-            con.execute(
-                "CALL lake.set_commit_message(?, ?, extra_info => ?)",
-                [MAINTENANCE_AUTHOR, run_id, intent_digest],
-            )
+        if retune_exporter_role is not None:
+            from .exporter import configure_export_storage, prime_export_inlining
+
+            def retune():
+                configure_export_storage(con)
+                prime_export_inlining(con)
+
+            attested_transaction(retune)
+
+        def compact():
             for table in selected:
                 before = _file_count(con, table)
                 merged = con.execute(
@@ -223,14 +286,8 @@ def maintain_lake(
                     "files_after": _file_count(con, table),
                 }
                 fence.check()
-            after = {table: _fingerprint(con, table) for table in selected}
-            if after != intent["tables"]:
-                raise ValueError("maintenance changed logical table content")
-            after_rows = {table: _row_count(con, table) for table in selected}
-            if after_rows != before_rows:
-                raise ValueError("maintenance changed logical table row counts")
-            # Keep every catalog-changing maintenance procedure in this one
-            # receipted transaction; a later anonymous expiry snapshot would
+            # Keep compaction/expiry/cleanup in their own receipted
+            # transaction; a later anonymous expiry snapshot would
             # correctly fail the serving proof.
             con.execute(
                 "CALL ducklake_expire_snapshots('lake', older_than => ?)",
@@ -242,27 +299,8 @@ def maintain_lake(
                 "older_than => now() - INTERVAL '7 days')"
             )
             fence.check()
-            con.execute("COMMIT")
-        except BaseException:
-            try:
-                con.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        commits = _snapshot_rows(con, before_snapshot)
-        if any(
-            row[1:] != [MAINTENANCE_AUTHOR, run_id, intent_digest] for row in commits
-        ):
-            raise ValueError("maintenance produced an unattested snapshot")
-        if commits:
-            receipt = {
-                **intent,
-                "after_snapshot": commits[-1][0],
-                "commits": commits,
-                "after_tables": after,
-                "intent_sha256": intent_digest,
-            }
-            _append_receipt(spec, receipt, fence=fence)
+
+        after_rows = attested_transaction(compact)
         for table in selected:
             report["tables"][table]["files_after"] = _file_count(con, table)
             report["tables"][table]["rows_after"] = after_rows[table]
@@ -271,6 +309,11 @@ def maintain_lake(
         from .serving_proof import advance_checkpoint
 
         checkpoint = advance_checkpoint(spec, proof_digest, fence=fence, con=con)
+        if retune_exporter_role is not None:
+            from .export_guard import grant_exporter_catalog_dml
+
+            grant_exporter_catalog_dml(spec, retune_exporter_role)
+            report["exporter_storage_retuned"] = True
         report.update(
             {
                 "snapshots_before": snapshots_before,
@@ -289,10 +332,13 @@ def maintain_lake(
 
 
 def compact_lake(
-    spec: LakeSpec, *, tables: tuple[str, ...] = EXPORT_MAINTENANCE_TABLES
+    spec: LakeSpec,
+    *,
+    tables: tuple[str, ...] = EXPORT_MAINTENANCE_TABLES,
+    retune_exporter_role: str | None = None,
 ):
     """Public name for the row-count-verified DuckLake compaction operation."""
-    return maintain_lake(spec, tables=tables)
+    return maintain_lake(spec, tables=tables, retune_exporter_role=retune_exporter_role)
 
 
 def referenced_file_health(spec: LakeSpec, *, hard_limit: int) -> dict:
@@ -402,6 +448,7 @@ class LakeCompactionScheduler:
         planned_stop_active,
         exporter_backlog_high,
         execute=_run_compaction_process,
+        exporter_pause=None,
     ) -> None:
         from .serving_proof import REFERENCED_FILE_LIMIT
 
@@ -419,17 +466,34 @@ class LakeCompactionScheduler:
         self._planned_stop_active = planned_stop_active
         self._exporter_backlog_high = exporter_backlog_high
         self._execute = execute
+        self._exporter_pause = exporter_pause or nullcontext
         self._hard_limit = REFERENCED_FILE_LIMIT
         self._lock = threading.Lock()
         self._last_completed_at: datetime | None = None
         self._last_report: dict | None = None
         self._last_skip: str | None = None
+        self._last_attempt_at: datetime | None = None
+        self._last_error: str | None = None
+        self._deferred_since: datetime | None = None
         self._file_health = {
             "state": "unknown",
             "referenced_files": None,
             "referenced_file_limit": self._hard_limit,
             "referenced_file_ratio": None,
         }
+        try:
+            saved = json.loads(
+                (
+                    reader_spec.data_root / "verification/maintenance-status.json"
+                ).read_text()
+            )
+            for key in ("last_completed_at", "last_attempt_at", "deferred_since"):
+                if saved.get(key):
+                    value = datetime.fromisoformat(saved[key])
+                    if value.tzinfo is not None:
+                        setattr(self, "_" + key, value.astimezone(UTC))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
 
     def refresh_health(self) -> dict:
         health = referenced_file_health(self._reader_spec, hard_limit=self._hard_limit)
@@ -452,6 +516,13 @@ class LakeCompactionScheduler:
                     last_completed.isoformat() if last_completed else None
                 ),
                 "last_report": report,
+                "last_attempt_at": (
+                    self._last_attempt_at.isoformat() if self._last_attempt_at else None
+                ),
+                "last_error": self._last_error,
+                "deferred_since": (
+                    self._deferred_since.isoformat() if self._deferred_since else None
+                ),
             }
         )
         if not self._maintenance_dsn_env:
@@ -461,6 +532,23 @@ class LakeCompactionScheduler:
         elif skip:
             health["last_skip"] = skip
         return health
+
+    def _publish_status(self):
+        """Keep operator evidence across hub restarts; never include raw errors."""
+        path = self._reader_spec.data_root / "verification/maintenance-status.json"
+        temporary = path.with_suffix(".pending")
+        try:
+            temporary.write_text(json.dumps(self.health(), sort_keys=True))
+            temporary.replace(path)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "maintenance status could not be persisted"
+            )
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def tick(self, *, now: datetime | None = None) -> dict | None:
         current = (now or datetime.now(UTC)).astimezone(UTC)
@@ -485,12 +573,35 @@ class LakeCompactionScheduler:
             if skip:
                 with self._lock:
                     self._last_skip = skip
+                    self._deferred_since = self._deferred_since or current
+                self._publish_status()
                 return None
-            report = self._execute(
-                self._maintenance_spec, timeout_seconds=self._max_runtime_seconds
-            )
+            with self._lock:
+                self._last_attempt_at = current
+            try:
+                # Exporter ownership spans its lifetime; an idle batch alone
+                # does not release MutationFence. Wait for explicit owner ack.
+                with self._exporter_pause():
+                    report = self._execute(
+                        self._maintenance_spec,
+                        timeout_seconds=self._max_runtime_seconds,
+                    )
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = (
+                        exc.code
+                        if isinstance(exc, LakeError)
+                        else "lake_compaction_failed"
+                    )
+                    self._deferred_since = self._deferred_since or current
+                self._publish_status()
+                raise
         with self._lock:
             self._last_completed_at = current
             self._last_report = report
             self._last_skip = None
+            self._last_error = None
+            self._deferred_since = None
+        self.refresh_health()
+        self._publish_status()
         return report

@@ -3493,6 +3493,7 @@ def _expected_structured_json(row) -> dict:
         "status": row.status,
         "mode": row.mode or "structured",
         "awaiting": row.awaiting,
+        "attention_id": row.attention_id,
         "model": row.model,
         "thinking_effort": row.thinking_effort,
         "last_activity": (row.last_activity.isoformat() if row.last_activity else None),

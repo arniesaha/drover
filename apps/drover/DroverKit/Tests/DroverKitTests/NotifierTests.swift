@@ -9,6 +9,8 @@ import Testing
 private actor SpyNotifier: Notifying {
     private(set) var notifications: [(title: String, body: String, id: String)] = []
     private(set) var badgeCounts: [Int] = []
+    private(set) var resolvedAwaitingSets: [Set<String>] = []
+    private(set) var resolvedWorkSets: [(active: Set<WorkAttentionRef>, workspaces: Set<String>)] = []
 
     func notify(title: String, body: String, id: String) async {
         notifications.append((title: title, body: body, id: id))
@@ -16,6 +18,16 @@ private actor SpyNotifier: Notifying {
 
     func setBadge(_ count: Int) async {
         badgeCounts.append(count)
+    }
+
+    func clearResolvedAwaiting(sessionIDs: Set<String>) async {
+        resolvedAwaitingSets.append(sessionIDs)
+    }
+
+    func clearResolvedWorkAttention(
+        activeRefs: Set<WorkAttentionRef>, workspaceIDs: Set<String>
+    ) async {
+        resolvedWorkSets.append((activeRefs, workspaceIDs))
     }
 }
 
@@ -82,10 +94,10 @@ struct NotifierTests {
     let notifications = await spy.notifications
     #expect(notifications.count == 2)
     #expect(notifications.contains {
-        $0.id == "sess-approval" && $0.title == "claude-code needs you" && $0.body == "project · approval required"
+        $0.id == "sess-approval" && $0.title == "Drover needs you" && $0.body == "Claude Code · approval required"
     })
     #expect(notifications.contains {
-        $0.id == "sess-input" && $0.title == "agy needs you" && $0.body == "other · your turn"
+        $0.id == "sess-input" && $0.title == "Drover needs you" && $0.body == "Coding agent · reply requested"
     })
 
     let badges = await spy.badgeCounts
@@ -152,7 +164,7 @@ struct NotifierTests {
     let notifications = await spy.notifications
     #expect(notifications.count == 1)
     #expect(notifications[0].id == "sess-input")
-    #expect(notifications[0].body == "other · your turn")
+    #expect(notifications[0].body == "Coding agent · reply requested")
     let badges = await spy.badgeCounts
     #expect(badges == [1])
 }
@@ -313,6 +325,7 @@ struct NotifierTests {
     #expect(notifications.isEmpty)
     // The badge is still the truth, so it is set either way.
     #expect(await spy.badgeCounts == [2])
+    #expect(await spy.resolvedAwaitingSets == [Set(["sess-1", "sess-2"])])
 }
 
 @Test func aSyncedSessionIsNotReAlertedByTheNextEvaluate() async throws {
@@ -374,6 +387,58 @@ struct NotifierTests {
     await watcher.evaluate(asking)
 
     #expect(await spy.notifications.map(\.id) == ["sess-42"])
+}
+
+@Test func aChangingHeartbeatDoesNotReplayTheSameAwaitingAction() async throws {
+    func snapshot(awaiting: String?, activity: String) throws -> HarnessSnapshot {
+        let awaitingJSON = awaiting.map { "\"\($0)\"" } ?? "null"
+        return try HarnessSnapshot.decode(from: Data("""
+        {"hosts":[],"sessions":[{"session_id":"same-session","host_id":"host-1",
+        "harness":"codex","mode":"structured","status":"running","awaiting":\(awaitingJSON),
+        "last_activity":"\(activity)"}],"cwd_suggestions":[]}
+        """.utf8))
+    }
+
+    let spy = SpyNotifier()
+    let watcher = AttentionWatcher(notifier: spy, seenStore: testDefaults())
+    let first = try snapshot(awaiting: "input", activity: "2026-11-21T20:00:00Z")
+    await watcher.evaluate(first)
+    await watcher.evaluate(first) // reconnect/app-open replay
+
+    // `update_session_activity` rewrites last_activity even if a harness
+    // repeats the same awaiting state. That must not make a local fallback
+    // replay the same alert.
+    let heartbeat = try snapshot(awaiting: "input", activity: "2026-11-21T20:02:00Z")
+    await watcher.evaluate(heartbeat)
+
+    let notifications = await spy.notifications
+    #expect(notifications.map(\.id) == ["same-session"])
+    #expect(notifications.map(\.body) == ["Codex · reply requested"])
+}
+
+@Test func actionGenerationSurvivesMissedClearAndProcessRestart() async throws {
+    func snapshot(_ generation: String, _ activity: String) throws -> HarnessSnapshot {
+        try HarnessSnapshot.decode(from: Data("""
+        {"hosts":[],"sessions":[{"session_id":"same-session","host_id":"host-1",
+        "harness":"codex","mode":"structured","status":"running","awaiting":"input",
+        "attention_id":"\(generation)","last_activity":"\(activity)"}],"cwd_suggestions":[]}
+        """.utf8))
+    }
+    let defaults = testDefaults()
+    let spy = SpyNotifier()
+    let first = try snapshot("question-a", "2026-11-21T20:00:00Z")
+    let watcher = AttentionWatcher(notifier: spy, seenStore: defaults)
+    await watcher.evaluate(first)
+    await watcher.markRead("same-session", in: first)
+    // Same question after a heartbeat and a fresh process must stay silent/read.
+    let restarted = AttentionWatcher(notifier: spy, seenStore: defaults)
+    await restarted.evaluate(try snapshot("question-a", "2026-11-21T20:01:00Z"))
+    // Resolution and a new question both happened entirely between polls.
+    await restarted.evaluate(try snapshot("question-b", "2026-11-21T20:02:00Z"))
+    await AttentionWatcher(notifier: spy, seenStore: defaults).evaluate(
+        try snapshot("question-b", "2026-11-21T20:03:00Z"))
+    #expect(await spy.notifications.map(\.id) == ["same-session", "same-session"])
+    #expect(await spy.badgeCounts == [1, 0, 0, 1, 1])
 }
 
 // MARK: - One announcer at a time

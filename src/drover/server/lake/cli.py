@@ -349,6 +349,28 @@ def maintain_cmd(data_root, catalog_dsn_env, dry_run):
     click.echo(json.dumps(report, indent=2))
 
 
+@lake_cmd.command("preflight")
+@click.pass_context
+def preflight_cmd(ctx):
+    """Verify the selected serving lake before draining or stopping services.
+
+    Run with the service's effective config/environment, including launchd
+    EnvironmentVariables. This read-only gate never raises the serving limit.
+    """
+    from drover.server.__main__ import _resolve_config
+
+    from .serving import check_selected, configure_analytics, validate_startup_config
+
+    cfg = _resolve_config(ctx.obj["config_path"], validate_analytics=False)
+    try:
+        configure_analytics(cfg.duckdb_path, cfg.analytics)
+        validate_startup_config(cfg.analytics)
+        check_selected(cfg.duckdb_path)
+    except LakeError as exc:
+        raise _lake_failure(exc, cfg.analytics.data_root) from None
+    click.echo(json.dumps({"verified": True, "backend": cfg.analytics.backend}))
+
+
 @lake_cmd.command("compact")
 @click.option(
     "--data-root", type=click.Path(exists=True, path_type=Path), required=True
@@ -359,6 +381,11 @@ def maintain_cmd(data_root, catalog_dsn_env, dry_run):
     help="Environment variable holding the catalog ADMIN DSN.",
 )
 @click.option("--dry-run", is_flag=True, help="Show the non-mutating compaction plan.")
+@click.option(
+    "--retune-exporter-role",
+    default=None,
+    help="Explicit admin-only append-only inlining/retention retune and DML grants.",
+)
 @click.option(
     "--backup-receipt",
     type=click.Path(path_type=Path),
@@ -376,6 +403,7 @@ def compact_cmd(
     dry_run: bool,
     backup_receipt: Path,
     i_have_a_backup: bool,
+    retune_exporter_role: str | None,
 ) -> None:
     """Merge tiny files under the mutation fence and verify every row count."""
     from .maintenance import CLEANUP_RETENTION, EXPORT_MAINTENANCE_TABLES, compact_lake
@@ -389,6 +417,7 @@ def compact_cmd(
                     "referenced_files_before": None,
                     "referenced_files_after": None,
                     "after_is_projected": False,
+                    "retune_exporter_role": retune_exporter_role,
                     "row_counts": "would verify equal before and after each table",
                     "operations": [
                         "drained_mutation fence",
@@ -407,7 +436,12 @@ def compact_cmd(
             "recent verified backup required; provide --backup-receipt or --i-have-a-backup"
         )
     try:
-        report = compact_lake(spec_from_options(data_root, catalog_dsn_env))
+        spec = spec_from_options(data_root, catalog_dsn_env)
+        report = (
+            compact_lake(spec, retune_exporter_role=retune_exporter_role)
+            if retune_exporter_role is not None
+            else compact_lake(spec)
+        )
     except LakeError as exc:
         raise _lake_failure(exc, data_root) from None
     click.echo(json.dumps(report, indent=2))

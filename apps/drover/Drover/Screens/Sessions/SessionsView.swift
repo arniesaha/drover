@@ -45,6 +45,7 @@ struct SessionsView: View {
     @State private var launchedSession: LaunchedSession?
     let isDemoMode: Bool
     @State private var notificationSessionIDs: Set<String>?
+    @State private var notificationRouteNotice: String?
     @State private var filterState: FleetFilterState
     @State private var isOverviewExpanded = false
 
@@ -84,6 +85,15 @@ struct SessionsView: View {
     var body: some View {
         VStack(spacing: 0) {
             chromeRow
+            if let notificationRouteNotice {
+                Label(notificationRouteNotice, systemImage: "info.circle")
+                    .droverText(.subtitle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 8)
+                    .background(DroverColor.accentTint)
+                    .accessibilityIdentifier("notification-route-stale")
+            }
             if notificationSessionIDs != nil {
                 HStack {
                     Text("Notification sessions")
@@ -695,13 +705,28 @@ struct SessionsView: View {
         guard let route = notificationRoute else { return }
         switch route {
         case .summary(let ids):
-            notificationSessionIDs = Set(ids)
+            guard let snapshot = store.snapshot else { return }
+            let active = Set(snapshot.sessions.map(\.id))
+            let matching = Set(ids).intersection(active)
+            guard !matching.isEmpty else {
+                notificationSessionIDs = nil
+                notificationRouteNotice = "Those notification sessions are no longer active. Showing current sessions."
+                notificationRoute = nil
+                return
+            }
+            notificationRouteNotice = nil
+            notificationSessionIDs = matching
             launchedSession = nil
             notificationRoute = nil
         case .session(let id):
-            guard let session = store.snapshot?.sessions.first(where: { $0.id == id }) else {
+            guard let snapshot = store.snapshot else { return }
+            guard let session = snapshot.sessions.first(where: { $0.id == id }) else {
+                notificationSessionIDs = nil
+                notificationRouteNotice = "That notification is no longer active. Showing current sessions."
+                notificationRoute = nil
                 return
             }
+            notificationRouteNotice = nil
             notificationSessionIDs = nil
             notificationRoute = nil
             launchedSession = LaunchedSession(

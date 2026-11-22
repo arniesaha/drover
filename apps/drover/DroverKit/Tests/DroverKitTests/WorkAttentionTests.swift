@@ -16,9 +16,12 @@ func attentionItemJSON(kind: String = "agent_question", uncertain: Bool = false,
     """
 }
 
-func attentionResponse(_ items: [String], truncated: Bool = false) throws -> WorkAttentionResponse {
-    try JSONDecoder().decode(WorkAttentionResponse.self, from: Data("""
-    {"items":[\(items.joined(separator: ","))],"stale":false,"truncated":\(truncated),"poll_interval_seconds":120}
+func attentionResponse(
+    _ items: [String], truncated: Bool = false, workspaceID: String? = "workspace"
+) throws -> WorkAttentionResponse {
+    let workspace = workspaceID.map { "\"workspace_id\":\"\($0)\"," } ?? ""
+    return try JSONDecoder().decode(WorkAttentionResponse.self, from: Data("""
+    {\(workspace)"items":[\(items.joined(separator: ","))],"stale":false,"truncated":\(truncated),"poll_interval_seconds":120}
     """.utf8))
 }
 
@@ -223,11 +226,13 @@ struct WorkAttentionTests {
         #expect(store.message?.contains("unknown") == true)
     }
 
-    @Test func attentionNotificationRoutesWithoutSessionFallbackAndHasGenericText() throws {
+    @Test func actionableAttentionNotificationRoutesWithoutSessionFallback() throws {
         let ref = WorkAttentionRef(workspaceID: "workspace", id: "source-1")
-        let content = LocalNotifier.content(attention: ref)
-        #expect(content.title == "Needs you")
-        #expect(content.body == "Open Drover to review pending work.")
+        let content = LocalNotifier.content(attention: WorkAttentionNotification(
+            ref: ref, title: "Drover needs you", body: "Agent question needs a reply"
+        ))
+        #expect(content.title == "Drover needs you")
+        #expect(content.body == "Agent question needs a reply")
         #expect(NotificationRoute.attentionRef(userInfo: content.userInfo) == ref)
         #expect(NotificationRoute.sessionID(userInfo: content.userInfo, requestIdentifier: "source-1") == nil)
         #expect(NotificationRoute.sessionIDs(userInfo: content.userInfo) == nil)
@@ -254,12 +259,141 @@ struct WorkAttentionTests {
         await WorkAttentionNotifications.evaluate(items, notifier: notifier, defaults: defaults)
         #expect(await notifier.count == 1)
     }
+
+    @Test func onlyQuestionsAndApprovalsAlertWithSafeActionCopy() async throws {
+        let suite = "work-attention-notification-kinds-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let notifier = AttentionSpy()
+        let items = try attentionResponse([
+            attentionItemJSON(kind: "agent_question", id: "question"),
+            attentionItemJSON(kind: "environment_approval", id: "approval"),
+            attentionItemJSON(kind: "draft_pr", id: "draft"),
+            attentionItemJSON(kind: "failed_session", id: "failed")
+        ]).items
+
+        await WorkAttentionNotifications.evaluate(items, notifier: notifier, defaults: defaults)
+
+        let notifications = await notifier.notifications
+        #expect(notifications.map(\.ref.id).sorted() == ["approval", "question"])
+        #expect(notifications.allSatisfy { $0.title == "Drover needs you" })
+        #expect(notifications.map(\.body).sorted() == [
+            "Agent question needs a reply", "Environment approval required"
+        ])
+        #expect(notifications.allSatisfy {
+            !$0.body.contains("example/project") && !$0.body.contains("github.com")
+        })
+    }
+
+    @Test func partialResponsesPreserveOmittedReceiptsUntilAuthoritativeResolution() async throws {
+        let suite = "work-attention-partial-receipts-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let notifier = AttentionSpy()
+        let complete = try attentionResponse([
+            attentionItemJSON(kind: "agent_question", id: "A"),
+            attentionItemJSON(kind: "environment_approval", id: "B")
+        ])
+        let partial = try attentionResponse([
+            attentionItemJSON(kind: "agent_question", id: "A")
+        ], truncated: true)
+        for response in [complete, partial, complete] {
+            await WorkAttentionNotifications.evaluate(
+                response.items, resolvedWorkspaceIDs: response.resolvedWorkspaceIDs,
+                notifier: notifier, defaults: defaults
+            )
+        }
+        #expect(await notifier.notifications.map(\.ref.id).sorted() == ["A", "B"])
+        WorkAttentionNotifications.markSeen(
+            WorkAttentionRef(workspaceID: "other", id: "other-action"), defaults: defaults
+        )
+        let empty = try attentionResponse([])
+        await WorkAttentionNotifications.evaluate(
+            empty.items, resolvedWorkspaceIDs: empty.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        #expect(defaults.stringArray(forKey: "drover.work.seen.workspace") == [])
+        #expect(defaults.stringArray(forKey: "drover.work.seen.other") == ["other-action"])
+        await WorkAttentionNotifications.evaluate(
+            complete.items, resolvedWorkspaceIDs: complete.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        #expect(await notifier.count == 4)
+    }
+
+    @Test func onlyCompleteWorkspaceResponsesClearAbsentWorkAlerts() async throws {
+        let suite = "work-attention-cleanup-\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let notifier = AttentionSpy()
+        let active = try attentionResponse([
+            attentionItemJSON(kind: "agent_question", id: "still-open")
+        ], workspaceID: "workspace")
+        let partial = try attentionResponse([
+            attentionItemJSON(kind: "environment_approval", id: "visible-in-partial")
+        ], truncated: true, workspaceID: "workspace")
+        let empty = try attentionResponse([], workspaceID: "workspace")
+        let store = WorkAttentionStore(service: AttentionService([active, partial, empty]))
+
+        // Match MainTabView: complete response permits cleanup.
+        await store.refresh()
+        await WorkAttentionNotifications.evaluate(
+            store.items,
+            resolvedWorkspaceIDs: store.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        // Foreground partial response may still announce its visible approval,
+        // but must never treat omitted rows as resolved.
+        await store.refresh()
+        await WorkAttentionNotifications.evaluate(
+            store.items,
+            resolvedWorkspaceIDs: store.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        // BackgroundRefresh uses the response counterpart of the same scope
+        // rule, so it is equally non-authoritative while truncated.
+        #expect(partial.resolvedWorkspaceIDs.isEmpty)
+        await WorkAttentionNotifications.evaluate(
+            partial.items,
+            resolvedWorkspaceIDs: partial.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+        // An empty complete response is authoritative for its workspace.
+        await store.refresh()
+        await WorkAttentionNotifications.evaluate(
+            store.items,
+            resolvedWorkspaceIDs: store.resolvedWorkspaceIDs,
+            notifier: notifier, defaults: defaults
+        )
+
+        let cleanups = await notifier.resolvedWorkSets
+        #expect(cleanups.count == 4)
+        #expect(cleanups[0].active == [WorkAttentionRef(workspaceID: "workspace", id: "still-open")])
+        #expect(cleanups[0].workspaces == ["workspace"])
+        #expect(cleanups[1].workspaces.isEmpty)
+        #expect(cleanups[2].workspaces.isEmpty)
+        #expect(cleanups[3].active.isEmpty)
+        #expect(cleanups[3].workspaces == ["workspace"])
+        #expect(await notifier.notifications.map(\.ref.id) == ["still-open", "visible-in-partial"])
+    }
 }
 
 private actor AttentionSpy: Notifying {
-    var count = 0
-    func notify(title: String, body: String, id: String) async { count += 1 }
+    var notifications: [WorkAttentionNotification] = []
+    var resolvedWorkSets: [(active: Set<WorkAttentionRef>, workspaces: Set<String>)] = []
+    var count: Int { notifications.count }
+    func notify(title: String, body: String, id: String) async {
+        notifications.append(WorkAttentionNotification(
+            ref: WorkAttentionRef(workspaceID: "session", id: id), title: title, body: body
+        ))
+    }
+    func notify(attention: WorkAttentionNotification) async { notifications.append(attention) }
     func setBadge(_ count: Int) async {}
+    func clearResolvedWorkAttention(
+        activeRefs: Set<WorkAttentionRef>, workspaceIDs: Set<String>
+    ) async {
+        resolvedWorkSets.append((activeRefs, workspaceIDs))
+    }
 }
 
 extension MockNetworkTests {
@@ -274,7 +408,7 @@ struct WorkAttentionClientTests {
             if request.httpMethod == "GET" {
                 #expect(request.url?.path == "/work/list")
                 #expect(request.url?.query == "view=attention&limit=100")
-                return (200, Data("{\"items\":[\(json)],\"stale\":false,\"truncated\":false,\"poll_interval_seconds\":120}".utf8))
+                return (200, Data("{\"workspace_id\":\"workspace\",\"items\":[\(json)],\"stale\":false,\"truncated\":false,\"poll_interval_seconds\":120}".utf8))
             }
             #expect(request.url?.path == "/work/decide")
             let body = try! JSONSerialization.jsonObject(with: request.bodyStreamData()) as! [String: Any]
@@ -284,7 +418,9 @@ struct WorkAttentionClientTests {
             return (200, Data(#"{"resolved":true}"#.utf8))
         }
         let client = mock.client()
-        let items = try await client.workAttention().items
+        let response = try await client.workAttention()
+        let items = response.items
+        #expect(response.workspaceID == "workspace")
         #expect(try await client.workDecide(item: items[0], action: "reject").resolved)
     }
 }

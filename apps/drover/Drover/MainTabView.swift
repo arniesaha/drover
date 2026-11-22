@@ -127,7 +127,10 @@ struct MainTabView: View {
                     )
                 }
             }
-            .tabItem { Label("Inbox", systemImage: "tray.full") }
+            // Keep Inbox aligned with the other four labels at accessibility
+            // sizes.  A direct Label here left it as the only spoken tab
+            // title while the rest intentionally compact to their symbols.
+            .tabItem { tabLabel(for: .inbox) }
             .tag(AppTab.inbox)
             .accessibilityLabel(AppTab.inbox.title)
             .accessibilityIdentifier(AppTab.inbox.accessibilityIdentifier)
@@ -301,7 +304,11 @@ struct MainTabView: View {
             while !Task.isCancelled {
                 await workStore.refresh()
                 if workStore.isReachable {
-                    await WorkAttentionNotifications.evaluate(workStore.items, notifier: notifier, defaults: defaults)
+                    await WorkAttentionNotifications.evaluate(
+                        workStore.items,
+                        resolvedWorkspaceIDs: workStore.resolvedWorkspaceIDs,
+                        notifier: notifier, defaults: defaults
+                    )
                 }
                 guard let interval = workStore.pollIntervalSeconds else { return }
                 do { try await Task.sleep(for: .seconds(interval)) }
