@@ -96,12 +96,29 @@ class Client:
         except (json.JSONDecodeError, UnicodeError):
             raise Rejected("ASC returned malformed JSON") from None
 
-    def collection(self, path, *, params=None, deadline):
+    def collection(self, path, *, params=None, deadline, max_pages=None):
+        if max_pages is not None and (
+            isinstance(max_pages, bool)
+            or not isinstance(max_pages, int)
+            or max_pages < 1
+        ):
+            raise Rejected("invalid ASC collection page limit")
         items = []
+        pages = 0
         while path:
+            if max_pages is not None and pages >= max_pages:
+                raise Rejected("ASC collection exceeded page limit")
             page = self.request("GET", path, params=params, deadline=deadline)
+            pages += 1
+            if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                raise Rejected("ASC returned malformed collection")
             items.extend(page["data"])
-            path = page.get("links", {}).get("next")
+            links = page.get("links", {})
+            if not isinstance(links, dict):
+                raise Rejected("ASC returned malformed collection")
+            path = links.get("next")
+            if path is not None and (not isinstance(path, str) or not path):
+                raise Rejected("ASC returned malformed pagination")
             params = None
         return items
 
@@ -109,6 +126,143 @@ class Client:
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
+
+
+def _inventory_text(value, field):
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 191
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise Rejected(f"ASC inventory {field} is incomplete")
+    return value
+
+
+def inventory(
+    client,
+    bundle_id,
+    *,
+    timeout=60,
+    max_pages=2,
+    max_versions=20,
+    max_builds_per_version=50,
+    max_internal_groups=50,
+    clock=time.monotonic,
+):
+    """Return a bounded, GET-only projection of existing iOS TestFlight state.
+
+    The result deliberately contains no ASC resource IDs, account details,
+    tokens, diagnostics, or candidate selection.  Callers can inspect existing
+    versions/builds/groups but must still choose any later release candidate.
+    """
+    if (
+        not isinstance(bundle_id, str)
+        or not bundle_id.strip()
+        or len(bundle_id) > 191
+        or not 0 < timeout <= 600
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (
+                max_pages,
+                max_versions,
+                max_builds_per_version,
+                max_internal_groups,
+            )
+        )
+    ):
+        raise Rejected("invalid ASC inventory bounds")
+    deadline = clock() + timeout
+
+    def collect(path, params):
+        try:
+            return client.collection(
+                path, params=params, deadline=deadline, max_pages=max_pages
+            )
+        except Retryable:
+            raise Rejected("ASC inventory is temporarily unavailable") from None
+
+    apps = collect(
+        "/v1/apps", {"filter[bundleId]": bundle_id, "limit": min(max_versions, 50)}
+    )
+    if len(apps) != 1 or not isinstance(apps[0], dict):
+        raise Rejected("ASC app record is missing or ambiguous")
+    try:
+        app_id = _inventory_text(apps[0].get("id"), "app")
+    except Rejected:
+        raise Rejected("ASC app record is missing or ambiguous") from None
+
+    versions_data = collect(
+        "/v1/preReleaseVersions",
+        {
+            "filter[app]": app_id,
+            "filter[platform]": "IOS",
+            "limit": min(max_versions, 50),
+        },
+    )
+    if len(versions_data) > max_versions:
+        raise Rejected("ASC inventory exceeds version limit")
+    versions = []
+    builds = []
+    for version_data in versions_data:
+        if not isinstance(version_data, dict) or not isinstance(
+            version_data.get("attributes"), dict
+        ):
+            raise Rejected("ASC inventory version metadata is incomplete")
+        version_id = _inventory_text(version_data.get("id"), "version")
+        version = _inventory_text(version_data["attributes"].get("version"), "version")
+        versions.append({"version": version})
+        version_builds = collect(
+            f"/v1/preReleaseVersions/{version_id}/builds",
+            {"limit": min(max_builds_per_version, 50)},
+        )
+        if len(version_builds) > max_builds_per_version:
+            raise Rejected("ASC inventory exceeds build limit")
+        for build_data in version_builds:
+            if not isinstance(build_data, dict) or not isinstance(
+                build_data.get("attributes"), dict
+            ):
+                raise Rejected("ASC inventory build metadata is incomplete")
+            attributes = build_data["attributes"]
+            builds.append(
+                {
+                    "version": version,
+                    "build": _inventory_text(attributes.get("version"), "build"),
+                    "processing_state": _inventory_text(
+                        attributes.get("processingState"), "processing state"
+                    ),
+                }
+            )
+
+    groups_data = collect(
+        "/v1/betaGroups",
+        {
+            "filter[app]": app_id,
+            "filter[isInternalGroup]": "true",
+            "limit": min(max_internal_groups, 50),
+        },
+    )
+    if len(groups_data) > max_internal_groups:
+        raise Rejected("ASC inventory exceeds internal group limit")
+    groups = []
+    for group_data in groups_data:
+        if not isinstance(group_data, dict) or not isinstance(
+            group_data.get("attributes"), dict
+        ):
+            raise Rejected("ASC inventory group metadata is incomplete")
+        attributes = group_data["attributes"]
+        if attributes.get("isInternalGroup") is not True:
+            raise Rejected("ASC inventory group metadata is incomplete")
+        groups.append({"name": _inventory_text(attributes.get("name"), "group")})
+
+    return {
+        "versions": [
+            {"version": version}
+            for version in sorted({row["version"] for row in versions})
+        ],
+        "builds": sorted(builds, key=lambda row: (row["version"], row["build"])),
+        "internal_groups": sorted(groups, key=lambda row: row["name"]),
+    }
 
 
 def distribute(
