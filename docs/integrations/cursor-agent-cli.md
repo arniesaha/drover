@@ -18,6 +18,9 @@ headless contracts for those features. The driver never adds `--force`,
 Models are never embedded in Drover: the authenticated local CLI is the source
 of model IDs. An unauthenticated or malformed `status`/`models` response yields
 an unavailable catalog rather than a default model or successful launch.
+The catalog accepts up to 512 individually validated CLI rows and rejects a
+larger listing rather than truncating it. Its public serialized envelope remains
+bounded at 256 KiB.
 
 ## Authentication
 
@@ -57,3 +60,9 @@ Arnab's stated $20 Grok subscription entitlement is unverified. Do not infer
 that it covers Cursor until the authenticated Cursor account confirms plan and
 model access. This harness neither purchases credit nor enables automatic
 spend, and it does not change existing Codex defaults.
+
+The reviewed Cursor CLI `status` schema establishes authentication, not
+remaining allowance; `models` establishes availability, not entitlement. Its
+documented help lists no quota or usage command, and Drover has no Cursor usage
+probe. Drover therefore leaves Cursor quota unavailable rather than inventing a
+percentage or treating a listed model as included-use confirmation.

@@ -87,7 +87,7 @@ struct HarnessModelCatalogPersistenceTests {
     @Test func oversizedCatalogsAreNotPersisted() {
         let defaults = catalogDefaults()
         let store = HarnessModelCatalogStore(defaults: defaults)
-        let tooMany = (0...256).map { index in
+        let tooMany = (0...512).map { index in
             HarnessModelOption(
                 id: "model-\(index)", displayName: "Model \(index)",
                 description: nil, isDefault: index == 0, reasoning: nil
@@ -113,6 +113,26 @@ struct HarnessModelCatalogPersistenceTests {
         ))
 
         #expect(store.catalog(hostID: "mac-mini", harness: "codex") == nil)
+    }
+
+    @Test func cursorSizedCatalogPersistsWithoutTruncation() {
+        let defaults = catalogDefaults()
+        let store = HarnessModelCatalogStore(defaults: defaults)
+        let models = (0..<284).map { index in
+            HarnessModelOption(
+                id: "cursor-public-\(index)", displayName: "Cursor Public \(index)",
+                description: nil, isDefault: index == 143, reasoning: nil
+            )
+        }
+        store.save(catalog: HarnessModelCatalog(
+            schemaVersion: 1, hostID: "studio", harness: "cursor",
+            accountScopeID: "cursor-scope", harnessVersion: "2026.11.19",
+            discoveredAt: nil, stale: false, staleReason: nil, models: models
+        ))
+
+        let catalog = store.catalog(hostID: "studio", harness: "cursor")
+        #expect(catalog?.models.count == 284)
+        #expect(catalog?.namedDefault?.id == "cursor-public-143")
     }
 }
 

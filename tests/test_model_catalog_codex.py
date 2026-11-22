@@ -223,7 +223,7 @@ def test_native_cache_rejects_an_unbounded_mostly_hidden_model_array(
         json.dumps(
             {
                 "client_version": "0.147.0",
-                "models": [hidden] * 257
+                "models": [hidden] * 513
                 + [
                     {
                         "slug": "gpt-5.6-terra",
