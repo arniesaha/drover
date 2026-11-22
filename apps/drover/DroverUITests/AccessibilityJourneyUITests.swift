@@ -236,7 +236,19 @@ final class AccessibilityJourneyUITests: XCTestCase {
                 return currentInline.exists && currentChip.exists
                     && currentInline.frame.maxY <= currentChip.frame.minY
             }, object: app)
-        XCTAssertEqual(XCTWaiter.wait(for: [cleared], timeout: timeout), .completed)
+        let clearanceResult = XCTWaiter.wait(for: [cleared], timeout: timeout)
+        let settledInline = app.buttons["artifact-pane-toggle"]
+        let settledChip = app.buttons["chat-floating-artifacts"]
+        XCTAssertEqual(
+            clearanceResult,
+            .completed,
+            "Inline artifact must clear the floating chip after tail anchoring "
+                + "(inline maxY: \(settledInline.frame.maxY), chip minY: \(settledChip.frame.minY))."
+        )
+        let clearedScreenshot = XCTAttachment(screenshot: app.screenshot())
+        clearedScreenshot.name = "Inline artifact clears floating chip XXXL"
+        clearedScreenshot.lifetime = .keepAlways
+        add(clearedScreenshot)
         chip.tap()
         XCTAssertTrue(app.buttons["Open Pull request"].waitForExistence(timeout: timeout))
         app.buttons["Done"].tap()
@@ -346,6 +358,68 @@ final class AccessibilityJourneyUITests: XCTestCase {
             app.textFields["composer-input"].waitForExistence(timeout: timeout),
             "The clear card hit region must open the bottom running session"
         )
+    }
+
+    @MainActor
+    func testCoreJourneyReduceMotionFixtureKeepsPrimaryNavigationReachable() throws {
+        let app = coreJourneyApp(assertReduceMotion: true)
+        app.launch()
+
+        let motionState = app.staticTexts["fixture-reduce-motion-state"]
+        XCTAssertTrue(
+            motionState.waitForExistence(timeout: timeout),
+            "The DEBUG app-root Reduce Motion probe must exist when this test requests it."
+        )
+        guard motionState.label == "Reduce Motion fixture enabled" else {
+            throw XCTSkip(
+                "Requires a simulator with Settings > Accessibility > Motion > Reduce Motion enabled; "
+                    + "the app-root probe reported \(motionState.label). This test does not override system accessibility settings."
+            )
+        }
+        XCTAssertEqual(motionState.label, "Reduce Motion fixture enabled")
+
+        let fleet = app.scrollViews["fleet-list"]
+        XCTAssertTrue(fleet.waitForExistence(timeout: timeout))
+        let home = XCTAttachment(screenshot: app.screenshot())
+        home.name = "Reduce Motion fixture Home XXXL"
+        home.lifetime = .keepAlways
+        add(home)
+
+        // Drive the real root's fleet -> session -> composer path, then return
+        // to Home before opening and dismissing the root's launch sheet.
+        openFixtureChat(in: app)
+        XCTAssertTrue(app.textFields["composer-input"].isHittable)
+        let chat = XCTAttachment(screenshot: app.screenshot())
+        chat.name = "Reduce Motion fixture session composer XXXL"
+        chat.lifetime = .keepAlways
+        add(chat)
+
+        let back = app.navigationBars.buttons.firstMatch
+        XCTAssertTrue(back.waitForExistence(timeout: timeout))
+        back.tap()
+        XCTAssertTrue(fleet.waitForExistence(timeout: timeout))
+
+        let launch = app.buttons["launch-button"]
+        XCTAssertTrue(launch.waitForExistence(timeout: timeout))
+        launch.tap()
+        XCTAssertTrue(app.buttons["launch-confirm-button"].waitForExistence(timeout: timeout))
+        let launchSheet = XCTAttachment(screenshot: app.screenshot())
+        launchSheet.name = "Reduce Motion fixture launch sheet XXXL"
+        launchSheet.lifetime = .keepAlways
+        add(launchSheet)
+        app.buttons["Cancel"].tap()
+        XCTAssertTrue(launch.waitForExistence(timeout: timeout))
+
+        let accounts = app.tabBars.buttons["Accounts"]
+        XCTAssertTrue(accounts.waitForExistence(timeout: timeout))
+        accounts.tap()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["screen-header-accounts"].waitForExistence(timeout: timeout)
+        )
+        let accountsCapture = XCTAttachment(screenshot: app.screenshot())
+        accountsCapture.name = "Reduce Motion fixture Accounts XXXL"
+        accountsCapture.lifetime = .keepAlways
+        add(accountsCapture)
     }
 
     @MainActor
@@ -492,10 +566,13 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
-    private func coreJourneyApp() -> XCUIApplication {
+    private func coreJourneyApp(assertReduceMotion: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
         app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        if assertReduceMotion {
+            app.launchEnvironment["DROVER_UI_TEST_ASSERT_REDUCE_MOTION"] = "1"
+        }
         app.launchArguments += [
             "-UIPreferredContentSizeCategoryName",
             "UICTContentSizeCategoryAccessibilityXXXL",
