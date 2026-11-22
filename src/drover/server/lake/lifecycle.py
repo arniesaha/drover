@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from drover.server.runtime_observability import activity
@@ -75,6 +76,9 @@ class ExporterLifecycle:
         self._recovering = False
         self._owner_lock = threading.Lock()
         self._owner = None
+        self._maintenance_requested = threading.Event()
+        self._maintenance_paused = threading.Event()
+        self._maintenance_lock = threading.Lock()
         self._batch_started_at = None
         self._cancel_requested_at = None
         self._cancellation_stuck = False
@@ -197,9 +201,20 @@ class ExporterLifecycle:
 
     def _supervise(self, shutdown):
         while not self._stop.is_set() and not shutdown.is_set():
+            if self._maintenance_requested.is_set():
+                # Only acknowledge after _run's context has released its
+                # lifetime catalog fence, never while an export is in flight.
+                self._maintenance_paused.set()
+                while self._maintenance_requested.is_set():
+                    if self._stop.wait(0.1) or shutdown.is_set():
+                        return
+                self._maintenance_paused.clear()
+                continue
             self._run(shutdown)
             if not self._started or self._stop.is_set() or shutdown.is_set():
                 return
+            if self._maintenance_requested.is_set():
+                continue
             if self._recovery_exhausted:
                 with self._owner_lock:
                     retry_due = self._next_recovery_retry_monotonic is None
@@ -321,7 +336,11 @@ class ExporterLifecycle:
                 # A restart after a long run must not wait 500 exports to bound
                 # the serving check again.
                 self._checkpoint(exporter)
-                while not self._stop.is_set() and not shutdown.is_set():
+                while (
+                    not self._stop.is_set()
+                    and not shutdown.is_set()
+                    and not self._maintenance_requested.is_set()
+                ):
                     if self.config.analytics.retire_legacy_writers:
                         from .writer_gate import legacy_derived_write
 
@@ -427,6 +446,27 @@ class ExporterLifecycle:
                 record["snapshot"],
                 record["exports"],
             )
+
+    @contextmanager
+    def pause_for_maintenance(self, *, timeout_seconds=180):
+        """Finish the current batch and relinquish ownership, then resume.
+
+        A deadline is not permission to cancel a live writer or compact beside
+        it. The maintenance process must still acquire its database fences.
+        """
+        if not self._maintenance_lock.acquire(blocking=False):
+            raise LakeError("lake_maintenance_already_requested")
+        self._maintenance_paused.clear()
+        self._maintenance_requested.set()
+        try:
+            if not self._maintenance_paused.wait(timeout_seconds):
+                raise LakeError("lake_exporter_maintenance_pause_deadline")
+            if self._stop.is_set():
+                raise LakeError("lake_exporter_stopping")
+            yield
+        finally:
+            self._maintenance_requested.clear()
+            self._maintenance_lock.release()
 
     def stop(self):
         self._stop.set()

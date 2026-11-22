@@ -2923,6 +2923,7 @@ def _run_api_role(
     cfg: DroverConfig,
     config_path: Path,
     metrics_host: str,
+    analytics_failure: str | None = None,
 ) -> None:
     """Run the public/control role without opening any analytical resource."""
     bootstrap_control_plane_store(cfg.duckdb_path)
@@ -2936,7 +2937,11 @@ def _run_api_role(
     stop = threading.Event()
     boundary = AnalyticsBoundaryClient(
         cfg.analytics_boundary,
-        token=os.environ.get(cfg.analytics_boundary.api_to_worker_token_env, ""),
+        token=(
+            ""
+            if analytics_failure
+            else os.environ.get(cfg.analytics_boundary.api_to_worker_token_env, "")
+        ),
     )
     collector = MetricsCollector(
         duckdb_path=cfg.duckdb_path,
@@ -2950,7 +2955,11 @@ def _run_api_role(
         favorite_cwds=cfg.harness_favorite_cwds,
         content_consent_reader=lambda: consent.state().heartbeat(),
         include_analytical_readiness=False,
-        exporter_health=boundary.health_report,
+        exporter_health=(
+            (lambda: {"state": "unavailable", "detail": analytics_failure})
+            if analytics_failure
+            else boundary.health_report
+        ),
         archive_resolver=boundary,
         archive_resolver_factory=boundary.page_resolver,
     )
@@ -2959,25 +2968,28 @@ def _run_api_role(
     start_reporter(collector, stop)
     from drover.server.work_queue.reconciler import start_shadow_reconciler
 
-    start_shadow_reconciler(collector, cfg.work_queue, stop, auth=auth)
-    from drover.server.work_queue.runtime import (
-        start_github_webhook_worker,
-        start_idle_undeclared_worker,
-        start_queue_execution_worker,
-        start_work_item_event_worker,
-        start_work_item_rule_worker,
-        start_work_service,
-    )
+    # Recovery keeps auth and control reachable, without admitting background
+    # work whose analytical prerequisites have not passed.
+    if analytics_failure is None:
+        start_shadow_reconciler(collector, cfg.work_queue, stop, auth=auth)
+        from drover.server.work_queue.runtime import (
+            start_github_webhook_worker,
+            start_idle_undeclared_worker,
+            start_queue_execution_worker,
+            start_work_item_event_worker,
+            start_work_item_rule_worker,
+            start_work_service,
+        )
 
-    start_work_service(collector, cfg.work_queue)
-    start_work_item_event_worker(collector, cfg.work_queue, stop)
-    start_github_webhook_worker(collector, cfg.work_queue, stop)
-    start_work_item_rule_worker(collector, cfg.work_queue, stop)
-    start_queue_execution_worker(collector, cfg.work_queue, stop)
-    start_idle_undeclared_worker(
-        collector, cfg.work_queue, stop, credential_store=auth.credentials
-    )
-    if cfg.update_enabled:
+        start_work_service(collector, cfg.work_queue)
+        start_work_item_event_worker(collector, cfg.work_queue, stop)
+        start_github_webhook_worker(collector, cfg.work_queue, stop)
+        start_work_item_rule_worker(collector, cfg.work_queue, stop)
+        start_queue_execution_worker(collector, cfg.work_queue, stop)
+        start_idle_undeclared_worker(
+            collector, cfg.work_queue, stop, credential_store=auth.credentials
+        )
+    if cfg.update_enabled and analytics_failure is None:
         planner = UpdatePlanner(
             cfg, RuntimeLayout(config_home(), root=cfg.update_runtime_root)
         )
@@ -3152,7 +3164,7 @@ def run(
     """Run the selected all, API, or analytics role in the foreground."""
     _register_stack_dump()
     with _startup_phase("resolve_startup_config"):
-        cfg = _resolve_config(ctx.obj["config_path"])
+        cfg = _resolve_config(ctx.obj["config_path"], validate_analytics=False)
     from drover.server.process_memory import configure_memory_guard
 
     configure_memory_guard(cfg.memory)
@@ -3212,6 +3224,39 @@ def run(
         raise click.UsageError(
             "--no-metrics and --metrics-host do not apply to --role analytics"
         )
+    if cfg.analytics.backend == "ducklake":
+        from drover.server.lake.runtime import LakeError
+        from drover.server.lake.serving import (
+            check_selected,
+            configure_analytics,
+            validate_startup_config,
+        )
+
+        try:
+            with _startup_phase("preflight_ducklake_serving"):
+                # Resolution deliberately skips analytics for the no-touch API
+                # role. Register here before checking: an unregistered path
+                # otherwise selects the legacy backend and silently skips proof.
+                configure_analytics(cfg.duckdb_path, cfg.analytics)
+                validate_startup_config(cfg.analytics)
+                check_selected(cfg.duckdb_path)
+        except LakeError as exc:
+            if selected_role != "all" or cfg.control_store.backend != "postgres":
+                raise
+            # Reuse the tested split-role boundary. An empty boundary token
+            # forbids proxy reads and archived-content fallback, even if a
+            # stale local analytics worker is still listening. No lake worker
+            # or exporter starts in this explicitly degraded control runtime.
+            log.error(
+                "analytics unavailable (%s); starting recovery control API", exc.code
+            )
+            _run_api_role(
+                cfg=cfg,
+                config_path=runtime_config_path,
+                metrics_host=metrics_host or cfg.server_metrics_host,
+                analytics_failure=exc.code,
+            )
+            return
     # Bring up durable tables/control state first, but do not bind the
     # historical Parquet views yet. DuckDB resolves read_parquet(...,
     # union_by_name=true) metadata while creating those views; on a degraded
@@ -3392,6 +3437,9 @@ def run(
             ),
             max_runtime_seconds=cfg.analytics.auto_compaction_max_runtime_seconds,
             maintenance_admission=MaintenanceAdmission(analytics_gate),
+            exporter_pause=(
+                outbox_exporter.pause_for_maintenance if outbox_exporter else None
+            ),
             planned_stop_active=lambda: valid_marker(planned_stop_store.read()),
             exporter_backlog_high=_exporter_backlog_high,
         )
