@@ -55,7 +55,11 @@ The user can currently configure an HTTPS or HTTP server URL. HTTPS maps to
 `wss` for live streams; HTTP maps to `ws`. Release and StoreRelease use
 `NSAllowsLocalNetworking = YES` and deliberately omit
 `NSAllowsArbitraryLoads`; Debug retains the broad exception solely for
-simulator fixtures and local test servers. The supported Store matrix is:
+simulator fixtures and local test servers. The `DroverWidget` extension
+fetches from the same hub with the same client and follows the same policy
+through its own derived Info.plist; `scripts/ios/verify_widget_ipa.sh` rejects
+an exported widget whose ATS dictionary is anything other than
+`NSAllowsLocalNetworking = YES`. The supported Store matrix is:
 
 | Endpoint | Store configuration | Security consequence |
 | --- | --- | --- |

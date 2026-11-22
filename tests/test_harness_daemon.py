@@ -752,6 +752,9 @@ class _FakeStructuredManager:
         del session_id
         return self.busy
 
+    def turn_in_flight(self, session_id: str) -> bool | None:
+        return self.busy if self.has(session_id) else None
+
     def start(self, *args, **kwargs) -> None:
         self.starts.append((args, kwargs))
 
@@ -3539,6 +3542,7 @@ def test_harnessd_listing_merges_pty_registry_and_manager_only_sessions(tmp_path
         state.structured.session_ids = lambda: ["manager-only"]  # type: ignore[method-assign]
         state.structured.has = lambda session_id: session_id == "manager-only"  # type: ignore[method-assign]
         state.structured.is_busy = lambda session_id: False  # type: ignore[method-assign]
+        state.structured.turn_in_flight = lambda session_id: False  # type: ignore[method-assign]
 
         status, inventory = _json_request(f"{base_url}/sessions")
         assert status == 200

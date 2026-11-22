@@ -102,6 +102,15 @@ committing a clean machine to an installation, use
 disposable runtime, verify the published checksums, and confirm the
 PostgreSQL-default installer contract without writing `~/.drover`.
 
+Open the built-in web cockpit at `http://127.0.0.1:7080/ui` on the hub
+machine and pair the browser with the one-time code printed by
+`drover-server pair` (the same command shows a QR code for the iOS app). No
+Xcode or phone is needed to start. To reach the hub from other devices, set
+`[server] advertised_url` to a private LAN or Tailscale address first.
+
+To look around before any host is connected, open
+`http://127.0.0.1:7080/ui/?fixture` for a read-only preview with sample data.
+
 Add another machine with the one-liner printed by
 `drover-server pair-host --name <host>`.
 
@@ -194,8 +203,9 @@ device signing, and server configuration.
 ## Status and limitations
 
 Drover is source-distributed software for technical users operating a trusted
-personal fleet. The latest public release is **v0.6.56**; see the
-[changelog](CHANGELOG.md) and [GitHub releases](https://github.com/arniesaha/drover/releases) for upgrade notes and checksums. Verify a pinned public release with `install.sh --verify-release`; private validation artifacts are not public releases. The Python server and
+personal fleet. The latest public release is listed on
+[GitHub releases](https://github.com/arniesaha/drover/releases/latest); see the
+[changelog](CHANGELOG.md) and the release page for upgrade notes and checksums. Verify a pinned public release with `install.sh --verify-release`; private validation artifacts are not public releases. The Python server and
 native iOS client are
 functional. The iOS app is built from source or distributed to testers through
 the TestFlight production lane; it is not on the public App Store. Push notifications work when the

@@ -39,8 +39,8 @@ curl --fail --silent --show-error --max-time 5 \
   "$DROVER_HTTP_URL/profile?scope=first_turn"
 ```
 
-Credentials are issued with `drover profile agents issue AGENT --tier trusted`
-and revoked with `drover profile agents revoke AGENT`. A newly issued credential
+Credentials are issued with `drover-server profile agents issue AGENT --tier trusted`
+and revoked with `drover-server profile agents revoke AGENT`. A newly issued credential
 has scope `profile` with no host identity and authorizes only HTTP `GET /profile`
 and MCP `drover_profile`.
 Only a verifier is stored on the server; the plaintext token is printed once.

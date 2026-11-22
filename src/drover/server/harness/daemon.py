@@ -3700,9 +3700,13 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         # A registry row without a live manager entry is not evidence that a
         # structured turn is idle (for example, after a daemon restart).  Keep
         # that distinction explicit so hub claim settlement can fail closed.
+        # ``turn_in_flight`` reports a live turn, not ``is_busy``'s restart
+        # quiescence: an idle persistent adapter is busy for restart purposes
+        # but has no turn the hub's claim settlement should wait on.
+        structured = self.server.state.structured
         payload["turn_active"] = (
-            self.server.state.structured.is_busy(session_id)
-            if self.server.state.structured.has(session_id)
+            structured.turn_in_flight(session_id)
+            if structured.has(session_id)
             else None
         )
         return payload

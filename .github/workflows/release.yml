@@ -16,6 +16,11 @@ jobs:
   release:
     name: Build and publish release artifacts
     runs-on: ubuntu-latest
+    # A job-level block replaces the workflow default, so restate contents.
+    # actions: read lets the exact-SHA CI gate query ci.yml runs.
+    permissions:
+      contents: write
+      actions: read
     steps:
     # On a tag push GITHUB_REF_NAME is the tag, which is what we want. On
     # workflow_dispatch it is the *branch*, so a manual run without this
@@ -40,6 +45,16 @@ jobs:
     - uses: actions/checkout@v4
       with:
         ref: ${{ github.event.inputs.ref || github.ref }}
+
+    # The release must be for the checkout, not GITHUB_SHA: on a manual
+    # dispatch the latter is the dispatcher branch head rather than the tag.
+    # This runs before every build/publish step and accepts only a successful
+    # ci.yml push run on main for that exact commit.
+    - name: Require green main CI for the tagged commit
+      timeout-minutes: 50
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: RELEASE_SHA="$(git rev-parse HEAD)" python3 scripts/require_main_ci.py --wait-minutes 45
 
     - uses: actions/setup-node@v4
       with:
@@ -177,8 +192,12 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
+        # Lead with the reviewed CHANGELOG section; GitHub appends generated
+        # PR notes after it when --generate-notes is also supplied.
+        python3 scripts/changelog_section.py "${RELEASE_TAG}" > "${RUNNER_TEMP}/release-notes.md"
         gh release create "${RELEASE_TAG}" \
           --title "${RELEASE_TAG}" \
+          --notes-file "${RUNNER_TEMP}/release-notes.md" \
           --generate-notes \
           dist/drover-*-py3-none-any.whl \
           dist/requirements.lock.txt \

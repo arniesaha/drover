@@ -2,6 +2,9 @@
 name = "drover-harnessd"
 version = "0.7.0"
 edition = "2021"
+# Oldest toolchain the locked dependency graph builds with (icu_* 2.3 and
+# friends in Cargo.lock need 1.88-1.89). CI uses current stable.
+rust-version = "1.89"
 license = "MIT"
 
 [[bin]]

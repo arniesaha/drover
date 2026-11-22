@@ -19,12 +19,19 @@ The default network posture is private. The hub joins the operator's tailnet,
 either through a Tailscale sidecar or `tailscale serve`, and clients use the
 hub's HTTPS `ts.net` name. No hub port is published to the public internet.
 
-`deploy/Dockerfile` is the reference hub image build. It runs only
+`deploy/Dockerfile` is the reference hub image build. Build it from the
+repository root with `docker build -f deploy/Dockerfile -t drover-hub .`; a
+Node stage builds the `/ui` web client into the package before the Python
+wheel is installed, and `deploy/Dockerfile.dockerignore` scopes the context.
+It runs only
 `drover-server` as an unprivileged user and deliberately does not include a
 harness CLI, Git, `sqlite3`, PostgreSQL client tools, Tailscale, a service
-manager, or troubleshooting utilities. Compose and Helm templates remain
-follow-up work; platform configuration must still meet the persistent-service
-contract below.
+manager, or troubleshooting utilities. `deploy/compose.yaml` is the one-command
+single-VM stack: PostgreSQL 17 with pgvector (the image CI pins), a one-shot
+`control-store init`, and the hub published on `127.0.0.1:7080` with
+`deploy/compose/config.toml` mounted read-only and secrets from `deploy/.env`.
+A Helm template remains follow-up work; platform configuration must still meet
+the persistent-service contract below.
 
 For Railway or another generic container platform, provide (1) a private
 PostgreSQL service for the control store and DuckLake catalog, (2) one durable
