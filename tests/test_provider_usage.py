@@ -779,6 +779,107 @@ def test_login_refresh_needed_keeps_last_known_usage_and_its_age(
     assert account.freshness_age_seconds == 300
 
 
+def test_authenticated_cursor_quota_unsupported_refresh_is_fresh_and_recovers(
+    tmp_path, provider_host
+):
+    """A supported account can honestly lack a supported quota contract."""
+    parquet_dir = tmp_path / "parquet"
+    duckdb_path = tmp_path / "drover.duckdb"
+    bootstrap(parquet_dir=parquet_dir, duckdb_path=duckdb_path)
+    clock = [datetime(2026, 11, 22, 15, 50, tzinfo=timezone.utc)]
+    service = ProviderUsageService(
+        duckdb_path,
+        parquet_dir,
+        clock=lambda: clock[0],
+        freshness_threshold_seconds=300,
+    )
+    quota_unsupported = {
+        "accounts": [
+            {
+                "snapshot_id": "cursor-account",
+                "dedup_key": "cursor-account",
+                "provider": "cursor",
+                "account_label": "Cursor",
+                "plan_label": None,
+                "host_id": "mac-mini",
+                "status": "usage_unavailable",
+                "observed_at": clock[0].isoformat(),
+                "source": "cursor-cli",
+                "error_category": "quota_unsupported",
+                "windows": [],
+            }
+        ]
+    }
+
+    service.refresh_host(provider_host, fetch=lambda _: quota_unsupported)
+
+    account = service.latest_accounts()[0]
+    assert account.status == "usage_unavailable"
+    assert account.error_category == "quota_unsupported"
+    assert account.windows == ()
+    capacity = CockpitService(
+        duckdb_path=None,
+        provider_usage=service,
+        connect=lambda: (_ for _ in ()).throw(RuntimeError("activity unavailable")),
+    ).overview(AnalyticsFilters(days=7))["provider_capacity"]
+    assert capacity["status"] == "ok"
+    assert capacity["data"][0]["status"] == "usage_unavailable"
+    assert capacity["data"][0]["error_category"] == "quota_unsupported"
+    assert capacity["data"][0]["windows"] == ()
+
+    clock[0] += timedelta(minutes=5)
+    service.refresh_host(provider_host, fetch=lambda _: quota_unsupported)
+    refreshed = service.latest_accounts()[0]
+    assert refreshed.status == "usage_unavailable"
+    assert refreshed.error_category == "quota_unsupported"
+    assert refreshed.observed_at == clock[0]
+    with duckdb.connect(str(duckdb_path)) as con:
+        connection = con.execute("""
+            SELECT last_attempt_at, last_success_at, error_category
+            FROM provider_connections
+            WHERE provider = 'cursor' AND account_label = 'Cursor'
+              AND host_id = 'mac-mini'
+            """).fetchone()
+    assert connection == (clock[0], clock[0], None)
+
+    clock[0] += timedelta(minutes=1)
+    timeout = {
+        "accounts": [
+            {
+                **quota_unsupported["accounts"][0],
+                "snapshot_id": "cursor-timeout",
+                "dedup_key": "cursor-timeout",
+                "status": "error",
+                "observed_at": clock[0].isoformat(),
+                "error_category": "timeout",
+            }
+        ]
+    }
+    service.refresh_host(provider_host, fetch=lambda _: timeout)
+    failed = service.latest_accounts()[0]
+    assert failed.status == "stale"
+    assert failed.error_category == "timeout"
+    with duckdb.connect(str(duckdb_path)) as con:
+        connection = con.execute("""
+            SELECT last_attempt_at, last_success_at, error_category
+            FROM provider_connections
+            WHERE provider = 'cursor' AND account_label = 'Cursor'
+              AND host_id = 'mac-mini'
+            """).fetchone()
+    assert connection == (
+        clock[0],
+        clock[0] - timedelta(minutes=1),
+        "timeout",
+    )
+
+    clock[0] += timedelta(minutes=1)
+    service.refresh_host(provider_host, fetch=lambda _: quota_unsupported)
+    recovered = service.latest_accounts()[0]
+    assert recovered.status == "usage_unavailable"
+    assert recovered.error_category == "quota_unsupported"
+    assert recovered.windows == ()
+
+
 def test_provider_refresh_is_atomic_deduplicated_and_records_every_attempt(
     provider_service, provider_host
 ):
