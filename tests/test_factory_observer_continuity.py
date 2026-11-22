@@ -597,6 +597,39 @@ def test_expiry_recovers_same_action_and_fences_stale_owner(bridge):
     )
 
 
+def test_zero_second_lease_releases_only_the_live_exact_owner_fence(bridge):
+    store, _, _ = bridge
+    fence = owner(store, lease_seconds=30)
+    with pytest.raises(ContinuityConflict, match="current owner lease"):
+        store.lease(
+            RUN,
+            owner_id=fence["owner_id"],
+            owner_epoch=fence["owner_epoch"] + 1,
+            lease_seconds=0,
+        )
+    with pytest.raises(ContinuityConflict, match="not authorized"):
+        store.lease(
+            RUN,
+            owner_id="other-owner",
+            owner_epoch=fence["owner_epoch"],
+            lease_seconds=0,
+        )
+    released = store.lease(RUN, **fence, lease_seconds=0)
+    assert released == {
+        "owner_id": fence["owner_id"],
+        "owner_epoch": fence["owner_epoch"],
+        "lease_until": None,
+    }
+    assert store.status(RUN)["owner"] == {
+        "id": fence["owner_id"],
+        "epoch": fence["owner_epoch"],
+        "lease_until": None,
+        "live": False,
+    }
+    with pytest.raises(ContinuityConflict, match="current owner lease"):
+        store.lease(RUN, **fence, lease_seconds=0)
+
+
 @pytest.mark.parametrize(
     "kind,action_type", [("ci_red", "correct_ci"), ("ci_green", "review_ci")]
 )
@@ -924,7 +957,7 @@ def test_projection_is_bounded_and_rejects_control_vocabulary(bridge):
     for limit in (0, 51, True):
         with pytest.raises(ValueError):
             store.status(RUN, limit=limit)
-    for seconds in (0, 301, True):
+    for seconds in (301, True):
         with pytest.raises(ValueError):
             owner(store, lease_seconds=seconds)
     with pytest.raises(ValueError, match="unsupported"):
@@ -1037,6 +1070,34 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
         )
         assert status == 200 and payload["continuity"]["recovery"] == "claim_owner"
         assert request(query=f"?run_id={RUN}&limit=51")[0] == 400
+        telemetry_query = (
+            f"?run_id={RUN}&owner_id=legacy%3Aoperator"
+            "&session_activity_at=2026-10-03T00%3A00%3A00%2B00%3A00"
+            "&last_error=temporary%20transport%20failure"
+        )
+        status, telemetry = request(query=telemetry_query)
+        assert status == 200
+        assert telemetry["continuity"]["owner_telemetry"] == {
+            "owner_id": "legacy:operator",
+            "session_activity_at": "2026-10-03T00:00:00+00:00",
+            "last_error": "temporary transport failure",
+        }
+        # Telemetry is durable but is never a delivery or synthetic ack.
+        assert telemetry["continuity"]["inbox_counts"] == {"pending": 1}
+        for malformed in (
+            f"?run_id={RUN}&session_activity_at=2026-10-03T00%3A00%3A00%2B00%3A00",
+            f"?run_id={RUN}&owner_id=legacy%3Aoperator&session_activity_at=not-a-time",
+        ):
+            assert request(query=malformed)[0] == 400
+        assert (
+            request(
+                query=(
+                    f"?run_id={RUN}&owner_id=agent%3Aother%3Amain"
+                    "&session_activity_at=2026-10-03T00%3A00%3A00%2B00%3A00"
+                )
+            )[0]
+            == 403
+        )
         assert request(query=f"?run_id={RUN}&limit=1")[1]["continuity"][
             "inbox_counts"
         ] == {"pending": 1}
@@ -1049,6 +1110,18 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
         )
         assert status == 200
         epoch = payload["continuity"]["owner"]["epoch"]
+        assert (
+            request(
+                {
+                    "operation": "lease",
+                    "run_id": RUN,
+                    "owner_id": "legacy:operator",
+                    "owner_epoch": epoch + 1,
+                    "lease_seconds": 0,
+                }
+            )[0]
+            == 409
+        )
         status, payload = request(
             {
                 "operation": "consume",
@@ -1058,6 +1131,21 @@ def test_http_boundary_authenticated_bounded_and_report_only(bridge, tmp_path):
             }
         )
         assert status == 200 and payload["delivery"]["type"] == "review_ci"
+        status, payload = request(
+            {
+                "operation": "lease",
+                "run_id": RUN,
+                "owner_id": "legacy:operator",
+                "owner_epoch": epoch,
+                "lease_seconds": 0,
+            }
+        )
+        assert status == 200 and payload["continuity"]["owner"] == {
+            "id": "legacy:operator",
+            "epoch": epoch,
+            "lease_until": None,
+            "live": False,
+        }
         assert (
             request(
                 {
