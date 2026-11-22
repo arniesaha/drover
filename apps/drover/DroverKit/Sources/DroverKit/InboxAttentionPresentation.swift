@@ -2,13 +2,13 @@ import Foundation
 
 /// Membership and count rules for the actionable Inbox segment.
 ///
-/// This intentionally does not reuse the Home fleet headline: that headline
-/// includes approval states, while Inbox only counts sessions waiting for an
-/// answer plus work decisions and unresolved priority findings.
+/// The Inbox and Home's attention route must agree: approvals and questions
+/// are both actionable sessions, alongside work decisions and priority
+/// findings.
 public enum InboxAttentionPresentation {
     public static func sessionsAwaitingAnswer(_ sessions: [SessionSummary]) -> [SessionSummary] {
         sessions
-            .filter { $0.attention == .needsInput }
+            .filter { $0.attention == .needsApproval || $0.attention == .needsInput }
             .sorted { ($0.activityDate ?? .distantPast) > ($1.activityDate ?? .distantPast) }
     }
 

@@ -80,7 +80,7 @@ struct FleetHeader: View {
             }
             .foregroundStyle(isOverviewExpanded ? DroverColor.accentHi : DroverColor.muted)
             .padding(.horizontal, 9)
-            .padding(.vertical, 5)
+            .frame(minHeight: 44)
             .background(isOverviewExpanded ? DroverColor.accentTint : DroverColor.surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -150,6 +150,7 @@ private struct AllHostsChip: View {
                     .foregroundStyle(isSelected ? AnyShapeStyle(DroverColor.accentHi) : AnyShapeStyle(DroverColor.muted))
             }
             .padding(.horizontal, 10)
+            .frame(minHeight: 44)
             .background {
                 if isSelected {
                     Capsule().fill(DroverColor.accentTint)
@@ -210,6 +211,7 @@ private struct HostChip: View {
                     .foregroundStyle(isSelected ? AnyShapeStyle(DroverColor.accentHi) : countStyle)
             }
             .padding(.horizontal, 10)
+            .frame(minHeight: 44)
             .background {
                 if isSelected {
                     Capsule().fill(DroverColor.accentTint)

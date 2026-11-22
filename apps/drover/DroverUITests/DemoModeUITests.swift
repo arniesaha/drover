@@ -81,8 +81,10 @@ final class DemoModeUITests: XCTestCase {
         tryDemoButton.tap()
 
         // 2. Fleet / Home Screen in Demo Mode
-        let demoBadge = app.descendants(matching: .any)["demo-badge"]
-        XCTAssertTrue(demoBadge.waitForExistence(timeout: 5), "Expected DEMO badge on home screen")
+        // The released root presents a concise Demo label instead of the
+        // removed decorative badge; assert the actual mode affordance.
+        let demoLabel = app.staticTexts["Demo"]
+        XCTAssertTrue(demoLabel.waitForExistence(timeout: 5), "Expected Demo label on home screen")
         XCTAssertTrue(app.buttons[sessionStreaming].waitForExistence(timeout: 5))
         captureScreenshot(named: "02_Fleet_Home_Demo", in: app)
 
@@ -124,10 +126,15 @@ final class DemoModeUITests: XCTestCase {
 
         // Back to fleet
         app.navigationBars.firstMatch.buttons.firstMatch.tap()
-        XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
+        XCTAssertTrue(demoLabel.waitForExistence(timeout: 5))
 
         // 4. Open Approval Request Session
-        let approvalSession = app.buttons[sessionApproval]
+        // Home intentionally directs actionable sessions to Inbox instead of
+        // duplicating them beside running work. Exercise that real route.
+        let openInbox = app.buttons["home-open-inbox"]
+        XCTAssertTrue(openInbox.waitForExistence(timeout: 5))
+        openInbox.tap()
+        let approvalSession = app.buttons["inbox-session-\(sessionApproval)"]
         XCTAssertTrue(approvalSession.waitForExistence(timeout: 5))
         approvalSession.tap()
 
@@ -140,9 +147,11 @@ final class DemoModeUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Migration 004 applied successfully. 3 tables and index created."].waitForExistence(timeout: 5))
         captureScreenshot(named: "05_Session_Approved", in: app)
 
-        // Back to fleet
+        // Back to Inbox, then return to Home for the remaining demo tour.
         app.navigationBars.firstMatch.buttons.firstMatch.tap()
-        XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Inbox"].waitForExistence(timeout: 5))
+        app.tabBars.buttons["Home"].tap()
+        XCTAssertTrue(demoLabel.waitForExistence(timeout: 5))
 
         // 5. Open Diff & Artifacts Session
         let diffSession = app.buttons[sessionDiffArtifacts]
@@ -151,27 +160,22 @@ final class DemoModeUITests: XCTestCase {
             _ = app.descendants(matching: .any)["chat-floating-artifacts"].waitForExistence(timeout: 3)
             captureScreenshot(named: "06_Session_DiffArtifacts", in: app)
             app.navigationBars.firstMatch.buttons.firstMatch.tap()
-            XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
+            XCTAssertTrue(demoLabel.waitForExistence(timeout: 5))
         }
 
         // 6. View Analytics
-        app.buttons["dock-analytics"].tap()
+        app.tabBars.buttons["Analytics"].tap()
 
         let analyticsFilters = app.descendants(matching: .any)["analytics-filters"]
         XCTAssertTrue(analyticsFilters.waitForExistence(timeout: 5))
         captureScreenshot(named: "07_Analytics_Overview", in: app)
 
         // Back to fleet
-        app.buttons["dock-home"].tap()
-        XCTAssertTrue(demoBadge.waitForExistence(timeout: 5))
+        app.tabBars.buttons["Home"].tap()
+        XCTAssertTrue(demoLabel.waitForExistence(timeout: 5))
 
         // 7. Settings & Exit Demo
-        let settingsButton = app.buttons["settings-button"]
-        if !settingsButton.isHittable {
-            app.scrollViews["fleet-list"].swipeDown()
-        }
-        XCTAssertTrue(settingsButton.waitForExistence(timeout: 5))
-        settingsButton.tap()
+        app.tabBars.buttons["Settings"].tap()
 
         let settingsDemoBadge = app.descendants(matching: .any)["settings-demo-badge"]
         XCTAssertTrue(settingsDemoBadge.waitForExistence(timeout: 5))
